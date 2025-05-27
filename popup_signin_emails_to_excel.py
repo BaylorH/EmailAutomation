@@ -1,4 +1,4 @@
-# EmailAutomation.py
+# emailautomation.py
 
 from msal import PublicClientApplication
 import requests
