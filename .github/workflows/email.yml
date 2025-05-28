@@ -44,9 +44,9 @@ jobs:
             echo "Token cache updated"
           fi
           
-      - name: Upload Excel file
-        uses: actions/upload-artifact@v3
-        if: always()
-        with:
-          name: email-responses
-          path: responses.xlsx
+      # - name: Upload Excel file
+      #   uses: actions/upload-artifact@v3
+      #   if: always()
+      #   with:
+      #     name: email-responses
+      #     path: responses.xlsx
