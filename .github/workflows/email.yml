@@ -4,7 +4,7 @@ on:
   schedule:
     # - cron: '0 9 * * 1'  # Every Monday at 9 AM UTC (weekly)
     # Alternative schedules:
-    - cron: '*/5 * * * *'  # Every 5 minutes (for testing)
+    # - cron: '*/5 * * * *'  # Every 5 minutes (for testing)
     # - cron: '0 */6 * * *'  # Every 6 hours
     # - cron: '0 9 * * *'    # Daily at 9 AM UTC
 
