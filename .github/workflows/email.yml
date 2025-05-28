@@ -21,7 +21,7 @@ jobs:
         run: pip install msal requests openpyxl
 
       - name: Restore MSAL cache
-        run: echo "${{ secrets.MSAL_CACHE }}" > msal_token_cache.bin
+        run: echo "${{ secrets.MSAL_CACHE_B64 }}" | base64 --decode > msal_token_cache.bin
 
       - name: Run email script
         env:
