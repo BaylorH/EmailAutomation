@@ -3,7 +3,10 @@
 from msal import PublicClientApplication
 import requests
 
-CLIENT_ID = "70013c0d-89a5-40b1-9dc9-4da89dd0362e"
+CLIENT_ID = os.getenv("CLIENT_ID")
+if not CLIENT_ID:
+    raise RuntimeError("CLIENT_ID not set in environment")
+    
 AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Mail.Read", "Mail.ReadWrite", "Mail.Send"]
 
