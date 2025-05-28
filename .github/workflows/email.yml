@@ -1,11 +1,10 @@
 name: Email Automation
-
 on:
   workflow_dispatch:
   schedule:
-    # - cron: '0 9 * * 1'  # Every Monday at 9 AM UTC (weekly)
+    - cron: '0 9 * * 1'  # Every Monday at 9 AM UTC (weekly)
     # Alternative schedules:
-    - cron: '*/5 * * * *'  # Every 5 minutes (for testing)
+    # - cron: '*/5 * * * *'  # Every 5 minutes (for testing)
     # - cron: '0 */6 * * *'  # Every 6 hours
     # - cron: '0 9 * * *'    # Daily at 9 AM UTC
 
@@ -14,20 +13,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
-
+        uses: actions/checkout@v4
+        
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.x'
-
-      - name: Install deps
+          
+      - name: Install dependencies
         run: pip install msal requests openpyxl
-
+        
       - name: Restore MSAL cache
-        run: echo "${{ secrets.MSAL_CACHE_B64 }}" | base64 --decode > msal_token_cache.bin
-
+        run: |
+          if [ -n "${{ secrets.MSAL_CACHE_B64 }}" ]; then
+            echo "${{ secrets.MSAL_CACHE_B64 }}" | base64 --decode > msal_token_cache.bin
+          else
+            echo "No MSAL cache found, will authenticate interactively"
+          fi
+          
       - name: Run email script
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
         run: python noPopup_signin_emails_to_excel.py
+        
+      - name: Save MSAL cache
+        if: always()
+        run: |
+          if [ -f msal_token_cache.bin ]; then
+            echo "MSAL_CACHE_B64=$(base64 -w 0 msal_token_cache.bin)" >> $GITHUB_ENV
+            echo "Token cache updated"
+          fi
+          
+      - name: Upload Excel file
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: email-responses
+          path: responses.xlsx
