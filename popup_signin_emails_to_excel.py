@@ -1,72 +1,59 @@
-# emailautomation.py
+import os
+import json
+import atexit
+from msal import PublicClientApplication, SerializableTokenCache
+from firebase_helpers import upload_token
 
-from msal import PublicClientApplication
-import requests
+print("🔥 Starting local token saver")
 
-CLIENT_ID = os.getenv("CLIENT_ID")
+# ─── Config ──────────────────────
+FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
+
+CLIENT_ID   = os.getenv("CLIENT_ID")
+AUTHORITY   = "https://login.microsoftonline.com/common"
+SCOPES      = ["Mail.ReadWrite", "Mail.Send"]
+TOKEN_CACHE = "msal_token_cache.bin"
+
 if not CLIENT_ID:
-    raise RuntimeError("CLIENT_ID not set in environment")
-    
-AUTHORITY = "https://login.microsoftonline.com/common"
-SCOPES = ["Mail.Read", "Mail.ReadWrite", "Mail.Send"]
+    raise RuntimeError("Missing CLIENT_ID")
 
-# Create an MSAL app instance
-app = PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+print("✅ CLIENT_ID:", CLIENT_ID)
 
-# Login with a browser popup
-result = app.acquire_token_interactive(scopes=SCOPES)
-access_token = result["access_token"]
-headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+# ─── Token Cache ─────────────────
+cache = SerializableTokenCache()
+if os.path.exists(TOKEN_CACHE):
+    cache.deserialize(open(TOKEN_CACHE, 'r').read())
+    print("📁 Loaded existing token cache")
 
-# Logic to send a question email
-def send_question_email(to_address):
+def _save_cache():
+    if cache.has_state_changed:
+        with open(TOKEN_CACHE, 'w') as f:
+            f.write(cache.serialize())
+        print("💾 Token cache saved to", TOKEN_CACHE)
+atexit.register(_save_cache)
 
-    # Conents of email
-    email_data = {
-        "message": {
-            "subject": "Weekly Questions",
-            "body": {
-                "contentType": "Text",
-                "content": (
-                    "Hi,\n\nPlease answer the following:\n"
-                    "1. How was your week?\n"
-                    "2. What challenges did you face?\n"
-                    "3. Any updates to share?\n\nThanks!"
-                ),
-            },
-            "toRecipients": [{"emailAddress": {"address": to_address}}],
-        },
-        "saveToSentItems": "true"
-    }
+app = PublicClientApplication(
+    CLIENT_ID,
+    authority=AUTHORITY,
+    token_cache=cache
+)
 
-    # Send email
-    res = requests.post(
-        "https://graph.microsoft.com/v1.0/me/sendMail",
-        headers=headers,
-        json=email_data
-    )
-    print("Email sent:", res.status_code)
+# ─── Auth ────────────────────────
+accounts = app.get_accounts()
+result = None
+if accounts:
+    print("🔐 Trying silent sign-in...")
+    result = app.acquire_token_silent(SCOPES, account=accounts[0])
 
-# Check inbox for replies and save them to Excel
-def extract_replies_to_excel():
-    res = requests.get(
-        "https://graph.microsoft.com/v1.0/me/messages?$orderby=receivedDateTime desc&$top=5",
-        headers=headers
-    )
-    messages = res.json().get("value", [])
-    for msg in messages:
-        if "Weekly Questions" in msg["subject"] and not msg["isRead"]:
-            sender = msg["from"]["emailAddress"]["address"]
-            content = msg["body"]["content"]
+if not result:
+    print("🌐 No cached token found. Starting interactive login...")
+    result = app.acquire_token_interactive(SCOPES, prompt="select_account")
+    print("✅ Logged in successfully")
 
-            import openpyxl
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.append(["Sender", "Response"])
-            ws.append([sender, content])
-            wb.save("responses.xlsx")
-            print(f"Saved reply from {sender}")
-            return
+access_token = result.get("access_token")
+if not access_token:
+    raise RuntimeError(f"Token acquisition failed: {json.dumps(result, indent=2)}")
 
-send_question_email("bp21harrison@gmail.com") 
-extract_replies_to_excel()
+print("🟢 Access token acquired")
+
+upload_token(FIREBASE_API_KEY, input_file="msal_token_cache.bin", user_id="default_user")
