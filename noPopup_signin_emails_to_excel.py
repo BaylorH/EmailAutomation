@@ -5,6 +5,18 @@ import requests
 import openpyxl
 from msal import PublicClientApplication, SerializableTokenCache
 
+from firebase_helpers import download_token, upload_token
+
+FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
+
+if not FIREBASE_API_KEY:
+    raise RuntimeError("FIREBASE_API_KEY is not set in the environment.")
+
+download_token(FIREBASE_API_KEY)
+# Your MSAL/email logic runs here
+upload_token(FIREBASE_API_KEY)
+
+
 # ─── Configuration ──────────────────────────────────────
 CLIENT_ID      = os.getenv("CLIENT_ID")
 if not CLIENT_ID:
