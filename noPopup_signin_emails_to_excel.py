@@ -13,9 +13,6 @@ if not FIREBASE_API_KEY:
     raise RuntimeError("FIREBASE_API_KEY is not set in the environment.")
 
 download_token(FIREBASE_API_KEY)
-# Your MSAL/email logic runs here
-upload_token(FIREBASE_API_KEY)
-
 
 # ─── Configuration ──────────────────────────────────────
 CLIENT_ID      = os.getenv("CLIENT_ID")
@@ -38,12 +35,16 @@ THANK_YOU_BODY = "Thanks for your response."
 
 # ─── Persistent MSAL token cache ─────────────────────────
 cache = SerializableTokenCache()
-if os.path.exists(TOKEN_CACHE):
-    cache.deserialize(open(TOKEN_CACHE, 'r').read())
 
+with open("msal_token_cache.bin", "r") as f:
+    cache.deserialize(f.read())
+    
 def _save_cache():
     if cache.has_state_changed:
-        open(TOKEN_CACHE, 'w').write(cache.serialize())
+        with open("msal_token_cache.bin", "w") as f:
+            f.write(cache.serialize())
+        upload_token(FIREBASE_API_KEY, input_file="msal_token_cache.bin", user_id="default_user")
+        
 atexit.register(_save_cache)
 
 app = PublicClientApplication(
