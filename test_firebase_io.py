@@ -8,7 +8,7 @@ USER_ID = "test_user"  # You can use any string here for testing
 # If you want it dynamic, refactor firebase_helpers to accept USER_ID as a param
 
 print("Uploading...")
-upload_token(FIREBASE_API_KEY, input_file="test_token.bin")
+upload_token(FIREBASE_API_KEY, input_file="test_token.bin", user_id=USER_ID)
 
 print("Downloading...")
-download_token(FIREBASE_API_KEY, output_file="downloaded_test_token.bin")
+download_token(FIREBASE_API_KEY, output_file="downloaded_test_token.bin", user_id=USER_ID)
