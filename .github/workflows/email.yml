@@ -4,50 +4,74 @@ on:
   schedule:
     # - cron: '0 9 * * 1'  # Every Monday at 9 AM UTC (weekly)
     # Alternative schedules:
-    # - cron: '*/5 * * * *'  # Every 5 minutes (for testing)
+    - cron: '*/5 * * * *'  # Every 5 minutes (for testing)
     # - cron: '0 */6 * * *'  # Every 6 hours
     # - cron: '0 9 * * *'    # Daily at 9 AM UTC
 
+# jobs:
+#   email:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Checkout
+#         uses: actions/checkout@v4
+        
+#       - name: Setup Python
+#         uses: actions/setup-python@v4
+#         with:
+#           python-version: '3.x'
+          
+#       - name: Install dependencies
+#         run: pip install msal requests openpyxl
+        
+#       - name: Restore MSAL cache
+#         run: |
+#           if [ -n "${{ secrets.MSAL_CACHE_B64 }}" ]; then
+#             echo "${{ secrets.MSAL_CACHE_B64 }}" | base64 --decode > msal_token_cache.bin
+#           else
+#             echo "No MSAL cache found, will authenticate interactively"
+#           fi
+          
+#       - name: Run email script
+#         env:
+#           CLIENT_ID: ${{ secrets.CLIENT_ID }}
+#           FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+#         run: python noPopup_signin_emails_to_excel.py
+        
+#       - name: Save MSAL cache
+#         if: always()
+#         run: |
+#           if [ -f msal_token_cache.bin ]; then
+#             echo "MSAL_CACHE_B64=$(base64 -w 0 msal_token_cache.bin)" >> $GITHUB_ENV
+#             echo "Token cache updated"
+#           fi
+          
+#       # - name: Upload Excel file
+#       #   uses: actions/upload-artifact@v3
+#       #   if: always()
+#       #   with:
+#       #     name: email-responses
+#       #     path: responses.xlsx
+
+
 jobs:
-  email:
+  test-firebase:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
-        
+
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.x'
-          
+
       - name: Install dependencies
-        run: pip install msal requests openpyxl
-        
-      - name: Restore MSAL cache
-        run: |
-          if [ -n "${{ secrets.MSAL_CACHE_B64 }}" ]; then
-            echo "${{ secrets.MSAL_CACHE_B64 }}" | base64 --decode > msal_token_cache.bin
-          else
-            echo "No MSAL cache found, will authenticate interactively"
-          fi
-          
-      - name: Run email script
+        run: pip install requests
+
+      - name: Create test file
+        run: echo "this is a test cache file" > test_token.bin
+
+      - name: Run Firebase I/O test
         env:
-          CLIENT_ID: ${{ secrets.CLIENT_ID }}
           FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
-        run: python noPopup_signin_emails_to_excel.py
-        
-      - name: Save MSAL cache
-        if: always()
-        run: |
-          if [ -f msal_token_cache.bin ]; then
-            echo "MSAL_CACHE_B64=$(base64 -w 0 msal_token_cache.bin)" >> $GITHUB_ENV
-            echo "Token cache updated"
-          fi
-          
-      # - name: Upload Excel file
-      #   uses: actions/upload-artifact@v3
-      #   if: always()
-      #   with:
-      #     name: email-responses
-      #     path: responses.xlsx
+        run: python test_firebase_io.py
