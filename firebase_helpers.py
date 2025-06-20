@@ -1,6 +1,6 @@
 import requests
 
-FIREBASE_BUCKET = "email-automation-cache.appspot.com"
+FIREBASE_BUCKET = "email-automation-cache.firebasestorage.app"
 
 def download_token(api_key: str, output_file="msal_token_cache.bin", user_id="default_user"):
     object_path = f"msal_caches/{user_id}/msal_token_cache.bin"
