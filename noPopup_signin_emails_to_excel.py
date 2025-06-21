@@ -5,7 +5,7 @@ import requests
 import openpyxl
 from msal import PublicClientApplication, SerializableTokenCache
 
-from firebase_helpers import download_token, upload_token
+from firebase_helpers import download_token, upload_token, upload_excel
 
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
 
@@ -141,14 +141,10 @@ def process_replies():
         print("ℹ️  No new replies.")
         return
 
-    # Load or create workbook
-    if os.path.exists(EXCEL_FILE):
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws = wb.active
-    else:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.append(["Sender", "Response", "ReceivedDateTime"])
+    # Create a new workbook every time
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Sender", "Response", "ReceivedDateTime"])  # Header row
 
     for msg in messages:
         sender = msg["from"]["emailAddress"]["address"]
@@ -170,6 +166,7 @@ def process_replies():
         print(f"📥 Replied to and logged reply from {sender}")
 
     wb.save(EXCEL_FILE)
+    upload_excel(FIREBASE_API_KEY, input_file=EXCEL_FILE)
     print(f"✅ Saved {len(messages)} replies to {EXCEL_FILE}")
 
 # ─── Debug function to test API calls ─────────────────────
