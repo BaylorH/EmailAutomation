@@ -34,3 +34,23 @@ def upload_token(api_key: str, input_file="msal_token_cache.bin", user_id="defau
     else:
         print(f"❌ Upload failed for {user_id} ({r.status_code}):", r.text)
 
+def upload_excel(api_key: str, input_file="responses.xlsx", user_id="default_user"):
+    with open(input_file, "rb") as f:
+        data = f.read()
+    
+    object_path = f"excels/{user_id}/responses.xlsx"
+    url = (
+        f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_BUCKET}/o?"
+        f"uploadType=media&name={object_path}&key={api_key}"
+    )
+
+    headers = {
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    }
+    
+    r = requests.post(url, headers=headers, data=data)
+    
+    if r.status_code in [200, 201]:
+        print(f"✅ Excel file uploaded for {user_id}.")
+    else:
+        print(f"❌ Excel upload failed for {user_id} ({r.status_code}):", r.text)
