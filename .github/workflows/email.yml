@@ -25,4 +25,4 @@ jobs:
           FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
           FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
         # run: python noPopup_signin_emails_to_excel.py
-        run: python multi_user_email.py
+        run: python main.py
