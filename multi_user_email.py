@@ -13,11 +13,7 @@ if not CLIENT_ID:
 AUTHORITY  = "https://login.microsoftonline.com/common"
 SCOPES     = ["Mail.Send", "Mail.ReadWrite"]
 
-# Firebase Storage bucket name (as used in REST URLs)
-FIREBASE_STORAGE_BUCKET = os.getenv(
-    "FIREBASE_STORAGE_BUCKET",
-    "email-automation-cache.firebasestorage.app"
-)
+FIREBASE_STORAGE_BUCKET = "email-automation-cache.firebasestorage.app"
 
 # ─── Initialize Firebase Admin SDK ──────────────────────
 # Assumes GOOGLE_APPLICATION_CREDENTIALS is set to your service account JSON
