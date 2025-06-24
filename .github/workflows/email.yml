@@ -23,4 +23,5 @@ jobs:
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
-        run: python noPopup_signin_emails_to_excel.py
+        # run: python noPopup_signin_emails_to_excel.py
+        run: python multi_user_email.py
