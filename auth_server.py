@@ -16,11 +16,13 @@ CACHE_FILE       = "msal_token_cache.bin"
 def start_auth():
     uid = request.args.get("uid", "default_user")
 
-    # Create token cache and MSAL app instance
     cache = SerializableTokenCache()
-    app_obj = PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
+    app_obj = PublicClientApplication(
+        CLIENT_ID,
+        authority=AUTHORITY,
+        token_cache=cache
+    )
 
-    # Start device flow
     flow = app_obj.initiate_device_flow(scopes=SCOPES)
     if "user_code" not in flow:
         return "❌ Failed to create device flow", 500
@@ -28,7 +30,6 @@ def start_auth():
     verification_uri = flow["verification_uri"]
     user_code = flow["user_code"]
 
-    # Poll and upload in background
     def poll_and_upload():
         print(f"⏳ Polling for token for {uid}...")
         result = app_obj.acquire_token_by_device_flow(flow)
@@ -42,20 +43,18 @@ def start_auth():
 
     threading.Thread(target=poll_and_upload).start()
 
-    # Immediate response to browser
-    html = f"""
+    return f"""
     <html>
-    <head><title>Authorize Access</title></head>
+    <head><title>Authorize App</title></head>
     <body style="font-family: sans-serif; padding: 2rem;">
         <h2>📩 Authorize Access</h2>
         <p>Click the link below and paste the code to allow email access:</p>
         <a href="{verification_uri}" target="_blank" style="font-size: 18px;">{verification_uri}</a>
         <h3>🔐 Your Code: <code style="font-size: 24px;">{user_code}</code></h3>
-        <p>Leave this page open — the system will connect automatically.</p>
+        <p>This window will automatically poll while you complete sign-in.</p>
     </body>
     </html>
     """
-    return html
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
