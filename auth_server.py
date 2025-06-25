@@ -64,6 +64,7 @@ def start_auth():
 @app.route("/poll-token")
 def poll_token():
     uid = request.args.get("uid", "default_user")
+    print(f"📡 /poll-token called for uid={uid}")
     if uid not in user_flows:
         return jsonify({"status": "not_started"})
 
