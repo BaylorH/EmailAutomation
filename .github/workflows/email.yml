@@ -27,5 +27,5 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_API_APP_ID: ${{ secrets.AZURE_API_APP_ID }}
           AZURE_API_CLIENT_SECRET: ${{ secrets.AZURE_API_CLIENT_SECRET }}
-        # run: python noPopup_signin_emails_to_excel.py
-        run: python main.py
+        run: python noPopup_signin_emails_to_excel.py
+        # run: python main.py
