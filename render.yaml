@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: msal-auth-server
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python auth_server.py
+    plan: free
+    envVars:
+      - key: AZURE_API_APP_ID
