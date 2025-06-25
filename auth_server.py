@@ -32,34 +32,41 @@ def start_auth():
     user_flows[uid] = (flow, cache)
 
     return render_template_string("""
-        <html>
-        <head><title>Authorize App</title></head>
-        <body style="font-family: sans-serif; padding: 2rem;">
-            <h2>📩 Authorize Access</h2>
-            <p>Click the link below and paste the code to allow email access:</p>
-            <a href="{{ uri }}" target="_blank" style="font-size: 18px;">{{ uri }}</a>
-            <h3>🔐 Your Code: <code style="font-size: 24px;">{{ code }}</code></h3>
-            <p>This page will check automatically while you complete sign-in.</p>
-            <script>
-              const uid = "{{ uid }}";
-              const poll = async () => {
-                const res = await fetch(`/poll-token?uid=${uid}`);
-                const data = await res.json();
-                if (data.status === "done") {
-                  alert("✅ Email access granted!");
-                  window.close();
-                } else if (data.status === "error") {
-                  console.error("Token error:", data.error);
-                } else {
-                  setTimeout(poll, 3000);
-                }
-              };
-              poll();
-            </script>
-        </body>
-        </html>
-    """, uri=flow["verification_uri"], code=flow["user_code"], uid=uid)
-
+                                    <html>
+                                    <head><title>Authorize App</title></head>
+                                    <body style="font-family: sans-serif; padding: 2rem;">
+                                        <h2>📩 Authorize Access</h2>
+                                        <p>Click the link below and paste the code to allow email access:</p>
+                                        <a href="{{ uri }}" target="_blank" style="font-size: 18px;">{{ uri }}</a>
+                                        <h3>🔐 Your Code: <code style="font-size: 24px;">{{ code }}</code></h3>
+                                        <p>This page will check automatically while you complete sign-in.</p>
+                                        <script>
+                                          const uid = "{{ uid | safe }}";
+                                          console.log("✅ Polling initialized for UID:", uid);
+                                    
+                                          const poll = async () => {
+                                            try {
+                                              const res = await fetch(`/poll-token?uid=${uid}`);
+                                              const data = await res.json();
+                                              console.log("📡 Poll response:", data);
+                                    
+                                              if (data.status === "done") {
+                                                alert("✅ Email access granted!");
+                                                window.close();
+                                              } else if (data.status === "error") {
+                                                console.error("❌ Token error:", data.error);
+                                              } else {
+                                                setTimeout(poll, 3000);
+                                              }
+                                            } catch (err) {
+                                              console.error("⚠️ Polling failed:", err);
+                                            }
+                                          };
+                                          poll();
+                                        </script>
+                                    </body>
+                                    </html>
+                                    """, uri=flow["verification_uri"], code=flow["user_code"], uid=uid)
 
 @app.route("/poll-token")
 def poll_token():
