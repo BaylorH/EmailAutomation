@@ -12,10 +12,16 @@ def send_weekly_email(uid: str, recipients: list[str]):
     # 2) Rehydrate the MSAL cache from memory (it’s already in msal_app.token_cache)
     #    and silent-acquire a fresh Graph token
     from obo import msal_app
-    result = msal_app.acquire_token_silent(GRAPH_SCOPES, account=None)
-    if not result or "access_token" not in result:
-        print("❌ Silent token acquisition failed")
+    # Pick the first account MSAL knows about (seeded by OBO)
+    accounts = msal_app.get_accounts()
+    if not accounts:
+        print("❌ No accounts in MSAL cache—OBO may have failed")
         return
+    result = msal_app.acquire_token_silent(GRAPH_SCOPES, account=accounts[0])
+    if not result or "access_token" not in result:
+        print("❌ Silent token acquisition failed:", result.get("error_description"))
+        return
+
     graph_token = result["access_token"]
 
     # 3) Call Graph
