@@ -8,7 +8,10 @@ TENANT_ID     = os.getenv("AZURE_TENANT_ID")
 if not TENANT_ID:
     raise RuntimeError("AZURE_TENANT_ID is not set")
 AUTHORITY     = f"https://login.microsoftonline.com/{TENANT_ID}"
-GRAPH_SCOPES  = ["https://graph.microsoft.com/.default"]
+GRAPH_SCOPES  = [
+    "https://graph.microsoft.com/Mail.Send",
+    "https://graph.microsoft.com/Mail.ReadWrite",
+]
 
 # Firebase Admin
 from firebase_admin import credentials, initialize_app, firestore
