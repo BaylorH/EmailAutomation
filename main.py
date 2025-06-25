@@ -1,6 +1,5 @@
-# main.py
 from fastapi import FastAPI, HTTPException
-from scheduler_runner import send_weekly_email, process_replies
+from scheduler_runner_api import send_weekly_email, process_replies
 
 app = FastAPI()
 
