@@ -18,6 +18,11 @@ jobs:
           
       - name: Install dependencies
         run: pip install msal requests openpyxl firebase-admin
+
+      - name: Echo CLIENT_ID
+        run: echo "CLIENT_ID is $CLIENT_ID"
+        env:
+          CLIENT_ID: ${{ secrets.AZURE_API_APP_ID }}
           
       - name: Run email script
         env:
