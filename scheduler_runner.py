@@ -3,6 +3,7 @@
 import os
 import json
 import atexit
+import base64
 import requests
 from openpyxl import Workbook
 from msal import PublicClientApplication, SerializableTokenCache
@@ -14,8 +15,7 @@ CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
 TENANT_ID        = os.getenv("AZURE_TENANT_ID")
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
 
-USER_ID         = "default_user"  # Could be made dynamic per user
-
+USER_ID         = "default_user"
 AUTHORITY       = f"https://login.microsoftonline.com/{TENANT_ID}"
 SCOPES          = ["Mail.ReadWrite", "Mail.Send"]
 TOKEN_CACHE     = "msal_token_cache.bin"
@@ -48,9 +48,8 @@ def _save_cache():
 
 atexit.register(_save_cache)
 
-# ─── Create MSAL App and Acquire Token ──────────────────
+# ─── Acquire Token ──────────────────────────────────────
 app = PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
-
 accounts = app.get_accounts()
 result = None
 if accounts:
@@ -59,9 +58,7 @@ if accounts:
 if not result or "access_token" not in result:
     raise RuntimeError("Silent authentication failed or no token available.")
 
-# 🔍 Debug: Print app ID from token
-import base64
-
+# 🔍 Check token source
 def decode_token_payload(token):
     payload = token.split(".")[1]
     padded = payload + '=' * (-len(payload) % 4)
@@ -75,7 +72,13 @@ if not appid.startswith("54cec"):
 else:
     print("✅ Token appid starts with correct prefix.")
 
-# ─── Functions: Email Send + Process Replies ─────────────
+access_token = result["access_token"]
+headers = {
+    "Authorization": f"Bearer {access_token}",
+    "Content-Type": "application/json"
+}
+
+# ─── Functions ──────────────────────────────────────────
 def send_weekly_email(to_addresses):
     for addr in to_addresses:
         payload = {
@@ -128,9 +131,8 @@ def process_replies():
     upload_excel(FIREBASE_API_KEY, input_file=EXCEL_FILE)
     print(f"✅ Saved {len(messages)} replies to {EXCEL_FILE}")
 
-# ─── Main Execution ─────────────────────────────────────
+# ─── Run ────────────────────────────────────────────────
 if __name__ == "__main__":
-    recipients = ["bp21harrison@gmail.com"]  # You can load this from Firebase or env if needed
-
+    recipients = ["bp21harrison@gmail.com"]
     send_weekly_email(recipients)
     process_replies()
