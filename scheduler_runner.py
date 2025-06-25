@@ -59,6 +59,17 @@ if accounts:
 if not result or "access_token" not in result:
     raise RuntimeError("Silent authentication failed or no token available.")
 
+# 🔍 Debug: Print app ID from token
+import base64
+
+def decode_token_payload(token):
+    payload = token.split(".")[1]
+    padded = payload + '=' * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(padded))
+
+decoded = decode_token_payload(result["access_token"])
+print("🔐 Token appid:", decoded.get("appid"))
+
 access_token = result["access_token"]
 headers = {
     "Authorization": f"Bearer {access_token}",
