@@ -29,8 +29,8 @@ BODY            = (
 )
 THANK_YOU_BODY  = "Thanks for your response."
 
-if not CLIENT_ID or not TENANT_ID or not FIREBASE_API_KEY:
-    raise RuntimeError("Missing CLIENT_ID, TENANT_ID, or FIREBASE_API_KEY.")
+if not CLIENT_ID or not FIREBASE_API_KEY:
+    raise RuntimeError("Missing CLIENT_ID or FIREBASE_API_KEY.")
 
 # ─── Load Token from Firebase ───────────────────────────
 download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=USER_ID)
