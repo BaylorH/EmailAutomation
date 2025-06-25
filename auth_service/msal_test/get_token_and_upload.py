@@ -7,6 +7,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))  # Add ../ to impor
 
 from firebase_helpers import upload_token
 
+print("AZURE_API_APP_ID =", os.getenv("AZURE_API_APP_ID"))
 CLIENT_ID  = os.getenv("AZURE_API_APP_ID")
 AUTHORITY  = "https://login.microsoftonline.com/256868d6-80ad-401e-b4fa-e7be6ec6446d"
 SCOPES     = ["Mail.ReadWrite", "Mail.Send"]
