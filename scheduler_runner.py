@@ -12,11 +12,10 @@ from firebase_helpers import download_token, upload_token, upload_excel
 
 # ─── Environment Config ─────────────────────────────────
 CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
-TENANT_ID        = os.getenv("AZURE_TENANT_ID")
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
 
 USER_ID         = "default_user"
-AUTHORITY       = f"https://login.microsoftonline.com/{TENANT_ID}"
+AUTHORITY  = "https://login.microsoftonline.com/common"
 SCOPES          = ["Mail.ReadWrite", "Mail.Send"]
 TOKEN_CACHE     = "msal_token_cache.bin"
 EXCEL_FILE      = "responses.xlsx"
@@ -30,8 +29,8 @@ BODY            = (
 )
 THANK_YOU_BODY  = "Thanks for your response."
 
-if not CLIENT_ID or not TENANT_ID or not FIREBASE_API_KEY:
-    raise RuntimeError("Missing CLIENT_ID, TENANT_ID, or FIREBASE_API_KEY.")
+if not CLIENT_ID or not FIREBASE_API_KEY:
+    raise RuntimeError("Missing CLIENT_ID or FIREBASE_API_KEY.")
 
 # ─── Load Token from Firebase ───────────────────────────
 download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=USER_ID)
@@ -45,6 +44,8 @@ def _save_cache():
         with open(TOKEN_CACHE, "w") as f:
             f.write(cache.serialize())
         upload_token(FIREBASE_API_KEY, input_file=TOKEN_CACHE, user_id=USER_ID)
+        print("✅ Token cache uploaded for", USER_ID)
+        print("⬆️  token uploaded to Firebase via upload_token()")
 
 atexit.register(_save_cache)
 
@@ -53,7 +54,7 @@ app = PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
 accounts = app.get_accounts()
 result = None
 if accounts:
-    result = app.acquire_token_silent(SCOPES, account=accounts[0])
+    result = app.acquire_token_silent(SCOPES, account=accounts[0], force_refresh=True)
 
 if not result or "access_token" not in result:
     raise RuntimeError("Silent authentication failed or no token available.")
@@ -64,13 +65,22 @@ def decode_token_payload(token):
     padded = payload + '=' * (-len(payload) % 4)
     return json.loads(base64.urlsafe_b64decode(padded))
 
-decoded = decode_token_payload(result["access_token"])
-appid = decoded.get("appid", "")
+access_token = result.get("access_token", "")
 
-if not appid.startswith("54cec"):
-    raise RuntimeError("❌ Token was issued by the wrong Azure app.")
+# Debug print: token preview and structure
+print("Access token sample:", access_token[:40])
+print("Token segments:", access_token.count("."))
+
+if access_token.count(".") != 2:
+    print("⚠️ Not a JWT — skipping decode")
+    appid = "unknown"
 else:
-    print("✅ Token appid starts with correct prefix.")
+    decoded = decode_token_payload(access_token)
+    appid = decoded.get("appid", "")
+    if not appid.startswith("54cec"):
+        raise RuntimeError("❌ Token was issued by the wrong Azure app.")
+    else:
+        print("✅ Token appid starts with correct prefix.")
 
 access_token = result["access_token"]
 headers = {
