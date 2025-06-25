@@ -63,7 +63,13 @@ def decode_token_payload(token):
     padded = payload + '=' * (-len(payload) % 4)
     return json.loads(base64.urlsafe_b64decode(padded))
 
-decoded = decode_token_payload(result["access_token"])
+access_token = result.get("access_token", "")
+if access_token.count(".") != 2:
+    print("⚠️ Unexpected token format:", access_token[:40], "...")
+    raise RuntimeError("Invalid token format — not a JWT access_token")
+
+decoded = decode_token_payload(access_token)
+
 appid = decoded.get("appid", "")
 
 if not appid.startswith("54cec"):
