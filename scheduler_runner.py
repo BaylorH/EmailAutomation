@@ -44,6 +44,8 @@ def _save_cache():
         with open(TOKEN_CACHE, "w") as f:
             f.write(cache.serialize())
         upload_token(FIREBASE_API_KEY, input_file=TOKEN_CACHE, user_id=USER_ID)
+        print("✅ Token cache uploaded for", USER_ID)
+        print("⬆️  token uploaded to Firebase via upload_token()")
 
 atexit.register(_save_cache)
 
