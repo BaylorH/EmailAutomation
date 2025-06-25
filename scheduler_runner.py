@@ -78,6 +78,15 @@ headers = {
     "Content-Type": "application/json"
 }
 
+# ─── DEBUG: Check if mailbox exists ─────────────────────
+print("👤 Checking /me info...")
+me_resp = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers)
+print("🔍 /me response:", me_resp.status_code, me_resp.json())
+
+print("\n📬 Checking /me/mailFolders...")
+folders_resp = requests.get("https://graph.microsoft.com/v1.0/me/mailFolders", headers=headers)
+print("🔍 /me/mailFolders response:", folders_resp.status_code, folders_resp.json())
+
 # ─── Functions ──────────────────────────────────────────
 def send_weekly_email(to_addresses):
     for addr in to_addresses:
