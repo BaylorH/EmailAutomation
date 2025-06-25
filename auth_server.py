@@ -1,5 +1,8 @@
 import os
+import sys
+import subprocess
 import json
+from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
 from msal import PublicClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
@@ -12,166 +15,283 @@ AUTHORITY        = "https://login.microsoftonline.com/common"
 SCOPES           = ["Mail.ReadWrite", "Mail.Send"]
 CACHE_FILE       = "msal_token_cache.bin"
 
-# Global dict to store user device flows
-user_flows = {}
-
-@app.route("/start-auth")
-def start_auth():
-    uid = request.args.get("uid", "default_user")
-    
-    print(f"🚀 Starting auth for uid={uid}")
-
-    cache = SerializableTokenCache()
-    app_obj = PublicClientApplication(
-        CLIENT_ID,
-        authority=AUTHORITY,
-        token_cache=cache
-    )
-
-    # Initiate device flow
-    flow = app_obj.initiate_device_flow(scopes=SCOPES)
-    if "user_code" not in flow:
-        print("❌ Failed to create device flow")
-        return "❌ Failed to create device flow", 500
-
-    # Store the flow and app instance
-    user_flows[uid] = {
-        'flow': flow,
-        'cache': cache,
-        'app': app_obj
-    }
-    
-    print(f"✅ Device flow created for {uid}: {flow.get('user_code')}")
-
-    return render_template_string("""
-        <html>
-            <head><title>Authorize App</title></head>
-            <body style="font-family: sans-serif; padding: 2rem;">
-                <h2>📩 Authorize Access</h2>
-                <p>Click the link below and paste the code to allow email access:</p>
-                <a href="{{ uri }}" target="_blank" style="font-size: 18px;">{{ uri }}</a>
-                <h3>🔐 Your Code: <code style="font-size: 24px;">{{ code }}</code></h3>
-                <p>This page will check automatically while you complete sign-in.</p>
-                <div id="status">⏳ Waiting for authentication...</div>
-                <script>
-                  const uid = "{{ uid | safe }}";
-                  console.log("✅ Polling initialized for UID:", uid);
-                  
-                  let pollCount = 0;
-                  const maxPolls = 60; // 5 minutes max
-            
-                  const poll = async () => {
-                    try {
-                      pollCount++;
-                      console.log(`📡 Poll attempt ${pollCount}/${maxPolls} for UID: ${uid}`);
-                      
-                      const res = await fetch(`/poll-token?uid=${encodeURIComponent(uid)}`);
-                      
-                      if (!res.ok) {
-                        console.error(`❌ HTTP ${res.status}: ${res.statusText}`);
-                        document.getElementById('status').innerHTML = `❌ Error: ${res.status} ${res.statusText}`;
-                        return;
-                      }
-                      
-                      const data = await res.json();
-                      console.log("📡 Poll response:", data);
-            
-                      if (data.status === "done") {
-                        document.getElementById('status').innerHTML = "✅ Email access granted! You can close this window.";
-                        alert("✅ Email access granted!");
-                      } else if (data.status === "error") {
-                        console.error("❌ Token error:", data.error);
-                        document.getElementById('status').innerHTML = `❌ Error: ${data.error}`;
-                      } else if (data.status === "pending") {
-                        document.getElementById('status').innerHTML = "⏳ Still waiting for authentication...";
-                        if (pollCount < maxPolls) {
-                          setTimeout(poll, 5000); // Poll every 5 seconds
-                        } else {
-                          document.getElementById('status').innerHTML = "⏰ Timeout: Please refresh and try again.";
-                        }
-                      } else if (data.status === "not_started") {
-                        document.getElementById('status').innerHTML = "❌ Session not found. Please refresh.";
-                      }
-                    } catch (err) {
-                      console.error("⚠️ Polling failed:", err);
-                      document.getElementById('status').innerHTML = `⚠️ Network error: ${err.message}`;
-                    }
-                  };
-                  
-                  // Start polling after a short delay
-                  setTimeout(poll, 2000);
-                </script>
-            </body>
-        </html>
-    """, uri=flow["verification_uri"], code=flow["user_code"], uid=uid)
-
-@app.route("/poll-token")
-def poll_token():
-    uid = request.args.get("uid", "default_user")
-    print(f"📡 /poll-token called for uid={uid}")
-    
-    if uid not in user_flows:
-        print(f"❌ UID {uid} not found in user_flows")
-        return jsonify({"status": "not_started"})
-
-    flow_data = user_flows[uid]
-    flow = flow_data['flow']
-    cache = flow_data['cache']
-    app_obj = flow_data['app']
+def check_token_status():
+    """Check if we have a valid token"""
+    if not os.path.exists(CACHE_FILE):
+        return {"status": "no_cache", "message": "No token cache found"}
     
     try:
-        # This call will not block and will return immediately with current status
+        cache = SerializableTokenCache()
+        cache.deserialize(open(CACHE_FILE).read())
+        
+        app_obj = PublicClientApplication(
+            CLIENT_ID,
+            authority=AUTHORITY,
+            token_cache=cache
+        )
+        
+        accounts = app_obj.get_accounts()
+        if not accounts:
+            return {"status": "no_accounts", "message": "No accounts in cache"}
+        
+        # Try silent token acquisition
+        result = app_obj.acquire_token_silent(SCOPES, account=accounts[0])
+        
+        if result and "access_token" in result:
+            return {
+                "status": "valid",
+                "message": "Token is valid",
+                "account": accounts[0].get("username", "Unknown"),
+                "expires": result.get("expires_in", "Unknown")
+            }
+        else:
+            return {
+                "status": "expired",
+                "message": "Token exists but expired or invalid",
+                "error": result.get("error_description", "Unknown error") if result else "No result"
+            }
+    except Exception as e:
+        return {"status": "error", "message": f"Error checking token: {str(e)}"}
+
+@app.route("/")
+def index():
+    status = check_token_status()
+    return render_template_string("""
+    <html>
+        <head>
+            <title>📧 Email Token Manager</title>
+            <style>
+                body { font-family: sans-serif; padding: 2rem; max-width: 800px; margin: 0 auto; }
+                .status { padding: 1rem; border-radius: 8px; margin: 1rem 0; }
+                .valid { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
+                .expired { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+                .no_cache { background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; }
+                .error { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+                button { padding: 0.5rem 1rem; margin: 0.5rem; border: none; border-radius: 4px; cursor: pointer; }
+                .btn-primary { background: #007bff; color: white; }
+                .btn-success { background: #28a745; color: white; }
+                .btn-warning { background: #ffc107; color: black; }
+                #output { background: #f8f9fa; padding: 1rem; border-radius: 4px; font-family: monospace; white-space: pre-wrap; }
+            </style>
+        </head>
+        <body>
+            <h1>📧 Email Token Manager</h1>
+            
+            <div class="status {{ status.status }}">
+                <h3>🔍 Token Status: {{ status.status.title() }}</h3>
+                <p>{{ status.message }}</p>
+                {% if status.account %}
+                <p><strong>Account:</strong> {{ status.account }}</p>
+                {% endif %}
+                {% if status.expires %}
+                <p><strong>Expires in:</strong> {{ status.expires }} seconds</p>
+                {% endif %}
+            </div>
+            
+            <div>
+                {% if status.status == 'valid' %}
+                    <button class="btn-success" onclick="uploadToken()">☁️ Upload Valid Token to Firebase</button>
+                    <button class="btn-warning" onclick="refreshToken()">🔄 Refresh Token</button>
+                {% else %}
+                    <button class="btn-primary" onclick="startDeviceFlow()">🔐 Start Device Authentication</button>
+                {% endif %}
+                <button class="btn-primary" onclick="checkStatus()">🔍 Check Status</button>
+            </div>
+            
+            <h3>📋 Output:</h3>
+            <div id="output">Ready...</div>
+            
+            <script>
+                function log(message) {
+                    const output = document.getElementById('output');
+                    const timestamp = new Date().toLocaleTimeString();
+                    output.textContent += `[${timestamp}] ${message}\n`;
+                    output.scrollTop = output.scrollHeight;
+                }
+                
+                async function apiCall(endpoint, method = 'GET') {
+                    try {
+                        log(`Making ${method} request to ${endpoint}...`);
+                        const response = await fetch(endpoint, { method });
+                        const data = await response.json();
+                        log(`Response: ${JSON.stringify(data, null, 2)}`);
+                        return data;
+                    } catch (error) {
+                        log(`Error: ${error.message}`);
+                        return null;
+                    }
+                }
+                
+                async function checkStatus() {
+                    const data = await apiCall('/api/status');
+                    if (data) {
+                        setTimeout(() => location.reload(), 1000);
+                    }
+                }
+                
+                async function uploadToken() {
+                    await apiCall('/api/upload', 'POST');
+                }
+                
+                async function refreshToken() {
+                    await apiCall('/api/refresh', 'POST');
+                    setTimeout(() => location.reload(), 2000);
+                }
+                
+                async function startDeviceFlow() {
+                    const data = await apiCall('/api/device-flow', 'POST');
+                    if (data && data.verification_uri && data.user_code) {
+                        log(`\n🔐 DEVICE CODE: ${data.user_code}`);
+                        log(`🌐 Go to: ${data.verification_uri}`);
+                        log(`\nOpening in new window...`);
+                        window.open(data.verification_uri, '_blank');
+                        
+                        // Start polling
+                        pollDeviceFlow();
+                    }
+                }
+                
+                async function pollDeviceFlow() {
+                    log("📡 Polling for device flow completion...");
+                    const poll = async () => {
+                        const data = await apiCall('/api/poll-device');
+                        if (data) {
+                            if (data.status === 'completed') {
+                                log("✅ Device flow completed successfully!");
+                                setTimeout(() => location.reload(), 2000);
+                                return;
+                            } else if (data.status === 'error') {
+                                log(`❌ Device flow error: ${data.error}`);
+                                return;
+                            } else if (data.status === 'pending') {
+                                log("⏳ Still waiting for user authentication...");
+                                setTimeout(poll, 5000);
+                            }
+                        }
+                    };
+                    setTimeout(poll, 5000);
+                }
+            </script>
+        </body>
+    </html>
+    """, status=status)
+
+# Global variable to store device flow
+current_device_flow = None
+
+@app.route("/api/status")
+def api_status():
+    return jsonify(check_token_status())
+
+@app.route("/api/upload", methods=["POST"])
+def api_upload():
+    try:
+        if not os.path.exists(CACHE_FILE):
+            return jsonify({"error": "No token cache file found"})
+        
+        upload_token(FIREBASE_API_KEY, input_file=CACHE_FILE, user_id="web_user")
+        return jsonify({"success": True, "message": "Token uploaded to Firebase"})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route("/api/refresh", methods=["POST"])
+def api_refresh():
+    try:
+        cache = SerializableTokenCache()
+        if os.path.exists(CACHE_FILE):
+            cache.deserialize(open(CACHE_FILE).read())
+        
+        app_obj = PublicClientApplication(
+            CLIENT_ID,
+            authority=AUTHORITY,
+            token_cache=cache
+        )
+        
+        accounts = app_obj.get_accounts()
+        if not accounts:
+            return jsonify({"error": "No accounts found"})
+        
+        # Force refresh by passing force_refresh=True
+        result = app_obj.acquire_token_silent(
+            SCOPES, 
+            account=accounts[0], 
+            force_refresh=True
+        )
+        
+        if result and "access_token" in result:
+            with open(CACHE_FILE, "w") as f:
+                f.write(cache.serialize())
+            return jsonify({"success": True, "message": "Token refreshed successfully"})
+        else:
+            return jsonify({"error": f"Failed to refresh token: {result.get('error_description', 'Unknown error')}"})
+    
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route("/api/device-flow", methods=["POST"])
+def api_device_flow():
+    global current_device_flow
+    
+    try:
+        cache = SerializableTokenCache()
+        app_obj = PublicClientApplication(
+            CLIENT_ID,
+            authority=AUTHORITY,
+            token_cache=cache
+        )
+        
+        flow = app_obj.initiate_device_flow(scopes=SCOPES)
+        if "user_code" not in flow:
+            return jsonify({"error": "Failed to initiate device flow"})
+        
+        current_device_flow = (app_obj, flow, cache)
+        
+        return jsonify({
+            "success": True,
+            "verification_uri": flow["verification_uri"],
+            "user_code": flow["user_code"]
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route("/api/poll-device")
+def api_poll_device():
+    global current_device_flow
+    
+    if not current_device_flow:
+        return jsonify({"error": "No device flow in progress"})
+    
+    app_obj, flow, cache = current_device_flow
+    
+    try:
         result = app_obj.acquire_token_by_device_flow(flow)
         
-        print(f"🔍 Token acquisition result keys: {list(result.keys())}")
-        
         if "access_token" in result:
-            print("✅ Access token acquired successfully")
-            
-            # Save token to cache file
-            try:
-                with open(CACHE_FILE, "w") as f:
-                    f.write(cache.serialize())
-                print(f"💾 Token cache saved to {CACHE_FILE}")
-            except Exception as e:
-                print(f"⚠️ Failed to save cache file: {e}")
-            
-            # Upload to Firebase
-            try:
-                upload_token(FIREBASE_API_KEY, input_file=CACHE_FILE, user_id=uid)
-                print(f"☁️ Token uploaded to Firebase for {uid}")
-            except Exception as e:
-                print(f"⚠️ Failed to upload to Firebase: {e}")
+            # Success! Save token
+            with open(CACHE_FILE, "w") as f:
+                f.write(cache.serialize())
             
             # Clean up
-            del user_flows[uid]
-            return jsonify({"status": "done"})
+            current_device_flow = None
             
+            return jsonify({"status": "completed", "message": "Token acquired successfully"})
+        
         elif "error" in result:
-            error_msg = result.get("error", "Unknown error")
-            error_desc = result.get("error_description", "")
-            print(f"❌ Token acquisition error: {error_msg} - {error_desc}")
-            
-            # If it's authorization_pending, that's normal - keep polling
-            if error_msg == "authorization_pending":
+            error = result["error"]
+            if error == "authorization_pending":
                 return jsonify({"status": "pending"})
             else:
-                # Clean up on actual error
-                del user_flows[uid]
-                return jsonify({"status": "error", "error": f"{error_msg}: {error_desc}"})
+                current_device_flow = None
+                return jsonify({"status": "error", "error": result.get("error_description", error)})
+        
         else:
-            print("⏳ Token acquisition still pending")
             return jsonify({"status": "pending"})
-            
+    
     except Exception as e:
-        print(f"💥 Exception in poll_token: {e}")
         return jsonify({"status": "error", "error": str(e)})
-
-@app.route("/health")
-def health_check():
-    return jsonify({"status": "healthy", "active_flows": len(user_flows)})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Starting Flask app on port {port}")
+    print(f"🚀 Starting Token Manager on port {port}")
     app.run(host="0.0.0.0", port=port, debug=True)
