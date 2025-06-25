@@ -15,7 +15,7 @@ CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
 
 USER_ID         = "default_user"
-AUTHORITY = "https://login.microsoftonline.com/common"
+AUTHORITY  = "https://login.microsoftonline.com/common/v2.0"
 SCOPES          = ["Mail.ReadWrite", "Mail.Send"]
 TOKEN_CACHE     = "msal_token_cache.bin"
 EXCEL_FILE      = "responses.xlsx"
