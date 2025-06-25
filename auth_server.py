@@ -1,37 +1,57 @@
 import os
-from flask import Flask, render_template_string
+import threading
+from flask import Flask, request
 from msal import PublicClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
 
 app = Flask(__name__)
-CLIENT_ID = os.getenv("AZURE_API_APP_ID")
-AUTHORITY = "https://login.microsoftonline.com/common"
-SCOPES = ["Mail.ReadWrite", "Mail.Send"]
-CACHE_FILE = "msal_token_cache.bin"
+
+CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
+FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
+AUTHORITY        = "https://login.microsoftonline.com/common"
+SCOPES           = ["Mail.ReadWrite", "Mail.Send"]
+CACHE_FILE       = "msal_token_cache.bin"
 
 @app.route("/start-auth")
 def start_auth():
+    uid = request.args.get("uid", "default_user")
+
+    # Create token cache and MSAL app instance
     cache = SerializableTokenCache()
     app_obj = PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
 
     # Start device flow
     flow = app_obj.initiate_device_flow(scopes=SCOPES)
     if "user_code" not in flow:
-        return "Failed to create device flow", 500
+        return "❌ Failed to create device flow", 500
 
     verification_uri = flow["verification_uri"]
     user_code = flow["user_code"]
 
-    # Just render this for now (no blocking)
+    # Poll and upload in background
+    def poll_and_upload():
+        print(f"⏳ Polling for token for {uid}...")
+        result = app_obj.acquire_token_by_device_flow(flow)
+        if "access_token" in result:
+            with open(CACHE_FILE, "w") as f:
+                f.write(cache.serialize())
+            upload_token(FIREBASE_API_KEY, input_file=CACHE_FILE, user_id=uid)
+            print(f"✅ Token acquired and uploaded for {uid}")
+        else:
+            print(f"❌ Failed to acquire token for {uid}:", result)
+
+    threading.Thread(target=poll_and_upload).start()
+
+    # Immediate response to browser
     html = f"""
     <html>
-    <head><title>Authorize App</title></head>
+    <head><title>Authorize Access</title></head>
     <body style="font-family: sans-serif; padding: 2rem;">
         <h2>📩 Authorize Access</h2>
         <p>Click the link below and paste the code to allow email access:</p>
         <a href="{verification_uri}" target="_blank" style="font-size: 18px;">{verification_uri}</a>
         <h3>🔐 Your Code: <code style="font-size: 24px;">{user_code}</code></h3>
-        <p>This part works! Polling will be added next.</p>
+        <p>Leave this page open — the system will connect automatically.</p>
     </body>
     </html>
     """
