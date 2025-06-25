@@ -7,7 +7,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))  # Add ../ to impor
 
 from firebase_helpers import upload_token
 
-CLIENT_ID  = os.getenv("CLIENT_ID")
+CLIENT_ID  = os.getenv("AZURE_API_APP_ID")
 AUTHORITY  = "https://login.microsoftonline.com/256868d6-80ad-401e-b4fa-e7be6ec6446d"
 SCOPES     = ["Mail.ReadWrite", "Mail.Send"]
 CACHE_FILE = "msal_token_cache.bin"
