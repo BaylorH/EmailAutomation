@@ -1,5 +1,3 @@
 flask
 msal
-firebase-admin
-google-cloud-firestore
 requests
