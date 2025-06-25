@@ -10,9 +10,10 @@ from msal import PublicClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token, upload_excel
 
 # ─── Environment Config ─────────────────────────────────
-CLIENT_ID       = os.getenv("CLIENT_ID")
-TENANT_ID       = os.getenv("TENANT_ID")
+CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
+TENANT_ID        = os.getenv("AZURE_TENANT_ID")
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
+
 USER_ID         = "default_user"  # Could be made dynamic per user
 
 AUTHORITY       = f"https://login.microsoftonline.com/{TENANT_ID}"
