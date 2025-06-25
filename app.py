@@ -231,7 +231,7 @@ def api_refresh():
 @app.route("/api/device-flow", methods=["POST"])
 def api_device_flow():
     global current_device_flow
-    
+
     try:
         cache = SerializableTokenCache()
         app_obj = PublicClientApplication(
@@ -239,21 +239,25 @@ def api_device_flow():
             authority=AUTHORITY,
             token_cache=cache
         )
-        
+
         flow = app_obj.initiate_device_flow(scopes=SCOPES)
         if "user_code" not in flow:
             return jsonify({"error": "Failed to initiate device flow"})
-        
+
         current_device_flow = (app_obj, flow, cache)
-        
+
+        # Force the standard Microsoft device login URI
+        verification_uri = "https://microsoft.com/devicelogin"
+
         return jsonify({
             "success": True,
-            "verification_uri": flow["verification_uri"],
+            "verification_uri": verification_uri,
             "user_code": flow["user_code"]
         })
-    
+
     except Exception as e:
         return jsonify({"error": str(e)})
+
 
 @app.route("/api/poll-device")
 def api_poll_device():
