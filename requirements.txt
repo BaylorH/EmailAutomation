@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+openpyxl
+requests
+msal
+firebase-admin
