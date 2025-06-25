@@ -19,8 +19,14 @@ jobs:
       - name: Install dependencies
         run: pip install msal requests openpyxl firebase-admin
 
-      - name: Echo CLIENT_ID
-        run: echo "CLIENT_ID is $CLIENT_ID"
+      - name: Validate CLIENT_ID prefix
+        run: |
+          if [[ "$CLIENT_ID" != 54cec* ]]; then
+            echo "❌ CLIENT_ID does not start with expected prefix"
+            exit 1
+          else
+            echo "✅ CLIENT_ID prefix looks correct"
+          fi
         env:
           CLIENT_ID: ${{ secrets.AZURE_API_APP_ID }}
           
