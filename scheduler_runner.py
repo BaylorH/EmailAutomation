@@ -68,13 +68,12 @@ def decode_token_payload(token):
     return json.loads(base64.urlsafe_b64decode(padded))
 
 decoded = decode_token_payload(result["access_token"])
-print("🔐 Token appid:", decoded.get("appid"))
+appid = decoded.get("appid", "")
 
-access_token = result["access_token"]
-headers = {
-    "Authorization": f"Bearer {access_token}",
-    "Content-Type": "application/json"
-}
+if not appid.startswith("54cec"):
+    raise RuntimeError("❌ Token was issued by the wrong Azure app.")
+else:
+    print("✅ Token appid starts with correct prefix.")
 
 # ─── Functions: Email Send + Process Replies ─────────────
 def send_weekly_email(to_addresses):
