@@ -54,7 +54,7 @@ app = PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
 accounts = app.get_accounts()
 result = None
 if accounts:
-    result = app.acquire_token_silent(SCOPES, account=accounts[0])
+    result = app.acquire_token_silent(SCOPES, account=accounts[0], force_refresh=True)
 
 if not result or "access_token" not in result:
     raise RuntimeError("Silent authentication failed or no token available.")
