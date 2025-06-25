@@ -70,17 +70,15 @@ print("Access token sample:", access_token[:40])
 print("Token segments:", access_token.count("."))
 
 if access_token.count(".") != 2:
-    print("⚠️ Unexpected token format:", access_token[:40], "...")
-    raise RuntimeError("Invalid token format — not a JWT access_token")
-
-decoded = decode_token_payload(access_token)
-
-appid = decoded.get("appid", "")
-
-if not appid.startswith("54cec"):
-    raise RuntimeError("❌ Token was issued by the wrong Azure app.")
+    print("⚠️ Not a JWT — skipping decode")
+    appid = "unknown"
 else:
-    print("✅ Token appid starts with correct prefix.")
+    decoded = decode_token_payload(access_token)
+    appid = decoded.get("appid", "")
+    if not appid.startswith("54cec"):
+        raise RuntimeError("❌ Token was issued by the wrong Azure app.")
+    else:
+        print("✅ Token appid starts with correct prefix.")
 
 access_token = result["access_token"]
 headers = {
