@@ -24,5 +24,8 @@ jobs:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
           FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_API_APP_ID: ${{ secrets.AZURE_API_APP_ID }}
+          AZURE_API_APP_SECRET: ${{ secrets.AZURE_API_APP_SECRET }}
         # run: python noPopup_signin_emails_to_excel.py
         run: python main.py
