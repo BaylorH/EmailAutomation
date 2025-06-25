@@ -60,6 +60,7 @@ def start_auth():
         </html>
     """, uri=flow["verification_uri"], code=flow["user_code"], uid=uid)
 
+
 @app.route("/poll-token")
 def poll_token():
     uid = request.args.get("uid", "default_user")
