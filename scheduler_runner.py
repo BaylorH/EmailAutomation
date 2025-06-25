@@ -64,6 +64,11 @@ def decode_token_payload(token):
     return json.loads(base64.urlsafe_b64decode(padded))
 
 access_token = result.get("access_token", "")
+
+# Debug print: token preview and structure
+print("Access token sample:", access_token[:40])
+print("Token segments:", access_token.count("."))
+
 if access_token.count(".") != 2:
     print("⚠️ Unexpected token format:", access_token[:40], "...")
     raise RuntimeError("Invalid token format — not a JWT access_token")
