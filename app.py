@@ -17,7 +17,10 @@ CACHE_FILE       = "msal_token_cache.bin"
 
 # Get the base URL for redirect URI
 def get_base_url():
-    return "https://email-token-manager.onrender.com"
+    if "https://email-token-manager.onrender.com" === request.url_root.rstrip('/')
+        return "https://email-token-manager.onrender.com"
+    else
+        return "NOT SAME"
 
 def check_token_status():
     """Check if we have a valid token"""
@@ -335,7 +338,7 @@ def auth_login():
     # Build authorization URL
     auth_url = app_obj.get_authorization_request_url(
         SCOPES,
-        redirect_uri=url_for('auth_callback', _external=True)
+        redirect_uri="https://email-token-manager.onrender.com/auth/callback"
     )
     
     return redirect(auth_url)
@@ -371,7 +374,7 @@ def auth_callback():
         result = app_obj.acquire_token_by_authorization_code(
             code,
             scopes=SCOPES,
-            redirect_uri=url_for('auth_callback', _external=True)
+            redirect_uri="https://email-token-manager.onrender.com/auth/callback"
         )
         
         if "access_token" in result:
