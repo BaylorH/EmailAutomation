@@ -25,12 +25,13 @@ def get_base_url():
 
 def check_token_status():
     """Check if we have a valid token"""
-    if not os.path.exists(CACHE_FILE):
+    cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
+    if not os.path.exists(cache_file):
         return {"status": "no_cache", "message": "No token cache found"}
     
     try:
         cache = SerializableTokenCache()
-        cache.deserialize(open(CACHE_FILE).read())
+        cache.deserialize(open(cache_file).read())
         
         app_obj = ConfidentialClientApplication(
             CLIENT_ID,
@@ -64,6 +65,8 @@ def check_token_status():
 
 @app.route("/")
 def index():
+    uid = request.args.get("uid", "web_user")
+    session["uid"] = uid
     status = check_token_status()
     base_url = get_base_url()
     return render_template_string("""
@@ -272,10 +275,11 @@ def api_status():
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
     try:
-        if not os.path.exists(CACHE_FILE):
+        cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
+        if not os.path.exists(cache_file):
             return jsonify({"error": "No token cache file found"})
         
-        upload_token(FIREBASE_API_KEY, input_file=CACHE_FILE, user_id="web_user")
+        upload_token(FIREBASE_API_KEY, input_file=cache_file, user_id=session.get("uid", "web_user"))
         return jsonify({"success": True, "message": "Token uploaded to Firebase"})
     except Exception as e:
         return jsonify({"error": str(e)})
@@ -283,8 +287,9 @@ def api_upload():
 @app.route("/api/clear", methods=["POST"])
 def api_clear():
     try:
-        if os.path.exists(CACHE_FILE):
-            os.remove(CACHE_FILE)
+        cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
         global current_device_flow
         current_device_flow = None
         return jsonify({"success": True, "message": "Token cache cleared"})
@@ -294,9 +299,10 @@ def api_clear():
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
     try:
+        cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
         cache = SerializableTokenCache()
-        if os.path.exists(CACHE_FILE):
-            cache.deserialize(open(CACHE_FILE).read())
+        if os.path.exists(cache_file):
+            cache.deserialize(open(cache_file).read())
         
         app_obj = ConfidentialClientApplication(
             CLIENT_ID,
@@ -316,7 +322,7 @@ def api_refresh():
         )
         
         if result and "access_token" in result:
-            with open(CACHE_FILE, "w") as f:
+            with open(cache_file, "w") as f:
                 f.write(cache.serialize())
             return jsonify({"success": True, "message": "Token refreshed successfully"})
         else:
@@ -329,8 +335,9 @@ def api_refresh():
 @app.route("/auth/login")
 def auth_login():
     cache = SerializableTokenCache()
-    if os.path.exists(CACHE_FILE):
-        cache.deserialize(open(CACHE_FILE).read())
+    cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
+    if os.path.exists(cache_file):
+        cache.deserialize(open(cache_file).read())
     
     app_obj = ConfidentialClientApplication(
         CLIENT_ID,
@@ -350,9 +357,10 @@ def auth_login():
 @app.route("/auth/callback")
 def auth_callback():
     try:
+        cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
         cache = SerializableTokenCache()
-        if os.path.exists(CACHE_FILE):
-            cache.deserialize(open(CACHE_FILE).read())
+        if os.path.exists(cache_file):
+            cache.deserialize(open(cache_file).read())
         
         app_obj = ConfidentialClientApplication(
             CLIENT_ID,
@@ -384,7 +392,7 @@ def auth_callback():
         
         if "access_token" in result:
             # Save token
-            with open(CACHE_FILE, "w") as f:
+            with open(cache_file, "w") as f:
                 f.write(cache.serialize())
             
             account = result.get("account", {}).get("username", "Unknown")
@@ -469,10 +477,10 @@ def api_poll_device():
     
     try:
         result = app_obj.acquire_token_by_device_flow(flow)
-        
+        cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
         if "access_token" in result:
             # Success! Save token
-            with open(CACHE_FILE, "w") as f:
+            with open(cache_file, "w") as f:
                 f.write(cache.serialize())
             
             # Clean up
