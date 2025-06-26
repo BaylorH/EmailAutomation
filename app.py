@@ -3,7 +3,7 @@ import sys
 import subprocess
 import json
 from datetime import datetime
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
 
