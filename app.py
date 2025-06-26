@@ -11,6 +11,11 @@ app = Flask(__name__)
 
 app.secret_key = os.getenv("SECRET_KEY", "some-default-secret")
 
+app.config.update(
+    SESSION_COOKIE_SECURE=True,        # ensures cookie is sent over HTTPS
+    SESSION_COOKIE_SAMESITE='Lax',     # allows session to persist during OAuth redirect
+)
+
 CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
 CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
