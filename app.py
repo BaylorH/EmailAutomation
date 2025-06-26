@@ -27,7 +27,10 @@ def get_base_url():
 
 def check_token_status():
     """Check if we have a valid token"""
-    cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
+    uid = session.get("uid", "web_user") 
+    user_dir = f"msal_caches/{uid}" 
+    cache_file = f"{user_dir}/msal_token_cache.bin" 
+    os.makedirs(user_dir, exist_ok=True)
     if not os.path.exists(cache_file):
         return {"status": "no_cache", "message": "No token cache found"}
     
@@ -277,7 +280,10 @@ def api_status():
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
     try:
-        cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
+        uid = session.get("uid", "web_user") 
+        user_dir = f"msal_caches/{uid}" 
+        cache_file = f"{user_dir}/msal_token_cache.bin" 
+        os.makedirs(user_dir, exist_ok=True)
         if not os.path.exists(cache_file):
             return jsonify({"error": "No token cache file found"})
         
@@ -289,7 +295,10 @@ def api_upload():
 @app.route("/api/clear", methods=["POST"])
 def api_clear():
     try:
-        cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
+        uid = session.get("uid", "web_user") 
+        user_dir = f"msal_caches/{uid}" 
+        cache_file = f"{user_dir}/msal_token_cache.bin" 
+        os.makedirs(user_dir, exist_ok=True)
         if os.path.exists(cache_file):
             os.remove(cache_file)
         global current_device_flow
@@ -301,7 +310,10 @@ def api_clear():
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
     try:
-        cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
+        uid = session.get("uid", "web_user") 
+        user_dir = f"msal_caches/{uid}" 
+        cache_file = f"{user_dir}/msal_token_cache.bin" 
+        os.makedirs(user_dir, exist_ok=True)
         cache = SerializableTokenCache()
         if os.path.exists(cache_file):
             cache.deserialize(open(cache_file).read())
@@ -337,7 +349,10 @@ def api_refresh():
 @app.route("/auth/login")
 def auth_login():
     cache = SerializableTokenCache()
-    cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
+    uid = session.get("uid", "web_user") 
+    user_dir = f"msal_caches/{uid}" 
+    cache_file = f"{user_dir}/msal_token_cache.bin" 
+    os.makedirs(user_dir, exist_ok=True)
     if os.path.exists(cache_file):
         cache.deserialize(open(cache_file).read())
     
@@ -359,7 +374,10 @@ def auth_login():
 @app.route("/auth/callback")
 def auth_callback():
     try:
-        cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
+        uid = session.get("uid", "web_user") 
+        user_dir = f"msal_caches/{uid}" 
+        cache_file = f"{user_dir}/msal_token_cache.bin" 
+        os.makedirs(user_dir, exist_ok=True)
         cache = SerializableTokenCache()
         if os.path.exists(cache_file):
             cache.deserialize(open(cache_file).read())
@@ -479,7 +497,10 @@ def api_poll_device():
     
     try:
         result = app_obj.acquire_token_by_device_flow(flow)
-        cache_file = f"msal_caches/{session.get('uid', 'web_user')}.bin"
+        uid = session.get("uid", "web_user") 
+        user_dir = f"msal_caches/{uid}" 
+        cache_file = f"{user_dir}/msal_token_cache.bin" 
+        os.makedirs(user_dir, exist_ok=True)
         if "access_token" in result:
             # Success! Save token
             with open(cache_file, "w") as f:
