@@ -4,7 +4,7 @@ import subprocess
 import json
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for
-from msal import PublicClientApplication, SerializableTokenCache
+from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
 
 app = Flask(__name__)
@@ -31,8 +31,9 @@ def check_token_status():
         cache = SerializableTokenCache()
         cache.deserialize(open(CACHE_FILE).read())
         
-        app_obj = PublicClientApplication(
+        app_obj = ConfidentialClientApplication(
             CLIENT_ID,
+            client_credential=CLIENT_SECRET,
             authority=AUTHORITY,
             token_cache=cache
         )
