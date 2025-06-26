@@ -431,8 +431,9 @@ def api_device_flow():
 
     try:
         cache = SerializableTokenCache()
-        app_obj = PublicClientApplication(
+        app_obj = ConfidentialClientApplication(
             CLIENT_ID,
+            client_credential=CLIENT_SECRET,
             authority=AUTHORITY,
             token_cache=cache
         )
