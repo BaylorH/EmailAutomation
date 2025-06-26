@@ -349,7 +349,8 @@ def api_refresh():
 @app.route("/auth/login")
 def auth_login():
     cache = SerializableTokenCache()
-    uid = session.get("uid", "web_user") 
+    uid = request.args.get("uid") or session.get("uid", "web_user")
+    session["uid"] = uid
     user_dir = f"msal_caches/{uid}" 
     cache_file = f"{user_dir}/msal_token_cache.bin" 
     os.makedirs(user_dir, exist_ok=True)
@@ -366,7 +367,7 @@ def auth_login():
     # Build authorization URL
     auth_url = app_obj.get_authorization_request_url(
         SCOPES,
-        redirect_uri="https://email-token-manager.onrender.com/auth/callback"
+        redirect_uri=url_for('auth_callback', _external=True, uid=uid)
     )
     
     return redirect(auth_url)
@@ -374,7 +375,8 @@ def auth_login():
 @app.route("/auth/callback")
 def auth_callback():
     try:
-        uid = session.get("uid", "web_user") 
+        uid = request.args.get("uid") or session.get("uid", "web_user")
+        session["uid"] = uid 
         user_dir = f"msal_caches/{uid}" 
         cache_file = f"{user_dir}/msal_token_cache.bin" 
         os.makedirs(user_dir, exist_ok=True)
@@ -423,9 +425,9 @@ def auth_callback():
                         <h2>✅ Authentication Successful!</h2>
                         <p>Account: {{ account }}</p>
                         <p>Token has been saved and cached.</p>
-                        <a href="/" style="padding: 0.5rem 1rem; background: #28a745; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
+                        <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #28a745; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
                         <script>
-                            setTimeout(() => window.location.href = '/', 3000);
+                            setTimeout(() => window.location.href = '/?uid={{ uid }}', 3000);
                         </script>
                     </body>
                 </html>
