@@ -297,8 +297,9 @@ def api_refresh():
         if os.path.exists(CACHE_FILE):
             cache.deserialize(open(CACHE_FILE).read())
         
-        app_obj = PublicClientApplication(
+        app_obj = ConfidentialClientApplication(
             CLIENT_ID,
+            client_credential=CLIENT_SECRET,
             authority=AUTHORITY,
             token_cache=cache
         )
