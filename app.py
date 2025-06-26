@@ -375,6 +375,7 @@ def auth_callback():
             code,
             scopes=SCOPES,
             redirect_uri="https://email-token-manager.onrender.com/auth/callback"
+            client_secret=os.getenv("AZURE_CLIENT_SECRET")
         )
         
         if "access_token" in result:
