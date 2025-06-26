@@ -334,6 +334,7 @@ def auth_login():
     
     app_obj = ConfidentialClientApplication(
         CLIENT_ID,
+        client_credential=CLIENT_SECRET,
         authority=AUTHORITY,
         token_cache=cache
     )
