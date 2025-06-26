@@ -7,9 +7,9 @@ from flask import Flask, request, jsonify, render_template_string, redirect, url
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
 
-app.secret_key = os.getenv("SECRET_KEY", "some-default-secret")
-
 app = Flask(__name__)
+
+app.secret_key = os.getenv("SECRET_KEY", "some-default-secret")
 
 CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
 CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
