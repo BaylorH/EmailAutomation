@@ -10,6 +10,7 @@ from firebase_helpers import upload_token
 app = Flask(__name__)
 
 CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
+CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
 AUTHORITY        = "https://login.microsoftonline.com/common"
 SCOPES           = ["Mail.ReadWrite", "Mail.Send"]
@@ -331,7 +332,7 @@ def auth_login():
     if os.path.exists(CACHE_FILE):
         cache.deserialize(open(CACHE_FILE).read())
     
-    app_obj = PublicClientApplication(
+    app_obj = ConfidentialClientApplication(
         CLIENT_ID,
         authority=AUTHORITY,
         token_cache=cache
@@ -352,8 +353,9 @@ def auth_callback():
         if os.path.exists(CACHE_FILE):
             cache.deserialize(open(CACHE_FILE).read())
         
-        app_obj = PublicClientApplication(
+        app_obj = ConfidentialClientApplication(
             CLIENT_ID,
+            client_credential=CLIENT_SECRET,
             authority=AUTHORITY,
             token_cache=cache
         )
@@ -377,7 +379,7 @@ def auth_callback():
             code,
             scopes=SCOPES,
             redirect_uri="https://email-token-manager.onrender.com/auth/callback",
-            client_secret=os.getenv("AZURE_CLIENT_SECRET")
+            client_credential=CLIENT_SECRET,
         )
         
         if "access_token" in result:
