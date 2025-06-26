@@ -367,7 +367,7 @@ def auth_login():
     # Build authorization URL
     auth_url = app_obj.get_authorization_request_url(
         SCOPES,
-        redirect_uri=url_for('auth_callback', _external=True, uid=uid)
+        redirect_uri="https://email-token-manager.onrender.com/auth/callback"
     )
     
     return redirect(auth_url)
