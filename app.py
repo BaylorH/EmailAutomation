@@ -17,7 +17,7 @@ CACHE_FILE       = "msal_token_cache.bin"
 
 # Get the base URL for redirect URI
 def get_base_url():
-    return request.url_root.rstrip('/')
+    return "https://email-token-manager.onrender.com"
 
 def check_token_status():
     """Check if we have a valid token"""
