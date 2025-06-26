@@ -374,7 +374,7 @@ def auth_callback():
         result = app_obj.acquire_token_by_authorization_code(
             code,
             scopes=SCOPES,
-            redirect_uri="https://email-token-manager.onrender.com/auth/callback"
+            redirect_uri="https://email-token-manager.onrender.com/auth/callback",
             client_secret=os.getenv("AZURE_CLIENT_SECRET")
         )
         
