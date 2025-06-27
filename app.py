@@ -121,17 +121,10 @@ def index():
                 .auth-methods { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; }
                 .method-card { border: 1px solid #ddd; padding: 1rem; border-radius: 8px; flex: 1; min-width: 300px; }
                 .method-card h4 { margin-top: 0; }
-                .uid-info { background: #f0f8f0; padding: 1rem; border-radius: 4px; margin: 1rem 0; border-left: 4px solid #28a745; }
             </style>
         </head>
         <body>
             <h1>📧 Email Token Manager</h1>
-            
-            <div class="uid-info">
-                <h4>🆔 Current User ID</h4>
-                <p><strong>UID:</strong> {{ uid }}</p>
-                <p><small>This ID is used to separate token caches for different users</small></p>
-            </div>
             
             {% if status.status == 'valid' %}
                 <div class="status completed">
