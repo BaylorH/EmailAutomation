@@ -52,6 +52,10 @@ atexit.register(_save_cache)
 # ─── Acquire Token ──────────────────────────────────────
 app = PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
 accounts = app.get_accounts()
+for a in accounts:
+    print(f"🧾 Account: {a}")
+    print("🔐 Attempting silent token for:", a.get("username"))
+
 result = None
 if accounts:
     result = app.acquire_token_silent(SCOPES, account=accounts[0])
