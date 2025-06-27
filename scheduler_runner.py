@@ -60,6 +60,7 @@ result = None
 if accounts:
     result = app.acquire_token_silent(SCOPES, account=accounts[0])
     print("🎯 acquire_token_silent() result:", result)
+    _save_cache()
 
 if not result or "access_token" not in result:
     raise RuntimeError("Silent authentication failed or no token available.")
