@@ -58,7 +58,7 @@ for a in accounts:
 
 result = None
 if accounts:
-    result = app.acquire_token_silent(SCOPES, account=accounts[0])
+    result = app.acquire_token_silent(SCOPES, account=accounts[0], force_refresh=True)
     print("🎯 acquire_token_silent() result:", result)
     _save_cache()
 
