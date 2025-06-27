@@ -77,6 +77,7 @@ def check_token_status():
 def index():
     uid = request.args.get("uid", "web_user")
     session["uid"] = uid
+    print(f"[INDEX] Setting UID in session: {uid}")
     status = check_token_status()
     base_url = get_base_url()
     return render_template_string("""
@@ -100,10 +101,17 @@ def index():
                 .method-card { border: 1px solid #ddd; padding: 1rem; border-radius: 8px; flex: 1; min-width: 300px; }
                 .method-card h4 { margin-top: 0; }
                 .redirect-info { background: #e3f2fd; padding: 1rem; border-radius: 4px; margin: 1rem 0; border-left: 4px solid #2196f3; }
+                .uid-info { background: #f0f8f0; padding: 1rem; border-radius: 4px; margin: 1rem 0; border-left: 4px solid #28a745; }
             </style>
         </head>
         <body>
             <h1>📧 Email Token Manager</h1>
+            
+            <div class="uid-info">
+                <h4>🆔 Current User ID</h4>
+                <p><strong>UID:</strong> {{ uid }}</p>
+                <p><small>This ID is used to separate token caches for different users</small></p>
+            </div>
             
             <div class="status {{ status.status }}">
                 <h3>🔍 Token Status: {{ status.status.title() }}</h3>
@@ -273,7 +281,7 @@ def index():
             </script>
         </body>
     </html>
-    """, status=status, base_url=base_url)
+    """, status=status, base_url=base_url, uid=uid)
 
 # Global variable to store device flow
 current_device_flow = None
@@ -355,10 +363,12 @@ def api_refresh():
 # Web-based authentication routes
 @app.route("/auth/login")
 def auth_login():
+    # Get UID from session, set during initial page load
+    uid = session.get("uid", "web_user")
+    print(f"[LOGIN] Using UID from session: {uid}")
+    
+    # Setup cache for this user
     cache = SerializableTokenCache()
-    uid = request.args.get("uid") or session.get("uid", "web_user")
-    print(f"[LOGIN] Received UID: {uid}")
-    session["uid"] = uid
     user_dir = f"msal_caches/{uid}" 
     cache_file = f"{user_dir}/msal_token_cache.bin" 
     os.makedirs(user_dir, exist_ok=True)
@@ -372,23 +382,27 @@ def auth_login():
         token_cache=cache
     )
     
-    # Build authorization URL
+    # CRITICAL: Pass UID as state parameter to preserve it through OAuth redirect
     auth_url = app_obj.get_authorization_request_url(
         SCOPES,
         redirect_uri="https://email-token-manager.onrender.com/auth/callback",
-        state=uid
+        state=uid  # This preserves the UID through the OAuth flow
     )
     
+    print(f"[LOGIN] Redirecting to auth URL with state={uid}")
     return redirect(auth_url)
 
 @app.route("/auth/callback")
 def auth_callback():
     try:
-        # uid = request.args.get("uid") or session.get("uid", "web_user")
+        # CRITICAL: Get UID from state parameter (this is how it survives the redirect)
         uid = request.args.get("state", "web_user")
-        print(f"[CALLBACK] Received UID from state: {uid}")
-
+        print(f"[CALLBACK] Received UID from state parameter: {uid}")
+        
+        # Update session with the recovered UID
         session["uid"] = uid 
+        
+        # Setup paths for this specific user
         user_dir = f"msal_caches/{uid}" 
         cache_file = f"{user_dir}/msal_token_cache.bin" 
         os.makedirs(user_dir, exist_ok=True)
@@ -414,10 +428,10 @@ def auth_callback():
                     <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
                         <h2>❌ Authentication Failed</h2>
                         <p>{{ error }}</p>
-                        <a href="/" style="padding: 0.5rem 1rem; background: #007bff; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
+                        <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #007bff; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
                     </body>
                 </html>
-            """, error=error)
+            """, error=error, uid=uid)
         
         # Exchange code for token
         result = app_obj.acquire_token_by_authorization_code(
@@ -427,17 +441,19 @@ def auth_callback():
         )
         
         if "access_token" in result:
-            # Save token
+            # Save token to user-specific cache file
             with open(cache_file, "w") as f:
                 f.write(cache.serialize())
             
             account = result.get("account", {}).get("username", "Unknown")
+            print(f"[CALLBACK] Successfully saved token for UID {uid}, account: {account}")
             
             return render_template_string("""
                 <html>
                     <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
                         <h2>✅ Authentication Successful!</h2>
-                        <p>Account: {{ account }}</p>
+                        <p><strong>User ID:</strong> {{ uid }}</p>
+                        <p><strong>Account:</strong> {{ account }}</p>
                         <p>Token has been saved and cached.</p>
                         <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #28a745; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
                         <script>
@@ -445,7 +461,7 @@ def auth_callback():
                         </script>
                     </body>
                 </html>
-            """, account=account)
+            """, account=account, uid=uid)
         else:
             error = result.get("error_description", "Failed to acquire token")
             return render_template_string("""
@@ -453,28 +469,33 @@ def auth_callback():
                     <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
                         <h2>❌ Token Acquisition Failed</h2>
                         <p>{{ error }}</p>
-                        <a href="/" style="padding: 0.5rem 1rem; background: #007bff; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
+                        <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #007bff; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
                     </body>
                 </html>
-            """, error=error)
+            """, error=error, uid=uid)
     
     except Exception as e:
+        print(f"[CALLBACK] Exception: {str(e)}")
+        uid = request.args.get("state", "web_user")  # Try to get UID for error page
         return render_template_string("""
             <html>
                 <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
                     <h2>❌ Authentication Error</h2>
                     <p>{{ error }}</p>
-                    <a href="/" style="padding: 0.5rem 1rem; background: #007bff; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
+                    <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #007bff; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
                 </body>
             </html>
-        """, error=str(e))
+        """, error=str(e), uid=uid)
 
-# Device flow endpoints (fixed)
+# Device flow endpoints (updated to handle UID properly)
 @app.route("/api/device-flow", methods=["POST"])
 def api_device_flow():
     global current_device_flow
 
     try:
+        uid = session.get("uid", "web_user")
+        print(f"[DEVICE-FLOW] Starting device flow for UID: {uid}")
+        
         cache = SerializableTokenCache()
         app_obj = ConfidentialClientApplication(
             CLIENT_ID,
@@ -490,7 +511,8 @@ def api_device_flow():
             error_msg = flow.get("error_description", "Failed to initiate device flow")
             return jsonify({"error": error_msg})
 
-        current_device_flow = (app_obj, flow, cache)
+        # Store with UID context
+        current_device_flow = (app_obj, flow, cache, uid)
 
         return jsonify({
             "success": True,
@@ -509,18 +531,22 @@ def api_poll_device():
     if not current_device_flow:
         return jsonify({"error": "No device flow in progress"})
     
-    app_obj, flow, cache = current_device_flow
+    app_obj, flow, cache, uid = current_device_flow
+    print(f"[POLL-DEVICE] Polling for UID: {uid}")
     
     try:
         result = app_obj.acquire_token_by_device_flow(flow)
-        uid = session.get("uid", "web_user") 
-        user_dir = f"msal_caches/{uid}" 
-        cache_file = f"{user_dir}/msal_token_cache.bin" 
-        os.makedirs(user_dir, exist_ok=True)
+        
         if "access_token" in result:
-            # Success! Save token
+            # Success! Save token to user-specific location
+            user_dir = f"msal_caches/{uid}" 
+            cache_file = f"{user_dir}/msal_token_cache.bin" 
+            os.makedirs(user_dir, exist_ok=True)
+            
             with open(cache_file, "w") as f:
                 f.write(cache.serialize())
+            
+            print(f"[POLL-DEVICE] Successfully saved token for UID {uid}")
             
             # Clean up
             current_device_flow = None
