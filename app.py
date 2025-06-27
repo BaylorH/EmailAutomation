@@ -117,6 +117,7 @@ def index():
                 .btn-success { background: #28a745; color: white; }
                 .btn-warning { background: #ffc107; color: black; }
                 .btn-danger { background: #dc3545; color: white; }
+                #output { background: #f8f9fa; padding: 1rem; border-radius: 4px; font-family: monospace; white-space: pre-wrap; max-height: 400px; overflow-y: auto; }
                 .auth-methods { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; }
                 .method-card { border: 1px solid #ddd; padding: 1rem; border-radius: 8px; flex: 1; min-width: 300px; }
                 .method-card h4 { margin-top: 0; }
@@ -150,7 +151,9 @@ def index():
                 </div>
                 
                 <div>
+                    <button class="btn-warning" onclick="refreshToken()">🔄 Refresh Token</button>
                     <button class="btn-danger" onclick="clearToken()">🗑️ Clear Token</button>
+                    <button class="btn-primary" onclick="checkStatus()">🔍 Check Status</button>
                 </div>
             {% else %}
                 <div class="status {{ status.status }}">
@@ -166,7 +169,7 @@ def index():
                 
                 <div class="auth-methods">
                     <div class="method-card">
-                        <h4>🌐 Web Authentication</h4>
+                        <h4>🌐 Web Authentication (Recommended)</h4>
                         <p>Uses browser redirect - works well for web deployments</p>
                         <button class="btn-primary" onclick="startWebAuth()">🔐 Start Web Authentication</button>
                     </div>
@@ -178,7 +181,11 @@ def index():
                     </div>
                 </div>
                 
+                <button class="btn-primary" onclick="checkStatus()">🔍 Check Status</button>
             {% endif %}
+            
+            <h3>📋 Output:</h3>
+            <div id="output">Ready...</div>
             
             <script>
                 function log(message) {
@@ -199,6 +206,18 @@ def index():
                         log(`Error: ${error.message}`);
                         return null;
                     }
+                }
+                
+                async function checkStatus() {
+                    const data = await apiCall('/api/status');
+                    if (data) {
+                        setTimeout(() => location.reload(), 1000);
+                    }
+                }
+                
+                async function refreshToken() {
+                    await apiCall('/api/refresh', 'POST');
+                    setTimeout(() => location.reload(), 2000);
                 }
                 
                 async function clearToken() {
@@ -289,6 +308,11 @@ def index():
     """, status=status, base_url=base_url, uid=uid, upload_result=upload_result)
 
 # Global variable to store device flow
+current_device_flow = None
+
+@app.route("/api/status")
+def api_status():
+    return jsonify(check_token_status())
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
@@ -319,6 +343,44 @@ def api_clear():
         global current_device_flow
         current_device_flow = None
         return jsonify({"success": True, "message": "Token cache cleared"})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route("/api/refresh", methods=["POST"])
+def api_refresh():
+    try:
+        uid = session.get("uid", "web_user") 
+        user_dir = f"msal_caches/{uid}" 
+        cache_file = f"{user_dir}/msal_token_cache.bin" 
+        os.makedirs(user_dir, exist_ok=True)
+        cache = SerializableTokenCache()
+        if os.path.exists(cache_file):
+            cache.deserialize(open(cache_file).read())
+        
+        app_obj = ConfidentialClientApplication(
+            CLIENT_ID,
+            client_credential=CLIENT_SECRET,
+            authority=AUTHORITY,
+            token_cache=cache
+        )
+        
+        accounts = app_obj.get_accounts()
+        if not accounts:
+            return jsonify({"error": "No accounts found"})
+        
+        result = app_obj.acquire_token_silent(
+            SCOPES, 
+            account=accounts[0], 
+            force_refresh=True
+        )
+        
+        if result and "access_token" in result:
+            with open(cache_file, "w") as f:
+                f.write(cache.serialize())
+            return jsonify({"success": True, "message": "Token refreshed successfully"})
+        else:
+            return jsonify({"error": f"Failed to refresh token: {result.get('error_description', 'Unknown error')}"})
+    
     except Exception as e:
         return jsonify({"error": str(e)})
 
