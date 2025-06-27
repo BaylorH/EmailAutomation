@@ -73,6 +73,20 @@ def check_token_status():
     except Exception as e:
         return {"status": "error", "message": f"Error checking token: {str(e)}"}
 
+def auto_upload_token():
+    """Automatically upload token to Firebase if valid"""
+    try:
+        uid = session.get("uid", "web_user") 
+        user_dir = f"msal_caches/{uid}" 
+        cache_file = f"{user_dir}/msal_token_cache.bin" 
+        
+        if os.path.exists(cache_file):
+            upload_token(FIREBASE_API_KEY, input_file=cache_file, user_id=uid)
+            return {"success": True, "message": "Token automatically uploaded to Firebase"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    return {"success": False, "error": "No token file found"}
+
 @app.route("/")
 def index():
     uid = request.args.get("uid", "web_user")
@@ -80,6 +94,12 @@ def index():
     print(f"[INDEX] Setting UID in session: {uid}")
     status = check_token_status()
     base_url = get_base_url()
+    
+    # Auto-upload if token is valid
+    upload_result = None
+    if status["status"] == "valid":
+        upload_result = auto_upload_token()
+    
     return render_template_string("""
     <html>
         <head>
@@ -91,6 +111,7 @@ def index():
                 .expired { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
                 .no_cache { background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; }
                 .error { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+                .completed { background: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }
                 button { padding: 0.5rem 1rem; margin: 0.5rem; border: none; border-radius: 4px; cursor: pointer; }
                 .btn-primary { background: #007bff; color: white; }
                 .btn-success { background: #28a745; color: white; }
@@ -113,25 +134,40 @@ def index():
                 <p><small>This ID is used to separate token caches for different users</small></p>
             </div>
             
-            <div class="status {{ status.status }}">
-                <h3>🔍 Token Status: {{ status.status.title() }}</h3>
-                <p>{{ status.message }}</p>
-                {% if status.account %}
-                <p><strong>Account:</strong> {{ status.account }}</p>
-                {% endif %}
-                {% if status.expires %}
-                <p><strong>Expires in:</strong> {{ status.expires }} seconds</p>
-                {% endif %}
-            </div>
-            
             {% if status.status == 'valid' %}
+                <div class="status completed">
+                    <h3>✅ Authentication Completed</h3>
+                    <p><strong>Account:</strong> {{ status.account }}</p>
+                    <p><strong>Token Status:</strong> Valid and automatically uploaded to Firebase</p>
+                    {% if status.expires %}
+                    <p><strong>Expires in:</strong> {{ status.expires }} seconds</p>
+                    {% endif %}
+                    {% if upload_result %}
+                        {% if upload_result.success %}
+                        <p><strong>Upload Status:</strong> ✅ {{ upload_result.message }}</p>
+                        {% else %}
+                        <p><strong>Upload Status:</strong> ❌ {{ upload_result.error }}</p>
+                        {% endif %}
+                    {% endif %}
+                </div>
+                
                 <div>
-                    <button class="btn-success" onclick="uploadToken()">☁️ Upload Valid Token to Firebase</button>
                     <button class="btn-warning" onclick="refreshToken()">🔄 Refresh Token</button>
                     <button class="btn-danger" onclick="clearToken()">🗑️ Clear Token</button>
                     <button class="btn-primary" onclick="checkStatus()">🔍 Check Status</button>
                 </div>
             {% else %}
+                <div class="status {{ status.status }}">
+                    <h3>🔍 Token Status: {{ status.status.title() }}</h3>
+                    <p>{{ status.message }}</p>
+                    {% if status.account %}
+                    <p><strong>Account:</strong> {{ status.account }}</p>
+                    {% endif %}
+                    {% if status.expires %}
+                    <p><strong>Expires in:</strong> {{ status.expires }} seconds</p>
+                    {% endif %}
+                </div>
+                
                 <div class="redirect-info">
                     <h4>🔧 Azure App Registration Setup</h4>
                     <p>For web authentication to work, add this redirect URI to your Azure app:</p>
@@ -185,10 +221,6 @@ def index():
                     if (data) {
                         setTimeout(() => location.reload(), 1000);
                     }
-                }
-                
-                async function uploadToken() {
-                    await apiCall('/api/upload', 'POST');
                 }
                 
                 async function refreshToken() {
@@ -281,7 +313,7 @@ def index():
             </script>
         </body>
     </html>
-    """, status=status, base_url=base_url, uid=uid)
+    """, status=status, base_url=base_url, uid=uid, upload_result=upload_result)
 
 # Global variable to store device flow
 current_device_flow = None
