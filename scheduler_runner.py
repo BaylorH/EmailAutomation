@@ -38,7 +38,7 @@ def list_user_ids():
     user_ids = set()
     for item in data.get("items", []):
         parts = item["name"].split("/")
-        if len(parts) == 2 and parts[0] == "msal_caches":
+        if len(parts) == 3 and parts[0] == "msal_caches" and parts[2] == "msal_token_cache.bin":
             user_ids.add(parts[1])
     return list(user_ids)
 
