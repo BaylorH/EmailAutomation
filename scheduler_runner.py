@@ -13,7 +13,7 @@ from firebase_helpers import download_token, upload_token, upload_excel
 CLIENT_ID         = os.getenv("AZURE_API_APP_ID")
 CLIENT_SECRET     = os.getenv("AZURE_API_CLIENT_SECRET")
 FIREBASE_API_KEY  = os.getenv("FIREBASE_API_KEY")
-FIREBASE_BUCKET   = "email-automation-cache"
+FIREBASE_BUCKET   = "email-automation-cache.firebasestorage.app"
 AUTHORITY         = "https://login.microsoftonline.com/common"
 SCOPES            = ["Mail.ReadWrite", "Mail.Send"]
 TOKEN_CACHE       = "msal_token_cache.bin"
