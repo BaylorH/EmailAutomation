@@ -14,7 +14,7 @@ from firebase_helpers import download_token, upload_token, upload_excel
 CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
 
-USER_ID         = "default_user"
+USER_ID         = "6h0p7yYDnSZOd5CAy6qCvs4zw4D2"
 AUTHORITY  = "https://login.microsoftonline.com/common"
 SCOPES          = ["Mail.ReadWrite", "Mail.Send"]
 TOKEN_CACHE     = "msal_token_cache.bin"
