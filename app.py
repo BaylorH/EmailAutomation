@@ -143,9 +143,7 @@ def index():
                 </div>
                 
                 <div>
-                    <button class="btn-warning" onclick="refreshToken()">🔄 Refresh Token</button>
                     <button class="btn-danger" onclick="clearToken()">🗑️ Clear Token</button>
-                    <button class="btn-primary" onclick="checkStatus()">🔍 Check Status</button>
                 </div>
             {% else %}
                 <div class="status {{ status.status }}">
@@ -164,56 +162,23 @@ def index():
                     <p>Authenticate using browser redirect to get your Microsoft email token</p>
                     <button class="btn-primary" onclick="startWebAuth()">🔐 Start Authentication</button>
                 </div>
-                
-                <button class="btn-primary" onclick="checkStatus()">🔍 Check Status</button>
             {% endif %}
             
-            <h3>📋 Output:</h3>
-            <div id="output">Ready...</div>
-            
             <script>
-                function log(message) {
-                    const output = document.getElementById('output');
-                    const timestamp = new Date().toLocaleTimeString();
-                    output.textContent += `[${timestamp}] ${message}\n`;
-                    output.scrollTop = output.scrollHeight;
-                }
-                
-                async function apiCall(endpoint, method = 'GET') {
-                    try {
-                        log(`Making ${method} request to ${endpoint}...`);
-                        const response = await fetch(endpoint, { method });
-                        const data = await response.json();
-                        log(`Response: ${JSON.stringify(data, null, 2)}`);
-                        return data;
-                    } catch (error) {
-                        log(`Error: ${error.message}`);
-                        return null;
-                    }
-                }
-                
-                async function checkStatus() {
-                    const data = await apiCall('/api/status');
-                    if (data) {
-                        setTimeout(() => location.reload(), 1000);
-                    }
-                }
-                
-                async function refreshToken() {
-                    await apiCall('/api/refresh', 'POST');
-                    setTimeout(() => location.reload(), 2000);
+                function startWebAuth() {
+                    window.location.href = '/auth/login';
                 }
                 
                 async function clearToken() {
                     if (confirm('Are you sure you want to clear the token cache?')) {
-                        await apiCall('/api/clear', 'POST');
-                        setTimeout(() => location.reload(), 1000);
+                        try {
+                            const response = await fetch('/api/clear', { method: 'POST' });
+                            await response.json();
+                            setTimeout(() => location.reload(), 1000);
+                        } catch (error) {
+                            console.error('Error:', error);
+                        }
                     }
-                }
-                
-                function startWebAuth() {
-                    log("🌐 Starting web authentication...");
-                    window.location.href = '/auth/login';
                 }
             </script>
         </body>
