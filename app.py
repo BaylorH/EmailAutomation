@@ -121,7 +121,6 @@ def index():
                 .auth-methods { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; }
                 .method-card { border: 1px solid #ddd; padding: 1rem; border-radius: 8px; flex: 1; min-width: 300px; }
                 .method-card h4 { margin-top: 0; }
-                .redirect-info { background: #e3f2fd; padding: 1rem; border-radius: 4px; margin: 1rem 0; border-left: 4px solid #2196f3; }
                 .uid-info { background: #f0f8f0; padding: 1rem; border-radius: 4px; margin: 1rem 0; border-left: 4px solid #28a745; }
             </style>
         </head>
@@ -166,13 +165,6 @@ def index():
                     {% if status.expires %}
                     <p><strong>Expires in:</strong> {{ status.expires }} seconds</p>
                     {% endif %}
-                </div>
-                
-                <div class="redirect-info">
-                    <h4>🔧 Azure App Registration Setup</h4>
-                    <p>For web authentication to work, add this redirect URI to your Azure app:</p>
-                    <code>{{ base_url }}/auth/callback</code>
-                    <p><small>Go to Azure Portal → App Registrations → Your App → Authentication → Add Platform → Web</small></p>
                 </div>
                 
                 <div class="auth-methods">
@@ -482,18 +474,56 @@ def auth_callback():
             
             return render_template_string("""
                 <html>
-                    <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
-                        <h2>✅ Authentication Successful!</h2>
-                        <p><strong>User ID:</strong> {{ uid }}</p>
-                        <p><strong>Account:</strong> {{ account }}</p>
-                        <p>Token has been saved and cached.</p>
-                        <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #28a745; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
-                        <script>
-                            setTimeout(() => window.location.href = '/?uid={{ uid }}', 3000);
-                        </script>
-                    </body>
+                <head>
+                    <style>
+                    body {
+                        font-family: sans-serif;
+                        padding: 2rem;
+                        text-align: center;
+                        background-color: #f5f5f5;
+                    }
+                    .card {
+                        background: white;
+                        display: inline-block;
+                        padding: 2rem 3rem;
+                        border-radius: 12px;
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+                        animation: fadeIn 0.6s ease-in-out;
+                    }
+                    .spinner {
+                        margin-top: 1.5rem;
+                        width: 48px;
+                        height: 48px;
+                        border: 5px solid #ddd;
+                        border-top: 5px solid #28a745;
+                        border-radius: 50%;
+                        animation: spin 1s linear infinite;
+                    }
+                    @keyframes spin {
+                        0% { transform: rotate(0deg); }
+                        100% { transform: rotate(360deg); }
+                    }
+                    @keyframes fadeIn {
+                        from { opacity: 0; transform: translateY(20px); }
+                        to { opacity: 1; transform: translateY(0); }
+                    }
+                    </style>
+                </head>
+                <body>
+                    <div class="card">
+                    <h2>✅ Authentication Successful</h2>
+                    <p><strong>User ID:</strong> {{ uid }}</p>
+                    <p><strong>Account:</strong> {{ account }}</p>
+                    <p>Uploading token to Firestore...</p>
+                    <div class="spinner"></div>
+                    </div>
+                    <script>
+                    setTimeout(() => window.location.href = '/?uid={{ uid }}', 3000);
+                    </script>
+                </body>
                 </html>
-            """, account=account, uid=uid)
+                """, account=account, uid=uid)
+
         else:
             error = result.get("error_description", "Failed to acquire token")
             return render_template_string("""
@@ -612,15 +642,4 @@ def api_poll_device():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Starting Token Manager on port {port}")
-    
-    # Print helpful setup info
-    print("\n📋 Setup Instructions:")
-    print("1. Ensure AZURE_API_APP_ID environment variable is set")
-    print("2. In Azure Portal, add this redirect URI to your app:")
-    print(f"   http://localhost:{port}/auth/callback")
-    print("   (or your production URL + /auth/callback)")
-    print("\n🌐 Access the app at:")
-    print(f"   http://localhost:{port}")
-    
     app.run(host="0.0.0.0", port=port, debug=True)
