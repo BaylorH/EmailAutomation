@@ -12,21 +12,23 @@ app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "some-default-secret")
 
 app.config.update(
-    SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=True,        # ensures cookie is sent over HTTPS
+    SESSION_COOKIE_SAMESITE='Lax',     # allows session to persist during OAuth redirect
 )
 
-CLIENT_ID = os.getenv("AZURE_API_APP_ID")
+CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
 CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
-AUTHORITY = "https://login.microsoftonline.com/common"
-SCOPES = ["Mail.ReadWrite", "Mail.Send"]
+AUTHORITY        = "https://login.microsoftonline.com/common"
+SCOPES           = ["Mail.ReadWrite", "Mail.Send"]
+CACHE_FILE       = "msal_token_cache.bin"
 
+# Get the base URL for redirect URI
 def get_base_url():
     if "https://email-token-manager.onrender.com" == request.url_root.rstrip('/'):
         return "https://email-token-manager.onrender.com"
     else:
-        return "http://localhost:5000"  # Default for development
+        return "NOT SAME"
 
 def check_token_status():
     """Check if we have a valid token"""
@@ -34,9 +36,8 @@ def check_token_status():
     user_dir = f"msal_caches/{uid}" 
     cache_file = f"{user_dir}/msal_token_cache.bin" 
     os.makedirs(user_dir, exist_ok=True)
-    
     if not os.path.exists(cache_file):
-        return {"status": "no_token", "message": "No authentication token found"}
+        return {"status": "no_cache", "message": "No token cache found"}
     
     try:
         cache = SerializableTokenCache()
@@ -51,21 +52,22 @@ def check_token_status():
         
         accounts = app_obj.get_accounts()
         if not accounts:
-            return {"status": "no_token", "message": "No authenticated accounts found"}
+            return {"status": "no_accounts", "message": "No accounts in cache"}
         
+        # Try silent token acquisition
         result = app_obj.acquire_token_silent(SCOPES, account=accounts[0])
         
         if result and "access_token" in result:
             return {
-                "status": "authenticated",
-                "message": "Ready to upload token",
+                "status": "valid",
+                "message": "Token is valid",
                 "account": accounts[0].get("username", "Unknown"),
                 "expires": result.get("expires_in", "Unknown")
             }
         else:
             return {
                 "status": "expired",
-                "message": "Token expired, please authenticate again",
+                "message": "Token exists but expired or invalid",
                 "error": result.get("error_description", "Unknown error") if result else "No result"
             }
     except Exception as e:
@@ -75,240 +77,297 @@ def check_token_status():
 def index():
     uid = request.args.get("uid", "web_user")
     session["uid"] = uid
+    print(f"[INDEX] Setting UID in session: {uid}")
     status = check_token_status()
-    
-    # If we have a valid token, show success page and auto-upload
-    if status["status"] == "authenticated":
-        return render_template_string("""
-        <html>
-            <head>
-                <title>📧 Email Token Manager - Success</title>
-                <style>
-                    body { 
-                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-                        padding: 2rem; 
-                        max-width: 600px; 
-                        margin: 0 auto; 
-                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                        min-height: 100vh;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                    }
-                    .container {
-                        background: white;
-                        padding: 3rem;
-                        border-radius: 20px;
-                        box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-                        text-align: center;
-                        animation: slideUp 0.6s ease-out;
-                    }
-                    @keyframes slideUp {
-                        from { opacity: 0; transform: translateY(30px); }
-                        to { opacity: 1; transform: translateY(0); }
-                    }
-                    .success-icon {
-                        font-size: 4rem;
-                        color: #28a745;
-                        margin-bottom: 1rem;
-                        animation: bounce 1s infinite alternate;
-                    }
-                    @keyframes bounce {
-                        from { transform: scale(1); }
-                        to { transform: scale(1.1); }
-                    }
-                    h1 { color: #333; margin-bottom: 1rem; }
-                    .account-info {
-                        background: #f8f9fa;
-                        padding: 1rem;
-                        border-radius: 10px;
-                        margin: 1rem 0;
-                        border-left: 4px solid #28a745;
-                    }
-                    .status-message {
-                        color: #666;
-                        margin: 1rem 0;
-                        font-size: 1.1rem;
-                    }
-                    .loading {
-                        display: inline-block;
-                        width: 20px;
-                        height: 20px;
-                        border: 3px solid #f3f3f3;
-                        border-top: 3px solid #007bff;
-                        border-radius: 50%;
-                        animation: spin 1s linear infinite;
-                        margin-left: 10px;
-                    }
-                    @keyframes spin {
-                        0% { transform: rotate(0deg); }
-                        100% { transform: rotate(360deg); }
-                    }
-                    .btn {
-                        padding: 12px 24px;
-                        margin: 10px;
-                        border: none;
-                        border-radius: 8px;
-                        cursor: pointer;
-                        font-size: 1rem;
-                        text-decoration: none;
-                        display: inline-block;
-                        transition: all 0.3s ease;
-                    }
-                    .btn-primary { background: #007bff; color: white; }
-                    .btn-primary:hover { background: #0056b3; transform: translateY(-2px); }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <div class="success-icon">✅</div>
-                    <h1>Authentication Successful!</h1>
-                    
-                    <div class="account-info">
-                        <strong>Account:</strong> {{ status.account }}
-                    </div>
-                    
-                    <div class="status-message" id="statusMessage">
-                        Uploading token to Firebase<span class="loading"></span>
-                    </div>
-                    
-                    <a href="/?uid={{ uid }}" class="btn btn-primary" style="display: none;" id="doneButton">
-                        🔄 Start Over
-                    </a>
-                </div>
-                
-                <script>
-                    // Auto-upload token on page load
-                    async function uploadToken() {
-                        try {
-                            const response = await fetch('/api/upload', { method: 'POST' });
-                            const data = await response.json();
-                            
-                            if (data.success) {
-                                document.getElementById('statusMessage').innerHTML = '🎉 Token successfully uploaded to Firebase!';
-                                document.getElementById('doneButton').style.display = 'inline-block';
-                            } else {
-                                document.getElementById('statusMessage').innerHTML = '❌ Upload failed: ' + (data.error || 'Unknown error');
-                                document.getElementById('doneButton').style.display = 'inline-block';
-                            }
-                        } catch (error) {
-                            document.getElementById('statusMessage').innerHTML = '❌ Upload failed: ' + error.message;
-                            document.getElementById('doneButton').style.display = 'inline-block';
-                        }
-                    }
-                    
-                    // Start upload after a brief delay for better UX
-                    setTimeout(uploadToken, 1500);
-                </script>
-            </body>
-        </html>
-        """, status=status, uid=uid)
-    
-    # Otherwise, show the simple authentication page
     base_url = get_base_url()
     return render_template_string("""
     <html>
         <head>
             <title>📧 Email Token Manager</title>
             <style>
-                body { 
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-                    padding: 2rem; 
-                    max-width: 500px; 
-                    margin: 0 auto; 
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    min-height: 100vh;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                }
-                .container {
-                    background: white;
-                    padding: 3rem;
-                    border-radius: 20px;
-                    box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-                    text-align: center;
-                    animation: fadeIn 0.6s ease-out;
-                }
-                @keyframes fadeIn {
-                    from { opacity: 0; transform: scale(0.9); }
-                    to { opacity: 1; transform: scale(1); }
-                }
-                h1 { 
-                    color: #333; 
-                    margin-bottom: 1rem;
-                    font-size: 2.5rem;
-                }
-                .subtitle {
-                    color: #666;
-                    margin-bottom: 2rem;
-                    font-size: 1.1rem;
-                }
-                .auth-button {
-                    background: linear-gradient(45deg, #007bff, #0056b3);
-                    color: white;
-                    padding: 15px 30px;
-                    border: none;
-                    border-radius: 50px;
-                    font-size: 1.2rem;
-                    cursor: pointer;
-                    transition: all 0.3s ease;
-                    box-shadow: 0 4px 15px rgba(0, 123, 255, 0.3);
-                    text-decoration: none;
-                    display: inline-block;
-                }
-                .auth-button:hover {
-                    transform: translateY(-3px);
-                    box-shadow: 0 6px 20px rgba(0, 123, 255, 0.4);
-                    background: linear-gradient(45deg, #0056b3, #004085);
-                }
-                .setup-info {
-                    background: #e3f2fd;
-                    padding: 1rem;
-                    border-radius: 10px;
-                    margin: 2rem 0;
-                    border-left: 4px solid #2196f3;
-                    font-size: 0.9rem;
-                    text-align: left;
-                }
-                .user-info {
-                    background: #f0f8f0;
-                    padding: 1rem;
-                    border-radius: 10px;
-                    margin: 1rem 0;
-                    border-left: 4px solid #28a745;
-                    font-size: 0.9rem;
-                }
+                body { font-family: sans-serif; padding: 2rem; max-width: 900px; margin: 0 auto; }
+                .status { padding: 1rem; border-radius: 8px; margin: 1rem 0; }
+                .valid { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
+                .expired { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+                .no_cache { background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; }
+                .error { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+                button { padding: 0.5rem 1rem; margin: 0.5rem; border: none; border-radius: 4px; cursor: pointer; }
+                .btn-primary { background: #007bff; color: white; }
+                .btn-success { background: #28a745; color: white; }
+                .btn-warning { background: #ffc107; color: black; }
+                .btn-danger { background: #dc3545; color: white; }
+                #output { background: #f8f9fa; padding: 1rem; border-radius: 4px; font-family: monospace; white-space: pre-wrap; max-height: 400px; overflow-y: auto; }
+                .auth-methods { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; }
+                .method-card { border: 1px solid #ddd; padding: 1rem; border-radius: 8px; flex: 1; min-width: 300px; }
+                .method-card h4 { margin-top: 0; }
+                .redirect-info { background: #e3f2fd; padding: 1rem; border-radius: 4px; margin: 1rem 0; border-left: 4px solid #2196f3; }
+                .uid-info { background: #f0f8f0; padding: 1rem; border-radius: 4px; margin: 1rem 0; border-left: 4px solid #28a745; }
             </style>
         </head>
         <body>
-            <div class="container">
-                <h1>📧</h1>
-                <h1>Email Token Manager</h1>
-                <p class="subtitle">Secure Microsoft Outlook authentication</p>
-                
-                <div class="user-info">
-                    <strong>User ID:</strong> {{ uid }}
-                </div>
-                
-                <a href="/auth/login" class="auth-button">
-                    🔐 Authenticate with Microsoft
-                </a>
-                
-                <div class="setup-info">
-                    <strong>Azure Setup Required:</strong><br>
-                    Add this redirect URI to your Azure app:<br>
-                    <code>{{ base_url }}/auth/callback</code>
-                </div>
+            <h1>📧 Email Token Manager</h1>
+            
+            <div class="uid-info">
+                <h4>🆔 Current User ID</h4>
+                <p><strong>UID:</strong> {{ uid }}</p>
+                <p><small>This ID is used to separate token caches for different users</small></p>
             </div>
+            
+            <div class="status {{ status.status }}">
+                <h3>🔍 Token Status: {{ status.status.title() }}</h3>
+                <p>{{ status.message }}</p>
+                {% if status.account %}
+                <p><strong>Account:</strong> {{ status.account }}</p>
+                {% endif %}
+                {% if status.expires %}
+                <p><strong>Expires in:</strong> {{ status.expires }} seconds</p>
+                {% endif %}
+            </div>
+            
+            {% if status.status == 'valid' %}
+                <div>
+                    <button class="btn-success" onclick="uploadToken()">☁️ Upload Valid Token to Firebase</button>
+                    <button class="btn-warning" onclick="refreshToken()">🔄 Refresh Token</button>
+                    <button class="btn-danger" onclick="clearToken()">🗑️ Clear Token</button>
+                    <button class="btn-primary" onclick="checkStatus()">🔍 Check Status</button>
+                </div>
+            {% else %}
+                <div class="redirect-info">
+                    <h4>🔧 Azure App Registration Setup</h4>
+                    <p>For web authentication to work, add this redirect URI to your Azure app:</p>
+                    <code>{{ base_url }}/auth/callback</code>
+                    <p><small>Go to Azure Portal → App Registrations → Your App → Authentication → Add Platform → Web</small></p>
+                </div>
+                
+                <div class="auth-methods">
+                    <div class="method-card">
+                        <h4>🌐 Web Authentication (Recommended)</h4>
+                        <p>Uses browser redirect - works well for web deployments</p>
+                        <button class="btn-primary" onclick="startWebAuth()">🔐 Start Web Authentication</button>
+                    </div>
+                    
+                    <div class="method-card">
+                        <h4>📱 Device Code Flow</h4>
+                        <p>Use another device/browser - good for servers</p>
+                        <button class="btn-primary" onclick="startDeviceFlow()">📱 Start Device Authentication</button>
+                    </div>
+                </div>
+                
+                <button class="btn-primary" onclick="checkStatus()">🔍 Check Status</button>
+            {% endif %}
+            
+            <h3>📋 Output:</h3>
+            <div id="output">Ready...</div>
+            
+            <script>
+                function log(message) {
+                    const output = document.getElementById('output');
+                    const timestamp = new Date().toLocaleTimeString();
+                    output.textContent += `[${timestamp}] ${message}\n`;
+                    output.scrollTop = output.scrollHeight;
+                }
+                
+                async function apiCall(endpoint, method = 'GET') {
+                    try {
+                        log(`Making ${method} request to ${endpoint}...`);
+                        const response = await fetch(endpoint, { method });
+                        const data = await response.json();
+                        log(`Response: ${JSON.stringify(data, null, 2)}`);
+                        return data;
+                    } catch (error) {
+                        log(`Error: ${error.message}`);
+                        return null;
+                    }
+                }
+                
+                async function checkStatus() {
+                    const data = await apiCall('/api/status');
+                    if (data) {
+                        setTimeout(() => location.reload(), 1000);
+                    }
+                }
+                
+                async function uploadToken() {
+                    await apiCall('/api/upload', 'POST');
+                }
+                
+                async function refreshToken() {
+                    await apiCall('/api/refresh', 'POST');
+                    setTimeout(() => location.reload(), 2000);
+                }
+                
+                async function clearToken() {
+                    if (confirm('Are you sure you want to clear the token cache?')) {
+                        await apiCall('/api/clear', 'POST');
+                        setTimeout(() => location.reload(), 1000);
+                    }
+                }
+                
+                function startWebAuth() {
+                    log("🌐 Starting web authentication...");
+                    window.location.href = '/auth/login';
+                }
+                
+                async function startDeviceFlow() {
+                    const data = await apiCall('/api/device-flow', 'POST');
+                    if (data && data.verification_uri && data.user_code) {
+                        log(`\n🔐 DEVICE CODE: ${data.user_code}`);
+                        log(`🌐 Go to: ${data.verification_uri}`);
+                        log(`📋 Copy this code: ${data.user_code}`);
+                        log(`\nOpening in new window...`);
+                        
+                        // Create a more user-friendly page
+                        const newWindow = window.open('', '_blank', 'width=600,height=400');
+                        newWindow.document.write(`
+                            <html>
+                                <head><title>Device Authentication</title></head>
+                                <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
+                                    <h2>📱 Device Authentication</h2>
+                                    <p>1. Go to: <a href="${data.verification_uri}" target="_blank">${data.verification_uri}</a></p>
+                                    <p>2. Enter this code:</p>
+                                    <div style="font-size: 2rem; font-weight: bold; background: #f0f0f0; padding: 1rem; border-radius: 8px; margin: 1rem;">
+                                        ${data.user_code}
+                                    </div>
+                                    <button onclick="navigator.clipboard.writeText('${data.user_code}')" style="padding: 0.5rem 1rem; background: #007bff; color: white; border: none; border-radius: 4px;">
+                                        📋 Copy Code
+                                    </button>
+                                    <br><br>
+                                    <a href="${data.verification_uri}" target="_blank" style="padding: 0.5rem 1rem; background: #28a745; color: white; text-decoration: none; border-radius: 4px;">
+                                        🔗 Open Microsoft Login
+                                    </a>
+                                </body>
+                            </html>
+                        `);
+                        
+                        // Start polling
+                        pollDeviceFlow();
+                    }
+                }
+                
+                async function pollDeviceFlow() {
+                    log("📡 Polling for device flow completion...");
+                    let pollCount = 0;
+                    const maxPolls = 180; // 15 minutes
+                    
+                    const poll = async () => {
+                        pollCount++;
+                        const data = await apiCall('/api/poll-device');
+                        
+                        if (data) {
+                            if (data.status === 'completed') {
+                                log(`✅ Device flow completed successfully! Account: ${data.account || 'Unknown'}`);
+                                setTimeout(() => location.reload(), 2000);
+                                return;
+                            } else if (data.status === 'error') {
+                                log(`❌ Device flow error: ${data.error}`);
+                                return;
+                            } else if (data.status === 'pending') {
+                                const remainingTime = Math.max(0, maxPolls - pollCount);
+                                const minutes = Math.floor(remainingTime * 5 / 60);
+                                const seconds = (remainingTime * 5) % 60;
+                                log(`⏳ Still waiting... (${minutes}:${seconds.toString().padStart(2, '0')} remaining)`);
+                                
+                                if (pollCount < maxPolls) {
+                                    setTimeout(poll, 5000);
+                                } else {
+                                    log("⏰ Polling timeout reached. Please start a new authentication if needed.");
+                                }
+                            }
+                        }
+                    };
+                    
+                    setTimeout(poll, 5000);
+                }
+            </script>
         </body>
     </html>
-    """, base_url=base_url, uid=uid)
+    """, status=status, base_url=base_url, uid=uid)
 
+# Global variable to store device flow
+current_device_flow = None
+
+@app.route("/api/status")
+def api_status():
+    return jsonify(check_token_status())
+
+@app.route("/api/upload", methods=["POST"])
+def api_upload():
+    try:
+        uid = session.get("uid", "web_user") 
+        print(f"[UPLOAD] Upload requested for UID: {uid}")
+        
+        user_dir = f"msal_caches/{uid}" 
+        cache_file = f"{user_dir}/msal_token_cache.bin" 
+        os.makedirs(user_dir, exist_ok=True)
+        if not os.path.exists(cache_file):
+            return jsonify({"error": "No token cache file found"})
+        
+        upload_token(FIREBASE_API_KEY, input_file=cache_file, user_id=session.get("uid", "web_user"))
+        return jsonify({"success": True, "message": "Token uploaded to Firebase"})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route("/api/clear", methods=["POST"])
+def api_clear():
+    try:
+        uid = session.get("uid", "web_user") 
+        user_dir = f"msal_caches/{uid}" 
+        cache_file = f"{user_dir}/msal_token_cache.bin" 
+        os.makedirs(user_dir, exist_ok=True)
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
+        global current_device_flow
+        current_device_flow = None
+        return jsonify({"success": True, "message": "Token cache cleared"})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route("/api/refresh", methods=["POST"])
+def api_refresh():
+    try:
+        uid = session.get("uid", "web_user") 
+        user_dir = f"msal_caches/{uid}" 
+        cache_file = f"{user_dir}/msal_token_cache.bin" 
+        os.makedirs(user_dir, exist_ok=True)
+        cache = SerializableTokenCache()
+        if os.path.exists(cache_file):
+            cache.deserialize(open(cache_file).read())
+        
+        app_obj = ConfidentialClientApplication(
+            CLIENT_ID,
+            client_credential=CLIENT_SECRET,
+            authority=AUTHORITY,
+            token_cache=cache
+        )
+        
+        accounts = app_obj.get_accounts()
+        if not accounts:
+            return jsonify({"error": "No accounts found"})
+        
+        result = app_obj.acquire_token_silent(
+            SCOPES, 
+            account=accounts[0], 
+            force_refresh=True
+        )
+        
+        if result and "access_token" in result:
+            with open(cache_file, "w") as f:
+                f.write(cache.serialize())
+            return jsonify({"success": True, "message": "Token refreshed successfully"})
+        else:
+            return jsonify({"error": f"Failed to refresh token: {result.get('error_description', 'Unknown error')}"})
+    
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+# Web-based authentication routes
 @app.route("/auth/login")
 def auth_login():
+    # Get UID from session, set during initial page load
     uid = session.get("uid", "web_user")
+    print(f"[LOGIN] Using UID from session: {uid}")
     
+    # Setup cache for this user
     cache = SerializableTokenCache()
     user_dir = f"msal_caches/{uid}" 
     cache_file = f"{user_dir}/msal_token_cache.bin" 
@@ -323,84 +382,31 @@ def auth_login():
         token_cache=cache
     )
     
-    base_url = get_base_url()
+    # CRITICAL: Pass UID as state parameter to preserve it through OAuth redirect
     auth_url = app_obj.get_authorization_request_url(
         SCOPES,
-        redirect_uri=f"{base_url}/auth/callback",
-        state=uid
+        redirect_uri="https://email-token-manager.onrender.com/auth/callback",
+        state=uid  # This preserves the UID through the OAuth flow
     )
     
+    print(f"[LOGIN] Redirecting to auth URL with state={uid}")
     return redirect(auth_url)
 
 @app.route("/auth/callback")
 def auth_callback():
-    # Show a brief loading screen while processing
-    return render_template_string("""
-    <html>
-        <head>
-            <title>Processing Authentication...</title>
-            <style>
-                body { 
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-                    padding: 2rem; 
-                    max-width: 500px; 
-                    margin: 0 auto; 
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    min-height: 100vh;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                }
-                .container {
-                    background: white;
-                    padding: 3rem;
-                    border-radius: 20px;
-                    box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-                    text-align: center;
-                }
-                .spinner {
-                    width: 50px;
-                    height: 50px;
-                    border: 5px solid #f3f3f3;
-                    border-top: 5px solid #007bff;
-                    border-radius: 50%;
-                    animation: spin 1s linear infinite;
-                    margin: 0 auto 1rem auto;
-                }
-                @keyframes spin {
-                    0% { transform: rotate(0deg); }
-                    100% { transform: rotate(360deg); }
-                }
-                h2 { color: #333; }
-                p { color: #666; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="spinner"></div>
-                <h2>Processing Authentication</h2>
-                <p>Please wait while we complete your authentication...</p>
-            </div>
-            
-            <script>
-                // Immediately process the callback
-                setTimeout(() => {
-                    window.location.href = '/auth/process?' + window.location.search.substring(1);
-                }, 1000);
-            </script>
-        </body>
-    </html>
-    """)
-
-@app.route("/auth/process")
-def auth_process():
     try:
+        # CRITICAL: Get UID from state parameter (this is how it survives the redirect)
         uid = request.args.get("state", "web_user")
+        print(f"[CALLBACK] Received UID from state parameter: {uid}")
+        
+        # Update session with the recovered UID
         session["uid"] = uid 
         
+        # Setup paths for this specific user
         user_dir = f"msal_caches/{uid}" 
         cache_file = f"{user_dir}/msal_token_cache.bin" 
         os.makedirs(user_dir, exist_ok=True)
+        print(f"[CALLBACK] Will save token to: {cache_file}")
 
         cache = SerializableTokenCache()
         if os.path.exists(cache_file):
@@ -413,50 +419,176 @@ def auth_process():
             token_cache=cache
         )
         
+        # Get authorization code from callback
         code = request.args.get('code')
         if not code:
-            error = request.args.get('error_description', 'Authentication was cancelled or failed')
-            return redirect(f"/?uid={uid}&error={error}")
+            error = request.args.get('error_description', 'No authorization code received')
+            return render_template_string("""
+                <html>
+                    <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
+                        <h2>❌ Authentication Failed</h2>
+                        <p>{{ error }}</p>
+                        <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #007bff; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
+                    </body>
+                </html>
+            """, error=error, uid=uid)
         
-        base_url = get_base_url()
+        # Exchange code for token
         result = app_obj.acquire_token_by_authorization_code(
             code,
             scopes=SCOPES,
-            redirect_uri=f"{base_url}/auth/callback"
+            redirect_uri="https://email-token-manager.onrender.com/auth/callback"
         )
         
         if "access_token" in result:
+            # Save token to user-specific cache file
             with open(cache_file, "w") as f:
                 f.write(cache.serialize())
             
-            # Redirect to main page which will now show success screen
-            return redirect(f"/?uid={uid}")
+            account = result.get("account", {}).get("username", "Unknown")
+            print(f"[CALLBACK] Successfully saved token for UID {uid}, account: {account}")
+            
+            return render_template_string("""
+                <html>
+                    <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
+                        <h2>✅ Authentication Successful!</h2>
+                        <p><strong>User ID:</strong> {{ uid }}</p>
+                        <p><strong>Account:</strong> {{ account }}</p>
+                        <p>Token has been saved and cached.</p>
+                        <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #28a745; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
+                        <script>
+                            setTimeout(() => window.location.href = '/?uid={{ uid }}', 3000);
+                        </script>
+                    </body>
+                </html>
+            """, account=account, uid=uid)
         else:
             error = result.get("error_description", "Failed to acquire token")
-            return redirect(f"/?uid={uid}&error={error}")
+            return render_template_string("""
+                <html>
+                    <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
+                        <h2>❌ Token Acquisition Failed</h2>
+                        <p>{{ error }}</p>
+                        <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #007bff; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
+                    </body>
+                </html>
+            """, error=error, uid=uid)
     
     except Exception as e:
-        uid = request.args.get("state", "web_user")
-        return redirect(f"/?uid={uid}&error={str(e)}")
+        print(f"[CALLBACK] Exception: {str(e)}")
+        uid = request.args.get("state", "web_user")  # Try to get UID for error page
+        return render_template_string("""
+            <html>
+                <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
+                    <h2>❌ Authentication Error</h2>
+                    <p>{{ error }}</p>
+                    <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #007bff; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
+                </body>
+            </html>
+        """, error=str(e), uid=uid)
 
-@app.route("/api/upload", methods=["POST"])
-def api_upload():
+# Device flow endpoints (updated to handle UID properly)
+@app.route("/api/device-flow", methods=["POST"])
+def api_device_flow():
+    global current_device_flow
+
     try:
-        uid = session.get("uid", "web_user") 
-        user_dir = f"msal_caches/{uid}" 
-        cache_file = f"{user_dir}/msal_token_cache.bin" 
-        os.makedirs(user_dir, exist_ok=True)
+        uid = session.get("uid", "web_user")
+        print(f"[DEVICE-FLOW] Starting device flow for UID: {uid}")
         
-        if not os.path.exists(cache_file):
-            return jsonify({"success": False, "error": "No token cache file found"})
+        cache = SerializableTokenCache()
+        app_obj = ConfidentialClientApplication(
+            CLIENT_ID,
+            client_credential=CLIENT_SECRET,
+            authority=AUTHORITY,
+            token_cache=cache
+        )
+
+        # Initiate device flow with proper error handling
+        flow = app_obj.initiate_device_flow(scopes=SCOPES)
         
-        upload_token(FIREBASE_API_KEY, input_file=cache_file, user_id=uid)
-        return jsonify({"success": True, "message": "Token uploaded to Firebase successfully"})
+        if "user_code" not in flow:
+            error_msg = flow.get("error_description", "Failed to initiate device flow")
+            return jsonify({"error": error_msg})
+
+        # Store with UID context
+        current_device_flow = (app_obj, flow, cache, uid)
+
+        return jsonify({
+            "success": True,
+            "verification_uri": flow["verification_uri"],
+            "user_code": flow["user_code"],
+            "expires_in": flow.get("expires_in", 900)
+        })
+
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return jsonify({"error": str(e)})
+
+@app.route("/api/poll-device")
+def api_poll_device():
+    global current_device_flow
+    
+    if not current_device_flow:
+        return jsonify({"error": "No device flow in progress"})
+    
+    app_obj, flow, cache, uid = current_device_flow
+    print(f"[POLL-DEVICE] Polling for UID: {uid}")
+    
+    try:
+        result = app_obj.acquire_token_by_device_flow(flow)
+        
+        if "access_token" in result:
+            # Success! Save token to user-specific location
+            user_dir = f"msal_caches/{uid}" 
+            cache_file = f"{user_dir}/msal_token_cache.bin" 
+            os.makedirs(user_dir, exist_ok=True)
+            
+            with open(cache_file, "w") as f:
+                f.write(cache.serialize())
+            
+            print(f"[POLL-DEVICE] Successfully saved token for UID {uid}")
+            
+            # Clean up
+            current_device_flow = None
+            
+            return jsonify({
+                "status": "completed", 
+                "message": "Token acquired successfully",
+                "account": result.get("account", {}).get("username", "Unknown")
+            })
+        
+        elif "error" in result:
+            error = result["error"]
+            if error == "authorization_pending":
+                return jsonify({"status": "pending", "message": "Waiting for user authentication..."})
+            elif error == "authorization_declined":
+                current_device_flow = None
+                return jsonify({"status": "error", "error": "User declined the authentication request"})
+            elif error == "expired_token":
+                current_device_flow = None
+                return jsonify({"status": "error", "error": "Device code expired. Please start a new authentication."})
+            else:
+                current_device_flow = None
+                return jsonify({"status": "error", "error": result.get("error_description", error)})
+        
+        else:
+            return jsonify({"status": "pending", "message": "Authentication in progress..."})
+    
+    except Exception as e:
+        current_device_flow = None
+        return jsonify({"status": "error", "error": f"Unexpected error: {str(e)}"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Starting Simplified Token Manager on port {port}")
-    print(f"🌐 Access the app at: http://localhost:{port}")
+    print(f"🚀 Starting Token Manager on port {port}")
+    
+    # Print helpful setup info
+    print("\n📋 Setup Instructions:")
+    print("1. Ensure AZURE_API_APP_ID environment variable is set")
+    print("2. In Azure Portal, add this redirect URI to your app:")
+    print(f"   http://localhost:{port}/auth/callback")
+    print("   (or your production URL + /auth/callback)")
+    print("\n🌐 Access the app at:")
+    print(f"   http://localhost:{port}")
+    
     app.run(host="0.0.0.0", port=port, debug=True)
