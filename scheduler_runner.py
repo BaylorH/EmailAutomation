@@ -66,7 +66,7 @@ for a in accounts:
 
 result = None
 if accounts:
-    result = app.acquire_token_silent(SCOPES, account=accounts[0], force_refresh=True)
+    result = app.acquire_token_silent(SCOPES, account=accounts[0])
     print("🎯 acquire_token_silent() result:", result)
 
 if not result or "access_token" not in result:
