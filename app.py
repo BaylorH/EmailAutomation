@@ -490,6 +490,13 @@ def auth_callback():
                         box-shadow: 0 4px 12px rgba(0,0,0,0.1);
                         animation: fadeIn 0.6s ease-in-out;
                     }
+                    .center {
+                        width:100%;
+                        display:flex;
+                        align-content:center;
+                        justify-content:center;
+                        align-items:center;
+                        text-align:center;}
                     .spinner {
                         margin-top: 1.5rem;
                         width: 48px;
@@ -515,7 +522,9 @@ def auth_callback():
                     <p><strong>User ID:</strong> {{ uid }}</p>
                     <p><strong>Account:</strong> {{ account }}</p>
                     <p>Uploading token to Firestore...</p>
+                    <div class="center">
                     <div class="spinner"></div>
+                    </div>
                     </div>
                     <script>
                     setTimeout(() => window.location.href = '/?uid={{ uid }}', 3000);
