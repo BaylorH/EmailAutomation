@@ -101,76 +101,226 @@ def index():
         upload_result = auto_upload_token()
     
     return render_template_string("""
-    <html>
+    <!DOCTYPE html>
+    <html lang="en">
         <head>
-            <title>📧 Email Token Manager</title>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Email Access Setup</title>
             <style>
-                body { font-family: sans-serif; padding: 2rem; max-width: 900px; margin: 0 auto; }
-                .status { padding: 1rem; border-radius: 8px; margin: 1rem 0; }
-                .valid { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
-                .expired { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
-                .no_cache { background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; }
-                .error { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
-                .completed { background: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }
-                button { padding: 0.5rem 1rem; margin: 0.5rem; border: none; border-radius: 4px; cursor: pointer; }
-                .btn-primary { background: #007bff; color: white; }
-                .btn-success { background: #28a745; color: white; }
-                .btn-warning { background: #ffc107; color: black; }
-                .btn-danger { background: #dc3545; color: white; }
-                #output { background: #f8f9fa; padding: 1rem; border-radius: 4px; font-family: monospace; white-space: pre-wrap; max-height: 400px; overflow-y: auto; }
-                .auth-section { border: 1px solid #ddd; padding: 1.5rem; border-radius: 8px; margin: 1rem 0; }
-                .auth-section h4 { margin-top: 0; }
+                * {
+                    margin: 0;
+                    padding: 0;
+                    box-sizing: border-box;
+                }
+                
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }
+                
+                .container {
+                    background: white;
+                    border-radius: 16px;
+                    box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                    padding: 40px;
+                    max-width: 500px;
+                    width: 100%;
+                    text-align: center;
+                }
+                
+                .header {
+                    margin-bottom: 30px;
+                }
+                
+                .header h1 {
+                    color: #2d3748;
+                    font-size: 28px;
+                    font-weight: 600;
+                    margin-bottom: 8px;
+                }
+                
+                .header p {
+                    color: #718096;
+                    font-size: 16px;
+                    line-height: 1.5;
+                }
+                
+                .status-card {
+                    padding: 20px;
+                    border-radius: 12px;
+                    margin: 20px 0;
+                    text-align: left;
+                }
+                
+                .status-connected {
+                    background: linear-gradient(135deg, #48bb78, #38a169);
+                    color: white;
+                }
+                
+                .status-pending {
+                    background: linear-gradient(135deg, #ed8936, #dd6b20);
+                    color: white;
+                }
+                
+                .status-card h3 {
+                    font-size: 18px;
+                    font-weight: 600;
+                    margin-bottom: 8px;
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                }
+                
+                .status-card p {
+                    margin-bottom: 6px;
+                    opacity: 0.9;
+                }
+                
+                .status-card .email {
+                    font-weight: 500;
+                    background: rgba(255,255,255,0.2);
+                    padding: 4px 8px;
+                    border-radius: 6px;
+                    display: inline-block;
+                    margin-top: 8px;
+                }
+                
+                .connect-section {
+                    background: #f7fafc;
+                    border: 2px dashed #cbd5e0;
+                    border-radius: 12px;
+                    padding: 30px;
+                    margin: 20px 0;
+                }
+                
+                .connect-section h3 {
+                    color: #2d3748;
+                    font-size: 20px;
+                    margin-bottom: 12px;
+                }
+                
+                .connect-section p {
+                    color: #4a5568;
+                    margin-bottom: 20px;
+                    line-height: 1.5;
+                }
+                
+                .btn {
+                    display: inline-block;
+                    padding: 12px 24px;
+                    font-size: 16px;
+                    font-weight: 500;
+                    text-decoration: none;
+                    border-radius: 8px;
+                    border: none;
+                    cursor: pointer;
+                    transition: all 0.2s;
+                    margin: 8px;
+                }
+                
+                .btn-primary {
+                    background: linear-gradient(135deg, #4299e1, #3182ce);
+                    color: white;
+                }
+                
+                .btn-primary:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 8px 16px rgba(66, 153, 225, 0.3);
+                }
+                
+                .btn-danger {
+                    background: linear-gradient(135deg, #f56565, #e53e3e);
+                    color: white;
+                }
+                
+                .btn-danger:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 8px 16px rgba(245, 101, 101, 0.3);
+                }
+                
+                .footer {
+                    margin-top: 30px;
+                    padding-top: 20px;
+                    border-top: 1px solid #e2e8f0;
+                    color: #718096;
+                    font-size: 14px;
+                }
+                
+                .icon {
+                    font-size: 20px;
+                }
+                
+                @media (max-width: 480px) {
+                    .container {
+                        padding: 30px 20px;
+                    }
+                    
+                    .header h1 {
+                        font-size: 24px;
+                    }
+                    
+                    .btn {
+                        width: 100%;
+                        margin: 8px 0;
+                    }
+                }
             </style>
         </head>
         <body>
-            <h1>📧 Email Token Manager</h1>
-            
-            {% if status.status == 'valid' %}
-                <div class="status completed">
-                    <h3>✅ Authentication Completed</h3>
-                    <p><strong>Account:</strong> {{ status.account }}</p>
-                    <p><strong>Token Status:</strong> Valid and automatically uploaded to Firebase</p>
-                    {% if status.expires %}
-                    <p><strong>Expires in:</strong> {{ status.expires }} seconds</p>
-                    {% endif %}
-                    {% if upload_result %}
-                        {% if upload_result.success %}
-                        <p><strong>Upload Status:</strong> ✅ {{ upload_result.message }}</p>
-                        {% else %}
-                        <p><strong>Upload Status:</strong> ❌ {{ upload_result.error }}</p>
+            <div class="container">
+                <div class="header">
+                    <h1>📧 Email Access Setup</h1>
+                    <p>Connect your email account to enable automated email management</p>
+                </div>
+                
+                {% if status.status == 'valid' %}
+                    <div class="status-card status-connected">
+                        <h3><span class="icon">✅</span> Email Access Connected</h3>
+                        <p>Your email account is successfully connected and ready to use.</p>
+                        <div class="email">{{ status.account }}</div>
+                        {% if upload_result and upload_result.success %}
+                        <p style="margin-top: 12px; font-size: 14px;">
+                            <span class="icon">☁️</span> Securely synced to cloud
+                        </p>
                         {% endif %}
-                    {% endif %}
-                </div>
+                    </div>
+                    
+                    <button class="btn btn-danger" onclick="disconnectEmail()">
+                        🔓 Disconnect Email Access
+                    </button>
+                {% else %}
+                    <div class="status-card status-pending">
+                        <h3><span class="icon">⏳</span> Email Access Required</h3>
+                        <p>To use automated email features, please connect your email account.</p>
+                    </div>
+                    
+                    <div class="connect-section">
+                        <h3>🔐 Connect Your Email</h3>
+                        <p>Click below to securely connect your Microsoft email account. You'll be redirected to Microsoft's secure login page.</p>
+                        <button class="btn btn-primary" onclick="connectEmail()">
+                            Connect Email Account
+                        </button>
+                    </div>
+                {% endif %}
                 
-                <div>
-                    <button class="btn-danger" onclick="clearToken()">🗑️ Clear Token</button>
+                <div class="footer">
+                    <p>🔒 Your email credentials are never stored. Only secure access tokens are used.</p>
                 </div>
-            {% else %}
-                <div class="status {{ status.status }}">
-                    <h3>🔍 Token Status: {{ status.status.title() }}</h3>
-                    <p>{{ status.message }}</p>
-                    {% if status.account %}
-                    <p><strong>Account:</strong> {{ status.account }}</p>
-                    {% endif %}
-                    {% if status.expires %}
-                    <p><strong>Expires in:</strong> {{ status.expires }} seconds</p>
-                    {% endif %}
-                </div>
-                
-                <div class="auth-section">
-                    <h4>🌐 Web Authentication</h4>
-                    <p>Authenticate using browser redirect to get your Microsoft email token</p>
-                    <button class="btn-primary" onclick="startWebAuth()">🔐 Start Authentication</button>
-                </div>
-            {% endif %}
+            </div>
             
             <script>
-                function startWebAuth() {
+                function connectEmail() {
                     window.location.href = '/auth/login';
                 }
                 
-                async function clearToken() {
-                    if (confirm('Are you sure you want to clear the token cache?')) {
+                async function disconnectEmail() {
+                    if (confirm('Are you sure you want to disconnect your email account? You will need to reconnect it to use email features.')) {
                         try {
                             const response = await fetch('/api/clear', { method: 'POST' });
                             await response.json();
@@ -319,13 +469,51 @@ def auth_callback():
         # Get authorization code from callback
         code = request.args.get('code')
         if not code:
-            error = request.args.get('error_description', 'No authorization code received')
+            error = request.args.get('error_description', 'Authorization was cancelled or failed')
             return render_template_string("""
-                <html>
-                    <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
-                        <h2>❌ Authentication Failed</h2>
-                        <p>{{ error }}</p>
-                        <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #007bff; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
+                <!DOCTYPE html>
+                <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Connection Failed</title>
+                        <style>
+                            body {
+                                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                min-height: 100vh;
+                                display: flex;
+                                align-items: center;
+                                justify-content: center;
+                                padding: 20px;
+                            }
+                            .container {
+                                background: white;
+                                border-radius: 16px;
+                                padding: 40px;
+                                text-align: center;
+                                max-width: 400px;
+                                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                            }
+                            h2 { color: #e53e3e; margin-bottom: 16px; }
+                            p { color: #4a5568; margin-bottom: 24px; }
+                            .btn {
+                                display: inline-block;
+                                padding: 12px 24px;
+                                background: linear-gradient(135deg, #4299e1, #3182ce);
+                                color: white;
+                                text-decoration: none;
+                                border-radius: 8px;
+                                font-weight: 500;
+                            }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="container">
+                            <h2>❌ Connection Failed</h2>
+                            <p>{{ error }}</p>
+                            <a href="/?uid={{ uid }}" class="btn">← Try Again</a>
+                        </div>
                     </body>
                 </html>
             """, error=error, uid=uid)
@@ -346,74 +534,120 @@ def auth_callback():
             print(f"[CALLBACK] Successfully saved token for UID {uid}, account: {account}")
             
             return render_template_string("""
-                <html>
+                <!DOCTYPE html>
+                <html lang="en">
                 <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Connection Successful</title>
                     <style>
-                    body {
-                        font-family: sans-serif;
-                        padding: 2rem;
-                        text-align: center;
-                        background-color: #f5f5f5;
-                    }
-                    .card {
-                        background: white;
-                        display: inline-block;
-                        padding: 2rem 3rem;
-                        border-radius: 12px;
-                        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-                        animation: fadeIn 0.6s ease-in-out;
-                    }
-                    .center {
-                        width:100%;
-                        display:flex;
-                        align-content:center;
-                        justify-content:center;
-                        align-items:center;
-                        text-align:center;}
-                    .spinner {
-                        margin-top: 1.5rem;
-                        width: 48px;
-                        height: 48px;
-                        border: 5px solid #ddd;
-                        border-top: 5px solid #28a745;
-                        border-radius: 50%;
-                        animation: spin 1s linear infinite;
-                    }
-                    @keyframes spin {
-                        0% { transform: rotate(0deg); }
-                        100% { transform: rotate(360deg); }
-                    }
-                    @keyframes fadeIn {
-                        from { opacity: 0; transform: translateY(20px); }
-                        to { opacity: 1; transform: translateY(0); }
-                    }
+                        body {
+                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                            min-height: 100vh;
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                            padding: 20px;
+                        }
+                        .container {
+                            background: white;
+                            border-radius: 16px;
+                            padding: 40px;
+                            text-align: center;
+                            max-width: 400px;
+                            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                        }
+                        h2 { 
+                            color: #38a169; 
+                            margin-bottom: 16px;
+                            font-size: 24px;
+                        }
+                        .email {
+                            background: #f7fafc;
+                            padding: 8px 16px;
+                            border-radius: 8px;
+                            color: #2d3748;
+                            font-weight: 500;
+                            margin: 16px 0;
+                        }
+                        .spinner {
+                            width: 40px;
+                            height: 40px;
+                            border: 4px solid #e2e8f0;
+                            border-top: 4px solid #4299e1;
+                            border-radius: 50%;
+                            animation: spin 1s linear infinite;
+                            margin: 20px auto;
+                        }
+                        @keyframes spin {
+                            0% { transform: rotate(0deg); }
+                            100% { transform: rotate(360deg); }
+                        }
+                        p { color: #4a5568; margin-bottom: 16px; }
                     </style>
                 </head>
                 <body>
-                    <div class="card">
-                    <h2>✅ Authentication Successful</h2>
-                    <p><strong>User ID:</strong> {{ uid }}</p>
-                    <p><strong>Account:</strong> {{ account }}</p>
-                    <p>Uploading token to Firestore...</p>
-                    <div class="center">
-                    <div class="spinner"></div>
-                    </div>
+                    <div class="container">
+                        <h2>✅ Successfully Connected!</h2>
+                        <div class="email">{{ account }}</div>
+                        <p>Your email access has been set up successfully.</p>
+                        <p>Completing setup...</p>
+                        <div class="spinner"></div>
                     </div>
                     <script>
-                    setTimeout(() => window.location.href = '/?uid={{ uid }}', 3000);
+                        setTimeout(() => window.location.href = '/?uid={{ uid }}', 3000);
                     </script>
                 </body>
                 </html>
                 """, account=account, uid=uid)
 
         else:
-            error = result.get("error_description", "Failed to acquire token")
+            error = result.get("error_description", "Failed to connect your email account")
             return render_template_string("""
-                <html>
-                    <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
-                        <h2>❌ Token Acquisition Failed</h2>
-                        <p>{{ error }}</p>
-                        <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #007bff; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
+                <!DOCTYPE html>
+                <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Connection Failed</title>
+                        <style>
+                            body {
+                                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                min-height: 100vh;
+                                display: flex;
+                                align-items: center;
+                                justify-content: center;
+                                padding: 20px;
+                            }
+                            .container {
+                                background: white;
+                                border-radius: 16px;
+                                padding: 40px;
+                                text-align: center;
+                                max-width: 400px;
+                                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                            }
+                            h2 { color: #e53e3e; margin-bottom: 16px; }
+                            p { color: #4a5568; margin-bottom: 24px; }
+                            .btn {
+                                display: inline-block;
+                                padding: 12px 24px;
+                                background: linear-gradient(135deg, #4299e1, #3182ce);
+                                color: white;
+                                text-decoration: none;
+                                border-radius: 8px;
+                                font-weight: 500;
+                            }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="container">
+                            <h2>❌ Connection Failed</h2>
+                            <p>{{ error }}</p>
+                            <a href="/?uid={{ uid }}" class="btn">← Try Again</a>
+                        </div>
                     </body>
                 </html>
             """, error=error, uid=uid)
@@ -422,11 +656,49 @@ def auth_callback():
         print(f"[CALLBACK] Exception: {str(e)}")
         uid = request.args.get("state", "web_user")  # Try to get UID for error page
         return render_template_string("""
-            <html>
-                <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
-                    <h2>❌ Authentication Error</h2>
-                    <p>{{ error }}</p>
-                    <a href="/?uid={{ uid }}" style="padding: 0.5rem 1rem; background: #007bff; color: white; text-decoration: none; border-radius: 4px;">← Back to Token Manager</a>
+            <!DOCTYPE html>
+            <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Connection Error</title>
+                    <style>
+                        body {
+                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                            min-height: 100vh;
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                            padding: 20px;
+                        }
+                        .container {
+                            background: white;
+                            border-radius: 16px;
+                            padding: 40px;
+                            text-align: center;
+                            max-width: 400px;
+                            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                        }
+                        h2 { color: #e53e3e; margin-bottom: 16px; }
+                        p { color: #4a5568; margin-bottom: 24px; }
+                        .btn {
+                            display: inline-block;
+                            padding: 12px 24px;
+                            background: linear-gradient(135deg, #4299e1, #3182ce);
+                            color: white;
+                            text-decoration: none;
+                            border-radius: 8px;
+                            font-weight: 500;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h2>❌ Connection Error</h2>
+                        <p>{{ error }}</p>
+                        <a href="/?uid={{ uid }}" class="btn">← Try Again</a>
+                    </div>
                 </body>
             </html>
         """, error=str(e), uid=uid)
