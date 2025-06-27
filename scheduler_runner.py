@@ -6,13 +6,16 @@ import atexit
 import base64
 import requests
 from openpyxl import Workbook
-from msal import PublicClientApplication, SerializableTokenCache
+from msal import ConfidentialClientApplication, SerializableTokenCache
 
 from firebase_helpers import download_token, upload_token, upload_excel
 
 # ─── Environment Config ─────────────────────────────────
 CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
+CLIENT_SECRET = os.getenv("AZURE_API_CLIENT_SECRET")
+if not CLIENT_SECRET:
+    raise RuntimeError("Missing CLIENT_SECRET")
 
 USER_ID         = "6h0p7yYDnSZOd5CAy6qCvs4zw4D2"
 AUTHORITY  = "https://login.microsoftonline.com/common"
@@ -50,7 +53,12 @@ def _save_cache():
 atexit.register(_save_cache)
 
 # ─── Acquire Token ──────────────────────────────────────
-app = PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
+app = ConfidentialClientApplication(
+    CLIENT_ID,
+    client_credential=CLIENT_SECRET,
+    authority=AUTHORITY,
+    token_cache=cache
+)
 accounts = app.get_accounts()
 for a in accounts:
     print(f"🧾 Account: {a}")
@@ -60,7 +68,6 @@ result = None
 if accounts:
     result = app.acquire_token_silent(SCOPES, account=accounts[0], force_refresh=True)
     print("🎯 acquire_token_silent() result:", result)
-    _save_cache()
 
 if not result or "access_token" not in result:
     raise RuntimeError("Silent authentication failed or no token available.")
