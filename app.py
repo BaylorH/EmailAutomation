@@ -286,6 +286,8 @@ def api_status():
 def api_upload():
     try:
         uid = session.get("uid", "web_user") 
+        print(f"[UPLOAD] Upload requested for UID: {uid}")
+        
         user_dir = f"msal_caches/{uid}" 
         cache_file = f"{user_dir}/msal_token_cache.bin" 
         os.makedirs(user_dir, exist_ok=True)
@@ -355,6 +357,7 @@ def api_refresh():
 def auth_login():
     cache = SerializableTokenCache()
     uid = request.args.get("uid") or session.get("uid", "web_user")
+    print(f"[LOGIN] Received UID: {uid}")
     session["uid"] = uid
     user_dir = f"msal_caches/{uid}" 
     cache_file = f"{user_dir}/msal_token_cache.bin" 
@@ -372,7 +375,8 @@ def auth_login():
     # Build authorization URL
     auth_url = app_obj.get_authorization_request_url(
         SCOPES,
-        redirect_uri="https://email-token-manager.onrender.com/auth/callback"
+        redirect_uri="https://email-token-manager.onrender.com/auth/callback",
+        state=uid
     )
     
     return redirect(auth_url)
@@ -380,11 +384,16 @@ def auth_login():
 @app.route("/auth/callback")
 def auth_callback():
     try:
-        uid = request.args.get("uid") or session.get("uid", "web_user")
+        # uid = request.args.get("uid") or session.get("uid", "web_user")
+        uid = request.args.get("state", "web_user")
+        print(f"[CALLBACK] Received UID from state: {uid}")
+
         session["uid"] = uid 
         user_dir = f"msal_caches/{uid}" 
         cache_file = f"{user_dir}/msal_token_cache.bin" 
         os.makedirs(user_dir, exist_ok=True)
+        print(f"[CALLBACK] Will save token to: {cache_file}")
+
         cache = SerializableTokenCache()
         if os.path.exists(cache_file):
             cache.deserialize(open(cache_file).read())
