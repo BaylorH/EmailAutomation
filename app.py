@@ -170,6 +170,12 @@ def index():
                         <p>Uses browser redirect - works well for web deployments</p>
                         <button class="btn-primary" onclick="startWebAuth()">🔐 Start Web Authentication</button>
                     </div>
+                    
+                    <div class="method-card">
+                        <h4>📱 Device Code Flow</h4>
+                        <p>Use another device/browser - good for servers</p>
+                        <button class="btn-primary" onclick="startDeviceFlow()">📱 Start Device Authentication</button>
+                    </div>
                 </div>
                 
             {% endif %}
@@ -207,11 +213,82 @@ def index():
                     window.location.href = '/auth/login';
                 }
                 
+                async function startDeviceFlow() {
+                    const data = await apiCall('/api/device-flow', 'POST');
+                    if (data && data.verification_uri && data.user_code) {
+                        log(`\n🔐 DEVICE CODE: ${data.user_code}`);
+                        log(`🌐 Go to: ${data.verification_uri}`);
+                        log(`📋 Copy this code: ${data.user_code}`);
+                        log(`\nOpening in new window...`);
+                        
+                        // Create a more user-friendly page
+                        const newWindow = window.open('', '_blank', 'width=600,height=400');
+                        newWindow.document.write(`
+                            <html>
+                                <head><title>Device Authentication</title></head>
+                                <body style="font-family: sans-serif; padding: 2rem; text-align: center;">
+                                    <h2>📱 Device Authentication</h2>
+                                    <p>1. Go to: <a href="${data.verification_uri}" target="_blank">${data.verification_uri}</a></p>
+                                    <p>2. Enter this code:</p>
+                                    <div style="font-size: 2rem; font-weight: bold; background: #f0f0f0; padding: 1rem; border-radius: 8px; margin: 1rem;">
+                                        ${data.user_code}
+                                    </div>
+                                    <button onclick="navigator.clipboard.writeText('${data.user_code}')" style="padding: 0.5rem 1rem; background: #007bff; color: white; border: none; border-radius: 4px;">
+                                        📋 Copy Code
+                                    </button>
+                                    <br><br>
+                                    <a href="${data.verification_uri}" target="_blank" style="padding: 0.5rem 1rem; background: #28a745; color: white; text-decoration: none; border-radius: 4px;">
+                                        🔗 Open Microsoft Login
+                                    </a>
+                                </body>
+                            </html>
+                        `);
+                        
+                        // Start polling
+                        pollDeviceFlow();
+                    }
+                }
+                
+                async function pollDeviceFlow() {
+                    log("📡 Polling for device flow completion...");
+                    let pollCount = 0;
+                    const maxPolls = 180; // 15 minutes
+                    
+                    const poll = async () => {
+                        pollCount++;
+                        const data = await apiCall('/api/poll-device');
+                        
+                        if (data) {
+                            if (data.status === 'completed') {
+                                log(`✅ Device flow completed successfully! Account: ${data.account || 'Unknown'}`);
+                                setTimeout(() => location.reload(), 2000);
+                                return;
+                            } else if (data.status === 'error') {
+                                log(`❌ Device flow error: ${data.error}`);
+                                return;
+                            } else if (data.status === 'pending') {
+                                const remainingTime = Math.max(0, maxPolls - pollCount);
+                                const minutes = Math.floor(remainingTime * 5 / 60);
+                                const seconds = (remainingTime * 5) % 60;
+                                log(`⏳ Still waiting... (${minutes}:${seconds.toString().padStart(2, '0')} remaining)`);
+                                
+                                if (pollCount < maxPolls) {
+                                    setTimeout(poll, 5000);
+                                } else {
+                                    log("⏰ Polling timeout reached. Please start a new authentication if needed.");
+                                }
+                            }
+                        }
+                    };
+                    
+                    setTimeout(poll, 5000);
+                }
             </script>
         </body>
     </html>
     """, status=status, base_url=base_url, uid=uid, upload_result=upload_result)
 
+# Global variable to store device flow
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
@@ -239,6 +316,8 @@ def api_clear():
         os.makedirs(user_dir, exist_ok=True)
         if os.path.exists(cache_file):
             os.remove(cache_file)
+        global current_device_flow
+        current_device_flow = None
         return jsonify({"success": True, "message": "Token cache cleared"})
     except Exception as e:
         return jsonify({"error": str(e)})
@@ -407,6 +486,97 @@ def auth_callback():
                 </body>
             </html>
         """, error=str(e), uid=uid)
+
+# Device flow endpoints (updated to handle UID properly)
+@app.route("/api/device-flow", methods=["POST"])
+def api_device_flow():
+    global current_device_flow
+
+    try:
+        uid = session.get("uid", "web_user")
+        print(f"[DEVICE-FLOW] Starting device flow for UID: {uid}")
+        
+        cache = SerializableTokenCache()
+        app_obj = ConfidentialClientApplication(
+            CLIENT_ID,
+            client_credential=CLIENT_SECRET,
+            authority=AUTHORITY,
+            token_cache=cache
+        )
+
+        # Initiate device flow with proper error handling
+        flow = app_obj.initiate_device_flow(scopes=SCOPES)
+        
+        if "user_code" not in flow:
+            error_msg = flow.get("error_description", "Failed to initiate device flow")
+            return jsonify({"error": error_msg})
+
+        # Store with UID context
+        current_device_flow = (app_obj, flow, cache, uid)
+
+        return jsonify({
+            "success": True,
+            "verification_uri": flow["verification_uri"],
+            "user_code": flow["user_code"],
+            "expires_in": flow.get("expires_in", 900)
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route("/api/poll-device")
+def api_poll_device():
+    global current_device_flow
+    
+    if not current_device_flow:
+        return jsonify({"error": "No device flow in progress"})
+    
+    app_obj, flow, cache, uid = current_device_flow
+    print(f"[POLL-DEVICE] Polling for UID: {uid}")
+    
+    try:
+        result = app_obj.acquire_token_by_device_flow(flow)
+        
+        if "access_token" in result:
+            # Success! Save token to user-specific location
+            user_dir = f"msal_caches/{uid}" 
+            cache_file = f"{user_dir}/msal_token_cache.bin" 
+            os.makedirs(user_dir, exist_ok=True)
+            
+            with open(cache_file, "w") as f:
+                f.write(cache.serialize())
+            
+            print(f"[POLL-DEVICE] Successfully saved token for UID {uid}")
+            
+            # Clean up
+            current_device_flow = None
+            
+            return jsonify({
+                "status": "completed", 
+                "message": "Token acquired successfully",
+                "account": result.get("account", {}).get("username", "Unknown")
+            })
+        
+        elif "error" in result:
+            error = result["error"]
+            if error == "authorization_pending":
+                return jsonify({"status": "pending", "message": "Waiting for user authentication..."})
+            elif error == "authorization_declined":
+                current_device_flow = None
+                return jsonify({"status": "error", "error": "User declined the authentication request"})
+            elif error == "expired_token":
+                current_device_flow = None
+                return jsonify({"status": "error", "error": "Device code expired. Please start a new authentication."})
+            else:
+                current_device_flow = None
+                return jsonify({"status": "error", "error": result.get("error_description", error)})
+        
+        else:
+            return jsonify({"status": "pending", "message": "Authentication in progress..."})
+    
+    except Exception as e:
+        current_device_flow = None
+        return jsonify({"status": "error", "error": f"Unexpected error: {str(e)}"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
