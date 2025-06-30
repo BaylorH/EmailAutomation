@@ -154,8 +154,8 @@ def refresh_and_process_user(user_id):
         "Content-Type": "application/json"
     }
 
-    send_weekly_email(headers, ["bp21harrison@gmail.com"])
-    process_replies(headers, user_id)
+    # send_weekly_email(headers, ["bp21harrison@gmail.com"])
+    # process_replies(headers, user_id)
 
 # ─── Entry ─────────────────────────────────────────────
 if __name__ == "__main__":
