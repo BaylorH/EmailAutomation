@@ -17,7 +17,7 @@ jobs:
           python-version: '3.x'
           
       - name: Install dependencies
-        run: pip install msal requests openpyxl firebase-admin
+        run: pip install -r requirements.txt
 
       - name: Validate CLIENT_ID prefix
         run: |
@@ -29,9 +29,15 @@ jobs:
           fi
         env:
           CLIENT_ID: ${{ secrets.AZURE_API_APP_ID }}
+
+      - name: Write service account key
+        # Expect a repo secret named FIREBASE_SERVICE_ACCOUNT_JSON containing the full JSON
+        run: |
+          echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}' > $RUNNER_TEMP/sa.json
           
       - name: Run email script
         env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
           FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
