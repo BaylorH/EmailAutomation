@@ -9,6 +9,9 @@ from msal import ConfidentialClientApplication, SerializableTokenCache
 
 from firebase_helpers import download_token, upload_token, upload_excel
 
+from google.cloud import firestore
+import re
+
 # ─── Config ─────────────────────────────────────────────
 CLIENT_ID         = os.getenv("AZURE_API_APP_ID")
 CLIENT_SECRET     = os.getenv("AZURE_API_CLIENT_SECRET")
@@ -29,6 +32,99 @@ THANK_YOU_BODY = "Thanks for your response."
 
 if not CLIENT_ID or not CLIENT_SECRET or not FIREBASE_API_KEY:
     raise RuntimeError("❌ Missing required env vars")
+
+# Firestore Admin client (uses GOOGLE_APPLICATION_CREDENTIALS)
+_fs = firestore.Client()
+
+# ─── Helper: detect HTML vs text ───────────────────────
+_html_rx = re.compile(r"<[a-zA-Z/][^>]*>")
+
+def _body_kind(script: str):
+    if script and _html_rx.search(script):
+        return "HTML", script
+    return "Text", script or ""
+
+# ─── Send email via Graph ──────────────────────────────
+def send_email(headers, script: str, emails: list[str]):
+    if not emails:
+        return {"sent": [], "errors": {"_all": "No recipients"}}
+
+    content_type, content = _body_kind(script)
+    results = {"sent": [], "errors": {}}
+
+    for addr in emails:
+        payload = {
+            "message": {
+                "subject": "Client Outreach",
+                "body": {"contentType": content_type, "content": content},
+                "toRecipients": [{"emailAddress": {"address": addr}}],
+            },
+            "saveToSentItems": True,
+        }
+        try:
+            r = requests.post(
+                "https://graph.microsoft.com/v1.0/me/sendMail",
+                headers=headers,
+                json=payload,
+                timeout=20,
+            )
+            r.raise_for_status()
+            results["sent"].append(addr)
+            print(f"✅ Sent to {addr}")
+        except Exception as e:
+            msg = str(e)
+            print(f"❌ Failed to send to {addr}: {msg}")
+            results["errors"][addr] = msg
+
+    return results
+
+# ─── Process outbox for one user ───────────────────────
+def send_outboxes(user_id: str, headers):
+    """
+    Reads users/{uid}/outbox/* docs.
+    Each doc should contain only:
+      - assignedEmails: string[]
+      - script:         string
+    Success: delete the doc.
+    Failure: keep the doc with { attempts += 1, lastError }.
+    """
+    outbox_ref = _fs.collection("users").document(user_id).collection("outbox")
+    docs = list(outbox_ref.stream())
+
+    if not docs:
+        print("📭 Outbox empty")
+        return
+
+    print(f"📬 Found {len(docs)} outbox item(s)")
+    for d in docs:
+        data = d.to_dict() or {}
+        emails = data.get("assignedEmails") or []
+        script = data.get("script") or ""
+
+        print(f"→ Sending outbox item {d.id} to {len(emails)} recipient(s)")
+
+        try:
+            res = send_email(headers, script, emails)
+            any_errors = bool(res["errors"])
+
+            if not any_errors and res["sent"]:
+                d.reference.delete()
+                print(f"🗑️  Deleted outbox item {d.id}")
+            else:
+                attempts = int(data.get("attempts") or 0) + 1
+                d.reference.set(
+                    {"attempts": attempts, "lastError": json.dumps(res["errors"])[:1500]},
+                    merge=True,
+                )
+                print(f"⚠️  Kept item {d.id} with error; attempts={attempts}")
+
+        except Exception as e:
+            attempts = int(data.get("attempts") or 0) + 1
+            d.reference.set(
+                {"attempts": attempts, "lastError": str(e)[:1500]},
+                merge=True,
+            )
+            print(f"💥 Error sending item {d.id}: {e}; attempts={attempts}")
 
 # ─── Utility: List user IDs from Firebase ──────────────
 def list_user_ids():
@@ -156,6 +252,7 @@ def refresh_and_process_user(user_id):
 
     # send_weekly_email(headers, ["bp21harrison@gmail.com"])
     # process_replies(headers, user_id)
+    send_outboxes(user_id, headers)
 
 # ─── Entry ─────────────────────────────────────────────
 if __name__ == "__main__":
