@@ -3,3 +3,5 @@ msal
 requests
 google-cloud-firestore
 google-auth
+openpyxl 
+firebase-admin
