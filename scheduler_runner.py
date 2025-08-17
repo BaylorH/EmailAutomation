@@ -267,7 +267,31 @@ def refresh_and_process_user(user_id: str):
     print(f"🔎 RT env:                    {rt_env}")
     print(f"🔎 RT home_account_id:        {rt_home}")
 
-    # 3) Determine the correct authority to use
+    # 3) Create MSAL app with common authority first to get accounts
+    app_initial = ConfidentialClientApplication(
+        CLIENT_ID,
+        client_credential=CLIENT_SECRET,
+        authority=AUTHORITY,
+        token_cache=cache,
+    )
+
+    # 4) Get accounts to determine account type
+    accts = app_initial.get_accounts()
+    print("👤 Accounts in cache:", [a.get("username") for a in accts] or "<none>")
+    if not accts:
+        print("⚠️ No account objects found; cache likely not matching this app/authority.")
+        return
+    
+    account = accts[0]
+    print(f"🔍 Using account: {account.get('username')} (account object type: {type(account)})")
+    print(f"🔍 Account keys: {list(account.keys()) if hasattr(account, 'keys') else 'N/A'}")
+    
+    # Validate account is not None (critical for MSAL 1.23+)
+    if account is None:
+        print("❌ Account is None - this will cause acquire_token_silent to return None in MSAL 1.23+")
+        return
+
+    # 5) Determine the correct authority to use based on account type
     utid = _extract_utid(rt_home) if rt_home else None
     
     # Check if this is a personal Microsoft account (MSA)
@@ -286,7 +310,7 @@ def refresh_and_process_user(user_id: str):
         auth_to_use = AUTHORITY
         print(f"🧭 Using common authority: {auth_to_use}")
 
-    # 4) Create MSAL app with the correct authority
+    # 6) Create MSAL app with the correct authority
     app = ConfidentialClientApplication(
         CLIENT_ID,
         client_credential=CLIENT_SECRET,
@@ -294,23 +318,16 @@ def refresh_and_process_user(user_id: str):
         token_cache=cache,
     )
 
-    # 5) Get accounts from the app
+    # Re-get accounts from the correct authority app
     accts = app.get_accounts()
-    print("👤 Accounts in cache:", [a.get("username") for a in accts] or "<none>")
-    if not accts:
-        print("⚠️ No account objects found; cache likely not matching this app/authority.")
-        return
-    
-    account = accts[0]
-    print(f"🔍 Using account: {account.get('username')} (account object type: {type(account)})")
-    print(f"🔍 Account keys: {list(account.keys()) if hasattr(account, 'keys') else 'N/A'}")
-    
-    # Validate account is not None (critical for MSAL 1.23+)
-    if account is None:
-        print("❌ Account is None - this will cause acquire_token_silent to return None in MSAL 1.23+")
-        return
+    if accts:
+        account = accts[0]  # Update account from correct authority
+        print(f"🔍 Updated account from {auth_to_use}: {account.get('username')}")
+    else:
+        print(f"⚠️ No accounts found with {auth_to_use} authority, using original account")
+        # Keep the original account from common authority
 
-    # 6) Try silent auth (first without force, then with force if needed)
+    # 7) Try silent auth (first without force, then with force if needed)
     print("🔐 Attempting silent token acquisition...")
     print(f"🔍 Scopes: {SCOPES}")
     print(f"🔍 Account username: {account.get('username')}")
@@ -333,7 +350,7 @@ def refresh_and_process_user(user_id: str):
                 claims_challenge=None
             )
 
-    # 7) If the first authority didn't work, try additional fallbacks
+    # 8) If the first authority didn't work, try additional fallbacks
     if not (result and "access_token" in result):
         print("🔄 First authority failed, trying fallback authorities...")
         
@@ -492,7 +509,7 @@ def refresh_and_process_user(user_id: str):
         print("   4. Conditional Access policy preventing silent refresh")
         print("   → Recommendation: User needs to re-authenticate through your web app.")
 
-    # 8) Final check with enhanced error reporting
+    # 9) Final check with enhanced error reporting
     if not (result and "access_token" in result):
         if result:
             error_code = result.get("error")
