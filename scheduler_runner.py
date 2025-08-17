@@ -198,7 +198,7 @@ def process_replies(headers, user_id):
     print(f"✅ Saved replies to {file}")
 
 # ─── Main Loop ─────────────────────────────────────────
-def refresh_and_process_user(user_id):
+def refresh_and_process_user(user_id: str):
     print(f"\n🔄 Processing user: {user_id}")
 
     download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
@@ -229,14 +229,23 @@ def refresh_and_process_user(user_id):
         print(f"⚠️ No account found for {user_id}")
         return
 
-    result = app.acquire_token_silent(SCOPES, account=accounts[0], force_refresh=True)
+    # --- KEY CHANGE: do NOT force refresh; let MSAL use cached AT first ---
+    before_state = cache.has_state_changed  # usually False right after deserialize
+    result = app.acquire_token_silent(SCOPES, account=accounts[0])  # <-- no force_refresh
+    after_state = cache.has_state_changed
+
     if not result or "access_token" not in result:
         print(f"❌ Silent auth failed for {user_id}")
         return
 
     access_token = result["access_token"]
-    print(f"🎯 Token refreshed for {user_id} — preview: {access_token[:40]}")
 
+    # Helpful logging: was it cached or refreshed?
+    token_source = "refreshed_via_refresh_token" if (not before_state and after_state) else "cached_access_token"
+    exp_secs = result.get("expires_in")
+    print(f"🎯 Using {token_source}; expires_in≈{exp_secs}s — preview: {access_token[:40]}")
+
+    # (Optional) sanity check on JWT-shaped token & appid
     if access_token.count(".") == 2:
         decoded = decode_token_payload(access_token)
         appid = decoded.get("appid", "unknown")
@@ -253,6 +262,7 @@ def refresh_and_process_user(user_id):
     # send_weekly_email(headers, ["bp21harrison@gmail.com"])
     # process_replies(headers, user_id)
     send_outboxes(user_id, headers)
+
 
 # ─── Entry ─────────────────────────────────────────────
 if __name__ == "__main__":
