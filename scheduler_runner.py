@@ -103,6 +103,7 @@ def fetch_conversation_messages(headers, conversation_id: str, max_items: int = 
     messages.sort(key=lambda m: (m.get("sentDateTime") or m.get("receivedDateTime") or ""))
     return messages
 
+
 def log_conversation(messages: list[dict], my_address: str, label: str):
     """
     Print a readable transcript to console.
@@ -126,6 +127,10 @@ def log_conversation(messages: list[dict], my_address: str, label: str):
         for line in body_txt.splitlines():
             print(f"     {line}")
 
+# show *all* conversations you initiated that carry an x-client-id (recent window)
+# dump_conversations_for_client(headers, client_id=None, top_sent=25)
+# …or focus a single client:
+# dump_conversations_for_client(headers, client_id="3WI5hjxYqmbOim2b1oQS", top_sent=50)
 def dump_conversations_for_client(headers, client_id: str | None = None, top_sent: int = 25):
     """
     Step 1: pull Sent with x-client-id (optionally filter specific client)
@@ -599,12 +604,6 @@ def refresh_and_process_user(user_id: str):
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
     }
-
-    # show *all* conversations you initiated that carry an x-client-id (recent window)
-    dump_conversations_for_client(headers, client_id=None, top_sent=25)
-
-    # …or focus a single client:
-    # dump_conversations_for_client(headers, client_id="3WI5hjxYqmbOim2b1oQS", top_sent=50)
 
     # send_weekly_email(headers, ["bp21harrison@gmail.com"])
     # process_replies(headers, user_id)
