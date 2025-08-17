@@ -52,6 +52,32 @@ def _get_header(headers_list, name: str) -> str:
             return h.get("value", "")
     return ""
 
+def _tokenize_refs(refs_value: str) -> set[str]:
+    # References header is space-separated message-ids like "<a@x> <b@y>"
+    return set(t for t in (refs_value or "").split() if t.startswith("<") and t.endswith(">"))
+
+def _load_recent_sent(headers, top: int = 100):
+    """Fetch recent Sent Items once; return dicts by internetMessageId and by conversationId."""
+    url = "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages"
+    params = {
+        "$top": str(top),
+        "$orderby": "sentDateTime desc",
+        "$select": "id,subject,sentDateTime,conversationId,internetMessageId,internetMessageHeaders"
+    }
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    r.raise_for_status()
+    items = r.json().get("value", [])
+    by_imid = {}
+    by_conv = {}
+    for m in items:
+        imid = m.get("internetMessageId")
+        if imid:
+            by_imid[imid] = m
+        conv = m.get("conversationId")
+        if conv:
+            by_conv.setdefault(conv, []).append(m)
+    return by_imid, by_conv
+
 # ─── Send email via Graph ──────────────────────────────
 def send_email(headers, script: str, emails: list[str], client_id: str | None = None):
     if not emails:
@@ -171,32 +197,80 @@ def send_weekly_email(headers, to_addresses):
         resp.raise_for_status()
         print(f"✅ Sent '{SUBJECT}' to {addr}")
 
+def scan_new_mail_and_find_client_from_sent(headers, only_unread: bool = True, top_inbox: int = 10, top_sent: int = 100):
+    """
+    For each recent inbound message:
+      - detect reply via In-Reply-To/References
+      - find the related SENT message
+      - print the x-client-id from the SENT message's headers
+    """
+    # 1) Load Sent Items once
+    by_imid, by_conv = _load_recent_sent(headers, top=top_sent)
 
-def scan_sent_for_client_header(headers, top: int = 5):
-    url = "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages"
+    # 2) Load recent Inbox messages
+    inbox_url = "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
     params = {
-        "$top": str(top),
-        "$orderby": "sentDateTime desc",
-        "$select": "id,subject,sentDateTime,conversationId,internetMessageId,internetMessageHeaders",
-        "$filter": "startswith(subject,'Client Outreach')"  # adjust if needed
+        "$top": str(top_inbox),
+        "$orderby": "receivedDateTime desc",
+        "$select": "id,subject,from,replyTo,receivedDateTime,conversationId,internetMessageId,internetMessageHeaders",
     }
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    r.raise_for_status()
-    items = r.json().get("value", [])
-    if not items:
-        print("📭 Sent scan: none found.")
+    if only_unread:
+        params["$filter"] = "isRead eq false"
+
+    resp = requests.get(inbox_url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    messages = resp.json().get("value", [])
+
+    if not messages:
+        print("📭 Inbox scan: no messages.")
         return
 
-    print(f"🔎 Scanning {len(items)} sent message(s) for x-client-id ...")
-    for m in items:
+    print(f"🔎 Scanning {len(messages)} inbound message(s) and resolving x-client-id from Sent Items ...")
+
+    for m in messages:
         hdrs = m.get("internetMessageHeaders") or []
-        x_client_id = _get_header(hdrs, "x-client-id")
-        print(f"• [{m.get('sentDateTime','')}] {m.get('subject','(no subject)')}")
-        print(f"   conversationId={m.get('conversationId')}, internetMessageId={m.get('internetMessageId')}")
-        if x_client_id:
-            print(f"   🧩 x-client-id={x_client_id}")
+        in_reply_to = _get_header(hdrs, "In-Reply-To")
+        references  = _tokenize_refs(_get_header(hdrs, "References"))
+        conv_id     = m.get("conversationId")
+        subj        = m.get("subject", "(no subject)")
+        frm         = (m.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
+        when        = m.get("receivedDateTime", "")
+
+        # Try to locate the related SENT message
+        sent_msg = None
+        if in_reply_to and in_reply_to in by_imid:
+            sent_msg = by_imid[in_reply_to]
+        if not sent_msg and references:
+            for ref in references:
+                if ref in by_imid:
+                    sent_msg = by_imid[ref]
+                    break
+        if not sent_msg and conv_id and conv_id in by_conv:
+            # fallback: any message we sent in the same conversation
+            # pick the most recent sent item for that conversation
+            sent_msg = sorted(by_conv[conv_id], key=lambda x: x.get("sentDateTime",""), reverse=True)[0]
+
+        print(f"• [{when}] from {frm} — {subj}")
+        if in_reply_to:
+            print(f"   ↪ In-Reply-To: {in_reply_to}")
+        if references:
+            preview = " ".join(list(references))[:120] + ("…" if len(" ".join(list(references))) > 120 else "")
+            print(f"   ↪ References:  {preview}")
+        if conv_id:
+            print(f"   ↪ conversationId: {conv_id}")
+
+        if sent_msg:
+            x_client_id = _get_header(sent_msg.get("internetMessageHeaders", []), "x-client-id")
+            imid_sent   = sent_msg.get("internetMessageId")
+            subj_sent   = sent_msg.get("subject")
+            print(f"   ✅ Matched SENT item: {subj_sent}")
+            print(f"      internetMessageId={imid_sent}")
+            if x_client_id:
+                print(f"      🧩 x-client-id={x_client_id}")
+            else:
+                print("      (SENT item has no x-client-id header)")
         else:
-            print("   (no x-client-id on SENT message)")
+            print("   ⚠️ Could not find a related SENT item (try increasing top_sent, or store the original imid at send-time)")
 
 
 def scan_new_mail_for_client_header(headers, only_unread: bool = True, top: int = 10):
@@ -374,7 +448,7 @@ def refresh_and_process_user(user_id: str):
     # process_replies(headers, user_id)
     send_outboxes(user_id, headers)
     scan_new_mail_for_client_header(headers, only_unread=True, top=10)
-    scan_sent_for_client_header(headers, top=5)
+    scan_new_mail_and_find_client_from_sent(headers, only_unread=True, top_inbox=10, top_sent=100)
 
 
 # ─── Entry ─────────────────────────────────────────────
