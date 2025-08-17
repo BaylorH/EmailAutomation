@@ -44,6 +44,14 @@ def _body_kind(script: str):
         return "HTML", script
     return "Text", script or ""
 
+def _get_header(headers_list, name: str) -> str:
+    """Case-insensitive lookup of an internet message header."""
+    name_l = name.lower()
+    for h in headers_list or []:
+        if h.get("name", "").lower() == name_l:
+            return h.get("value", "")
+    return ""
+
 # ─── Send email via Graph ──────────────────────────────
 def send_email(headers, script: str, emails: list[str], client_id: str | None = None):
     if not emails:
@@ -165,6 +173,76 @@ def send_weekly_email(headers, to_addresses):
         resp.raise_for_status()
         print(f"✅ Sent '{SUBJECT}' to {addr}")
 
+def scan_new_mail_for_client_header(headers, only_unread: bool = True, top: int = 10):
+    """
+    Scan recent Inbox messages and log whether custom x-headers are present.
+    Intended as a diagnostic to confirm header behavior on replies.
+    """
+    base = "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
+    params = {
+        "$top": str(top),
+        "$orderby": "receivedDateTime desc",
+        "$select": "id,subject,from,replyTo,receivedDateTime,conversationId,internetMessageId,internetMessageHeaders",
+    }
+    if only_unread:
+        params["$filter"] = "isRead eq false"
+
+    resp = requests.get(base, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    messages = resp.json().get("value", [])
+
+    if not messages:
+        print("📭 Inbox scan: no messages.")
+        return
+
+    print(f"🔎 Scanning {len(messages)} inbound message(s) for x-client-id ...")
+
+    for m in messages:
+        hdrs = m.get("internetMessageHeaders")
+
+        # Fallback: some tenants/clients require fetching the item again with a $select for headers
+        if hdrs is None:
+            r2 = requests.get(
+                f"https://graph.microsoft.com/v1.0/me/messages/{m['id']}",
+                headers=headers,
+                params={"$select": "internetMessageHeaders,subject,from,receivedDateTime,conversationId,internetMessageId"},
+                timeout=20
+            )
+            if r2.ok:
+                j = r2.json()
+                hdrs = j.get("internetMessageHeaders", [])
+                # keep other fields if the first call omitted them
+                m.setdefault("subject", j.get("subject"))
+                m.setdefault("from", j.get("from"))
+                m.setdefault("receivedDateTime", j.get("receivedDateTime"))
+                m.setdefault("conversationId", j.get("conversationId"))
+                m.setdefault("internetMessageId", j.get("internetMessageId"))
+            else:
+                hdrs = []
+
+        in_reply_to = _get_header(hdrs, "In-Reply-To")
+        references  = _get_header(hdrs, "References")
+        x_client_id = _get_header(hdrs, "x-client-id")
+        x_thread_id = _get_header(hdrs, "x-thread-id")
+
+        is_reply = bool(in_reply_to or m.get("replyTo"))
+        subj = m.get("subject", "(no subject)")
+        frm  = (m.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
+        when = m.get("receivedDateTime", "")
+
+        print(f"• {'REPLY' if is_reply else 'NEW  '} [{when}] from {frm} — {subj}")
+        if in_reply_to:
+            print(f"   ↪ In-Reply-To: {in_reply_to}")
+        if references:
+            preview = references[:120] + ("…" if len(references) > 120 else "")
+            print(f"   ↪ References:  {preview}")
+
+        if x_client_id or x_thread_id:
+            print(f"   🧩 Custom headers found → x-client-id={x_client_id or '—'}; x-thread-id={x_thread_id or '—'}")
+        else:
+            print("   (no custom x-headers found)")
+
+
 def process_replies(headers, user_id):
     url = "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
     params = {
@@ -269,6 +347,7 @@ def refresh_and_process_user(user_id: str):
     # send_weekly_email(headers, ["bp21harrison@gmail.com"])
     # process_replies(headers, user_id)
     send_outboxes(user_id, headers)
+    scan_new_mail_for_client_header(headers, only_unread=True, top=10)
 
 
 # ─── Entry ─────────────────────────────────────────────
