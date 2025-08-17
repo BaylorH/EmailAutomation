@@ -10,7 +10,146 @@ from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token, upload_excel
 
 from google.cloud import firestore
+
+from datetime import datetime
+import html
 import re
+
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+_BODY_TAG_RX = re.compile(r"<[^>]+>")  # crude HTML stripper for logs
+
+def _strip_html(s: str) -> str:
+    if not s:
+        return ""
+    # unescape entities then drop tags
+    return _BODY_TAG_RX.sub("", html.unescape(s))
+
+def _get_my_address(headers) -> str:
+    r = requests.get(f"{GRAPH_BASE}/me", headers=headers, params={"$select":"mail,userPrincipalName"}, timeout=20)
+    r.raise_for_status()
+    me = r.json()
+    return (me.get("mail") or me.get("userPrincipalName") or "").lower()
+
+def get_sent_with_client_id(headers, client_id: str | None = None, top: int = 50):
+    """
+    Return recent sent messages that carry x-client-id (optionally match a specific client_id).
+    Each item: {id, subject, to, sentDateTime, conversationId, internetMessageId, x_client_id}
+    """
+    params = {
+        "$top": str(top),
+        "$orderby": "sentDateTime desc",
+        "$select": "id,subject,toRecipients,sentDateTime,conversationId,internetMessageId,internetMessageHeaders",
+    }
+    r = requests.get(f"{GRAPH_BASE}/me/mailFolders/SentItems/messages", headers=headers, params=params, timeout=20)
+    r.raise_for_status()
+    items = r.json().get("value", [])
+    results = []
+    for m in items:
+        hdrs = m.get("internetMessageHeaders")
+        # fallback fetch if headers missing
+        if hdrs is None:
+            r2 = requests.get(f"{GRAPH_BASE}/me/messages/{m['id']}",
+                              headers=headers,
+                              params={"$select":"internetMessageHeaders,subject,toRecipients,sentDateTime,conversationId,internetMessageId"},
+                              timeout=20)
+            if r2.ok:
+                j = r2.json()
+                m["internetMessageHeaders"] = hdrs = j.get("internetMessageHeaders", [])
+                for k in ("subject","toRecipients","sentDateTime","conversationId","internetMessageId"):
+                    m.setdefault(k, j.get(k))
+            else:
+                hdrs = []
+        x_client = _get_header(hdrs, "x-client-id")
+        if not x_client:
+            continue
+        if client_id and x_client != client_id:
+            continue
+        results.append({
+            "id": m.get("id"),
+            "subject": m.get("subject"),
+            "to": [t["emailAddress"]["address"] for t in (m.get("toRecipients") or []) if "emailAddress" in t],
+            "sentDateTime": m.get("sentDateTime"),
+            "conversationId": m.get("conversationId"),
+            "internetMessageId": m.get("internetMessageId"),
+            "x_client_id": x_client
+        })
+    return results
+
+def fetch_conversation_messages(headers, conversation_id: str, max_items: int = 200):
+    """
+    Fetch all messages for a conversationId, across folders.
+    Returns list sorted by sentDateTime ascending.
+    """
+    # Pull in chunks (Graph paging); keep it simple for now
+    messages = []
+    url = f"{GRAPH_BASE}/me/messages"
+    params = {
+        "$filter": f"conversationId eq '{conversation_id}'",
+        "$select": "id,subject,from,toRecipients,sentDateTime,receivedDateTime,conversationId,internetMessageId,body,bodyPreview",
+        "$orderby": "sentDateTime asc",
+        "$top": "50",
+    }
+    while True:
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        messages.extend(data.get("value", []))
+        if len(messages) >= max_items or "@odata.nextLink" not in data:
+            break
+        # page through
+        url = data["@odata.nextLink"]
+        params = None  # nextLink already has query
+    # final sort (belt & suspenders)
+    messages.sort(key=lambda m: (m.get("sentDateTime") or m.get("receivedDateTime") or ""))
+    return messages
+
+def log_conversation(messages: list[dict], my_address: str, label: str):
+    """
+    Print a readable transcript to console.
+    """
+    print(f"\n🧵 Conversation: {label} — {len(messages)} message(s)")
+    for m in messages:
+        frm = (m.get("from") or {}).get("emailAddress", {}).get("address", "").lower()
+        to_addrs = [t["emailAddress"]["address"].lower() for t in (m.get("toRecipients") or []) if "emailAddress" in t]
+        direction = "ME → THEM" if frm == my_address else "THEM → ME"
+        ts = m.get("sentDateTime") or m.get("receivedDateTime") or ""
+        subj = m.get("subject", "(no subject)")
+        body = (m.get("body") or {}).get("content", "") or m.get("bodyPreview") or ""
+        body_txt = _strip_html(body).strip()
+        if len(body_txt) > 1200:
+            body_txt = body_txt[:1200] + "…"
+
+        print(f"— {direction} @ {ts}")
+        print(f"   Subject: {subj}")
+        print(f"   From: {frm}  To: {', '.join(to_addrs)}")
+        print("   Body:")
+        for line in body_txt.splitlines():
+            print(f"     {line}")
+
+def dump_conversations_for_client(headers, client_id: str | None = None, top_sent: int = 25):
+    """
+    Step 1: pull Sent with x-client-id (optionally filter specific client)
+    Step 2: for each, fetch all messages in that conversation
+    Step 3: console log the full thread
+    """
+    my_addr = _get_my_address(headers)
+    sent_hits = get_sent_with_client_id(headers, client_id=client_id, top=top_sent)
+    if not sent_hits:
+        print("ℹ️ No sent items with x-client-id found in the window.")
+        return
+
+    # Deduplicate by conversationId (in case multiple sent messages exist in same thread)
+    seen = set()
+    for s in sent_hits:
+        conv = s["conversationId"]
+        if not conv or conv in seen:
+            continue
+        seen.add(conv)
+
+        label = f"{s['subject']}  | x-client-id={s['x_client_id']}  | convId={conv}"
+        msgs = fetch_conversation_messages(headers, conv, max_items=300)
+        log_conversation(msgs, my_addr, label)
+
 
 # ─── Config ─────────────────────────────────────────────
 CLIENT_ID         = os.getenv("AZURE_API_APP_ID")
@@ -460,6 +599,12 @@ def refresh_and_process_user(user_id: str):
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
     }
+
+    # show *all* conversations you initiated that carry an x-client-id (recent window)
+    dump_conversations_for_client(headers, client_id=None, top_sent=25)
+
+    # …or focus a single client:
+    # dump_conversations_for_client(headers, client_id="3WI5hjxYqmbOim2b1oQS", top_sent=50)
 
     # send_weekly_email(headers, ["bp21harrison@gmail.com"])
     # process_replies(headers, user_id)
