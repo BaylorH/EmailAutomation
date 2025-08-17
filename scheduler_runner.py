@@ -238,7 +238,7 @@ def refresh_and_process_user(user_id):
             print("Correlation ID:", result.get("correlation_id"))
             print("Trace ID:", result.get("trace_id"))
         else:
-            print(f"❌ Silent auth failed for {user_id}: no result")
+            print(f"❌ Silent auth failed for {user_id}: no result HERE")
         return
 
     access_token = result["access_token"]
