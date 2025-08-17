@@ -197,6 +197,26 @@ def process_replies(headers, user_id):
     upload_excel(FIREBASE_API_KEY, input_file=file)
     print(f"✅ Saved replies to {file}")
 
+def debug_dump_cache(cache, label=""):
+    try:
+        data = json.loads(cache.serialize())
+        ats = data.get("AccessToken", {})
+        rts = data.get("RefreshToken", {})
+        ids = data.get("IdToken", {})
+        print(f"\n🧪 Cache dump {label}")
+        print(f"   AccessTokens: {len(ats)}")
+        print(f"   RefreshTokens: {len(rts)}")
+        print(f"   IdTokens: {len(ids)}")
+        # Optional: peek at refresh token metadata only (no secret values)
+        for k, v in rts.items():
+            print("   ↳ RT key:", k)
+            print("      client_id:", v.get("client_id"))
+            print("      env:", v.get("environment"))
+            print("      home_account_id:", v.get("home_account_id"))
+    except Exception as e:
+        print("🧪 Failed to dump cache:", e)
+
+
 # ─── Main Loop ─────────────────────────────────────────
 def refresh_and_process_user(user_id):
     print(f"\n🔄 Processing user: {user_id}")
@@ -206,6 +226,8 @@ def refresh_and_process_user(user_id):
     cache = SerializableTokenCache()
     with open(TOKEN_CACHE, "r") as f:
         cache.deserialize(f.read())
+    
+    debug_dump_cache(cache, label=user_id)
 
     def _save_cache():
         if cache.has_state_changed:
