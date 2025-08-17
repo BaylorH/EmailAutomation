@@ -171,6 +171,34 @@ def send_weekly_email(headers, to_addresses):
         resp.raise_for_status()
         print(f"✅ Sent '{SUBJECT}' to {addr}")
 
+
+def scan_sent_for_client_header(headers, top: int = 5):
+    url = "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages"
+    params = {
+        "$top": str(top),
+        "$orderby": "sentDateTime desc",
+        "$select": "id,subject,sentDateTime,conversationId,internetMessageId,internetMessageHeaders",
+        "$filter": "startswith(subject,'Client Outreach')"  # adjust if needed
+    }
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    r.raise_for_status()
+    items = r.json().get("value", [])
+    if not items:
+        print("📭 Sent scan: none found.")
+        return
+
+    print(f"🔎 Scanning {len(items)} sent message(s) for x-client-id ...")
+    for m in items:
+        hdrs = m.get("internetMessageHeaders") or []
+        x_client_id = _get_header(hdrs, "x-client-id")
+        print(f"• [{m.get('sentDateTime','')}] {m.get('subject','(no subject)')}")
+        print(f"   conversationId={m.get('conversationId')}, internetMessageId={m.get('internetMessageId')}")
+        if x_client_id:
+            print(f"   🧩 x-client-id={x_client_id}")
+        else:
+            print("   (no x-client-id on SENT message)")
+
+
 def scan_new_mail_for_client_header(headers, only_unread: bool = True, top: int = 10):
     """
     Scan recent Inbox messages and log whether custom x-headers are present.
@@ -346,6 +374,7 @@ def refresh_and_process_user(user_id: str):
     # process_replies(headers, user_id)
     send_outboxes(user_id, headers)
     scan_new_mail_for_client_header(headers, only_unread=True, top=10)
+    scan_sent_for_client_header(headers, top=5)
 
 
 # ─── Entry ─────────────────────────────────────────────
