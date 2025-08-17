@@ -3,23 +3,29 @@ import json
 import atexit
 import base64
 import requests
+import time
+import logging
 from urllib.parse import quote
 from openpyxl import Workbook
 from msal import ConfidentialClientApplication, SerializableTokenCache
 
 from firebase_helpers import download_token, upload_token, upload_excel
-
 from google.cloud import firestore
 import re
 
+# Enable MSAL logging for better debugging
+logging.basicConfig(level=logging.DEBUG)
+msal_logger = logging.getLogger("msal")
+msal_logger.setLevel(logging.DEBUG)
+
 # ─── Config ─────────────────────────────────────────────
-CLIENT_ID         = os.getenv("AZURE_API_APP_ID")
-CLIENT_SECRET     = os.getenv("AZURE_API_CLIENT_SECRET")
-FIREBASE_API_KEY  = os.getenv("FIREBASE_API_KEY")
-FIREBASE_BUCKET   = "email-automation-cache.firebasestorage.app"
-AUTHORITY         = "https://login.microsoftonline.com/common"
-SCOPES            = ["mail.readwrite", "mail.send"]
-TOKEN_CACHE       = "msal_token_cache.bin"
+CLIENT_ID = os.getenv("AZURE_API_APP_ID")
+CLIENT_SECRET = os.getenv("AZURE_API_CLIENT_SECRET")
+FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
+FIREBASE_BUCKET = "email-automation-cache.firebasestorage.app"
+AUTHORITY = "https://login.microsoftonline.com/common"
+SCOPES = ["mail.readwrite", "mail.send"]
+TOKEN_CACHE = "msal_token_cache.bin"
 
 SUBJECT = "Weekly Questions"
 BODY = (
@@ -33,18 +39,370 @@ THANK_YOU_BODY = "Thanks for your response."
 if not CLIENT_ID or not CLIENT_SECRET or not FIREBASE_API_KEY:
     raise RuntimeError("❌ Missing required env vars")
 
-# Firestore Admin client (uses GOOGLE_APPLICATION_CREDENTIALS)
+# Firestore Admin client
 _fs = firestore.Client()
 
-# ─── Helper: detect HTML vs text ───────────────────────
-_html_rx = re.compile(r"<[a-zA-Z/][^>]*>")
+# ─── Enhanced Token Validation ─────────────────────────
+def validate_token_freshness(token_data):
+    """Check if access token is fresh enough"""
+    if not token_data or "expires_in" not in token_data:
+        return False
+    
+    issued_at = token_data.get("cached_at", time.time())
+    expires_in = token_data.get("expires_in", 3600)
+    
+    # Check if token expires in less than 5 minutes
+    time_remaining = (issued_at + expires_in) - time.time()
+    return time_remaining > 300  # 5 minutes buffer
 
+def decode_token_payload(token):
+    """Decode JWT payload for debugging"""
+    try:
+        payload = token.split(".")[1]
+        padded = payload + '=' * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(padded))
+    except Exception as e:
+        print(f"⚠️ Failed to decode token: {e}")
+        return {}
+
+# ─── Enhanced Cache Analysis ────────────────────────────
+def analyze_cache_state(cache, client_id):
+    """Perform deep analysis of token cache state"""
+    cache_data = json.loads(cache.serialize() or "{}")
+    
+    access_tokens = cache_data.get("AccessToken", {})
+    refresh_tokens = cache_data.get("RefreshToken", {})
+    id_tokens = cache_data.get("IdToken", {})
+    accounts = cache_data.get("Account", {})
+    
+    print(f"\n🔬 DEEP CACHE ANALYSIS:")
+    print(f"   Access Tokens: {len(access_tokens)}")
+    print(f"   Refresh Tokens: {len(refresh_tokens)}")
+    print(f"   ID Tokens: {len(id_tokens)}")
+    print(f"   Accounts: {len(accounts)}")
+    
+    # Analyze refresh tokens in detail
+    for rt_key, rt_data in refresh_tokens.items():
+        print(f"\n   🔍 Refresh Token Analysis:")
+        print(f"      Key: {rt_key}")
+        print(f"      Client ID: {rt_data.get('client_id')}")
+        print(f"      Environment: {rt_data.get('environment')}")
+        print(f"      Home Account ID: {rt_data.get('home_account_id')}")
+        print(f"      Family ID: {rt_data.get('family_id', 'None')}")
+        
+        # Check expiration
+        expires_on = rt_data.get("expires_on")
+        cached_at = rt_data.get("cached_at")
+        
+        if expires_on:
+            try:
+                exp_time = int(expires_on)
+                current_time = int(time.time())
+                time_left = exp_time - current_time
+                
+                print(f"      Expires On: {exp_time} ({time.ctime(exp_time)})")
+                print(f"      Time Remaining: {time_left} seconds ({time_left//3600}h {(time_left%3600)//60}m)")
+                
+                if time_left <= 0:
+                    print("      ❌ REFRESH TOKEN EXPIRED!")
+                    return False, "refresh_token_expired"
+                elif time_left < 86400:  # Less than 24 hours
+                    print("      ⚠️ REFRESH TOKEN EXPIRES SOON!")
+            except ValueError:
+                print(f"      ⚠️ Invalid expires_on format: {expires_on}")
+        
+        elif cached_at:
+            try:
+                cache_time = int(cached_at)
+                current_time = int(time.time())
+                age_seconds = current_time - cache_time
+                age_days = age_seconds // 86400
+                
+                print(f"      Cached At: {cache_time} ({time.ctime(cache_time)})")
+                print(f"      Age: {age_days} days, {(age_seconds%86400)//3600} hours")
+                
+                if age_days > 90:
+                    print("      ❌ REFRESH TOKEN TOO OLD (>90 days)!")
+                    return False, "refresh_token_too_old"
+                elif age_days > 60:
+                    print("      ⚠️ REFRESH TOKEN IS GETTING OLD (>60 days)")
+            except ValueError:
+                print(f"      ⚠️ Invalid cached_at format: {cached_at}")
+        
+        # Check client ID match
+        rt_client_id = rt_data.get("client_id")
+        if rt_client_id != client_id:
+            print(f"      ❌ CLIENT ID MISMATCH!")
+            print(f"         RT Client ID: {rt_client_id}")
+            print(f"         App Client ID: {client_id}")
+            return False, "client_id_mismatch"
+        else:
+            print(f"      ✅ Client ID matches")
+    
+    # Analyze accounts
+    for acc_key, acc_data in accounts.items():
+        print(f"\n   👤 Account Analysis:")
+        print(f"      Username: {acc_data.get('username')}")
+        print(f"      Environment: {acc_data.get('environment')}")
+        print(f"      Authority Type: {acc_data.get('authority_type')}")
+        print(f"      Home Account ID: {acc_data.get('home_account_id')}")
+        print(f"      Local Account ID: {acc_data.get('local_account_id')}")
+        print(f"      Realm: {acc_data.get('realm')}")
+    
+    return True, "cache_valid"
+
+# ─── Authority Matching Logic ───────────────────────────
+def determine_correct_authority(account, rt_data=None):
+    """Determine the correct authority based on account type and token data"""
+    username = account.get('username', '') if account else ''
+    
+    # Personal Microsoft account detection
+    personal_domains = ('@outlook.com', '@hotmail.com', '@live.com', '@msn.com')
+    is_personal = any(username.endswith(domain) for domain in personal_domains)
+    
+    if is_personal:
+        return "https://login.microsoftonline.com/consumers", "personal"
+    
+    # Extract tenant ID from home_account_id or refresh token
+    home_account_id = account.get('home_account_id') if account else None
+    if not home_account_id and rt_data:
+        home_account_id = rt_data.get('home_account_id')
+    
+    if home_account_id and '.' in home_account_id:
+        try:
+            tenant_id = home_account_id.split('.')[1]
+            # Validate it looks like a GUID
+            if len(tenant_id) == 36 and tenant_id.count('-') == 4:
+                return f"https://login.microsoftonline.com/{tenant_id}", "organizational"
+        except (IndexError, AttributeError):
+            pass
+    
+    # Check realm from account
+    realm = account.get('realm') if account else None
+    if realm and realm not in ['common', 'consumers', 'organizations']:
+        return f"https://login.microsoftonline.com/{realm}", "organizational"
+    
+    # Default to common
+    return "https://login.microsoftonline.com/common", "common"
+
+# ─── Enhanced Token Acquisition ─────────────────────────
+def acquire_token_with_comprehensive_retry(client_id, client_secret, cache, scopes):
+    """Try multiple strategies to acquire a token"""
+    
+    # First, analyze the cache
+    cache_valid, cache_status = analyze_cache_state(cache, client_id)
+    if not cache_valid:
+        print(f"❌ Cache validation failed: {cache_status}")
+        return None, f"Cache validation failed: {cache_status}"
+    
+    # Get accounts from cache using a temporary common authority app
+    temp_app = ConfidentialClientApplication(
+        client_id,
+        client_credential=client_secret,
+        authority="https://login.microsoftonline.com/common",
+        token_cache=cache,
+    )
+    
+    accounts = temp_app.get_accounts()
+    if not accounts:
+        print("❌ No accounts found in cache")
+        return None, "No accounts found in cache"
+    
+    account = accounts[0]
+    print(f"👤 Primary account: {account.get('username')}")
+    
+    # Get refresh token data for authority determination
+    cache_data = json.loads(cache.serialize() or "{}")
+    refresh_tokens = list(cache_data.get("RefreshToken", {}).values())
+    rt_data = refresh_tokens[0] if refresh_tokens else None
+    
+    # Determine the correct authority
+    correct_authority, auth_type = determine_correct_authority(account, rt_data)
+    print(f"🧭 Determined authority: {correct_authority} (type: {auth_type})")
+    
+    # Create app with the correct authority
+    app = ConfidentialClientApplication(
+        client_id,
+        client_credential=client_secret,
+        authority=correct_authority,
+        token_cache=cache,
+    )
+    
+    # Get accounts from the correct authority app
+    accounts = app.get_accounts()
+    if accounts:
+        account = accounts[0]
+        print(f"✅ Account found with correct authority: {account.get('username')}")
+    else:
+        print("⚠️ No accounts with correct authority, trying with original account")
+    
+    # Strategy 1: Normal silent acquisition
+    print("🔄 Strategy 1: Normal silent acquisition")
+    result = app.acquire_token_silent(scopes, account=account)
+    
+    if result and "access_token" in result:
+        print("✅ Strategy 1 successful")
+        return result, None
+    elif result and "error" in result:
+        error_msg = f"{result.get('error')}: {result.get('error_description', '')}"
+        print(f"❌ Strategy 1 failed with error: {error_msg}")
+        return None, error_msg
+    
+    # Strategy 2: Force refresh
+    print("🔄 Strategy 2: Force refresh")
+    result = app.acquire_token_silent(scopes, account=account, force_refresh=True)
+    
+    if result and "access_token" in result:
+        print("✅ Strategy 2 successful")
+        return result, None
+    elif result and "error" in result:
+        error_msg = f"{result.get('error')}: {result.get('error_description', '')}"
+        print(f"❌ Strategy 2 failed with error: {error_msg}")
+        return None, error_msg
+    
+    # Strategy 3: Try alternative authorities
+    alternative_authorities = [
+        ("common", "https://login.microsoftonline.com/common"),
+        ("consumers", "https://login.microsoftonline.com/consumers"),
+        ("organizations", "https://login.microsoftonline.com/organizations")
+    ]
+    
+    # Remove the current authority from alternatives
+    alternative_authorities = [(name, url) for name, url in alternative_authorities 
+                             if url != correct_authority]
+    
+    for auth_name, auth_url in alternative_authorities:
+        print(f"🔄 Strategy 3.{auth_name}: Trying {auth_url}")
+        
+        alt_app = ConfidentialClientApplication(
+            client_id,
+            client_credential=client_secret,
+            authority=auth_url,
+            token_cache=cache,
+        )
+        
+        alt_accounts = alt_app.get_accounts()
+        if not alt_accounts:
+            print(f"   No accounts found with {auth_name} authority")
+            continue
+        
+        alt_account = alt_accounts[0]
+        print(f"   Found account: {alt_account.get('username')}")
+        
+        # Try normal then force refresh
+        for force_refresh in [False, True]:
+            refresh_text = "with force_refresh" if force_refresh else "normal"
+            result = alt_app.acquire_token_silent(
+                scopes, 
+                account=alt_account, 
+                force_refresh=force_refresh
+            )
+            
+            if result and "access_token" in result:
+                print(f"✅ Strategy 3.{auth_name} successful ({refresh_text})")
+                return result, None
+            elif result and "error" in result:
+                error_msg = f"{result.get('error')}: {result.get('error_description', '')}"
+                print(f"❌ Strategy 3.{auth_name} failed ({refresh_text}): {error_msg}")
+                # Continue trying other strategies
+    
+    # If we get here, all strategies failed
+    return None, "All token acquisition strategies failed"
+
+# ─── Main Processing Function ───────────────────────────
+def refresh_and_process_user(user_id: str):
+    print(f"\n🔄 Processing user: {user_id}")
+    
+    try:
+        import msal
+        print(f"🔍 MSAL version: {msal.__version__}")
+    except:
+        print("⚠️ Could not determine MSAL version")
+
+    # Download and setup cache
+    download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
+    cache = SerializableTokenCache()
+    
+    try:
+        with open(TOKEN_CACHE, "r") as f:
+            cache_content = f.read().strip()
+            if cache_content:
+                cache.deserialize(cache_content)
+                print("✅ Token cache loaded successfully")
+            else:
+                print("⚠️ Token cache file is empty")
+                return
+    except FileNotFoundError:
+        print("❌ Token cache file not found")
+        return
+    except Exception as e:
+        print(f"❌ Error loading token cache: {e}")
+        return
+
+    # Setup cache auto-save
+    def save_cache():
+        if cache.has_state_changed:
+            try:
+                with open(TOKEN_CACHE, "w") as f:
+                    f.write(cache.serialize())
+                upload_token(FIREBASE_API_KEY, input_file=TOKEN_CACHE, user_id=user_id)
+                print(f"✅ Token cache uploaded for {user_id}")
+            except Exception as e:
+                print(f"❌ Failed to save cache: {e}")
+
+    atexit.unregister(save_cache)
+    atexit.register(save_cache)
+
+    # Attempt comprehensive token acquisition
+    result, error = acquire_token_with_comprehensive_retry(
+        CLIENT_ID, CLIENT_SECRET, cache, SCOPES
+    )
+    
+    if not result:
+        print(f"❌ All token acquisition attempts failed: {error}")
+        print("\n💡 RECOMMENDED ACTIONS:")
+        print("   1. User needs to re-authenticate through your web application")
+        print("   2. Check if user changed password or enabled 2FA")
+        print("   3. Verify Azure AD app registration permissions")
+        print("   4. Check for Conditional Access policy changes")
+        return
+
+    # Success!
+    access_token = result["access_token"]
+    print(f"🎯 Token acquired successfully!")
+    
+    # Validate token
+    token_info = decode_token_payload(access_token)
+    if token_info:
+        print(f"🔐 Token info:")
+        print(f"   App ID: {token_info.get('appid', 'unknown')}")
+        print(f"   Audience: {token_info.get('aud', 'unknown')}")
+        print(f"   Expires: {time.ctime(token_info.get('exp', 0)) if token_info.get('exp') else 'unknown'}")
+        print(f"   Issuer: {token_info.get('iss', 'unknown')}")
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}", 
+        "Content-Type": "application/json"
+    }
+
+    # Execute your business logic
+    try:
+        send_weekly_email(headers, ["bp21harrison@gmail.com"])
+        # process_replies(headers, user_id)
+        # send_outboxes(user_id, headers)
+        print("✅ All operations completed successfully")
+    except Exception as e:
+        print(f"❌ Error during operations: {e}")
+        import traceback
+        traceback.print_exc()
+
+# ─── Helper Functions (unchanged) ───────────────────────
 def _body_kind(script: str):
+    _html_rx = re.compile(r"<[a-zA-Z/][^>]*>")
     if script and _html_rx.search(script):
         return "HTML", script
     return "Text", script or ""
 
-# ─── Send email via Graph ──────────────────────────────
 def send_email(headers, script: str, emails: list[str]):
     if not emails:
         return {"sent": [], "errors": {"_all": "No recipients"}}
@@ -78,16 +436,60 @@ def send_email(headers, script: str, emails: list[str]):
 
     return results
 
-# ─── Process outbox for one user ───────────────────────
+def send_weekly_email(headers, to_addresses):
+    for addr in to_addresses:
+        payload = {
+            "message": {
+                "subject": SUBJECT,
+                "body": {"contentType": "Text", "content": BODY},
+                "toRecipients": [{"emailAddress": {"address": addr}}]
+            },
+            "saveToSentItems": True
+        }
+        resp = requests.post("https://graph.microsoft.com/v1.0/me/sendMail", headers=headers, json=payload)
+        resp.raise_for_status()
+        print(f"✅ Sent '{SUBJECT}' to {addr}")
+
+def process_replies(headers, user_id):
+    url = "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
+    params = {
+        '$filter': f"isRead eq false and startswith(subject,'Re: {SUBJECT}')",
+        '$top': '10',
+        '$orderby': 'receivedDateTime desc'
+    }
+
+    resp = requests.get(url, headers=headers, params=params)
+    messages = resp.json().get("value", [])
+
+    if not messages:
+        print("ℹ️  No new replies.")
+        return
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Sender", "Response", "ReceivedDateTime"])
+
+    for msg in messages:
+        sender = msg["from"]["emailAddress"]["address"]
+        body = msg["body"]["content"].strip()
+        dt = msg["receivedDateTime"]
+
+        reply_url = f"https://graph.microsoft.com/v1.0/me/messages/{msg['id']}/reply"
+        reply_payload = {"message": {"body": {"contentType": "Text", "content": THANK_YOU_BODY}}}
+        requests.post(reply_url, headers=headers, json=reply_payload)
+
+        mark_read_url = f"https://graph.microsoft.com/v1.0/me/messages/{msg['id']}"
+        requests.patch(mark_read_url, headers=headers, json={"isRead": True})
+
+        ws.append([sender, body, dt])
+        print(f"📥 Replied to and logged reply from {sender}")
+
+    file = f"responses_{user_id}.xlsx"
+    wb.save(file)
+    upload_excel(FIREBASE_API_KEY, input_file=file)
+    print(f"✅ Saved replies to {file}")
+
 def send_outboxes(user_id: str, headers):
-    """
-    Reads users/{uid}/outbox/* docs.
-    Each doc should contain only:
-      - assignedEmails: string[]
-      - script:         string
-    Success: delete the doc.
-    Failure: keep the doc with { attempts += 1, lastError }.
-    """
     outbox_ref = _fs.collection("users").document(user_id).collection("outbox")
     docs = list(outbox_ref.stream())
 
@@ -126,7 +528,6 @@ def send_outboxes(user_id: str, headers):
             )
             print(f"💥 Error sending item {d.id}: {e}; attempts={attempts}")
 
-# ─── Utility: List user IDs from Firebase ──────────────
 def list_user_ids():
     url = f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_BUCKET}/o?prefix=msal_caches%2F&key={FIREBASE_API_KEY}"
     r = requests.get(url)
@@ -138,450 +539,7 @@ def list_user_ids():
             user_ids.add(parts[1])
     return list(user_ids)
 
-def decode_token_payload(token):
-    payload = token.split(".")[1]
-    padded = payload + '=' * (-len(payload) % 4)
-    return json.loads(base64.urlsafe_b64decode(padded))
-
-# ─── Email Functions ───────────────────────────────────
-def send_weekly_email(headers, to_addresses):
-    for addr in to_addresses:
-        payload = {
-            "message": {
-                "subject": SUBJECT,
-                "body": {"contentType": "Text", "content": BODY},
-                "toRecipients": [{"emailAddress": {"address": addr}}]
-            },
-            "saveToSentItems": True
-        }
-        resp = requests.post("https://graph.microsoft.com/v1.0/me/sendMail", headers=headers, json=payload)
-        resp.raise_for_status()
-        print(f"✅ Sent '{SUBJECT}' to {addr}")
-
-def process_replies(headers, user_id):
-    url = "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
-    params = {
-        '$filter': f"isRead eq false and startswith(subject,'Re: {SUBJECT}')",
-        '$top': '10',
-        '$orderby': 'receivedDateTime desc'
-    }
-
-    resp = requests.get(url, headers=headers, params=params)
-    messages = resp.json().get("value", [])
-
-    if not messages:
-        print("ℹ️  No new replies.")
-        return
-
-    wb = Workbook()
-    ws = wb.active
-    ws.append(["Sender", "Response", "ReceivedDateTime"])
-
-    for msg in messages:
-        sender = msg["from"]["emailAddress"]["address"]
-        body   = msg["body"]["content"].strip()
-        dt     = msg["receivedDateTime"]
-
-        reply_url = f"https://graph.microsoft.com/v1.0/me/messages/{msg['id']}/reply"
-        reply_payload = {"message": {"body": {"contentType": "Text", "content": THANK_YOU_BODY}}}
-        requests.post(reply_url, headers=headers, json=reply_payload)
-
-        mark_read_url = f"https://graph.microsoft.com/v1.0/me/messages/{msg['id']}"
-        requests.patch(mark_read_url, headers=headers, json={"isRead": True})
-
-        ws.append([sender, body, dt])
-        print(f"📥 Replied to and logged reply from {sender}")
-
-    file = f"responses_{user_id}.xlsx"
-    wb.save(file)
-    upload_excel(FIREBASE_API_KEY, input_file=file)
-    print(f"✅ Saved replies to {file}")
-
-import hashlib
-
-def debug_dump_cache(cache, label=""):
-    raw = cache.serialize() or "{}"
-    data = json.loads(raw)
-    ats = data.get("AccessToken", {})
-    rts = data.get("RefreshToken", {})
-    ids = data.get("IdToken", {})
-    print(f"\n🧪 Cache dump [{label}]")
-    print(f"   AccessTokens:  {len(ats)}")
-    print(f"   RefreshTokens: {len(rts)}")
-    print(f"   IdTokens:      {len(ids)}")
-    # Print RT metadata (safe)
-    for k, v in rts.items():
-        print("   ↳ RT key:", k)
-        print("      client_id:", v.get("client_id"))
-        print("      environment:", v.get("environment"))
-        print("      home_account_id:", v.get("home_account_id"))
-
-def _extract_utid(home_account_id: str):
-    """Extract tenant ID from MSAL home_account_id format: <uid>.<utid>"""
-    try:
-        return (home_account_id or "").split(".")[1]
-    except (IndexError, AttributeError):
-        return None
-
-# ─── Main Loop ─────────────────────────────────────────
-def refresh_and_process_user(user_id: str):
-    print(f"\n🔄 Processing user: {user_id}")
-    
-    # Check MSAL version first
-    try:
-        import msal
-        print(f"🔍 MSAL version: {msal.__version__}")
-    except:
-        print("⚠️ Could not determine MSAL version")
-
-    # 1) Download & deserialize cache
-    download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
-    cache = SerializableTokenCache()
-    with open(TOKEN_CACHE, "r") as f:
-        cache.deserialize(f.read())
-
-    # Debug counts
-    debug_dump_cache(cache, label=user_id)
-
-    # Ensure cache uploads back if mutated
-    def _save_cache():
-        if cache.has_state_changed:
-            with open(TOKEN_CACHE, "w") as f:
-                f.write(cache.serialize())
-            upload_token(FIREBASE_API_KEY, input_file=TOKEN_CACHE, user_id=user_id)
-            print(f"✅ Token cache uploaded for {user_id}")
-
-    atexit.unregister(_save_cache)
-    atexit.register(_save_cache)
-
-    # 2) Extract tenant info from cache BEFORE creating any app
-    cache_json = json.loads(cache.serialize() or "{}")
-    rts = list((cache_json.get("RefreshToken") or {}).values())
-    rt_client_id = rts[0].get("client_id") if rts else None
-    rt_home = rts[0].get("home_account_id") if rts else None
-    rt_env = rts[0].get("environment") if rts else None
-
-    print(f"🔎 CLIENT_ID (scheduler env): {CLIENT_ID}")
-    print(f"🔎 CLIENT_ID (in cache RT):   {rt_client_id}")
-    print(f"🔎 Authority (scheduler):     {AUTHORITY}")
-    print(f"🔎 RT env:                    {rt_env}")
-    print(f"🔎 RT home_account_id:        {rt_home}")
-
-    # 3) Create MSAL app with common authority first to get accounts
-    app_initial = ConfidentialClientApplication(
-        CLIENT_ID,
-        client_credential=CLIENT_SECRET,
-        authority=AUTHORITY,
-        token_cache=cache,
-    )
-
-    # 4) Get accounts to determine account type
-    accts = app_initial.get_accounts()
-    print("👤 Accounts in cache:", [a.get("username") for a in accts] or "<none>")
-    if not accts:
-        print("⚠️ No account objects found; cache likely not matching this app/authority.")
-        return
-    
-    account = accts[0]
-    print(f"🔍 Using account: {account.get('username')} (account object type: {type(account)})")
-    print(f"🔍 Account keys: {list(account.keys()) if hasattr(account, 'keys') else 'N/A'}")
-    
-    # Validate account is not None (critical for MSAL 1.23+)
-    if account is None:
-        print("❌ Account is None - this will cause acquire_token_silent to return None in MSAL 1.23+")
-        return
-
-    # 5) Determine the correct authority to use based on account type
-    utid = _extract_utid(rt_home) if rt_home else None
-    
-    # Check if this is a personal Microsoft account (MSA)
-    is_personal_account = account.get('username', '').endswith(('@outlook.com', '@hotmail.com', '@live.com', '@msn.com'))
-    
-    if is_personal_account:
-        # Personal Microsoft accounts should use /consumers
-        auth_to_use = "https://login.microsoftonline.com/consumers"
-        print(f"🧭 Detected personal Microsoft account - using consumers authority: {auth_to_use}")
-    elif utid:
-        # Use tenant-specific authority for organizational accounts
-        auth_to_use = f"https://login.microsoftonline.com/{utid}"
-        print(f"🧭 Using tenant-specific authority: {auth_to_use}")
-    else:
-        # Fall back to common
-        auth_to_use = AUTHORITY
-        print(f"🧭 Using common authority: {auth_to_use}")
-
-    # 6) Create MSAL app with the correct authority
-    app = ConfidentialClientApplication(
-        CLIENT_ID,
-        client_credential=CLIENT_SECRET,
-        authority=auth_to_use,
-        token_cache=cache,
-    )
-
-    # Re-get accounts from the correct authority app
-    accts = app.get_accounts()
-    if accts:
-        account = accts[0]  # Update account from correct authority
-        print(f"🔍 Updated account from {auth_to_use}: {account.get('username')}")
-    else:
-        print(f"⚠️ No accounts found with {auth_to_use} authority, using original account")
-        # Keep the original account from common authority
-
-    # 7) Try silent auth (first without force, then with force if needed)
-    print("🔐 Attempting silent token acquisition...")
-    print(f"🔍 Scopes: {SCOPES}")
-    print(f"🔍 Account username: {account.get('username')}")
-    
-    result = app.acquire_token_silent(SCOPES, account=account)
-    print(f"🔍 First attempt result type: {type(result)}, is None: {result is None}")
-    
-    if not (result and "access_token" in result):
-        print("🔄 Silent auth failed, trying with force_refresh=True...")
-        result = app.acquire_token_silent(SCOPES, account=account, force_refresh=True)
-        print(f"🔍 Force refresh result type: {type(result)}, is None: {result is None}")
-        
-        # If still None, try with explicit parameters
-        if result is None:
-            print("🔄 Still None, trying with explicit username...")
-            result = app.acquire_token_silent(
-                SCOPES, 
-                account=account,
-                force_refresh=True,
-                claims_challenge=None
-            )
-
-    # 8) If the first authority didn't work, try additional fallbacks
-    if not (result and "access_token" in result):
-        print("🔄 First authority failed, trying fallback authorities...")
-        
-        # Try different authorities based on account type
-        fallback_authorities = []
-        
-        if is_personal_account and auth_to_use != AUTHORITY:
-            fallback_authorities.append(("common", AUTHORITY))
-        elif not is_personal_account and auth_to_use != "https://login.microsoftonline.com/consumers":
-            fallback_authorities.append(("consumers", "https://login.microsoftonline.com/consumers"))
-        
-        if auth_to_use not in [AUTHORITY, "https://login.microsoftonline.com/consumers"]:
-            fallback_authorities.append(("common", AUTHORITY))
-        
-        for auth_name, auth_url in fallback_authorities:
-            print(f"🔄 Trying {auth_name} authority: {auth_url}")
-            app_fallback = ConfidentialClientApplication(
-                CLIENT_ID,
-                client_credential=CLIENT_SECRET,
-                authority=auth_url,
-                token_cache=cache,
-            )
-            accts_fallback = app_fallback.get_accounts()
-            print(f"👤 {auth_name.title()} authority accounts: {[a.get('username') for a in accts_fallback] or '<none>'}")
-            
-            if accts_fallback:
-                fallback_account = accts_fallback[0]
-                print(f"🔍 Using {auth_name} account: {fallback_account.get('username')} (type: {type(fallback_account)})")
-                
-                result = app_fallback.acquire_token_silent(SCOPES, account=fallback_account)
-                print(f"🔍 {auth_name.title()} auth result type: {type(result)}, is None: {result is None}")
-                
-                if result and "access_token" in result:
-                    print(f"✅ Success with {auth_name} authority!")
-                    break
-                
-                if not (result and "access_token" in result):
-                    result = app_fallback.acquire_token_silent(SCOPES, account=fallback_account, force_refresh=True)
-                    print(f"🔍 {auth_name.title()} auth force refresh result type: {type(result)}, is None: {result is None}")
-                    
-                    if result and "access_token" in result:
-                        print(f"✅ Success with {auth_name} authority (force refresh)!")
-                        break
-
-    # Alternative approach: Try to get actual error details instead of None
-    if not (result and "access_token" in result):
-        print("🔄 All silent attempts failed. Attempting diagnostic methods to get actual error...")
-        
-        # Method 1: Try to use the refresh token directly to get a proper error
-        try:
-            cache_data = json.loads(cache.serialize() or "{}")
-            refresh_tokens = cache_data.get("RefreshToken", {})
-            if refresh_tokens:
-                print(f"🔍 Found {len(refresh_tokens)} refresh tokens in cache")
-                first_rt_key = list(refresh_tokens.keys())[0]
-                first_rt = refresh_tokens[first_rt_key]
-                
-                # Try different diagnostic approaches
-                print("🔍 Attempting diagnostic token acquisition...")
-                
-                # Try with exact scope matching from cache
-                rt_scopes_from_key = first_rt_key.split("--")[-1] if "--" in first_rt_key else ""
-                if rt_scopes_from_key:
-                    original_scopes = [s.strip() for s in rt_scopes_from_key.replace("-", " ").split() if s.strip() and s.strip() not in ["openid", "profile", "offline_access"]]
-                    if original_scopes:
-                        print(f"🔍 Trying with exact cache scopes: {original_scopes}")
-                        diagnostic_result = app.acquire_token_silent(original_scopes, account=account, force_refresh=True)
-                        print(f"🔍 Diagnostic result with cache scopes: {type(diagnostic_result)} - {diagnostic_result}")
-                        if diagnostic_result and isinstance(diagnostic_result, dict) and "error" in diagnostic_result:
-                            print(f"🎯 ACTUAL ERROR FOUND: {diagnostic_result.get('error')} - {diagnostic_result.get('error_description')}")
-                            return  # Exit early with the real error
-                
-                # Method 2: Try to trigger a different error by using invalid scopes
-                print("🔍 Trying with obviously invalid scope to trigger error response...")
-                diagnostic_result = app.acquire_token_silent(["invalid.scope.test"], account=account)
-                print(f"🔍 Invalid scope test result: {type(diagnostic_result)} - {diagnostic_result}")
-                
-                # Method 3: Check if we can get any error by examining cache state more deeply
-                print(f"🔍 RT client_id: {first_rt.get('client_id')}")
-                print(f"🔍 RT environment: {first_rt.get('environment')}")
-                print(f"🔍 RT home_account_id: {first_rt.get('home_account_id')}")
-                
-                # Check if refresh token has expiration info
-                rt_expires_on = first_rt.get("expires_on")
-                if rt_expires_on:
-                    import time
-                    current_time = int(time.time())
-                    try:
-                        rt_expires_on_int = int(rt_expires_on)
-                        time_until_expiry = rt_expires_on_int - current_time
-                        
-                        print(f"🔍 RT expires_on: {rt_expires_on} (timestamp)")
-                        print(f"🔍 Current time: {current_time} (timestamp)")
-                        print(f"🔍 Time until RT expiry: {time_until_expiry} seconds")
-                        
-                        if time_until_expiry <= 0:
-                            print("🎯 ACTUAL ERROR: REFRESH TOKEN HAS EXPIRED!")
-                            print("   User needs to re-authenticate through your web app.")
-                            return
-                        elif time_until_expiry < 3600:  # Less than 1 hour
-                            print(f"⚠️  REFRESH TOKEN EXPIRES SOON! ({time_until_expiry//60} minutes)")
-                        else:
-                            print(f"✅ Refresh token is still valid for {time_until_expiry//3600} hours")
-                    except ValueError:
-                        print(f"⚠️ Could not parse expires_on timestamp: {rt_expires_on}")
-                else:
-                    print("⚠️ RT does not have expires_on field - checking cached_at")
-                    cached_at = first_rt.get("cached_at")
-                    if cached_at:
-                        import time
-                        current_time = int(time.time())
-                        try:
-                            cached_at_int = int(cached_at)
-                            age_seconds = current_time - cached_at_int
-                            age_days = age_seconds // 86400
-                            
-                            print(f"🔍 RT cached_at: {cached_at} (timestamp)")
-                            print(f"🔍 RT age: {age_days} days")
-                            
-                            if age_days > 90:
-                                print("🎯 ACTUAL ERROR: REFRESH TOKEN IS VERY OLD (>90 days) - likely expired!")
-                                print("   User needs to re-authenticate through your web app.")
-                                return
-                            elif age_days > 60:
-                                print("⚠️  REFRESH TOKEN IS OLD (>60 days) - may be nearing expiration")
-                            else:
-                                print(f"✅ Refresh token age seems reasonable ({age_days} days)")
-                        except ValueError:
-                            print(f"⚠️ Could not parse cached_at timestamp: {cached_at}")
-                    else:
-                        print("⚠️ No expiration or cached_at info available in RT")
-                
-                # Method 4: Try to directly inspect MSAL logs if possible
-                print("🔍 MSAL Configuration Check:")
-                print(f"   App authority: {app.authority}")
-                print(f"   App client_id: {CLIENT_ID}")
-                print(f"   Account authority_type: {account.get('authority_type')}")
-                print(f"   Account environment: {account.get('environment')}")
-                print(f"   Account realm: {account.get('realm')}")
-                
-                # Check for authority/environment mismatch
-                if account.get('environment') != app.authority.replace('https://login.', '').replace('/common', '').replace('/consumers', '').replace(f'/{utid}' if utid else '', ''):
-                    print("🎯 POSSIBLE ISSUE: Environment mismatch between account and app authority")
-                
-        except Exception as e:
-            print(f"⚠️ Error during diagnostic: {e}")
-            import traceback
-            print(f"🔍 Diagnostic traceback: {traceback.format_exc()}")
-            
-        # If we get here, we still don't have the exact error
-        print("🎯 CONCLUSION: MSAL is returning None without specific error details.")
-        print("   This typically indicates one of these issues:")
-        print("   1. Authority mismatch (account cached with different authority than app)")
-        print("   2. Refresh token expired/revoked (but no expiration data available)")
-        print("   3. Application configuration issue (wrong client_id/tenant)")
-        print("   4. Conditional Access policy preventing silent refresh")
-        print("   → Recommendation: User needs to re-authenticate through your web app.")
-
-    # 9) Final check with enhanced error reporting
-    if not (result and "access_token" in result):
-        if result:
-            error_code = result.get("error")
-            error_desc = result.get("error_description", "")
-            
-            print("🎯 ACTUAL ERROR DETAILS:")
-            print(f"   Error Code: {error_code}")
-            print(f"   Error Description: {error_desc}")
-            print(f"   Correlation ID: {result.get('correlation_id')}")
-            print(f"   Trace ID: {result.get('trace_id')}")
-            
-            # Provide specific guidance based on error code
-            if error_code == "invalid_grant":
-                print("💡 ERROR ANALYSIS: 'invalid_grant' means:")
-                print("   - Refresh token has expired or been revoked")
-                print("   - User changed password") 
-                print("   - Conditional Access policy changed")
-                print("   → User needs to re-authenticate through your web app.")
-                
-            elif error_code in ["interaction_required", "consent_required"]:
-                print("💡 ERROR ANALYSIS: This error means:")
-                print("   - Additional user consent is required")
-                print("   - MFA/Conditional Access requires user interaction")
-                print("   → User needs to re-authenticate through your web app.")
-                
-            elif error_code == "expired_token":
-                print("💡 ERROR ANALYSIS: 'expired_token' means:")
-                print("   - The cached token has expired")
-                print("   → This should have been handled by force_refresh")
-                
-            elif error_code == "invalid_client":
-                print("💡 ERROR ANALYSIS: 'invalid_client' means:")
-                print("   - Wrong client_id or client_secret")
-                print("   - App not properly registered")
-                
-            elif error_code == "unauthorized_client":
-                print("💡 ERROR ANALYSIS: 'unauthorized_client' means:")
-                print("   - App doesn't have permission for this operation")
-                print("   - Wrong authority for this app registration")
-                
-            else:
-                print(f"💡 ERROR ANALYSIS: Unknown error '{error_code}'")
-                print("   → Check Azure AD sign-in logs for more details")
-                
-        else:
-            print("🎯 NO ERROR OBJECT RETURNED (None result)")
-            print("   → This means MSAL couldn't find a matching token/account combination")
-            print("   → See detailed diagnostic analysis above for root cause")
-        return
-
-    # 9) Success → proceed
-    access_token = result["access_token"]
-    print(f"🎯 Token acquired — preview: {access_token[:40]}")
-
-    # Optional sanity check on appid in JWT
-    if access_token.count(".") == 2:
-        try:
-            decoded = decode_token_payload(access_token)
-            appid = decoded.get("appid", "unknown")
-            print(f"🔐 JWT appid: {appid}")
-        except Exception as e:
-            print(f"⚠️ Could not decode JWT: {e}")
-
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-
-    # Do work
-    send_weekly_email(headers, ["bp21harrison@gmail.com"])
-    # process_replies(headers, user_id)
-    # send_outboxes(user_id, headers)
-
-
-# ─── Entry ─────────────────────────────────────────────
+# ─── Entry Point ───────────────────────────────────────
 if __name__ == "__main__":
     all_users = list_user_ids()
     print(f"📦 Found {len(all_users)} token cache users: {all_users}")
@@ -591,3 +549,5 @@ if __name__ == "__main__":
             refresh_and_process_user(uid)
         except Exception as e:
             print(f"💥 Error for user {uid}:", str(e))
+            import traceback
+            traceback.print_exc()
