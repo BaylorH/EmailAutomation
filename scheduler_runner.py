@@ -231,7 +231,14 @@ def refresh_and_process_user(user_id):
 
     result = app.acquire_token_silent(SCOPES, account=accounts[0], force_refresh=True)
     if not result or "access_token" not in result:
-        print(f"❌ Silent auth failed for {user_id}")
+        if result:
+            print(f"❌ Silent auth failed for {user_id}")
+            print("Error:", result.get("error"))
+            print("Description:", result.get("error_description"))
+            print("Correlation ID:", result.get("correlation_id"))
+            print("Trace ID:", result.get("trace_id"))
+        else:
+            print(f"❌ Silent auth failed for {user_id}: no result")
         return
 
     access_token = result["access_token"]
