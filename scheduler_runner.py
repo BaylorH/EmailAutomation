@@ -216,14 +216,7 @@ def debug_dump_cache(cache, label=""):
         print("      environment:", v.get("environment"))
         print("      home_account_id:", v.get("home_account_id"))
 
-def _extract_utid(home_account_id: str):
-    """Extract tenant ID from MSAL home_account_id format: <uid>.<utid>"""
-    try:
-        return (home_account_id or "").split(".")[1]
-    except (IndexError, AttributeError):
-        return None
 
-# ─── Main Loop ─────────────────────────────────────────
 def refresh_and_process_user(user_id: str):
     print(f"\n🔄 Processing user: {user_id}")
     
@@ -266,6 +259,50 @@ def refresh_and_process_user(user_id: str):
     print(f"🔎 Authority (scheduler):     {AUTHORITY}")
     print(f"🔎 RT env:                    {rt_env}")
     print(f"🔎 RT home_account_id:        {rt_home}")
+
+    # CRITICAL: Check scopes in cached tokens vs requested scopes
+    print(f"\n🔍 SCOPE ANALYSIS:")
+    print(f"🔍 Requested scopes: {SCOPES}")
+    
+    # Check scopes in refresh tokens
+    for rt_key, rt_data in (cache_json.get("RefreshToken") or {}).items():
+        print(f"🔍 RT key parts: {rt_key}")
+        # RT key format includes scopes, usually at the end
+        if "--" in rt_key:
+            scope_part = rt_key.split("--")[-1] if rt_key.split("--")[-1] else "no-scopes"
+            print(f"🔍 RT scopes from key: '{scope_part}'")
+        
+    # Check scopes in access tokens (if any)
+    ats = cache_json.get("AccessToken", {})
+    for at_key, at_data in ats.items():
+        print(f"🔍 AT key: {at_key}")
+        if "target" in at_data:
+            print(f"🔍 AT target scopes: {at_data['target']}")
+    
+    # Check scopes in ID tokens
+    ids = cache_json.get("IdToken", {})
+    for id_key, id_data in ids.items():
+        print(f"🔍 ID token key: {id_key}")
+        # ID tokens don't have scopes, but show for completeness
+        
+    print(f"🔍 Scopes comparison:")
+    print(f"   Requesting: {' '.join(sorted(SCOPES))}")
+    if rts:
+        first_rt_key = list((cache_json.get("RefreshToken") or {}).keys())[0]
+        if "--" in first_rt_key:
+            cached_scope_str = first_rt_key.split("--")[-1]
+            cached_scopes = cached_scope_str.replace("-", " ").split() if cached_scope_str != "no-scopes" else []
+            print(f"   In cache:   {' '.join(sorted(cached_scopes))}")
+            
+            # Check for exact match
+            if sorted(SCOPES) == sorted(cached_scopes):
+                print("✅ SCOPES MATCH - not a scope issue")
+            else:
+                print("❌ SCOPES MISMATCH - this is likely the problem!")
+                print("💡 SOLUTION: Request token with original scopes first, then use incremental consent")
+        else:
+            print("   In cache:   <could not parse from RT key>")
+    print()
 
     # 3) Determine the correct authority to use
     utid = _extract_utid(rt_home) if rt_home else None
@@ -476,6 +513,13 @@ def refresh_and_process_user(user_id: str):
     send_weekly_email(headers, ["bp21harrison@gmail.com"])
     # process_replies(headers, user_id)
     # send_outboxes(user_id, headers)
+
+def _extract_utid(home_account_id: str):
+    """Extract tenant ID from MSAL home_account_id format: <uid>.<utid>"""
+    try:
+        return (home_account_id or "").split(".")[1]
+    except (IndexError, AttributeError):
+        return None
 
 
 # ─── Entry ─────────────────────────────────────────────
