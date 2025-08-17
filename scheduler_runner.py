@@ -610,6 +610,7 @@ def refresh_and_process_user(user_id: str):
     send_outboxes(user_id, headers)
     # scan_new_mail_for_client_header(headers, only_unread=True, top=10)
     scan_new_mail_and_find_client_from_sent(headers, only_unread=True, top_inbox=10, top_sent=100)
+    dump_conversations_for_client(headers, client_id=None, top_sent=50)
 
 
 # ─── Entry ─────────────────────────────────────────────
