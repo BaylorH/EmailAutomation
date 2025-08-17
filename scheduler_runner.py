@@ -45,7 +45,7 @@ def _body_kind(script: str):
     return "Text", script or ""
 
 # ─── Send email via Graph ──────────────────────────────
-def send_email(headers, script: str, emails: list[str]):
+def send_email(headers, script: str, emails: list[str], client_id: str | None = None):
     if not emails:
         return {"sent": [], "errors": {"_all": "No recipients"}}
 
@@ -61,6 +61,12 @@ def send_email(headers, script: str, emails: list[str]):
             },
             "saveToSentItems": True,
         }
+
+        if client_id:
+            payload["message"]["internetMessageHeaders"] = [
+                {"name": "x-client-id", "value": client_id}
+            ]
+            
         try:
             r = requests.post(
                 "https://graph.microsoft.com/v1.0/me/sendMail",
@@ -70,7 +76,7 @@ def send_email(headers, script: str, emails: list[str]):
             )
             r.raise_for_status()
             results["sent"].append(addr)
-            print(f"✅ Sent to {addr}")
+            print(f"✅ Sent to {addr} (x-client-id={client_id or 'n/a'})")
         except Exception as e:
             msg = str(e)
             print(f"❌ Failed to send to {addr}: {msg}")
@@ -100,11 +106,12 @@ def send_outboxes(user_id: str, headers):
         data = d.to_dict() or {}
         emails = data.get("assignedEmails") or []
         script = data.get("script") or ""
+        clientId = (data.get("clientId") or "").strip()
 
-        print(f"→ Sending outbox item {d.id} to {len(emails)} recipient(s)")
+        print(f"→ Sending outbox item {d.id} to {len(emails)} recipient(s) (clientId={clientId or 'n/a'})")
 
         try:
-            res = send_email(headers, script, emails)
+            res = send_email(headers, script, emails, client_id=clientId)
             any_errors = bool(res["errors"])
 
             if not any_errors and res["sent"]:
