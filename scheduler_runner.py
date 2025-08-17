@@ -21,9 +21,12 @@ AUTHORITY         = "https://login.microsoftonline.com/common"
 SCOPES            = ["Mail.ReadWrite", "Mail.Send"]
 TOKEN_CACHE       = "msal_token_cache.bin"
 
-SUBJECT = "Hi"
+SUBJECT = "Weekly Questions"
 BODY = (
-    "Hey"
+    "Hi,\n\nPlease answer the following:\n"
+    "1. How was your week?\n"
+    "2. What challenges did you face?\n"
+    "3. Any updates to share?\n\nThanks!"
 )
 THANK_YOU_BODY = "Thanks for your response."
 
@@ -195,16 +198,14 @@ def process_replies(headers, user_id):
     print(f"✅ Saved replies to {file}")
 
 # ─── Main Loop ─────────────────────────────────────────
-# ─── Replace your refresh_and_process_user with this version ───────────────────
-def refresh_and_process_user(user_id: str):
+def refresh_and_process_user(user_id):
     print(f"\n🔄 Processing user: {user_id}")
 
-    # Download & load cache
     download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
+
     cache = SerializableTokenCache()
-    if os.path.exists(TOKEN_CACHE):
-        with open(TOKEN_CACHE, "r") as f:
-            cache.deserialize(f.read())
+    with open(TOKEN_CACHE, "r") as f:
+        cache.deserialize(f.read())
 
     def _save_cache():
         if cache.has_state_changed:
@@ -219,64 +220,39 @@ def refresh_and_process_user(user_id: str):
     app = ConfidentialClientApplication(
         CLIENT_ID,
         client_credential=CLIENT_SECRET,
-        authority=AUTHORITY,          # keep "common"; cache guides MSAL to right tenant
+        authority=AUTHORITY,
         token_cache=cache
     )
 
     accounts = app.get_accounts()
     if not accounts:
-        print(f"⚠️ No account found for {user_id} — user must sign in via your web flow")
+        print(f"⚠️ No account found for {user_id}")
         return
-    account = accounts[0]
 
-    # Acquire token with best-practice flow (no constant refresh)
-    result = acquire_access_token(app, SCOPES, account)
-
-    if "access_token" not in result:
-        # Inspect error for actionable states
-        err = f"{result.get('error')}: {result.get('error_description','')}"
-        print(f"❌ Auth failed for {user_id}: {err}")
-
-        if _is_abuse(err):
-            # Optional: flag in Firestore so your scheduler skips until manual clear
-            _fs.collection("users").document(user_id).set(
-                {"auth": {"blocked": True, "lastError": err[:1500]}},
-                merge=True,
-            )
-            print("⛔ Account flagged in service abuse mode. Pausing this user until re-auth.")
-        elif _needs_reauth(err):
-            _fs.collection("users").document(user_id).set(
-                {"auth": {"reauthRequired": True, "lastError": err[:1500]}},
-                merge=True,
-            )
-            print("🔐 Re-auth required (MFA/SSPR/CA). Prompt user in your web UI.")
+    result = app.acquire_token_silent(SCOPES, account=accounts[0], force_refresh=True)
+    if not result or "access_token" not in result:
+        print(f"❌ Silent auth failed for {user_id}")
         return
 
     access_token = result["access_token"]
-    print(f"🎯 Using cached/renewed token — preview: {access_token[:40]}")
+    print(f"🎯 Token refreshed for {user_id} — preview: {access_token[:40]}")
 
-    # (Optional) sanity-check token claims
-    try:
-        if access_token.count(".") == 2:
-            decoded = decode_token_payload(access_token)
-            appid = decoded.get("appid", "unknown")
-            if not appid.startswith("54cec"):
-                print(f"⚠️ Unexpected appid: {appid}")
-            else:
-                print("✅ Token appid matches expected prefix")
-    except Exception:
-        pass
+    if access_token.count(".") == 2:
+        decoded = decode_token_payload(access_token)
+        appid = decoded.get("appid", "unknown")
+        if not appid.startswith("54cec"):
+            print(f"⚠️ Unexpected appid: {appid}")
+        else:
+            print("✅ Token appid matches expected prefix")
 
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
     }
 
-    # Your existing work:
     # send_weekly_email(headers, ["bp21harrison@gmail.com"])
     # process_replies(headers, user_id)
     send_outboxes(user_id, headers)
-
 
 # ─── Entry ─────────────────────────────────────────────
 if __name__ == "__main__":
