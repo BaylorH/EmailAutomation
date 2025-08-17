@@ -59,30 +59,27 @@ def send_email(headers, script: str, emails: list[str], client_id: str | None = 
 
     content_type, content = _body_kind(script)
     results = {"sent": [], "errors": {}}
+    base = "https://graph.microsoft.com/v1.0"
 
     for addr in emails:
-        payload = {
-            "message": {
-                "subject": "Client Outreach",
-                "body": {"contentType": content_type, "content": content},
-                "toRecipients": [{"emailAddress": {"address": addr}}],
-            },
-            "saveToSentItems": True,
+        msg = {
+            "subject": "Client Outreach",
+            "body": {"contentType": content_type, "content": content},
+            "toRecipients": [{"emailAddress": {"address": addr}}],
         }
-
         if client_id:
-            payload["message"]["internetMessageHeaders"] = [
-                {"name": "x-client-id", "value": client_id}
-            ]
-            
+            msg["internetMessageHeaders"] = [{"name": "x-client-id", "value": client_id}]
+
         try:
-            r = requests.post(
-                "https://graph.microsoft.com/v1.0/me/sendMail",
-                headers=headers,
-                json=payload,
-                timeout=20,
-            )
+            # create draft (this is where custom headers are supported)
+            r = requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=20)
             r.raise_for_status()
+            draft_id = r.json()["id"]
+
+            # send draft
+            r = requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=20)
+            r.raise_for_status()
+
             results["sent"].append(addr)
             print(f"✅ Sent to {addr} (x-client-id={client_id or 'n/a'})")
         except Exception as e:
@@ -91,6 +88,7 @@ def send_email(headers, script: str, emails: list[str], client_id: str | None = 
             results["errors"][addr] = msg
 
     return results
+
 
 # ─── Process outbox for one user ───────────────────────
 def send_outboxes(user_id: str, headers):
