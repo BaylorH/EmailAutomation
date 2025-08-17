@@ -197,24 +197,31 @@ def process_replies(headers, user_id):
     upload_excel(FIREBASE_API_KEY, input_file=file)
     print(f"✅ Saved replies to {file}")
 
+import hashlib
+
 def debug_dump_cache(cache, label=""):
+    raw = cache.serialize() or "{}"
+    data = json.loads(raw)
+    ats = data.get("AccessToken", {})
+    rts = data.get("RefreshToken", {})
+    ids = data.get("IdToken", {})
+    print(f"\n🧪 Cache dump [{label}]")
+    print(f"   AccessTokens:  {len(ats)}")
+    print(f"   RefreshTokens: {len(rts)}")
+    print(f"   IdTokens:      {len(ids)}")
+    # Print RT metadata (safe)
+    for k, v in rts.items():
+        print("   ↳ RT key:", k)
+        print("      client_id:", v.get("client_id"))
+        print("      environment:", v.get("environment"))
+        print("      home_account_id:", v.get("home_account_id"))
+
+def extract_utid(home_account_id):
+    # MSAL home_account_id format: <uid>.<utid>
     try:
-        data = json.loads(cache.serialize())
-        ats = data.get("AccessToken", {})
-        rts = data.get("RefreshToken", {})
-        ids = data.get("IdToken", {})
-        print(f"\n🧪 Cache dump {label}")
-        print(f"   AccessTokens: {len(ats)}")
-        print(f"   RefreshTokens: {len(rts)}")
-        print(f"   IdTokens: {len(ids)}")
-        # Optional: peek at refresh token metadata only (no secret values)
-        for k, v in rts.items():
-            print("   ↳ RT key:", k)
-            print("      client_id:", v.get("client_id"))
-            print("      env:", v.get("environment"))
-            print("      home_account_id:", v.get("home_account_id"))
-    except Exception as e:
-        print("🧪 Failed to dump cache:", e)
+        return (home_account_id or "").split(".")[1]
+    except Exception:
+        return None
 
 
 # ─── Main Loop ─────────────────────────────────────────
@@ -228,6 +235,23 @@ def refresh_and_process_user(user_id):
         cache.deserialize(f.read())
     
     debug_dump_cache(cache, label=user_id)
+
+        # --- Inspect RT metadata vs your env ---
+    cache_json = json.loads(cache.serialize() or "{}")
+    rts = list((cache_json.get("RefreshToken") or {}).values())
+    rt_client_id = rts[0].get("client_id") if rts else None
+    rt_home = rts[0].get("home_account_id") if rts else None
+    rt_env = rts[0].get("environment") if rts else None
+
+    print(f"🔎 CLIENT_ID (scheduler env): {CLIENT_ID}")
+    print(f"🔎 CLIENT_ID (in cache RT):   {rt_client_id}")
+    print(f"🔎 Authority (scheduler):     {AUTHORITY}")
+    print(f"🔎 RT env:                    {rt_env}")
+    print(f"🔎 RT home_account_id:        {rt_home}")
+
+    accts = app.get_accounts()
+    print("👤 Accounts in cache:", [a.get('username') for a in accts] or "<none>")
+
 
     def _save_cache():
         if cache.has_state_changed:
