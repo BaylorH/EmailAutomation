@@ -30,6 +30,128 @@ def _get_my_address(headers) -> str:
     me = r.json()
     return (me.get("mail") or me.get("userPrincipalName") or "").lower()
 
+from datetime import datetime, timezone
+
+from datetime import timedelta, timezone
+
+def scan_inbox_with_sent_index(headers, only_unread: bool = True, top_inbox: int = 50, since_days: int = 180):
+    """
+    Build an index of Sent (within a window), then scan Inbox and resolve clientId via:
+      In-Reply-To → References → conversationId
+    """
+    # 1) Build Sent index (e.g., last 6 months)
+    since = datetime.now(timezone.utc) - timedelta(days=since_days)
+    by_imid, by_conv = index_sent_threads(headers, since=since, page_size=50, max_pages=50)
+
+    # 2) Fetch recent Inbox
+    inbox_url = f"{GRAPH_BASE}/me/mailFolders/Inbox/messages"
+    params = {
+        "$top": str(top_inbox),
+        "$orderby": "receivedDateTime desc",
+        "$select": "id,subject,from,receivedDateTime,conversationId,internetMessageHeaders"
+    }
+    if only_unread:
+        params["$filter"] = "isRead eq false"
+
+    resp = requests.get(inbox_url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    msgs = resp.json().get("value", [])
+
+    print(f"🔎 Inbox scan with Sent index: {len(msgs)} message(s)")
+    for m in msgs:
+        hdrs = m.get("internetMessageHeaders") or []
+        in_reply_to = _get_header(hdrs, "In-Reply-To")
+
+        # tokenise References like "<id1> <id2>"
+        refs_header = _get_header(hdrs, "References") or ""
+        refs = [t for t in refs_header.split() if t.startswith("<") and t.endswith(">")]
+
+        conv = m.get("conversationId")
+        subj = m.get("subject", "(no subject)")
+        frm  = (m.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
+        when = m.get("receivedDateTime", "")
+
+        client_id = None
+        matched_via = None
+
+        if in_reply_to and in_reply_to in by_imid:
+            client_id = by_imid[in_reply_to]["clientId"]
+            matched_via = "In-Reply-To"
+        elif refs:
+            for r in refs:
+                if r in by_imid:
+                    client_id = by_imid[r]["clientId"]
+                    matched_via = "References"
+                    break
+        if not client_id and conv and conv in by_conv:
+            client_id = by_conv[conv]
+            matched_via = "conversationId"
+
+        print(f"• [{when}] from {frm} — {subj}")
+        if client_id:
+            print(f"   🧩 clientId={client_id} (matched via {matched_via})")
+        else:
+            print("   (no clientId match in index; original send may be older than window)")
+
+
+def index_sent_threads(headers, since: datetime | None = None, page_size=50, max_pages=50):
+    """
+    Return two dicts:
+      by_imid: internetMessageId -> {'clientId':..., 'conversationId':...}
+      by_conv: conversationId     -> 'clientId'
+    """
+    url = f"{GRAPH_BASE}/me/mailFolders/SentItems/messages"
+    params = {
+        "$orderby": "sentDateTime desc",
+        "$select": "id,sentDateTime,conversationId,internetMessageId,internetMessageHeaders",
+        "$top": str(page_size),
+    }
+    by_imid, by_conv = {}, {}
+    cutoff = (since.astimezone(timezone.utc).isoformat().replace("+00:00","Z") if since else None)
+    pages = 0
+
+    while url and pages < max_pages:
+        r = requests.get(url, headers=headers, params=params if pages == 0 else None, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("value", [])
+        pages += 1
+
+        for m in items:
+            ts = m.get("sentDateTime") or ""
+            if cutoff and ts and ts < cutoff:
+                return by_imid, by_conv
+
+            hdrs = m.get("internetMessageHeaders")
+            if hdrs is None:
+                r2 = requests.get(f"{GRAPH_BASE}/me/messages/{m['id']}",
+                                  headers=headers,
+                                  params={"$select":"internetMessageHeaders,sentDateTime,conversationId,internetMessageId"},
+                                  timeout=20)
+                if r2.ok:
+                    j = r2.json()
+                    hdrs = j.get("internetMessageHeaders", [])
+                    for k in ("sentDateTime","conversationId","internetMessageId"):
+                        m.setdefault(k, j.get(k))
+                else:
+                    hdrs = []
+
+            cid = _get_header(hdrs, "x-client-id")
+            if not cid:
+                continue
+
+            imid = m.get("internetMessageId")
+            conv = m.get("conversationId")
+            if imid:
+                by_imid[imid] = {"clientId": cid, "conversationId": conv}
+            if conv and conv not in by_conv:
+                by_conv[conv] = cid
+
+        url = data.get("@odata.nextLink")
+
+    return by_imid, by_conv
+
+
 def get_sent_with_client_id(headers, client_id: str | None = None, top: int = 50):
     """
     Return recent sent messages that carry x-client-id (optionally match a specific client_id).
@@ -609,7 +731,9 @@ def refresh_and_process_user(user_id: str):
     # process_replies(headers, user_id)
     send_outboxes(user_id, headers)
     # scan_new_mail_for_client_header(headers, only_unread=True, top=10)
-    scan_new_mail_and_find_client_from_sent(headers, only_unread=True, top_inbox=10, top_sent=100)
+    # scan_new_mail_and_find_client_from_sent(headers, only_unread=True, top_inbox=10, top_sent=100)
+    scan_inbox_with_sent_index(headers, only_unread=True, top_inbox=10, since_days=180)
+
     dump_conversations_for_client(headers, client_id=None, top_sent=50)
 
 
