@@ -57,7 +57,6 @@ def _tokenize_refs(refs_value: str) -> set[str]:
     return set(t for t in (refs_value or "").split() if t.startswith("<") and t.endswith(">"))
 
 def _load_recent_sent(headers, top: int = 100):
-    """Fetch recent Sent Items once; return dicts by internetMessageId and by conversationId."""
     url = "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages"
     params = {
         "$top": str(top),
@@ -67,16 +66,34 @@ def _load_recent_sent(headers, top: int = 100):
     r = requests.get(url, headers=headers, params=params, timeout=20)
     r.raise_for_status()
     items = r.json().get("value", [])
-    by_imid = {}
-    by_conv = {}
+    by_imid, by_conv = {}, {}
+
     for m in items:
+        # 🔹 Fallback: fetch headers if missing
+        if m.get("internetMessageHeaders") is None:
+            r2 = requests.get(
+                f"https://graph.microsoft.com/v1.0/me/messages/{m['id']}",
+                headers=headers,
+                params={"$select": "internetMessageHeaders,subject,sentDateTime,conversationId,internetMessageId"},
+                timeout=20
+            )
+            if r2.ok:
+                j = r2.json()
+                m["internetMessageHeaders"] = j.get("internetMessageHeaders", [])
+                m.setdefault("subject", j.get("subject"))
+                m.setdefault("sentDateTime", j.get("sentDateTime"))
+                m.setdefault("conversationId", j.get("conversationId"))
+                m.setdefault("internetMessageId", j.get("internetMessageId"))
+
         imid = m.get("internetMessageId")
         if imid:
             by_imid[imid] = m
         conv = m.get("conversationId")
         if conv:
             by_conv.setdefault(conv, []).append(m)
+
     return by_imid, by_conv
+
 
 # ─── Send email via Graph ──────────────────────────────
 def send_email(headers, script: str, emails: list[str], client_id: str | None = None):
@@ -447,7 +464,7 @@ def refresh_and_process_user(user_id: str):
     # send_weekly_email(headers, ["bp21harrison@gmail.com"])
     # process_replies(headers, user_id)
     send_outboxes(user_id, headers)
-    scan_new_mail_for_client_header(headers, only_unread=True, top=10)
+    # scan_new_mail_for_client_header(headers, only_unread=True, top=10)
     scan_new_mail_and_find_client_from_sent(headers, only_unread=True, top_inbox=10, top_sent=100)
 
 
