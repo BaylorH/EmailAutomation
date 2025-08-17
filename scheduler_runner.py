@@ -269,8 +269,16 @@ def refresh_and_process_user(user_id: str):
 
     # 3) Determine the correct authority to use
     utid = _extract_utid(rt_home) if rt_home else None
-    if utid:
-        # Use tenant-specific authority from the start
+    
+    # Check if this is a personal Microsoft account (MSA)
+    is_personal_account = account.get('username', '').endswith(('@outlook.com', '@hotmail.com', '@live.com', '@msn.com'))
+    
+    if is_personal_account:
+        # Personal Microsoft accounts should use /consumers
+        auth_to_use = "https://login.microsoftonline.com/consumers"
+        print(f"🧭 Detected personal Microsoft account - using consumers authority: {auth_to_use}")
+    elif utid:
+        # Use tenant-specific authority for organizational accounts
         auth_to_use = f"https://login.microsoftonline.com/{utid}"
         print(f"🧭 Using tenant-specific authority: {auth_to_use}")
     else:
@@ -325,42 +333,85 @@ def refresh_and_process_user(user_id: str):
                 claims_challenge=None
             )
 
-    # 7) If tenant-specific didn't work and we haven't tried common, try common as fallback
-    if not (result and "access_token" in result) and auth_to_use != AUTHORITY:
-        print("🔄 Tenant-specific failed, trying common authority as fallback...")
-        app_common = ConfidentialClientApplication(
-            CLIENT_ID,
-            client_credential=CLIENT_SECRET,
-            authority=AUTHORITY,
-            token_cache=cache,
-        )
-        accts_common = app_common.get_accounts()
-        print(f"👤 Common authority accounts: {[a.get('username') for a in accts_common] or '<none>'}")
-        
-        if accts_common:
-            common_account = accts_common[0]
-            print(f"🔍 Using common account: {common_account.get('username')} (type: {type(common_account)})")
-            
-            result = app_common.acquire_token_silent(SCOPES, account=common_account)
-            print(f"🔍 Common auth result type: {type(result)}, is None: {result is None}")
-            
-            if not (result and "access_token" in result):
-                result = app_common.acquire_token_silent(SCOPES, account=common_account, force_refresh=True)
-                print(f"🔍 Common auth force refresh result type: {type(result)}, is None: {result is None}")
-
-    # Alternative approach: Try without account parameter to see if we get better error info
+    # 7) If the first authority didn't work, try additional fallbacks
     if not (result and "access_token" in result):
-        print("🔄 All account-based attempts failed, trying acquire_token_by_refresh_token if available...")
-        # This is a diagnostic attempt - check if we can get better error information
+        print("🔄 First authority failed, trying fallback authorities...")
+        
+        # Try different authorities based on account type
+        fallback_authorities = []
+        
+        if is_personal_account and auth_to_use != AUTHORITY:
+            fallback_authorities.append(("common", AUTHORITY))
+        elif not is_personal_account and auth_to_use != "https://login.microsoftonline.com/consumers":
+            fallback_authorities.append(("consumers", "https://login.microsoftonline.com/consumers"))
+        
+        if auth_to_use not in [AUTHORITY, "https://login.microsoftonline.com/consumers"]:
+            fallback_authorities.append(("common", AUTHORITY))
+        
+        for auth_name, auth_url in fallback_authorities:
+            print(f"🔄 Trying {auth_name} authority: {auth_url}")
+            app_fallback = ConfidentialClientApplication(
+                CLIENT_ID,
+                client_credential=CLIENT_SECRET,
+                authority=auth_url,
+                token_cache=cache,
+            )
+            accts_fallback = app_fallback.get_accounts()
+            print(f"👤 {auth_name.title()} authority accounts: {[a.get('username') for a in accts_fallback] or '<none>'}")
+            
+            if accts_fallback:
+                fallback_account = accts_fallback[0]
+                print(f"🔍 Using {auth_name} account: {fallback_account.get('username')} (type: {type(fallback_account)})")
+                
+                result = app_fallback.acquire_token_silent(SCOPES, account=fallback_account)
+                print(f"🔍 {auth_name.title()} auth result type: {type(result)}, is None: {result is None}")
+                
+                if result and "access_token" in result:
+                    print(f"✅ Success with {auth_name} authority!")
+                    break
+                
+                if not (result and "access_token" in result):
+                    result = app_fallback.acquire_token_silent(SCOPES, account=fallback_account, force_refresh=True)
+                    print(f"🔍 {auth_name.title()} auth force refresh result type: {type(result)}, is None: {result is None}")
+                    
+                    if result and "access_token" in result:
+                        print(f"✅ Success with {auth_name} authority (force refresh)!")
+                        break
+
+    # Alternative approach: Try to get actual error details instead of None
+    if not (result and "access_token" in result):
+        print("🔄 All silent attempts failed. Attempting diagnostic methods to get actual error...")
+        
+        # Method 1: Try to use the refresh token directly to get a proper error
         try:
-            # Try to extract refresh token and use it directly
             cache_data = json.loads(cache.serialize() or "{}")
             refresh_tokens = cache_data.get("RefreshToken", {})
             if refresh_tokens:
                 print(f"🔍 Found {len(refresh_tokens)} refresh tokens in cache")
-                # Log first RT for debugging (safely)
                 first_rt_key = list(refresh_tokens.keys())[0]
                 first_rt = refresh_tokens[first_rt_key]
+                
+                # Try different diagnostic approaches
+                print("🔍 Attempting diagnostic token acquisition...")
+                
+                # Try with exact scope matching from cache
+                rt_scopes_from_key = first_rt_key.split("--")[-1] if "--" in first_rt_key else ""
+                if rt_scopes_from_key:
+                    original_scopes = [s.strip() for s in rt_scopes_from_key.replace("-", " ").split() if s.strip() and s.strip() not in ["openid", "profile", "offline_access"]]
+                    if original_scopes:
+                        print(f"🔍 Trying with exact cache scopes: {original_scopes}")
+                        diagnostic_result = app.acquire_token_silent(original_scopes, account=account, force_refresh=True)
+                        print(f"🔍 Diagnostic result with cache scopes: {type(diagnostic_result)} - {diagnostic_result}")
+                        if diagnostic_result and isinstance(diagnostic_result, dict) and "error" in diagnostic_result:
+                            print(f"🎯 ACTUAL ERROR FOUND: {diagnostic_result.get('error')} - {diagnostic_result.get('error_description')}")
+                            return  # Exit early with the real error
+                
+                # Method 2: Try to trigger a different error by using invalid scopes
+                print("🔍 Trying with obviously invalid scope to trigger error response...")
+                diagnostic_result = app.acquire_token_silent(["invalid.scope.test"], account=account)
+                print(f"🔍 Invalid scope test result: {type(diagnostic_result)} - {diagnostic_result}")
+                
+                # Method 3: Check if we can get any error by examining cache state more deeply
                 print(f"🔍 RT client_id: {first_rt.get('client_id')}")
                 print(f"🔍 RT environment: {first_rt.get('environment')}")
                 print(f"🔍 RT home_account_id: {first_rt.get('home_account_id')}")
@@ -370,91 +421,126 @@ def refresh_and_process_user(user_id: str):
                 if rt_expires_on:
                     import time
                     current_time = int(time.time())
-                    rt_expires_on_int = int(rt_expires_on)
-                    time_until_expiry = rt_expires_on_int - current_time
-                    
-                    print(f"🔍 RT expires_on: {rt_expires_on} (timestamp)")
-                    print(f"🔍 Current time: {current_time} (timestamp)")
-                    print(f"🔍 Time until RT expiry: {time_until_expiry} seconds")
-                    
-                    if time_until_expiry <= 0:
-                        print("❌ REFRESH TOKEN HAS EXPIRED!")
-                        print("   User needs to re-authenticate through your web app.")
-                    elif time_until_expiry < 3600:  # Less than 1 hour
-                        print(f"⚠️  REFRESH TOKEN EXPIRES SOON! ({time_until_expiry//60} minutes)")
-                    else:
-                        print(f"✅ Refresh token is still valid for {time_until_expiry//3600} hours")
+                    try:
+                        rt_expires_on_int = int(rt_expires_on)
+                        time_until_expiry = rt_expires_on_int - current_time
+                        
+                        print(f"🔍 RT expires_on: {rt_expires_on} (timestamp)")
+                        print(f"🔍 Current time: {current_time} (timestamp)")
+                        print(f"🔍 Time until RT expiry: {time_until_expiry} seconds")
+                        
+                        if time_until_expiry <= 0:
+                            print("🎯 ACTUAL ERROR: REFRESH TOKEN HAS EXPIRED!")
+                            print("   User needs to re-authenticate through your web app.")
+                            return
+                        elif time_until_expiry < 3600:  # Less than 1 hour
+                            print(f"⚠️  REFRESH TOKEN EXPIRES SOON! ({time_until_expiry//60} minutes)")
+                        else:
+                            print(f"✅ Refresh token is still valid for {time_until_expiry//3600} hours")
+                    except ValueError:
+                        print(f"⚠️ Could not parse expires_on timestamp: {rt_expires_on}")
                 else:
                     print("⚠️ RT does not have expires_on field - checking cached_at")
                     cached_at = first_rt.get("cached_at")
                     if cached_at:
                         import time
                         current_time = int(time.time())
-                        cached_at_int = int(cached_at)
-                        age_seconds = current_time - cached_at_int
-                        age_days = age_seconds // 86400
-                        
-                        print(f"🔍 RT cached_at: {cached_at} (timestamp)")
-                        print(f"🔍 RT age: {age_days} days")
-                        
-                        # Refresh tokens typically last 90 days for personal accounts, 
-                        # but can vary based on tenant policies
-                        if age_days > 90:
-                            print("❌ REFRESH TOKEN IS VERY OLD (>90 days) - likely expired!")
-                            print("   User needs to re-authenticate through your web app.")
-                        elif age_days > 60:
-                            print("⚠️  REFRESH TOKEN IS OLD (>60 days) - may be nearing expiration")
-                        else:
-                            print(f"✅ Refresh token age seems reasonable ({age_days} days)")
+                        try:
+                            cached_at_int = int(cached_at)
+                            age_seconds = current_time - cached_at_int
+                            age_days = age_seconds // 86400
+                            
+                            print(f"🔍 RT cached_at: {cached_at} (timestamp)")
+                            print(f"🔍 RT age: {age_days} days")
+                            
+                            if age_days > 90:
+                                print("🎯 ACTUAL ERROR: REFRESH TOKEN IS VERY OLD (>90 days) - likely expired!")
+                                print("   User needs to re-authenticate through your web app.")
+                                return
+                            elif age_days > 60:
+                                print("⚠️  REFRESH TOKEN IS OLD (>60 days) - may be nearing expiration")
+                            else:
+                                print(f"✅ Refresh token age seems reasonable ({age_days} days)")
+                        except ValueError:
+                            print(f"⚠️ Could not parse cached_at timestamp: {cached_at}")
                     else:
                         print("⚠️ No expiration or cached_at info available in RT")
                 
+                # Method 4: Try to directly inspect MSAL logs if possible
+                print("🔍 MSAL Configuration Check:")
+                print(f"   App authority: {app.authority}")
+                print(f"   App client_id: {CLIENT_ID}")
+                print(f"   Account authority_type: {account.get('authority_type')}")
+                print(f"   Account environment: {account.get('environment')}")
+                print(f"   Account realm: {account.get('realm')}")
+                
+                # Check for authority/environment mismatch
+                if account.get('environment') != app.authority.replace('https://login.', '').replace('/common', '').replace('/consumers', '').replace(f'/{utid}' if utid else '', ''):
+                    print("🎯 POSSIBLE ISSUE: Environment mismatch between account and app authority")
+                
         except Exception as e:
-            print(f"⚠️ Error inspecting refresh tokens: {e}")
+            print(f"⚠️ Error during diagnostic: {e}")
+            import traceback
+            print(f"🔍 Diagnostic traceback: {traceback.format_exc()}")
+            
+        # If we get here, we still don't have the exact error
+        print("🎯 CONCLUSION: MSAL is returning None without specific error details.")
+        print("   This typically indicates one of these issues:")
+        print("   1. Authority mismatch (account cached with different authority than app)")
+        print("   2. Refresh token expired/revoked (but no expiration data available)")
+        print("   3. Application configuration issue (wrong client_id/tenant)")
+        print("   4. Conditional Access policy preventing silent refresh")
+        print("   → Recommendation: User needs to re-authenticate through your web app.")
 
-    # 8) Final check
+    # 8) Final check with enhanced error reporting
     if not (result and "access_token" in result):
         if result:
             error_code = result.get("error")
             error_desc = result.get("error_description", "")
             
-            print("❌ Silent auth failed (dict):", error_code, "-", error_desc)
-            print("correlation_id:", result.get("correlation_id"), "trace_id:", result.get("trace_id"))
+            print("🎯 ACTUAL ERROR DETAILS:")
+            print(f"   Error Code: {error_code}")
+            print(f"   Error Description: {error_desc}")
+            print(f"   Correlation ID: {result.get('correlation_id')}")
+            print(f"   Trace ID: {result.get('trace_id')}")
             
-            # Check for specific error codes that indicate expiration or re-auth needed
-            if error_code in ["invalid_grant"]:
-                print("💡 ERROR ANALYSIS: 'invalid_grant' usually means:")
-                print("   - Refresh token has expired")
-                print("   - Refresh token has been revoked")  
-                print("   - User changed password")
+            # Provide specific guidance based on error code
+            if error_code == "invalid_grant":
+                print("💡 ERROR ANALYSIS: 'invalid_grant' means:")
+                print("   - Refresh token has expired or been revoked")
+                print("   - User changed password") 
                 print("   - Conditional Access policy changed")
                 print("   → User needs to re-authenticate through your web app.")
                 
             elif error_code in ["interaction_required", "consent_required"]:
-                print("💡 ERROR ANALYSIS: This error suggests:")
-                print("   - Additional consent is required")
+                print("💡 ERROR ANALYSIS: This error means:")
+                print("   - Additional user consent is required")
                 print("   - MFA/Conditional Access requires user interaction")
                 print("   → User needs to re-authenticate through your web app.")
                 
-            elif error_code in ["expired_token"]:
+            elif error_code == "expired_token":
                 print("💡 ERROR ANALYSIS: 'expired_token' means:")
-                print("   - The token in cache has expired")
-                print("   → This should have been handled by force_refresh, but apparently failed")
+                print("   - The cached token has expired")
+                print("   → This should have been handled by force_refresh")
                 
-            elif "expired" in error_desc.lower() or "invalid" in error_desc.lower():
-                print("💡 ERROR ANALYSIS: Error description suggests token expiration/invalidity")
-                print("   → User likely needs to re-authenticate through your web app.")
+            elif error_code == "invalid_client":
+                print("💡 ERROR ANALYSIS: 'invalid_client' means:")
+                print("   - Wrong client_id or client_secret")
+                print("   - App not properly registered")
+                
+            elif error_code == "unauthorized_client":
+                print("💡 ERROR ANALYSIS: 'unauthorized_client' means:")
+                print("   - App doesn't have permission for this operation")
+                print("   - Wrong authority for this app registration")
                 
             else:
-                print("💡 ERROR ANALYSIS: Unknown error - check Azure AD logs for more details")
+                print(f"💡 ERROR ANALYSIS: Unknown error '{error_code}'")
+                print("   → Check Azure AD sign-in logs for more details")
                 
         else:
-            print("❌ Silent auth failed: None (no result)")
-            print("💡 ANALYSIS: This typically means:")
-            print("   - No matching account found in cache for this authority")
-            print("   - Account object is None/invalid (MSAL 1.23+ requirement)")
-            print("   - Authority mismatch between cache and app configuration")
-            print("   - Refresh token may have expired (check expiration analysis above)")
+            print("🎯 NO ERROR OBJECT RETURNED (None result)")
+            print("   → This means MSAL couldn't find a matching token/account combination")
+            print("   → See detailed diagnostic analysis above for root cause")
         return
 
     # 9) Success → proceed
