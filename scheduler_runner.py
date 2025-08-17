@@ -18,7 +18,7 @@ CLIENT_SECRET     = os.getenv("AZURE_API_CLIENT_SECRET")
 FIREBASE_API_KEY  = os.getenv("FIREBASE_API_KEY")
 FIREBASE_BUCKET   = "email-automation-cache.firebasestorage.app"
 AUTHORITY         = "https://login.microsoftonline.com/common"
-SCOPES = ["mail.readwrite", "mail.send", "openid", "profile"]
+SCOPES            = ["mail.readwrite", "mail.send"]
 TOKEN_CACHE       = "msal_token_cache.bin"
 
 SUBJECT = "Weekly Questions"
