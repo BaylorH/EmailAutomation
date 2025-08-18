@@ -10,272 +10,12 @@ from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token, upload_excel
 
 from google.cloud import firestore
+from google.cloud.firestore import SERVER_TIMESTAMP
 
-from datetime import datetime
-import html
 import re
-
-GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-_BODY_TAG_RX = re.compile(r"<[^>]+>")  # crude HTML stripper for logs
-
-def _strip_html(s: str) -> str:
-    if not s:
-        return ""
-    # unescape entities then drop tags
-    return _BODY_TAG_RX.sub("", html.unescape(s))
-
-def _get_my_address(headers) -> str:
-    r = requests.get(f"{GRAPH_BASE}/me", headers=headers, params={"$select":"mail,userPrincipalName"}, timeout=20)
-    r.raise_for_status()
-    me = r.json()
-    return (me.get("mail") or me.get("userPrincipalName") or "").lower()
-
-from datetime import datetime, timezone
-
-from datetime import timedelta, timezone
-
-def scan_inbox_with_sent_index(headers, only_unread: bool = True, top_inbox: int = 50, since_days: int = 180):
-    """
-    Build an index of Sent (within a window), then scan Inbox and resolve clientId via:
-      In-Reply-To → References → conversationId
-    """
-    # 1) Build Sent index (e.g., last 6 months)
-    since = datetime.now(timezone.utc) - timedelta(days=since_days)
-    by_imid, by_conv = index_sent_threads(headers, since=since, page_size=50, max_pages=50)
-
-    # 2) Fetch recent Inbox
-    inbox_url = f"{GRAPH_BASE}/me/mailFolders/Inbox/messages"
-    params = {
-        "$top": str(top_inbox),
-        "$orderby": "receivedDateTime desc",
-        "$select": "id,subject,from,receivedDateTime,conversationId,internetMessageHeaders"
-    }
-    if only_unread:
-        params["$filter"] = "isRead eq false"
-
-    resp = requests.get(inbox_url, headers=headers, params=params, timeout=20)
-    resp.raise_for_status()
-    msgs = resp.json().get("value", [])
-
-    print(f"🔎 Inbox scan with Sent index: {len(msgs)} message(s)")
-    for m in msgs:
-        hdrs = m.get("internetMessageHeaders") or []
-        in_reply_to = _get_header(hdrs, "In-Reply-To")
-
-        # tokenise References like "<id1> <id2>"
-        refs_header = _get_header(hdrs, "References") or ""
-        refs = [t for t in refs_header.split() if t.startswith("<") and t.endswith(">")]
-
-        conv = m.get("conversationId")
-        subj = m.get("subject", "(no subject)")
-        frm  = (m.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
-        when = m.get("receivedDateTime", "")
-
-        client_id = None
-        matched_via = None
-
-        if in_reply_to and in_reply_to in by_imid:
-            client_id = by_imid[in_reply_to]["clientId"]
-            matched_via = "In-Reply-To"
-        elif refs:
-            for r in refs:
-                if r in by_imid:
-                    client_id = by_imid[r]["clientId"]
-                    matched_via = "References"
-                    break
-        if not client_id and conv and conv in by_conv:
-            client_id = by_conv[conv]
-            matched_via = "conversationId"
-
-        print(f"• [{when}] from {frm} — {subj}")
-        if client_id:
-            print(f"   🧩 clientId={client_id} (matched via {matched_via})")
-        else:
-            print("   (no clientId match in index; original send may be older than window)")
-
-
-def index_sent_threads(headers, since: datetime | None = None, page_size=50, max_pages=50):
-    """
-    Return two dicts:
-      by_imid: internetMessageId -> {'clientId':..., 'conversationId':...}
-      by_conv: conversationId     -> 'clientId'
-    """
-    url = f"{GRAPH_BASE}/me/mailFolders/SentItems/messages"
-    params = {
-        "$orderby": "sentDateTime desc",
-        "$select": "id,sentDateTime,conversationId,internetMessageId,internetMessageHeaders",
-        "$top": str(page_size),
-    }
-    by_imid, by_conv = {}, {}
-    cutoff = (since.astimezone(timezone.utc).isoformat().replace("+00:00","Z") if since else None)
-    pages = 0
-
-    while url and pages < max_pages:
-        r = requests.get(url, headers=headers, params=params if pages == 0 else None, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("value", [])
-        pages += 1
-
-        for m in items:
-            ts = m.get("sentDateTime") or ""
-            if cutoff and ts and ts < cutoff:
-                return by_imid, by_conv
-
-            hdrs = m.get("internetMessageHeaders")
-            if hdrs is None:
-                r2 = requests.get(f"{GRAPH_BASE}/me/messages/{m['id']}",
-                                  headers=headers,
-                                  params={"$select":"internetMessageHeaders,sentDateTime,conversationId,internetMessageId"},
-                                  timeout=20)
-                if r2.ok:
-                    j = r2.json()
-                    hdrs = j.get("internetMessageHeaders", [])
-                    for k in ("sentDateTime","conversationId","internetMessageId"):
-                        m.setdefault(k, j.get(k))
-                else:
-                    hdrs = []
-
-            cid = _get_header(hdrs, "x-client-id")
-            if not cid:
-                continue
-
-            imid = m.get("internetMessageId")
-            conv = m.get("conversationId")
-            if imid:
-                by_imid[imid] = {"clientId": cid, "conversationId": conv}
-            if conv and conv not in by_conv:
-                by_conv[conv] = cid
-
-        url = data.get("@odata.nextLink")
-
-    return by_imid, by_conv
-
-
-def get_sent_with_client_id(headers, client_id: str | None = None, top: int = 50):
-    """
-    Return recent sent messages that carry x-client-id (optionally match a specific client_id).
-    Each item: {id, subject, to, sentDateTime, conversationId, internetMessageId, x_client_id}
-    """
-    params = {
-        "$top": str(top),
-        "$orderby": "sentDateTime desc",
-        "$select": "id,subject,toRecipients,sentDateTime,conversationId,internetMessageId,internetMessageHeaders",
-    }
-    r = requests.get(f"{GRAPH_BASE}/me/mailFolders/SentItems/messages", headers=headers, params=params, timeout=20)
-    r.raise_for_status()
-    items = r.json().get("value", [])
-    results = []
-    for m in items:
-        hdrs = m.get("internetMessageHeaders")
-        # fallback fetch if headers missing
-        if hdrs is None:
-            r2 = requests.get(f"{GRAPH_BASE}/me/messages/{m['id']}",
-                              headers=headers,
-                              params={"$select":"internetMessageHeaders,subject,toRecipients,sentDateTime,conversationId,internetMessageId"},
-                              timeout=20)
-            if r2.ok:
-                j = r2.json()
-                m["internetMessageHeaders"] = hdrs = j.get("internetMessageHeaders", [])
-                for k in ("subject","toRecipients","sentDateTime","conversationId","internetMessageId"):
-                    m.setdefault(k, j.get(k))
-            else:
-                hdrs = []
-        x_client = _get_header(hdrs, "x-client-id")
-        if not x_client:
-            continue
-        if client_id and x_client != client_id:
-            continue
-        results.append({
-            "id": m.get("id"),
-            "subject": m.get("subject"),
-            "to": [t["emailAddress"]["address"] for t in (m.get("toRecipients") or []) if "emailAddress" in t],
-            "sentDateTime": m.get("sentDateTime"),
-            "conversationId": m.get("conversationId"),
-            "internetMessageId": m.get("internetMessageId"),
-            "x_client_id": x_client
-        })
-    return results
-
-def fetch_conversation_messages(headers, conversation_id: str, max_items: int = 200):
-    """
-    Fetch all messages for a conversationId, across folders.
-    Returns list sorted by sentDateTime ascending.
-    """
-    # Pull in chunks (Graph paging); keep it simple for now
-    messages = []
-    url = f"{GRAPH_BASE}/me/messages"
-    params = {
-        "$filter": f"conversationId eq '{conversation_id}'",
-        "$select": "id,subject,from,toRecipients,sentDateTime,receivedDateTime,conversationId,internetMessageId,body,bodyPreview",
-        "$orderby": "sentDateTime asc",
-        "$top": "50",
-    }
-    while True:
-        r = requests.get(url, headers=headers, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        messages.extend(data.get("value", []))
-        if len(messages) >= max_items or "@odata.nextLink" not in data:
-            break
-        # page through
-        url = data["@odata.nextLink"]
-        params = None  # nextLink already has query
-    # final sort (belt & suspenders)
-    messages.sort(key=lambda m: (m.get("sentDateTime") or m.get("receivedDateTime") or ""))
-    return messages
-
-
-def log_conversation(messages: list[dict], my_address: str, label: str):
-    """
-    Print a readable transcript to console.
-    """
-    print(f"\n🧵 Conversation: {label} — {len(messages)} message(s)")
-    for m in messages:
-        frm = (m.get("from") or {}).get("emailAddress", {}).get("address", "").lower()
-        to_addrs = [t["emailAddress"]["address"].lower() for t in (m.get("toRecipients") or []) if "emailAddress" in t]
-        direction = "ME → THEM" if frm == my_address else "THEM → ME"
-        ts = m.get("sentDateTime") or m.get("receivedDateTime") or ""
-        subj = m.get("subject", "(no subject)")
-        body = (m.get("body") or {}).get("content", "") or m.get("bodyPreview") or ""
-        body_txt = _strip_html(body).strip()
-        if len(body_txt) > 1200:
-            body_txt = body_txt[:1200] + "…"
-
-        print(f"— {direction} @ {ts}")
-        print(f"   Subject: {subj}")
-        print(f"   From: {frm}  To: {', '.join(to_addrs)}")
-        print("   Body:")
-        for line in body_txt.splitlines():
-            print(f"     {line}")
-
-# show *all* conversations you initiated that carry an x-client-id (recent window)
-# dump_conversations_for_client(headers, client_id=None, top_sent=25)
-# …or focus a single client:
-# dump_conversations_for_client(headers, client_id="3WI5hjxYqmbOim2b1oQS", top_sent=50)
-def dump_conversations_for_client(headers, client_id: str | None = None, top_sent: int = 25):
-    """
-    Step 1: pull Sent with x-client-id (optionally filter specific client)
-    Step 2: for each, fetch all messages in that conversation
-    Step 3: console log the full thread
-    """
-    my_addr = _get_my_address(headers)
-    sent_hits = get_sent_with_client_id(headers, client_id=client_id, top=top_sent)
-    if not sent_hits:
-        print("ℹ️ No sent items with x-client-id found in the window.")
-        return
-
-    # Deduplicate by conversationId (in case multiple sent messages exist in same thread)
-    seen = set()
-    for s in sent_hits:
-        conv = s["conversationId"]
-        if not conv or conv in seen:
-            continue
-        seen.add(conv)
-
-        label = f"{s['subject']}  | x-client-id={s['x_client_id']}  | convId={conv}"
-        msgs = fetch_conversation_messages(headers, conv, max_items=300)
-        log_conversation(msgs, my_addr, label)
+import time
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 
 
 # ─── Config ─────────────────────────────────────────────
@@ -310,104 +50,447 @@ def _body_kind(script: str):
         return "HTML", script
     return "Text", script or ""
 
-def _get_header(headers_list, name: str) -> str:
-    """Case-insensitive lookup of an internet message header."""
-    name_l = name.lower()
-    for h in headers_list or []:
-        if h.get("name", "").lower() == name_l:
-            return h.get("value", "")
-    return ""
+# ─── New Helper Functions for Pipeline ─────────────────
 
-def _tokenize_refs(refs_value: str) -> set[str]:
-    # References header is space-separated message-ids like "<a@x> <b@y>"
-    return set(t for t in (refs_value or "").split() if t.startswith("<") and t.endswith(">"))
+def b64url_id(message_id: str) -> str:
+    """Encode message ID for safe use as Firestore document key."""
+    return base64.urlsafe_b64encode(message_id.encode('utf-8')).decode('ascii').rstrip('=')
 
-def _load_recent_sent(headers, top: int = 100):
-    url = "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages"
-    params = {
-        "$top": str(top),
-        "$orderby": "sentDateTime desc",
-        "$select": "id,subject,sentDateTime,conversationId,internetMessageId,internetMessageHeaders"
-    }
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    r.raise_for_status()
-    items = r.json().get("value", [])
-    by_imid, by_conv = {}, {}
+def normalize_message_id(msg_id: str) -> str:
+    """Normalize message ID - keep as-is but strip whitespace."""
+    return msg_id.strip() if msg_id else ""
 
-    for m in items:
-        # 🔹 Fallback: fetch headers if missing
-        if m.get("internetMessageHeaders") is None:
-            r2 = requests.get(
-                f"https://graph.microsoft.com/v1.0/me/messages/{m['id']}",
-                headers=headers,
-                params={"$select": "internetMessageHeaders,subject,sentDateTime,conversationId,internetMessageId"},
-                timeout=20
-            )
-            if r2.ok:
-                j = r2.json()
-                m["internetMessageHeaders"] = j.get("internetMessageHeaders", [])
-                m.setdefault("subject", j.get("subject"))
-                m.setdefault("sentDateTime", j.get("sentDateTime"))
-                m.setdefault("conversationId", j.get("conversationId"))
-                m.setdefault("internetMessageId", j.get("internetMessageId"))
+def parse_references_header(references: str) -> List[str]:
+    """Parse References header into list of message IDs."""
+    if not references:
+        return []
+    
+    # Split by whitespace and filter non-empty tokens
+    tokens = [token.strip() for token in references.split() if token.strip()]
+    return tokens
 
-        imid = m.get("internetMessageId")
-        if imid:
-            by_imid[imid] = m
-        conv = m.get("conversationId")
-        if conv:
-            by_conv.setdefault(conv, []).append(m)
+def strip_html_tags(html: str) -> str:
+    """Strip HTML tags for preview."""
+    if not html:
+        return ""
+    # Simple HTML tag removal
+    clean = re.sub(r'<[^>]+>', '', html)
+    # Decode common HTML entities
+    clean = clean.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+    clean = clean.replace('&quot;', '"').replace('&#39;', "'")
+    return clean.strip()
 
-    return by_imid, by_conv
+def safe_preview(content: str, max_len: int = 200) -> str:
+    """Create safe preview of email content."""
+    preview = strip_html_tags(content) if content else ""
+    if len(preview) > max_len:
+        preview = preview[:max_len] + "..."
+    return preview
 
+def save_thread_root(root_id: str, meta: Dict[str, Any]):
+    """Save or update thread root document."""
+    try:
+        thread_ref = _fs.collection("threads").document(root_id)
+        meta["updatedAt"] = SERVER_TIMESTAMP
+        if "createdAt" not in meta:
+            meta["createdAt"] = SERVER_TIMESTAMP
+        
+        thread_ref.set(meta, merge=True)
+        print(f"💾 Saved thread root: {root_id}")
+    except Exception as e:
+        print(f"❌ Failed to save thread root {root_id}: {e}")
 
-# ─── Send email via Graph ──────────────────────────────
-def send_email(headers, script: str, emails: list[str], client_id: str | None = None):
-    if not emails:
+def save_message(thread_id: str, message_id: str, payload: Dict[str, Any]):
+    """Save message to thread."""
+    try:
+        msg_ref = _fs.collection("threads").document(thread_id).collection("messages").document(message_id)
+        payload["createdAt"] = SERVER_TIMESTAMP
+        msg_ref.set(payload, merge=True)
+        print(f"💾 Saved message {message_id} to thread {thread_id}")
+    except Exception as e:
+        print(f"❌ Failed to save message {message_id}: {e}")
+
+def index_message_id(message_id: str, thread_id: str):
+    """Index message ID for O(1) lookup."""
+    try:
+        encoded_id = b64url_id(message_id)
+        index_ref = _fs.collection("msgIndex").document(encoded_id)
+        index_ref.set({"threadId": thread_id}, merge=True)
+        print(f"🔍 Indexed message ID: {message_id[:50]}... -> {thread_id}")
+    except Exception as e:
+        print(f"❌ Failed to index message {message_id}: {e}")
+
+def lookup_thread_by_message_id(message_id: str) -> Optional[str]:
+    """Look up thread ID by message ID."""
+    try:
+        encoded_id = b64url_id(message_id)
+        doc = _fs.collection("msgIndex").document(encoded_id).get()
+        if doc.exists:
+            return doc.to_dict().get("threadId")
+        return None
+    except Exception as e:
+        print(f"❌ Failed to lookup message {message_id}: {e}")
+        return None
+
+def index_conversation_id(conversation_id: str, thread_id: str):
+    """Index conversation ID for fallback lookup."""
+    if not conversation_id:
+        return
+    try:
+        conv_ref = _fs.collection("convIndex").document(conversation_id)
+        conv_ref.set({"threadId": thread_id}, merge=True)
+        print(f"🔍 Indexed conversation ID: {conversation_id} -> {thread_id}")
+    except Exception as e:
+        print(f"❌ Failed to index conversation {conversation_id}: {e}")
+
+def lookup_thread_by_conversation_id(conversation_id: str) -> Optional[str]:
+    """Look up thread ID by conversation ID (fallback)."""
+    if not conversation_id:
+        return None
+    try:
+        doc = _fs.collection("convIndex").document(conversation_id).get()
+        if doc.exists:
+            return doc.to_dict().get("threadId")
+        return None
+    except Exception as e:
+        print(f"❌ Failed to lookup conversation {conversation_id}: {e}")
+        return None
+
+def exponential_backoff_request(func, max_retries: int = 3):
+    """Execute request with exponential backoff on rate limits."""
+    for attempt in range(max_retries):
+        try:
+            response = func()
+            if response.status_code == 429:  # Rate limited
+                retry_after = int(response.headers.get('Retry-After', 2 ** attempt))
+                print(f"⏳ Rate limited, retrying after {retry_after}s")
+                time.sleep(retry_after)
+                continue
+            response.raise_for_status()
+            return response
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code >= 500 and attempt < max_retries - 1:
+                sleep_time = 2 ** attempt
+                print(f"⏳ Server error, retrying after {sleep_time}s")
+                time.sleep(sleep_time)
+                continue
+            raise
+        except Exception as e:
+            if attempt < max_retries - 1:
+                sleep_time = 2 ** attempt
+                print(f"⏳ Request failed, retrying after {sleep_time}s")
+                time.sleep(sleep_time)
+                continue
+            raise
+    raise Exception(f"Request failed after {max_retries} attempts")
+
+# ─── Send and Index Email ──────────────────────────────
+
+def send_and_index_email(headers: Dict[str, str], script: str, recipients: List[str], client_id_or_none: Optional[str] = None):
+    """Send email and immediately index it in Firestore for reply tracking."""
+    if not recipients:
         return {"sent": [], "errors": {"_all": "No recipients"}}
 
     content_type, content = _body_kind(script)
     results = {"sent": [], "errors": {}}
     base = "https://graph.microsoft.com/v1.0"
 
-    for addr in emails:
+    for addr in recipients:
         msg = {
-            "subject": "Client Outreach",
+            "subject": "Client Outreach", 
             "body": {"contentType": content_type, "content": content},
             "toRecipients": [{"emailAddress": {"address": addr}}],
         }
-        if client_id:
-            msg["internetMessageHeaders"] = [{"name": "x-client-id", "value": client_id}]
+        if client_id_or_none:
+            msg["internetMessageHeaders"] = [{"name": "x-client-id", "value": client_id_or_none}]
 
         try:
-            # create draft (this is where custom headers are supported)
-            r = requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=20)
-            r.raise_for_status()
-            draft_id = r.json()["id"]
+            # 1. Create draft
+            create_response = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
+            )
+            draft_id = create_response.json()["id"]
+            print(f"📝 Created draft {draft_id} for {addr}")
 
-            # send draft
-            r = requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=20)
-            r.raise_for_status()
+            # 2. Get message identifiers
+            get_response = exponential_backoff_request(
+                lambda: requests.get(
+                    f"{base}/me/messages/{draft_id}",
+                    headers=headers,
+                    params={"$select": "internetMessageId,conversationId,subject,toRecipients"},
+                    timeout=30
+                )
+            )
+            message_data = get_response.json()
+            
+            internet_message_id = message_data.get("internetMessageId")
+            conversation_id = message_data.get("conversationId")
+            subject = message_data.get("subject", "")
+
+            if not internet_message_id:
+                raise Exception("No internetMessageId returned from Graph")
+
+            # 3. Send draft
+            exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
+            )
+
+            # 4. Index in Firestore
+            root_id = normalize_message_id(internet_message_id)
+            
+            # Thread root
+            thread_meta = {
+                "subject": subject,
+                "clientId": client_id_or_none,
+                "email": [addr],
+                "conversationId": conversation_id,
+            }
+            save_thread_root(root_id, thread_meta)
+            
+            # Message record
+            message_record = {
+                "direction": "outbound",
+                "subject": subject,
+                "from": "me",  # Graph doesn't return our own address easily
+                "to": [addr],
+                "sentDateTime": datetime.utcnow().isoformat() + "Z",
+                "receivedDateTime": None,
+                "headers": {
+                    "internetMessageId": internet_message_id,
+                    "inReplyTo": None,
+                    "references": []
+                },
+                "body": {
+                    "contentType": content_type,
+                    "content": content,
+                    "preview": safe_preview(content)
+                }
+            }
+            save_message(root_id, root_id, message_record)
+            
+            # Index message
+            index_message_id(internet_message_id, root_id)
+            
+            # Index conversation (optional fallback)
+            if conversation_id:
+                index_conversation_id(conversation_id, root_id)
 
             results["sent"].append(addr)
-            print(f"✅ Sent to {addr} (x-client-id={client_id or 'n/a'})")
+            print(f"✅ Sent and indexed email to {addr} (threadId: {root_id})")
+            
         except Exception as e:
             msg = str(e)
-            print(f"❌ Failed to send to {addr}: {msg}")
+            print(f"❌ Failed to send/index to {addr}: {msg}")
             results["errors"][addr] = msg
 
     return results
 
+# ─── Scan Inbox and Match Replies ──────────────────────
 
-# ─── Process outbox for one user ───────────────────────
+def scan_inbox_against_index(headers: Dict[str, str], only_unread: bool = True, top: int = 50):
+    """Scan inbox for replies and match against our Firestore index."""
+    base = "https://graph.microsoft.com/v1.0"
+    
+    # Build filter
+    filters = []
+    if only_unread:
+        filters.append("isRead eq false")
+    
+    filter_str = " and ".join(filters) if filters else ""
+    
+    params = {
+        "$top": str(top),
+        "$orderby": "receivedDateTime desc",
+        "$select": "id,subject,from,toRecipients,receivedDateTime,sentDateTime,conversationId,internetMessageId,internetMessageHeaders,bodyPreview"
+    }
+    if filter_str:
+        params["$filter"] = filter_str
+
+    try:
+        # Get inbox messages
+        response = exponential_backoff_request(
+            lambda: requests.get(f"{base}/me/mailFolders/Inbox/messages", headers=headers, params=params, timeout=30)
+        )
+        messages = response.json().get("value", [])
+        
+        print(f"📥 Found {len(messages)} inbox messages to process")
+        
+        for msg in messages:
+            try:
+                process_inbox_message(headers, msg)
+            except Exception as e:
+                print(f"❌ Failed to process message {msg.get('id', 'unknown')}: {e}")
+                
+    except Exception as e:
+        print(f"❌ Failed to scan inbox: {e}")
+
+def process_inbox_message(headers: Dict[str, str], msg: Dict[str, Any]):
+    """Process a single inbox message for reply matching."""
+    msg_id = msg.get("id")
+    subject = msg.get("subject", "")
+    from_addr = msg.get("from", {}).get("emailAddress", {}).get("address", "")
+    internet_message_id = msg.get("internetMessageId")
+    conversation_id = msg.get("conversationId")
+    received_dt = msg.get("receivedDateTime")
+    sent_dt = msg.get("sentDateTime")
+    body_preview = msg.get("bodyPreview", "")
+    to_recipients = [r.get("emailAddress", {}).get("address", "") for r in msg.get("toRecipients", [])]
+    
+    # Get headers if not present
+    internet_message_headers = msg.get("internetMessageHeaders")
+    if not internet_message_headers:
+        try:
+            response = exponential_backoff_request(
+                lambda: requests.get(
+                    f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}",
+                    headers=headers,
+                    params={"$select": "internetMessageHeaders"},
+                    timeout=30
+                )
+            )
+            internet_message_headers = response.json().get("internetMessageHeaders", [])
+        except Exception as e:
+            print(f"⚠️ Could not fetch headers for {msg_id}: {e}")
+            internet_message_headers = []
+    
+    # Extract reply headers
+    in_reply_to = None
+    references = []
+    
+    for header in internet_message_headers or []:
+        name = header.get("name", "").lower()
+        value = header.get("value", "")
+        if name == "in-reply-to":
+            in_reply_to = normalize_message_id(value)
+        elif name == "references":
+            references = parse_references_header(value)
+    
+    print(f"📧 Processing: {subject} from {from_addr}")
+    print(f"   In-Reply-To: {in_reply_to}")
+    print(f"   References: {references}")
+    
+    # Match against our index
+    thread_id = None
+    matched_header = None
+    
+    # Try In-Reply-To first
+    if in_reply_to:
+        thread_id = lookup_thread_by_message_id(in_reply_to)
+        if thread_id:
+            matched_header = f"In-Reply-To: {in_reply_to}"
+    
+    # Try References (newest to oldest)
+    if not thread_id and references:
+        for ref in reversed(references):  # References are oldest to newest, we want newest first
+            ref = normalize_message_id(ref)
+            thread_id = lookup_thread_by_message_id(ref)
+            if thread_id:
+                matched_header = f"References: {ref}"
+                break
+    
+    # Fallback to conversation ID
+    if not thread_id and conversation_id:
+        thread_id = lookup_thread_by_conversation_id(conversation_id)
+        if thread_id:
+            matched_header = f"ConversationId: {conversation_id}"
+    
+    if not thread_id:
+        print(f"❓ No thread match found for message from {from_addr}")
+        return
+    
+    print(f"🎯 Matched via {matched_header} -> thread {thread_id}")
+    
+    # Create message record
+    message_record = {
+        "direction": "inbound",
+        "subject": subject,
+        "from": from_addr,
+        "to": to_recipients,
+        "sentDateTime": sent_dt,
+        "receivedDateTime": received_dt,
+        "headers": {
+            "internetMessageId": internet_message_id,
+            "inReplyTo": in_reply_to,
+            "references": references
+        },
+        "body": {
+            "contentType": "Text",  # bodyPreview is always text
+            "content": body_preview,
+            "preview": safe_preview(body_preview)
+        }
+    }
+    
+    # Save to Firestore
+    if internet_message_id:
+        save_message(thread_id, internet_message_id, message_record)
+        index_message_id(internet_message_id, thread_id)
+    else:
+        # Use Graph message ID as fallback
+        save_message(thread_id, msg_id, message_record)
+    
+    # Update thread timestamp
+    try:
+        thread_ref = _fs.collection("threads").document(thread_id)
+        thread_ref.set({"updatedAt": SERVER_TIMESTAMP}, merge=True)
+    except Exception as e:
+        print(f"⚠️ Failed to update thread timestamp: {e}")
+    
+    # Dump the conversation
+    dump_thread_from_firestore(thread_id)
+
+def dump_thread_from_firestore(thread_id: str):
+    """Console dump of thread conversation in chronological order."""
+    try:
+        print(f"\n📜 CONVERSATION THREAD: {thread_id}")
+        print("=" * 80)
+        
+        # Get all messages in thread
+        messages_ref = _fs.collection("threads").document(thread_id).collection("messages")
+        messages = list(messages_ref.stream())
+        
+        if not messages:
+            print("(No messages found)")
+            return
+        
+        # Sort by timestamp
+        message_data = []
+        for msg in messages:
+            data = msg.to_dict()
+            # Use sentDateTime for outbound, receivedDateTime for inbound
+            timestamp = data.get("sentDateTime") or data.get("receivedDateTime") or data.get("createdAt")
+            if hasattr(timestamp, 'timestamp'):
+                timestamp = timestamp.timestamp()
+            message_data.append((timestamp, data))
+        
+        message_data.sort(key=lambda x: x[0] if x[0] else 0)
+        
+        for timestamp, data in message_data:
+            direction = data.get("direction", "unknown")
+            subject = data.get("subject", "")
+            from_addr = data.get("from", "")
+            to_addrs = data.get("to", [])
+            preview = data.get("body", {}).get("preview", "")
+            
+            if direction == "outbound":
+                arrow = "ME → " + ", ".join(to_addrs)
+            else:
+                arrow = f"{from_addr} → ME"
+            
+            print(f"{arrow}")
+            print(f"   Subject: {subject}")
+            print(f"   Preview: {preview}")
+            print()
+        
+        print("=" * 80)
+        
+    except Exception as e:
+        print(f"❌ Failed to dump thread {thread_id}: {e}")
+
+# ─── Modified Outbox Processing ────────────────────────
+
 def send_outboxes(user_id: str, headers):
     """
-    Reads users/{uid}/outbox/* docs.
-    Each doc should contain only:
-      - assignedEmails: string[]
-      - script:         string
-    Success: delete the doc.
-    Failure: keep the doc with { attempts += 1, lastError }.
+    Modified to use send_and_index_email instead of send_email.
     """
     outbox_ref = _fs.collection("users").document(user_id).collection("outbox")
     docs = list(outbox_ref.stream())
@@ -426,7 +509,8 @@ def send_outboxes(user_id: str, headers):
         print(f"→ Sending outbox item {d.id} to {len(emails)} recipient(s) (clientId={clientId or 'n/a'})")
 
         try:
-            res = send_email(headers, script, emails, client_id=clientId)
+            # Use new send_and_index_email function
+            res = send_and_index_email(headers, script, emails, client_id_or_none=clientId)
             any_errors = bool(res["errors"])
 
             if not any_errors and res["sent"]:
@@ -447,6 +531,12 @@ def send_outboxes(user_id: str, headers):
                 merge=True,
             )
             print(f"💥 Error sending item {d.id}: {e}; attempts={attempts}")
+
+# ─── Legacy Functions (kept for compatibility) ──────────
+
+def send_email(headers, script: str, emails: list[str], client_id: str | None = None):
+    """Legacy function - redirects to send_and_index_email"""
+    return send_and_index_email(headers, script, emails, client_id)
 
 # ─── Utility: List user IDs from Firebase ──────────────
 def list_user_ids():
@@ -479,152 +569,6 @@ def send_weekly_email(headers, to_addresses):
         resp = requests.post("https://graph.microsoft.com/v1.0/me/sendMail", headers=headers, json=payload)
         resp.raise_for_status()
         print(f"✅ Sent '{SUBJECT}' to {addr}")
-
-def scan_new_mail_and_find_client_from_sent(headers, only_unread: bool = True, top_inbox: int = 10, top_sent: int = 100):
-    """
-    For each recent inbound message:
-      - detect reply via In-Reply-To/References
-      - find the related SENT message
-      - print the x-client-id from the SENT message's headers
-    """
-    # 1) Load Sent Items once
-    by_imid, by_conv = _load_recent_sent(headers, top=top_sent)
-
-    # 2) Load recent Inbox messages
-    inbox_url = "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
-    params = {
-        "$top": str(top_inbox),
-        "$orderby": "receivedDateTime desc",
-        "$select": "id,subject,from,replyTo,receivedDateTime,conversationId,internetMessageId,internetMessageHeaders",
-    }
-    if only_unread:
-        params["$filter"] = "isRead eq false"
-
-    resp = requests.get(inbox_url, headers=headers, params=params, timeout=20)
-    resp.raise_for_status()
-    messages = resp.json().get("value", [])
-
-    if not messages:
-        print("📭 Inbox scan: no messages.")
-        return
-
-    print(f"🔎 Scanning {len(messages)} inbound message(s) and resolving x-client-id from Sent Items ...")
-
-    for m in messages:
-        hdrs = m.get("internetMessageHeaders") or []
-        in_reply_to = _get_header(hdrs, "In-Reply-To")
-        references  = _tokenize_refs(_get_header(hdrs, "References"))
-        conv_id     = m.get("conversationId")
-        subj        = m.get("subject", "(no subject)")
-        frm         = (m.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
-        when        = m.get("receivedDateTime", "")
-
-        # Try to locate the related SENT message
-        sent_msg = None
-        if in_reply_to and in_reply_to in by_imid:
-            sent_msg = by_imid[in_reply_to]
-        if not sent_msg and references:
-            for ref in references:
-                if ref in by_imid:
-                    sent_msg = by_imid[ref]
-                    break
-        if not sent_msg and conv_id and conv_id in by_conv:
-            # fallback: any message we sent in the same conversation
-            # pick the most recent sent item for that conversation
-            sent_msg = sorted(by_conv[conv_id], key=lambda x: x.get("sentDateTime",""), reverse=True)[0]
-
-        print(f"• [{when}] from {frm} — {subj}")
-        if in_reply_to:
-            print(f"   ↪ In-Reply-To: {in_reply_to}")
-        if references:
-            preview = " ".join(list(references))[:120] + ("…" if len(" ".join(list(references))) > 120 else "")
-            print(f"   ↪ References:  {preview}")
-        if conv_id:
-            print(f"   ↪ conversationId: {conv_id}")
-
-        if sent_msg:
-            x_client_id = _get_header(sent_msg.get("internetMessageHeaders", []), "x-client-id")
-            imid_sent   = sent_msg.get("internetMessageId")
-            subj_sent   = sent_msg.get("subject")
-            print(f"   ✅ Matched SENT item: {subj_sent}")
-            print(f"      internetMessageId={imid_sent}")
-            if x_client_id:
-                print(f"      🧩 x-client-id={x_client_id}")
-            else:
-                print("      (SENT item has no x-client-id header)")
-        else:
-            print("   ⚠️ Could not find a related SENT item (try increasing top_sent, or store the original imid at send-time)")
-
-
-def scan_new_mail_for_client_header(headers, only_unread: bool = True, top: int = 10):
-    """
-    Scan recent Inbox messages and log whether custom x-headers are present.
-    Intended as a diagnostic to confirm header behavior on replies.
-    """
-    base = "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
-    params = {
-        "$top": str(top),
-        "$orderby": "receivedDateTime desc",
-        "$select": "id,subject,from,replyTo,receivedDateTime,conversationId,internetMessageId,internetMessageHeaders",
-    }
-    if only_unread:
-        params["$filter"] = "isRead eq false"
-
-    resp = requests.get(base, headers=headers, params=params, timeout=20)
-    resp.raise_for_status()
-    messages = resp.json().get("value", [])
-
-    if not messages:
-        print("📭 Inbox scan: no messages.")
-        return
-
-    print(f"🔎 Scanning {len(messages)} inbound message(s) for x-client-id ...")
-
-    for m in messages:
-        hdrs = m.get("internetMessageHeaders")
-
-        # Fallback: some tenants/clients require fetching the item again with a $select for headers
-        if hdrs is None:
-            r2 = requests.get(
-                f"https://graph.microsoft.com/v1.0/me/messages/{m['id']}",
-                headers=headers,
-                params={"$select": "internetMessageHeaders,subject,from,receivedDateTime,conversationId,internetMessageId"},
-                timeout=20
-            )
-            if r2.ok:
-                j = r2.json()
-                hdrs = j.get("internetMessageHeaders", [])
-                # keep other fields if the first call omitted them
-                m.setdefault("subject", j.get("subject"))
-                m.setdefault("from", j.get("from"))
-                m.setdefault("receivedDateTime", j.get("receivedDateTime"))
-                m.setdefault("conversationId", j.get("conversationId"))
-                m.setdefault("internetMessageId", j.get("internetMessageId"))
-            else:
-                hdrs = []
-
-        in_reply_to = _get_header(hdrs, "In-Reply-To")
-        references  = _get_header(hdrs, "References")
-        x_client_id = _get_header(hdrs, "x-client-id")
-        x_thread_id = _get_header(hdrs, "x-thread-id")
-
-        is_reply = bool(in_reply_to or m.get("replyTo"))
-        subj = m.get("subject", "(no subject)")
-        frm  = (m.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
-        when = m.get("receivedDateTime", "")
-
-        print(f"• {'REPLY' if is_reply else 'NEW  '} [{when}] from {frm} — {subj}")
-        if in_reply_to:
-            print(f"   ↪ In-Reply-To: {in_reply_to}")
-        if references:
-            preview = references[:120] + ("…" if len(references) > 120 else "")
-            print(f"   ↪ References:  {preview}")
-
-        if x_client_id or x_thread_id:
-            print(f"   🧩 Custom headers found → x-client-id={x_client_id or '—'}; x-thread-id={x_thread_id or '—'}")
-        else:
-            print("   (no custom x-headers found)")
-
 
 def process_replies(headers, user_id):
     url = "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
@@ -727,15 +671,12 @@ def refresh_and_process_user(user_id: str):
         "Content-Type": "application/json"
     }
 
-    # send_weekly_email(headers, ["bp21harrison@gmail.com"])
-    # process_replies(headers, user_id)
+    # Process outbound emails (now with indexing)
     send_outboxes(user_id, headers)
-    # scan_new_mail_for_client_header(headers, only_unread=True, top=10)
-    # scan_new_mail_and_find_client_from_sent(headers, only_unread=True, top_inbox=10, top_sent=100)
-    scan_inbox_with_sent_index(headers, only_unread=True, top_inbox=10, since_days=180)
-
-    dump_conversations_for_client(headers, client_id=None, top_sent=50)
-
+    
+    # Scan for reply matches
+    print(f"\n🔍 Scanning inbox for replies...")
+    scan_inbox_against_index(headers, only_unread=True, top=50)
 
 # ─── Entry ─────────────────────────────────────────────
 if __name__ == "__main__":
