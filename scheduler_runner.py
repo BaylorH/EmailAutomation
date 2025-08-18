@@ -17,6 +17,10 @@ import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+
 
 # ─── Config ─────────────────────────────────────────────
 CLIENT_ID         = os.getenv("AZURE_API_APP_ID")
@@ -50,7 +54,96 @@ def _body_kind(script: str):
         return "HTML", script
     return "Text", script or ""
 
-# ─── New Helper Functions for Pipeline ─────────────────
+
+def _helper_google_creds():
+    client_id     = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+    refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN")
+    if not (client_id and client_secret and refresh_token):
+        raise RuntimeError("❌ Missing GOOGLE_OAUTH_CLIENT_ID/SECRET/REFRESH_TOKEN")
+
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=[
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/spreadsheets",
+        ],
+    )
+    creds.refresh(Request())
+    return creds
+
+def _sheets_client():
+    creds  = _helper_google_creds()
+    sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return sheets
+
+
+def _get_sheet_id_or_fail(uid: str, client_id: str) -> str:
+    # Try active clients
+    doc_ref = _fs.collection("users").document(uid).collection("clients").document(client_id).get()
+    if doc_ref.exists:
+        sid = (doc_ref.to_dict() or {}).get("sheetId")
+        if sid:
+            return sid
+
+    # Try archived clients (emails might keep flowing after archive)
+    doc_ref = _fs.collection("users").document(uid).collection("archivedClients").document(client_id).get()
+    if doc_ref.exists:
+        sid = (doc_ref.to_dict() or {}).get("sheetId")
+        if sid:
+            return sid
+
+    # Required by design → fail loudly
+    raise RuntimeError(f"❌ sheetId not found for uid={uid} clientId={client_id}. This field is required.")
+
+
+def _read_first_sheet_header(sheets, spreadsheet_id: str):
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    first_title = meta["sheets"][0]["properties"]["title"]
+    header_resp = sheets.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{first_title}!A1:Z1"
+    ).execute()
+    header = header_resp.get("values", [[]])
+    header_row = header[0] if header else []
+    return first_title, header_row
+
+def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email: str | None):
+    # Read thread (to get clientId)
+    tdoc = (_fs.collection("users").document(uid)
+            .collection("threads").document(thread_id).get())
+    if not tdoc.exists:
+        print("⚠️ Thread doc not found; cannot fetch sheet")
+        return
+
+    tdata = tdoc.to_dict() or {}
+    client_id = tdata.get("clientId")
+    if not client_id:
+        print("⚠️ Thread has no clientId; cannot fetch sheet")
+        return
+
+    # Required: sheetId on client doc
+    sheet_id = _get_sheet_id_or_fail(uid, client_id)
+
+    # Connect to Sheets and read header
+    sheets = _sheets_client()
+    title, header = _read_first_sheet_header(sheets, sheet_id)
+
+    # If thread root already stored recipients, we can fill in a missing hint
+    if not counterparty_email:
+        # Try thread root "email" list (set when we sent the first message)
+        recipients = tdata.get("email") or []
+        if recipients:
+            counterparty_email = recipients[0]
+
+    print(f"📄 Sheet fetched: title='{title}', sheetId={sheet_id}")
+    print(f"   Header: {header}")
+    print(f"   Counterparty email (for row matching later): {counterparty_email or 'unknown'}")
+
 
 def b64url_id(message_id: str) -> str:
     """Encode message ID for safe use as Firestore document key."""
@@ -439,6 +532,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     
     # Dump the conversation
     dump_thread_from_firestore(user_id, thread_id)
+    # Step 1: fetch Google Sheet (required) and log header + counterparty email
+    fetch_and_log_sheet_for_thread(user_id, thread_id, counterparty_email=from_addr)
+
 
 def dump_thread_from_firestore(user_id: str, thread_id: str):
     """Console dump of thread conversation in chronological order."""
