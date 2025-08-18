@@ -2,7 +2,7 @@ name: Email Automation
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *'  # Every 5 minutes (for testing)
+    - cron: '*/30 * * * *'  # Every 30 minutes
 
 jobs:
   email:
@@ -44,6 +44,10 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_API_APP_ID: ${{ secrets.AZURE_API_APP_ID }}
           AZURE_API_CLIENT_SECRET: ${{ secrets.AZURE_API_CLIENT_SECRET }}
+          # Google OAuth (helper Gmail account for Drive/Sheets)
+          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         # run: python noPopup_signin_emails_to_excel.py
         # run: python main.py
         run: python scheduler_runner.py
