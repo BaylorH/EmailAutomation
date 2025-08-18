@@ -87,10 +87,10 @@ def safe_preview(content: str, max_len: int = 200) -> str:
         preview = preview[:max_len] + "..."
     return preview
 
-def save_thread_root(root_id: str, meta: Dict[str, Any]):
+def save_thread_root(user_id: str, root_id: str, meta: Dict[str, Any]):
     """Save or update thread root document."""
     try:
-        thread_ref = _fs.collection("threads").document(root_id)
+        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(root_id)
         meta["updatedAt"] = SERVER_TIMESTAMP
         if "createdAt" not in meta:
             meta["createdAt"] = SERVER_TIMESTAMP
@@ -100,31 +100,33 @@ def save_thread_root(root_id: str, meta: Dict[str, Any]):
     except Exception as e:
         print(f"❌ Failed to save thread root {root_id}: {e}")
 
-def save_message(thread_id: str, message_id: str, payload: Dict[str, Any]):
+def save_message(user_id: str, thread_id: str, message_id: str, payload: Dict[str, Any]):
     """Save message to thread."""
     try:
-        msg_ref = _fs.collection("threads").document(thread_id).collection("messages").document(message_id)
+        msg_ref = (_fs.collection("users").document(user_id)
+                   .collection("threads").document(thread_id)
+                   .collection("messages").document(message_id))
         payload["createdAt"] = SERVER_TIMESTAMP
         msg_ref.set(payload, merge=True)
         print(f"💾 Saved message {message_id} to thread {thread_id}")
     except Exception as e:
         print(f"❌ Failed to save message {message_id}: {e}")
 
-def index_message_id(message_id: str, thread_id: str):
+def index_message_id(user_id: str, message_id: str, thread_id: str):
     """Index message ID for O(1) lookup."""
     try:
         encoded_id = b64url_id(message_id)
-        index_ref = _fs.collection("msgIndex").document(encoded_id)
+        index_ref = _fs.collection("users").document(user_id).collection("msgIndex").document(encoded_id)
         index_ref.set({"threadId": thread_id}, merge=True)
         print(f"🔍 Indexed message ID: {message_id[:50]}... -> {thread_id}")
     except Exception as e:
         print(f"❌ Failed to index message {message_id}: {e}")
 
-def lookup_thread_by_message_id(message_id: str) -> Optional[str]:
+def lookup_thread_by_message_id(user_id: str, message_id: str) -> Optional[str]:
     """Look up thread ID by message ID."""
     try:
         encoded_id = b64url_id(message_id)
-        doc = _fs.collection("msgIndex").document(encoded_id).get()
+        doc = _fs.collection("users").document(user_id).collection("msgIndex").document(encoded_id).get()
         if doc.exists:
             return doc.to_dict().get("threadId")
         return None
@@ -132,23 +134,23 @@ def lookup_thread_by_message_id(message_id: str) -> Optional[str]:
         print(f"❌ Failed to lookup message {message_id}: {e}")
         return None
 
-def index_conversation_id(conversation_id: str, thread_id: str):
+def index_conversation_id(user_id: str, conversation_id: str, thread_id: str):
     """Index conversation ID for fallback lookup."""
     if not conversation_id:
         return
     try:
-        conv_ref = _fs.collection("convIndex").document(conversation_id)
+        conv_ref = _fs.collection("users").document(user_id).collection("convIndex").document(conversation_id)
         conv_ref.set({"threadId": thread_id}, merge=True)
         print(f"🔍 Indexed conversation ID: {conversation_id} -> {thread_id}")
     except Exception as e:
         print(f"❌ Failed to index conversation {conversation_id}: {e}")
 
-def lookup_thread_by_conversation_id(conversation_id: str) -> Optional[str]:
+def lookup_thread_by_conversation_id(user_id: str, conversation_id: str) -> Optional[str]:
     """Look up thread ID by conversation ID (fallback)."""
     if not conversation_id:
         return None
     try:
-        doc = _fs.collection("convIndex").document(conversation_id).get()
+        doc = _fs.collection("users").document(user_id).collection("convIndex").document(conversation_id).get()
         if doc.exists:
             return doc.to_dict().get("threadId")
         return None
@@ -186,7 +188,7 @@ def exponential_backoff_request(func, max_retries: int = 3):
 
 # ─── Send and Index Email ──────────────────────────────
 
-def send_and_index_email(headers: Dict[str, str], script: str, recipients: List[str], client_id_or_none: Optional[str] = None):
+def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, recipients: List[str], client_id_or_none: Optional[str] = None):
     """Send email and immediately index it in Firestore for reply tracking."""
     if not recipients:
         return {"sent": [], "errors": {"_all": "No recipients"}}
@@ -245,7 +247,7 @@ def send_and_index_email(headers: Dict[str, str], script: str, recipients: List[
                 "email": [addr],
                 "conversationId": conversation_id,
             }
-            save_thread_root(root_id, thread_meta)
+            save_thread_root(user_id, root_id, thread_meta)
             
             # Message record
             message_record = {
@@ -266,14 +268,14 @@ def send_and_index_email(headers: Dict[str, str], script: str, recipients: List[
                     "preview": safe_preview(content)
                 }
             }
-            save_message(root_id, root_id, message_record)
+            save_message(user_id, root_id, root_id, message_record)
             
             # Index message
-            index_message_id(internet_message_id, root_id)
+            index_message_id(user_id, internet_message_id, root_id)
             
             # Index conversation (optional fallback)
             if conversation_id:
-                index_conversation_id(conversation_id, root_id)
+                index_conversation_id(user_id, conversation_id, root_id)
 
             results["sent"].append(addr)
             print(f"✅ Sent and indexed email to {addr} (threadId: {root_id})")
@@ -287,7 +289,7 @@ def send_and_index_email(headers: Dict[str, str], script: str, recipients: List[
 
 # ─── Scan Inbox and Match Replies ──────────────────────
 
-def scan_inbox_against_index(headers: Dict[str, str], only_unread: bool = True, top: int = 50):
+def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread: bool = True, top: int = 50):
     """Scan inbox for replies and match against our Firestore index."""
     base = "https://graph.microsoft.com/v1.0"
     
@@ -317,14 +319,14 @@ def scan_inbox_against_index(headers: Dict[str, str], only_unread: bool = True, 
         
         for msg in messages:
             try:
-                process_inbox_message(headers, msg)
+                process_inbox_message(user_id, headers, msg)
             except Exception as e:
                 print(f"❌ Failed to process message {msg.get('id', 'unknown')}: {e}")
                 
     except Exception as e:
         print(f"❌ Failed to scan inbox: {e}")
 
-def process_inbox_message(headers: Dict[str, str], msg: Dict[str, Any]):
+def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, Any]):
     """Process a single inbox message for reply matching."""
     msg_id = msg.get("id")
     subject = msg.get("subject", "")
@@ -375,7 +377,7 @@ def process_inbox_message(headers: Dict[str, str], msg: Dict[str, Any]):
     
     # Try In-Reply-To first
     if in_reply_to:
-        thread_id = lookup_thread_by_message_id(in_reply_to)
+        thread_id = lookup_thread_by_message_id(user_id, in_reply_to)
         if thread_id:
             matched_header = f"In-Reply-To: {in_reply_to}"
     
@@ -383,14 +385,14 @@ def process_inbox_message(headers: Dict[str, str], msg: Dict[str, Any]):
     if not thread_id and references:
         for ref in reversed(references):  # References are oldest to newest, we want newest first
             ref = normalize_message_id(ref)
-            thread_id = lookup_thread_by_message_id(ref)
+            thread_id = lookup_thread_by_message_id(user_id, ref)
             if thread_id:
                 matched_header = f"References: {ref}"
                 break
     
     # Fallback to conversation ID
     if not thread_id and conversation_id:
-        thread_id = lookup_thread_by_conversation_id(conversation_id)
+        thread_id = lookup_thread_by_conversation_id(user_id, conversation_id)
         if thread_id:
             matched_header = f"ConversationId: {conversation_id}"
     
@@ -422,30 +424,32 @@ def process_inbox_message(headers: Dict[str, str], msg: Dict[str, Any]):
     
     # Save to Firestore
     if internet_message_id:
-        save_message(thread_id, internet_message_id, message_record)
-        index_message_id(internet_message_id, thread_id)
+        save_message(user_id, thread_id, internet_message_id, message_record)
+        index_message_id(user_id, internet_message_id, thread_id)
     else:
         # Use Graph message ID as fallback
-        save_message(thread_id, msg_id, message_record)
+        save_message(user_id, thread_id, msg_id, message_record)
     
     # Update thread timestamp
     try:
-        thread_ref = _fs.collection("threads").document(thread_id)
+        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
         thread_ref.set({"updatedAt": SERVER_TIMESTAMP}, merge=True)
     except Exception as e:
         print(f"⚠️ Failed to update thread timestamp: {e}")
     
     # Dump the conversation
-    dump_thread_from_firestore(thread_id)
+    dump_thread_from_firestore(user_id, thread_id)
 
-def dump_thread_from_firestore(thread_id: str):
+def dump_thread_from_firestore(user_id: str, thread_id: str):
     """Console dump of thread conversation in chronological order."""
     try:
         print(f"\n📜 CONVERSATION THREAD: {thread_id}")
         print("=" * 80)
         
         # Get all messages in thread
-        messages_ref = _fs.collection("threads").document(thread_id).collection("messages")
+        messages_ref = (_fs.collection("users").document(user_id)
+                        .collection("threads").document(thread_id)
+                        .collection("messages"))
         messages = list(messages_ref.stream())
         
         if not messages:
@@ -510,7 +514,7 @@ def send_outboxes(user_id: str, headers):
 
         try:
             # Use new send_and_index_email function
-            res = send_and_index_email(headers, script, emails, client_id_or_none=clientId)
+            res = send_and_index_email(user_id, headers, script, emails, client_id_or_none=clientId)
             any_errors = bool(res["errors"])
 
             if not any_errors and res["sent"]:
@@ -536,7 +540,9 @@ def send_outboxes(user_id: str, headers):
 
 def send_email(headers, script: str, emails: list[str], client_id: str | None = None):
     """Legacy function - redirects to send_and_index_email"""
-    return send_and_index_email(headers, script, emails, client_id)
+    # Note: This legacy function doesn't have user_id, so it can't use the new pipeline
+    # Users should migrate to send_and_index_email directly
+    raise NotImplementedError("send_email is deprecated. Use send_and_index_email with user_id parameter.")
 
 # ─── Utility: List user IDs from Firebase ──────────────
 def list_user_ids():
@@ -676,7 +682,7 @@ def refresh_and_process_user(user_id: str):
     
     # Scan for reply matches
     print(f"\n🔍 Scanning inbox for replies...")
-    scan_inbox_against_index(headers, only_unread=True, top=50)
+    scan_inbox_against_index(user_id, headers, only_unread=True, top=50)
 
 # ─── Entry ─────────────────────────────────────────────
 if __name__ == "__main__":
