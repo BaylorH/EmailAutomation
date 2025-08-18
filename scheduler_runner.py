@@ -14,6 +14,7 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 
 import re
 import time
+import hashlib
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -21,6 +22,7 @@ from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
+import openai
 
 # ─── Config ─────────────────────────────────────────────
 CLIENT_ID         = os.getenv("AZURE_API_APP_ID")
@@ -30,6 +32,10 @@ FIREBASE_BUCKET   = "email-automation-cache.firebasestorage.app"
 AUTHORITY         = "https://login.microsoftonline.com/common"
 SCOPES            = ["Mail.ReadWrite", "Mail.Send"]
 TOKEN_CACHE       = "msal_token_cache.bin"
+
+# OpenAI config
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_ASSISTANT_MODEL = os.getenv("OPENAI_ASSISTANT_MODEL", "gpt-4o")
 
 SUBJECT = "Weekly Questions"
 BODY = (
@@ -42,6 +48,13 @@ THANK_YOU_BODY = "Thanks for your response."
 
 if not CLIENT_ID or not CLIENT_SECRET or not FIREBASE_API_KEY:
     raise RuntimeError("❌ Missing required env vars")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("❌ Missing OPENAI_API_KEY env var")
+
+# Initialize OpenAI client
+openai.api_key = OPENAI_API_KEY
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # Firestore Admin client (uses GOOGLE_APPLICATION_CREDENTIALS)
 _fs = firestore.Client()
@@ -167,22 +180,474 @@ def _find_row_by_email(sheets, spreadsheet_id: str, tab_title: str, header: list
     return None, None
 
 
+# ─── NEW: Task A - Assistant Management ─────────────────────────
+
+def get_or_create_assistant(uid: str, client_id: str, email: str, sheet_id: str) -> dict:
+    """
+    Returns {"assistantId": str, "docRef": <Firestore ref>, "doc": dict}.
+    1) Compute key = f"{client_id}__{email.lower()}".
+    2) If doc exists, return it and update lastUsedAt.
+    3) Else create an OpenAI Assistant (model = env OPENAI_ASSISTANT_MODEL or "gpt-4o"),
+       with tools=[{"type":"code_interpreter"}], no files for now.
+    4) Persist doc with assistantId, clientId, email, sheetId, fileIds=[].
+    """
+    doc_id = f"{client_id}__{email.lower()}"
+    doc_ref = _fs.collection("users").document(uid).collection("assistantIndex").document(doc_id)
+    
+    # Check if doc exists
+    doc_snapshot = doc_ref.get()
+    
+    if doc_snapshot.exists:
+        # Update lastUsedAt and return existing
+        doc_ref.update({"lastUsedAt": SERVER_TIMESTAMP})
+        doc_data = doc_snapshot.to_dict()
+        assistant_id = doc_data.get("assistantId")
+        print(f"🔄 Reusing assistant {assistant_id} for {client_id}__{email.lower()}")
+        return {
+            "assistantId": assistant_id,
+            "docRef": doc_ref,
+            "doc": doc_data
+        }
+    else:
+        # Create new OpenAI Assistant
+        try:
+            assistant = openai_client.beta.assistants.create(
+                name=f"Sheet Assistant for {client_id}",
+                model=OPENAI_ASSISTANT_MODEL,
+                tools=[{"type": "code_interpreter"}],
+                tool_resources={"code_interpreter": {"file_ids": []}}
+            )
+            assistant_id = assistant.id
+            
+            # Create Firestore doc
+            doc_data = {
+                "assistantId": assistant_id,
+                "clientId": client_id,
+                "email": email.lower(),
+                "sheetId": sheet_id,
+                "fileIds": [],
+                "model": OPENAI_ASSISTANT_MODEL,
+                "createdAt": SERVER_TIMESTAMP,
+                "lastUsedAt": SERVER_TIMESTAMP
+            }
+            
+            doc_ref.set(doc_data)
+            print(f"🆕 Created assistant {assistant_id} for {client_id}__{email.lower()}")
+            
+            return {
+                "assistantId": assistant_id,
+                "docRef": doc_ref,
+                "doc": doc_data
+            }
+            
+        except Exception as e:
+            print(f"❌ Failed to create OpenAI assistant: {e}")
+            raise
+
+
+# ─── NEW: Task B - Test Sheet Write ─────────────────────────────
+
+def _ensure_log_tab_exists(sheets, spreadsheet_id: str) -> str:
+    """Ensure 'Log' tab exists and return its title."""
+    try:
+        meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheet_names = [sheet["properties"]["title"] for sheet in meta["sheets"]]
+        
+        if "Log" in sheet_names:
+            return "Log"
+        
+        # Create Log tab
+        request = {
+            "requests": [{
+                "addSheet": {
+                    "properties": {
+                        "title": "Log"
+                    }
+                }
+            }]
+        }
+        sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=request).execute()
+        print("📋 Created 'Log' tab")
+        return "Log"
+        
+    except Exception as e:
+        print(f"⚠️ Could not create Log tab: {e}")
+        # Fallback to first tab
+        meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        return meta["sheets"][0]["properties"]["title"]
+
+
+def _get_thread_messages_chronological(uid: str, thread_id: str) -> list[dict]:
+    """Get all messages in thread in chronological order."""
+    try:
+        messages_ref = (_fs.collection("users").document(uid)
+                        .collection("threads").document(thread_id)
+                        .collection("messages"))
+        messages = list(messages_ref.stream())
+        
+        if not messages:
+            return []
+        
+        # Sort by timestamp
+        message_data = []
+        for msg in messages:
+            data = msg.to_dict()
+            # Use sentDateTime for outbound, receivedDateTime for inbound
+            timestamp = data.get("sentDateTime") or data.get("receivedDateTime") or data.get("createdAt")
+            if hasattr(timestamp, 'timestamp'):
+                timestamp = timestamp.timestamp()
+            elif isinstance(timestamp, str):
+                try:
+                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    timestamp = dt.timestamp()
+                except:
+                    timestamp = 0
+            else:
+                timestamp = 0
+                
+            message_data.append((timestamp, data, msg.id))
+        
+        message_data.sort(key=lambda x: x[0])
+        return [{"data": data, "id": msg_id} for _, data, msg_id in message_data]
+        
+    except Exception as e:
+        print(f"❌ Failed to get thread messages: {e}")
+        return []
+
+
+def _get_last_logged_message_id(sheets, spreadsheet_id: str, tab_title: str, thread_id: str) -> str | None:
+    """Get the last message ID that was logged for this thread."""
+    try:
+        # Read all values from Log tab
+        resp = sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!A:H"
+        ).execute()
+        
+        rows = resp.get("values", [])
+        if not rows:
+            return None
+        
+        # Look for the most recent block for this thread_id
+        last_message_id = None
+        i = len(rows) - 1
+        
+        while i >= 0:
+            row = rows[i]
+            if len(row) >= 3 and row[1] == thread_id:
+                # This is a message row for our thread
+                # The last column should contain message ID or be empty for summary row
+                if len(row) >= 8 and row[7]:  # Message ID in column H
+                    last_message_id = row[7]
+                    break
+            i -= 1
+            
+        return last_message_id
+        
+    except Exception as e:
+        print(f"⚠️ Could not check last logged message: {e}")
+        return None
+
+
+def write_message_order_test(uid: str, thread_id: str, sheet_id: str):
+    """
+    1) Read the first tab title.
+    2) Create (if missing) a tab named 'Log' (case-sensitive).
+    3) Build a chronological list of this thread's messages from Firestore
+       (direction, from/to, subject, preview, received/sent time).
+    4) Append a single new row to 'Log':
+         [ iso_now, thread_id, "message_count=<N>", "emails=<counterpartyEmail>", "clientId=<clientId>" ]
+       Then append N additional rows (one per message) like:
+         [ "", "", "<idx>", "<direction>", "<from>", "<joined_to>", "<subject>", "<preview>" ]
+    Idempotency: if the immediately previous appended block has the same last message id,
+                 skip appending and log 'already logged'.
+    """
+    try:
+        sheets = _sheets_client()
+        
+        # Get thread info
+        thread_doc = _fs.collection("users").document(uid).collection("threads").document(thread_id).get()
+        if not thread_doc.exists:
+            print(f"⚠️ Thread {thread_id} not found for logging")
+            return
+            
+        thread_data = thread_doc.to_dict() or {}
+        client_id = thread_data.get("clientId", "unknown")
+        emails = thread_data.get("email", [])
+        counterparty_email = emails[0] if emails else "unknown"
+        
+        # Ensure Log tab exists
+        log_tab = _ensure_log_tab_exists(sheets, sheet_id)
+        
+        # Get chronological messages
+        messages = _get_thread_messages_chronological(uid, thread_id)
+        if not messages:
+            print(f"ℹ️ No messages found for thread {thread_id}")
+            return
+            
+        # Check idempotency - compare with last logged message ID
+        last_logged_id = _get_last_logged_message_id(sheets, sheet_id, log_tab, thread_id)
+        current_last_id = messages[-1]["id"] if messages else None
+        
+        if last_logged_id == current_last_id:
+            print(f"✅ Already logged; same last message id: {last_logged_id}")
+            return
+        
+        # Prepare rows to append
+        now_iso = datetime.utcnow().isoformat() + "Z"
+        message_count = len(messages)
+        
+        # Summary row
+        rows_to_append = [[
+            now_iso,
+            thread_id,
+            f"message_count={message_count}",
+            f"emails={counterparty_email}",
+            f"clientId={client_id}",
+            "",  # Empty columns
+            "",
+            ""
+        ]]
+        
+        # Message rows
+        for idx, msg_info in enumerate(messages, 1):
+            data = msg_info["data"]
+            msg_id = msg_info["id"]
+            
+            direction = data.get("direction", "unknown")
+            from_addr = data.get("from", "")
+            to_addrs = data.get("to", [])
+            joined_to = ", ".join(to_addrs) if to_addrs else ""
+            subject = data.get("subject", "")
+            preview = data.get("body", {}).get("preview", "")[:100]  # Limit preview length
+            
+            rows_to_append.append([
+                "",  # Empty timestamp for message rows
+                "",  # Empty thread_id for message rows  
+                str(idx),
+                direction,
+                from_addr,
+                joined_to,
+                subject,
+                msg_id  # Store message ID for idempotency checking
+            ])
+        
+        # Append to sheet
+        request_body = {
+            "values": rows_to_append
+        }
+        
+        sheets.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{log_tab}!A:H",
+            valueInputOption="RAW",
+            body=request_body
+        ).execute()
+        
+        print(f"📝 Logged {message_count} messages to '{log_tab}' tab for thread {thread_id}")
+        
+    except Exception as e:
+        print(f"❌ Failed to write message order test: {e}")
+
+
+# ─── NEW: Task C - GPT Proposal Scaffolding ─────────────────────
+
+def build_conversation_payload(uid: str, thread_id: str, limit: int = 10) -> list[dict]:
+    """
+    Return last N messages in chronological order, each item:
+    { "direction": "inbound"|"outbound", "from": str, "to": [str],
+      "subject": str, "timestamp": iso, "preview": str }
+    """
+    try:
+        messages = _get_thread_messages_chronological(uid, thread_id)
+        
+        # Take last N messages
+        recent_messages = messages[-limit:] if len(messages) > limit else messages
+        
+        payload = []
+        for msg_info in recent_messages:
+            data = msg_info["data"]
+            
+            # Get timestamp (prefer sent/received, fallback to created)
+            timestamp = data.get("sentDateTime") or data.get("receivedDateTime") or data.get("createdAt")
+            if hasattr(timestamp, 'isoformat'):
+                timestamp = timestamp.isoformat()
+            elif not isinstance(timestamp, str):
+                timestamp = datetime.utcnow().isoformat() + "Z"
+            
+            payload.append({
+                "direction": data.get("direction", "unknown"),
+                "from": data.get("from", ""),
+                "to": data.get("to", []),
+                "subject": data.get("subject", ""),
+                "timestamp": timestamp,
+                "preview": data.get("body", {}).get("preview", "")[:200]  # Limit for token budget
+            })
+        
+        return payload
+        
+    except Exception as e:
+        print(f"❌ Failed to build conversation payload: {e}")
+        return []
+
+
+def propose_sheet_updates(uid: str, client_id: str, email: str, sheet_id: str, header: list[str],
+                          rownum: int, rowvals: list[str], thread_id: str) -> dict | None:
+    """
+    - Uses get_or_create_assistant(...) to get assistantId (store/refresh lastUsedAt).
+    - Build a single 'user' message for OpenAI that contains:
+        * Header (row 2)
+        * Current values for the matched row
+        * Conversation payload from build_conversation_payload(...)
+        * Strict instruction to output JSON with shape:
+          {
+            "updates":[{"column": "<header name>", "value": "<string>", "confidence": 0..1, "reason": "<why>"}],
+            "notes": "<optional>"
+          }
+      and *only* that JSON as output.
+    - Parse JSON safely; on failure, log and return None.
+    - Log the proposal (pretty-printed) to console and also store a record in:
+      users/{uid}/sheetChangeLog/{threadId}__{iso}
+        - clientId, email, sheetId, rowNumber, proposalJson, proposalHash, status="proposed"
+    - Do NOT write to the sheet yet.
+    """
+    try:
+        # Get or create assistant
+        assistant_info = get_or_create_assistant(uid, client_id, email, sheet_id)
+        assistant_id = assistant_info["assistantId"]
+        
+        # Build conversation payload
+        conversation = build_conversation_payload(uid, thread_id, limit=10)
+        
+        # Build prompt for OpenAI
+        prompt = f"""
+You are analyzing a conversation thread to suggest updates to a Google Sheet row.
+
+SHEET HEADER (row 2):
+{json.dumps(header)}
+
+CURRENT ROW VALUES (row {rownum}):
+{json.dumps(rowvals)}
+
+CONVERSATION HISTORY:
+{json.dumps(conversation, indent=2)}
+
+Based on this conversation, suggest updates to the sheet row. Consider:
+- New information revealed in the conversation
+- Status changes or updates mentioned
+- Contact information updates
+- Progress or milestone updates
+
+OUTPUT ONLY valid JSON in this exact format:
+{{
+  "updates": [
+    {{
+      "column": "<exact header name>",
+      "value": "<new value as string>",
+      "confidence": 0.85,
+      "reason": "<brief explanation why this update is suggested>"
+    }}
+  ],
+  "notes": "<optional general notes about the conversation>"
+}}
+
+Be conservative with updates. Only suggest changes where you have good confidence based on explicit information in the conversation.
+"""
+
+        # Call OpenAI (using simple completion, not assistants API for this)
+        response = openai_client.chat.completions.create(
+            model=OPENAI_ASSISTANT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=1000
+        )
+        
+        raw_response = response.choices[0].message.content.strip()
+        
+        # Parse JSON safely
+        try:
+            # Handle potential code fences
+            if raw_response.startswith("```"):
+                lines = raw_response.split("\n")
+                json_lines = []
+                in_json = False
+                for line in lines:
+                    if line.strip().startswith("```"):
+                        in_json = not in_json
+                        continue
+                    if in_json:
+                        json_lines.append(line)
+                raw_response = "\n".join(json_lines)
+            
+            proposal = json.loads(raw_response)
+            
+        except json.JSONDecodeError as e:
+            print(f"❌ Failed to parse GPT JSON response: {e}")
+            print(f"Raw response: {raw_response}")
+            return None
+        
+        # Validate JSON structure
+        if not isinstance(proposal, dict) or "updates" not in proposal:
+            print(f"❌ Invalid proposal structure: {proposal}")
+            return None
+        
+        # Log the proposal
+        print(f"\n🤖 GPT Proposal for {client_id}__{email}:")
+        print(json.dumps(proposal, indent=2))
+        
+        # Store in sheetChangeLog
+        now_iso = datetime.utcnow().isoformat().replace(":", "-").replace(".", "-") + "Z"
+        log_doc_id = f"{thread_id}__{now_iso}"
+        
+        proposal_hash = hashlib.sha256(
+            json.dumps(proposal, sort_keys=True).encode('utf-8')
+        ).hexdigest()[:16]
+        
+        change_log_data = {
+            "clientId": client_id,
+            "email": email,
+            "sheetId": sheet_id,
+            "rowNumber": rownum,
+            "proposalJson": proposal,
+            "proposalHash": proposal_hash,
+            "status": "proposed",
+            "threadId": thread_id,
+            "assistantId": assistant_id,
+            "createdAt": SERVER_TIMESTAMP
+        }
+        
+        _fs.collection("users").document(uid).collection("sheetChangeLog").document(log_doc_id).set(change_log_data)
+        print(f"💾 Stored proposal in sheetChangeLog/{log_doc_id}")
+        
+        return proposal
+        
+    except Exception as e:
+        print(f"❌ Failed to propose sheet updates: {e}")
+        return None
+
+
+# ─── EXISTING FUNCTIONS (updated to integrate new features) ─────────
+
 def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email: str | None):
     # Read thread (to get clientId)
     tdoc = (_fs.collection("users").document(uid)
             .collection("threads").document(thread_id).get())
     if not tdoc.exists:
         print("⚠️ Thread doc not found; cannot fetch sheet")
-        return
+        return None, None, None, None, None  # Return tuple for unpacking
 
     tdata = tdoc.to_dict() or {}
     client_id = tdata.get("clientId")
     if not client_id:
         print("⚠️ Thread has no clientId; cannot fetch sheet")
-        return
+        return None, None, None, None, None
 
     # Required: sheetId on client doc
-    sheet_id = _get_sheet_id_or_fail(uid, client_id)
+    try:
+        sheet_id = _get_sheet_id_or_fail(uid, client_id)
+    except RuntimeError as e:
+        print(str(e))
+        return None, None, None, None, None
 
     # Counterparty email fallback: use thread's stored recipients if missing
     if not counterparty_email:
@@ -203,9 +668,11 @@ def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email:
     rownum, rowvals = _find_row_by_email(sheets, sheet_id, tab_title, header, counterparty_email or "")
     if rownum is not None:
         print(f"📌 Matched row {rownum}: {rowvals}")
+        return client_id, sheet_id, header, rownum, rowvals
     else:
         # Be loud – row must exist for our workflow
         print(f"❌ No sheet row found with email = {counterparty_email}")
+        return client_id, sheet_id, header, None, None
 
 
 def b64url_id(message_id: str) -> str:
@@ -733,8 +1200,20 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     
     # Dump the conversation
     dump_thread_from_firestore(user_id, thread_id)
+    
     # Step 1: fetch Google Sheet (required) and log header + counterparty email
-    fetch_and_log_sheet_for_thread(user_id, thread_id, counterparty_email=from_addr)
+    client_id, sheet_id, header, rownum, rowvals = fetch_and_log_sheet_for_thread(user_id, thread_id, counterparty_email=from_addr)
+    
+    # Only proceed if we successfully matched a sheet row
+    if sheet_id and rownum is not None:
+        from_addr_lower = (from_addr or "").lower()
+        
+        # Step 2: test write
+        write_message_order_test(user_id, thread_id, sheet_id)
+        
+        # Step 3: get GPT proposal (no writes yet)
+        proposal = propose_sheet_updates(user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals, thread_id)
+        # just log; do not apply updates yet
 
 
 def dump_thread_from_firestore(user_id: str, thread_id: str):
