@@ -15,12 +15,13 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 import re
 import time
 import hashlib
-from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+
+from datetime import datetime, timezone
 
 import openai
 
@@ -138,6 +139,89 @@ def _guess_email_col_idx(header: list[str]) -> int:
         if _normalize_email(h) in candidates:
             return i
     return -1
+
+def _col_letter(n: int) -> str:
+    """1-indexed column number -> A1 letter (1->A)."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def _header_index_map(header: list[str]) -> dict:
+    """Normalize headers for exact match regardless of spacing/case."""
+    return { (h or "").strip().lower(): i for i, h in enumerate(header, start=1) }  # 1-based
+
+def apply_proposal_to_sheet(
+    uid: str,
+    client_id: str,
+    sheet_id: str,
+    header: list[str],
+    rownum: int,
+    current_rowvals: list[str],
+    proposal: dict,
+) -> dict:
+    """
+    Applies proposal['updates'] to the sheet row.
+    Returns {"applied":[...], "skipped":[...]} items with old/new values.
+    """
+    try:
+        sheets = _sheets_client()
+        tab_title = _get_first_tab_title(sheets, sheet_id)
+
+        if not proposal or not isinstance(proposal.get("updates"), list):
+            return {"applied": [], "skipped": [{"reason":"no-updates"}]}
+
+        idx_map = _header_index_map(header)
+
+        data_payload = []
+        applied, skipped = [], []
+
+        for upd in proposal["updates"]:
+            col_name = (upd.get("column") or "").strip()
+            new_val  = "" if upd.get("value") is None else str(upd.get("value"))
+            conf     = upd.get("confidence")
+            reason   = upd.get("reason")
+
+            key = col_name.strip().lower()
+            if key not in idx_map:
+                skipped.append({"column": col_name, "reason": "unknown header"})
+                continue
+
+            col_idx = idx_map[key]                     # 1-based
+            col_letter = _col_letter(col_idx)          # A1
+            rng = f"{tab_title}!{col_letter}{rownum}"
+
+            old_val = current_rowvals[col_idx-1] if (col_idx-1) < len(current_rowvals) else ""
+
+            data_payload.append({"range": rng, "values": [[new_val]]})
+            applied.append({
+                "column": col_name,
+                "range": rng,
+                "oldValue": old_val,
+                "newValue": new_val,
+                "confidence": conf,
+                "reason": reason,
+            })
+
+        if not data_payload:
+            return {"applied": [], "skipped": skipped}
+
+        sheets.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={
+                "valueInputOption": "RAW",
+                "data": data_payload
+            }
+        ).execute()
+
+        # mark success
+        return {"applied": applied, "skipped": skipped}
+
+    except Exception as e:
+        print(f"❌ Failed to apply proposal to sheet: {e}")
+        return {"applied": [], "skipped": [{"reason": f"exception: {e}"}]}
+
 
 def _find_row_by_email(sheets, spreadsheet_id: str, tab_title: str, header: list[str], email: str):
     """
@@ -394,7 +478,10 @@ def write_message_order_test(uid: str, thread_id: str, sheet_id: str):
             return
         
         # Prepare rows to append
-        now_iso = datetime.utcnow().isoformat() + "Z"
+        # now_iso = datetime.utcnow().isoformat() + "Z"
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()  # ends with +00:00
+
         message_count = len(messages)
         
         # Summary row
@@ -473,8 +560,9 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10) -> lis
             if hasattr(timestamp, 'isoformat'):
                 timestamp = timestamp.isoformat()
             elif not isinstance(timestamp, str):
-                timestamp = datetime.utcnow().isoformat() + "Z"
-            
+                timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
             payload.append({
                 "direction": data.get("direction", "unknown"),
                 "from": data.get("from", ""),
@@ -596,8 +684,14 @@ Be conservative with updates. Only suggest changes where you have good confidenc
         print(json.dumps(proposal, indent=2))
         
         # Store in sheetChangeLog
-        now_iso = datetime.utcnow().isoformat().replace(":", "-").replace(".", "-") + "Z"
-        log_doc_id = f"{thread_id}__{now_iso}"
+        # now_iso = datetime.utcnow().isoformat().replace(":", "-").replace(".", "-") + "Z"
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()  # ends with +00:00
+
+        # log_doc_id = f"{thread_id}__{now_iso}"
+
+        log_doc_id = f"{thread_id}__{now_utc.isoformat().replace(':','-').replace('.','-').replace('+00:00','Z')}"
+
         
         proposal_hash = hashlib.sha256(
             json.dumps(proposal, sort_keys=True).encode('utf-8')
@@ -878,7 +972,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                 "subject": subject,
                 "from": "me",  # Graph doesn't return our own address easily
                 "to": [addr],
-                "sentDateTime": datetime.utcnow().isoformat() + "Z",
+                "sentDateTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "receivedDateTime": None,
                 "headers": {
                     "internetMessageId": internet_message_id,
@@ -913,6 +1007,50 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
 # ─── Scan Inbox and Match Replies ──────────────────────
 
 # Add these new helper functions after the existing Firestore helpers
+
+def add_client_notifications(
+    uid: str,
+    client_id: str,
+    email: str,
+    thread_id: str,
+    applied_updates: list[dict],
+    notes: str | None = None,
+):
+    """
+    Writes one notification doc per run under:
+      users/{uid}/clients/{client_id}/notifications/{autoId}
+
+    Also updates a small summary on the client doc for quick dashboards.
+    """
+    try:
+        base_ref = _fs.collection("users").document(uid)
+        client_ref = base_ref.collection("clients").document(client_id)
+        notif_ref = client_ref.collection("notifications").document()
+
+        summary_items = [f"{u['column']}='{u['newValue']}'" for u in applied_updates]
+        summary = f"Updated {', '.join(summary_items)} for {email}" if summary_items else "No updates applied"
+
+        payload = {
+            "type": "sheet_update",
+            "email": (email or "").lower(),
+            "threadId": thread_id,
+            "applied": applied_updates,   # [{column, oldValue, newValue, confidence, reason, range}]
+            "notes": notes or "",
+            "createdAt": SERVER_TIMESTAMP,
+        }
+        notif_ref.set(payload)
+
+        # light summary on the client document (cheap to read in UI)
+        client_ref.set({
+            "lastNotificationSummary": summary,
+            "lastNotificationAt": SERVER_TIMESTAMP,
+        }, merge=True)
+
+        print(f"🔔 Notification stored for client {client_id}: {summary}")
+
+    except Exception as e:
+        print(f"❌ Failed to write client notification: {e}")
+
 
 def _processed_ref(user_id: str, key: str):
     """Get reference to processed message document."""
@@ -970,9 +1108,12 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     
     # Calculate 5-hour cutoff
     from datetime import datetime, timedelta
-    now_utc = datetime.utcnow()
+    # now_utc = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()  # ends with +00:00
+
     cutoff_time = now_utc - timedelta(hours=5)
-    cutoff_iso = cutoff_time.isoformat() + "Z"
+    cutoff_iso = cutoff_time.isoformat().replace("+00:00", "Z")
     
     # Build filter with time window
     filters = [f"receivedDateTime ge {cutoff_iso}"]
@@ -1018,7 +1159,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
                 if received_dt:
                     try:
                         msg_time = datetime.fromisoformat(received_dt.replace('Z', '+00:00'))
-                        if msg_time.replace(tzinfo=None) < cutoff_time:
+                        if msg_time < cutoff_time:
                             print(f"⏰ Message older than 5 hours, stopping scan")
                             url = None  # Stop pagination
                             break
@@ -1079,8 +1220,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
         return
     
     # Set last scan timestamp
-    now_iso = now_utc.isoformat() + "Z"
-    set_last_scan_iso(user_id, now_iso)
+    set_last_scan_iso(user_id, now_utc.isoformat().replace("+00:00", "Z"))
     
     # Summary log
     print(f"📥 Scanned {scanned_count} message(s); processed {processed_count}; skipped {skipped_count}")
@@ -1213,7 +1353,42 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         
         # Step 3: get GPT proposal (no writes yet)
         proposal = propose_sheet_updates(user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals, thread_id)
-        # just log; do not apply updates yet
+        if proposal and proposal.get("updates"):
+            apply_result = apply_proposal_to_sheet(
+                user_id, client_id, sheet_id, header, rownum, rowvals, proposal
+            )
+
+            # optional: store an "applied" record in sheetChangeLog too
+            try:
+                applied_hash = hashlib.sha256(
+                    json.dumps(apply_result, sort_keys=True).encode("utf-8")
+                ).hexdigest()[:16]
+
+                now_id = datetime.now(timezone.utc).isoformat().replace(":", "-").replace(".", "-").replace("+00:00", "Z")
+                _fs.collection("users").document(user_id).collection("sheetChangeLog").document(f"{thread_id}__applied__{now_id}").set({
+                    "clientId": client_id,
+                    "email": from_addr_lower,
+                    "sheetId": sheet_id,
+                    "rowNumber": rownum,
+                    "applied": apply_result,
+                    "status": "applied",
+                    "threadId": thread_id,
+                    "createdAt": SERVER_TIMESTAMP,
+                    "assistantId": get_or_create_assistant(user_id, client_id, from_addr_lower, sheet_id)["assistantId"],
+                    "proposalHash": applied_hash,
+                })
+            except Exception as e:
+                print(f"⚠️ Failed to store applied record: {e}")
+
+            # write client notification
+            add_client_notifications(
+                user_id, client_id, from_addr_lower, thread_id,
+                applied_updates=apply_result.get("applied", []),
+                notes=proposal.get("notes")
+            )
+        else:
+            print("ℹ️ No proposal or no updates; nothing to apply.")
+
 
 
 def dump_thread_from_firestore(user_id: str, thread_id: str):
