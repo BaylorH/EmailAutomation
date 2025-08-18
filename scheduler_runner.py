@@ -445,42 +445,180 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
 
 # ─── Scan Inbox and Match Replies ──────────────────────
 
+# Add these new helper functions after the existing Firestore helpers
+
+def _processed_ref(user_id: str, key: str):
+    """Get reference to processed message document."""
+    encoded_key = b64url_id(key)
+    return _fs.collection("users").document(user_id).collection("processedMessages").document(encoded_key)
+
+def has_processed(user_id: str, key: str) -> bool:
+    """Check if a message has already been processed."""
+    try:
+        doc = _processed_ref(user_id, key).get()
+        return doc.exists
+    except Exception as e:
+        print(f"❌ Failed to check processed status for {key}: {e}")
+        return False
+
+def mark_processed(user_id: str, key: str):
+    """Mark a message as processed."""
+    try:
+        _processed_ref(user_id, key).set({
+            "processedAt": SERVER_TIMESTAMP
+        }, merge=True)
+    except Exception as e:
+        print(f"❌ Failed to mark message as processed {key}: {e}")
+
+def _sync_ref(user_id: str):
+    """Get reference to sync document."""
+    return _fs.collection("users").document(user_id).collection("sync").document("inbox")
+
+def get_last_scan_iso(user_id: str) -> str | None:
+    """Get the last scan timestamp."""
+    try:
+        doc = _sync_ref(user_id).get()
+        if doc.exists:
+            return doc.to_dict().get("lastScanISO")
+        return None
+    except Exception as e:
+        print(f"❌ Failed to get last scan ISO: {e}")
+        return None
+
+def set_last_scan_iso(user_id: str, iso_str: str):
+    """Set the last scan timestamp."""
+    try:
+        _sync_ref(user_id).set({
+            "lastScanISO": iso_str,
+            "updatedAt": SERVER_TIMESTAMP
+        }, merge=True)
+    except Exception as e:
+        print(f"❌ Failed to set last scan ISO: {e}")
+
+# Replace the existing scan_inbox_against_index function with this:
+
 def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread: bool = True, top: int = 50):
-    """Scan inbox for replies and match against our Firestore index."""
+    """Idempotent scan of inbox for replies with early exit on processed messages."""
     base = "https://graph.microsoft.com/v1.0"
     
-    # Build filter
-    filters = []
+    # Calculate 5-hour cutoff
+    from datetime import datetime, timedelta
+    now_utc = datetime.utcnow()
+    cutoff_time = now_utc - timedelta(hours=5)
+    cutoff_iso = cutoff_time.isoformat() + "Z"
+    
+    # Build filter with time window
+    filters = [f"receivedDateTime ge {cutoff_iso}"]
     if only_unread:
         filters.append("isRead eq false")
     
-    filter_str = " and ".join(filters) if filters else ""
+    filter_str = " and ".join(filters)
     
     params = {
         "$top": str(top),
         "$orderby": "receivedDateTime desc",
-        "$select": "id,subject,from,toRecipients,receivedDateTime,sentDateTime,conversationId,internetMessageId,internetMessageHeaders,bodyPreview"
+        "$select": "id,subject,from,toRecipients,receivedDateTime,sentDateTime,conversationId,internetMessageId,internetMessageHeaders,bodyPreview",
+        "$filter": filter_str
     }
-    if filter_str:
-        params["$filter"] = filter_str
 
+    processed_count = 0
+    scanned_count = 0
+    skipped_count = 0
+    hit_known = False
+    peek_counter = 0
+    
     try:
-        # Get inbox messages
-        response = exponential_backoff_request(
-            lambda: requests.get(f"{base}/me/mailFolders/Inbox/messages", headers=headers, params=params, timeout=30)
-        )
-        messages = response.json().get("value", [])
+        url = f"{base}/me/mailFolders/Inbox/messages"
         
-        print(f"📥 Found {len(messages)} inbox messages to process")
-        
-        for msg in messages:
-            try:
-                process_inbox_message(user_id, headers, msg)
-            except Exception as e:
-                print(f"❌ Failed to process message {msg.get('id', 'unknown')}: {e}")
+        while url:
+            response = exponential_backoff_request(
+                lambda: requests.get(url, headers=headers, params=params, timeout=30)
+            )
+            data = response.json()
+            messages = data.get("value", [])
+            
+            if not messages:
+                break
+                
+            if scanned_count == 0:  # First batch
+                print(f"📥 Found {len(messages)} inbox messages to process")
+            
+            for msg in messages:
+                scanned_count += 1
+                
+                # Check if message is older than 5 hours
+                received_dt = msg.get("receivedDateTime")
+                if received_dt:
+                    try:
+                        msg_time = datetime.fromisoformat(received_dt.replace('Z', '+00:00'))
+                        if msg_time.replace(tzinfo=None) < cutoff_time:
+                            print(f"⏰ Message older than 5 hours, stopping scan")
+                            url = None  # Stop pagination
+                            break
+                    except Exception as e:
+                        print(f"⚠️ Failed to parse message time {received_dt}: {e}")
+                
+                # Determine processed key (internetMessageId or id)
+                processed_key = msg.get("internetMessageId") or msg.get("id")
+                if not processed_key:
+                    print(f"⚠️ Message has no internetMessageId or id, skipping")
+                    continue
+                
+                # Check if already processed
+                if has_processed(user_id, processed_key):
+                    if not hit_known:
+                        hit_known = True
+                        print(f"⛳ Hit already-processed message; peeking 3 more and stopping")
+                    
+                    # Count this as skipped and increment peek counter
+                    skipped_count += 1
+                    peek_counter += 1
+                    
+                    # Stop after peeking 3 more
+                    if peek_counter >= 3:
+                        url = None  # Stop pagination
+                        break
+                    continue
+                
+                # If we're in peek mode but this message isn't processed, still process it
+                # but continue counting down the peek
+                if hit_known:
+                    peek_counter += 1
+                
+                # Process the message
+                try:
+                    process_inbox_message(user_id, headers, msg)
+                    processed_count += 1
+                except Exception as e:
+                    print(f"❌ Failed to process message {msg.get('id', 'unknown')}: {e}")
+                finally:
+                    # Always mark as processed to avoid reprocessing
+                    mark_processed(user_id, processed_key)
+                
+                # Stop after peeking if we hit known messages
+                if hit_known and peek_counter >= 3:
+                    url = None  # Stop pagination
+                    break
+            
+            # Handle pagination - but stop if we hit processed messages and finished peeking
+            if url and not hit_known:
+                url = data.get("@odata.nextLink")
+                params = {}  # nextLink includes all parameters
+            else:
+                url = None
                 
     except Exception as e:
         print(f"❌ Failed to scan inbox: {e}")
+        return
+    
+    # Set last scan timestamp
+    now_iso = now_utc.isoformat() + "Z"
+    set_last_scan_iso(user_id, now_iso)
+    
+    # Summary log
+    print(f"📥 Scanned {scanned_count} message(s); processed {processed_count}; skipped {skipped_count}")
+
+    
 
 def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, Any]):
     """Process a single inbox message for reply matching."""
