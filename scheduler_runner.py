@@ -101,16 +101,71 @@ def _get_sheet_id_or_fail(uid: str, client_id: str) -> str:
     raise RuntimeError(f"❌ sheetId not found for uid={uid} clientId={client_id}. This field is required.")
 
 
-def _read_first_sheet_header(sheets, spreadsheet_id: str):
+# --- SHEETS HELPERS (row 2 = header) ---------------------------------
+
+def _get_first_tab_title(sheets, spreadsheet_id: str) -> str:
     meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    first_title = meta["sheets"][0]["properties"]["title"]
-    header_resp = sheets.spreadsheets().values().get(
+    return meta["sheets"][0]["properties"]["title"]
+
+def _read_header_row2(sheets, spreadsheet_id: str, tab_title: str) -> list[str]:
+    # Entire row 2 regardless of width
+    resp = sheets.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=f"{first_title}!A1:Z1"
+        range=f"{tab_title}!2:2"
     ).execute()
-    header = header_resp.get("values", [[]])
-    header_row = header[0] if header else []
-    return first_title, header_row
+    vals = resp.get("values", [[]])
+    return vals[0] if vals else []
+
+def _normalize_email(s: str) -> str:
+    return (s or "").strip().lower()
+
+def _guess_email_col_idx(header: list[str]) -> int:
+    candidates = {"email", "email address", "contact email", "e-mail", "e mail"}
+    for i, h in enumerate(header):
+        if _normalize_email(h) in candidates:
+            return i
+    return -1
+
+def _find_row_by_email(sheets, spreadsheet_id: str, tab_title: str, header: list[str], email: str):
+    """
+    Returns (row_number, row_values) where row_number is the 1-based sheet row.
+    Header is row 2, data starts at row 3.
+    """
+    if not email:
+        return None, None
+
+    # Pull header + all data rows with a very wide column cap
+    resp = sheets.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{tab_title}!A2:ZZZ"
+    ).execute()
+    rows = resp.get("values", [])
+    if not rows:
+        return None, None
+
+    # rows[0] is header (row 2), rows[1:] are data starting row 3
+    data_rows = rows[1:]
+    email_idx = _guess_email_col_idx(header)
+    needle = _normalize_email(email)
+
+    for offset, row in enumerate(data_rows, start=3):  # sheet row numbers
+        # pad row to header length so indexing is safe
+        padded = row + [""] * (max(0, len(header) - len(row)))
+
+        candidate = None
+        if email_idx >= 0:
+            candidate = padded[email_idx]
+            if _normalize_email(candidate) == needle:
+                return offset, padded
+
+        # fallback: scan all cells for an exact email match
+        if email_idx < 0:
+            for cell in padded:
+                if _normalize_email(cell) == needle:
+                    return offset, padded
+
+    return None, None
+
 
 def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email: str | None):
     # Read thread (to get clientId)
@@ -129,20 +184,28 @@ def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email:
     # Required: sheetId on client doc
     sheet_id = _get_sheet_id_or_fail(uid, client_id)
 
-    # Connect to Sheets and read header
-    sheets = _sheets_client()
-    title, header = _read_first_sheet_header(sheets, sheet_id)
-
-    # If thread root already stored recipients, we can fill in a missing hint
+    # Counterparty email fallback: use thread's stored recipients if missing
     if not counterparty_email:
-        # Try thread root "email" list (set when we sent the first message)
-        recipients = tdata.get("email") or []
-        if recipients:
-            counterparty_email = recipients[0]
+        recips = tdata.get("email") or []
+        if recips:
+            counterparty_email = recips[0]
 
-    print(f"📄 Sheet fetched: title='{title}', sheetId={sheet_id}")
-    print(f"   Header: {header}")
-    print(f"   Counterparty email (for row matching later): {counterparty_email or 'unknown'}")
+    # Connect to Sheets; header = row 2
+    sheets = _sheets_client()
+    tab_title = _get_first_tab_title(sheets, sheet_id)
+    header = _read_header_row2(sheets, sheet_id, tab_title)
+
+    print(f"📄 Sheet fetched: title='{tab_title}', sheetId={sheet_id}")
+    print(f"   Header (row 2): {header}")
+    print(f"   Counterparty email (row match): {counterparty_email or 'unknown'}")
+
+    # Find the row matching the counterparty email and print it
+    rownum, rowvals = _find_row_by_email(sheets, sheet_id, tab_title, header, counterparty_email or "")
+    if rownum is not None:
+        print(f"📌 Matched row {rownum}: {rowvals}")
+    else:
+        # Be loud – row must exist for our workflow
+        print(f"❌ No sheet row found with email = {counterparty_email}")
 
 
 def b64url_id(message_id: str) -> str:
