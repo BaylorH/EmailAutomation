@@ -6,23 +6,17 @@ import requests
 from urllib.parse import quote
 from openpyxl import Workbook
 from msal import ConfidentialClientApplication, SerializableTokenCache
-
 from firebase_helpers import download_token, upload_token, upload_excel
-
 from google.cloud import firestore
 from google.cloud.firestore import SERVER_TIMESTAMP
-
 import re
 import time
 import hashlib
 from typing import Optional, List, Dict, Any
-
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-
 from datetime import datetime, timezone
-
 import openai
 
 # ─── Config ─────────────────────────────────────────────
@@ -903,6 +897,62 @@ def exponential_backoff_request(func, max_retries: int = 3):
             raise
     raise Exception(f"Request failed after {max_retries} attempts")
 
+
+def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> str | None:
+    """
+    Look up the row by email and return 'property address, city' as subject.
+    Falls back to None if sheet/row/columns not found.
+    """
+    try:
+        sheet_id = _get_sheet_id_or_fail(uid, client_id)
+        sheets   = _sheets_client()
+        tab      = _get_first_tab_title(sheets, sheet_id)
+        header   = _read_header_row2(sheets, sheet_id, tab)
+
+        rownum, rowvals = _find_row_by_email(sheets, sheet_id, tab, header, recipient_email)
+        if rownum is None or not rowvals:
+            print(f"⚠️ No row found for {recipient_email} in sheet {sheet_id}")
+            return None
+
+        # Build a header index map and support common variants
+        idx_map = _header_index_map(header)  # lowercased key -> 1-based index
+
+        # Try a few reasonable header name variants
+        addr_keys = [
+            "property address", "address", "street address", "property", "property_address"
+        ]
+        city_keys = [
+            "city", "town", "municipality"
+        ]
+
+        def _get_val(keys: list[str]) -> str | None:
+            for k in keys:
+                if k in idx_map:
+                    i = idx_map[k] - 1  # 0-based for rowvals
+                    if 0 <= i < len(rowvals):
+                        v = (rowvals[i] or "").strip()
+                        if v:
+                            return v
+            return None
+
+        prop = _get_val(addr_keys)
+        city = _get_val(city_keys)
+
+        if prop and city:
+            return f"{prop}, {city}"
+        if prop:
+            return prop
+        if city:
+            return city
+
+        print(f"ℹ️ Address/city columns not found for {recipient_email}")
+        return None
+
+    except Exception as e:
+        print(f"⚠️ Subject lookup failed for {recipient_email}: {e}")
+        return None
+
+
 # ─── Send and Index Email ──────────────────────────────
 
 def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, recipients: List[str], client_id_or_none: Optional[str] = None):
@@ -915,8 +965,14 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
     base = "https://graph.microsoft.com/v1.0"
 
     for addr in recipients:
+        dynamic_subject = None
+        if client_id_or_none:
+            dynamic_subject = _subject_for_recipient(user_id, client_id_or_none, (addr or "").lower())
+
+        subject_to_use = dynamic_subject or "Client Outreach"
+
         msg = {
-            "subject": "Client Outreach", 
+            "subject": subject_to_use,
             "body": {"contentType": content_type, "content": content},
             "toRecipients": [{"emailAddress": {"address": addr}}],
         }
