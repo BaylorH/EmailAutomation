@@ -829,9 +829,24 @@ def propose_sheet_updates(uid: str, client_id: str, email: str, sheet_id: str, h
         # Build conversation payload
         conversation = build_conversation_payload(uid, thread_id, limit=10)
         
+        # Column rules for money field mapping
+        COLUMN_RULES = """
+COLUMN SEMANTICS & MAPPING (use EXACT header names):
+- "Rent/SF /Yr": Base/asking rent per square foot per YEAR. Synonyms: asking, base rent, $/SF/yr.
+- "Ops Ex /SF": NNN/CAM/Operating Expenses per square foot per YEAR. Synonyms: NNN, CAM, OpEx, operating expenses.
+- "Gross Rent": If BOTH base rent and NNN are present, set to (Rent/SF /Yr + Ops Ex /SF), rounded to 2 decimals. Else leave unchanged.
+
+FORMATTING:
+- For money/area fields, output plain decimals (no "$", "SF", commas). Examples: "30", "14.29", "2400".
+- Prefer explicit statements in the email or attachments over inference.
+- Example: "$30.00/SF NNN ($14.29/SF)" → "Rent/SF /Yr" = "30", "Ops Ex /SF" = "14.29", "Gross Rent" = "44.29".
+"""
+        
         # Build prompt for OpenAI
         prompt = f"""
 You are analyzing a conversation thread to suggest updates to a Google Sheet row.
+
+{COLUMN_RULES}
 
 SHEET HEADER (row 2):
 {json.dumps(header)}
@@ -839,14 +854,10 @@ SHEET HEADER (row 2):
 CURRENT ROW VALUES (row {rownum}):
 {json.dumps(rowvals)}
 
-CONVERSATION HISTORY:
+CONVERSATION HISTORY (latest last):
 {json.dumps(conversation, indent=2)}
 
-Based on this conversation, suggest updates to the sheet row. Consider:
-- New information revealed in the conversation
-- Status changes or updates mentioned
-- Contact information updates
-- Progress or milestone updates
+Be conservative: only suggest changes you can cite from the text or attachments.
 
 OUTPUT ONLY valid JSON in this exact format:
 {{
