@@ -134,6 +134,135 @@ def _guess_email_col_idx(header: list[str]) -> int:
             return i
     return -1
 
+def _first_sheet_props(sheets, spreadsheet_id):
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    p = meta["sheets"][0]["properties"]
+    return p["sheetId"], p["title"]
+
+def _approx_header_px(text: str) -> int:
+    # rough width estimate for default Sheets font (keeps headers visible)
+    if not text:
+        return 80
+    px = int(len(text) * 7 + 24)  # chars * avg px + padding
+    return max(100, min(px, 1000))
+
+def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: list[str]):
+    """
+    Rules:
+      • Default: CLIP + auto-resize (covers header too). No header wrap.
+      • "Listing Brokers Comments" & "Jill and Clients comments":
+           WRAP for data rows (row 3+) only; header stays CLIP; set a wide width.
+      • "Listing Brokers Flyer / Link" & "Floorplan":
+           CLIP, compact fixed width (but never smaller than the header).
+    Trailing/odd spacing in header names is tolerated.
+    """
+    try:
+        sheets = _sheets_client()
+        sheet_id, _ = _first_sheet_props(sheets, spreadsheet_id)
+
+        def norm(s):  # normalize header names; ignores trailing spaces/case
+            return (s or "").strip().lower()
+
+        # tweakable widths (pixels)
+        COMMENTS_WIDTH_PX  = 460
+        FLYER_WIDTH_PX     = 320
+        FLOORPLAN_WIDTH_PX = 220
+
+        comment_cols = {
+            norm("Listing Brokers Comments"),
+            norm("Jill and Clients comments"),
+        }
+        link_cols = {
+            norm("Listing Brokers Flyer / Link"),
+            norm("Floorplan"),
+        }
+
+        req = []
+
+        for i, raw_name in enumerate(header, start=1):
+            key = norm(raw_name)
+            if not key:
+                continue
+
+            header_px = _approx_header_px(raw_name)
+
+            # Keep header unwrapped explicitly
+            req.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1, "endRowIndex": 2,    # header row (row 2)
+                        "startColumnIndex": i-1, "endColumnIndex": i
+                    },
+                    "cell": {"userEnteredFormat": {"wrapStrategy": "CLIP"}},
+                    "fields": "userEnteredFormat.wrapStrategy"
+                }
+            })
+
+            if key in comment_cols:
+                # Wrap only data rows (row 3+)
+                req.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 2,                    # from row 3 down
+                            "startColumnIndex": i-1,
+                            "endColumnIndex": i
+                        },
+                        "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP"}},
+                        "fields": "userEnteredFormat.wrapStrategy"
+                    }
+                })
+                # Wide column, but never less than header width
+                req.append({
+                    "updateDimensionProperties": {
+                        "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": i-1, "endIndex": i},
+                        "properties": {"pixelSize": max(COMMENTS_WIDTH_PX, header_px)},
+                        "fields": "pixelSize"
+                    }
+                })
+
+            elif key in link_cols:
+                # Links: clipped, compact width (≥ header width)
+                width = FLYER_WIDTH_PX if "flyer" in key else FLOORPLAN_WIDTH_PX
+                req.append({
+                    "repeatCell": {
+                        "range": {"sheetId": sheet_id, "startColumnIndex": i-1, "endColumnIndex": i},
+                        "cell": {"userEnteredFormat": {"wrapStrategy": "CLIP"}},
+                        "fields": "userEnteredFormat.wrapStrategy"
+                    }
+                })
+                req.append({
+                    "updateDimensionProperties": {
+                        "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": i-1, "endIndex": i},
+                        "properties": {"pixelSize": max(width, header_px)},
+                        "fields": "pixelSize"
+                    }
+                })
+
+            else:
+                # Everyone else: CLIP + auto-resize (lets data decide the width)
+                req.append({
+                    "repeatCell": {
+                        "range": {"sheetId": sheet_id, "startColumnIndex": i-1, "endColumnIndex": i},
+                        "cell": {"userEnteredFormat": {"wrapStrategy": "CLIP"}},
+                        "fields": "userEnteredFormat.wrapStrategy"
+                    }
+                })
+                req.append({
+                    "autoResizeDimensions": {
+                        "dimensions": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": i-1, "endIndex": i}
+                    }
+                })
+
+        if req:
+            sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": req}).execute()
+            print("🎨 Column formatting applied (autosize, header-safe, comments wrapped, links clipped).")
+
+    except Exception as e:
+        print(f"⚠️ Failed to format columns: {e}")
+
+
 def _col_letter(n: int) -> str:
     """1-indexed column number -> A1 letter (1->A)."""
     s = ""
@@ -1001,6 +1130,9 @@ def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email:
     tab_title = _get_first_tab_title(sheets, sheet_id)
     header = _read_header_row2(sheets, sheet_id, tab_title)
 
+    # Ensure sizing/behavior is correct on every run (idempotent)
+    format_sheet_columns_autosize_with_exceptions(sheet_id, header)
+
     print(f"📄 Sheet fetched: title='{tab_title}', sheetId={sheet_id}")
     print(f"   Header (row 2): {header}")
     print(f"   Counterparty email (row match): {counterparty_email or 'unknown'}")
@@ -1699,6 +1831,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 try:
                     sheets = _sheets_client()
                     append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, drive_links)
+                    # Re-read header in case we just created "Flyer / Link"
+                    try:
+                        tab_title = _get_first_tab_title(sheets, sheet_id)
+                        header = _read_header_row2(sheets, sheet_id, tab_title)
+                        format_sheet_columns_autosize_with_exceptions(sheet_id, header)
+                    except Exception as _e:
+                        print(f"ℹ️ Skipped re-format after link append: {_e}")
+
                 except Exception as e:
                     print(f"❌ Failed to append links to sheet: {e}")
         
