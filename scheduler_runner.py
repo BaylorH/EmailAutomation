@@ -777,41 +777,43 @@ def write_message_order_test(uid: str, thread_id: str, sheet_id: str):
 
 def build_conversation_payload(uid: str, thread_id: str, limit: int = 10) -> list[dict]:
     """
-    Return last N messages in chronological order, each item:
-    { "direction": "inbound"|"outbound", "from": str, "to": [str],
-      "subject": str, "timestamp": iso, "preview": str }
+    Return last N messages in chronological order. Each item includes:
+    direction, from, to, subject, timestamp, preview (short), content (full text, bounded)
     """
     try:
         messages = _get_thread_messages_chronological(uid, thread_id)
-        
-        # Take last N messages
-        recent_messages = messages[-limit:] if len(messages) > limit else messages
-        
+        recent = messages[-limit:] if len(messages) > limit else messages
+
         payload = []
-        for msg_info in recent_messages:
+        CUT = 2000  # cap to keep prompt small but meaningful
+        for msg_info in recent:
             data = msg_info["data"]
-            
-            # Get timestamp (prefer sent/received, fallback to created)
-            timestamp = data.get("sentDateTime") or data.get("receivedDateTime") or data.get("createdAt")
-            if hasattr(timestamp, 'isoformat'):
-                timestamp = timestamp.isoformat()
-            elif not isinstance(timestamp, str):
-                timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+            ts = data.get("sentDateTime") or data.get("receivedDateTime") or data.get("createdAt")
+            if hasattr(ts, "isoformat"):
+                ts = ts.isoformat()
+            elif not isinstance(ts, str):
+                ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+            body = data.get("body", {}) or {}
+            full_text = (body.get("content") or "")[:CUT]
+            preview = (body.get("preview") or "")[:200]
 
             payload.append({
                 "direction": data.get("direction", "unknown"),
                 "from": data.get("from", ""),
                 "to": data.get("to", []),
                 "subject": data.get("subject", ""),
-                "timestamp": timestamp,
-                "preview": data.get("body", {}).get("preview", "")[:200]  # Limit for token budget
+                "timestamp": ts,
+                "preview": preview,
+                "content": full_text,
             })
-        
+
         return payload
-        
     except Exception as e:
         print(f"❌ Failed to build conversation payload: {e}")
         return []
+
 
 
 def propose_sheet_updates(uid: str, client_id: str, email: str, sheet_id: str, header: list[str],
@@ -819,6 +821,7 @@ def propose_sheet_updates(uid: str, client_id: str, email: str, sheet_id: str, h
                           file_ids_for_this_run: list[str] = None) -> dict | None:
     """
     Uses OpenAI Responses API (no assistants) to propose sheet updates.
+    - Use the `content` field of each message (the full body). The `preview` fields are truncated and should not be used for extraction.
     - Build conversation payload from build_conversation_payload(...)
     - Use client.responses.create with input_file for PDFs + input_text for prompt
     - Parse JSON safely; on failure, log and return None.
@@ -1539,6 +1542,23 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     received_dt = msg.get("receivedDateTime")
     sent_dt = msg.get("sentDateTime")
     body_preview = msg.get("bodyPreview", "")
+    # --- PATCH: fetch full message body and normalize to plain text ---
+    try:
+        full_body_resp = exponential_backoff_request(
+            lambda: requests.get(
+                f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}",
+                headers=headers,
+                params={"$select": "body"},
+                timeout=30
+            )
+        ).json().get("body", {}) or {}
+        _raw_content = full_body_resp.get("content", "") or ""
+        _ctype = (full_body_resp.get("contentType") or "Text").upper()
+        _full_text = strip_html_tags(_raw_content) if _ctype == "HTML" else _raw_content
+    except Exception as e:
+        print(f"⚠️ Could not fetch full body for {msg_id}: {e}")
+        _full_text = body_preview or ""
+
     to_recipients = [r.get("emailAddress", {}).get("address", "") for r in msg.get("toRecipients", [])]
     
     # Get headers if not present
@@ -1619,9 +1639,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             "references": references
         },
         "body": {
-            "contentType": "Text",  # bodyPreview is always text
-            "content": body_preview,
-            "preview": safe_preview(body_preview)
+            "contentType": "Text",
+            "content": _full_text,
+            "preview": safe_preview(_full_text)
         }
     }
     
