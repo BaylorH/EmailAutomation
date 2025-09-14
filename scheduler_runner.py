@@ -838,11 +838,14 @@ COLUMN SEMANTICS & MAPPING (use EXACT header names):
 - "Rent/SF /Yr": Base/asking rent per square foot per YEAR. Synonyms: asking, base rent, $/SF/yr.
 - "Ops Ex /SF": NNN/CAM/Operating Expenses per square foot per YEAR. Synonyms: NNN, CAM, OpEx, operating expenses.
 - "Gross Rent": If BOTH base rent and NNN are present, set to (Rent/SF /Yr + Ops Ex /SF), rounded to 2 decimals. Else leave unchanged.
+- "Listing Brokers Comments ": Short, non-numeric broker/client notes not covered by other columns. Use terse fragments separated by " • ". Do NOT repeat rent/NNN/SF numbers. Pull only explicit statements from the email/attachments. If a comment already exists in this field only add onto it do not remove the existing one while ensuring you aren't duplicating.
 
 FORMATTING:
 - For money/area fields, output plain decimals (no "$", "SF", commas). Examples: "30", "14.29", "2400".
 - Prefer explicit statements in the email or attachments over inference.
 - Example: "$30.00/SF NNN ($14.29/SF)" → "Rent/SF /Yr" = "30", "Ops Ex /SF" = "14.29", "Gross Rent" = "44.29".
+- If any such notes exist, include one update for "Listing Brokers Comments " with a single string like: "Directly across from Gold’s Gym • Bathrooms in rear corridor can be incorporated into space"
+
 """
         
         # Build prompt for OpenAI
