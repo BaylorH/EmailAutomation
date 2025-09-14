@@ -49,7 +49,7 @@ if not OPENAI_API_KEY:
 
 # Initialize OpenAI client
 openai.api_key = OPENAI_API_KEY
-openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # Firestore Admin client (uses GOOGLE_APPLICATION_CREDENTIALS)
 _fs = firestore.Client()
@@ -146,6 +146,292 @@ def _header_index_map(header: list[str]) -> dict:
     """Normalize headers for exact match regardless of spacing/case."""
     return { (h or "").strip().lower(): i for i, h in enumerate(header, start=1) }  # 1-based
 
+# ─── NEW: AI_META helpers ─────────────────────────────
+
+def _ensure_ai_meta_tab(sheets, spreadsheet_id: str) -> None:
+    """Ensure AI_META tab exists with proper headers."""
+    try:
+        meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheet_names = [sheet["properties"]["title"] for sheet in meta["sheets"]]
+        
+        if "AI_META" in sheet_names:
+            return
+        
+        # Create AI_META tab
+        request = {
+            "requests": [{
+                "addSheet": {
+                    "properties": {
+                        "title": "AI_META",
+                        "hidden": True  # Hidden tab
+                    }
+                }
+            }]
+        }
+        sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=request).execute()
+        
+        # Add headers
+        headers = ["rowNumber", "columnName", "last_ai_value", "last_ai_write_iso", "human_override"]
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range="AI_META!A1:E1",
+            valueInputOption="RAW",
+            body={"values": [headers]}
+        ).execute()
+        
+        print("📋 Created 'AI_META' tab")
+        
+    except Exception as e:
+        print(f"⚠️ Could not create AI_META tab: {e}")
+
+def _read_ai_meta_row(sheets, spreadsheet_id: str, rownum: int, column: str) -> dict | None:
+    """Read AI_META record for specific row/column."""
+    try:
+        _ensure_ai_meta_tab(sheets, spreadsheet_id)
+        
+        # Read all AI_META data
+        resp = sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range="AI_META!A:E"
+        ).execute()
+        
+        rows = resp.get("values", [])
+        if len(rows) <= 1:  # Only header or empty
+            return None
+        
+        # Find matching row
+        for row in rows[1:]:  # Skip header
+            if len(row) >= 2 and str(row[0]) == str(rownum) and row[1].lower() == column.lower():
+                return {
+                    "rowNumber": row[0],
+                    "columnName": row[1],
+                    "last_ai_value": row[2] if len(row) > 2 else None,
+                    "last_ai_write_iso": row[3] if len(row) > 3 else None,
+                    "human_override": row[4] if len(row) > 4 else False
+                }
+        
+        return None
+        
+    except Exception as e:
+        print(f"⚠️ Failed to read AI_META for row {rownum}, column {column}: {e}")
+        return None
+
+def _append_ai_meta(sheets, spreadsheet_id: str, rownum: int, column: str, value: str, override: bool = False):
+    """Append new AI_META record."""
+    try:
+        _ensure_ai_meta_tab(sheets, spreadsheet_id)
+        
+        now_iso = datetime.now(timezone.utc).isoformat()
+        
+        row_data = [rownum, column, value, now_iso, override]
+        
+        sheets.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range="AI_META!A:E",
+            valueInputOption="RAW",
+            body={"values": [row_data]}
+        ).execute()
+        
+    except Exception as e:
+        print(f"⚠️ Failed to append AI_META record: {e}")
+
+# ─── NEW: PDF helpers ─────────────────────────────────
+
+def fetch_pdf_attachments(headers: Dict[str, str], graph_msg_id: str) -> List[Dict[str, Any]]:
+    """Fetch PDF attachments from current message only."""
+    try:
+        base = "https://graph.microsoft.com/v1.0"
+        
+        # Get attachments
+        resp = requests.get(
+            f"{base}/me/messages/{graph_msg_id}/attachments",
+            headers=headers,
+            timeout=30
+        )
+        resp.raise_for_status()
+        
+        attachments = resp.json().get("value", [])
+        pdf_attachments = []
+        
+        for attachment in attachments:
+            if attachment.get("contentType", "").lower() == "application/pdf":
+                name = attachment.get("name", "document.pdf")
+                content_bytes = base64.b64decode(attachment.get("contentBytes", ""))
+                pdf_attachments.append({
+                    "name": name,
+                    "bytes": content_bytes
+                })
+        
+        print(f"📎 Found {len(pdf_attachments)} PDF attachment(s)")
+        return pdf_attachments
+        
+    except Exception as e:
+        print(f"❌ Failed to fetch PDF attachments: {e}")
+        return []
+
+def ensure_drive_folder():
+    """Ensure Drive folder exists and return folder ID."""
+    try:
+        creds = _helper_google_creds()
+        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+        
+        # Search for existing folder
+        results = drive.files().list(
+            q="name='Email PDFs' and mimeType='application/vnd.google-apps.folder'",
+            spaces="drive"
+        ).execute()
+        
+        folders = results.get("files", [])
+        if folders:
+            return folders[0]["id"]
+        
+        # Create folder
+        folder_metadata = {
+            "name": "Email PDFs",
+            "mimeType": "application/vnd.google-apps.folder"
+        }
+        
+        folder = drive.files().create(body=folder_metadata).execute()
+        print(f"📁 Created Drive folder: {folder.get('id')}")
+        return folder.get("id")
+        
+    except Exception as e:
+        print(f"❌ Failed to ensure Drive folder: {e}")
+        return None
+
+def upload_pdf_to_drive(name: str, content: bytes, folder_id: str = None) -> str | None:
+    """Upload PDF to Drive and return webViewLink."""
+    try:
+        creds = _helper_google_creds()
+        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+        
+        if not folder_id:
+            folder_id = ensure_drive_folder()
+        
+        file_metadata = {
+            "name": name,
+            "parents": [folder_id] if folder_id else []
+        }
+        
+        from googleapiclient.http import MediaIoBaseUpload
+        import io
+        
+        media = MediaIoBaseUpload(
+            io.BytesIO(content),
+            mimetype="application/pdf",
+            resumable=True
+        )
+        
+        file = drive.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id,webViewLink"
+        ).execute()
+        
+        # Make link-shareable
+        drive.permissions().create(
+            fileId=file.get("id"),
+            body={
+                "role": "reader",
+                "type": "anyone"
+            }
+        ).execute()
+        
+        web_link = file.get("webViewLink")
+        print(f"📁 Uploaded to Drive: {name} -> {web_link}")
+        return web_link
+        
+    except Exception as e:
+        print(f"❌ Failed to upload PDF to Drive: {e}")
+        return None
+
+def upload_pdf_user_data(filename: str, content: bytes) -> str:
+    """Upload PDF to OpenAI with purpose='user_data' and return file_id."""
+    try:
+        import tempfile
+        
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+            tmp_file.write(content)
+            tmp_file.flush()
+            
+            with open(tmp_file.name, "rb") as f:
+                file_response = client.files.create(
+                    file=f,
+                    purpose="user_data"
+                )
+            
+            os.unlink(tmp_file.name)  # Clean up
+            
+            file_id = file_response.id
+            print(f"📤 Uploaded to OpenAI: {filename} -> {file_id}")
+            return file_id
+            
+    except Exception as e:
+        print(f"❌ Failed to upload PDF to OpenAI: {e}")
+        raise
+
+def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]):
+    """Find/create Flyer / Link column and append links."""
+    try:
+        tab_title = _get_first_tab_title(sheets, spreadsheet_id)
+        idx_map = _header_index_map(header)
+        
+        # Look for exact match (case-insensitive, trimmed)
+        target_key = "flyer / link"
+        col_idx = None
+        
+        for key, idx in idx_map.items():
+            if key == target_key:
+                col_idx = idx
+                break
+        
+        # Create column if not found
+        if col_idx is None:
+            col_idx = len(header) + 1  # Add at end
+            col_letter = _col_letter(col_idx)
+            
+            # Add header
+            sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{tab_title}!{col_letter}2",
+                valueInputOption="RAW",
+                body={"values": [["Flyer / Link"]]}
+            ).execute()
+            print(f"📋 Created 'Flyer / Link' column at {col_letter}")
+        
+        # Get current value
+        col_letter = _col_letter(col_idx)
+        cell_range = f"{tab_title}!{col_letter}{rownum}"
+        
+        resp = sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=cell_range
+        ).execute()
+        
+        current_value = ""
+        values = resp.get("values", [])
+        if values and values[0]:
+            current_value = values[0][0]
+        
+        # Append links
+        new_links = "\n".join(links)
+        if current_value.strip():
+            updated_value = current_value + "\n" + new_links
+        else:
+            updated_value = new_links
+        
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=cell_range,
+            valueInputOption="RAW",
+            body={"values": [[updated_value]]}
+        ).execute()
+        
+        print(f"🔗 Appended {len(links)} link(s) to Flyer / Link column")
+        
+    except Exception as e:
+        print(f"❌ Failed to append links to Flyer / Link column: {e}")
+
 def apply_proposal_to_sheet(
     uid: str,
     client_id: str,
@@ -156,12 +442,14 @@ def apply_proposal_to_sheet(
     proposal: dict,
 ) -> dict:
     """
-    Applies proposal['updates'] to the sheet row.
+    Applies proposal['updates'] to the sheet row with AI write guards.
     Returns {"applied":[...], "skipped":[...]} items with old/new values.
     """
     try:
         sheets = _sheets_client()
         tab_title = _get_first_tab_title(sheets, sheet_id)
+        
+        _ensure_ai_meta_tab(sheets, sheet_id)
 
         if not proposal or not isinstance(proposal.get("updates"), list):
             return {"applied": [], "skipped": [{"reason":"no-updates"}]}
@@ -188,6 +476,26 @@ def apply_proposal_to_sheet(
 
             old_val = current_rowvals[col_idx-1] if (col_idx-1) < len(current_rowvals) else ""
 
+            # 1) no-op
+            if (old_val or "") == (new_val or ""):
+                skipped.append({"column": col_name, "reason": "no-change"})
+                continue
+
+            # Check AI_META for write guards
+            meta = _read_ai_meta_row(sheets, sheet_id, rownum, col_name)
+
+            # 2) prior AI write and human changed it
+            if meta and meta.get("last_ai_value") is not None and str(old_val) != str(meta["last_ai_value"]):
+                skipped.append({"column": col_name, "reason": "human-override"})
+                # TODO: suggest to Jill
+                continue
+
+            # 3) no prior AI write but cell already has a value → assume human value; skip
+            if not meta and (old_val or "").strip() != "":
+                skipped.append({"column": col_name, "reason": "existing-human-value"})
+                continue
+
+            # 4) otherwise proceed to write...
             data_payload.append({"range": rng, "values": [[new_val]]})
             applied.append({
                 "column": col_name,
@@ -201,6 +509,7 @@ def apply_proposal_to_sheet(
         if not data_payload:
             return {"applied": [], "skipped": skipped}
 
+        # Execute batch update
         sheets.spreadsheets().values().batchUpdate(
             spreadsheetId=sheet_id,
             body={
@@ -209,7 +518,10 @@ def apply_proposal_to_sheet(
             }
         ).execute()
 
-        # mark success
+        # Update AI_META for each applied change
+        for a in applied:
+            _append_ai_meta(sheets, sheet_id, rownum, a["column"], a["newValue"], override=False)
+
         return {"applied": applied, "skipped": skipped}
 
     except Exception as e:
@@ -257,73 +569,6 @@ def _find_row_by_email(sheets, spreadsheet_id: str, tab_title: str, header: list
 
     return None, None
 
-
-# ─── NEW: Task A - Assistant Management ─────────────────────────
-
-def get_or_create_assistant(uid: str, client_id: str, email: str, sheet_id: str) -> dict:
-    """
-    Returns {"assistantId": str, "docRef": <Firestore ref>, "doc": dict}.
-    1) Compute key = f"{client_id}__{email.lower()}".
-    2) If doc exists, return it and update lastUsedAt.
-    3) Else create an OpenAI Assistant (model = env OPENAI_ASSISTANT_MODEL or "gpt-4o"),
-       with tools=[{"type":"code_interpreter"}], no files for now.
-    4) Persist doc with assistantId, clientId, email, sheetId, fileIds=[].
-    """
-    doc_id = f"{client_id}__{email.lower()}"
-    doc_ref = _fs.collection("users").document(uid).collection("assistantIndex").document(doc_id)
-    
-    # Check if doc exists
-    doc_snapshot = doc_ref.get()
-    
-    if doc_snapshot.exists:
-        # Update lastUsedAt and return existing
-        doc_ref.update({"lastUsedAt": SERVER_TIMESTAMP})
-        doc_data = doc_snapshot.to_dict()
-        assistant_id = doc_data.get("assistantId")
-        print(f"🔄 Reusing assistant {assistant_id} for {client_id}__{email.lower()}")
-        return {
-            "assistantId": assistant_id,
-            "docRef": doc_ref,
-            "doc": doc_data
-        }
-    else:
-        # Create new OpenAI Assistant
-        try:
-            assistant = openai_client.beta.assistants.create(
-                name=f"Sheet Assistant for {client_id}",
-                model=OPENAI_ASSISTANT_MODEL,
-                tools=[{"type": "code_interpreter"}],
-                tool_resources={"code_interpreter": {"file_ids": []}}
-            )
-            assistant_id = assistant.id
-            
-            # Create Firestore doc
-            doc_data = {
-                "assistantId": assistant_id,
-                "clientId": client_id,
-                "email": email.lower(),
-                "sheetId": sheet_id,
-                "fileIds": [],
-                "model": OPENAI_ASSISTANT_MODEL,
-                "createdAt": SERVER_TIMESTAMP,
-                "lastUsedAt": SERVER_TIMESTAMP
-            }
-            
-            doc_ref.set(doc_data)
-            print(f"🆕 Created assistant {assistant_id} for {client_id}__{email.lower()}")
-            
-            return {
-                "assistantId": assistant_id,
-                "docRef": doc_ref,
-                "doc": doc_data
-            }
-            
-        except Exception as e:
-            print(f"❌ Failed to create OpenAI assistant: {e}")
-            raise
-
-
-# ─── NEW: Task B - Test Sheet Write ─────────────────────────────
 
 def _ensure_log_tab_exists(sheets, spreadsheet_id: str) -> str:
     """Ensure 'Log' tab exists and return its title."""
@@ -472,7 +717,6 @@ def write_message_order_test(uid: str, thread_id: str, sheet_id: str):
             return
         
         # Prepare rows to append
-        # now_iso = datetime.utcnow().isoformat() + "Z"
         now_utc = datetime.now(timezone.utc)
         now_iso = now_utc.isoformat()  # ends with +00:00
 
@@ -531,8 +775,6 @@ def write_message_order_test(uid: str, thread_id: str, sheet_id: str):
         print(f"❌ Failed to write message order test: {e}")
 
 
-# ─── NEW: Task C - GPT Proposal Scaffolding ─────────────────────
-
 def build_conversation_payload(uid: str, thread_id: str, limit: int = 10) -> list[dict]:
     """
     Return last N messages in chronological order, each item:
@@ -556,7 +798,6 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10) -> lis
             elif not isinstance(timestamp, str):
                 timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-
             payload.append({
                 "direction": data.get("direction", "unknown"),
                 "from": data.get("from", ""),
@@ -574,30 +815,17 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10) -> lis
 
 
 def propose_sheet_updates(uid: str, client_id: str, email: str, sheet_id: str, header: list[str],
-                          rownum: int, rowvals: list[str], thread_id: str) -> dict | None:
+                          rownum: int, rowvals: list[str], thread_id: str, 
+                          file_ids_for_this_run: list[str] = None) -> dict | None:
     """
-    - Uses get_or_create_assistant(...) to get assistantId (store/refresh lastUsedAt).
-    - Build a single 'user' message for OpenAI that contains:
-        * Header (row 2)
-        * Current values for the matched row
-        * Conversation payload from build_conversation_payload(...)
-        * Strict instruction to output JSON with shape:
-          {
-            "updates":[{"column": "<header name>", "value": "<string>", "confidence": 0..1, "reason": "<why>"}],
-            "notes": "<optional>"
-          }
-      and *only* that JSON as output.
+    Uses OpenAI Responses API (no assistants) to propose sheet updates.
+    - Build conversation payload from build_conversation_payload(...)
+    - Use client.responses.create with input_file for PDFs + input_text for prompt
     - Parse JSON safely; on failure, log and return None.
-    - Log the proposal (pretty-printed) to console and also store a record in:
-      users/{uid}/sheetChangeLog/{threadId}__{iso}
-        - clientId, email, sheetId, rowNumber, proposalJson, proposalHash, status="proposed"
+    - Log the proposal and store a record in sheetChangeLog
     - Do NOT write to the sheet yet.
     """
     try:
-        # Get or create assistant
-        assistant_info = get_or_create_assistant(uid, client_id, email, sheet_id)
-        assistant_id = assistant_info["assistantId"]
-        
         # Build conversation payload
         conversation = build_conversation_payload(uid, thread_id, limit=10)
         
@@ -636,15 +864,27 @@ OUTPUT ONLY valid JSON in this exact format:
 Be conservative with updates. Only suggest changes where you have good confidence based on explicit information in the conversation.
 """
 
-        # Call OpenAI (using simple completion, not assistants API for this)
-        response = openai_client.chat.completions.create(
+        # Prepare input content for Responses API
+        input_content = []
+        
+        # Add file inputs first
+        if file_ids_for_this_run:
+            for file_id in file_ids_for_this_run:
+                input_content.append({"type": "input_file", "file_id": file_id})
+        
+        # Add text input
+        input_content.append({"type": "input_text", "text": prompt})
+
+        # Call OpenAI Responses API
+        response = client.responses.create(
             model=OPENAI_ASSISTANT_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=1000
+            input=[{
+                "role": "user",
+                "content": input_content
+            }]
         )
         
-        raw_response = response.choices[0].message.content.strip()
+        raw_response = response.output_text.strip()
         
         # Parse JSON safely
         try:
@@ -664,7 +904,7 @@ Be conservative with updates. Only suggest changes where you have good confidenc
             proposal = json.loads(raw_response)
             
         except json.JSONDecodeError as e:
-            print(f"❌ Failed to parse GPT JSON response: {e}")
+            print(f"❌ Failed to parse OpenAI JSON response: {e}")
             print(f"Raw response: {raw_response}")
             return None
         
@@ -674,18 +914,14 @@ Be conservative with updates. Only suggest changes where you have good confidenc
             return None
         
         # Log the proposal
-        print(f"\n🤖 GPT Proposal for {client_id}__{email}:")
+        print(f"\n🤖 OpenAI Proposal for {client_id}__{email}:")
         print(json.dumps(proposal, indent=2))
         
         # Store in sheetChangeLog
-        # now_iso = datetime.utcnow().isoformat().replace(":", "-").replace(".", "-") + "Z"
         now_utc = datetime.now(timezone.utc)
         now_iso = now_utc.isoformat()  # ends with +00:00
 
-        # log_doc_id = f"{thread_id}__{now_iso}"
-
         log_doc_id = f"{thread_id}__{now_utc.isoformat().replace(':','-').replace('.','-').replace('+00:00','Z')}"
-
         
         proposal_hash = hashlib.sha256(
             json.dumps(proposal, sort_keys=True).encode('utf-8')
@@ -700,7 +936,7 @@ Be conservative with updates. Only suggest changes where you have good confidenc
             "proposalHash": proposal_hash,
             "status": "proposed",
             "threadId": thread_id,
-            "assistantId": assistant_id,
+            "fileIds": file_ids_for_this_run or [],
             "createdAt": SERVER_TIMESTAMP
         }
         
@@ -1164,7 +1400,6 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     
     # Calculate 5-hour cutoff
     from datetime import datetime, timedelta
-    # now_utc = datetime.utcnow()
     now_utc = datetime.now(timezone.utc)
     now_iso = now_utc.isoformat()  # ends with +00:00
 
@@ -1404,11 +1639,40 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     if sheet_id and rownum is not None:
         from_addr_lower = (from_addr or "").lower()
         
+        # NEW: Handle PDF attachments for current message only
+        file_ids_for_this_run = []
+        pdf_attachments = fetch_pdf_attachments(headers, msg_id)
+        
+        if pdf_attachments:
+            drive_links = []
+            
+            for pdf in pdf_attachments:
+                try:
+                    # Upload to Drive
+                    drive_link = upload_pdf_to_drive(pdf["name"], pdf["bytes"])
+                    if drive_link:
+                        drive_links.append(drive_link)
+                    
+                    # Upload to OpenAI
+                    file_id = upload_pdf_user_data(pdf["name"], pdf["bytes"])
+                    file_ids_for_this_run.append(file_id)
+                    
+                except Exception as e:
+                    print(f"❌ Failed to process PDF {pdf['name']}: {e}")
+            
+            # Append Drive links to Flyer / Link column
+            if drive_links:
+                try:
+                    sheets = _sheets_client()
+                    append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, drive_links)
+                except Exception as e:
+                    print(f"❌ Failed to append links to sheet: {e}")
+        
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)
         
-        # Step 3: get GPT proposal (no writes yet)
-        proposal = propose_sheet_updates(user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals, thread_id)
+        # Step 3: get proposal using Responses API (no assistants)
+        proposal = propose_sheet_updates(user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals, thread_id, file_ids_for_this_run)
         if proposal and proposal.get("updates"):
             apply_result = apply_proposal_to_sheet(
                 user_id, client_id, sheet_id, header, rownum, rowvals, proposal
@@ -1430,7 +1694,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     "status": "applied",
                     "threadId": thread_id,
                     "createdAt": SERVER_TIMESTAMP,
-                    "assistantId": get_or_create_assistant(user_id, client_id, from_addr_lower, sheet_id)["assistantId"],
+                    "fileIds": file_ids_for_this_run,
                     "proposalHash": applied_hash,
                 })
             except Exception as e:
