@@ -99,16 +99,20 @@ def _sheets_client():
 
 def _get_sheet_id_or_fail(uid: str, client_id: str) -> str:
     # Try active clients
-    doc_ref = _fs.collection("users").document(uid).collection("clients").document(client_id).get()
-    if doc_ref.exists:
-        sid = (doc_ref.to_dict() or {}).get("sheetId")
+    doc_ref = _fs.collection("users").document(uid).collection("clients").document(client_id)
+    doc_snapshot = doc_ref.get()
+    if doc_snapshot.exists:
+        doc_data = doc_snapshot.to_dict() or {}
+        sid = doc_data.get("sheetId")
         if sid:
             return sid
 
     # Try archived clients (emails might keep flowing after archive)
-    doc_ref = _fs.collection("users").document(uid).collection("archivedClients").document(client_id).get()
-    if doc_ref.exists:
-        sid = (doc_ref.to_dict() or {}).get("sheetId")
+    archived_doc_ref = _fs.collection("users").document(uid).collection("archivedClients").document(client_id)
+    archived_doc_snapshot = archived_doc_ref.get()
+    if archived_doc_snapshot.exists:
+        archived_doc_data = archived_doc_snapshot.to_dict() or {}
+        sid = archived_doc_data.get("sheetId")
         if sid:
             return sid
 
@@ -670,15 +674,17 @@ def send_remaining_questions_email(uid: str, client_id: str, headers: dict, reci
         dedupe_key = f"remaining_questions:{thread_id}:{content_hash}"
         
         # Simple check: look for recent similar notifications
-        recent_notifs = (_fs.collection("users").document(uid)
-                         .collection("clients").document(client_id)
-                         .collection("notifications")
-                         .where("threadId", "==", thread_id)
-                         .where("kind", "==", "action_needed")
-                         .limit(5)
-                         .get())
-        for notif in recent_notifs:
-            if notif.to_dict().get("dedupeKey") == dedupe_key:
+        recent_notifs_query = (_fs.collection("users").document(uid)
+                              .collection("clients").document(client_id)
+                              .collection("notifications")
+                              .where("threadId", "==", thread_id)
+                              .where("kind", "==", "action_needed")
+                              .limit(5))
+        
+        # Execute the query and iterate through results
+        for notif in recent_notifs_query.stream():
+            notif_data = notif.to_dict()
+            if notif_data and notif_data.get("dedupeKey") == dedupe_key:
                 print(f"📧 Skipped duplicate remaining questions email")
                 return False
         
@@ -2683,17 +2689,20 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 
                 if event_type == "call_requested":
                     # Create action_needed notification
-                    write_notification(
-                        user_id, client_id,
-                        kind="action_needed",
-                        priority="important",
-                        email=from_addr_lower,
-                        thread_id=thread_id,
-                        row_number=rownum,
-                        row_anchor=row_anchor,
-                        meta={"reason": "call_requested", "details": "Call requested in conversation"},
-                        dedupe_key=f"call_requested:{thread_id}"
-                    )
+                    try:
+                        write_notification(
+                            user_id, client_id,
+                            kind="action_needed",
+                            priority="important",
+                            email=from_addr_lower,
+                            thread_id=thread_id,
+                            row_number=rownum,
+                            row_anchor=row_anchor,
+                            meta={"reason": "call_requested", "details": "Call requested in conversation"},
+                            dedupe_key=f"call_requested:{thread_id}"
+                        )
+                    except Exception as e:
+                        print(f"❌ Failed to write notification: {e}")
                 
                 elif event_type == "property_unavailable":
                     # Move row below divider and create notification
@@ -2813,7 +2822,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         print(f"🎉 Sent closing email - all required fields complete")
                         
             except Exception as e:
-                print(f"❌ Failed to handle required fields check: {e}")
+                print(f"❌ Failed to send remaining questions email: {e}")
         
         else:
             print("ℹ️ No proposal generated; nothing to apply.")
