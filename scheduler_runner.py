@@ -2747,6 +2747,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         # --- flags for gating later (NEW) ---
         old_row_became_nonviable = False   # set true when we move the row below divider
         new_row_created = False            # set true when we insert a new property row
+        new_row_number = None              # track the newly created row number
 
         # NEW: Handle PDF attachments for current message only
         file_ids_for_this_run = []
@@ -2769,7 +2770,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 except Exception as e:
                     print(f"❌ Failed to process PDF {pdf['name']}: {e}")
             
-            # Append Drive links to Flyer / Link column
+            # Append Drive links to Flyer / Link column on the current row (keep existing behavior)
             if drive_links:
                 try:
                     sheets = _sheets_client()
@@ -2787,6 +2788,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         
         # NEW: URL exploration - find URLs in message and fetch content
         url_texts = []
+        found_urls = []  # <--- collect; don't write to a row yet (CHANGED)
         url_pattern = r'https?://[^\s<>"\']+[^\s<>"\'.,;)]'
         urls_found = re.findall(url_pattern, _full_text)
         
@@ -2795,13 +2797,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             fetched_text = fetch_url_as_text(clean)
             if fetched_text:
                 url_texts.append({"url": clean, "text": fetched_text})
-            
-            # Put URL in Flyer / Link (surgical change already made upstream)
-            try:
-                sheets = _sheets_client()
-                append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, [clean])
-            except Exception as e:
-                print(f"❌ Failed to append URL to comments: {e}")
+            found_urls.append(clean)  # defer writing so we know which row to target
         
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)
@@ -2903,7 +2899,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         print(f"❌ Failed to handle property_unavailable: {e}")
                 
                 elif event_type == "new_property":
-                    # Insert new property row and create a PENDING notification (do NOT send email)  (CHANGED)
+                    # Insert new property row and create a PENDING notification (do NOT send email)
                     try:
                         address = event.get("address", "")
                         city = event.get("city", "")
@@ -2921,7 +2917,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             values_by_header["email"] = from_addr_lower
                             values_by_header["email address"] = from_addr_lower
                         
-                        # Put the URL itself in Flyer / Link
+                        # Put the URL itself in Flyer / Link initially (keeps behavior if no urls were parsed)
                         if link:
                             values_by_header["flyer / link"] = link
 
@@ -2935,14 +2931,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         # Reformat after insert
                         format_sheet_columns_autosize_with_exceptions(sheet_id, header)
 
-                        # Also append (deduped) link to Flyer / Link if column already existed
-                        if link:
-                            try:
-                                append_links_to_flyer_link_column(_sheets_client(), sheet_id, header, new_rownum, [link])
-                            except Exception as e:
-                                print(f"❌ Failed to write link to Flyer / Link: {e}")
+                        # --- remember the new row to target links later (NEW) ---
+                        new_row_created = True
+                        new_row_number = new_rownum
 
-                        # --- Build suggested (not sent) email payload (NEW) ---
+                        # Build suggested (not sent) email payload
                         email_payload = {
                             "to": [from_addr_lower],
                             "subject": f"{address}, {city}" if city else address,
@@ -2965,7 +2958,7 @@ Thanks!""",
                             "rowNumber": new_rownum
                         }
 
-                        # --- Create ACTION_NEEDED notification with draft email (NEW) ---
+                        # Create ACTION_NEEDED notification with draft email
                         write_notification(
                             user_id, client_id,
                             kind="action_needed",
@@ -2986,10 +2979,7 @@ Thanks!""",
                             dedupe_key=f"new_property_pending:{address}:{city}:{from_addr_lower}"
                         )
 
-                        # --- mark that we created a new row this run (NEW) ---
-                        new_row_created = True
-
-                        # IMPORTANT: we intentionally DO NOT call send_new_property_email(...) anymore
+                        # IMPORTANT: do NOT call send_new_property_email(...)
 
                     except Exception as e:
                         print(f"❌ Failed to handle new_property: {e}")
@@ -2997,13 +2987,42 @@ Thanks!""",
                 elif event_type == "close_conversation":
                     # Check if all required fields are complete for closing logic
                     pass  # This will be handled below in the required fields check
+
+            # --- FINAL: append discovered URLs to the correct row (NEW) ---
+            try:
+                if found_urls:
+                    # target = new row if created; else stick with original row
+                    target_row = new_row_number if (new_row_created and new_row_number) else rownum
+
+                    # If target is the original row and it's now below NON-VIABLE, skip writing links
+                    tab_title = _get_first_tab_title(sheets, sheet_id)
+                    try:
+                        a_col = sheets.spreadsheets().values().get(
+                            spreadsheetId=sheet_id, range=f"{tab_title}!A:A"
+                        ).execute().get("values", [])
+                        divider_row = None
+                        for i, r in enumerate(a_col, start=1):
+                            if r and str(r[0]).strip().upper() == "NON-VIABLE":
+                                divider_row = i
+                                break
+                    except Exception:
+                        divider_row = None
+
+                    if not (divider_row and target_row > divider_row):
+                        # de-dupe in the list we pass (doesn't check existing cell content)
+                        unique_links = list(dict.fromkeys(found_urls))
+                        append_links_to_flyer_link_column(sheets, sheet_id, header, target_row, unique_links)
+                    else:
+                        print("ℹ️ Skipped writing links to non-viable row.")
+            except Exception as e:
+                print(f"❌ Failed final link append: {e}")
             
-            # NEW: Required fields check and remaining questions flow (GATED)
+            # NEW: Required fields check and remaining questions flow (existing gating remains below)
             try:
                 sheets = _sheets_client()
                 tab_title = _get_first_tab_title(sheets, sheet_id)
 
-                # --- Stateless divider check so we don't nag on non-viable rows (NEW) ---
+                # Stateless divider check so we don't nag on non-viable rows
                 try:
                     div_resp = sheets.spreadsheets().values().get(
                         spreadsheetId=sheet_id, range=f"{tab_title}!A:A"
