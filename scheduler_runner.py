@@ -18,8 +18,9 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from datetime import datetime, timezone
 import openai
+from bs4 import BeautifulSoup
 
-# ─── Config ─────────────────────────────────────────────
+# Config
 CLIENT_ID         = os.getenv("AZURE_API_APP_ID")
 CLIENT_SECRET     = os.getenv("AZURE_API_CLIENT_SECRET")
 FIREBASE_API_KEY  = os.getenv("FIREBASE_API_KEY")
@@ -41,11 +42,17 @@ BODY = (
 )
 THANK_YOU_BODY = "Thanks for your response."
 
+# Required fields for closing conversations
+REQUIRED_FIELDS_FOR_CLOSE = [
+    "Total SF","Rent/SF /Yr","Ops Ex /SF","Gross Rent",
+    "Drive Ins","Docks","Ceiling Ht","Power"
+]
+
 if not CLIENT_ID or not CLIENT_SECRET or not FIREBASE_API_KEY:
-    raise RuntimeError("❌ Missing required env vars")
+    raise RuntimeError("Missing required env vars")
 
 if not OPENAI_API_KEY:
-    raise RuntimeError("❌ Missing OPENAI_API_KEY env var")
+    raise RuntimeError("Missing OPENAI_API_KEY env var")
 
 # Initialize OpenAI client
 openai.api_key = OPENAI_API_KEY
@@ -54,7 +61,7 @@ client = openai.OpenAI(api_key=OPENAI_API_KEY)
 # Firestore Admin client (uses GOOGLE_APPLICATION_CREDENTIALS)
 _fs = firestore.Client()
 
-# ─── Helper: detect HTML vs text ───────────────────────
+# Helper: detect HTML vs text
 _html_rx = re.compile(r"<[a-zA-Z/][^>]*>")
 
 def _body_kind(script: str):
@@ -68,7 +75,7 @@ def _helper_google_creds():
     client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
     refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN")
     if not (client_id and client_secret and refresh_token):
-        raise RuntimeError("❌ Missing GOOGLE_OAUTH_CLIENT_ID/SECRET/REFRESH_TOKEN")
+        raise RuntimeError("Missing GOOGLE_OAUTH_CLIENT_ID/SECRET/REFRESH_TOKEN")
 
     creds = Credentials(
         token=None,
@@ -106,7 +113,7 @@ def _get_sheet_id_or_fail(uid: str, client_id: str) -> str:
             return sid
 
     # Required by design → fail loudly
-    raise RuntimeError(f"❌ sheetId not found for uid={uid} clientId={client_id}. This field is required.")
+    raise RuntimeError(f"sheetId not found for uid={uid} clientId={client_id}. This field is required.")
 
 
 # --- SHEETS HELPERS (row 2 = header) ---------------------------------
@@ -292,7 +299,617 @@ def _header_index_map(header: list[str]) -> dict:
     """Normalize headers for exact match regardless of spacing/case."""
     return { (h or "").strip().lower(): i for i, h in enumerate(header, start=1) }  # 1-based
 
-# ─── NEW: AI_META helpers ─────────────────────────────
+# --- NEW: Notifications System ---
+
+def write_notification(uid: str, client_id: str, *, kind: str, priority: str, email: str, 
+                      thread_id: str, row_number: int = None, row_anchor: str = None, 
+                      meta: dict = None, dedupe_key: str = None) -> str:
+    """
+    Write notification and bump counters atomically.
+    Returns the notification document ID.
+    """
+    try:
+        # Use dedupe_key as doc ID if provided
+        if dedupe_key:
+            doc_id = hashlib.sha1(dedupe_key.encode('utf-8')).hexdigest()
+        else:
+            doc_id = None  # Let Firestore auto-generate
+        
+        client_ref = _fs.collection("users").document(uid).collection("clients").document(client_id)
+        
+        # Check if dedupe doc already exists
+        if dedupe_key:
+            notif_ref = client_ref.collection("notifications").document(doc_id)
+            if notif_ref.get().exists:
+                print(f"📋 Skipped duplicate notification: {dedupe_key}")
+                return doc_id
+        else:
+            notif_ref = client_ref.collection("notifications").document()
+            doc_id = notif_ref.id
+        
+        # Prepare notification document
+        notification_doc = {
+            "kind": kind,
+            "priority": priority,
+            "email": email,
+            "threadId": thread_id,
+            "rowNumber": row_number,
+            "rowAnchor": row_anchor,
+            "createdAt": SERVER_TIMESTAMP,
+            "meta": meta or {},
+            "dedupeKey": dedupe_key
+        }
+        
+        # Atomic transaction to write notification and update counters
+        @firestore.transactional
+        def update_with_counters(transaction):
+            # Write notification
+            transaction.set(notif_ref, notification_doc)
+            
+            # Read current client doc
+            client_doc = transaction.get(client_ref)
+            current_data = client_doc.to_dict() if client_doc.exists else {}
+            
+            # Update counters
+            unread_count = current_data.get("notificationsUnread", 0) + 1
+            new_update_count = current_data.get("newUpdateCount", 0)
+            notif_counts = current_data.get("notifCounts", {})
+            
+            if kind == "sheet_update":
+                new_update_count += 1
+            
+            notif_counts[kind] = notif_counts.get(kind, 0) + 1
+            
+            # Write updated counters
+            transaction.set(client_ref, {
+                "notificationsUnread": unread_count,
+                "newUpdateCount": new_update_count,
+                "notifCounts": notif_counts
+            }, merge=True)
+        
+        # Execute transaction
+        transaction = _fs.transaction()
+        update_with_counters(transaction)
+        
+        print(f"📋 Created {kind} notification for {client_id}: {doc_id}")
+        return doc_id
+        
+    except Exception as e:
+        print(f"❌ Failed to write notification: {e}")
+        raise
+
+# --- NEW: URL Exploration ---
+
+def fetch_url_as_text(url: str) -> str | None:
+    """
+    Try to fetch URL content and extract visible text using BeautifulSoup.
+    Returns None on any failure (fail-safe).
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+        response.raise_for_status()
+        
+        # Parse with BeautifulSoup
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.decompose()
+        
+        # Get text
+        text = soup.get_text()
+        
+        # Clean up whitespace
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = ' '.join(chunk for chunk in chunks if chunk)
+        
+        # Limit size
+        if len(text) > 5000:
+            text = text[:5000] + "..."
+        
+        print(f"🌐 Fetched {len(text)} chars from {url}")
+        return text
+        
+    except Exception as e:
+        print(f"⚠️ Failed to fetch URL {url}: {e}")
+        return None
+
+# --- NEW: Non-viable divider and row operations ---
+
+def ensure_nonviable_divider(sheets, spreadsheet_id: str, tab_title: str) -> int:
+    """
+    Ensure NON-VIABLE divider row exists. Returns divider row number.
+    Creates if missing, styles with red background and bold white text.
+    """
+    try:
+        # Read current data to find existing divider
+        resp = sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!A:A"
+        ).execute()
+        rows = resp.get("values", [])
+        
+        # Look for existing "NON-VIABLE" divider
+        for i, row in enumerate(rows, start=1):
+            if row and str(row[0]).strip().upper() == "NON-VIABLE":
+                print(f"📍 Found existing NON-VIABLE divider at row {i}")
+                return i
+        
+        # No divider found, create one at the end
+        header = _read_header_row2(sheets, spreadsheet_id, tab_title)
+        divider_row = len(rows) + 1
+        
+        # Fill entire row with "NON-VIABLE"
+        divider_values = ["NON-VIABLE"] * len(header) if header else ["NON-VIABLE"]
+        
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!{divider_row}:{divider_row}",
+            valueInputOption="RAW",
+            body={"values": [divider_values]}
+        ).execute()
+        
+        # Style the divider row: red background, bold white text
+        sheet_id = _first_sheet_props(sheets, spreadsheet_id)[0]
+        
+        format_request = {
+            "requests": [{
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": divider_row - 1,
+                        "endRowIndex": divider_row,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": len(header) if header else 10
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": {"red": 0.8, "green": 0.0, "blue": 0.0},
+                            "textFormat": {
+                                "bold": True,
+                                "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,textFormat)"
+                }
+            }]
+        }
+        
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body=format_request
+        ).execute()
+        
+        print(f"🔴 Created NON-VIABLE divider at row {divider_row}")
+        return divider_row
+        
+    except Exception as e:
+        print(f"❌ Failed to ensure NON-VIABLE divider: {e}")
+        raise
+
+def move_row_below_divider(sheets, spreadsheet_id: str, tab_title: str, src_row: int, divider_row: int) -> int:
+    """
+    Move source row to immediately below the divider row.
+    Returns the new row number.
+    """
+    try:
+        sheet_id = _first_sheet_props(sheets, spreadsheet_id)[0]
+        
+        # Cut the source row
+        cut_request = {
+            "requests": [{
+                "cutPaste": {
+                    "source": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": src_row - 1,
+                        "endRowIndex": src_row
+                    },
+                    "destination": {
+                        "sheetId": sheet_id,
+                        "rowIndex": divider_row  # Insert right after divider
+                    },
+                    "pasteType": "PASTE_NORMAL"
+                }
+            }]
+        }
+        
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body=cut_request
+        ).execute()
+        
+        new_row = divider_row + 1
+        print(f"📍 Moved row {src_row} to {new_row} (below NON-VIABLE divider)")
+        return new_row
+        
+    except Exception as e:
+        print(f"❌ Failed to move row below divider: {e}")
+        raise
+
+def insert_property_row_above_divider(sheets, spreadsheet_id: str, tab_title: str, values_by_header: dict) -> int:
+    """
+    Insert a new property row one row above the divider (or at end if no divider).
+    Returns the new row number.
+    """
+    try:
+        header = _read_header_row2(sheets, spreadsheet_id, tab_title)
+        
+        # Find divider
+        resp = sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!A:A"
+        ).execute()
+        rows = resp.get("values", [])
+        
+        divider_row = None
+        for i, row in enumerate(rows, start=1):
+            if row and str(row[0]).strip().upper() == "NON-VIABLE":
+                divider_row = i
+                break
+        
+        if divider_row:
+            insert_row = divider_row
+        else:
+            insert_row = len(rows) + 1
+        
+        # Build values array based on header
+        row_values = []
+        for col_name in header:
+            key = col_name.strip().lower()
+            value = values_by_header.get(key, "")
+            row_values.append(value)
+        
+        # Insert the row
+        sheet_id = _first_sheet_props(sheets, spreadsheet_id)[0]
+        
+        insert_request = {
+            "requests": [{
+                "insertRange": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": insert_row - 1,
+                        "endRowIndex": insert_row
+                    },
+                    "shiftDimension": "ROWS"
+                }
+            }]
+        }
+        
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body=insert_request
+        ).execute()
+        
+        # Fill the new row with values
+        if row_values:
+            sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{tab_title}!{insert_row}:{insert_row}",
+                valueInputOption="RAW",
+                body={"values": [row_values]}
+            ).execute()
+        
+        print(f"✨ Inserted new property row {insert_row} above divider")
+        return insert_row
+        
+    except Exception as e:
+        print(f"❌ Failed to insert property row: {e}")
+        raise
+
+# --- NEW: Row anchoring helpers ---
+
+def get_row_anchor(rowvals: list[str], header: list[str]) -> str:
+    """Create a brief row anchor from property address and city."""
+    try:
+        idx_map = _header_index_map(header)
+        
+        # Try to find address and city
+        addr_keys = ["property address", "address", "street address", "property"]
+        city_keys = ["city", "town", "municipality"]
+        
+        def _get_val(keys: list[str]) -> str:
+            for k in keys:
+                if k in idx_map:
+                    i = idx_map[k] - 1  # 0-based for rowvals
+                    if 0 <= i < len(rowvals):
+                        v = (rowvals[i] or "").strip()
+                        if v:
+                            return v
+            return ""
+        
+        addr = _get_val(addr_keys)
+        city = _get_val(city_keys)
+        
+        if addr and city:
+            return f"{addr}, {city}"
+        elif addr:
+            return addr
+        elif city:
+            return city
+        else:
+            return f"Row data incomplete"
+    except Exception:
+        return "Unknown property"
+
+def check_missing_required_fields(rowvals: list[str], header: list[str]) -> list[str]:
+    """Check which required fields are missing from the row."""
+    try:
+        idx_map = _header_index_map(header)
+        missing = []
+        
+        for field in REQUIRED_FIELDS_FOR_CLOSE:
+            key = field.strip().lower()
+            if key in idx_map:
+                i = idx_map[key] - 1  # 0-based
+                if i >= len(rowvals) or not (rowvals[i] or "").strip():
+                    missing.append(field)
+            else:
+                missing.append(field)  # Column doesn't exist
+        
+        return missing
+    except Exception as e:
+        print(f"❌ Failed to check missing fields: {e}")
+        return REQUIRED_FIELDS_FOR_CLOSE  # Assume all missing on error
+
+def send_remaining_questions_email(uid: str, client_id: str, headers: dict, recipient: str, 
+                                 missing_fields: list[str], thread_id: str, row_number: int) -> bool:
+    """
+    Send a remaining questions email in the same thread (idempotent).
+    Returns True if sent, False if skipped (duplicate).
+    """
+    try:
+        # Create content hash for idempotency
+        content_key = f"missing:{','.join(sorted(missing_fields))}"
+        content_hash = hashlib.sha256(content_key.encode('utf-8')).hexdigest()[:16]
+        
+        # Check if we already sent this exact list
+        dedupe_key = f"remaining_questions:{thread_id}:{content_hash}"
+        
+        # Simple check: look for recent similar notifications
+        recent_notifs = (_fs.collection("users").document(uid)
+                        .collection("clients").document(client_id)
+                        .collection("notifications")
+                        .where("threadId", "==", thread_id)
+                        .where("kind", "==", "action_needed")
+                        .limit(5).get())
+        
+        for notif in recent_notifs:
+            if notif.to_dict().get("dedupeKey") == dedupe_key:
+                print(f"📧 Skipped duplicate remaining questions email")
+                return False
+        
+        # Compose email
+        field_list = "\n".join(f"- {field}" for field in missing_fields)
+        
+        body = f"""Hi,
+
+We still need the following information to complete your property details:
+
+{field_list}
+
+Could you please provide these details when you have a moment?
+
+Thanks!"""
+        
+        # Reply in the same thread
+        base = "https://graph.microsoft.com/v1.0"
+        
+        # Find the original message to reply to
+        thread_doc = _fs.collection("users").document(uid).collection("threads").document(thread_id).get()
+        if not thread_doc.exists:
+            print(f"❌ Thread {thread_id} not found for remaining questions")
+            return False
+        
+        # Get the root message ID (should be the thread_id itself for our system)
+        root_message_id = thread_id
+        
+        # Compose reply
+        reply_payload = {
+            "message": {
+                "subject": "Re: Remaining questions",
+                "body": {"contentType": "Text", "content": body},
+                "toRecipients": [{"emailAddress": {"address": recipient}}],
+                "internetMessageHeaders": [
+                    {"name": "x-row-anchor", "value": f"rowNumber={row_number}"}
+                ]
+            }
+        }
+        
+        # Send via Graph API (reply endpoint would be ideal but may not work with our indexing)
+        # Instead, send as new email but with proper In-Reply-To header
+        msg = {
+            "subject": "Re: Remaining questions",
+            "body": {"contentType": "Text", "content": body},
+            "toRecipients": [{"emailAddress": {"address": recipient}}],
+            "internetMessageHeaders": [
+                {"name": "In-Reply-To", "value": root_message_id},
+                {"name": "x-row-anchor", "value": f"rowNumber={row_number}"}
+            ]
+        }
+        
+        response = requests.post(f"{base}/me/sendMail", headers=headers, json={"message": msg}, timeout=30)
+        response.raise_for_status()
+        
+        # Create action_needed notification
+        write_notification(
+            uid, client_id,
+            kind="action_needed",
+            priority="important",
+            email=recipient,
+            thread_id=thread_id,
+            row_number=row_number,
+            row_anchor=get_row_anchor([], []),  # Will be filled by caller
+            meta={"reason": "missing_fields", "details": f"Missing: {', '.join(missing_fields)}"},
+            dedupe_key=dedupe_key
+        )
+        
+        print(f"📧 Sent remaining questions email for {len(missing_fields)} missing fields")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to send remaining questions email: {e}")
+        return False
+
+def send_closing_email(uid: str, client_id: str, headers: dict, recipient: str, 
+                      thread_id: str, row_number: int, row_anchor: str) -> bool:
+    """Send polite closing email when all required fields are complete."""
+    try:
+        body = """Hi,
+
+Thank you for providing all the requested information! We now have everything we need for your property details.
+
+We'll be in touch if we need any additional information.
+
+Best regards"""
+        
+        # Send email
+        base = "https://graph.microsoft.com/v1.0"
+        msg = {
+            "subject": "Re: Property information complete",
+            "body": {"contentType": "Text", "content": body},
+            "toRecipients": [{"emailAddress": {"address": recipient}}],
+            "internetMessageHeaders": [
+                {"name": "In-Reply-To", "value": thread_id},
+                {"name": "x-row-anchor", "value": f"rowNumber={row_number}"}
+            ]
+        }
+        
+        response = requests.post(f"{base}/me/sendMail", headers=headers, json={"message": msg}, timeout=30)
+        response.raise_for_status()
+        
+        # Create row_completed notification
+        write_notification(
+            uid, client_id,
+            kind="row_completed",
+            priority="important",
+            email=recipient,
+            thread_id=thread_id,
+            row_number=row_number,
+            row_anchor=row_anchor,
+            meta={"completedFields": REQUIRED_FIELDS_FOR_CLOSE, "missingFields": []},
+            dedupe_key=f"row_completed:{thread_id}:{row_number}"
+        )
+        
+        print(f"📧 Sent closing email for completed row {row_number}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to send closing email: {e}")
+        return False
+
+def send_new_property_email(uid: str, client_id: str, headers: dict, recipient: str, 
+                          address: str, city: str, row_number: int) -> str | None:
+    """
+    Send a new thread email for a new property suggestion.
+    Returns the new thread ID if successful.
+    """
+    try:
+        subject = f"{address}, {city}" if city else address
+        
+        body = f"""Hi,
+
+We noticed you mentioned a new property: {address}{', ' + city if city else ''}.
+
+Could you please provide the following details for this property:
+
+- Total square footage
+- Rent per square foot per year
+- Operating expenses per square foot
+- Number of drive-in doors
+- Number of dock doors  
+- Ceiling height
+- Power specifications
+
+Thanks!"""
+        
+        # Send as new email (not a reply)
+        base = "https://graph.microsoft.com/v1.0"
+        msg = {
+            "subject": subject,
+            "body": {"contentType": "Text", "content": body},
+            "toRecipients": [{"emailAddress": {"address": recipient}}],
+            "internetMessageHeaders": [
+                {"name": "x-client-id", "value": client_id},
+                {"name": "x-row-anchor", "value": f"rowNumber={row_number}"}
+            ]
+        }
+        
+        # Create draft first to get message ID
+        create_response = requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
+        create_response.raise_for_status()
+        draft_id = create_response.json()["id"]
+        
+        # Get message identifiers
+        get_response = requests.get(
+            f"{base}/me/messages/{draft_id}",
+            headers=headers,
+            params={"$select": "internetMessageId,conversationId,subject,toRecipients"},
+            timeout=30
+        )
+        get_response.raise_for_status()
+        message_data = get_response.json()
+        
+        internet_message_id = message_data.get("internetMessageId")
+        conversation_id = message_data.get("conversationId")
+        
+        if not internet_message_id:
+            raise Exception("No internetMessageId returned from Graph")
+        
+        # Send draft
+        requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
+        
+        # Index in Firestore
+        root_id = normalize_message_id(internet_message_id)
+        
+        # Thread root with rowNumber for anchoring
+        thread_meta = {
+            "subject": subject,
+            "clientId": client_id,
+            "email": [recipient],
+            "conversationId": conversation_id,
+            "rowNumber": row_number  # NEW: Store row number for anchoring
+        }
+        save_thread_root(uid, root_id, thread_meta)
+        
+        # Message record
+        message_record = {
+            "direction": "outbound",
+            "subject": subject,
+            "from": "me",
+            "to": [recipient],
+            "sentDateTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "receivedDateTime": None,
+            "headers": {
+                "internetMessageId": internet_message_id,
+                "inReplyTo": None,
+                "references": []
+            },
+            "body": {
+                "contentType": "Text",
+                "content": body,
+                "preview": f"New property questions for {address}"
+            }
+        }
+        save_message(uid, root_id, root_id, message_record)
+        
+        # Index message
+        index_message_id(uid, internet_message_id, root_id)
+        if conversation_id:
+            index_conversation_id(uid, conversation_id, root_id)
+        
+        print(f"📧 Sent new property email for {address} -> thread {root_id}")
+        return root_id
+        
+    except Exception as e:
+        print(f"❌ Failed to send new property email: {e}")
+        return None
+
+# --- NEW: AI_META helpers ---
 
 def _ensure_ai_meta_tab(sheets, spreadsheet_id: str) -> None:
     """Ensure AI_META tab exists with proper headers."""
@@ -381,7 +998,7 @@ def _append_ai_meta(sheets, spreadsheet_id: str, rownum: int, column: str, value
     except Exception as e:
         print(f"⚠️ Failed to append AI_META record: {e}")
 
-# ─── NEW: PDF helpers ─────────────────────────────────
+# --- NEW: PDF helpers ---
 
 def fetch_pdf_attachments(headers: Dict[str, str], graph_msg_id: str) -> List[Dict[str, Any]]:
     """Fetch PDF attachments from current message only."""
@@ -578,6 +1195,57 @@ def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[
     except Exception as e:
         print(f"❌ Failed to append links to Flyer / Link column: {e}")
 
+def append_url_to_comments(sheets, spreadsheet_id: str, header: list[str], rownum: int, url: str):
+    """Always append URL to Listing Brokers Comments column."""
+    try:
+        tab_title = _get_first_tab_title(sheets, spreadsheet_id)
+        idx_map = _header_index_map(header)
+        
+        # Look for Listing Brokers Comments column
+        target_key = "listing brokers comments"
+        col_idx = None
+        
+        for key, idx in idx_map.items():
+            if key == target_key:
+                col_idx = idx
+                break
+        
+        if col_idx is None:
+            print(f"⚠️ 'Listing Brokers Comments' column not found")
+            return
+        
+        # Get current value
+        col_letter = _col_letter(col_idx)
+        cell_range = f"{tab_title}!{col_letter}{rownum}"
+        
+        resp = sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=cell_range
+        ).execute()
+        
+        current_value = ""
+        values = resp.get("values", [])
+        if values and values[0]:
+            current_value = values[0][0]
+        
+        # Append URL
+        if current_value.strip():
+            updated_value = current_value + " • " + url
+        else:
+            updated_value = url
+        
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=cell_range,
+            valueInputOption="RAW",
+            body={"values": [[updated_value]]}
+        ).execute()
+        
+        print(f"🔗 Appended URL to Listing Brokers Comments: {url}")
+        
+    except Exception as e:
+        print(f"❌ Failed to append URL to comments: {e}")
+
 def apply_proposal_to_sheet(
     uid: str,
     client_id: str,
@@ -633,7 +1301,6 @@ def apply_proposal_to_sheet(
             # 2) prior AI write and human changed it
             if meta and meta.get("last_ai_value") is not None and str(old_val) != str(meta["last_ai_value"]):
                 skipped.append({"column": col_name, "reason": "human-override"})
-                # TODO: suggest to Jill
                 continue
 
             # 3) no prior AI write but cell already has a value → assume human value; skip
@@ -714,6 +1381,40 @@ def _find_row_by_email(sheets, spreadsheet_id: str, tab_title: str, header: list
                     return offset, padded
 
     return None, None
+
+def _find_row_by_anchor(uid: str, thread_id: str, sheets, spreadsheet_id: str, tab_title: str, 
+                       header: list[str], fallback_email: str):
+    """
+    Enhanced row matching: try thread rowNumber first, then fall back to email match.
+    """
+    try:
+        # Check thread metadata for rowNumber
+        thread_doc = _fs.collection("users").document(uid).collection("threads").document(thread_id).get()
+        if thread_doc.exists:
+            thread_data = thread_doc.to_dict() or {}
+            stored_row_num = thread_data.get("rowNumber")
+            
+            if stored_row_num:
+                # Verify row exists and get values
+                resp = sheets.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"{tab_title}!{stored_row_num}:{stored_row_num}"
+                ).execute()
+                
+                rows = resp.get("values", [])
+                if rows and rows[0]:
+                    # Pad to header length
+                    padded = rows[0] + [""] * (max(0, len(header) - len(rows[0])))
+                    print(f"📍 Using thread-anchored row {stored_row_num}")
+                    return stored_row_num, padded
+        
+        # Fall back to email matching
+        print(f"📧 Falling back to email matching for {fallback_email}")
+        return _find_row_by_email(sheets, spreadsheet_id, tab_title, header, fallback_email)
+        
+    except Exception as e:
+        print(f"⚠️ Row anchor lookup failed: {e}")
+        return _find_row_by_email(sheets, spreadsheet_id, tab_title, header, fallback_email)
 
 
 def _ensure_log_tab_exists(sheets, spreadsheet_id: str) -> str:
@@ -964,15 +1665,11 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10) -> lis
 
 def propose_sheet_updates(uid: str, client_id: str, email: str, sheet_id: str, header: list[str],
                           rownum: int, rowvals: list[str], thread_id: str, 
-                          file_ids_for_this_run: list[str] = None) -> dict | None:
+                          file_ids_for_this_run: list[str] = None,
+                          url_texts: list[dict] = None) -> dict | None:
     """
-    Uses OpenAI Responses API (no assistants) to propose sheet updates.
-    - Use the `content` field of each message (the full body). The `preview` fields are truncated and should not be used for extraction.
-    - Build conversation payload from build_conversation_payload(...)
-    - Use client.responses.create with input_file for PDFs + input_text for prompt
-    - Parse JSON safely; on failure, log and return None.
-    - Log the proposal and store a record in sheetChangeLog
-    - Do NOT write to the sheet yet.
+    Uses OpenAI Responses API to propose sheet updates.
+    Enhanced to support events array and URL exploration text.
     """
     try:
         # Build conversation payload
@@ -990,13 +1687,21 @@ FORMATTING:
 - For money/area fields, output plain decimals (no "$", "SF", commas). Examples: "30", "14.29", "2400".
 - Prefer explicit statements in the email or attachments over inference.
 - Example: "$30.00/SF NNN ($14.29/SF)" → "Rent/SF /Yr" = "30", "Ops Ex /SF" = "14.29", "Gross Rent" = "44.29".
-- If any such notes exist, include one update for "Listing Brokers Comments " with a single string like: "Directly across from Gold’s Gym • Bathrooms in rear corridor can be incorporated into space"
+- If any such notes exist, include one update for "Listing Brokers Comments " with a single string like: "Directly across from Gold's Gym • Bathrooms in rear corridor can be incorporated into space"
 
+EVENTS DETECTION:
+Detect these event types based on conversation content:
+- "call_requested": When someone asks for a call or phone conversation
+- "property_unavailable": When current property is no longer available/viable
+- "new_property": When a NEW property is mentioned (different from current row)
+- "close_conversation": When conversation appears complete with all key info provided
+
+For new_property events, extract: address, city, email (if different), link (if mentioned), notes
 """
         
         # Build prompt for OpenAI
-        prompt = f"""
-You are analyzing a conversation thread to suggest updates to a Google Sheet row.
+        prompt_parts = [f"""
+You are analyzing a conversation thread to suggest updates to a Google Sheet row and detect key events.
 
 {COLUMN_RULES}
 
@@ -1007,25 +1712,45 @@ CURRENT ROW VALUES (row {rownum}):
 {json.dumps(rowvals)}
 
 CONVERSATION HISTORY (latest last):
-{json.dumps(conversation, indent=2)}
+{json.dumps(conversation, indent=2)}"""]
 
-Be conservative: only suggest changes you can cite from the text or attachments.
+        # Add URL content if available
+        if url_texts:
+            prompt_parts.append("\nURL CONTENT FETCHED:")
+            for url_info in url_texts:
+                prompt_parts.append(f"\nURL: {url_info['url']}")
+                prompt_parts.append(f"Content: {url_info['text'][:1000]}...")
+
+        prompt_parts.append("""
+Be conservative: only suggest changes you can cite from the text, attachments, or fetched URLs.
 
 OUTPUT ONLY valid JSON in this exact format:
-{{
+{
   "updates": [
-    {{
+    {
       "column": "<exact header name>",
       "value": "<new value as string>",
       "confidence": 0.85,
       "reason": "<brief explanation why this update is suggested>"
-    }}
+    }
+  ],
+  "events": [
+    {
+      "type": "call_requested | property_unavailable | new_property | close_conversation",
+      "address": "<for new_property only>",
+      "city": "<for new_property only>", 
+      "email": "<for new_property if different>",
+      "link": "<for new_property if mentioned>",
+      "notes": "<for new_property additional context>"
+    }
   ],
   "notes": "<optional general notes about the conversation>"
-}}
+}
 
-Be conservative with updates. Only suggest changes where you have good confidence based on explicit information in the conversation.
-"""
+Be conservative with updates. Only suggest changes where you have good confidence based on explicit information in the conversation or fetched content.
+""")
+
+        prompt = "".join(prompt_parts)
 
         # Prepare input content for Responses API
         input_content = []
@@ -1072,9 +1797,15 @@ Be conservative with updates. Only suggest changes where you have good confidenc
             return None
         
         # Validate JSON structure
-        if not isinstance(proposal, dict) or "updates" not in proposal:
+        if not isinstance(proposal, dict):
             print(f"❌ Invalid proposal structure: {proposal}")
             return None
+        
+        # Ensure updates and events arrays exist
+        if "updates" not in proposal:
+            proposal["updates"] = []
+        if "events" not in proposal:
+            proposal["events"] = []
         
         # Log the proposal
         print(f"\n🤖 OpenAI Proposal for {client_id}__{email}:")
@@ -1100,6 +1831,7 @@ Be conservative with updates. Only suggest changes where you have good confidenc
             "status": "proposed",
             "threadId": thread_id,
             "fileIds": file_ids_for_this_run or [],
+            "urlTexts": url_texts or [],
             "createdAt": SERVER_TIMESTAMP
         }
         
@@ -1113,7 +1845,7 @@ Be conservative with updates. Only suggest changes where you have good confidenc
         return None
 
 
-# ─── EXISTING FUNCTIONS (updated to integrate new features) ─────────
+# --- EXISTING FUNCTIONS (updated to integrate new features) ---
 
 def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email: str | None):
     # Read thread (to get clientId)
@@ -1154,8 +1886,9 @@ def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email:
     print(f"   Header (row 2): {header}")
     print(f"   Counterparty email (row match): {counterparty_email or 'unknown'}")
 
-    # Find the row matching the counterparty email and print it
-    rownum, rowvals = _find_row_by_email(sheets, sheet_id, tab_title, header, counterparty_email or "")
+    # NEW: Use row anchoring for enhanced row matching
+    rownum, rowvals = _find_row_by_anchor(uid, thread_id, sheets, sheet_id, tab_title, header, counterparty_email or "")
+    
     if rownum is not None:
         print(f"📌 Matched row {rownum}: {rowvals}")
         return client_id, sheet_id, header, rownum, rowvals
@@ -1355,9 +2088,10 @@ def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> st
         return None
 
 
-# ─── Send and Index Email ──────────────────────────────
+# --- Send and Index Email ---
 
-def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, recipients: List[str], client_id_or_none: Optional[str] = None):
+def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, recipients: List[str], 
+                        client_id_or_none: Optional[str] = None, row_number: int = None):
     """Send email and immediately index it in Firestore for reply tracking."""
     if not recipients:
         return {"sent": [], "errors": {"_all": "No recipients"}}
@@ -1378,8 +2112,16 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             "body": {"contentType": content_type, "content": content},
             "toRecipients": [{"emailAddress": {"address": addr}}],
         }
+        
+        # Add headers
+        internet_headers = []
         if client_id_or_none:
-            msg["internetMessageHeaders"] = [{"name": "x-client-id", "value": client_id_or_none}]
+            internet_headers.append({"name": "x-client-id", "value": client_id_or_none})
+        if row_number:
+            internet_headers.append({"name": "x-row-anchor", "value": f"rowNumber={row_number}"})
+        
+        if internet_headers:
+            msg["internetMessageHeaders"] = internet_headers
 
         try:
             # 1. Create draft
@@ -1422,6 +2164,11 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                 "email": [addr],
                 "conversationId": conversation_id,
             }
+            
+            # NEW: Store row number for anchoring if provided
+            if row_number:
+                thread_meta["rowNumber"] = row_number
+            
             save_thread_root(user_id, root_id, thread_meta)
             
             # Message record
@@ -1462,9 +2209,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
 
     return results
 
-# ─── Scan Inbox and Match Replies ──────────────────────
-
-# Add these new helper functions after the existing Firestore helpers
+# --- Enhanced Notifications Function ---
 
 def add_client_notifications(
     uid: str,
@@ -1475,39 +2220,49 @@ def add_client_notifications(
     notes: str | None = None,
 ):
     """
-    Writes one notification doc per run under:
-      users/{uid}/clients/{client_id}/notifications/{autoId}
-
-    Also updates a small summary on the client doc for quick dashboards.
+    UPDATED: Writes one notification doc per applied field change.
+    Also updates summary on the client doc for quick dashboards.
     """
     try:
-        base_ref = _fs.collection("users").document(uid)
-        client_ref = base_ref.collection("clients").document(client_id)
-        notif_ref = client_ref.collection("notifications").document()
+        # Write one notification per applied update
+        for update in applied_updates:
+            dedupe_key = f"{thread_id}:{update.get('range', '')}:{update.get('column', '')}:{update.get('newValue', '')}"
+            
+            write_notification(
+                uid, client_id,
+                kind="sheet_update",
+                priority="normal",
+                email=email,
+                thread_id=thread_id,
+                row_number=None,  # Could extract from range if needed
+                row_anchor=None,
+                meta={
+                    "column": update.get("column", ""),
+                    "oldValue": update.get("oldValue", ""),
+                    "newValue": update.get("newValue", ""),
+                    "reason": update.get("reason", ""),
+                    "confidence": update.get("confidence", 0.0)
+                },
+                dedupe_key=dedupe_key
+            )
 
-        summary_items = [f"{u['column']}='{u['newValue']}'" for u in applied_updates]
-        summary = f"Updated {', '.join(summary_items)} for {email}" if summary_items else "No updates applied"
+        # Legacy summary on client doc
+        if applied_updates:
+            base_ref = _fs.collection("users").document(uid)
+            client_ref = base_ref.collection("clients").document(client_id)
+            
+            summary_items = [f"{u['column']}='{u['newValue']}'" for u in applied_updates]
+            summary = f"Updated {', '.join(summary_items)} for {email}"
 
-        payload = {
-            "type": "sheet_update",
-            "email": (email or "").lower(),
-            "threadId": thread_id,
-            "applied": applied_updates,   # [{column, oldValue, newValue, confidence, reason, range}]
-            "notes": notes or "",
-            "createdAt": SERVER_TIMESTAMP,
-        }
-        notif_ref.set(payload)
+            client_ref.set({
+                "lastNotificationSummary": summary,
+                "lastNotificationAt": SERVER_TIMESTAMP,
+            }, merge=True)
 
-        # light summary on the client document (cheap to read in UI)
-        client_ref.set({
-            "lastNotificationSummary": summary,
-            "lastNotificationAt": SERVER_TIMESTAMP,
-        }, merge=True)
-
-        print(f"🔔 Notification stored for client {client_id}: {summary}")
+            print(f"📢 Created {len(applied_updates)} sheet_update notifications for client {client_id}")
 
     except Exception as e:
-        print(f"❌ Failed to write client notification: {e}")
+        print(f"❌ Failed to write client notifications: {e}")
 
 
 def _processed_ref(user_id: str, key: str):
@@ -1685,7 +2440,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     
 
 def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, Any]):
-    """Process a single inbox message for reply matching."""
+    """ENHANCED: Process a single inbox message with full pipeline including events."""
     msg_id = msg.get("id")
     subject = msg.get("subject", "")
     from_addr = msg.get("from", {}).get("emailAddress", {}).get("address", "")
@@ -1694,7 +2449,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     received_dt = msg.get("receivedDateTime")
     sent_dt = msg.get("sentDateTime")
     body_preview = msg.get("bodyPreview", "")
-    # --- PATCH: fetch full message body and normalize to plain text ---
+    
+    # NEW: fetch full message body and normalize to plain text
     try:
         full_body_resp = exponential_backoff_request(
             lambda: requests.get(
@@ -1859,46 +2615,212 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 except Exception as e:
                     print(f"❌ Failed to append links to sheet: {e}")
         
+        # NEW: URL exploration - find URLs in message and fetch content
+        url_texts = []
+        url_pattern = r'https?://[^\s<>"\']+[^\s<>"\'.,;)]'
+        urls_found = re.findall(url_pattern, _full_text)
+        
+        for url in urls_found[:3]:  # Limit to 3 URLs to avoid overwhelming
+            fetched_text = fetch_url_as_text(url)
+            if fetched_text:
+                url_texts.append({"url": url, "text": fetched_text})
+            
+            # Always append URL to Listing Brokers Comments
+            try:
+                sheets = _sheets_client()
+                append_url_to_comments(sheets, sheet_id, header, rownum, url)
+            except Exception as e:
+                print(f"❌ Failed to append URL to comments: {e}")
+        
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)
         
-        # Step 3: get proposal using Responses API (no assistants)
-        proposal = propose_sheet_updates(user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals, thread_id, file_ids_for_this_run)
-        if proposal and proposal.get("updates"):
-            apply_result = apply_proposal_to_sheet(
-                user_id, client_id, sheet_id, header, rownum, rowvals, proposal
-            )
+        # Step 3: get proposal using Responses API with URL content
+        proposal = propose_sheet_updates(
+            user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals, 
+            thread_id, file_ids_for_this_run, url_texts
+        )
+        
+        if proposal:
+            # Process updates
+            if proposal.get("updates"):
+                apply_result = apply_proposal_to_sheet(
+                    user_id, client_id, sheet_id, header, rownum, rowvals, proposal
+                )
 
-            # optional: store an "applied" record in sheetChangeLog too
+                # Store applied record in sheetChangeLog
+                try:
+                    applied_hash = hashlib.sha256(
+                        json.dumps(apply_result, sort_keys=True).encode("utf-8")
+                    ).hexdigest()[:16]
+
+                    now_id = datetime.now(timezone.utc).isoformat().replace(":", "-").replace(".", "-").replace("+00:00", "Z")
+                    _fs.collection("users").document(user_id).collection("sheetChangeLog").document(f"{thread_id}__applied__{now_id}").set({
+                        "clientId": client_id,
+                        "email": from_addr_lower,
+                        "sheetId": sheet_id,
+                        "rowNumber": rownum,
+                        "applied": apply_result,
+                        "status": "applied",
+                        "threadId": thread_id,
+                        "createdAt": SERVER_TIMESTAMP,
+                        "fileIds": file_ids_for_this_run,
+                        "proposalHash": applied_hash,
+                    })
+                except Exception as e:
+                    print(f"⚠️ Failed to store applied record: {e}")
+
+                # Write client notifications (one per field)
+                add_client_notifications(
+                    user_id, client_id, from_addr_lower, thread_id,
+                    applied_updates=apply_result.get("applied", []),
+                    notes=proposal.get("notes")
+                )
+            
+            # NEW: Process events from the proposal
+            events = proposal.get("events", [])
+            sheets = _sheets_client()
+            row_anchor = get_row_anchor(rowvals, header)
+            
+            for event in events:
+                event_type = event.get("type")
+                
+                if event_type == "call_requested":
+                    # Create action_needed notification
+                    write_notification(
+                        user_id, client_id,
+                        kind="action_needed",
+                        priority="important",
+                        email=from_addr_lower,
+                        thread_id=thread_id,
+                        row_number=rownum,
+                        row_anchor=row_anchor,
+                        meta={"reason": "call_requested", "details": "Call requested in conversation"},
+                        dedupe_key=f"call_requested:{thread_id}"
+                    )
+                
+                elif event_type == "property_unavailable":
+                    # Move row below divider and create notification
+                    try:
+                        tab_title = _get_first_tab_title(sheets, sheet_id)
+                        divider_row = ensure_nonviable_divider(sheets, sheet_id, tab_title)
+                        new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
+                        
+                        # Reformat after move
+                        format_sheet_columns_autosize_with_exceptions(sheet_id, header)
+                        
+                        write_notification(
+                            user_id, client_id,
+                            kind="property_unavailable",
+                            priority="important",
+                            email=from_addr_lower,
+                            thread_id=thread_id,
+                            row_number=new_rownum,
+                            row_anchor=row_anchor,
+                            meta={"address": event.get("address", ""), "city": event.get("city", "")},
+                            dedupe_key=f"property_unavailable:{thread_id}:{rownum}"
+                        )
+                        
+                    except Exception as e:
+                        print(f"❌ Failed to handle property_unavailable: {e}")
+                
+                elif event_type == "new_property":
+                    # Insert new property row and start new thread
+                    try:
+                        address = event.get("address", "")
+                        city = event.get("city", "")
+                        link = event.get("link", "")
+                        notes = event.get("notes", "")
+                        
+                        # Prepare values for new row
+                        values_by_header = {}
+                        if address:
+                            values_by_header["property address"] = address
+                            values_by_header["address"] = address
+                        if city:
+                            values_by_header["city"] = city
+                        if from_addr_lower:
+                            values_by_header["email"] = from_addr_lower
+                            values_by_header["email address"] = from_addr_lower
+                        
+                        # Add link and notes to comments
+                        comment_parts = []
+                        if link:
+                            comment_parts.append(link)
+                        if notes:
+                            comment_parts.append(notes)
+                        if comment_parts:
+                            values_by_header["listing brokers comments"] = " • ".join(comment_parts)
+                        
+                        tab_title = _get_first_tab_title(sheets, sheet_id)
+                        new_rownum = insert_property_row_above_divider(sheets, sheet_id, tab_title, values_by_header)
+                        
+                        # Reformat after insert
+                        format_sheet_columns_autosize_with_exceptions(sheet_id, header)
+                        
+                        # Send new property email and get thread ID
+                        new_thread_id = send_new_property_email(
+                            user_id, client_id, headers, from_addr_lower, address, city, new_rownum
+                        )
+                        
+                        if new_thread_id:
+                            write_notification(
+                                user_id, client_id,
+                                kind="new_property",
+                                priority="important",
+                                email=from_addr_lower,
+                                thread_id=new_thread_id,
+                                row_number=new_rownum,
+                                row_anchor=f"{address}, {city}" if city else address,
+                                meta={"address": address, "city": city, "link": link, "notes": notes},
+                                dedupe_key=f"new_property:{address}:{city}"
+                            )
+                        
+                    except Exception as e:
+                        print(f"❌ Failed to handle new_property: {e}")
+                
+                elif event_type == "close_conversation":
+                    # Check if all required fields are complete for closing logic
+                    pass  # This will be handled below in the required fields check
+            
+            # NEW: Required fields check and remaining questions flow
             try:
-                applied_hash = hashlib.sha256(
-                    json.dumps(apply_result, sort_keys=True).encode("utf-8")
-                ).hexdigest()[:16]
-
-                now_id = datetime.now(timezone.utc).isoformat().replace(":", "-").replace(".", "-").replace("+00:00", "Z")
-                _fs.collection("users").document(user_id).collection("sheetChangeLog").document(f"{thread_id}__applied__{now_id}").set({
-                    "clientId": client_id,
-                    "email": from_addr_lower,
-                    "sheetId": sheet_id,
-                    "rowNumber": rownum,
-                    "applied": apply_result,
-                    "status": "applied",
-                    "threadId": thread_id,
-                    "createdAt": SERVER_TIMESTAMP,
-                    "fileIds": file_ids_for_this_run,
-                    "proposalHash": applied_hash,
-                })
+                # Re-read row data in case it was updated
+                sheets = _sheets_client()
+                tab_title = _get_first_tab_title(sheets, sheet_id)
+                resp = sheets.spreadsheets().values().get(
+                    spreadsheetId=sheet_id,
+                    range=f"{tab_title}!{rownum}:{rownum}"
+                ).execute()
+                
+                current_row = resp.get("values", [[]])[0] if resp.get("values") else []
+                if len(current_row) < len(header):
+                    current_row.extend([""] * (len(header) - len(current_row)))
+                
+                missing_fields = check_missing_required_fields(current_row, header)
+                
+                if missing_fields:
+                    # Send remaining questions email
+                    sent = send_remaining_questions_email(
+                        user_id, client_id, headers, from_addr_lower, 
+                        missing_fields, thread_id, rownum
+                    )
+                    if sent:
+                        print(f"📧 Sent remaining questions for {len(missing_fields)} missing fields")
+                else:
+                    # All required fields complete - send closing email
+                    sent = send_closing_email(
+                        user_id, client_id, headers, from_addr_lower, 
+                        thread_id, rownum, row_anchor
+                    )
+                    if sent:
+                        print(f"🎉 Sent closing email - all required fields complete")
+                        
             except Exception as e:
-                print(f"⚠️ Failed to store applied record: {e}")
-
-            # write client notification
-            add_client_notifications(
-                user_id, client_id, from_addr_lower, thread_id,
-                applied_updates=apply_result.get("applied", []),
-                notes=proposal.get("notes")
-            )
+                print(f"❌ Failed to handle required fields check: {e}")
+        
         else:
-            print("ℹ️ No proposal or no updates; nothing to apply.")
+            print("ℹ️ No proposal generated; nothing to apply.")
 
 
 
@@ -1952,7 +2874,7 @@ def dump_thread_from_firestore(user_id: str, thread_id: str):
     except Exception as e:
         print(f"❌ Failed to dump thread {thread_id}: {e}")
 
-# ─── Modified Outbox Processing ────────────────────────
+# --- Modified Outbox Processing ---
 
 def send_outboxes(user_id: str, headers):
     """
@@ -1981,14 +2903,14 @@ def send_outboxes(user_id: str, headers):
 
             if not any_errors and res["sent"]:
                 d.reference.delete()
-                print(f"🗑️  Deleted outbox item {d.id}")
+                print(f"🗑️ Deleted outbox item {d.id}")
             else:
                 attempts = int(data.get("attempts") or 0) + 1
                 d.reference.set(
                     {"attempts": attempts, "lastError": json.dumps(res["errors"])[:1500]},
                     merge=True,
                 )
-                print(f"⚠️  Kept item {d.id} with error; attempts={attempts}")
+                print(f"⚠️ Kept item {d.id} with error; attempts={attempts}")
 
         except Exception as e:
             attempts = int(data.get("attempts") or 0) + 1
@@ -1998,7 +2920,7 @@ def send_outboxes(user_id: str, headers):
             )
             print(f"💥 Error sending item {d.id}: {e}; attempts={attempts}")
 
-# ─── Legacy Functions (kept for compatibility) ──────────
+# --- Legacy Functions (kept for compatibility) ---
 
 def send_email(headers, script: str, emails: list[str], client_id: str | None = None):
     """Legacy function - redirects to send_and_index_email"""
@@ -2006,7 +2928,7 @@ def send_email(headers, script: str, emails: list[str], client_id: str | None = 
     # Users should migrate to send_and_index_email directly
     raise NotImplementedError("send_email is deprecated. Use send_and_index_email with user_id parameter.")
 
-# ─── Utility: List user IDs from Firebase ──────────────
+# --- Utility: List user IDs from Firebase ---
 def list_user_ids():
     url = f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_BUCKET}/o?prefix=msal_caches%2F&key={FIREBASE_API_KEY}"
     r = requests.get(url)
@@ -2023,7 +2945,7 @@ def decode_token_payload(token):
     padded = payload + '=' * (-len(payload) % 4)
     return json.loads(base64.urlsafe_b64decode(padded))
 
-# ─── Email Functions ───────────────────────────────────
+# --- Email Functions ---
 def send_weekly_email(headers, to_addresses):
     for addr in to_addresses:
         payload = {
@@ -2050,7 +2972,7 @@ def process_replies(headers, user_id):
     messages = resp.json().get("value", [])
 
     if not messages:
-        print("ℹ️  No new replies.")
+        print("ℹ️ No new replies.")
         return
 
     wb = Workbook()
@@ -2077,7 +2999,7 @@ def process_replies(headers, user_id):
     upload_excel(FIREBASE_API_KEY, input_file=file)
     print(f"✅ Saved replies to {file}")
 
-# ─── Main Loop ─────────────────────────────────────────
+# --- Main Loop ---
 def refresh_and_process_user(user_id: str):
     print(f"\n🔄 Processing user: {user_id}")
 
@@ -2123,7 +3045,7 @@ def refresh_and_process_user(user_id: str):
     # Helpful logging: was it cached or refreshed?
     token_source = "refreshed_via_refresh_token" if (not before_state and after_state) else "cached_access_token"
     exp_secs = result.get("expires_in")
-    print(f"🎯 Using {token_source}; expires_in≈{exp_secs}s — preview: {access_token[:40]}")
+    print(f"🎯 Using {token_source}; expires_in≈{exp_secs}s – preview: {access_token[:40]}")
 
     # (Optional) sanity check on JWT-shaped token & appid
     if access_token.count(".") == 2:
@@ -2146,7 +3068,7 @@ def refresh_and_process_user(user_id: str):
     print(f"\n🔍 Scanning inbox for replies...")
     scan_inbox_against_index(user_id, headers, only_unread=True, top=50)
 
-# ─── Entry ─────────────────────────────────────────────
+# --- Entry ---
 if __name__ == "__main__":
     all_users = list_user_ids()
     print(f"📦 Found {len(all_users)} token cache users: {all_users}")
