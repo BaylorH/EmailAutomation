@@ -316,18 +316,10 @@ def write_notification(uid: str, client_id: str, *, kind: str, priority: str, em
             doc_id = None  # Let Firestore auto-generate
         
         client_ref = _fs.collection("users").document(uid).collection("clients").document(client_id)
-        
-        # Check if dedupe doc already exists
-        if dedupe_key:
-            notif_ref = client_ref.collection("notifications").document(doc_id)
-            if notif_ref.get().exists:
-                print(f"📋 Skipped duplicate notification: {dedupe_key}")
-                return doc_id
-        else:
-            notif_ref = client_ref.collection("notifications").document()
-            doc_id = notif_ref.id
-        
-        # Prepare notification document
+        # If doc_id is fixed (dedupe), we can safely create a stable ref now
+        notif_ref = (client_ref.collection("notifications").document(doc_id)
+                     if doc_id else client_ref.collection("notifications").document())
+
         notification_doc = {
             "kind": kind,
             "priority": priority,
@@ -339,44 +331,50 @@ def write_notification(uid: str, client_id: str, *, kind: str, priority: str, em
             "meta": meta or {},
             "dedupeKey": dedupe_key
         }
-        
-        # Atomic transaction to write notification and update counters
+
         @firestore.transactional
         def update_with_counters(transaction):
-            # Write notification
-            transaction.set(notif_ref, notification_doc)
-            
-            # Read current client doc
-            client_doc = client_ref.get(transaction=transaction)
-            current_data = client_doc.to_dict() if client_doc.exists else {}
-            
-            # Update counters
-            unread_count = current_data.get("notificationsUnread", 0) + 1
-            new_update_count = current_data.get("newUpdateCount", 0)
-            notif_counts = current_data.get("notifCounts", {})
-            
+            # READS FIRST
+            client_snapshot = transaction.get(client_ref)
+
+            # Dedupe check must also be a READ before any WRITE
+            if dedupe_key:
+                notif_snapshot = transaction.get(notif_ref)
+                if notif_snapshot.exists:
+                    print(f"📋 Skipped duplicate notification: {dedupe_key}")
+                    return notif_ref.id  # No-op
+
+            current_data = client_snapshot.to_dict() if client_snapshot.exists else {}
+            unread_count = (current_data.get("notificationsUnread") or 0) + 1
+            new_update_count = (current_data.get("newUpdateCount") or 0)
+            notif_counts = dict(current_data.get("notifCounts") or {})
+
             if kind == "sheet_update":
                 new_update_count += 1
-            
             notif_counts[kind] = notif_counts.get(kind, 0) + 1
-            
-            # Write updated counters
-            transaction.set(client_ref, {
-                "notificationsUnread": unread_count,
-                "newUpdateCount": new_update_count,
-                "notifCounts": notif_counts
-            }, merge=True)
-        
-        # Execute transaction
+
+            # WRITES AFTER ALL READS
+            transaction.set(notif_ref, notification_doc)
+            transaction.set(
+                client_ref,
+                {
+                    "notificationsUnread": unread_count,
+                    "newUpdateCount": new_update_count,
+                    "notifCounts": notif_counts
+                },
+                merge=True
+            )
+            return notif_ref.id
+
         transaction = _fs.transaction()
-        update_with_counters(transaction)
-        
-        print(f"📋 Created {kind} notification for {client_id}: {doc_id}")
-        return doc_id
-        
+        created_id = update_with_counters(transaction)
+        print(f"📋 Created {kind} notification for {client_id}: {created_id}")
+        return created_id
+
     except Exception as e:
         print(f"❌ Failed to write notification: {e}")
         raise
+
 
 # --- NEW: URL Exploration ---
 
@@ -675,10 +673,10 @@ def send_remaining_questions_email(uid: str, client_id: str, headers: dict, reci
         recent_notifs = (_fs.collection("users").document(uid)
                          .collection("clients").document(client_id)
                          .collection("notifications")
-                         .where(filter=("threadId", "==", thread_id))
-                         .where(filter=("kind", "==", "action_needed"))
-                         .limit(5).get())
-        
+                         .where("threadId", "==", thread_id)
+                         .where("kind", "==", "action_needed")
+                         .limit(5)
+                         .get())
         for notif in recent_notifs:
             if notif.to_dict().get("dedupeKey") == dedupe_key:
                 print(f"📧 Skipped duplicate remaining questions email")
