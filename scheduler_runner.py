@@ -1838,33 +1838,24 @@ COLUMN SEMANTICS & MAPPING (use EXACT header names):
 - "Rent/SF /Yr": Base/asking rent per square foot per YEAR. Synonyms: asking, base rent, $/SF/yr.
 - "Ops Ex /SF": NNN/CAM/Operating Expenses per square foot per YEAR. Synonyms: NNN, CAM, OpEx, operating expenses.
 - "Gross Rent": If BOTH base rent and NNN are present, set to (Rent/SF /Yr + Ops Ex /SF), rounded to 2 decimals. Else leave unchanged.
-- "Listing Brokers Comments ": Short, non-numeric broker/client notes not covered by other columns. Use terse fragments separated by " • ". Do NOT repeat rent/NNN/SF numbers. Pull only explicit statements from the email/attachments. If a comment already exists in this field only add onto it do not remove the existing one while ensuring you aren't duplicating.
+- "Total SF": Total square footage. Synonyms: sq footage, square feet, SF, size.
+- "Drive Ins": Number of drive-in doors. Synonyms: drive in doors, loading doors.
+- "Ceiling Ht": Ceiling height. Synonyms: max ceiling height, ceiling clearance.
+- "Listing Brokers Comments ": Short, non-numeric broker/client notes not covered by other columns. Use terse fragments separated by " • ". Do NOT put numeric data like square footage, rent, or ceiling height here if it belongs in dedicated columns.
 
 FORMATTING:
 - For money/area fields, output plain decimals (no "$", "SF", commas). Examples: "30", "14.29", "2400".
-- Prefer explicit statements in the email or attachments over inference.
-- Example: "$30.00/SF NNN ($14.29/SF)" → "Rent/SF /Yr" = "30", "Ops Ex /SF" = "14.29", "Gross Rent" = "44.29".
-- If any such notes exist, include one update for "Listing Brokers Comments " with a single string like: "Directly across from Gold's Gym • Bathrooms in rear corridor can be incorporated into space"
+- For square footage, output just the number: "2000" not "2000 SF".
+- For ceiling height, output just the number: "9" not "9 feet" or "9'".
+- For drive-ins, output just the number: "3" not "3 doors".
 
-EVENTS DETECTION:
-Detect these event types based on conversation content - BE VERY SPECIFIC:
-- "call_requested": Only when someone explicitly asks for a call or phone conversation (e.g., "can we schedule a call", "let's talk on the phone")
-- "property_unavailable": ONLY when the current property is explicitly stated as unavailable, leased, off-market, or no longer viable (e.g., "this property is no longer available", "space has been leased", "property is off the market")
-- "new_property": When a NEW property is mentioned with a different address from the current row
-- "close_conversation": When conversation appears complete with all key info provided AND sender indicates they're done (e.g., "that's all I need", "thanks for everything")
+EVENTS DETECTION - BE VERY SPECIFIC:
+- "call_requested": Only when someone explicitly asks for a call or phone conversation
+- "property_unavailable": ONLY when the current property is explicitly stated as unavailable, leased, or off-market
+- "new_property": ONLY when mentioning a DIFFERENT property with a DIFFERENT ADDRESS from the current row. DO NOT trigger for providing details about the current property.
+- "close_conversation": When conversation appears complete and sender indicates they're done
 
-For property_unavailable events, only trigger if there are EXPLICIT statements like:
-- "property is no longer available"
-- "space has been leased" 
-- "building is off the market"
-- "property is unavailable"
-- "we're no longer considering this location"
-
-Do NOT trigger property_unavailable for:
-- General responses providing information
-- Asking questions about the property
-- Providing requested details
-- Normal conversation flow
+CRITICAL: If someone provides square footage, ceiling height, drive-ins, or other property details in response to questions, these are details about the CURRENT property in the sheet row. Only trigger "new_property" if they explicitly mention a different address or say something like "I have another property at..."
 
 For new_property events, extract: address, city, email (if different), link (if mentioned), notes
 """
