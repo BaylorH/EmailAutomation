@@ -151,24 +151,21 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
     Auto-size all columns to the longest visible value + padding, with exceptions:
       - 'Listing Brokers Comments ' and 'Jill and Clients Comments' -> WRAP and be reasonably wide
       - 'Flyer / Link' and 'Floorplan' -> CLIP and keep width small (ignore huge URLs)
-
     Header row (row 2) is NOT wrapped.
+    Column A additionally respects the width of cell A1 (client name).
     """
-    # --- Tunables (bump these if you still see clipping) -----------------------
-    CHAR_PX          = 8        # px per character (Arial-ish at normal zoom)
-    BASE_PADDING_PX  = 24       # extra px on top of measured content (fixes last-letter cut)
-    EXTRA_FUDGE_PX   = 6        # tiny safety buffer
+    # --- Tunables --------------------------------------------------------------
+    CHAR_PX          = 8
+    BASE_PADDING_PX  = 24
+    EXTRA_FUDGE_PX   = 6
 
-    # Wrap columns width bounds
     MIN_WRAP_PX      = 280
     MAX_WRAP_PX      = 600
 
-    # Link columns limits (kept small)
     LINK_MIN_PX      = 140
     LINK_CAP_PX      = 240
-    LINK_HALF_FACTOR = 0.5      # halve whatever auto-size thinks, then cap
+    LINK_HALF_FACTOR = 0.5
 
-    # Absolute guards for everything else
     MIN_ANY_PX       = 80
     MAX_ANY_PX       = 900
     # --------------------------------------------------------------------------
@@ -177,40 +174,50 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
         return (name or "").strip().lower()
 
     WRAP_KEYS = {
-        "listing brokers comments",   # note: original header has a trailing space, we normalize
+        "listing brokers comments",   # trailing space in sheet header is normalized out
         "jill and clients comments",
     }
-    LINK_KEYS = {
-        "flyer / link",
-        "floorplan",
-        "floor plan",
-    }
+    LINK_KEYS = {"flyer / link", "floorplan", "floor plan"}
 
     sheets = _sheets_client()
-    # Read meta to get gridId + actual tab title
     meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     first_sheet = meta["sheets"][0]
     grid_id     = first_sheet["properties"]["sheetId"]
     tab_title   = first_sheet["properties"]["title"]
 
-    # Read row 2 (header) + data rows
+    # Get A1 (client name) so col A can respect it
+    a1_val = ""
+    try:
+        a1_resp = sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!A1:A1"
+        ).execute()
+        a1_vals = a1_resp.get("values", [])
+        if a1_vals and a1_vals[0]:
+            a1_val = str(a1_vals[0][0]) or ""
+    except Exception as _:
+        a1_val = ""
+
+    a1_px = len(a1_val) * CHAR_PX + BASE_PADDING_PX + EXTRA_FUDGE_PX if a1_val else 0
+
+    # Read header row (2) + data (rows 3+)
     values_resp = sheets.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=f"{tab_title}!A2:ZZZ"
     ).execute()
     rows = values_resp.get("values", [])
-    hdr  = rows[0] if rows else header  # prefer live header from sheet
+    hdr  = rows[0] if rows else header
     data = rows[1:] if len(rows) > 1 else []
 
     num_cols = max(len(hdr), len(header))
     requests = []
 
-    for c in range(num_cols):  # 0-based col index
+    for c in range(num_cols):
         header_text = (hdr[c] if c < len(hdr) else (header[c] if c < len(header) else "")) or ""
         header_len  = len(header_text)
         header_px   = header_len * CHAR_PX + BASE_PADDING_PX + EXTRA_FUDGE_PX
 
-        # Find longest cell text length in this column (rows 3+)
+        # Longest content in data rows
         max_len = header_len
         for r in data:
             if c < len(r) and r[c]:
@@ -221,43 +228,43 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
         auto_px = max_len * CHAR_PX + BASE_PADDING_PX + EXTRA_FUDGE_PX
         col_key = _norm(header_text)
 
-        # Decide wrapping + final width
+        # --- width/wrap policy by column type
         if col_key in LINK_KEYS:
-            # Keep link columns small: halve the auto width and cap; clip text
             width_px = int(auto_px * LINK_HALF_FACTOR)
             width_px = max(width_px, max(header_px, LINK_MIN_PX))
             width_px = min(width_px, LINK_CAP_PX)
             wrap_mode = "CLIP"
+
         elif col_key in WRAP_KEYS:
-            # Comments: wrap and keep within sensible bounds
             width_px = max(MIN_WRAP_PX, min(auto_px, MAX_WRAP_PX))
             wrap_mode = "WRAP"
+
         else:
-            # Normal columns: no wrap; make sure width is at least header and content + padding
             width_px = max(header_px, auto_px)
-            width_px = max(MIN_ANY_PX, min(width_px, MAX_ANY_PX))
             wrap_mode = "OVERFLOW_CELL"
 
-        # 1) Set column width
+        # NEW: ensure column A is at least wide enough for A1 (client name)
+        if c == 0:
+            width_px = max(width_px, a1_px)
+
+        # clamp final width
+        width_px = max(MIN_ANY_PX, min(int(width_px), MAX_ANY_PX))
+
+        # 1) set column width
         requests.append({
             "updateDimensionProperties": {
-                "range": {
-                    "sheetId": grid_id,
-                    "dimension": "COLUMNS",
-                    "startIndex": c,
-                    "endIndex": c + 1
-                },
+                "range": {"sheetId": grid_id, "dimension": "COLUMNS", "startIndex": c, "endIndex": c + 1},
                 "properties": {"pixelSize": int(width_px)},
                 "fields": "pixelSize"
             }
         })
 
-        # 2) Apply wrap strategy to DATA ONLY (startRowIndex=2 -> row 3+); header row (row 2) stays unwrapped
+        # 2) wrap strategy for DATA ONLY (row 3+); header row stays unwrapped
         requests.append({
             "repeatCell": {
                 "range": {
                     "sheetId": grid_id,
-                    "startRowIndex": 2,            # 0-based -> row 3
+                    "startRowIndex": 2,
                     "startColumnIndex": c,
                     "endColumnIndex": c + 1
                 },
