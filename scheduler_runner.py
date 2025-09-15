@@ -767,7 +767,7 @@ We'll be in touch if we need any additional information.
 
 Best regards"""
         
-        # Send email
+        # Send email using sendMail endpoint
         base = "https://graph.microsoft.com/v1.0"
         msg = {
             "subject": "Re: Property information complete",
@@ -779,7 +779,8 @@ Best regards"""
             ]
         }
         
-        response = requests.post(f"{base}/me/sendMail", headers=headers, json={"message": msg}, timeout=30)
+        send_payload = {"message": msg, "saveToSentItems": True}
+        response = requests.post(f"{base}/me/sendMail", headers=headers, json=send_payload, timeout=30)
         response.raise_for_status()
         
         # Create row_completed notification
