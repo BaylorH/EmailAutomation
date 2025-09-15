@@ -1228,26 +1228,23 @@ def upload_pdf_user_data(filename: str, content: bytes) -> str:
         raise
 
 def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]):
-    """Find/create Flyer / Link column and append links."""
+    """Find/create Flyer / Link column and append unique links (no duplicates)."""
     try:
         tab_title = _get_first_tab_title(sheets, spreadsheet_id)
         idx_map = _header_index_map(header)
-        
-        # Look for exact match (case-insensitive, trimmed)
+
+        # Find 'Flyer / Link' (case-insensitive, trimmed)
         target_key = "flyer / link"
         col_idx = None
-        
         for key, idx in idx_map.items():
             if key == target_key:
                 col_idx = idx
                 break
-        
-        # Create column if not found
+
+        # Create column if missing
         if col_idx is None:
-            col_idx = len(header) + 1  # Add at end
+            col_idx = len(header) + 1  # add at end
             col_letter = _col_letter(col_idx)
-            
-            # Add header
             sheets.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range=f"{tab_title}!{col_letter}2",
@@ -1255,39 +1252,58 @@ def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[
                 body={"values": [["Flyer / Link"]]}
             ).execute()
             print(f"📋 Created 'Flyer / Link' column at {col_letter}")
-        
-        # Get current value
+            # (Optional) you may refresh header outside this function if you rely on it elsewhere
+
+        # Cell range for this row/column
         col_letter = _col_letter(col_idx)
         cell_range = f"{tab_title}!{col_letter}{rownum}"
-        
+
+        # Current cell value
         resp = sheets.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=cell_range
         ).execute()
-        
         current_value = ""
         values = resp.get("values", [])
         if values and values[0]:
             current_value = values[0][0]
-        
-        # Append links
-        new_links = "\n".join(links)
-        if current_value.strip():
-            updated_value = current_value + "\n" + new_links
-        else:
-            updated_value = new_links
-        
+
+        # Existing links (normalized by stripping whitespace)
+        existing_lines = [l.strip() for l in (current_value.splitlines() if current_value else []) if l.strip()]
+        existing = set(existing_lines)
+
+        # Clean + dedupe incoming links
+        additions = []
+        for raw in links or []:
+            if not raw:
+                continue
+            clean = _sanitize_url(raw).strip()
+            if not clean:
+                continue
+            if clean not in existing:
+                additions.append(clean)
+                existing.add(clean)
+
+        if not additions:
+            print("ℹ️ All links already present in Flyer / Link")
+            return
+
+        # Build updated cell content (preserve prior order, append new)
+        updated_lines = existing_lines + additions
+        updated_value = "\n".join(updated_lines)
+
         sheets.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=cell_range,
             valueInputOption="RAW",
             body={"values": [[updated_value]]}
         ).execute()
-        
-        print(f"🔗 Appended {len(links)} link(s) to Flyer / Link column")
-        
+
+        print(f"🔗 Appended {len(additions)} new link(s) to Flyer / Link")
+
     except Exception as e:
         print(f"❌ Failed to append links to Flyer / Link column: {e}")
+
 
 def append_url_to_comments(sheets, spreadsheet_id: str, header: list[str], rownum: int, url: str):
     """Always append URL to Listing Brokers Comments column."""
@@ -2732,7 +2748,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             # Always append URL to Listing Brokers Comments
             try:
                 sheets = _sheets_client()
-                append_url_to_comments(sheets, sheet_id, header, rownum, clean)
+                append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, [clean])
             except Exception as e:
                 print(f"❌ Failed to append URL to comments: {e}")
         
@@ -2850,14 +2866,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             values_by_header["email"] = from_addr_lower
                             values_by_header["email address"] = from_addr_lower
                         
-                        # Add link and notes to comments
-                        comment_parts = []
+                        # Put the URL itself in Flyer / Link
                         if link:
-                            comment_parts.append(link)
+                            values_by_header["flyer / link"] = link
+
+                        # Keep human-readable notes (without the URL) in Listing Brokers Comments 
                         if notes:
-                            comment_parts.append(notes)
-                        if comment_parts:
-                            values_by_header["listing brokers comments"] = " • ".join(comment_parts)
+                            values_by_header["listing brokers comments"] = notes
+
                         
                         tab_title = _get_first_tab_title(sheets, sheet_id)
                         new_rownum = insert_property_row_above_divider(sheets, sheet_id, tab_title, values_by_header)
