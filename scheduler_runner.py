@@ -1847,11 +1847,24 @@ FORMATTING:
 - If any such notes exist, include one update for "Listing Brokers Comments " with a single string like: "Directly across from Gold's Gym • Bathrooms in rear corridor can be incorporated into space"
 
 EVENTS DETECTION:
-Detect these event types based on conversation content:
-- "call_requested": When someone asks for a call or phone conversation
-- "property_unavailable": When current property is no longer available/viable
-- "new_property": When a NEW property is mentioned (different from current row)
-- "close_conversation": When conversation appears complete with all key info provided
+Detect these event types based on conversation content - BE VERY SPECIFIC:
+- "call_requested": Only when someone explicitly asks for a call or phone conversation (e.g., "can we schedule a call", "let's talk on the phone")
+- "property_unavailable": ONLY when the current property is explicitly stated as unavailable, leased, off-market, or no longer viable (e.g., "this property is no longer available", "space has been leased", "property is off the market")
+- "new_property": When a NEW property is mentioned with a different address from the current row
+- "close_conversation": When conversation appears complete with all key info provided AND sender indicates they're done (e.g., "that's all I need", "thanks for everything")
+
+For property_unavailable events, only trigger if there are EXPLICIT statements like:
+- "property is no longer available"
+- "space has been leased" 
+- "building is off the market"
+- "property is unavailable"
+- "we're no longer considering this location"
+
+Do NOT trigger property_unavailable for:
+- General responses providing information
+- Asking questions about the property
+- Providing requested details
+- Normal conversation flow
 
 For new_property events, extract: address, city, email (if different), link (if mentioned), notes
 """
@@ -2871,32 +2884,40 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 
                 elif event_type == "property_unavailable":
                     # Move row below divider and create notification
-                    try:
-                        tab_title = _get_first_tab_title(sheets, sheet_id)
-                        divider_row = ensure_nonviable_divider(sheets, sheet_id, tab_title)
-                        new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
-                        
-                        # Reformat after move
-                        format_sheet_columns_autosize_with_exceptions(sheet_id, header)
-                        
-                        # --- mark the row as non-viable for this run (NEW) ---
-                        old_row_became_nonviable = True
-                        rownum = new_rownum  # keep our pointer accurate if used later
+                    message_content = _full_text.lower()
+                    unavailable_keywords = [
+                        "no longer available", "not available", "off the market", 
+                        "has been leased", "space is leased", "property is unavailable",
+                        "building unavailable", "no longer considering"
+                    ]
+                    
+                    # Only proceed if we find explicit unavailability language
+                    if any(keyword in message_content for keyword in unavailable_keywords):
+                        try:
+                            tab_title = _get_first_tab_title(sheets, sheet_id)
+                            divider_row = ensure_nonviable_divider(sheets, sheet_id, tab_title)
+                            new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
+                            
+                            # Reformat after move
+                            format_sheet_columns_autosize_with_exceptions(sheet_id, header)
+                            
+                            # --- mark the row as non-viable for this run (NEW) ---
+                            old_row_became_nonviable = True
+                            rownum = new_rownum  # keep our pointer accurate if used later
 
-                        write_notification(
-                            user_id, client_id,
-                            kind="property_unavailable",
-                            priority="important",
-                            email=from_addr_lower,
-                            thread_id=thread_id,
-                            row_number=new_rownum,
-                            row_anchor=row_anchor,
-                            meta={"address": event.get("address", ""), "city": event.get("city", "")},
-                            dedupe_key=f"property_unavailable:{thread_id}:{rownum}"
-                        )
-                        
-                    except Exception as e:
-                        print(f"❌ Failed to handle property_unavailable: {e}")
+                            write_notification(
+                                user_id, client_id,
+                                kind="property_unavailable",
+                                priority="important",
+                                email=from_addr_lower,
+                                thread_id=thread_id,
+                                row_number=new_rownum,
+                                row_anchor=row_anchor,
+                                meta={"address": event.get("address", ""), "city": event.get("city", "")},
+                                dedupe_key=f"property_unavailable:{thread_id}:{rownum}"
+                            )
+                        except Exception as e:
+                            print(f"❌ Failed to handle property_unavailable: {e}")
                 
                 elif event_type == "new_property":
                     # Insert new property row and create a PENDING notification (do NOT send email)
