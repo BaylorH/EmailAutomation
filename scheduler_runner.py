@@ -158,6 +158,53 @@ def _approx_header_px(text: str) -> int:
     px = int(len(text) * 7 + 24)  # chars * avg px + padding
     return max(100, min(px, 1000))
 
+def build_new_property_email_payload(address: str, city: str, to_email: str, client_id: str, row_number: int) -> dict:
+    subject = f"{address}, {city}" if city else address
+    body = f"""Hi,
+
+We noticed you mentioned a new property: {address}{', ' + city if city else ''}.
+
+Could you please provide the following details for this property:
+
+- Total square footage
+- Rent per square foot per year
+- Operating expenses per square foot
+- Number of drive-in doors
+- Number of dock doors  
+- Ceiling height
+- Power specifications
+
+Thanks!"""
+    return {
+        "to": [to_email],
+        "subject": subject,
+        "body": body,
+        "clientId": client_id,
+        "rowNumber": row_number,
+    }
+
+
+def _find_nonviable_divider_row(sheets, spreadsheet_id: str, tab_title: str) -> int | None:
+    """Return the divider row index if it exists, else None (no creation)."""
+    try:
+        resp = sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{tab_title}!A:A"
+        ).execute()
+        rows = resp.get("values", [])
+        for i, row in enumerate(rows, start=1):
+            if row and str(row[0]).strip().upper() == "NON-VIABLE":
+                return i
+        return None
+    except Exception:
+        return None
+
+
+def _is_row_below_nonviable(sheets, spreadsheet_id: str, tab_title: str, rownum: int) -> bool:
+    """Stateless check: is this row visually below the 'NON-VIABLE' divider?"""
+    div = _find_nonviable_divider_row(sheets, spreadsheet_id, tab_title)
+    return bool(div and rownum > div)
+
+
 def _ensure_divider_conditional_formatting(sheets, spreadsheet_id: str):
     meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     sheet = meta["sheets"][0]
@@ -2696,7 +2743,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     # Only proceed if we successfully matched a sheet row
     if sheet_id and rownum is not None:
         from_addr_lower = (from_addr or "").lower()
-        
+
+        # --- flags for gating later (NEW) ---
+        old_row_became_nonviable = False   # set true when we move the row below divider
+        new_row_created = False            # set true when we insert a new property row
+
         # NEW: Handle PDF attachments for current message only
         file_ids_for_this_run = []
         pdf_attachments = fetch_pdf_attachments(headers, msg_id)
@@ -2745,7 +2796,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             if fetched_text:
                 url_texts.append({"url": clean, "text": fetched_text})
             
-            # Always append URL to Listing Brokers Comments
+            # Put URL in Flyer / Link (surgical change already made upstream)
             try:
                 sheets = _sheets_client()
                 append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, [clean])
@@ -2832,6 +2883,10 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         # Reformat after move
                         format_sheet_columns_autosize_with_exceptions(sheet_id, header)
                         
+                        # --- mark the row as non-viable for this run (NEW) ---
+                        old_row_became_nonviable = True
+                        rownum = new_rownum  # keep our pointer accurate if used later
+
                         write_notification(
                             user_id, client_id,
                             kind="property_unavailable",
@@ -2848,7 +2903,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         print(f"❌ Failed to handle property_unavailable: {e}")
                 
                 elif event_type == "new_property":
-                    # Insert new property row and start new thread
+                    # Insert new property row and create a PENDING notification (do NOT send email)  (CHANGED)
                     try:
                         address = event.get("address", "")
                         city = event.get("city", "")
@@ -2874,31 +2929,68 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         if notes:
                             values_by_header["listing brokers comments"] = notes
 
-                        
                         tab_title = _get_first_tab_title(sheets, sheet_id)
                         new_rownum = insert_property_row_above_divider(sheets, sheet_id, tab_title, values_by_header)
-                        
+
                         # Reformat after insert
                         format_sheet_columns_autosize_with_exceptions(sheet_id, header)
-                        
-                        # Send new property email and get thread ID
-                        new_thread_id = send_new_property_email(
-                            user_id, client_id, headers, from_addr_lower, address, city, new_rownum
+
+                        # Also append (deduped) link to Flyer / Link if column already existed
+                        if link:
+                            try:
+                                append_links_to_flyer_link_column(_sheets_client(), sheet_id, header, new_rownum, [link])
+                            except Exception as e:
+                                print(f"❌ Failed to write link to Flyer / Link: {e}")
+
+                        # --- Build suggested (not sent) email payload (NEW) ---
+                        email_payload = {
+                            "to": [from_addr_lower],
+                            "subject": f"{address}, {city}" if city else address,
+                            "body": f"""Hi,
+
+We noticed you mentioned a new property: {address}{', ' + city if city else ''}.
+
+Could you please provide the following details for this property:
+
+- Total square footage
+- Rent per square foot per year
+- Operating expenses per square foot
+- Number of drive-in doors
+- Number of dock doors  
+- Ceiling height
+- Power specifications
+
+Thanks!""",
+                            "clientId": client_id,
+                            "rowNumber": new_rownum
+                        }
+
+                        # --- Create ACTION_NEEDED notification with draft email (NEW) ---
+                        write_notification(
+                            user_id, client_id,
+                            kind="action_needed",
+                            priority="important",
+                            email=from_addr_lower,
+                            thread_id=thread_id,   # keep context with original thread
+                            row_number=new_rownum,
+                            row_anchor=f"{address}, {city}" if city else address,
+                            meta={
+                                "reason": "new_property_pending_send",
+                                "status": "pending_send",
+                                "address": address,
+                                "city": city,
+                                "link": link,
+                                "notes": notes,
+                                "suggestedEmail": email_payload
+                            },
+                            dedupe_key=f"new_property_pending:{address}:{city}:{from_addr_lower}"
                         )
-                        
-                        if new_thread_id:
-                            write_notification(
-                                user_id, client_id,
-                                kind="new_property",
-                                priority="important",
-                                email=from_addr_lower,
-                                thread_id=new_thread_id,
-                                row_number=new_rownum,
-                                row_anchor=f"{address}, {city}" if city else address,
-                                meta={"address": address, "city": city, "link": link, "notes": notes},
-                                dedupe_key=f"new_property:{address}:{city}"
-                            )
-                        
+
+                        # --- mark that we created a new row this run (NEW) ---
+                        new_row_created = True
+
+                        # IMPORTANT: we intentionally DO NOT call send_new_property_email(...) anymore
+
                     except Exception as e:
                         print(f"❌ Failed to handle new_property: {e}")
                 
@@ -2906,44 +2998,62 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     # Check if all required fields are complete for closing logic
                     pass  # This will be handled below in the required fields check
             
-            # NEW: Required fields check and remaining questions flow
+            # NEW: Required fields check and remaining questions flow (GATED)
             try:
-                # Re-read row data in case it was updated
                 sheets = _sheets_client()
                 tab_title = _get_first_tab_title(sheets, sheet_id)
-                resp = sheets.spreadsheets().values().get(
-                    spreadsheetId=sheet_id,
-                    range=f"{tab_title}!{rownum}:{rownum}"
-                ).execute()
-                
-                current_row = resp.get("values", [[]])[0] if resp.get("values") else []
-                if len(current_row) < len(header):
-                    current_row.extend([""] * (len(header) - len(current_row)))
-                
-                missing_fields = check_missing_required_fields(current_row, header)
-                
-                if missing_fields:
-                    # Send remaining questions email
-                    sent = send_remaining_questions_email(
-                        user_id, client_id, headers, from_addr_lower, 
-                        missing_fields, thread_id, rownum, row_anchor
-                    )
-                    if sent:
-                        print(f"📧 Sent remaining questions for {len(missing_fields)} missing fields")
+
+                # --- Stateless divider check so we don't nag on non-viable rows (NEW) ---
+                try:
+                    div_resp = sheets.spreadsheets().values().get(
+                        spreadsheetId=sheet_id, range=f"{tab_title}!A:A"
+                    ).execute()
+                    a_col = div_resp.get("values", [])
+                    divider_row = None
+                    for i, r in enumerate(a_col, start=1):
+                        if r and str(r[0]).strip().upper() == "NON-VIABLE":
+                            divider_row = i
+                            break
+                except Exception as _e:
+                    divider_row = None
+
+                if old_row_became_nonviable or new_row_created or (divider_row and rownum > divider_row):
+                    print("ℹ️ Skipping remaining-questions for old row (non-viable and/or new property pending).")
                 else:
-                    # All required fields complete - send closing email
-                    sent = send_closing_email(
-                        user_id, client_id, headers, from_addr_lower, 
-                        thread_id, rownum, row_anchor
-                    )
-                    if sent:
-                        print(f"🎉 Sent closing email - all required fields complete")
+                    # Re-read row data in case it was updated
+                    resp = sheets.spreadsheets().values().get(
+                        spreadsheetId=sheet_id,
+                        range=f"{tab_title}!{rownum}:{rownum}"
+                    ).execute()
+                    current_row = resp.get("values", [[]])[0] if resp.get("values") else []
+                    if len(current_row) < len(header):
+                        current_row.extend([""] * (len(header) - len(current_row)))
+                    
+                    missing_fields = check_missing_required_fields(current_row, header)
+                    
+                    if missing_fields:
+                        # Send remaining questions email
+                        sent = send_remaining_questions_email(
+                            user_id, client_id, headers, from_addr_lower, 
+                            missing_fields, thread_id, rownum, row_anchor
+                        )
+                        if sent:
+                            print(f"📧 Sent remaining questions for {len(missing_fields)} missing fields")
+                    else:
+                        # All required fields complete - send closing email
+                        sent = send_closing_email(
+                            user_id, client_id, headers, from_addr_lower, 
+                            thread_id, rownum, row_anchor
+                        )
+                        if sent:
+                            print(f"🎉 Sent closing email - all required fields complete")
                         
             except Exception as e:
                 print(f"❌ Failed to send remaining questions email: {e}")
         
         else:
             print("ℹ️ No proposal generated; nothing to apply.")
+
 
 
 
