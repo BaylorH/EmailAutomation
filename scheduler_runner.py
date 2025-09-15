@@ -146,121 +146,131 @@ def _approx_header_px(text: str) -> int:
     px = int(len(text) * 7 + 24)  # chars * avg px + padding
     return max(100, min(px, 1000))
 
-def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: list[str]):
+def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: list[str]) -> None:
     """
-    Rules:
-      • Default: CLIP + auto-resize (covers header too). No header wrap.
-      • "Listing Brokers Comments" & "Jill and Clients comments":
-           WRAP for data rows (row 3+) only; header stays CLIP; set a wide width.
-      • "Listing Brokers Flyer / Link" & "Floorplan":
-           CLIP, compact fixed width (but never smaller than the header).
-    Trailing/odd spacing in header names is tolerated.
+    Auto-size all columns to the longest visible value + padding, with exceptions:
+      - 'Listing Brokers Comments ' and 'Jill and Clients Comments' -> WRAP and be reasonably wide
+      - 'Flyer / Link' and 'Floorplan' -> CLIP and keep width small (ignore huge URLs)
+
+    Header row (row 2) is NOT wrapped.
     """
-    try:
-        sheets = _sheets_client()
-        sheet_id, _ = _first_sheet_props(sheets, spreadsheet_id)
+    # --- Tunables (bump these if you still see clipping) -----------------------
+    CHAR_PX          = 8        # px per character (Arial-ish at normal zoom)
+    BASE_PADDING_PX  = 24       # extra px on top of measured content (fixes last-letter cut)
+    EXTRA_FUDGE_PX   = 6        # tiny safety buffer
 
-        def norm(s):  # normalize header names; ignores trailing spaces/case
-            return (s or "").strip().lower()
+    # Wrap columns width bounds
+    MIN_WRAP_PX      = 280
+    MAX_WRAP_PX      = 600
 
-        # tweakable widths (pixels)
-        COMMENTS_WIDTH_PX  = 460
-        FLYER_WIDTH_PX     = 320
-        FLOORPLAN_WIDTH_PX = 220
+    # Link columns limits (kept small)
+    LINK_MIN_PX      = 140
+    LINK_CAP_PX      = 240
+    LINK_HALF_FACTOR = 0.5      # halve whatever auto-size thinks, then cap
 
-        comment_cols = {
-            norm("Listing Brokers Comments"),
-            norm("Jill and Clients comments"),
-        }
-        link_cols = {
-            norm("Listing Brokers Flyer / Link"),
-            norm("Floorplan"),
-        }
+    # Absolute guards for everything else
+    MIN_ANY_PX       = 80
+    MAX_ANY_PX       = 900
+    # --------------------------------------------------------------------------
 
-        req = []
+    def _norm(name: str) -> str:
+        return (name or "").strip().lower()
 
-        for i, raw_name in enumerate(header, start=1):
-            key = norm(raw_name)
-            if not key:
-                continue
+    WRAP_KEYS = {
+        "listing brokers comments",   # note: original header has a trailing space, we normalize
+        "jill and clients comments",
+    }
+    LINK_KEYS = {
+        "flyer / link",
+        "floorplan",
+        "floor plan",
+    }
 
-            header_px = _approx_header_px(raw_name)
+    sheets = _sheets_client()
+    # Read meta to get gridId + actual tab title
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    first_sheet = meta["sheets"][0]
+    grid_id     = first_sheet["properties"]["sheetId"]
+    tab_title   = first_sheet["properties"]["title"]
 
-            # Keep header unwrapped explicitly
-            req.append({
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": 1, "endRowIndex": 2,    # header row (row 2)
-                        "startColumnIndex": i-1, "endColumnIndex": i
-                    },
-                    "cell": {"userEnteredFormat": {"wrapStrategy": "CLIP"}},
-                    "fields": "userEnteredFormat.wrapStrategy"
-                }
-            })
+    # Read row 2 (header) + data rows
+    values_resp = sheets.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{tab_title}!A2:ZZZ"
+    ).execute()
+    rows = values_resp.get("values", [])
+    hdr  = rows[0] if rows else header  # prefer live header from sheet
+    data = rows[1:] if len(rows) > 1 else []
 
-            if key in comment_cols:
-                # Wrap only data rows (row 3+)
-                req.append({
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 2,                    # from row 3 down
-                            "startColumnIndex": i-1,
-                            "endColumnIndex": i
-                        },
-                        "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP"}},
-                        "fields": "userEnteredFormat.wrapStrategy"
-                    }
-                })
-                # Wide column, but never less than header width
-                req.append({
-                    "updateDimensionProperties": {
-                        "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": i-1, "endIndex": i},
-                        "properties": {"pixelSize": max(COMMENTS_WIDTH_PX, header_px)},
-                        "fields": "pixelSize"
-                    }
-                })
+    num_cols = max(len(hdr), len(header))
+    requests = []
 
-            elif key in link_cols:
-                # Links: clipped, compact width (≥ header width)
-                width = FLYER_WIDTH_PX if "flyer" in key else FLOORPLAN_WIDTH_PX
-                req.append({
-                    "repeatCell": {
-                        "range": {"sheetId": sheet_id, "startColumnIndex": i-1, "endColumnIndex": i},
-                        "cell": {"userEnteredFormat": {"wrapStrategy": "CLIP"}},
-                        "fields": "userEnteredFormat.wrapStrategy"
-                    }
-                })
-                req.append({
-                    "updateDimensionProperties": {
-                        "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": i-1, "endIndex": i},
-                        "properties": {"pixelSize": max(width, header_px)},
-                        "fields": "pixelSize"
-                    }
-                })
+    for c in range(num_cols):  # 0-based col index
+        header_text = (hdr[c] if c < len(hdr) else (header[c] if c < len(header) else "")) or ""
+        header_len  = len(header_text)
+        header_px   = header_len * CHAR_PX + BASE_PADDING_PX + EXTRA_FUDGE_PX
 
-            else:
-                # Everyone else: CLIP + auto-resize (lets data decide the width)
-                req.append({
-                    "repeatCell": {
-                        "range": {"sheetId": sheet_id, "startColumnIndex": i-1, "endColumnIndex": i},
-                        "cell": {"userEnteredFormat": {"wrapStrategy": "CLIP"}},
-                        "fields": "userEnteredFormat.wrapStrategy"
-                    }
-                })
-                req.append({
-                    "autoResizeDimensions": {
-                        "dimensions": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": i-1, "endIndex": i}
-                    }
-                })
+        # Find longest cell text length in this column (rows 3+)
+        max_len = header_len
+        for r in data:
+            if c < len(r) and r[c]:
+                L = len(str(r[c]))
+                if L > max_len:
+                    max_len = L
 
-        if req:
-            sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": req}).execute()
-            print("🎨 Column formatting applied (autosize, header-safe, comments wrapped, links clipped).")
+        auto_px = max_len * CHAR_PX + BASE_PADDING_PX + EXTRA_FUDGE_PX
+        col_key = _norm(header_text)
 
-    except Exception as e:
-        print(f"⚠️ Failed to format columns: {e}")
+        # Decide wrapping + final width
+        if col_key in LINK_KEYS:
+            # Keep link columns small: halve the auto width and cap; clip text
+            width_px = int(auto_px * LINK_HALF_FACTOR)
+            width_px = max(width_px, max(header_px, LINK_MIN_PX))
+            width_px = min(width_px, LINK_CAP_PX)
+            wrap_mode = "CLIP"
+        elif col_key in WRAP_KEYS:
+            # Comments: wrap and keep within sensible bounds
+            width_px = max(MIN_WRAP_PX, min(auto_px, MAX_WRAP_PX))
+            wrap_mode = "WRAP"
+        else:
+            # Normal columns: no wrap; make sure width is at least header and content + padding
+            width_px = max(header_px, auto_px)
+            width_px = max(MIN_ANY_PX, min(width_px, MAX_ANY_PX))
+            wrap_mode = "OVERFLOW_CELL"
+
+        # 1) Set column width
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": grid_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": c,
+                    "endIndex": c + 1
+                },
+                "properties": {"pixelSize": int(width_px)},
+                "fields": "pixelSize"
+            }
+        })
+
+        # 2) Apply wrap strategy to DATA ONLY (startRowIndex=2 -> row 3+); header row (row 2) stays unwrapped
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": grid_id,
+                    "startRowIndex": 2,            # 0-based -> row 3
+                    "startColumnIndex": c,
+                    "endColumnIndex": c + 1
+                },
+                "cell": {"userEnteredFormat": {"wrapStrategy": wrap_mode}},
+                "fields": "userEnteredFormat.wrapStrategy"
+            }
+        })
+
+    if requests:
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests}
+        ).execute()
 
 
 def _col_letter(n: int) -> str:
