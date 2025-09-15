@@ -347,7 +347,7 @@ def write_notification(uid: str, client_id: str, *, kind: str, priority: str, em
             transaction.set(notif_ref, notification_doc)
             
             # Read current client doc
-            client_doc = transaction.get(client_ref)
+            client_doc = client_ref.get(transaction=transaction)
             current_data = client_doc.to_dict() if client_doc.exists else {}
             
             # Update counters
@@ -657,7 +657,8 @@ def check_missing_required_fields(rowvals: list[str], header: list[str]) -> list
         return REQUIRED_FIELDS_FOR_CLOSE  # Assume all missing on error
 
 def send_remaining_questions_email(uid: str, client_id: str, headers: dict, recipient: str, 
-                                 missing_fields: list[str], thread_id: str, row_number: int) -> bool:
+                                 missing_fields: list[str], thread_id: str, row_number: int,
+                                 row_anchor: str) -> bool:
     """
     Send a remaining questions email in the same thread (idempotent).
     Returns True if sent, False if skipped (duplicate).
@@ -672,11 +673,11 @@ def send_remaining_questions_email(uid: str, client_id: str, headers: dict, reci
         
         # Simple check: look for recent similar notifications
         recent_notifs = (_fs.collection("users").document(uid)
-                        .collection("clients").document(client_id)
-                        .collection("notifications")
-                        .where("threadId", "==", thread_id)
-                        .where("kind", "==", "action_needed")
-                        .limit(5).get())
+                         .collection("clients").document(client_id)
+                         .collection("notifications")
+                         .where(filter=("threadId", "==", thread_id))
+                         .where(filter=("kind", "==", "action_needed"))
+                         .limit(5).get())
         
         for notif in recent_notifs:
             if notif.to_dict().get("dedupeKey") == dedupe_key:
@@ -696,44 +697,30 @@ Could you please provide these details when you have a moment?
 
 Thanks!"""
         
-        # Reply in the same thread
         base = "https://graph.microsoft.com/v1.0"
-        
-        # Find the original message to reply to
-        thread_doc = _fs.collection("users").document(uid).collection("threads").document(thread_id).get()
-        if not thread_doc.exists:
-            print(f"❌ Thread {thread_id} not found for remaining questions")
-            return False
-        
-        # Get the root message ID (should be the thread_id itself for our system)
-        root_message_id = thread_id
-        
-        # Compose reply
-        reply_payload = {
-            "message": {
-                "subject": "Re: Remaining questions",
+        # 1) Find Graph message id by our stored internetMessageId (thread_id)
+        q = {"$filter": f"internetMessageId eq '{thread_id}'", "$select": "id"}
+        lookup = requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
+        lookup.raise_for_status()
+        vals = lookup.json().get("value", [])
+
+        if vals:
+            graph_id = vals[0]["id"]
+            # 2) Reply in-thread (this preserves proper headers)
+            reply_payload = {"comment": body}
+            resp = requests.post(f"{base}/me/messages/{graph_id}/reply",
+                                 headers=headers, json=reply_payload, timeout=30)
+            resp.raise_for_status()
+        else:
+            # 3) Fallback: send a new email (no custom In-Reply-To headers)
+            msg = {
+                "subject": "Remaining questions",
                 "body": {"contentType": "Text", "content": body},
                 "toRecipients": [{"emailAddress": {"address": recipient}}],
-                "internetMessageHeaders": [
-                    {"name": "x-row-anchor", "value": f"rowNumber={row_number}"}
-                ]
             }
-        }
-        
-        # Send via Graph API (reply endpoint would be ideal but may not work with our indexing)
-        # Instead, send as new email but with proper In-Reply-To header
-        msg = {
-            "subject": "Re: Remaining questions",
-            "body": {"contentType": "Text", "content": body},
-            "toRecipients": [{"emailAddress": {"address": recipient}}],
-            "internetMessageHeaders": [
-                {"name": "In-Reply-To", "value": root_message_id},
-                {"name": "x-row-anchor", "value": f"rowNumber={row_number}"}
-            ]
-        }
-        
-        response = requests.post(f"{base}/me/sendMail", headers=headers, json={"message": msg}, timeout=30)
-        response.raise_for_status()
+            send_payload = {"message": msg, "saveToSentItems": True}
+            resp = requests.post(f"{base}/me/sendMail", headers=headers, json=send_payload, timeout=30)
+            resp.raise_for_status()
         
         # Create action_needed notification
         write_notification(
@@ -743,7 +730,7 @@ Thanks!"""
             email=recipient,
             thread_id=thread_id,
             row_number=row_number,
-            row_anchor=get_row_anchor([], []),  # Will be filled by caller
+            row_anchor=row_anchor,
             meta={"reason": "missing_fields", "details": f"Missing: {', '.join(missing_fields)}"},
             dedupe_key=dedupe_key
         )
@@ -2438,7 +2425,16 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     # Summary log
     print(f"📥 Scanned {scanned_count} message(s); processed {processed_count}; skipped {skipped_count}")
 
-    
+
+def _sanitize_url(u: str) -> str:
+    if not u:
+        return u
+    # Trim common trailing junk (punctuation, stray words glued to the URL)
+    u = re.sub(r'[\)\]\}\.,;:!?]+$', '', u)
+    # If a trailing capitalized token got glued on (e.g., 'Thank'/'Thanks'), drop it
+    u = re.sub(r'(?i)(thank(?:s| you)?)$', '', u)
+    return u
+
 
 def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, Any]):
     """ENHANCED: Process a single inbox message with full pipeline including events."""
@@ -2622,14 +2618,15 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         urls_found = re.findall(url_pattern, _full_text)
         
         for url in urls_found[:3]:  # Limit to 3 URLs to avoid overwhelming
-            fetched_text = fetch_url_as_text(url)
+            clean = _sanitize_url(url)
+            fetched_text = fetch_url_as_text(clean)
             if fetched_text:
-                url_texts.append({"url": url, "text": fetched_text})
+                url_texts.append({"url": clean, "text": fetched_text})
             
             # Always append URL to Listing Brokers Comments
             try:
                 sheets = _sheets_client()
-                append_url_to_comments(sheets, sheet_id, header, rownum, url)
+                append_url_to_comments(sheets, sheet_id, header, rownum, clean)
             except Exception as e:
                 print(f"❌ Failed to append URL to comments: {e}")
         
@@ -2804,7 +2801,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     # Send remaining questions email
                     sent = send_remaining_questions_email(
                         user_id, client_id, headers, from_addr_lower, 
-                        missing_fields, thread_id, rownum
+                        missing_fields, thread_id, rownum, row_anchor
                     )
                     if sent:
                         print(f"📧 Sent remaining questions for {len(missing_fields)} missing fields")
