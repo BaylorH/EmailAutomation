@@ -158,6 +158,47 @@ def _approx_header_px(text: str) -> int:
     px = int(len(text) * 7 + 24)  # chars * avg px + padding
     return max(100, min(px, 1000))
 
+def _ensure_divider_conditional_formatting(sheets, spreadsheet_id: str):
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheet = meta["sheets"][0]
+    sheet_id = sheet["properties"]["sheetId"]
+
+    # Remove any existing identical rules (optional tidy, safe to skip)
+    # You can fetch existing CF rules via spreadsheets().get and clean if you want.
+
+    # Apply: from row 3 down, across all columns we care about.
+    add_rule = {
+        "requests": [{
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": sheet_id,
+                        "startRowIndex": 2,  # row 3 (0-based)
+                        "startColumnIndex": 0,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": '=$A3="NON-VIABLE"'}]
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 0.8, "green": 0.0, "blue": 0.0},
+                            "textFormat": {
+                                "bold": True,
+                                "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}
+                            }
+                        }
+                    }
+                },
+                "index": 0
+            }
+        }]
+    }
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id, body=add_rule
+    ).execute()
+
+
 def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: list[str]) -> None:
     """
     Auto-size all columns to the longest visible value + padding, with exceptions:
@@ -423,116 +464,176 @@ def fetch_url_as_text(url: str) -> str | None:
 
 # --- NEW: Non-viable divider and row operations ---
 
-def ensure_nonviable_divider(sheets, spreadsheet_id: str, tab_title: str) -> int:
+def _ensure_divider_conditional_formatting(sheets, spreadsheet_id: str) -> None:
     """
-    Ensure NON-VIABLE divider row exists. Returns divider row number.
-    Creates if missing, styles with red background and bold white text.
+    Add a conditional formatting rule that paints ANY row red + bold white text
+    when column A equals 'NON-VIABLE'. Idempotent enough for repeated calls.
     """
+    # Figure out sheet + a reasonable column span
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    first = meta["sheets"][0]
+    sheet_id = first["properties"]["sheetId"]
+    tab_title = first["properties"]["title"]
+
+    # Use header width to decide how many columns to cover (fallback to 26)
     try:
-        # Read current data to find existing divider
-        resp = sheets.spreadsheets().values().get(
+        header_resp = sheets.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"{tab_title}!A:A"
+            range=f"{tab_title}!2:2"
         ).execute()
-        rows = resp.get("values", [])
-        
-        # Look for existing "NON-VIABLE" divider
-        for i, row in enumerate(rows, start=1):
-            if row and str(row[0]).strip().upper() == "NON-VIABLE":
-                print(f"📍 Found existing NON-VIABLE divider at row {i}")
-                return i
-        
-        # No divider found, create one at the end
-        header = _read_header_row2(sheets, spreadsheet_id, tab_title)
-        divider_row = len(rows) + 1
-        
-        # Fill entire row with "NON-VIABLE"
-        divider_values = ["NON-VIABLE"] * len(header) if header else ["NON-VIABLE"]
-        
-        sheets.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{tab_title}!{divider_row}:{divider_row}",
-            valueInputOption="RAW",
-            body={"values": [divider_values]}
-        ).execute()
-        
-        # Style the divider row: red background, bold white text
-        sheet_id = _first_sheet_props(sheets, spreadsheet_id)[0]
-        
-        format_request = {
-            "requests": [{
-                "repeatCell": {
-                    "range": {
+        header = header_resp.get("values", [[]])[0] if header_resp.get("values") else []
+        num_cols = max(26, len(header) or 0)
+    except Exception:
+        num_cols = 26
+
+    # Apply rule from row 3 downward (data rows), across detected columns
+    add_rule = {
+        "requests": [{
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
                         "sheetId": sheet_id,
-                        "startRowIndex": divider_row - 1,
-                        "endRowIndex": divider_row,
+                        "startRowIndex": 2,          # row 3 (0-based)
                         "startColumnIndex": 0,
-                        "endColumnIndex": len(header) if header else 10
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
+                        "endColumnIndex": num_cols
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": '=$A3="NON-VIABLE"'}]
+                        },
+                        "format": {
                             "backgroundColor": {"red": 0.8, "green": 0.0, "blue": 0.0},
                             "textFormat": {
                                 "bold": True,
                                 "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}
                             }
                         }
-                    },
-                    "fields": "userEnteredFormat(backgroundColor,textFormat)"
-                }
-            }]
-        }
-        
-        sheets.spreadsheets().batchUpdate(
+                    }
+                },
+                "index": 0
+            }
+        }]
+    }
+
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body=add_rule
+    ).execute()
+
+
+def ensure_nonviable_divider(sheets, spreadsheet_id: str, tab_title: str) -> int:
+    """
+    Ensure a NON-VIABLE divider row exists. Returns the divider row number.
+    Creates if missing by writing 'NON-VIABLE' in column A only and
+    ensures conditional formatting is installed (no hard painting).
+    """
+    try:
+        # Scan column A for existing divider
+        resp = sheets.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            body=format_request
+            range=f"{tab_title}!A:A"
         ).execute()
-        
+        rows = resp.get("values", [])
+
+        for i, row in enumerate(rows, start=1):
+            if row and str(row[0]).strip().upper() == "NON-VIABLE":
+                # Make sure CF rule exists even if divider already present
+                _ensure_divider_conditional_formatting(sheets, spreadsheet_id)
+                print(f"📍 Found existing NON-VIABLE divider at row {i}")
+                return i
+
+        # Not found: create at the end by setting ONLY column A
+        divider_row = (len(rows) + 1) if rows else 1
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!A{divider_row}",
+            valueInputOption="RAW",
+            body={"values": [["NON-VIABLE"]]}
+        ).execute()
+
+        # Ensure the conditional formatting (styling follows the text)
+        _ensure_divider_conditional_formatting(sheets, spreadsheet_id)
+
         print(f"🔴 Created NON-VIABLE divider at row {divider_row}")
         return divider_row
-        
+
     except Exception as e:
         print(f"❌ Failed to ensure NON-VIABLE divider: {e}")
         raise
 
+
 def move_row_below_divider(sheets, spreadsheet_id: str, tab_title: str, src_row: int, divider_row: int) -> int:
     """
-    Move source row to immediately below the divider row.
-    Returns the new row number.
+    Move src_row to immediately below the divider *and* keep the divider as the boundary.
+    Returns the new row number of the moved row (immediately below the divider after the operation).
+    All row numbers are 1-based in the function signature.
     """
     try:
         sheet_id = _first_sheet_props(sheets, spreadsheet_id)[0]
-        
-        # Cut the source row
-        cut_request = {
-            "requests": [{
-                "cutPaste": {
-                    "source": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": src_row - 1,
-                        "endRowIndex": src_row
-                    },
-                    "destination": {
-                        "sheetId": sheet_id,
-                        "rowIndex": divider_row  # Insert right after divider
-                    },
-                    "pasteType": "PASTE_NORMAL"
+
+        # 1) Insert one blank row immediately BELOW the divider (0-based index = divider_row)
+        requests = [{
+            "insertDimension": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": divider_row,      # 0-based; divider_row is 1-based → row below divider
+                    "endIndex": divider_row + 1
+                },
+                "inheritFromBefore": False
+            }
+        }]
+
+        # Count columns so we can copy across all used columns
+        header = _read_header_row2(sheets, spreadsheet_id, tab_title)
+        num_cols = max(1, len(header))
+
+        # 2) COPY the source row to the new blank row just inserted (at divider_row+1 in 1-based terms)
+        requests.append({
+            "copyPaste": {
+                "source": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": src_row - 1,
+                    "endRowIndex": src_row,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols
+                },
+                "destination": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": divider_row,   # the newly inserted blank row (0-based)
+                    "endRowIndex": divider_row + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols
+                },
+                "pasteType": "PASTE_NORMAL"
+            }
+        })
+
+        # 3) DELETE the original source row (above the divider), which lifts divider up by one
+        requests.append({
+            "deleteDimension": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": src_row - 1,
+                    "endIndex": src_row
                 }
-            }]
-        }
-        
-        sheets.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body=cut_request
-        ).execute()
-        
-        new_row = divider_row + 1
-        print(f"📍 Moved row {src_row} to {new_row} (below NON-VIABLE divider)")
+            }
+        })
+
+        sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
+
+        # After deletion of a row above the divider, the divider shifts up by 1.
+        # The moved row sits immediately below the (new) divider.
+        new_row = divider_row  # 1-based index of the moved row after the sequence
+        print(f"📍 Moved row {src_row} below divider -> now at {new_row}")
         return new_row
-        
+
     except Exception as e:
         print(f"❌ Failed to move row below divider: {e}")
         raise
+
 
 def insert_property_row_above_divider(sheets, spreadsheet_id: str, tab_title: str, values_by_header: dict) -> int:
     """
