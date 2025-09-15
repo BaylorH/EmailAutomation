@@ -19,6 +19,7 @@ from google.auth.transport.requests import Request
 from datetime import datetime, timezone
 import openai
 from bs4 import BeautifulSoup
+from google.cloud.firestore_v1 import FieldFilter
 
 # Config
 CLIENT_ID         = os.getenv("AZURE_API_APP_ID")
@@ -339,11 +340,11 @@ def write_notification(uid: str, client_id: str, *, kind: str, priority: str, em
         @firestore.transactional
         def update_with_counters(transaction):
             # READS FIRST
-            client_snapshot = transaction.get(client_ref)
+            client_snapshot = client_ref.get(transaction=transaction)
 
             # Dedupe check must also be a READ before any WRITE
             if dedupe_key:
-                notif_snapshot = transaction.get(notif_ref)
+                notif_snapshot = notif_ref.get(transaction=transaction)
                 if notif_snapshot.exists:
                     print(f"📋 Skipped duplicate notification: {dedupe_key}")
                     return notif_ref.id  # No-op
@@ -677,8 +678,8 @@ def send_remaining_questions_email(uid: str, client_id: str, headers: dict, reci
         recent_notifs_query = (_fs.collection("users").document(uid)
                               .collection("clients").document(client_id)
                               .collection("notifications")
-                              .where("threadId", "==", thread_id)
-                              .where("kind", "==", "action_needed")
+                              .where(filter=FieldFilter("threadId", "==", thread_id))
+                              .where(filter=FieldFilter("kind", "==", "action_needed"))
                               .limit(5))
         
         # Execute the query and iterate through results
