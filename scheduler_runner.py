@@ -1871,19 +1871,27 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10) -> lis
 
 
 
-def propose_sheet_updates(uid: str, client_id: str, email: str, sheet_id: str, header: list[str],
-                          rownum: int, rowvals: list[str], thread_id: str, 
-                          file_ids_for_this_run: list[str] = None,
+def propose_sheet_updates(uid: str,
+                          client_id: str,
+                          email: str,
+                          sheet_id: str,
+                          header: list[str],
+                          rownum: int,
+                          rowvals: list[str],
+                          thread_id: str,
+                          file_manifest: list[dict] = None,   # [{"id": "...", "name": "..."}]
                           url_texts: list[dict] = None) -> dict | None:
     """
     Uses OpenAI Responses API to propose sheet updates.
-    Enhanced to support events array and URL exploration text.
+    - Grounds on the current row's (address, city) as TARGET PROPERTY.
+    - Shows the model the attachment names so it can pick the right PDF.
+    - Enforces strict event and document-selection rules.
     """
     try:
-        # Build conversation payload
+        # Build conversation payload (chronological; latest last)
         conversation = build_conversation_payload(uid, thread_id, limit=10)
-        
-        # Column rules for money field mapping
+
+        # ---- Rules sections ---------------------------------------------------
         COLUMN_RULES = """
 COLUMN SEMANTICS & MAPPING (use EXACT header names):
 - "Rent/SF /Yr": Base/asking rent per square foot per YEAR. Synonyms: asking, base rent, $/SF/yr.
@@ -1892,34 +1900,61 @@ COLUMN SEMANTICS & MAPPING (use EXACT header names):
 - "Total SF": Total square footage. Synonyms: sq footage, square feet, SF, size.
 - "Drive Ins": Number of drive-in doors. Synonyms: drive in doors, loading doors.
 - "Ceiling Ht": Ceiling height. Synonyms: max ceiling height, ceiling clearance.
-- "Listing Brokers Comments ": Short, non-numeric broker/client notes not covered by other columns. Use terse fragments separated by " • ". Do NOT put numeric data like square footage, rent, or ceiling height here if it belongs in dedicated columns.
+- "Listing Brokers Comments ": Short, non-numeric broker/client notes not covered by other columns. Use terse fragments separated by " • ".
+  Do NOT put numeric data like square footage, rent, or ceiling height here if it belongs in dedicated columns.
 
 FORMATTING:
 - For money/area fields, output plain decimals (no "$", "SF", commas). Examples: "30", "14.29", "2400".
 - For square footage, output just the number: "2000" not "2000 SF".
 - For ceiling height, output just the number: "9" not "9 feet" or "9'".
 - For drive-ins, output just the number: "3" not "3 doors".
-
-EVENTS DETECTION - BE VERY SPECIFIC:
-- Only consider the LAST HUMAN message for triggering `events`.
-- "call_requested": Only when someone explicitly asks for a call or phone conversation
-- "property_unavailable": ONLY when the current property is explicitly stated as unavailable, leased, or off-market. If they are suggesting a new property, this is an indicator to look cloesely at if they are doing so because the property itself is unavailable although they may use similiar wording.
-- "new_property": :
-    • Emit ONLY if the LAST HUMAN message contains a SPECIFIC street address (or unambiguous property name) that is DIFFERENT from the current row.
-    • Phrases like "new place", "another one", "I have something else" WITHOUT a specific, different address DO NOT qualify.
-    • If you cannot extract a concrete address string, DO NOT emit new_property.
-- "close_conversation": When conversation appears complete and sender indicates they're done
-
-CRITICAL: If someone provides square footage, ceiling height, drive-ins, or other property details in response to questions, these are details about the CURRENT property in the sheet row. Only trigger "new_property" if they explicitly mention a different address than the email subject or say something like "I have another property at..."
-
-For new_property events, extract: address, city, email (if different), link (if mentioned), notes
 """
-        
-        # Build prompt for OpenAI
+
+        DOC_SELECTION_RULES = """
+DOCUMENT SELECTION & EXTRACTION (strict):
+- Trust ATTACHMENTS (PDFs) over the email body when numbers conflict.
+- Extract values ONLY for the TARGET PROPERTY. If a PDF shows multiple buildings/addresses, use the page/section
+  that explicitly matches the TARGET PROPERTY (address/city). If no exact match, do not use that PDF for updates.
+- If an attachment clearly refers to a different address, ignore it unless the LAST HUMAN message explicitly proposes
+  it as an additional property (then you may emit a new_property event).
+- If a brochure lists multiple options (e.g., Building C & D), pick the option that most clearly matches the TARGET
+  PROPERTY/suite. If ambiguous, SKIP that field rather than guessing.
+
+FIELD MINING HINTS:
+- Rent/SF /Yr: look for "$14/SF NNN", "Asking: $15.00/sf/yr (NNN)".
+- Ops Ex /SF: look for "NNN", "CAM", "Operating Expenses" as $/SF/YR. If only monthly is given, multiply by 12.
+- Total SF: prefer the leasable area of the matched suite/building (not total park size).
+- Ceiling Ht: "clear height", "clearance" → output just the number.
+- Drive Ins / Docks: count numerical values for the matched space.
+- Gross Rent: only compute if BOTH Rent/SF /Yr and Ops Ex /SF are present (sum, 2 decimals).
+"""
+
+        EVENT_RULES = """
+EVENTS DETECTION (very specific; consider ONLY the LAST HUMAN message):
+- "call_requested": Only when someone explicitly asks for a call/phone conversation.
+- "property_unavailable": ONLY when the current property is explicitly stated as unavailable/leased/off-market.
+- "new_property":
+    • Emit ONLY if the LAST HUMAN message contains a SPECIFIC street address (or unambiguous property name)
+      that is DIFFERENT from the TARGET PROPERTY.
+    • Phrases like "new place", "another one", "I have something else" WITHOUT a concrete, different address DO NOT qualify.
+    • If you cannot extract a specific, different address string, DO NOT emit new_property.
+- "close_conversation": When conversation appears complete and the sender indicates they’re done.
+
+CRITICAL: If the LAST HUMAN message provides square footage, ceiling height, drive-ins, etc., that is an update about
+the CURRENT property unless it explicitly names a different address.
+"""
+
+        # ---- Build prompt -----------------------------------------------------
+        target_anchor = get_row_anchor(rowvals, header)  # e.g., "1 Randolph Ct, Evans"
+
         prompt_parts = [f"""
-You are analyzing a conversation thread to suggest updates to a Google Sheet row and detect key events.
+You are analyzing a conversation thread to suggest updates to ONE Google Sheet row and detect key events.
+
+TARGET PROPERTY (canonical identity for matching): {target_anchor}
 
 {COLUMN_RULES}
+{DOC_SELECTION_RULES}
+{EVENT_RULES}
 
 SHEET HEADER (row 2):
 {json.dumps(header)}
@@ -1928,15 +1963,25 @@ CURRENT ROW VALUES (row {rownum}):
 {json.dumps(rowvals)}
 
 CONVERSATION HISTORY (latest last):
-{json.dumps(conversation, indent=2)}"""]
+{json.dumps(conversation, indent=2)}
+""".rstrip()]
 
-        # Add URL content if available
+        # Attachment index (names only) helps the model choose the right file
+        if file_manifest:
+            prompt_parts.append("\nATTACHMENTS (names shown for grounding):")
+            for f in file_manifest:
+                # defensive: handle dicts with/without name
+                name = f.get("name") or "<unnamed.pdf>"
+                prompt_parts.append(f" - {name}")
+
+        # URL content (already fetched)
         if url_texts:
             prompt_parts.append("\nURL CONTENT FETCHED:")
             for url_info in url_texts:
                 prompt_parts.append(f"\nURL: {url_info['url']}")
                 prompt_parts.append(f"Content: {url_info['text'][:1000]}...")
 
+        # Output contract
         prompt_parts.append("""
 Be conservative: only suggest changes you can cite from the text, attachments, or fetched URLs.
 
@@ -1954,7 +1999,7 @@ OUTPUT ONLY valid JSON in this exact format:
     {
       "type": "call_requested | property_unavailable | new_property | close_conversation",
       "address": "<for new_property only>",
-      "city": "<for new_property only>", 
+      "city": "<for new_property only>",
       "email": "<for new_property if different>",
       "link": "<for new_property if mentioned>",
       "notes": "<for new_property additional context>"
@@ -1962,37 +2007,32 @@ OUTPUT ONLY valid JSON in this exact format:
   ],
   "notes": "<optional general notes about the conversation>"
 }
-
-Be conservative with updates. Only suggest changes where you have good confidence based on explicit information in the conversation or fetched content.
 """)
 
         prompt = "".join(prompt_parts)
 
-        # Prepare input content for Responses API
+        # ---- Prepare inputs (files first, then text) --------------------------
         input_content = []
-        
-        # Add file inputs first
-        if file_ids_for_this_run:
-            for file_id in file_ids_for_this_run:
-                input_content.append({"type": "input_file", "file_id": file_id})
-        
-        # Add text input
+        if file_manifest:
+            for f in file_manifest:
+                # Each file is actual content; the earlier index gives the model the names.
+                if "id" in f and f["id"]:
+                    input_content.append({"type": "input_file", "file_id": f["id"]})
+
         input_content.append({"type": "input_text", "text": prompt})
 
-        # Call OpenAI Responses API
+        # ---- Call OpenAI (low temperature for determinism) --------------------
         response = client.responses.create(
             model=OPENAI_ASSISTANT_MODEL,
-            input=[{
-                "role": "user",
-                "content": input_content
-            }]
+            input=[{"role": "user", "content": input_content}],
+            temperature=0.1
         )
-        
-        raw_response = response.output_text.strip()
-        
-        # Parse JSON safely
+
+        raw_response = (response.output_text or "").strip()
+
+        # ---- Parse JSON safely ------------------------------------------------
         try:
-            # Handle potential code fences
+            # Strip code fences if present
             if raw_response.startswith("```"):
                 lines = raw_response.split("\n")
                 json_lines = []
@@ -2004,61 +2044,54 @@ Be conservative with updates. Only suggest changes where you have good confidenc
                     if in_json:
                         json_lines.append(line)
                 raw_response = "\n".join(json_lines)
-            
+
             proposal = json.loads(raw_response)
-            
         except json.JSONDecodeError as e:
             print(f"❌ Failed to parse OpenAI JSON response: {e}")
             print(f"Raw response: {raw_response}")
             return None
-        
-        # Validate JSON structure
+
         if not isinstance(proposal, dict):
             print(f"❌ Invalid proposal structure: {proposal}")
             return None
-        
-        # Ensure updates and events arrays exist
-        if "updates" not in proposal:
-            proposal["updates"] = []
-        if "events" not in proposal:
-            proposal["events"] = []
-        
-        # Log the proposal
+
+        proposal.setdefault("updates", [])
+        proposal.setdefault("events", [])
+
+        # ---- Log + store in sheetChangeLog -----------------------------------
         print(f"\n🤖 OpenAI Proposal for {client_id}__{email}:")
         print(json.dumps(proposal, indent=2))
-        
-        # Store in sheetChangeLog
-        now_utc = datetime.now(timezone.utc)
-        now_iso = now_utc.isoformat()  # ends with +00:00
 
+        now_utc = datetime.now(timezone.utc)
         log_doc_id = f"{thread_id}__{now_utc.isoformat().replace(':','-').replace('.','-').replace('+00:00','Z')}"
-        
+
         proposal_hash = hashlib.sha256(
             json.dumps(proposal, sort_keys=True).encode('utf-8')
         ).hexdigest()[:16]
-        
-        change_log_data = {
+
+        _fs.collection("users").document(uid).collection("sheetChangeLog").document(log_doc_id).set({
             "clientId": client_id,
             "email": email,
             "sheetId": sheet_id,
             "rowNumber": rownum,
+            "targetAnchor": target_anchor,
             "proposalJson": proposal,
             "proposalHash": proposal_hash,
             "status": "proposed",
             "threadId": thread_id,
-            "fileIds": file_ids_for_this_run or [],
+            "fileManifest": file_manifest or [],
+            "fileIds": [f["id"] for f in (file_manifest or [])],  # keep old field for compatibility
             "urlTexts": url_texts or [],
             "createdAt": SERVER_TIMESTAMP
-        }
-        
-        _fs.collection("users").document(uid).collection("sheetChangeLog").document(log_doc_id).set(change_log_data)
+        })
         print(f"💾 Stored proposal in sheetChangeLog/{log_doc_id}")
-        
+
         return proposal
-        
+
     except Exception as e:
         print(f"❌ Failed to propose sheet updates: {e}")
         return None
+
 
 
 # --- EXISTING FUNCTIONS (updated to integrate new features) ---
@@ -2810,6 +2843,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
         # NEW: Handle PDF attachments for current message only
         file_ids_for_this_run = []
+        file_manifest = []
         pdf_attachments = fetch_pdf_attachments(headers, msg_id)
         
         if pdf_attachments:
@@ -2825,6 +2859,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     # Upload to OpenAI
                     file_id = upload_pdf_user_data(pdf["name"], pdf["bytes"])
                     file_ids_for_this_run.append(file_id)
+                    file_manifest.append({"id": file_id, "name": pdf["name"]})
                     
                 except Exception as e:
                     print(f"❌ Failed to process PDF {pdf['name']}: {e}")
@@ -2864,7 +2899,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         # Step 3: get proposal using Responses API with URL content
         proposal = propose_sheet_updates(
             user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals, 
-            thread_id, file_ids_for_this_run, url_texts
+            thread_id, file_manifest=file_manifest, url_texts=url_texts
         )
         
         if proposal:
