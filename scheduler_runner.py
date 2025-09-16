@@ -158,6 +158,54 @@ def _approx_header_px(text: str) -> int:
     px = int(len(text) * 7 + 24)  # chars * avg px + padding
     return max(100, min(px, 1000))
 
+def _subject_to_address_city(subject: str) -> tuple[str, str]:
+    if not subject:
+        return "", ""
+    s = re.sub(r'^(re:|fwd:)\s*', '', subject, flags=re.I).strip()
+    s = re.sub(r'\s+\[.*?\]$', '', s)  # drop trailing bracket tags
+    parts = [p.strip() for p in s.split(',') if p.strip()]
+    addr = parts[0] if parts else ""
+    city = parts[1] if len(parts) > 1 else ""
+    return addr, city
+
+def _norm_txt(x: str) -> str:
+    return (x or "").strip().lower()
+
+def _find_row_by_address_city(sheets, spreadsheet_id: str, tab_title: str,
+                              header: list[str], address: str, city: str):
+    if not address:
+        return None, None
+
+    idx_map = _header_index_map(header)  # lowercased header -> 1-based idx
+    addr_idx = idx_map.get("property address") or idx_map.get("address") or idx_map.get("street address") or 0
+    city_idx = idx_map.get("city") or 0
+    if not addr_idx:
+        return None, None
+
+    resp = sheets.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{tab_title}!A2:ZZZ"
+    ).execute()
+    rows = resp.get("values", [])
+    data_rows = rows[1:] if rows else []  # row 3+
+
+    want_addr = _norm_txt(address)
+    want_city = _norm_txt(city)
+
+    for sheet_rownum, row in enumerate(data_rows, start=3):
+        row = row + [""] * (max(0, len(header) - len(row)))
+        got_addr = _norm_txt(row[addr_idx-1]) if addr_idx else ""
+        if got_addr != want_addr:
+            continue
+        if city_idx:
+            got_city = _norm_txt(row[city_idx-1])
+            if want_city and got_city != want_city:
+                continue
+        return sheet_rownum, row
+
+    return None, None
+
+
 def build_new_property_email_payload(address: str, city: str, to_email: str, client_id: str, row_number: int) -> dict:
     subject = f"{address}, {city}" if city else address
     body = f"""Hi,
@@ -1541,37 +1589,40 @@ def _find_row_by_email(sheets, spreadsheet_id: str, tab_title: str, header: list
 
 def _find_row_by_anchor(uid: str, thread_id: str, sheets, spreadsheet_id: str, tab_title: str, 
                        header: list[str], fallback_email: str):
-    """
-    Enhanced row matching: try thread rowNumber first, then fall back to email match.
-    """
     try:
-        # Check thread metadata for rowNumber
+        # 1) Prefer explicit stored rowNumber (unchanged)
         thread_doc = _fs.collection("users").document(uid).collection("threads").document(thread_id).get()
         if thread_doc.exists:
             thread_data = thread_doc.to_dict() or {}
             stored_row_num = thread_data.get("rowNumber")
-            
             if stored_row_num:
-                # Verify row exists and get values
                 resp = sheets.spreadsheets().values().get(
                     spreadsheetId=spreadsheet_id,
                     range=f"{tab_title}!{stored_row_num}:{stored_row_num}"
                 ).execute()
-                
                 rows = resp.get("values", [])
                 if rows and rows[0]:
-                    # Pad to header length
                     padded = rows[0] + [""] * (max(0, len(header) - len(rows[0])))
                     print(f"📍 Using thread-anchored row {stored_row_num}")
                     return stored_row_num, padded
-        
-        # Fall back to email matching
+
+            # 2) NEW: subject → (address, city) → row
+            subj = thread_data.get("subject") or ""
+            addr, city = _subject_to_address_city(subj)
+            if addr:
+                rn, rv = _find_row_by_address_city(sheets, spreadsheet_id, tab_title, header, addr, city)
+                if rn is not None:
+                    print(f"📍 Using subject-anchored row {rn} for '{addr}{', '+city if city else ''}'")
+                    return rn, rv
+
+        # 3) Fallback: email matching (unchanged)
         print(f"📧 Falling back to email matching for {fallback_email}")
         return _find_row_by_email(sheets, spreadsheet_id, tab_title, header, fallback_email)
-        
+
     except Exception as e:
         print(f"⚠️ Row anchor lookup failed: {e}")
         return _find_row_by_email(sheets, spreadsheet_id, tab_title, header, fallback_email)
+
 
 
 def _ensure_log_tab_exists(sheets, spreadsheet_id: str) -> str:
@@ -1853,10 +1904,13 @@ EVENTS DETECTION - BE VERY SPECIFIC:
 - Only consider the LAST HUMAN message for triggering `events`.
 - "call_requested": Only when someone explicitly asks for a call or phone conversation
 - "property_unavailable": ONLY when the current property is explicitly stated as unavailable, leased, or off-market. If they are suggesting a new property, this is an indicator to look cloesely at if they are doing so because the property itself is unavailable although they may use similiar wording.
-- "new_property": ONLY when mentioning a DIFFERENT property with a DIFFERENT ADDRESS from the current row. DO NOT trigger for providing details about the current property.
+- "new_property": :
+    • Emit ONLY if the LAST HUMAN message contains a SPECIFIC street address (or unambiguous property name) that is DIFFERENT from the current row.
+    • Phrases like "new place", "another one", "I have something else" WITHOUT a specific, different address DO NOT qualify.
+    • If you cannot extract a concrete address string, DO NOT emit new_property.
 - "close_conversation": When conversation appears complete and sender indicates they're done
 
-CRITICAL: If someone provides square footage, ceiling height, drive-ins, or other property details in response to questions, these are details about the CURRENT property in the sheet row. Only trigger "new_property" if they explicitly mention a different address or say something like "I have another property at..."
+CRITICAL: If someone provides square footage, ceiling height, drive-ins, or other property details in response to questions, these are details about the CURRENT property in the sheet row. Only trigger "new_property" if they explicitly mention a different address than the email subject or say something like "I have another property at..."
 
 For new_property events, extract: address, city, email (if different), link (if mentioned), notes
 """
