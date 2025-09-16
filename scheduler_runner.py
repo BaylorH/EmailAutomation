@@ -1851,7 +1851,7 @@ FORMATTING:
 
 EVENTS DETECTION - BE VERY SPECIFIC:
 - "call_requested": Only when someone explicitly asks for a call or phone conversation
-- "property_unavailable": ONLY when the current property is explicitly stated as unavailable, leased, or off-market
+- "property_unavailable": ONLY when the current property is explicitly stated as unavailable, leased, or off-market. If they are suggesting a new property, this is an indicator to look cloesely at if they are doing so because the property itself is unavailable although they may use similiar wording.
 - "new_property": ONLY when mentioning a DIFFERENT property with a DIFFERENT ADDRESS from the current row. DO NOT trigger for providing details about the current property.
 - "close_conversation": When conversation appears complete and sender indicates they're done
 
