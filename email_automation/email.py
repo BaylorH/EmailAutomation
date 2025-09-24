@@ -183,7 +183,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
 
 def send_outboxes(user_id: str, headers):
     """Modified to use send_and_index_email instead of send_email."""
-    from clients import _fs
+    from .clients import _fs
     
     outbox_ref = _fs.collection("users").document(user_id).collection("outbox")
     docs = list(outbox_ref.stream())

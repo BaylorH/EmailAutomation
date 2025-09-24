@@ -48,7 +48,7 @@ def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email:
             counterparty_email = recips[0]
 
     # Connect to Sheets; header = row 2
-    from clients import _sheets_client
+    from .clients import _sheets_client
     sheets = _sheets_client()
     tab_title = _get_first_tab_title(sheets, sheet_id)
     header = _read_header_row2(sheets, sheet_id, tab_title)
@@ -241,7 +241,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             # Append Drive links to Flyer / Link column on the current row (keep existing behavior)
             if drive_links:
                 try:
-                    from clients import _sheets_client
+                    from .clients import _sheets_client
                     sheets = _sheets_client()
                     append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, drive_links)
                     # Re-read header in case we just created "Flyer / Link"
