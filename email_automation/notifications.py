@@ -2,6 +2,7 @@ import hashlib
 from typing import Optional, List, Dict, Any
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 from .clients import _fs
+import firestore
 
 def write_notification(uid: str, client_id: str, *, kind: str, priority: str, email: str, 
                       thread_id: str, row_number: int = None, row_anchor: str = None, 
@@ -34,7 +35,7 @@ def write_notification(uid: str, client_id: str, *, kind: str, priority: str, em
             "dedupeKey": dedupe_key
         }
 
-        @_fs.transactional
+        @firestore.transactional
         def update_with_counters(transaction):
             # READS FIRST
             client_snapshot = client_ref.get(transaction=transaction)
