@@ -4,8 +4,8 @@ from typing import Dict, List, Optional
 from datetime import datetime, timezone
 from .utils import exponential_backoff_request, safe_preview, _body_kind
 from .messaging import save_thread_root, save_message, index_message_id, index_conversation_id
-from .clients import _get_sheet_id_or_fail
-from .sheets import _find_row_by_email, _sheets_client, _get_first_tab_title, _read_header_row2
+from .clients import _get_sheet_id_or_fail, _sheets_client
+from .sheets import _find_row_by_email, _get_first_tab_title, _read_header_row2, _header_index_map
 from .utils import normalize_message_id
 
 def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> str | None:

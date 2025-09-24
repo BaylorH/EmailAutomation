@@ -1,7 +1,19 @@
 import re
 from typing import Optional, List, Dict, Any
 from .clients import _sheets_client
-from .utils import _norm_txt, _header_index_map, _normalize_email
+from .utils import _norm_txt, _normalize_email
+
+def _header_index_map(header: list[str]) -> dict:
+    """Normalize headers for exact match regardless of spacing/case."""
+    return {(h or "").strip().lower(): i for i, h in enumerate(header, start=1)}  # 1-based
+
+def _col_letter(n: int) -> str:
+    """1-indexed column number -> A1 letter (1->A)."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
 def _get_first_tab_title(sheets, spreadsheet_id: str) -> str:
     meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
@@ -16,70 +28,17 @@ def _read_header_row2(sheets, spreadsheet_id: str, tab_title: str) -> list[str]:
     vals = resp.get("values", [[]])
     return vals[0] if vals else []
 
+def _first_sheet_props(sheets, spreadsheet_id):
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    p = meta["sheets"][0]["properties"]
+    return p["sheetId"], p["title"]
+
 def _guess_email_col_idx(header: list[str]) -> int:
     candidates = {"email", "email address", "contact email", "e-mail", "e mail"}
     for i, h in enumerate(header):
         if _normalize_email(h) in candidates:
             return i
     return -1
-
-def _first_sheet_props(sheets, spreadsheet_id):
-    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    p = meta["sheets"][0]["properties"]
-    return p["sheetId"], p["title"]
-
-def _approx_header_px(text: str) -> int:
-    # rough width estimate for default Sheets font (keeps headers visible)
-    if not text:
-        return 80
-    px = int(len(text) * 7 + 24)  # chars * avg px + padding
-    return max(100, min(px, 1000))
-
-def _col_letter(n: int) -> str:
-    """1-indexed column number -> A1 letter (1->A)."""
-    s = ""
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-def _header_index_map(header: list[str]) -> dict:
-    """Normalize headers for exact match regardless of spacing/case."""
-    return { (h or "").strip().lower(): i for i, h in enumerate(header, start=1) }  # 1-based
-
-def _find_row_by_address_city(sheets, spreadsheet_id: str, tab_title: str,
-                              header: list[str], address: str, city: str):
-    if not address:
-        return None, None
-
-    idx_map = _header_index_map(header)  # lowercased header -> 1-based idx
-    addr_idx = idx_map.get("property address") or idx_map.get("address") or idx_map.get("street address") or 0
-    city_idx = idx_map.get("city") or 0
-    if not addr_idx:
-        return None, None
-
-    resp = sheets.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"{tab_title}!A2:ZZZ"
-    ).execute()
-    rows = resp.get("values", [])
-    data_rows = rows[1:] if rows else []  # row 3+
-
-    want_addr = _norm_txt(address)
-    want_city = _norm_txt(city)
-
-    for sheet_rownum, row in enumerate(data_rows, start=3):
-        row = row + [""] * (max(0, len(header) - len(row)))
-        got_addr = _norm_txt(row[addr_idx-1]) if addr_idx else ""
-        if got_addr != want_addr:
-            continue
-        if city_idx:
-            got_city = _norm_txt(row[city_idx-1])
-            if want_city and got_city != want_city:
-                continue
-        return sheet_rownum, row
-
-    return None, None
 
 def _find_row_by_email(sheets, spreadsheet_id: str, tab_title: str, header: list[str], email: str):
     """
@@ -118,6 +77,40 @@ def _find_row_by_email(sheets, spreadsheet_id: str, tab_title: str, header: list
             for cell in padded:
                 if _normalize_email(cell) == needle:
                     return offset, padded
+
+    return None, None
+
+def _find_row_by_address_city(sheets, spreadsheet_id: str, tab_title: str,
+                              header: list[str], address: str, city: str):
+    if not address:
+        return None, None
+
+    idx_map = _header_index_map(header)  # lowercased header -> 1-based idx
+    addr_idx = idx_map.get("property address") or idx_map.get("address") or idx_map.get("street address") or 0
+    city_idx = idx_map.get("city") or 0
+    if not addr_idx:
+        return None, None
+
+    resp = sheets.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{tab_title}!A2:ZZZ"
+    ).execute()
+    rows = resp.get("values", [])
+    data_rows = rows[1:] if rows else []  # row 3+
+
+    want_addr = _norm_txt(address)
+    want_city = _norm_txt(city)
+
+    for sheet_rownum, row in enumerate(data_rows, start=3):
+        row = row + [""] * (max(0, len(header) - len(row)))
+        got_addr = _norm_txt(row[addr_idx-1]) if addr_idx else ""
+        if got_addr != want_addr:
+            continue
+        if city_idx:
+            got_city = _norm_txt(row[city_idx-1])
+            if want_city and got_city != want_city:
+                continue
+        return sheet_rownum, row
 
     return None, None
 
@@ -254,7 +247,6 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
             body={"requests": requests}
         ).execute()
 
-# Function to append links to flyer/link column  
 def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]):
     """Find/create Flyer / Link column and append unique links (no duplicates)."""
     try:
@@ -280,7 +272,6 @@ def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[
                 body={"values": [["Flyer / Link"]]}
             ).execute()
             print(f"📋 Created 'Flyer / Link' column at {col_letter}")
-            # (Optional) you may refresh header outside this function if you rely on it elsewhere
 
         # Cell range for this row/column
         col_letter = _col_letter(col_idx)
@@ -305,7 +296,7 @@ def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[
         for raw in links or []:
             if not raw:
                 continue
-            clean = raw.strip()  # Using basic sanitization here
+            clean = raw.strip()
             if not clean:
                 continue
             if clean not in existing:
