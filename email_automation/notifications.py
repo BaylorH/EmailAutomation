@@ -2,7 +2,7 @@ import hashlib
 from typing import Optional, List, Dict, Any
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 from .clients import _fs
-import firestore
+from google.cloud import firestore
 
 def write_notification(uid: str, client_id: str, *, kind: str, priority: str, email: str, 
                       thread_id: str, row_number: int = None, row_anchor: str = None, 
