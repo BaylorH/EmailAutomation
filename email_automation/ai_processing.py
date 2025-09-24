@@ -302,18 +302,27 @@ FIELD MINING HINTS:
 """
 
         EVENT_RULES = """
-EVENTS DETECTION (very specific; consider ONLY the LAST HUMAN message):
+EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
+
+- "property_unavailable": ONLY when the CURRENT TARGET PROPERTY is explicitly stated as unavailable/leased/off-market/no longer available.
+
+- "new_property": Emit when the LAST HUMAN message suggests or mentions a DIFFERENT property than the TARGET PROPERTY.
+  • Look for phrases like: "we have another", "different location", "alternative property", "other space available"
+  • Look for URLs pointing to different properties/listings
+  • Look for property names, addresses, or locations mentioned that are NOT the TARGET PROPERTY
+  • If mentioning "forestville", "centre", "woodmore" or other location names different from TARGET, this likely indicates new_property
+  • Extract the property identifier (address, name, or URL) as the "address" field
+  • Try to infer city/location from context or URL
+
 - "call_requested": Only when someone explicitly asks for a call/phone conversation.
-- "property_unavailable": ONLY when the current property is explicitly stated as unavailable/leased/off-market.
-- "new_property":
-    • Emit ONLY if the LAST HUMAN message contains a SPECIFIC street address (or unambiguous property name)
-      that is DIFFERENT from the TARGET PROPERTY.
-    • Phrases like "new place", "another one", "I have something else" WITHOUT a concrete, different address DO NOT qualify.
-    • If you cannot extract a specific, different address string, DO NOT emit new_property.
+
 - "close_conversation": When conversation appears complete and the sender indicates they're done.
 
-CRITICAL: If the LAST HUMAN message provides square footage, ceiling height, drive-ins, etc., that is an update about
-the CURRENT property unless it explicitly names a different address.
+CRITICAL EXAMPLES:
+- "Below is the only current space we have" + URL = new_property event
+- "Here's an alternative location" = new_property event  
+- "This property isn't available" = property_unavailable event
+- "Can you call me?" = call_requested event
 """
 
         # ---- Build prompt -----------------------------------------------------
@@ -370,11 +379,11 @@ OUTPUT ONLY valid JSON in this exact format:
   "events": [
     {
       "type": "call_requested | property_unavailable | new_property | close_conversation",
-      "address": "<for new_property only>",
-      "city": "<for new_property only>",
-      "email": "<for new_property if different>",
-      "link": "<for new_property if mentioned>",
-      "notes": "<for new_property additional context>"
+      "address": "<for new_property: extract property name, address, or identifier>",
+      "city": "<for new_property: infer city/location if possible>",
+      "email": "<for new_property if different email needed>",
+      "link": "<for new_property: include URL if mentioned>",
+      "notes": "<for new_property: additional context about the property>"
     }
   ],
   "notes": "<optional general notes about the conversation>"
