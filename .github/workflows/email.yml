@@ -50,5 +50,5 @@ jobs:
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         # run: python noPopup_signin_emails_to_excel.py
-        # run: python main.py
-        run: python scheduler_runner.py
+        run: python main.py
+        # run: python scheduler_runner.py
