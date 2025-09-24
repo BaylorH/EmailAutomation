@@ -339,6 +339,16 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         print(f"❌ Failed to write call_requested notification: {e}")
                 
                 elif event_type == "property_unavailable":
+                    # Check if row is already below NON-VIABLE divider - if so, skip processing
+                    try:
+                        tab_title = _get_first_tab_title(sheets, sheet_id)
+                        if _is_row_below_nonviable(sheets, sheet_id, tab_title, rownum):
+                            print(f"ℹ️ Row {rownum} already below NON-VIABLE divider, skipping property_unavailable processing")
+                            continue
+                    except Exception as e:
+                        print(f"⚠️ Failed to check if row is below divider: {e}")
+                        # Continue processing if we can't determine position
+                    
                     # Move row below divider and create notification
                     message_content = _full_text.lower()
                     unavailable_keywords = [
@@ -351,7 +361,6 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     # Only proceed if we find explicit unavailability language
                     if any(keyword in message_content for keyword in unavailable_keywords):
                         try:
-                            tab_title = _get_first_tab_title(sheets, sheet_id)
                             divider_row = ensure_nonviable_divider(sheets, sheet_id, tab_title)
                             new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
                             
@@ -362,6 +371,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             old_row_became_nonviable = True
                             rownum = new_rownum  # keep our pointer accurate if used later
 
+                            # Create notification only after successful move
                             write_notification(
                                 user_id, client_id,
                                 kind="property_unavailable",
@@ -371,7 +381,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                                 row_number=new_rownum,
                                 row_anchor=row_anchor,
                                 meta={"address": event.get("address", ""), "city": event.get("city", "")},
-                                dedupe_key=f"property_unavailable:{thread_id}:{rownum}"
+                                dedupe_key=f"property_unavailable:{thread_id}:{new_rownum}:moved"
                             )
                             print(f"🚫 Moved property to non-viable and created notification")
                         except Exception as e:
