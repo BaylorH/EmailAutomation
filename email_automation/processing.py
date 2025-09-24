@@ -1,23 +1,23 @@
 import re
 import requests
-import json
 import hashlib
+import json
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
-from .clients import _fs, _get_sheet_id_or_fail
+from .clients import _fs, _get_sheet_id_or_fail, _sheets_client
 from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column
 from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable
 from .messaging import (save_message, index_message_id, dump_thread_from_firestore, 
-                      has_processed, mark_processed, set_last_scan_iso, 
-                      lookup_thread_by_message_id, lookup_thread_by_conversation_id)
+                       has_processed, mark_processed, set_last_scan_iso, 
+                       lookup_thread_by_message_id, lookup_thread_by_conversation_id)
 from .logging import write_message_order_test
 from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_row_anchor, check_missing_required_fields
 from .file_handling import fetch_pdf_attachments, upload_pdf_to_drive, upload_pdf_user_data
 from .notifications import write_notification, add_client_notifications
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview, 
-                  parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url)
+                   parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url)
 from .email_operations import send_remaining_questions_email, send_closing_email
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 
@@ -49,7 +49,6 @@ def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email:
             counterparty_email = recips[0]
 
     # Connect to Sheets; header = row 2
-    from .clients import _sheets_client
     sheets = _sheets_client()
     tab_title = _get_first_tab_title(sheets, sheet_id)
     header = _read_header_row2(sheets, sheet_id, tab_title)
@@ -211,7 +210,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     if sheet_id and rownum is not None:
         from_addr_lower = (from_addr or "").lower()
 
-        # --- flags for gating later (NEW) ---
+        # --- flags for gating later ---
         old_row_became_nonviable = False   # set true when we move the row below divider
         new_row_created = False            # set true when we insert a new property row
         new_row_number = None              # track the newly created row number
@@ -242,7 +241,6 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             # Append Drive links to Flyer / Link column on the current row (keep existing behavior)
             if drive_links:
                 try:
-                    from .clients import _sheets_client
                     sheets = _sheets_client()
                     append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, drive_links)
                     # Re-read header in case we just created "Flyer / Link"
@@ -258,7 +256,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         
         # NEW: URL exploration - find URLs in message and fetch content
         url_texts = []
-        found_urls = []  # <--- collect; don't write to a row yet (CHANGED)
+        found_urls = []  # collect; don't write to a row yet
         url_pattern = r'https?://[^\s<>"\']+[^\s<>"\'.,;)]'
         urls_found = re.findall(url_pattern, _full_text)
         
@@ -314,10 +312,244 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     notes=proposal.get("notes")
                 )
             
-            # Process events and handle remaining fields check here...
-            # (This is where the event processing and field checking logic would go)
-            # For brevity, I'll indicate where this complex logic continues...
+            # NEW: Process events from the proposal
+            events = proposal.get("events", [])
+            sheets = _sheets_client()
+            row_anchor = get_row_anchor(rowvals, header)
             
+            for event in events:
+                event_type = event.get("type")
+                
+                if event_type == "call_requested":
+                    # Create action_needed notification
+                    try:
+                        write_notification(
+                            user_id, client_id,
+                            kind="action_needed",
+                            priority="important",
+                            email=from_addr_lower,
+                            thread_id=thread_id,
+                            row_number=rownum,
+                            row_anchor=row_anchor,
+                            meta={"reason": "call_requested", "details": "Call requested in conversation"},
+                            dedupe_key=f"call_requested:{thread_id}"
+                        )
+                        print(f"📞 Created call_requested notification")
+                    except Exception as e:
+                        print(f"❌ Failed to write call_requested notification: {e}")
+                
+                elif event_type == "property_unavailable":
+                    # Move row below divider and create notification
+                    message_content = _full_text.lower()
+                    unavailable_keywords = [
+                        "no longer available", "not available", "off the market", 
+                        "has been leased", "space is leased", "property is unavailable",
+                        "building unavailable", "no longer considering", "isnt available", 
+                        "isn't available", "unavailable", "off market"
+                    ]
+                    
+                    # Only proceed if we find explicit unavailability language
+                    if any(keyword in message_content for keyword in unavailable_keywords):
+                        try:
+                            tab_title = _get_first_tab_title(sheets, sheet_id)
+                            divider_row = ensure_nonviable_divider(sheets, sheet_id, tab_title)
+                            new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
+                            
+                            # Reformat after move
+                            format_sheet_columns_autosize_with_exceptions(sheet_id, header)
+                            
+                            # mark the row as non-viable for this run
+                            old_row_became_nonviable = True
+                            rownum = new_rownum  # keep our pointer accurate if used later
+
+                            write_notification(
+                                user_id, client_id,
+                                kind="property_unavailable",
+                                priority="important",
+                                email=from_addr_lower,
+                                thread_id=thread_id,
+                                row_number=new_rownum,
+                                row_anchor=row_anchor,
+                                meta={"address": event.get("address", ""), "city": event.get("city", "")},
+                                dedupe_key=f"property_unavailable:{thread_id}:{rownum}"
+                            )
+                            print(f"🚫 Moved property to non-viable and created notification")
+                        except Exception as e:
+                            print(f"❌ Failed to handle property_unavailable: {e}")
+                    else:
+                        print(f"⚠️ Property unavailable event detected but no explicit unavailability keywords found")
+                
+                elif event_type == "new_property":
+                    # Insert new property row and create a PENDING notification (do NOT send email)
+                    try:
+                        address = event.get("address", "")
+                        city = event.get("city", "")
+                        link = event.get("link", "")
+                        notes = event.get("notes", "")
+                        
+                        # Prepare values for new row
+                        values_by_header = {}
+                        if address:
+                            values_by_header["property address"] = address
+                            values_by_header["address"] = address
+                        if city:
+                            values_by_header["city"] = city
+                        if from_addr_lower:
+                            values_by_header["email"] = from_addr_lower
+                            values_by_header["email address"] = from_addr_lower
+                        
+                        # Put the URL itself in Flyer / Link initially
+                        if link:
+                            values_by_header["flyer / link"] = link
+
+                        # Keep human-readable notes (without the URL) in Listing Brokers Comments 
+                        if notes:
+                            values_by_header["listing brokers comments"] = notes
+
+                        tab_title = _get_first_tab_title(sheets, sheet_id)
+                        new_rownum = insert_property_row_above_divider(sheets, sheet_id, tab_title, values_by_header)
+
+                        # Reformat after insert
+                        format_sheet_columns_autosize_with_exceptions(sheet_id, header)
+
+                        # remember the new row to target links later
+                        new_row_created = True
+                        new_row_number = new_rownum
+
+                        # Build suggested (not sent) email payload
+                        email_payload = {
+                            "to": [from_addr_lower],
+                            "subject": f"{address}, {city}" if city else address,
+                            "body": f"""Hi,
+
+We noticed you mentioned a new property: {address}{', ' + city if city else ''}.
+
+Could you please provide the following details for this property:
+
+- Total square footage
+- Rent per square foot per year
+- Operating expenses per square foot
+- Number of drive-in doors
+- Number of dock doors  
+- Ceiling height
+- Power specifications
+
+Thanks!""",
+                            "clientId": client_id,
+                            "rowNumber": new_rownum
+                        }
+
+                        # Create ACTION_NEEDED notification with draft email
+                        write_notification(
+                            user_id, client_id,
+                            kind="action_needed",
+                            priority="important",
+                            email=from_addr_lower,
+                            thread_id=thread_id,   # keep context with original thread
+                            row_number=new_rownum,
+                            row_anchor=f"{address}, {city}" if city else address,
+                            meta={
+                                "reason": "new_property_pending_send",
+                                "status": "pending_send",
+                                "address": address,
+                                "city": city,
+                                "link": link,
+                                "notes": notes,
+                                "suggestedEmail": email_payload
+                            },
+                            dedupe_key=f"new_property_pending:{address}:{city}:{from_addr_lower}"
+                        )
+                        print(f"🏢 Created new property row and pending notification")
+
+                    except Exception as e:
+                        print(f"❌ Failed to handle new_property: {e}")
+                
+                elif event_type == "close_conversation":
+                    # This will be handled below in the required fields check
+                    print(f"💬 Close conversation event detected")
+
+            # FINAL: append discovered URLs to the correct row
+            try:
+                if found_urls:
+                    # target = new row if created; else stick with original row
+                    target_row = new_row_number if (new_row_created and new_row_number) else rownum
+
+                    # If target is the original row and it's now below NON-VIABLE, skip writing links
+                    tab_title = _get_first_tab_title(sheets, sheet_id)
+                    try:
+                        a_col = sheets.spreadsheets().values().get(
+                            spreadsheetId=sheet_id, range=f"{tab_title}!A:A"
+                        ).execute().get("values", [])
+                        divider_row = None
+                        for i, r in enumerate(a_col, start=1):
+                            if r and str(r[0]).strip().upper() == "NON-VIABLE":
+                                divider_row = i
+                                break
+                    except Exception:
+                        divider_row = None
+
+                    if not (divider_row and target_row > divider_row):
+                        # de-dupe in the list we pass (doesn't check existing cell content)
+                        unique_links = list(dict.fromkeys(found_urls))
+                        append_links_to_flyer_link_column(sheets, sheet_id, header, target_row, unique_links)
+                    else:
+                        print("ℹ️ Skipped writing links to non-viable row.")
+            except Exception as e:
+                print(f"❌ Failed final link append: {e}")
+            
+            # Required fields check and remaining questions flow
+            try:
+                sheets = _sheets_client()
+                tab_title = _get_first_tab_title(sheets, sheet_id)
+
+                # Stateless divider check so we don't nag on non-viable rows
+                try:
+                    div_resp = sheets.spreadsheets().values().get(
+                        spreadsheetId=sheet_id, range=f"{tab_title}!A:A"
+                    ).execute()
+                    a_col = div_resp.get("values", [])
+                    divider_row = None
+                    for i, r in enumerate(a_col, start=1):
+                        if r and str(r[0]).strip().upper() == "NON-VIABLE":
+                            divider_row = i
+                            break
+                except Exception as _e:
+                    divider_row = None
+
+                if old_row_became_nonviable or new_row_created or (divider_row and rownum > divider_row):
+                    print("ℹ️ Skipping remaining-questions for old row (non-viable and/or new property pending).")
+                else:
+                    # Re-read row data in case it was updated
+                    resp = sheets.spreadsheets().values().get(
+                        spreadsheetId=sheet_id,
+                        range=f"{tab_title}!{rownum}:{rownum}"
+                    ).execute()
+                    current_row = resp.get("values", [[]])[0] if resp.get("values") else []
+                    if len(current_row) < len(header):
+                        current_row.extend([""] * (len(header) - len(current_row)))
+                    
+                    missing_fields = check_missing_required_fields(current_row, header)
+                    
+                    if missing_fields:
+                        # Send remaining questions email
+                        sent = send_remaining_questions_email(
+                            user_id, client_id, headers, from_addr_lower, 
+                            missing_fields, thread_id, rownum, row_anchor
+                        )
+                        if sent:
+                            print(f"📧 Sent remaining questions for {len(missing_fields)} missing fields")
+                    else:
+                        # All required fields complete - send closing email
+                        sent = send_closing_email(
+                            user_id, client_id, headers, from_addr_lower, 
+                            thread_id, rownum, row_anchor
+                        )
+                        if sent:
+                            print(f"🎉 Sent closing email - all required fields complete")
+                        
+            except Exception as e:
+                print(f"❌ Failed to send remaining questions email: {e}")
+        
         else:
             print("ℹ️ No proposal generated; nothing to apply.")
 
