@@ -127,6 +127,7 @@ def _sanitize_url(u: str) -> str:
     u = re.sub(r'[\)\]\}\.,;:!?]+$', '', u)
     # If a trailing capitalized token got glued on (e.g., 'Thank'/'Thanks'), drop it
     u = re.sub(r'(?i)(thank(?:s| you)?)$', '', u)
+    u = re.sub(r'On$', '', u)
     return u
 
 def _subject_to_address_city(subject: str) -> tuple[str, str]:
