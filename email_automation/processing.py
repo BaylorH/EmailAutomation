@@ -7,7 +7,7 @@ from typing import Dict, Any, List
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .clients import _fs, _get_sheet_id_or_fail, _sheets_client
-from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column
+from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, _header_index_map
 from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable
 from .messaging import (save_message, index_message_id, dump_thread_from_firestore, 
                        has_processed, mark_processed, set_last_scan_iso, 
@@ -254,9 +254,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 except Exception as e:
                     print(f"❌ Failed to append links to sheet: {e}")
         
-        # NEW: URL exploration - find URLs in message and fetch content
+        # NEW: URL exploration - find URLs in message and fetch content for AI processing only
         url_texts = []
-        found_urls = []  # collect; don't write to a row yet
         url_pattern = r'https?://[^\s<>"\']+'
         urls_found = re.findall(url_pattern, _full_text)
         
@@ -265,7 +264,6 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             fetched_text = fetch_url_as_text(clean)
             if fetched_text:
                 url_texts.append({"url": clean, "text": fetched_text})
-            found_urls.append(clean)  # defer writing so we know which row to target
         
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)
@@ -312,11 +310,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     notes=proposal.get("notes")
                 )
             
-            # NEW: Process events from the proposal
-            events = proposal.get("events", [])
+            # Process events from the proposal
             sheets = _sheets_client()
             row_anchor = get_row_anchor(rowvals, header)
             
+            events = proposal.get("events", [])
             for event in events:
                 event_type = event.get("type")
                 
@@ -388,12 +386,56 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             print(f"❌ Failed to handle property_unavailable: {e}")
                     else:
                         print(f"⚠️ Property unavailable event detected but no explicit unavailability keywords found")
-                
+
                 elif event_type == "new_property":
-                    # Insert new property row and create a PENDING notification (do NOT send email)
                     try:
                         address = event.get("address", "")
                         city = event.get("city", "")
+                        
+                        # Skip if no address provided
+                        if not address or not address.strip():
+                            print("⚠️ No address provided for new_property event, skipping")
+                            continue
+                        
+                        address = address.strip()
+                        city = city.strip() if city else ""
+                        
+                        # Check if property already exists in sheet
+                        tab_title = _get_first_tab_title(sheets, sheet_id)
+                        resp = sheets.spreadsheets().values().get(
+                            spreadsheetId=sheet_id,
+                            range=f"{tab_title}!3:1000"  # Skip header rows, read data rows
+                        ).execute()
+                        
+                        existing_rows = resp.get("values", [])
+                        property_exists = False
+                        
+                        # Build header index map to find address/city columns
+                        idx_map = _header_index_map(header)
+                        addr_col = idx_map.get("property address") or idx_map.get("address")
+                        city_col = idx_map.get("city")
+                        
+                        if addr_col is not None:
+                            # Check each row for existing property
+                            for row_idx, row in enumerate(existing_rows, start=3):
+                                if len(row) > (addr_col - 1):  # -1 because idx_map is 1-based
+                                    existing_addr = (row[addr_col - 1] or "").strip().lower()
+                                    existing_city = ""
+                                    
+                                    if city_col is not None and len(row) > (city_col - 1):
+                                        existing_city = (row[city_col - 1] or "").strip().lower()
+                                    
+                                    # Match both address and city
+                                    if (existing_addr == address.lower() and 
+                                        existing_city == city.lower()):
+                                        property_exists = True
+                                        print(f"ℹ️ Property '{address}, {city}' already exists in row {row_idx}, skipping")
+                                        break
+                        
+                        if property_exists:
+                            continue  # Skip this event - property already exists
+                        
+                        # Property doesn't exist, proceed with creation
                         link = event.get("link", "")
                         notes = event.get("notes", "")
                         
@@ -408,6 +450,21 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             values_by_header["email"] = from_addr_lower
                             values_by_header["email address"] = from_addr_lower
                         
+                        # Copy leasing company and contact from current row
+                        leasing_company_idx = idx_map.get("leasing company") or idx_map.get("leasing company ")
+                        leasing_contact_idx = idx_map.get("leasing contact") 
+                        
+                        if leasing_company_idx and (leasing_company_idx - 1) < len(rowvals):
+                            leasing_company = rowvals[leasing_company_idx - 1]
+                            if leasing_company:
+                                values_by_header["leasing company"] = leasing_company
+                                values_by_header["leasing company "] = leasing_company
+                        
+                        if leasing_contact_idx and (leasing_contact_idx - 1) < len(rowvals):
+                            leasing_contact = rowvals[leasing_contact_idx - 1]
+                            if leasing_contact:
+                                values_by_header["leasing contact"] = leasing_contact
+                        
                         # Put the URL itself in Flyer / Link initially
                         if link:
                             values_by_header["flyer / link"] = link
@@ -416,7 +473,6 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         if notes:
                             values_by_header["listing brokers comments"] = notes
 
-                        tab_title = _get_first_tab_title(sheets, sheet_id)
                         new_rownum = insert_property_row_above_divider(sheets, sheet_id, tab_title, values_by_header)
 
                         # Reformat after insert
@@ -432,19 +488,19 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             "subject": f"{address}, {city}" if city else address,
                             "body": f"""Hi,
 
-We noticed you mentioned a new property: {address}{', ' + city if city else ''}.
+                We noticed you mentioned a new property: {address}{', ' + city if city else ''}.
 
-Could you please provide the following details for this property:
+                Could you please provide the following details for this property:
 
-- Total square footage
-- Rent per square foot per year
-- Operating expenses per square foot
-- Number of drive-in doors
-- Number of dock doors  
-- Ceiling height
-- Power specifications
+                - Total square footage
+                - Rent per square foot per year
+                - Operating expenses per square foot
+                - Number of drive-in doors
+                - Number of dock doors  
+                - Ceiling height
+                - Power specifications
 
-Thanks!""",
+                Thanks!""",
                             "clientId": client_id,
                             "rowNumber": new_rownum
                         }
@@ -467,7 +523,7 @@ Thanks!""",
                                 "notes": notes,
                                 "suggestedEmail": email_payload
                             },
-                            dedupe_key=f"new_property_pending:{address}:{city}:{from_addr_lower}"
+                            dedupe_key=f"new_property_pending:{thread_id}:{address}:{city}:{from_addr_lower}"
                         )
                         print(f"🏢 Created new property row and pending notification")
 
@@ -478,35 +534,6 @@ Thanks!""",
                     # This will be handled below in the required fields check
                     print(f"💬 Close conversation event detected")
 
-            # FINAL: append discovered URLs to the correct row
-            try:
-                if found_urls:
-                    # target = new row if created; else stick with original row
-                    target_row = new_row_number if (new_row_created and new_row_number) else rownum
-
-                    # If target is the original row and it's now below NON-VIABLE, skip writing links
-                    tab_title = _get_first_tab_title(sheets, sheet_id)
-                    try:
-                        a_col = sheets.spreadsheets().values().get(
-                            spreadsheetId=sheet_id, range=f"{tab_title}!A:A"
-                        ).execute().get("values", [])
-                        divider_row = None
-                        for i, r in enumerate(a_col, start=1):
-                            if r and str(r[0]).strip().upper() == "NON-VIABLE":
-                                divider_row = i
-                                break
-                    except Exception:
-                        divider_row = None
-
-                    if not (divider_row and target_row > divider_row):
-                        # de-dupe in the list we pass (doesn't check existing cell content)
-                        unique_links = list(dict.fromkeys(found_urls))
-                        append_links_to_flyer_link_column(sheets, sheet_id, header, target_row, unique_links)
-                    else:
-                        print("ℹ️ Skipped writing links to non-viable row.")
-            except Exception as e:
-                print(f"❌ Failed final link append: {e}")
-            
             # Required fields check and remaining questions flow
             try:
                 sheets = _sheets_client()
