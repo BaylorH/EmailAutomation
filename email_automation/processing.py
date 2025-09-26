@@ -488,19 +488,19 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             "subject": f"{address}, {city}" if city else address,
                             "body": f"""Hi,
 
-                We noticed you mentioned a new property: {address}{', ' + city if city else ''}.
+We noticed you mentioned a new property: {address}{', ' + city if city else ''}.
 
-                Could you please provide the following details for this property:
+Could you please provide the following details for this property:
 
-                - Total square footage
-                - Rent per square foot per year
-                - Operating expenses per square foot
-                - Number of drive-in doors
-                - Number of dock doors  
-                - Ceiling height
-                - Power specifications
+- Total square footage
+- Rent per square foot per year
+- Operating expenses per square foot
+- Number of drive-in doors
+- Number of dock doors  
+- Ceiling height
+- Power specifications
 
-                Thanks!""",
+Thanks!""",
                             "clientId": client_id,
                             "rowNumber": new_rownum
                         }
