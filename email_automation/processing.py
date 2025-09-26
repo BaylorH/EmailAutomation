@@ -254,7 +254,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 except Exception as e:
                     print(f"❌ Failed to append links to sheet: {e}")
         
-        # NEW: URL exploration - find URLs in message and fetch content for AI processing only
+        # URL exploration - find URLs in message and fetch content for AI processing only
         url_texts = []
         url_pattern = r'https?://[^\s<>"\']+'
         urls_found = re.findall(url_pattern, _full_text)
