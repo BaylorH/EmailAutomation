@@ -257,7 +257,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         # NEW: URL exploration - find URLs in message and fetch content
         url_texts = []
         found_urls = []  # collect; don't write to a row yet
-        url_pattern = r'https?://[^\s<>"\']+[^\s<>"\'.,;)]'
+        url_pattern = r'https?://[^\s<>"\']+'
         urls_found = re.findall(url_pattern, _full_text)
         
         for url in urls_found[:3]:  # Limit to 3 URLs to avoid overwhelming
