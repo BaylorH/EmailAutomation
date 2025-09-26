@@ -488,17 +488,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             "subject": f"{address}, {city}" if city else address,
                             "body": f"""Hi,
 
-We noticed you mentioned a new property: {address}{', ' + city if city else ''}.
+You mentioned a new property: {address}{', ' + city if city else ''}.
 
-Could you please provide the following details for this property:
+If you think this might be a good fit:
+> Can you please verify the current asking rent rates and NNN's?
+> Provide any floor plans or flyers you may have.
+> When will the space be available?
 
-- Total square footage
-- Rent per square foot per year
-- Operating expenses per square foot
-- Number of drive-in doors
-- Number of dock doors  
-- Ceiling height
-- Power specifications
+Just like before — if this one’s no longer available or not a fit, feel free to let me know so I can cross it off and stop bugging you. And of course, if you know of any others that might be a good fit, I’d love to hear about them.
 
 Thanks!""",
                             "clientId": client_id,
