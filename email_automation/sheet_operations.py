@@ -1,5 +1,5 @@
 from typing import Optional, List, Dict, Any
-from .clients import _sheets_client, _fs
+from .clients import _fs, _sheets_client
 from .sheets import _get_first_tab_title, _read_header_row2, _header_index_map, _first_sheet_props, _find_row_by_address_city, _find_row_by_email
 from .utils import _subject_to_address_city
 
@@ -190,17 +190,18 @@ def move_row_below_divider(sheets, spreadsheet_id: str, tab_title: str, src_row:
         print(f"❌ Failed to move row below divider: {e}")
         raise
 
-def insert_property_row_above_divider(sheets, spreadsheet_id: str, tab_title: str, values_by_header: dict) -> int:
+def insert_property_row_above_divider(sheets, sheet_id: str, tab_title: str, values_by_header: dict) -> int:
     """
     Insert a new property row one row above the divider (or at end if no divider).
     Returns the new row number.
+    FIXED: All parameter references changed to sheet_id.
     """
     try:
-        header = _read_header_row2(sheets, spreadsheet_id, tab_title)
+        header = _read_header_row2(sheets, sheet_id, tab_title)
         
         # Find divider
         resp = sheets.spreadsheets().values().get(
-            spreadsheet_id=spreadsheet_id,
+            spreadsheetId=sheet_id,
             range=f"{tab_title}!A:A"
         ).execute()
         rows = resp.get("values", [])
@@ -223,14 +224,14 @@ def insert_property_row_above_divider(sheets, spreadsheet_id: str, tab_title: st
             value = values_by_header.get(key, "")
             row_values.append(value)
         
-        # Insert the row
-        sheet_id = _first_sheet_props(sheets, spreadsheet_id)[0]
+        # Insert the row - FIXED: Use sheet_id for both internal ID lookup and API calls
+        sheet_id_internal = _first_sheet_props(sheets, sheet_id)[0]
         
         insert_request = {
             "requests": [{
                 "insertRange": {
                     "range": {
-                        "sheetId": sheet_id,
+                        "sheetId": sheet_id_internal,
                         "startRowIndex": insert_row - 1,
                         "endRowIndex": insert_row
                     },
@@ -240,14 +241,14 @@ def insert_property_row_above_divider(sheets, spreadsheet_id: str, tab_title: st
         }
         
         sheets.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
+            spreadsheetId=sheet_id,
             body=insert_request
         ).execute()
         
-        # Fill the new row with values
+        # Fill the new row with values - FIXED: Use sheet_id consistently
         if row_values:
             sheets.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
+                spreadsheetId=sheet_id,
                 range=f"{tab_title}!{insert_row}:{insert_row}",
                 valueInputOption="RAW",
                 body={"values": [row_values]}
