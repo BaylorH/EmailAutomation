@@ -269,21 +269,42 @@ I'll review the new property details and get back to you if I have any questions
 Best regards"""
         
         base = "https://graph.microsoft.com/v1.0"
+        
+        # Try to find the original message to reply to
         q = {"$filter": f"internetMessageId eq '{thread_id}'", "$select": "id"}
-        lookup = requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
-        lookup.raise_for_status()
+        lookup = exponential_backoff_request(
+            lambda: requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
+        )
         vals = lookup.json().get("value", [])
 
         if vals:
+            # Reply in-thread
             graph_id = vals[0]["id"]
             reply_payload = {"comment": body}
-            resp = requests.post(f"{base}/me/messages/{graph_id}/reply",
-                               headers=headers, json=reply_payload, timeout=30)
-            resp.raise_for_status()
-            print(f"📧 Sent thank you + closing (new property suggested)")
-            return True
+            resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
+                                     headers=headers, json=reply_payload, timeout=30)
+            )
+            print(f"📧 Sent thank you + closing (new property suggested) via reply")
+        else:
+            # Fallback: send new email with proper threading headers
+            msg = {
+                "subject": "Re: Property update",
+                "body": {"contentType": "Text", "content": body},
+                "toRecipients": [{"emailAddress": {"address": recipient}}],
+                "internetMessageHeaders": [
+                    {"name": "In-Reply-To", "value": thread_id},
+                    {"name": "References", "value": thread_id}
+                ]
+            }
+            send_payload = {"message": msg, "saveToSentItems": True}
+            resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/sendMail", headers=headers, 
+                                     json=send_payload, timeout=30)
+            )
+            print(f"📧 Sent thank you + closing (new property suggested) via sendMail")
         
-        return False
+        return True
         
     except Exception as e:
         print(f"❌ Failed to send thank you email: {e}")
@@ -304,21 +325,42 @@ Do you have any other properties that might be a good fit for our requirements?
 Best regards"""
         
         base = "https://graph.microsoft.com/v1.0"
+        
+        # Try to find the original message to reply to
         q = {"$filter": f"internetMessageId eq '{thread_id}'", "$select": "id"}
-        lookup = requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
-        lookup.raise_for_status()
+        lookup = exponential_backoff_request(
+            lambda: requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
+        )
         vals = lookup.json().get("value", [])
 
         if vals:
+            # Reply in-thread
             graph_id = vals[0]["id"]
             reply_payload = {"comment": body}
-            resp = requests.post(f"{base}/me/messages/{graph_id}/reply",
-                               headers=headers, json=reply_payload, timeout=30)
-            resp.raise_for_status()
-            print(f"📧 Sent thank you + ask for alternatives")
-            return True
+            resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
+                                     headers=headers, json=reply_payload, timeout=30)
+            )
+            print(f"📧 Sent thank you + ask for alternatives via reply")
+        else:
+            # Fallback: send new email with proper threading headers
+            msg = {
+                "subject": "Re: Property availability",
+                "body": {"contentType": "Text", "content": body},
+                "toRecipients": [{"emailAddress": {"address": recipient}}],
+                "internetMessageHeaders": [
+                    {"name": "In-Reply-To", "value": thread_id},
+                    {"name": "References", "value": thread_id}
+                ]
+            }
+            send_payload = {"message": msg, "saveToSentItems": True}
+            resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/sendMail", headers=headers, 
+                                     json=send_payload, timeout=30)
+            )
+            print(f"📧 Sent thank you + ask for alternatives via sendMail")
         
-        return False
+        return True
         
     except Exception as e:
         print(f"❌ Failed to send alternatives request: {e}")
@@ -344,21 +386,42 @@ To complete the property details, could you please provide:
 Thanks!"""
         
         base = "https://graph.microsoft.com/v1.0"
+        
+        # Try to find the original message to reply to
         q = {"$filter": f"internetMessageId eq '{thread_id}'", "$select": "id"}
-        lookup = requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
-        lookup.raise_for_status()
+        lookup = exponential_backoff_request(
+            lambda: requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
+        )
         vals = lookup.json().get("value", [])
 
         if vals:
+            # Reply in-thread
             graph_id = vals[0]["id"]
             reply_payload = {"comment": body}
-            resp = requests.post(f"{base}/me/messages/{graph_id}/reply",
-                               headers=headers, json=reply_payload, timeout=30)
-            resp.raise_for_status()
-            print(f"📧 Sent thank you + missing fields request")
-            return True
+            resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
+                                     headers=headers, json=reply_payload, timeout=30)
+            )
+            print(f"📧 Sent thank you + missing fields request via reply")
+        else:
+            # Fallback: send new email with proper threading headers
+            msg = {
+                "subject": "Re: Property information",
+                "body": {"contentType": "Text", "content": body},
+                "toRecipients": [{"emailAddress": {"address": recipient}}],
+                "internetMessageHeaders": [
+                    {"name": "In-Reply-To", "value": thread_id},
+                    {"name": "References", "value": thread_id}
+                ]
+            }
+            send_payload = {"message": msg, "saveToSentItems": True}
+            resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/sendMail", headers=headers, 
+                                     json=send_payload, timeout=30)
+            )
+            print(f"📧 Sent thank you + missing fields request via sendMail")
         
-        return False
+        return True
         
     except Exception as e:
         print(f"❌ Failed to send missing fields request: {e}")
