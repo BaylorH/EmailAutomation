@@ -254,3 +254,112 @@ Thanks!"""
     except Exception as e:
         print(f"❌ Failed to send new property email: {e}")
         return None
+    
+def send_thankyou_closing_with_new_property(uid: str, client_id: str, headers: dict, 
+                                           recipient: str, thread_id: str, 
+                                           row_number: int, row_anchor: str) -> bool:
+    """Send thank you when property is unavailable but they suggested a new one."""
+    try:
+        body = """Hi,
+
+Thank you for letting me know that property is no longer available, and thanks for suggesting the alternative property.
+
+I'll review the new property details and get back to you if I have any questions.
+
+Best regards"""
+        
+        base = "https://graph.microsoft.com/v1.0"
+        q = {"$filter": f"internetMessageId eq '{thread_id}'", "$select": "id"}
+        lookup = requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
+        lookup.raise_for_status()
+        vals = lookup.json().get("value", [])
+
+        if vals:
+            graph_id = vals[0]["id"]
+            reply_payload = {"comment": body}
+            resp = requests.post(f"{base}/me/messages/{graph_id}/reply",
+                               headers=headers, json=reply_payload, timeout=30)
+            resp.raise_for_status()
+            print(f"📧 Sent thank you + closing (new property suggested)")
+            return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"❌ Failed to send thank you email: {e}")
+        return False
+
+
+def send_thankyou_ask_alternatives(uid: str, client_id: str, headers: dict, 
+                                  recipient: str, thread_id: str, 
+                                  row_number: int, row_anchor: str) -> bool:
+    """Send thank you + ask for alternatives when property is unavailable."""
+    try:
+        body = """Hi,
+
+Thank you for letting me know that property is no longer available.
+
+Do you have any other properties that might be a good fit for our requirements?
+
+Best regards"""
+        
+        base = "https://graph.microsoft.com/v1.0"
+        q = {"$filter": f"internetMessageId eq '{thread_id}'", "$select": "id"}
+        lookup = requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
+        lookup.raise_for_status()
+        vals = lookup.json().get("value", [])
+
+        if vals:
+            graph_id = vals[0]["id"]
+            reply_payload = {"comment": body}
+            resp = requests.post(f"{base}/me/messages/{graph_id}/reply",
+                               headers=headers, json=reply_payload, timeout=30)
+            resp.raise_for_status()
+            print(f"📧 Sent thank you + ask for alternatives")
+            return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"❌ Failed to send alternatives request: {e}")
+        return False
+
+
+def send_thankyou_request_missing_fields(uid: str, client_id: str, headers: dict, 
+                                        recipient: str, missing_fields: List[str],
+                                        thread_id: str, row_number: int, 
+                                        row_anchor: str) -> bool:
+    """Send thank you + request missing field values."""
+    try:
+        field_list = "\n".join(f"- {field}" for field in missing_fields)
+        
+        body = f"""Hi,
+
+Thank you for the information!
+
+To complete the property details, could you please provide:
+
+{field_list}
+
+Thanks!"""
+        
+        base = "https://graph.microsoft.com/v1.0"
+        q = {"$filter": f"internetMessageId eq '{thread_id}'", "$select": "id"}
+        lookup = requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
+        lookup.raise_for_status()
+        vals = lookup.json().get("value", [])
+
+        if vals:
+            graph_id = vals[0]["id"]
+            reply_payload = {"comment": body}
+            resp = requests.post(f"{base}/me/messages/{graph_id}/reply",
+                               headers=headers, json=reply_payload, timeout=30)
+            resp.raise_for_status()
+            print(f"📧 Sent thank you + missing fields request")
+            return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"❌ Failed to send missing fields request: {e}")
+        return False

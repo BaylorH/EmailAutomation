@@ -18,7 +18,13 @@ from .file_handling import fetch_pdf_attachments, upload_pdf_to_drive, upload_pd
 from .notifications import write_notification, add_client_notifications
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview, 
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url)
-from .email_operations import send_remaining_questions_email, send_closing_email
+from .email_operations import (
+    send_remaining_questions_email, 
+    send_closing_email,
+    send_thankyou_closing_with_new_property,
+    send_thankyou_ask_alternatives,
+    send_thankyou_request_missing_fields
+)
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 
 def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email: str | None):
@@ -532,57 +538,81 @@ Thanks!""",
                     print(f"💬 Close conversation event detected")
 
             # Required fields check and remaining questions flow
+            # Automatic response logic based on property state
             try:
-                sheets = _sheets_client()
-                tab_title = _get_first_tab_title(sheets, sheet_id)
-
-                # Stateless divider check so we don't nag on non-viable rows
-                try:
-                    div_resp = sheets.spreadsheets().values().get(
-                        spreadsheetId=sheet_id, range=f"{tab_title}!A:A"
-                    ).execute()
-                    a_col = div_resp.get("values", [])
-                    divider_row = None
-                    for i, r in enumerate(a_col, start=1):
-                        if r and str(r[0]).strip().upper() == "NON-VIABLE":
-                            divider_row = i
-                            break
-                except Exception as _e:
-                    divider_row = None
-
-                if old_row_became_nonviable or new_row_created or (divider_row and rownum > divider_row):
-                    print("ℹ️ Skipping remaining-questions for old row (non-viable and/or new property pending).")
-                else:
-                    # Re-read row data in case it was updated
-                    resp = sheets.spreadsheets().values().get(
-                        spreadsheetId=sheet_id,
-                        range=f"{tab_title}!{rownum}:{rownum}"
-                    ).execute()
-                    current_row = resp.get("values", [[]])[0] if resp.get("values") else []
-                    if len(current_row) < len(header):
-                        current_row.extend([""] * (len(header) - len(current_row)))
+                response_sent = False
+                
+                # Scenario 1: Property became non-viable AND new property was suggested
+                if old_row_became_nonviable and new_row_created:
+                    sent = send_thankyou_closing_with_new_property(
+                        user_id, client_id, headers, from_addr_lower,
+                        thread_id, rownum, row_anchor
+                    )
+                    if sent:
+                        response_sent = True
+                
+                # Scenario 2: Property became non-viable but NO new property suggested
+                elif old_row_became_nonviable and not new_row_created:
+                    sent = send_thankyou_ask_alternatives(
+                        user_id, client_id, headers, from_addr_lower,
+                        thread_id, rownum, row_anchor
+                    )
+                    if sent:
+                        response_sent = True
+                
+                # Scenario 3 & 4: Property is still viable - check missing fields
+                if not response_sent and not old_row_became_nonviable:
+                    sheets = _sheets_client()
+                    tab_title = _get_first_tab_title(sheets, sheet_id)
                     
-                    missing_fields = check_missing_required_fields(current_row, header)
+                    # Check if row is below NON-VIABLE divider
+                    try:
+                        div_resp = sheets.spreadsheets().values().get(
+                            spreadsheetId=sheet_id, range=f"{tab_title}!A:A"
+                        ).execute()
+                        a_col = div_resp.get("values", [])
+                        divider_row = None
+                        for i, r in enumerate(a_col, start=1):
+                            if r and str(r[0]).strip().upper() == "NON-VIABLE":
+                                divider_row = i
+                                break
+                    except Exception as _e:
+                        divider_row = None
                     
-                    if missing_fields:
-                        # Send remaining questions email
-                        sent = send_remaining_questions_email(
-                            user_id, client_id, headers, from_addr_lower, 
-                            missing_fields, thread_id, rownum, row_anchor
-                        )
-                        if sent:
-                            print(f"📧 Sent remaining questions for {len(missing_fields)} missing fields")
+                    # Skip if row is below divider or if new row was created
+                    if new_row_created or (divider_row and rownum > divider_row):
+                        print("ℹ️ Skipping response for non-viable or pending new property row")
                     else:
-                        # All required fields complete - send closing email
-                        sent = send_closing_email(
-                            user_id, client_id, headers, from_addr_lower, 
-                            thread_id, rownum, row_anchor
-                        )
-                        if sent:
-                            print(f"🎉 Sent closing email - all required fields complete")
+                        # Re-read row data to check missing fields
+                        resp = sheets.spreadsheets().values().get(
+                            spreadsheetId=sheet_id,
+                            range=f"{tab_title}!{rownum}:{rownum}"
+                        ).execute()
+                        current_row = resp.get("values", [[]])[0] if resp.get("values") else []
+                        if len(current_row) < len(header):
+                            current_row.extend([""] * (len(header) - len(current_row)))
+                        
+                        missing_fields = check_missing_required_fields(current_row, header)
+                        
+                        if missing_fields:
+                            # Scenario 3: Thank you + request missing fields
+                            sent = send_thankyou_request_missing_fields(
+                                user_id, client_id, headers, from_addr_lower,
+                                missing_fields, thread_id, rownum, row_anchor
+                            )
+                            if sent:
+                                print(f"📧 Sent thank you + missing fields request")
+                        else:
+                            # Scenario 4: All fields complete - send closing
+                            sent = send_closing_email(
+                                user_id, client_id, headers, from_addr_lower,
+                                thread_id, rownum, row_anchor
+                            )
+                            if sent:
+                                print(f"📧 Sent closing email - all fields complete")
                         
             except Exception as e:
-                print(f"❌ Failed to send remaining questions email: {e}")
+                print(f"❌ Failed to send automatic response: {e}")
         
         else:
             print("ℹ️ No proposal generated; nothing to apply.")
