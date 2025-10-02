@@ -19,14 +19,22 @@ TOKEN_CACHE = "msal_token_cache.bin"
 SCHEDULER_AVAILABLE = False
 try:
     # Only try to import if we have the basic required env vars
-    if os.getenv("OPENAI_API_KEY") and os.getenv("FIREBASE_API_KEY") and os.getenv("AZURE_API_APP_ID"):
+    firebase_key = os.getenv("FIREBASE_API_KEY")
+    azure_app_id = os.getenv("AZURE_API_APP_ID")
+    
+    print(f"🔍 Environment check: FIREBASE_API_KEY={'✅' if firebase_key else '❌'}, AZURE_API_APP_ID={'✅' if azure_app_id else '❌'}")
+    
+    if firebase_key and azure_app_id:
+        print("🚀 Attempting to import scheduler modules...")
         from email_automation.clients import list_user_ids, decode_token_payload
         from email_automation.email import send_outboxes
         from email_automation.processing import scan_inbox_against_index
         SCHEDULER_AVAILABLE = True
         print("✅ Scheduler functionality available")
     else:
-        print("⚠️ Scheduler functionality disabled - missing optional environment variables")
+        print("⚠️ Scheduler functionality disabled - missing environment variables")
+        print(f"   FIREBASE_API_KEY: {'present' if firebase_key else 'MISSING'}")
+        print(f"   AZURE_API_APP_ID: {'present' if azure_app_id else 'MISSING'}")
 except (ImportError, RuntimeError) as e:
     print(f"⚠️ Scheduler functionality not available: {e}")
 
@@ -57,7 +65,7 @@ app.config.update(
 )
 
 CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
-CLIENT_SECRET = os.getenv("AZURE_API_CLIENT_SECRET")  # Fixed to match GitHub secrets
+CLIENT_SECRET = os.getenv("AZURE_API_CLIENT_SECRET") or os.getenv("AZURE_CLIENT_SECRET")  # Support both names
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
 AUTHORITY        = "https://login.microsoftonline.com/common"
 SCOPES           = ["Mail.ReadWrite", "Mail.Send"]
@@ -623,9 +631,20 @@ def api_trigger_scheduler():
 def api_scheduler_status():
     """Get the current status of the scheduler"""
     global scheduler_status
+    
+    # Debug information
+    env_vars = {
+        "FIREBASE_API_KEY": "✅" if os.getenv("FIREBASE_API_KEY") else "❌",
+        "AZURE_API_APP_ID": "✅" if os.getenv("AZURE_API_APP_ID") else "❌", 
+        "OPENAI_API_KEY": "✅" if os.getenv("OPENAI_API_KEY") else "❌",
+        "AZURE_API_CLIENT_SECRET": "✅" if os.getenv("AZURE_API_CLIENT_SECRET") else "❌",
+        "AZURE_CLIENT_SECRET": "✅" if os.getenv("AZURE_CLIENT_SECRET") else "❌"
+    }
+    
     return jsonify({
         **scheduler_status,
-        "scheduler_available": SCHEDULER_AVAILABLE
+        "scheduler_available": SCHEDULER_AVAILABLE,
+        "debug_env_vars": env_vars
     })
 
 # Web-based authentication routes
