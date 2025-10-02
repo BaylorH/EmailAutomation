@@ -446,8 +446,57 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     # Only proceed if we find explicit unavailability language
                     if any(keyword in message_content for keyword in unavailable_keywords):
                         try:
+                            # Find which keyword triggered the unavailability detection
+                            found_keyword = next(keyword for keyword in unavailable_keywords if keyword in message_content)
+                            
                             divider_row = ensure_nonviable_divider(sheets, sheet_id, tab_title)
                             new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
+                            
+                            # Add comment to "Jill and Clients comments" column explaining why it was marked unviable
+                            try:
+                                # Find the comments column index
+                                comments_col_idx = None
+                                for i, col_name in enumerate(header):
+                                    if col_name and "jill and clients comments" in col_name.lower():
+                                        comments_col_idx = i + 1  # 1-based for Sheets API
+                                        break
+                                
+                                if comments_col_idx:
+                                    # Get current date for the comment
+                                    from datetime import datetime
+                                    current_date = datetime.now().strftime("%m/%d/%Y")
+                                    
+                                    # Create comment explaining why property was marked unviable
+                                    unavailable_comment = f"[{current_date}] Property marked unavailable - contact said: '{found_keyword}'"
+                                    
+                                    # Get existing comments to append to them
+                                    existing_resp = sheets.spreadsheets().values().get(
+                                        spreadsheetId=sheet_id,
+                                        range=f"{tab_title}!{chr(64 + comments_col_idx)}{new_rownum}"
+                                    ).execute()
+                                    existing_comment = ""
+                                    if existing_resp.get("values"):
+                                        existing_comment = existing_resp["values"][0][0] if existing_resp["values"][0] else ""
+                                    
+                                    # Combine existing and new comments
+                                    if existing_comment.strip():
+                                        final_comment = f"{existing_comment.strip()} | {unavailable_comment}"
+                                    else:
+                                        final_comment = unavailable_comment
+                                    
+                                    # Update the comments cell
+                                    sheets.spreadsheets().values().update(
+                                        spreadsheetId=sheet_id,
+                                        range=f"{tab_title}!{chr(64 + comments_col_idx)}{new_rownum}",
+                                        valueInputOption="RAW",
+                                        body={"values": [[final_comment]]}
+                                    ).execute()
+                                    
+                                    print(f"💬 Added unavailability comment: {unavailable_comment}")
+                                else:
+                                    print(f"⚠️ Could not find 'Jill and Clients comments' column to add unavailability reason")
+                            except Exception as comment_error:
+                                print(f"⚠️ Failed to add unavailability comment: {comment_error}")
                             
                             # Reformat after move
                             format_sheet_columns_autosize_with_exceptions(sheet_id, header)
