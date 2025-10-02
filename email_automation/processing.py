@@ -214,7 +214,35 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     
     # Only proceed if we successfully matched a sheet row
     if sheet_id and rownum is not None:
-        from_addr_lower = (from_addr or "").lower()
+        # Get the correct recipient email from the thread metadata (original external contact)
+        # instead of using the current message sender
+        try:
+            thread_doc = _fs.collection("users").document(user_id).collection("threads").document(thread_id).get()
+            thread_data = thread_doc.to_dict() or {}
+            thread_emails = thread_data.get("email", [])
+            
+            # Find the external contact email (not our own email addresses)
+            our_email_patterns = ["baylor.freelance@outlook.com", "outlook.com"]  # Add your email patterns here
+            external_email = None
+            
+            for email in thread_emails:
+                email_lower = (email or "").lower()
+                # Skip if it's one of our email addresses
+                is_our_email = any(pattern in email_lower for pattern in our_email_patterns)
+                if not is_our_email:
+                    external_email = email_lower
+                    break
+            
+            # Use external email if found, otherwise fall back to current sender
+            recipient_email = external_email or (from_addr or "").lower()
+            print(f"📧 Reply recipient determined: {recipient_email} (from thread: {thread_emails})")
+            
+        except Exception as e:
+            print(f"⚠️ Could not determine thread recipient, using current sender: {e}")
+            recipient_email = (from_addr or "").lower()
+        
+        # Keep the original variable name for compatibility but use correct recipient
+        from_addr_lower = recipient_email
 
         # --- flags for gating later ---
         old_row_became_nonviable = False   # set true when we move the row below divider
