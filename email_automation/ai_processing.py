@@ -205,10 +205,19 @@ def apply_proposal_to_sheet(
                 skipped.append({"column": col_name, "reason": "human-override"})
                 continue
 
-            # 3) no prior AI write but cell already has a value → assume human value; skip
+            # 3) no prior AI write but cell already has a value → check if we should still update
             if not meta and (old_val or "").strip() != "":
-                skipped.append({"column": col_name, "reason": "existing-human-value"})
-                continue
+                # Allow updates in these cases:
+                # a) AI has high confidence (≥ 0.8)
+                # b) Existing value looks incomplete/placeholder (short, vague, or contains "TBD", "?", etc.)
+                old_val_clean = (old_val or "").strip().lower()
+                is_placeholder = any(marker in old_val_clean for marker in ["tbd", "?", "n/a", "na", "unknown", "pending"])
+                is_short_incomplete = len(old_val_clean) <= 3 and old_val_clean.isdigit() == False
+                has_high_confidence = conf and float(conf) >= 0.8
+                
+                if not (has_high_confidence or is_placeholder or is_short_incomplete):
+                    skipped.append({"column": col_name, "reason": "existing-human-value", "oldValue": old_val, "confidence": conf})
+                    continue
 
             # 4) otherwise proceed to write...
             data_payload.append({"range": rng, "values": [[new_val]]})
@@ -236,6 +245,20 @@ def apply_proposal_to_sheet(
         # Update AI_META for each applied change
         for a in applied:
             _append_ai_meta(sheets, sheet_id, rownum, a["column"], a["newValue"], override=False)
+
+        # Enhanced logging for debugging
+        print(f"\n✅ Applied {len(applied)} updates, skipped {len(skipped)}")
+        if applied:
+            print("   Applied updates:")
+            for a in applied:
+                print(f"     • {a['column']}: '{a['oldValue']}' → '{a['newValue']}' (confidence: {a.get('confidence', 'N/A')})")
+        if skipped:
+            print("   Skipped updates:")
+            for s in skipped:
+                reason = s.get('reason', 'unknown')
+                old_val = s.get('oldValue', '')
+                conf = s.get('confidence', 'N/A')
+                print(f"     • {s.get('column', 'Unknown')}: '{old_val}' (reason: {reason}, confidence: {conf})")
 
         return {"applied": applied, "skipped": skipped}
 
@@ -442,6 +465,14 @@ OUTPUT ONLY valid JSON in this exact format:
         # ---- Log + store in sheetChangeLog -----------------------------------
         print(f"\n🤖 OpenAI Proposal for {client_id}__{email}:")
         print(json.dumps(proposal, indent=2))
+        
+        # Log what updates were suggested for debugging
+        if proposal.get("updates"):
+            print(f"\n📝 Proposed {len(proposal['updates'])} field updates:")
+            for upd in proposal["updates"]:
+                print(f"   • {upd.get('column', 'Unknown')}: '{upd.get('value', '')}' (confidence: {upd.get('confidence', 'N/A')})")
+        else:
+            print(f"\n📝 No field updates proposed")
 
         now_utc = datetime.now(timezone.utc)
         log_doc_id = f"{thread_id}__{now_utc.isoformat().replace(':','-').replace('.','-').replace('+00:00','Z')}"
