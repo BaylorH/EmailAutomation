@@ -64,6 +64,9 @@ Thanks!"""
             resp = requests.post(f"{base}/me/messages/{graph_id}/reply",
                                  headers=headers, json=reply_payload, timeout=30)
             resp.raise_for_status()
+            # Verify successful response
+            if not resp or resp.status_code not in [200, 201, 202]:
+                raise Exception(f"Reply failed with status {resp.status_code if resp else 'None'}")
         else:
             # 3) Fallback: send a new email (no custom In-Reply-To headers)
             msg = {
@@ -74,6 +77,9 @@ Thanks!"""
             send_payload = {"message": msg, "saveToSentItems": True}
             resp = requests.post(f"{base}/me/sendMail", headers=headers, json=send_payload, timeout=30)
             resp.raise_for_status()
+            # Verify successful response
+            if not resp or resp.status_code not in [200, 201, 202]:
+                raise Exception(f"SendMail failed with status {resp.status_code if resp else 'None'}")
         
         # Create action_needed notification
         write_notification(
@@ -93,6 +99,10 @@ Thanks!"""
         
     except Exception as e:
         print(f"❌ Failed to send remaining questions email: {e}")
+        # Add more detailed error information for debugging
+        if hasattr(e, 'response') and e.response:
+            print(f"   HTTP Status: {e.response.status_code}")
+            print(f"   Response: {e.response.text[:500]}...")
         return False
 
 def send_closing_email(uid: str, client_id: str, headers: dict, recipient: str, 
@@ -123,6 +133,10 @@ Best regards"""
         response = requests.post(f"{base}/me/sendMail", headers=headers, json=send_payload, timeout=30)
         response.raise_for_status()
         
+        # Verify successful response
+        if not response or response.status_code not in [200, 201, 202]:
+            raise Exception(f"SendMail failed with status {response.status_code if response else 'None'}")
+        
         # Create row_completed notification
         write_notification(
             uid, client_id,
@@ -141,6 +155,10 @@ Best regards"""
         
     except Exception as e:
         print(f"❌ Failed to send closing email: {e}")
+        # Add more detailed error information for debugging
+        if hasattr(e, 'response') and e.response:
+            print(f"   HTTP Status: {e.response.status_code}")
+            print(f"   Response: {e.response.text[:500]}...")
         return False
 
 def send_new_property_email(uid: str, client_id: str, headers: dict, recipient: str, 
@@ -285,7 +303,11 @@ Best regards"""
                 lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
                                      headers=headers, json=reply_payload, timeout=30)
             )
-            print(f"📧 Sent thank you + closing (new property suggested) via reply")
+            # Only log success if we get a successful response
+            if resp and resp.status_code in [200, 201, 202]:
+                print(f"📧 Sent thank you + closing (new property suggested) via reply")
+            else:
+                raise Exception(f"Reply failed with status {resp.status_code if resp else 'None'}")
         else:
             # Fallback: send new email with proper threading headers
             msg = {
@@ -302,12 +324,20 @@ Best regards"""
                 lambda: requests.post(f"{base}/me/sendMail", headers=headers, 
                                      json=send_payload, timeout=30)
             )
-            print(f"📧 Sent thank you + closing (new property suggested) via sendMail")
+            # Only log success if we get a successful response
+            if resp and resp.status_code in [200, 201, 202]:
+                print(f"📧 Sent thank you + closing (new property suggested) via sendMail")
+            else:
+                raise Exception(f"SendMail failed with status {resp.status_code if resp else 'None'}")
         
         return True
         
     except Exception as e:
         print(f"❌ Failed to send thank you email: {e}")
+        # Add more detailed error information for debugging
+        if hasattr(e, 'response') and e.response:
+            print(f"   HTTP Status: {e.response.status_code}")
+            print(f"   Response: {e.response.text[:500]}...")
         return False
 
 
@@ -341,7 +371,11 @@ Best regards"""
                 lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
                                      headers=headers, json=reply_payload, timeout=30)
             )
-            print(f"📧 Sent thank you + ask for alternatives via reply")
+            # Only log success if we get a successful response
+            if resp and resp.status_code in [200, 201, 202]:
+                print(f"📧 Sent thank you + ask for alternatives via reply")
+            else:
+                raise Exception(f"Reply failed with status {resp.status_code if resp else 'None'}")
         else:
             # Fallback: send new email with proper threading headers
             msg = {
@@ -358,12 +392,20 @@ Best regards"""
                 lambda: requests.post(f"{base}/me/sendMail", headers=headers, 
                                      json=send_payload, timeout=30)
             )
-            print(f"📧 Sent thank you + ask for alternatives via sendMail")
+            # Only log success if we get a successful response
+            if resp and resp.status_code in [200, 201, 202]:
+                print(f"📧 Sent thank you + ask for alternatives via sendMail")
+            else:
+                raise Exception(f"SendMail failed with status {resp.status_code if resp else 'None'}")
         
         return True
         
     except Exception as e:
         print(f"❌ Failed to send alternatives request: {e}")
+        # Add more detailed error information for debugging
+        if hasattr(e, 'response') and e.response:
+            print(f"   HTTP Status: {e.response.status_code}")
+            print(f"   Response: {e.response.text[:500]}...")
         return False
 
 
@@ -402,7 +444,11 @@ Thanks!"""
                 lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
                                      headers=headers, json=reply_payload, timeout=30)
             )
-            print(f"📧 Sent thank you + missing fields request via reply")
+            # Only log success if we get a successful response
+            if resp and resp.status_code in [200, 201, 202]:
+                print(f"📧 Sent thank you + missing fields request via reply")
+            else:
+                raise Exception(f"Reply failed with status {resp.status_code if resp else 'None'}")
         else:
             # Fallback: send new email with proper threading headers
             msg = {
@@ -419,10 +465,18 @@ Thanks!"""
                 lambda: requests.post(f"{base}/me/sendMail", headers=headers, 
                                      json=send_payload, timeout=30)
             )
-            print(f"📧 Sent thank you + missing fields request via sendMail")
+            # Only log success if we get a successful response
+            if resp and resp.status_code in [200, 201, 202]:
+                print(f"📧 Sent thank you + missing fields request via sendMail")
+            else:
+                raise Exception(f"SendMail failed with status {resp.status_code if resp else 'None'}")
         
         return True
         
     except Exception as e:
         print(f"❌ Failed to send missing fields request: {e}")
+        # Add more detailed error information for debugging
+        if hasattr(e, 'response') and e.response:
+            print(f"   HTTP Status: {e.response.status_code}")
+            print(f"   Response: {e.response.text[:500]}...")
         return False
