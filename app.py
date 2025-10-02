@@ -30,10 +30,20 @@ try:
         # Set environment variables that app_config expects
         if not os.getenv("AZURE_API_CLIENT_SECRET"):
             os.environ["AZURE_API_CLIENT_SECRET"] = os.getenv("AZURE_CLIENT_SECRET", "")
+            print(f"🔧 Set AZURE_API_CLIENT_SECRET from AZURE_CLIENT_SECRET")
         
+        print("🔍 Importing email_automation.clients...")
         from email_automation.clients import list_user_ids, decode_token_payload
+        print("✅ Successfully imported clients")
+        
+        print("🔍 Importing email_automation.email...")
         from email_automation.email import send_outboxes
+        print("✅ Successfully imported email")
+        
+        print("🔍 Importing email_automation.processing...")
         from email_automation.processing import scan_inbox_against_index
+        print("✅ Successfully imported processing")
+        
         SCHEDULER_AVAILABLE = True
         print("✅ Scheduler functionality available")
     else:
@@ -41,8 +51,12 @@ try:
         print(f"   FIREBASE_API_KEY: {'present' if firebase_key else 'MISSING'}")
         print(f"   AZURE_API_APP_ID: {'present' if azure_app_id else 'MISSING'}")
 except (ImportError, RuntimeError) as e:
+    import_error_message = f"{type(e).__name__}: {str(e)}"
     print(f"⚠️ Scheduler functionality not available: {e}")
-    print(f"⚠️ Import error details: {type(e).__name__}: {str(e)}")
+    print(f"⚠️ Import error details: {import_error_message}")
+    
+    # Store error for debugging
+    globals()['IMPORT_ERROR'] = import_error_message
 
 # Define dummy functions if scheduler not available
 if not SCHEDULER_AVAILABLE:
@@ -650,7 +664,8 @@ def api_scheduler_status():
     return jsonify({
         **scheduler_status,
         "scheduler_available": SCHEDULER_AVAILABLE,
-        "debug_env_vars": env_vars
+        "debug_env_vars": env_vars,
+        "import_error": globals().get('IMPORT_ERROR', 'No import error recorded')
     })
 
 # Web-based authentication routes
