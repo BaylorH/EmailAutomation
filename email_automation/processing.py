@@ -27,6 +27,66 @@ from .email_operations import (
 )
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 
+def send_reply_in_thread(user_id: str, headers: dict, body: str, thread_id: str, recipient: str) -> bool:
+    """Send a reply within an existing email thread using the same logic as email_operations.py"""
+    try:
+        from .utils import exponential_backoff_request
+        import requests
+        
+        base = "https://graph.microsoft.com/v1.0"
+        
+        # 1) Find Graph message id by our stored internetMessageId (thread_id)
+        q = {"$filter": f"internetMessageId eq '{thread_id}'", "$select": "id"}
+        lookup = exponential_backoff_request(
+            lambda: requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
+        )
+        vals = lookup.json().get("value", [])
+
+        if vals:
+            # 2) Reply in-thread (this preserves proper headers)
+            graph_id = vals[0]["id"]
+            reply_payload = {"comment": body}
+            resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
+                                     headers=headers, json=reply_payload, timeout=30)
+            )
+            
+            # Verify successful response
+            if resp and resp.status_code in [200, 201, 202]:
+                print(f"   ✅ Sent reply in thread via /reply endpoint")
+                return True
+            else:
+                print(f"   ❌ Reply failed with status {resp.status_code if resp else 'None'}")
+                return False
+        else:
+            # 3) Fallback: send a new email with proper threading headers
+            msg = {
+                "subject": "Re: Property information",
+                "body": {"contentType": "Text", "content": body},
+                "toRecipients": [{"emailAddress": {"address": recipient}}],
+                "internetMessageHeaders": [
+                    {"name": "In-Reply-To", "value": thread_id},
+                    {"name": "References", "value": thread_id}
+                ]
+            }
+            send_payload = {"message": msg, "saveToSentItems": True}
+            resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/sendMail", headers=headers, 
+                                     json=send_payload, timeout=30)
+            )
+            
+            # Verify successful response
+            if resp and resp.status_code in [200, 201, 202]:
+                print(f"   ✅ Sent reply via /sendMail with threading headers")
+                return True
+            else:
+                print(f"   ❌ SendMail failed with status {resp.status_code if resp else 'None'}")
+                return False
+        
+    except Exception as e:
+        print(f"   ❌ Failed to send reply: {e}")
+        return False
+
 def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email: str | None):
     # Read thread (to get clientId)
     tdoc = (_fs.collection("users").document(uid)
@@ -576,7 +636,7 @@ Thanks!""",
                 
                 # Scenario 1: Property became non-viable AND new property was suggested
                 if old_row_became_nonviable and new_row_created:
-                    # Use the existing working email sending function
+                    # Send reply within the existing thread
                     thank_you_body = """Hi,
 
 Thank you for letting me know that property is no longer available, and thanks for suggesting the alternative property.
@@ -585,20 +645,16 @@ I'll review the new property details and get back to you if I have any questions
 
 Best regards"""
                     
-                    result = send_and_index_email(
-                        user_id, headers, thank_you_body, [from_addr_lower], 
-                        client_id_or_none=client_id, row_number=rownum
-                    )
-                    
-                    if result["sent"]:
+                    sent = send_reply_in_thread(user_id, headers, thank_you_body, thread_id, from_addr_lower)
+                    if sent:
                         print(f"📧 Sent thank you + closing (new property suggested) to: {from_addr_lower}")
                         response_sent = True
                     else:
-                        print(f"❌ Failed to send thank you email: {result['errors']}")
+                        print(f"❌ Failed to send thank you email")
                 
                 # Scenario 2: Property became non-viable but NO new property suggested
                 elif old_row_became_nonviable and not new_row_created:
-                    # Use the existing working email sending function
+                    # Send reply within the existing thread
                     alternatives_body = """Hi,
 
 Thank you for letting me know that property is no longer available.
@@ -607,16 +663,12 @@ Do you have any other properties that might be a good fit for our requirements?
 
 Best regards"""
                     
-                    result = send_and_index_email(
-                        user_id, headers, alternatives_body, [from_addr_lower], 
-                        client_id_or_none=client_id, row_number=rownum
-                    )
-                    
-                    if result["sent"]:
+                    sent = send_reply_in_thread(user_id, headers, alternatives_body, thread_id, from_addr_lower)
+                    if sent:
                         print(f"📧 Sent thank you + ask for alternatives to: {from_addr_lower}")
                         response_sent = True
                     else:
-                        print(f"❌ Failed to send alternatives request: {result['errors']}")
+                        print(f"❌ Failed to send alternatives request")
                 
                 # Scenario 3 & 4: Property is still viable - check missing fields
                 if not response_sent and not old_row_became_nonviable:
@@ -654,11 +706,9 @@ Best regards"""
                         
                         if missing_fields:
                             # Scenario 3: Thank you + request missing fields
-                            # Use the existing working email sending function
-                            from .email import send_and_index_email
-                            
+                            # Send reply within the existing thread
                             field_list = "\n".join(f"- {field}" for field in missing_fields)
-                            email_body = f"""Hi,
+                            reply_body = f"""Hi,
 
 Thank you for the information!
 
@@ -668,18 +718,14 @@ To complete the property details, could you please provide:
 
 Thanks!"""
                             
-                            result = send_and_index_email(
-                                user_id, headers, email_body, [from_addr_lower], 
-                                client_id_or_none=client_id, row_number=rownum
-                            )
-                            
-                            if result["sent"]:
+                            sent = send_reply_in_thread(user_id, headers, reply_body, thread_id, from_addr_lower)
+                            if sent:
                                 print(f"📧 Sent thank you + missing fields request to: {from_addr_lower}")
                             else:
-                                print(f"❌ Failed to send missing fields request: {result['errors']}")
+                                print(f"❌ Failed to send missing fields request")
                         else:
                             # Scenario 4: All fields complete - send closing
-                            # Use the existing working email sending function
+                            # Send reply within the existing thread
                             closing_body = """Hi,
 
 Thank you for providing all the requested information! We now have everything we need for your property details.
@@ -688,15 +734,11 @@ We'll be in touch if we need any additional information.
 
 Best regards"""
                             
-                            result = send_and_index_email(
-                                user_id, headers, closing_body, [from_addr_lower], 
-                                client_id_or_none=client_id, row_number=rownum
-                            )
-                            
-                            if result["sent"]:
+                            sent = send_reply_in_thread(user_id, headers, closing_body, thread_id, from_addr_lower)
+                            if sent:
                                 print(f"📧 Sent closing email - all fields complete to: {from_addr_lower}")
                             else:
-                                print(f"❌ Failed to send closing email: {result['errors']}")
+                                print(f"❌ Failed to send closing email")
                         
             except Exception as e:
                 print(f"❌ Failed to send automatic response: {e}")
