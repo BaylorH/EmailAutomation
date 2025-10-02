@@ -27,39 +27,28 @@ from .email_operations import (
 )
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 
-def send_reply_in_thread(user_id: str, headers: dict, body: str, thread_id: str, recipient: str) -> bool:
-    """Send a reply within an existing email thread using the same logic as email_operations.py"""
+def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
+    """Send a reply to the current message being processed"""
     try:
         from .utils import exponential_backoff_request
         import requests
         
         base = "https://graph.microsoft.com/v1.0"
         
-        # 1) Find Graph message id by our stored internetMessageId (thread_id)
-        q = {"$filter": f"internetMessageId eq '{thread_id}'", "$select": "id"}
-        lookup = exponential_backoff_request(
-            lambda: requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
+        # Reply directly to the current message we're processing
+        reply_payload = {"comment": body}
+        resp = exponential_backoff_request(
+            lambda: requests.post(f"{base}/me/messages/{current_msg_id}/reply",
+                                 headers=headers, json=reply_payload, timeout=30)
         )
-        vals = lookup.json().get("value", [])
-
-        if vals:
-            # 2) Reply in-thread (this preserves proper headers)
-            graph_id = vals[0]["id"]
-            reply_payload = {"comment": body}
-            resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
-                                     headers=headers, json=reply_payload, timeout=30)
-            )
-            
-            # Verify successful response
-            if resp and resp.status_code in [200, 201, 202]:
-                print(f"   ✅ Sent reply in thread via /reply endpoint")
-                return True
-            else:
-                print(f"   ❌ Reply failed with status {resp.status_code if resp else 'None'}")
-                return False
+        
+        # Verify successful response
+        if resp and resp.status_code in [200, 201, 202]:
+            print(f"   ✅ Sent reply to current message via /reply endpoint")
+            return True
         else:
-            # 3) Fallback: send a new email with proper threading headers
+            print(f"   ❌ Reply failed with status {resp.status_code if resp else 'None'}")
+            # Fallback: send a new email with proper threading headers
             msg = {
                 "subject": "Re: Property information",
                 "body": {"contentType": "Text", "content": body},
@@ -645,7 +634,7 @@ I'll review the new property details and get back to you if I have any questions
 
 Best regards"""
                     
-                    sent = send_reply_in_thread(user_id, headers, thank_you_body, thread_id, from_addr_lower)
+                     sent = send_reply_in_thread(user_id, headers, thank_you_body, msg_id, from_addr_lower, thread_id)
                     if sent:
                         print(f"📧 Sent thank you + closing (new property suggested) to: {from_addr_lower}")
                         response_sent = True
@@ -663,7 +652,7 @@ Do you have any other properties that might be a good fit for our requirements?
 
 Best regards"""
                     
-                    sent = send_reply_in_thread(user_id, headers, alternatives_body, thread_id, from_addr_lower)
+                     sent = send_reply_in_thread(user_id, headers, alternatives_body, msg_id, from_addr_lower, thread_id)
                     if sent:
                         print(f"📧 Sent thank you + ask for alternatives to: {from_addr_lower}")
                         response_sent = True
@@ -718,7 +707,7 @@ To complete the property details, could you please provide:
 
 Thanks!"""
                             
-                            sent = send_reply_in_thread(user_id, headers, reply_body, thread_id, from_addr_lower)
+                             sent = send_reply_in_thread(user_id, headers, reply_body, msg_id, from_addr_lower, thread_id)
                             if sent:
                                 print(f"📧 Sent thank you + missing fields request to: {from_addr_lower}")
                             else:
@@ -734,7 +723,7 @@ We'll be in touch if we need any additional information.
 
 Best regards"""
                             
-                            sent = send_reply_in_thread(user_id, headers, closing_body, thread_id, from_addr_lower)
+                             sent = send_reply_in_thread(user_id, headers, closing_body, msg_id, from_addr_lower, thread_id)
                             if sent:
                                 print(f"📧 Sent closing email - all fields complete to: {from_addr_lower}")
                             else:
