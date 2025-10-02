@@ -16,13 +16,26 @@ try:
     from email_automation.processing import scan_inbox_against_index
     from email_automation.app_config import AUTHORITY, SCOPES, TOKEN_CACHE
     SCHEDULER_AVAILABLE = True
-except ImportError as e:
+except (ImportError, RuntimeError) as e:
     print(f"⚠️ Scheduler functionality not available: {e}")
     SCHEDULER_AVAILABLE = False
     # Fallback values for basic Flask app functionality
     AUTHORITY = "https://login.microsoftonline.com/common"
     SCOPES = ["Mail.ReadWrite", "Mail.Send"]
     TOKEN_CACHE = "msal_token_cache.bin"
+    
+    # Define dummy functions to prevent NameError
+    def list_user_ids():
+        return []
+    
+    def decode_token_payload(token):
+        return {}
+    
+    def send_outboxes(user_id, headers):
+        return {"success": False, "error": "Scheduler not available"}
+    
+    def scan_inbox_against_index(user_id, headers, only_unread=True, top=50):
+        return {"success": False, "error": "Scheduler not available"}
 
 app = Flask(__name__)
 
