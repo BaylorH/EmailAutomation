@@ -26,6 +26,11 @@ try:
     
     if firebase_key and azure_app_id:
         print("🚀 Attempting to import scheduler modules...")
+        
+        # Set environment variables that app_config expects
+        if not os.getenv("AZURE_API_CLIENT_SECRET"):
+            os.environ["AZURE_API_CLIENT_SECRET"] = os.getenv("AZURE_CLIENT_SECRET", "")
+        
         from email_automation.clients import list_user_ids, decode_token_payload
         from email_automation.email import send_outboxes
         from email_automation.processing import scan_inbox_against_index
@@ -37,6 +42,7 @@ try:
         print(f"   AZURE_API_APP_ID: {'present' if azure_app_id else 'MISSING'}")
 except (ImportError, RuntimeError) as e:
     print(f"⚠️ Scheduler functionality not available: {e}")
+    print(f"⚠️ Import error details: {type(e).__name__}: {str(e)}")
 
 # Define dummy functions if scheduler not available
 if not SCHEDULER_AVAILABLE:
