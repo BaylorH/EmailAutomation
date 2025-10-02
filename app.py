@@ -6,13 +6,23 @@ from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
-# Import scheduler logic
-from email_automation.clients import list_user_ids, decode_token_payload
-from email_automation.email import send_outboxes
-from email_automation.processing import scan_inbox_against_index
-from email_automation.app_config import AUTHORITY, SCOPES, TOKEN_CACHE
 import threading
 import time
+
+# Try to import scheduler logic - gracefully handle missing dependencies
+try:
+    from email_automation.clients import list_user_ids, decode_token_payload
+    from email_automation.email import send_outboxes
+    from email_automation.processing import scan_inbox_against_index
+    from email_automation.app_config import AUTHORITY, SCOPES, TOKEN_CACHE
+    SCHEDULER_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Scheduler functionality not available: {e}")
+    SCHEDULER_AVAILABLE = False
+    # Fallback values for basic Flask app functionality
+    AUTHORITY = "https://login.microsoftonline.com/common"
+    SCOPES = ["Mail.ReadWrite", "Mail.Send"]
+    TOKEN_CACHE = "msal_token_cache.bin"
 
 app = Flask(__name__)
 
@@ -96,6 +106,9 @@ def auto_upload_token():
 
 def refresh_and_process_user(user_id: str):
     """Process a single user - same logic as main.py"""
+    if not SCHEDULER_AVAILABLE:
+        return {"success": False, "error": "Scheduler functionality not available - missing dependencies"}
+    
     print(f"\n🔄 Processing user: {user_id}")
     
     try:
@@ -176,6 +189,9 @@ def refresh_and_process_user(user_id: str):
 
 def run_scheduler():
     """Run the full scheduler for all users - same logic as main.py"""
+    if not SCHEDULER_AVAILABLE:
+        return {"success": False, "error": "Scheduler functionality not available - missing dependencies"}
+    
     try:
         all_users = list_user_ids()
         print(f"📦 Found {len(all_users)} token cache users: {all_users}")
@@ -526,6 +542,13 @@ def api_trigger_scheduler():
     """
     global scheduler_status
     
+    # Check if scheduler functionality is available
+    if not SCHEDULER_AVAILABLE:
+        return jsonify({
+            "success": False,
+            "error": "Scheduler functionality not available - missing required environment variables or dependencies"
+        }), 503
+    
     # Check if scheduler is already running
     if scheduler_status["running"]:
         return jsonify({
@@ -577,7 +600,10 @@ def api_trigger_scheduler():
 def api_scheduler_status():
     """Get the current status of the scheduler"""
     global scheduler_status
-    return jsonify(scheduler_status)
+    return jsonify({
+        **scheduler_status,
+        "scheduler_available": SCHEDULER_AVAILABLE
+    })
 
 # Web-based authentication routes
 @app.route("/auth/login")
