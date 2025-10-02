@@ -291,9 +291,9 @@ def index():
                         {% endif %}
                     </div>
                     
-                    <button class="btn btn-danger" onclick="disconnectEmail()">
+                    <!-- <button class="btn btn-danger" onclick="disconnectEmail()">
                         🔓 Disconnect Email Access
-                    </button>
+                    </button> -->
                 {% else %}
                     <div class="status-card status-pending">
                         <h3><span class="icon">⏳</span> Email Access Required</h3>
