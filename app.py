@@ -4,6 +4,7 @@ import subprocess
 import json
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
+from flask_cors import CORS
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
 import threading
@@ -44,6 +45,9 @@ if not SCHEDULER_AVAILABLE:
         return {"success": False, "error": "Scheduler not available"}
 
 app = Flask(__name__)
+
+# Enable CORS for all routes and origins
+CORS(app, origins=["http://localhost:3000", "https://your-frontend-domain.com", "*"])
 
 app.secret_key = os.getenv("SECRET_KEY", "some-default-secret")
 
