@@ -215,48 +215,30 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     # Only proceed if we successfully matched a sheet row
     if sheet_id and rownum is not None:
         # Get the correct recipient email from the thread metadata (original external contact)
-        # instead of using the current message sender
+        # The send_and_index_email function will handle threading properly
         try:
-            # First, get the current authenticated user's email address
-            current_user_email = None
-            try:
-                me_response = exponential_backoff_request(
-                    lambda: requests.get("https://graph.microsoft.com/v1.0/me", 
-                                       headers=headers, 
-                                       params={"$select": "mail,userPrincipalName"}, 
-                                       timeout=30)
-                )
-                me_data = me_response.json()
-                current_user_email = (me_data.get("mail") or me_data.get("userPrincipalName", "")).lower()
-                print(f"📧 Current authenticated user: {current_user_email}")
-            except Exception as e:
-                print(f"⚠️ Could not get current user email: {e}")
-            
-            # Get thread participants
+            # Get thread participants to find the external contact
             thread_doc = _fs.collection("users").document(user_id).collection("threads").document(thread_id).get()
             thread_data = thread_doc.to_dict() or {}
             thread_emails = thread_data.get("email", [])
             
-            # Find the external contact email (not the current user's email)
+            # Find the external contact email (the one in the sheet row)
+            # Look up the email from the matched row since that's the external contact
             external_email = None
+            if rowvals and len(rowvals) > 5:  # Email is typically in column 6 (index 5)
+                sheet_email = (rowvals[5] or "").strip().lower()
+                if sheet_email and "@" in sheet_email:
+                    external_email = sheet_email
             
-            for email in thread_emails:
-                email_lower = (email or "").lower()
-                # Skip if it's the current user's email
-                if current_user_email and email_lower != current_user_email:
-                    external_email = email_lower
-                    break
-                elif not current_user_email and email_lower != (from_addr or "").lower():
-                    # Fallback: if we couldn't get user email, exclude current sender
-                    external_email = email_lower
-                    break
+            # Fallback: use thread participants if sheet email not found
+            if not external_email and thread_emails:
+                external_email = thread_emails[0].lower()
             
-            # Use external email if found, otherwise fall back to current sender
+            # Final fallback: use current sender
             recipient_email = external_email or (from_addr or "").lower()
             print(f"📧 Reply recipient determined: {recipient_email}")
             print(f"   Thread participants: {thread_emails}")
-            print(f"   Current user: {current_user_email}")
-            print(f"   Current message sender: {from_addr}")
+            print(f"   Sheet email: {rowvals[5] if rowvals and len(rowvals) > 5 else 'N/A'}")
             print(f"   Will reply to: {recipient_email}")
             
         except Exception as e:
@@ -594,23 +576,47 @@ Thanks!""",
                 
                 # Scenario 1: Property became non-viable AND new property was suggested
                 if old_row_became_nonviable and new_row_created:
-                    sent = send_thankyou_closing_with_new_property(
-                        user_id, client_id, headers, from_addr_lower,
-                        thread_id, rownum, row_anchor
+                    # Use the existing working email sending function
+                    thank_you_body = """Hi,
+
+Thank you for letting me know that property is no longer available, and thanks for suggesting the alternative property.
+
+I'll review the new property details and get back to you if I have any questions.
+
+Best regards"""
+                    
+                    result = send_and_index_email(
+                        user_id, headers, thank_you_body, [from_addr_lower], 
+                        client_id_or_none=client_id, row_number=rownum
                     )
-                    if sent:
+                    
+                    if result["sent"]:
                         print(f"📧 Sent thank you + closing (new property suggested) to: {from_addr_lower}")
                         response_sent = True
+                    else:
+                        print(f"❌ Failed to send thank you email: {result['errors']}")
                 
                 # Scenario 2: Property became non-viable but NO new property suggested
                 elif old_row_became_nonviable and not new_row_created:
-                    sent = send_thankyou_ask_alternatives(
-                        user_id, client_id, headers, from_addr_lower,
-                        thread_id, rownum, row_anchor
+                    # Use the existing working email sending function
+                    alternatives_body = """Hi,
+
+Thank you for letting me know that property is no longer available.
+
+Do you have any other properties that might be a good fit for our requirements?
+
+Best regards"""
+                    
+                    result = send_and_index_email(
+                        user_id, headers, alternatives_body, [from_addr_lower], 
+                        client_id_or_none=client_id, row_number=rownum
                     )
-                    if sent:
+                    
+                    if result["sent"]:
                         print(f"📧 Sent thank you + ask for alternatives to: {from_addr_lower}")
                         response_sent = True
+                    else:
+                        print(f"❌ Failed to send alternatives request: {result['errors']}")
                 
                 # Scenario 3 & 4: Property is still viable - check missing fields
                 if not response_sent and not old_row_became_nonviable:
@@ -648,20 +654,49 @@ Thanks!""",
                         
                         if missing_fields:
                             # Scenario 3: Thank you + request missing fields
-                            sent = send_thankyou_request_missing_fields(
-                                user_id, client_id, headers, from_addr_lower,
-                                missing_fields, thread_id, rownum, row_anchor
+                            # Use the existing working email sending function
+                            from .email import send_and_index_email
+                            
+                            field_list = "\n".join(f"- {field}" for field in missing_fields)
+                            email_body = f"""Hi,
+
+Thank you for the information!
+
+To complete the property details, could you please provide:
+
+{field_list}
+
+Thanks!"""
+                            
+                            result = send_and_index_email(
+                                user_id, headers, email_body, [from_addr_lower], 
+                                client_id_or_none=client_id, row_number=rownum
                             )
-                            if sent:
+                            
+                            if result["sent"]:
                                 print(f"📧 Sent thank you + missing fields request to: {from_addr_lower}")
+                            else:
+                                print(f"❌ Failed to send missing fields request: {result['errors']}")
                         else:
                             # Scenario 4: All fields complete - send closing
-                            sent = send_closing_email(
-                                user_id, client_id, headers, from_addr_lower,
-                                thread_id, rownum, row_anchor
+                            # Use the existing working email sending function
+                            closing_body = """Hi,
+
+Thank you for providing all the requested information! We now have everything we need for your property details.
+
+We'll be in touch if we need any additional information.
+
+Best regards"""
+                            
+                            result = send_and_index_email(
+                                user_id, headers, closing_body, [from_addr_lower], 
+                                client_id_or_none=client_id, row_number=rownum
                             )
-                            if sent:
+                            
+                            if result["sent"]:
                                 print(f"📧 Sent closing email - all fields complete to: {from_addr_lower}")
+                            else:
+                                print(f"❌ Failed to send closing email: {result['errors']}")
                         
             except Exception as e:
                 print(f"❌ Failed to send automatic response: {e}")
