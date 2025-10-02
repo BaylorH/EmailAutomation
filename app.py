@@ -9,22 +9,28 @@ from firebase_helpers import upload_token
 import threading
 import time
 
-# Try to import scheduler logic - gracefully handle missing dependencies
+# Constants for basic Flask app functionality (same as before)
+AUTHORITY = "https://login.microsoftonline.com/common"
+SCOPES = ["Mail.ReadWrite", "Mail.Send"]
+TOKEN_CACHE = "msal_token_cache.bin"
+
+# Try to import scheduler logic - completely optional
+SCHEDULER_AVAILABLE = False
 try:
-    from email_automation.clients import list_user_ids, decode_token_payload
-    from email_automation.email import send_outboxes
-    from email_automation.processing import scan_inbox_against_index
-    from email_automation.app_config import AUTHORITY, SCOPES, TOKEN_CACHE
-    SCHEDULER_AVAILABLE = True
+    # Only try to import if we have the basic required env vars
+    if os.getenv("OPENAI_API_KEY") and os.getenv("FIREBASE_API_KEY") and os.getenv("AZURE_API_APP_ID"):
+        from email_automation.clients import list_user_ids, decode_token_payload
+        from email_automation.email import send_outboxes
+        from email_automation.processing import scan_inbox_against_index
+        SCHEDULER_AVAILABLE = True
+        print("✅ Scheduler functionality available")
+    else:
+        print("⚠️ Scheduler functionality disabled - missing optional environment variables")
 except (ImportError, RuntimeError) as e:
     print(f"⚠️ Scheduler functionality not available: {e}")
-    SCHEDULER_AVAILABLE = False
-    # Fallback values for basic Flask app functionality
-    AUTHORITY = "https://login.microsoftonline.com/common"
-    SCOPES = ["Mail.ReadWrite", "Mail.Send"]
-    TOKEN_CACHE = "msal_token_cache.bin"
-    
-    # Define dummy functions to prevent NameError
+
+# Define dummy functions if scheduler not available
+if not SCHEDULER_AVAILABLE:
     def list_user_ids():
         return []
     
@@ -47,7 +53,7 @@ app.config.update(
 )
 
 CLIENT_ID        = os.getenv("AZURE_API_APP_ID")
-CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
+CLIENT_SECRET = os.getenv("AZURE_API_CLIENT_SECRET")  # Fixed to match GitHub secrets
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
 AUTHORITY        = "https://login.microsoftonline.com/common"
 SCOPES           = ["Mail.ReadWrite", "Mail.Send"]
