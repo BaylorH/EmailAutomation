@@ -634,7 +634,7 @@ I'll review the new property details and get back to you if I have any questions
 
 Best regards"""
                     
-                     sent = send_reply_in_thread(user_id, headers, thank_you_body, msg_id, from_addr_lower, thread_id)
+                    sent = send_reply_in_thread(user_id, headers, thank_you_body, msg_id, from_addr_lower, thread_id)
                     if sent:
                         print(f"📧 Sent thank you + closing (new property suggested) to: {from_addr_lower}")
                         response_sent = True
@@ -652,7 +652,7 @@ Do you have any other properties that might be a good fit for our requirements?
 
 Best regards"""
                     
-                     sent = send_reply_in_thread(user_id, headers, alternatives_body, msg_id, from_addr_lower, thread_id)
+                    sent = send_reply_in_thread(user_id, headers, alternatives_body, msg_id, from_addr_lower, thread_id)
                     if sent:
                         print(f"📧 Sent thank you + ask for alternatives to: {from_addr_lower}")
                         response_sent = True
@@ -707,7 +707,7 @@ To complete the property details, could you please provide:
 
 Thanks!"""
                             
-                             sent = send_reply_in_thread(user_id, headers, reply_body, msg_id, from_addr_lower, thread_id)
+                            sent = send_reply_in_thread(user_id, headers, reply_body, msg_id, from_addr_lower, thread_id)
                             if sent:
                                 print(f"📧 Sent thank you + missing fields request to: {from_addr_lower}")
                             else:
@@ -723,7 +723,7 @@ We'll be in touch if we need any additional information.
 
 Best regards"""
                             
-                             sent = send_reply_in_thread(user_id, headers, closing_body, msg_id, from_addr_lower, thread_id)
+                            sent = send_reply_in_thread(user_id, headers, closing_body, msg_id, from_addr_lower, thread_id)
                             if sent:
                                 print(f"📧 Sent closing email - all fields complete to: {from_addr_lower}")
                             else:
