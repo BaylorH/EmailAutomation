@@ -217,25 +217,47 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         # Get the correct recipient email from the thread metadata (original external contact)
         # instead of using the current message sender
         try:
+            # First, get the current authenticated user's email address
+            current_user_email = None
+            try:
+                me_response = exponential_backoff_request(
+                    lambda: requests.get("https://graph.microsoft.com/v1.0/me", 
+                                       headers=headers, 
+                                       params={"$select": "mail,userPrincipalName"}, 
+                                       timeout=30)
+                )
+                me_data = me_response.json()
+                current_user_email = (me_data.get("mail") or me_data.get("userPrincipalName", "")).lower()
+                print(f"📧 Current authenticated user: {current_user_email}")
+            except Exception as e:
+                print(f"⚠️ Could not get current user email: {e}")
+            
+            # Get thread participants
             thread_doc = _fs.collection("users").document(user_id).collection("threads").document(thread_id).get()
             thread_data = thread_doc.to_dict() or {}
             thread_emails = thread_data.get("email", [])
             
-            # Find the external contact email (not our own email addresses)
-            our_email_patterns = ["baylor.freelance@outlook.com", "outlook.com"]  # Add your email patterns here
+            # Find the external contact email (not the current user's email)
             external_email = None
             
             for email in thread_emails:
                 email_lower = (email or "").lower()
-                # Skip if it's one of our email addresses
-                is_our_email = any(pattern in email_lower for pattern in our_email_patterns)
-                if not is_our_email:
+                # Skip if it's the current user's email
+                if current_user_email and email_lower != current_user_email:
+                    external_email = email_lower
+                    break
+                elif not current_user_email and email_lower != (from_addr or "").lower():
+                    # Fallback: if we couldn't get user email, exclude current sender
                     external_email = email_lower
                     break
             
             # Use external email if found, otherwise fall back to current sender
             recipient_email = external_email or (from_addr or "").lower()
-            print(f"📧 Reply recipient determined: {recipient_email} (from thread: {thread_emails})")
+            print(f"📧 Reply recipient determined: {recipient_email}")
+            print(f"   Thread participants: {thread_emails}")
+            print(f"   Current user: {current_user_email}")
+            print(f"   Current message sender: {from_addr}")
+            print(f"   Will reply to: {recipient_email}")
             
         except Exception as e:
             print(f"⚠️ Could not determine thread recipient, using current sender: {e}")
@@ -577,6 +599,7 @@ Thanks!""",
                         thread_id, rownum, row_anchor
                     )
                     if sent:
+                        print(f"📧 Sent thank you + closing (new property suggested) to: {from_addr_lower}")
                         response_sent = True
                 
                 # Scenario 2: Property became non-viable but NO new property suggested
@@ -586,6 +609,7 @@ Thanks!""",
                         thread_id, rownum, row_anchor
                     )
                     if sent:
+                        print(f"📧 Sent thank you + ask for alternatives to: {from_addr_lower}")
                         response_sent = True
                 
                 # Scenario 3 & 4: Property is still viable - check missing fields
@@ -629,7 +653,7 @@ Thanks!""",
                                 missing_fields, thread_id, rownum, row_anchor
                             )
                             if sent:
-                                print(f"📧 Sent thank you + missing fields request")
+                                print(f"📧 Sent thank you + missing fields request to: {from_addr_lower}")
                         else:
                             # Scenario 4: All fields complete - send closing
                             sent = send_closing_email(
@@ -637,7 +661,7 @@ Thanks!""",
                                 thread_id, rownum, row_anchor
                             )
                             if sent:
-                                print(f"📧 Sent closing email - all fields complete")
+                                print(f"📧 Sent closing email - all fields complete to: {from_addr_lower}")
                         
             except Exception as e:
                 print(f"❌ Failed to send automatic response: {e}")
