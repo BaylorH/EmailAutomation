@@ -15,6 +15,11 @@ AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Mail.ReadWrite", "Mail.Send"]
 TOKEN_CACHE = "msal_token_cache.bin"
 
+# Fix environment variable naming before anything else
+if not os.getenv("AZURE_API_CLIENT_SECRET") and os.getenv("AZURE_CLIENT_SECRET"):
+    os.environ["AZURE_API_CLIENT_SECRET"] = os.getenv("AZURE_CLIENT_SECRET")
+    print(f"🔧 Fixed: Set AZURE_API_CLIENT_SECRET from AZURE_CLIENT_SECRET")
+
 # Try to import scheduler logic - completely optional
 SCHEDULER_AVAILABLE = False
 try:
@@ -27,10 +32,23 @@ try:
     if firebase_key and azure_app_id:
         print("🚀 Attempting to import scheduler modules...")
         
-        # Set environment variables that app_config expects
-        if not os.getenv("AZURE_API_CLIENT_SECRET"):
-            os.environ["AZURE_API_CLIENT_SECRET"] = os.getenv("AZURE_CLIENT_SECRET", "")
-            print(f"🔧 Set AZURE_API_CLIENT_SECRET from AZURE_CLIENT_SECRET")
+        # Set up Google credentials if we have the service account JSON
+        firebase_sa_key = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+        if firebase_sa_key:
+            import tempfile
+            import json
+            # Create temporary service account file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                if isinstance(firebase_sa_key, str):
+                    # If it's a string, assume it's JSON
+                    f.write(firebase_sa_key)
+                else:
+                    json.dump(firebase_sa_key, f)
+                temp_sa_path = f.name
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_sa_path
+            print(f"🔧 Set GOOGLE_APPLICATION_CREDENTIALS to temporary file")
+        else:
+            print("⚠️ No FIREBASE_SERVICE_ACCOUNT_JSON found - Firestore may not work")
         
         print("🔍 Importing email_automation.clients...")
         from email_automation.clients import list_user_ids, decode_token_payload
