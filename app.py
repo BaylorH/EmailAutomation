@@ -686,6 +686,107 @@ def api_scheduler_status():
         "import_error": globals().get('IMPORT_ERROR', 'No import error recorded')
     })
 
+@app.route("/api/debug-inbox", methods=["GET"])
+def api_debug_inbox():
+    """Debug endpoint to check inbox status and email processing"""
+    if not SCHEDULER_AVAILABLE:
+        return jsonify({"error": "Scheduler functionality not available"}), 503
+    
+    try:
+        from email_automation.clients import list_user_ids
+        from firebase_helpers import download_token
+        from msal import ConfidentialClientApplication, SerializableTokenCache
+        import requests
+        from datetime import datetime, timedelta, timezone
+        
+        # Get first user for debugging
+        user_ids = list_user_ids()
+        if not user_ids:
+            return jsonify({"error": "No users found"}), 404
+        
+        user_id = user_ids[0]
+        
+        # Download token and setup client
+        download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
+        cache = SerializableTokenCache()
+        with open(TOKEN_CACHE, "r") as f:
+            cache.deserialize(f.read())
+        
+        app_obj = ConfidentialClientApplication(
+            CLIENT_ID,
+            client_credential=CLIENT_SECRET,
+            authority=AUTHORITY,
+            token_cache=cache
+        )
+        
+        accounts = app_obj.get_accounts()
+        if not accounts:
+            return jsonify({"error": "No account found"}), 404
+        
+        result = app_obj.acquire_token_silent(SCOPES, account=accounts[0])
+        if not result or "access_token" not in result:
+            return jsonify({"error": "Failed to get access token"}), 401
+        
+        headers = {
+            "Authorization": f"Bearer {result['access_token']}",
+            "Content-Type": "application/json"
+        }
+        
+        # Check inbox with 5-hour filter (same as scheduler)
+        now_utc = datetime.now(timezone.utc)
+        cutoff_time = now_utc - timedelta(hours=5)
+        cutoff_iso = cutoff_time.isoformat().replace("+00:00", "Z")
+        
+        # Get recent emails
+        response = requests.get(
+            "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages",
+            headers=headers,
+            params={
+                "$top": "10",
+                "$orderby": "receivedDateTime desc",
+                "$select": "id,subject,from,toRecipients,receivedDateTime,isRead,conversationId,internetMessageId",
+                "$filter": f"receivedDateTime ge {cutoff_iso}"
+            },
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            return jsonify({"error": f"Failed to fetch emails: {response.status_code}"}), 500
+        
+        emails_data = response.json()
+        emails = emails_data.get("value", [])
+        
+        # Check processed status for each email
+        from email_automation.messaging import has_processed
+        
+        debug_info = {
+            "user_id": user_id,
+            "cutoff_time": cutoff_iso,
+            "total_emails_in_window": len(emails),
+            "emails": []
+        }
+        
+        for email in emails:
+            processed_key = email.get("internetMessageId") or email.get("id")
+            is_processed = has_processed(user_id, processed_key) if processed_key else False
+            
+            debug_info["emails"].append({
+                "id": email.get("id"),
+                "internetMessageId": email.get("internetMessageId"),
+                "subject": email.get("subject"),
+                "from": email.get("from", {}).get("emailAddress", {}).get("address"),
+                "receivedDateTime": email.get("receivedDateTime"),
+                "isRead": email.get("isRead"),
+                "conversationId": email.get("conversationId"),
+                "processed_key": processed_key,
+                "is_processed": is_processed
+            })
+        
+        return jsonify(debug_info)
+        
+    except Exception as e:
+        return jsonify({"error": f"Debug failed: {str(e)}"}), 500
+
 # Web-based authentication routes
 @app.route("/auth/login")
 def auth_login():
