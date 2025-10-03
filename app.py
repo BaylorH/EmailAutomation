@@ -87,8 +87,6 @@ if not SCHEDULER_AVAILABLE:
     def send_outboxes(user_id, headers):
         return {"success": False, "error": "Scheduler not available"}
     
-    def scan_inbox_against_index(user_id, headers, only_unread=True, top=50):
-        return {"success": False, "error": "Scheduler not available"}
 
 app = Flask(__name__)
 
@@ -781,6 +779,131 @@ def api_debug_inbox():
                 "processed_key": processed_key,
                 "is_processed": is_processed
             })
+        
+        return jsonify(debug_info)
+        
+    except Exception as e:
+        return jsonify({"error": f"Debug failed: {str(e)}"}), 500
+
+@app.route("/api/debug-thread-matching", methods=["GET"])
+def api_debug_thread_matching():
+    """Debug endpoint to check thread matching for specific conversation"""
+    if not SCHEDULER_AVAILABLE:
+        return jsonify({"error": "Scheduler functionality not available"}), 503
+    
+    try:
+        from email_automation.clients import list_user_ids
+        from email_automation.messaging import lookup_thread_by_conversation_id
+        from firebase_helpers import download_token
+        from msal import ConfidentialClientApplication, SerializableTokenCache
+        import requests
+        from datetime import datetime, timedelta, timezone
+        
+        # Get first user for debugging
+        user_ids = list_user_ids()
+        if not user_ids:
+            return jsonify({"error": "No users found"}), 404
+        
+        user_id = user_ids[0]
+        
+        # Download token and setup client
+        download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
+        cache = SerializableTokenCache()
+        with open(TOKEN_CACHE, "r") as f:
+            cache.deserialize(f.read())
+        
+        app_obj = ConfidentialClientApplication(
+            CLIENT_ID,
+            client_credential=CLIENT_SECRET,
+            authority=AUTHORITY,
+            token_cache=cache
+        )
+        
+        accounts = app_obj.get_accounts()
+        if not accounts:
+            return jsonify({"error": "No account found"}), 404
+        
+        result = app_obj.acquire_token_silent(SCOPES, account=accounts[0])
+        if not result or "access_token" not in result:
+            return jsonify({"error": "Failed to get access token"}), 401
+        
+        headers = {
+            "Authorization": f"Bearer {result['access_token']}",
+            "Content-Type": "application/json"
+        }
+        
+        # Get the unprocessed email
+        now_utc = datetime.now(timezone.utc)
+        cutoff_time = now_utc - timedelta(hours=5)
+        cutoff_iso = cutoff_time.isoformat().replace("+00:00", "Z")
+        
+        response = requests.get(
+            "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages",
+            headers=headers,
+            params={
+                "$top": "10",
+                "$orderby": "receivedDateTime desc",
+                "$select": "id,subject,from,toRecipients,receivedDateTime,isRead,conversationId,internetMessageId",
+                "$filter": f"receivedDateTime ge {cutoff_iso}"
+            },
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            return jsonify({"error": f"Failed to fetch emails: {response.status_code}"}), 500
+        
+        emails_data = response.json()
+        emails = emails_data.get("value", [])
+        
+        # Find unprocessed email
+        unprocessed_email = None
+        for email in emails:
+            processed_key = email.get("internetMessageId") or email.get("id")
+            from email_automation.messaging import has_processed
+            if not has_processed(user_id, processed_key):
+                unprocessed_email = email
+                break
+        
+        if not unprocessed_email:
+            return jsonify({"error": "No unprocessed emails found"}), 404
+        
+        # Check thread matching
+        conversation_id = unprocessed_email.get("conversationId")
+        thread_id = lookup_thread_by_conversation_id(user_id, conversation_id)
+        
+        debug_info = {
+            "unprocessed_email": {
+                "id": unprocessed_email.get("id"),
+                "subject": unprocessed_email.get("subject"),
+                "from": unprocessed_email.get("from", {}).get("emailAddress", {}).get("address"),
+                "conversationId": conversation_id,
+                "internetMessageId": unprocessed_email.get("internetMessageId")
+            },
+            "thread_matching": {
+                "conversation_id": conversation_id,
+                "thread_id_found": thread_id,
+                "thread_exists": thread_id is not None
+            }
+        }
+        
+        # If thread found, check sheet matching
+        if thread_id:
+            try:
+                from email_automation.processing import fetch_and_log_sheet_for_thread
+                client_id, sheet_id, header, rownum, rowvals = fetch_and_log_sheet_for_thread(
+                    user_id, thread_id, unprocessed_email.get("from", {}).get("emailAddress", {}).get("address")
+                )
+                
+                debug_info["sheet_matching"] = {
+                    "client_id": client_id,
+                    "sheet_id": sheet_id,
+                    "header": header,
+                    "row_found": rownum is not None,
+                    "row_number": rownum,
+                    "row_values": rowvals
+                }
+            except Exception as e:
+                debug_info["sheet_matching"] = {"error": str(e)}
         
         return jsonify(debug_info)
         
