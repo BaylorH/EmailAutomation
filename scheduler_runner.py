@@ -1900,6 +1900,7 @@ COLUMN SEMANTICS & MAPPING (use EXACT header names):
 - "Total SF": Total square footage. Synonyms: sq footage, square feet, SF, size.
 - "Drive Ins": Number of drive-in doors. Synonyms: drive in doors, loading doors.
 - "Ceiling Ht": Ceiling height. Synonyms: max ceiling height, ceiling clearance.
+- "Power": Electrical power specifications. Synonyms: electrical, power capacity, amperage, voltage, electrical service, power supply, electrical load, electrical capacity, power requirements, electrical specs.
 - "Listing Brokers Comments ": Short, non-numeric broker/client notes not covered by other columns. Use terse fragments separated by " • ".
   Do NOT put numeric data like square footage, rent, or ceiling height here if it belongs in dedicated columns.
 
@@ -1908,6 +1909,7 @@ FORMATTING:
 - For square footage, output just the number: "2000" not "2000 SF".
 - For ceiling height, output just the number: "9" not "9 feet" or "9'".
 - For drive-ins, output just the number: "3" not "3 doors".
+- For power, output the electrical specification as provided: "200A", "480V", "100A 3-phase", "208V/120V", "400A service", etc.
 """
 
         DOC_SELECTION_RULES = """
@@ -1926,6 +1928,7 @@ FIELD MINING HINTS:
 - Total SF: prefer the leasable area of the matched suite/building (not total park size).
 - Ceiling Ht: "clear height", "clearance" → output just the number.
 - Drive Ins / Docks: count numerical values for the matched space.
+- Power: look for "200A", "480V", "100A 3-phase", "208V/120V", "400A service", "electrical service", "power capacity", "amperage", "voltage", "electrical load", "power supply", "electrical specs", "electrical requirements".
 - Gross Rent: only compute if BOTH Rent/SF /Yr and Ops Ex /SF are present (sum, 2 decimals).
 """
 
