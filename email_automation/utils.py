@@ -139,3 +139,29 @@ def _subject_to_address_city(subject: str) -> tuple[str, str]:
     addr = parts[0] if parts else ""
     city = parts[1] if len(parts) > 1 else ""
     return addr, city
+
+def get_email_footer() -> str:
+    """Returns HTML formatted email footer for Jill Ames."""
+    return """<br><br>
+Thanks!<br>
+Best,<br>
+<br>
+<strong>Jill Ames</strong><br>
+Real Estate Broker<br>
+Mohr Partners, Inc.<br>
+Direct: 206-510-5575<br>
+<a href="http://www.JillAmes.com">www.JillAmes.com</a><br>
+<br>
+<em>This message and its contents are confidential. If you received this message in error, do not use or rely upon it. Instead, please inform the sender and then delete it. Thank you.</em>"""
+
+def format_email_body_with_footer(body: str) -> str:
+    """
+    Converts plain text email body to HTML and appends footer.
+    Preserves line breaks and formatting.
+    """
+    # Convert plain text to HTML
+    # Replace double newlines with <br><br>, single newlines with <br>
+    html_body = body.replace('\n\n', '<br><br>').replace('\n', '<br>')
+    
+    # Append footer
+    return html_body + get_email_footer()

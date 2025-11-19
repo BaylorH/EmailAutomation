@@ -4,7 +4,7 @@ from typing import List, Dict
 from google.cloud.firestore import FieldFilter
 from .clients import _fs
 from .notifications import write_notification
-from .utils import exponential_backoff_request
+from .utils import exponential_backoff_request, format_email_body_with_footer
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 
 def send_remaining_questions_email(uid: str, client_id: str, headers: dict, recipient: str, 
@@ -46,9 +46,10 @@ We still need the following information to complete your property details:
 
 {field_list}
 
-Could you please provide these details when you have a moment?
-
-Thanks!"""
+Could you please provide these details when you have a moment?"""
+        
+        # Format as HTML with footer
+        html_body = format_email_body_with_footer(body)
         
         base = "https://graph.microsoft.com/v1.0"
         # 1) Find Graph message id by our stored internetMessageId (thread_id)
@@ -60,7 +61,14 @@ Thanks!"""
         if vals:
             graph_id = vals[0]["id"]
             # 2) Reply in-thread (this preserves proper headers)
-            reply_payload = {"comment": body}
+            reply_payload = {
+                "message": {
+                    "body": {
+                        "contentType": "HTML",
+                        "content": html_body
+                    }
+                }
+            }
             resp = requests.post(f"{base}/me/messages/{graph_id}/reply",
                                  headers=headers, json=reply_payload, timeout=30)
             resp.raise_for_status()
@@ -71,7 +79,7 @@ Thanks!"""
             # 3) Fallback: send a new email (no custom In-Reply-To headers)
             msg = {
                 "subject": "Remaining questions",
-                "body": {"contentType": "Text", "content": body},
+                "body": {"contentType": "HTML", "content": html_body},
                 "toRecipients": [{"emailAddress": {"address": recipient}}],
             }
             send_payload = {"message": msg, "saveToSentItems": True}
@@ -113,15 +121,16 @@ def send_closing_email(uid: str, client_id: str, headers: dict, recipient: str,
 
 Thank you for providing all the requested information! We now have everything we need for your property details.
 
-We'll be in touch if we need any additional information.
-
-Best regards"""
+We'll be in touch if we need any additional information."""
+        
+        # Format as HTML with footer
+        html_body = format_email_body_with_footer(body)
         
         # Send email using sendMail endpoint
         base = "https://graph.microsoft.com/v1.0"
         msg = {
             "subject": "Re: Property information complete",
-            "body": {"contentType": "Text", "content": body},
+            "body": {"contentType": "HTML", "content": html_body},
             "toRecipients": [{"emailAddress": {"address": recipient}}],
             "internetMessageHeaders": [
                 {"name": "In-Reply-To", "value": thread_id},
@@ -182,15 +191,16 @@ Could you please provide the following details for this property:
 - Number of drive-in doors
 - Number of dock doors  
 - Ceiling height
-- Power specifications
-
-Thanks!"""
+- Power specifications"""
+        
+        # Format as HTML with footer
+        html_body = format_email_body_with_footer(body)
         
         # Send as new email (not a reply)
         base = "https://graph.microsoft.com/v1.0"
         msg = {
             "subject": subject,
-            "body": {"contentType": "Text", "content": body},
+            "body": {"contentType": "HTML", "content": html_body},
             "toRecipients": [{"emailAddress": {"address": recipient}}],
             "internetMessageHeaders": [
                 {"name": "x-client-id", "value": client_id},
@@ -254,8 +264,8 @@ Thanks!"""
                 "references": []
             },
             "body": {
-                "contentType": "Text",
-                "content": body,
+                "contentType": "HTML",
+                "content": html_body,
                 "preview": f"New property questions for {address}"
             }
         }
@@ -282,9 +292,10 @@ def send_thankyou_closing_with_new_property(uid: str, client_id: str, headers: d
 
 Thank you for letting me know that property is no longer available, and thanks for suggesting the alternative property.
 
-I'll review the new property details and get back to you if I have any questions.
-
-Best regards"""
+I'll review the new property details and get back to you if I have any questions."""
+        
+        # Format as HTML with footer
+        html_body = format_email_body_with_footer(body)
         
         base = "https://graph.microsoft.com/v1.0"
         
@@ -298,7 +309,14 @@ Best regards"""
         if vals:
             # Reply in-thread
             graph_id = vals[0]["id"]
-            reply_payload = {"comment": body}
+            reply_payload = {
+                "message": {
+                    "body": {
+                        "contentType": "HTML",
+                        "content": html_body
+                    }
+                }
+            }
             resp = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
                                      headers=headers, json=reply_payload, timeout=30)
@@ -312,7 +330,7 @@ Best regards"""
             # Fallback: send new email with proper threading headers
             msg = {
                 "subject": "Re: Property update",
-                "body": {"contentType": "Text", "content": body},
+                "body": {"contentType": "HTML", "content": html_body},
                 "toRecipients": [{"emailAddress": {"address": recipient}}],
                 "internetMessageHeaders": [
                     {"name": "In-Reply-To", "value": thread_id},
@@ -350,9 +368,10 @@ def send_thankyou_ask_alternatives(uid: str, client_id: str, headers: dict,
 
 Thank you for letting me know that property is no longer available.
 
-Do you have any other properties that might be a good fit for our requirements?
-
-Best regards"""
+Do you have any other properties that might be a good fit for our requirements?"""
+        
+        # Format as HTML with footer
+        html_body = format_email_body_with_footer(body)
         
         base = "https://graph.microsoft.com/v1.0"
         
@@ -366,7 +385,14 @@ Best regards"""
         if vals:
             # Reply in-thread
             graph_id = vals[0]["id"]
-            reply_payload = {"comment": body}
+            reply_payload = {
+                "message": {
+                    "body": {
+                        "contentType": "HTML",
+                        "content": html_body
+                    }
+                }
+            }
             resp = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
                                      headers=headers, json=reply_payload, timeout=30)
@@ -380,7 +406,7 @@ Best regards"""
             # Fallback: send new email with proper threading headers
             msg = {
                 "subject": "Re: Property availability",
-                "body": {"contentType": "Text", "content": body},
+                "body": {"contentType": "HTML", "content": html_body},
                 "toRecipients": [{"emailAddress": {"address": recipient}}],
                 "internetMessageHeaders": [
                     {"name": "In-Reply-To", "value": thread_id},
@@ -402,79 +428,6 @@ Best regards"""
         
     except Exception as e:
         print(f"❌ Failed to send alternatives request: {e}")
-        # Add more detailed error information for debugging
-        if hasattr(e, 'response') and e.response:
-            print(f"   HTTP Status: {e.response.status_code}")
-            print(f"   Response: {e.response.text[:500]}...")
-        return False
-
-
-def send_thankyou_request_missing_fields(uid: str, client_id: str, headers: dict, 
-                                        recipient: str, missing_fields: List[str],
-                                        thread_id: str, row_number: int, 
-                                        row_anchor: str) -> bool:
-    """Send thank you + request missing field values."""
-    try:
-        field_list = "\n".join(f"- {field}" for field in missing_fields)
-        
-        body = f"""Hi,
-
-Thank you for the information!
-
-To complete the property details, could you please provide:
-
-{field_list}
-
-Thanks!"""
-        
-        base = "https://graph.microsoft.com/v1.0"
-        
-        # Try to find the original message to reply to
-        q = {"$filter": f"internetMessageId eq '{thread_id}'", "$select": "id"}
-        lookup = exponential_backoff_request(
-            lambda: requests.get(f"{base}/me/messages", headers=headers, params=q, timeout=30)
-        )
-        vals = lookup.json().get("value", [])
-
-        if vals:
-            # Reply in-thread
-            graph_id = vals[0]["id"]
-            reply_payload = {"comment": body}
-            resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
-                                     headers=headers, json=reply_payload, timeout=30)
-            )
-            # Only log success if we get a successful response
-            if resp and resp.status_code in [200, 201, 202]:
-                print(f"📧 Sent thank you + missing fields request via reply")
-            else:
-                raise Exception(f"Reply failed with status {resp.status_code if resp else 'None'}")
-        else:
-            # Fallback: send new email with proper threading headers
-            msg = {
-                "subject": "Re: Property information",
-                "body": {"contentType": "Text", "content": body},
-                "toRecipients": [{"emailAddress": {"address": recipient}}],
-                "internetMessageHeaders": [
-                    {"name": "In-Reply-To", "value": thread_id},
-                    {"name": "References", "value": thread_id}
-                ]
-            }
-            send_payload = {"message": msg, "saveToSentItems": True}
-            resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/sendMail", headers=headers, 
-                                     json=send_payload, timeout=30)
-            )
-            # Only log success if we get a successful response
-            if resp and resp.status_code in [200, 201, 202]:
-                print(f"📧 Sent thank you + missing fields request via sendMail")
-            else:
-                raise Exception(f"SendMail failed with status {resp.status_code if resp else 'None'}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"❌ Failed to send missing fields request: {e}")
         # Add more detailed error information for debugging
         if hasattr(e, 'response') and e.response:
             print(f"   HTTP Status: {e.response.status_code}")

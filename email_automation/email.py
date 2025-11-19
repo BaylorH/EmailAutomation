@@ -69,6 +69,16 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         return {"sent": [], "errors": {"_all": "No recipients"}}
 
     content_type, content = _body_kind(script)
+    
+    # Append footer to all emails
+    from .utils import get_email_footer, format_email_body_with_footer
+    if content_type == "HTML":
+        # If already HTML, just append footer
+        content = content + get_email_footer()
+    else:
+        # Convert to HTML and add footer
+        content = format_email_body_with_footer(content)
+        content_type = "HTML"
     results = {"sent": [], "errors": {}}
     base = "https://graph.microsoft.com/v1.0"
 

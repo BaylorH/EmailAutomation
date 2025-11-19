@@ -17,13 +17,13 @@ from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_r
 from .file_handling import fetch_pdf_attachments, upload_pdf_to_drive, upload_pdf_user_data
 from .notifications import write_notification, add_client_notifications
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview, 
-                   parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url)
+                   parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
+                   format_email_body_with_footer)
 from .email_operations import (
     send_remaining_questions_email, 
     send_closing_email,
     send_thankyou_closing_with_new_property,
-    send_thankyou_ask_alternatives,
-    send_thankyou_request_missing_fields
+    send_thankyou_ask_alternatives
 )
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 
@@ -35,8 +35,19 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         
         base = "https://graph.microsoft.com/v1.0"
         
+        # Format body as HTML with footer
+        html_body = format_email_body_with_footer(body)
+        
         # Reply directly to the current message we're processing
-        reply_payload = {"comment": body}
+        # Use message structure to preserve line breaks properly
+        reply_payload = {
+            "message": {
+                "body": {
+                    "contentType": "HTML",
+                    "content": html_body
+                }
+            }
+        }
         resp = exponential_backoff_request(
             lambda: requests.post(f"{base}/me/messages/{current_msg_id}/reply",
                                  headers=headers, json=reply_payload, timeout=30)
@@ -51,7 +62,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             # Fallback: send a new email with proper threading headers
             msg = {
                 "subject": "Re: Property information",
-                "body": {"contentType": "Text", "content": body},
+                "body": {"contentType": "HTML", "content": html_body},
                 "toRecipients": [{"emailAddress": {"address": recipient}}],
                 "internetMessageHeaders": [
                     {"name": "In-Reply-To", "value": thread_id},
