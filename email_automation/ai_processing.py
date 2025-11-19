@@ -276,7 +276,8 @@ def propose_sheet_updates(uid: str,
                           thread_id: str,
                           file_manifest: list[dict] = None,   # [{"id": "...", "name": "..."}]
                           url_texts: list[dict] = None,
-                          contact_name: str = None) -> dict | None:
+                          contact_name: str = None,
+                          headers: dict = None) -> dict | None:
     """
     Uses OpenAI Responses API to propose sheet updates.
     - Grounds on the current row's (address, city) as TARGET PROPERTY.
@@ -285,7 +286,8 @@ def propose_sheet_updates(uid: str,
     """
     try:
         # Build conversation payload (chronological; latest last)
-        conversation = build_conversation_payload(uid, thread_id, limit=10)
+        # Pass headers to fetch from Graph API (includes manual emails we didn't index)
+        conversation = build_conversation_payload(uid, thread_id, limit=10, headers=headers)
 
         # ---- Rules sections ---------------------------------------------------
         COLUMN_RULES = """

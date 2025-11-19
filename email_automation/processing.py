@@ -390,7 +390,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         # Step 3: get proposal using Responses API with URL content
         proposal = propose_sheet_updates(
             user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals, 
-            thread_id, file_manifest=file_manifest, url_texts=url_texts, contact_name=contact_name
+            thread_id, file_manifest=file_manifest, url_texts=url_texts, contact_name=contact_name,
+            headers=headers
         )
         
         if proposal:

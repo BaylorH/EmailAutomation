@@ -112,14 +112,142 @@ def _get_thread_messages_chronological(uid: str, thread_id: str) -> list[dict]:
         print(f"❌ Failed to get thread messages: {e}")
         return []
 
-def build_conversation_payload(uid: str, thread_id: str, limit: int = 10) -> list[dict]:
+def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, headers: dict = None) -> list[dict]:
     """
     Return last N messages in chronological order. Each item includes:
     direction, from, to, subject, timestamp, preview (short), content (full text, bounded)
+    
+    Fetches from both Firestore (indexed messages) and Microsoft Graph API (all messages in thread)
+    to include manual emails that weren't indexed (e.g., Jill's manual replies).
     """
     try:
-        messages = _get_thread_messages_chronological(uid, thread_id)
-        recent = messages[-limit:] if len(messages) > limit else messages
+        # Get messages from Firestore (what we've indexed)
+        firestore_messages = _get_thread_messages_chronological(uid, thread_id)
+        
+        # Also fetch from Graph API if headers provided and we have conversationId
+        graph_messages = []
+        if headers:
+            try:
+                # Get conversationId from thread metadata
+                thread_ref = _fs.collection("users").document(uid).collection("threads").document(thread_id)
+                thread_doc = thread_ref.get()
+                if thread_doc.exists:
+                    thread_data = thread_doc.to_dict()
+                    conversation_id = thread_data.get("conversationId")
+                    
+                    if conversation_id:
+                        # Fetch all messages in this conversation from Graph API
+                        # This includes messages we didn't index (e.g., Jill's manual emails)
+                        import requests
+                        from .utils import exponential_backoff_request
+                        from .utils import strip_html_tags
+                        
+                        try:
+                            response = exponential_backoff_request(
+                                lambda: requests.get(
+                                    "https://graph.microsoft.com/v1.0/me/messages",
+                                    headers=headers,
+                                    params={
+                                        "$filter": f"conversationId eq '{conversation_id}'",
+                                        "$orderby": "sentDateTime asc",
+                                        "$select": "id,subject,from,toRecipients,sentDateTime,receivedDateTime,body,bodyPreview,internetMessageId",
+                                        "$top": 50  # Limit to prevent huge responses
+                                    },
+                                    timeout=30
+                                )
+                            )
+                            
+                            if response.status_code == 200:
+                                graph_data = response.json()
+                                for msg in graph_data.get("value", []):
+                                    # Determine direction
+                                    from_addr = msg.get("from", {}).get("emailAddress", {}).get("address", "")
+                                    to_recipients = [r.get("emailAddress", {}).get("address", "") for r in msg.get("toRecipients", [])]
+                                    
+                                    # Determine direction: if receivedDateTime exists, it's inbound; if only sentDateTime, likely outbound
+                                    # Also check if message is in SentItems folder (we'd need to fetch that separately)
+                                    # For now, use heuristic: if receivedDateTime exists and no sentDateTime, it's inbound
+                                    # If sentDateTime exists but no receivedDateTime, it's outbound
+                                    sent_dt = msg.get("sentDateTime")
+                                    received_dt = msg.get("receivedDateTime")
+                                    
+                                    if received_dt and not sent_dt:
+                                        direction = "inbound"
+                                    elif sent_dt and not received_dt:
+                                        direction = "outbound"
+                                    else:
+                                        # Both exist or neither - default to inbound (most common case)
+                                        direction = "inbound"
+                                    
+                                    # Get body content
+                                    body_obj = msg.get("body", {}) or {}
+                                    body_content = body_obj.get("content", "")
+                                    body_type = body_obj.get("contentType", "Text")
+                                    if body_type == "HTML":
+                                        body_content = strip_html_tags(body_content)
+                                    
+                                    graph_messages.append({
+                                        "data": {
+                                            "direction": direction,
+                                            "from": from_addr,
+                                            "to": to_recipients,
+                                            "subject": msg.get("subject", ""),
+                                            "sentDateTime": msg.get("sentDateTime"),
+                                            "receivedDateTime": msg.get("receivedDateTime"),
+                                            "body": {
+                                                "content": body_content,
+                                                "preview": msg.get("bodyPreview", "")[:200]
+                                            },
+                                            "internetMessageId": msg.get("internetMessageId")
+                                        },
+                                        "id": msg.get("internetMessageId") or msg.get("id")
+                                    })
+                                    
+                                print(f"📧 Fetched {len(graph_messages)} messages from Graph API for conversation {conversation_id}")
+                        except Exception as e:
+                            print(f"⚠️ Failed to fetch messages from Graph API: {e}")
+            except Exception as e:
+                print(f"⚠️ Failed to fetch Graph messages: {e}")
+        
+        # Merge messages from both sources, deduplicate by internetMessageId
+        all_messages = {}
+        
+        # Add Firestore messages
+        for msg_info in firestore_messages:
+            msg_id = msg_info.get("id") or ""
+            all_messages[msg_id] = msg_info
+        
+        # Add Graph messages (will overwrite Firestore if duplicate, but that's fine)
+        for msg_info in graph_messages:
+            msg_id = msg_info.get("id") or ""
+            if msg_id not in all_messages:  # Only add if not already in Firestore
+                all_messages[msg_id] = msg_info
+        
+        # Convert to list and sort chronologically
+        messages_list = list(all_messages.values())
+        
+        # Sort by timestamp
+        message_data = []
+        for msg_info in messages_list:
+            data = msg_info["data"]
+            ts = data.get("sentDateTime") or data.get("receivedDateTime") or data.get("createdAt")
+            if hasattr(ts, 'timestamp'):
+                ts = ts.timestamp()
+            elif isinstance(ts, str):
+                try:
+                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    ts = dt.timestamp()
+                except:
+                    ts = 0
+            else:
+                ts = 0
+            message_data.append((ts, msg_info))
+        
+        message_data.sort(key=lambda x: x[0])
+        sorted_messages = [msg_info for _, msg_info in message_data]
+        
+        # Take last N messages
+        recent = sorted_messages[-limit:] if len(sorted_messages) > limit else sorted_messages
 
         payload = []
         CUT = 2000  # cap to keep prompt small but meaningful
