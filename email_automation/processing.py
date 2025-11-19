@@ -141,7 +141,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     """ENHANCED: Process a single inbox message with full pipeline including events."""
     msg_id = msg.get("id")
     subject = msg.get("subject", "")
-    from_addr = msg.get("from", {}).get("emailAddress", {}).get("address", "")
+    from_info = msg.get("from", {}).get("emailAddress", {})
+    from_addr = from_info.get("address", "")
+    from_name = from_info.get("name", "")  # Extract sender name from email
     internet_message_id = msg.get("internetMessageId")
     conversation_id = msg.get("conversationId")
     received_dt = msg.get("receivedDateTime")
@@ -272,6 +274,25 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     # Step 1: fetch Google Sheet (required) and log header + counterparty email
     client_id, sheet_id, header, rownum, rowvals = fetch_and_log_sheet_for_thread(user_id, thread_id, counterparty_email=from_addr)
     
+    # Extract contact name: try email name first, then sheet row
+    contact_name = None
+    if from_name:
+        contact_name = from_name.strip()
+        print(f"📝 Extracted name from email: {contact_name}")
+    
+    # Try to get name from sheet row (common column names)
+    if not contact_name and rowvals and header:
+        idx_map = _header_index_map(header)
+        name_keys = ["name", "contact name", "leasing contact", "contact", "broker name", "broker"]
+        for key in name_keys:
+            idx = idx_map.get(key)
+            if idx and (idx - 1) < len(rowvals):
+                name_val = (rowvals[idx - 1] or "").strip()
+                if name_val:
+                    contact_name = name_val
+                    print(f"📝 Extracted name from sheet column '{key}': {contact_name}")
+                    break
+    
     # Only proceed if we successfully matched a sheet row
     if sheet_id and rownum is not None:
         # Get the correct recipient email from the thread metadata (original external contact)
@@ -369,7 +390,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         # Step 3: get proposal using Responses API with URL content
         proposal = propose_sheet_updates(
             user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals, 
-            thread_id, file_manifest=file_manifest, url_texts=url_texts
+            thread_id, file_manifest=file_manifest, url_texts=url_texts, contact_name=contact_name
         )
         
         if proposal:

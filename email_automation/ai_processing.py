@@ -275,7 +275,8 @@ def propose_sheet_updates(uid: str,
                           rowvals: list[str],
                           thread_id: str,
                           file_manifest: list[dict] = None,   # [{"id": "...", "name": "..."}]
-                          url_texts: list[dict] = None) -> dict | None:
+                          url_texts: list[dict] = None,
+                          contact_name: str = None) -> dict | None:
     """
     Uses OpenAI Responses API to propose sheet updates.
     - Grounds on the current row's (address, city) as TARGET PROPERTY.
@@ -370,6 +371,7 @@ Therefore, your response email body should:
 
 GUIDELINES:
 - Write in a professional, friendly tone matching Jill Ames' communication style
+- Vary your greetings naturally - don't always start the same way (mix "Hi,", "Hi [Name],", "Thanks [Name],", etc. based on context)
 - Reference specific details from the conversation to show you're paying attention
 - Avoid repeating the same message - vary your wording based on conversation context
 - Keep responses concise and to the point
@@ -407,10 +409,16 @@ IMPORTANT: The response should feel natural and conversational, not robotic or t
         # Check missing required fields to inform response email generation
         missing_fields = check_missing_required_fields(rowvals, header)
         
+        # Build contact name context (provided as info, not instruction)
+        contact_context = ""
+        if contact_name:
+            contact_context = f"\nCONTACT NAME: {contact_name}"
+        
         prompt_parts = [f"""
 You are analyzing a conversation thread to suggest updates to ONE Google Sheet row, detect key events, and generate an appropriate response email.
 
 TARGET PROPERTY (canonical identity for matching): {target_anchor}
+{contact_context}
 
 {COLUMN_RULES}
 {DOC_SELECTION_RULES}
