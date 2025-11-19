@@ -620,7 +620,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         json.dumps(apply_result, sort_keys=True).encode("utf-8")
                     ).hexdigest()[:16]
 
-                    now_id = datetime.now(timezone.utc).isoformat().replace(":", "-").replace(".", "-").replace("+00:00", "Z")
+                    from datetime import datetime as dt, timezone as tz
+                    now_id = dt.now(tz.utc).isoformat().replace(":", "-").replace(".", "-").replace("+00:00", "Z")
                     _fs.collection("users").document(user_id).collection("sheetChangeLog").document(f"{thread_id}__applied__{now_id}").set({
                         "clientId": client_id,
                         "email": from_addr_lower,

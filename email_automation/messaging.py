@@ -126,7 +126,7 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, header
         
         # Also fetch from Graph API if headers provided and we have conversationId
         graph_messages = []
-        if headers:
+        if headers and headers.get("Authorization"):
             try:
                 # Get conversationId from thread metadata
                 thread_ref = _fs.collection("users").document(uid).collection("threads").document(thread_id)
@@ -205,7 +205,9 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, header
                                     
                                 print(f"📧 Fetched {len(graph_messages)} messages from Graph API for conversation {conversation_id}")
                         except Exception as e:
+                            # Don't fail completely if Graph API fetch fails - we still have Firestore messages
                             print(f"⚠️ Failed to fetch messages from Graph API: {e}")
+                            # Continue with just Firestore messages
             except Exception as e:
                 print(f"⚠️ Failed to fetch Graph messages: {e}")
         
