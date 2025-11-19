@@ -475,6 +475,18 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     # Step 1: fetch Google Sheet (required) and log header + counterparty email
     client_id, sheet_id, header, rownum, rowvals = fetch_and_log_sheet_for_thread(user_id, thread_id, counterparty_email=from_addr)
     
+    # If no clientId found, try to find it by email and update the thread
+    if not client_id and from_addr:
+        print(f"   🔍 Retrying clientId lookup for email: {from_addr}")
+        client_id = _find_client_id_by_email(user_id, from_addr)
+        if client_id:
+            print(f"   ✅ Found clientId: {client_id}, updating thread...")
+            # Update thread with clientId
+            thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+            thread_ref.set({"clientId": client_id}, merge=True)
+            # Retry fetching sheet
+            client_id, sheet_id, header, rownum, rowvals = fetch_and_log_sheet_for_thread(user_id, thread_id, counterparty_email=from_addr)
+    
     # Extract contact name: try email name first, then sheet row
     contact_name = None
     if from_name:
@@ -1031,11 +1043,20 @@ Could you please provide your phone number so I can give you a call?"""
                         
                         missing_fields = check_missing_required_fields(current_row, header)
                         
+                        # CRITICAL: Filter out "Rent/SF /Yr" - it should NEVER be requested
+                        missing_fields = [f for f in missing_fields if f != "Rent/SF /Yr"]
+                        
                         if missing_fields:
                             # Scenario 3: Thank you + request missing fields
                             # Use LLM-generated response if available, otherwise use template
                             if llm_response_email:
                                 response_body = llm_response_email
+                                # Safety check: Remove any mention of "Rent/SF /Yr" from LLM response
+                                if "Rent/SF /Yr" in response_body or "Rent/SF/Yr" in response_body:
+                                    print(f"   ⚠️ LLM response contained 'Rent/SF /Yr', removing it...")
+                                    response_body = response_body.replace("Rent/SF /Yr", "").replace("Rent/SF/Yr", "")
+                                    # Clean up any double newlines or formatting issues
+                                    response_body = "\n".join(line for line in response_body.split("\n") if line.strip() and "Rent/SF" not in line)
                                 print(f"🤖 Using LLM-generated response for missing fields scenario")
                             else:
                                 field_list = "\n".join(f"- {field}" for field in missing_fields)
