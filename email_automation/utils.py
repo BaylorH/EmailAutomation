@@ -327,7 +327,8 @@ def format_email_body_with_footer(body: str) -> str:
     html_body = body.replace('\n\n', '<br><br>').replace('\n', '<br>')
     
     # Wrap in proper HTML structure to prevent email clients from collapsing footer
-    # Add a non-breaking separator before footer to prevent trimming
+    # Add a visible separator and non-breaking content before footer to prevent trimming
+    # This is especially important for replies where email clients may collapse signatures
     full_content = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -336,8 +337,11 @@ def format_email_body_with_footer(body: str) -> str:
 <body style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000; margin: 0; padding: 0;">
 <div style="max-width: 600px;">
 {html_body}
-<div style="margin-top: 20px; padding-top: 20px;">
+<!-- Email signature separator - prevents collapse -->
+<div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid transparent; min-height: 1px;">
+<div style="margin-top: 20px;">
 {get_email_footer()}
+</div>
 </div>
 </div>
 </body>

@@ -373,29 +373,45 @@ Therefore, your response email body should:
 
 GUIDELINES:
 - Write in a professional, friendly tone matching Jill Ames' communication style
-- Vary your greetings naturally - don't always start the same way (mix "Hi,", "Hi [Name],", "Thanks [Name],", etc. based on context)
+- Vary your greetings naturally - don't always use the same format
+- GREETING VARIATION RULES:
+  * When to use the contact name: Use it in longer messages, first messages in a thread, or when acknowledging specific information they provided
+  * When to omit the name: Use in brief requests, quick follow-ups, or when the message is very short
+  * Rotate greeting styles when using the name: Mix between "Hi [Name],", "Thanks [Name],", "[Name],", "Hi [Name] -" (with dash)
+  * Rotate greeting styles when NOT using the name: Mix between "Hi,", "Thanks,", "Thank you,"
+  * Examples of good variation:
+    - "Hi Scott, Thank you for confirming..."
+    - "Thanks Scott, I received..."
+    - "Hi, Could you please provide..."
+    - "Scott, To complete the property details..."
+    - "Thanks, I appreciate the update..."
 - Reference specific details from the conversation to show you're paying attention
 - Avoid repeating the same message - vary your wording based on conversation context
-- Keep responses concise and to the point
+- Keep responses concise and to the point - short and direct
 - If missing fields are identified, politely request them in a natural way
 - If all required information is complete, acknowledge and close appropriately
 - If property is unavailable, acknowledge and ask for alternatives if appropriate
 - If new property is suggested, thank them and indicate you'll review it
+- DO NOT use phrases like "Looking forward to your response" or "Looking forward to hearing from you" - instead, simply end with "Thanks" or similar brief closing
 
 SCENARIOS:
 1. Missing required fields: Thank them for the information, then list the missing fields naturally in a bulleted format.
    EXAMPLE FORMAT:
-   "To complete the property details, could you please provide:
+   "Thank you for confirming the number of drive-in doors. To complete the property details, could you please provide:
    
    - Total SF
    - Ops Ex /SF
    - Gross Rent
-   - Drive Ins
    - Docks
    - Ceiling Ht
-   - Power"
+   - Power
    
-   IMPORTANT: NEVER request "Rent/SF /Yr" - this field should never be asked for.
+   Thanks."
+   
+   IMPORTANT: 
+   - NEVER request "Rent/SF /Yr" - this field should never be asked for
+   - Keep it short and concise
+   - End with a simple "Thanks" - do NOT use "Looking forward to your response" or similar phrases
    
 2. All fields complete: Thank them and indicate you have everything needed
 3. Property unavailable + new property suggested: Thank them for both pieces of information
@@ -415,10 +431,10 @@ IMPORTANT: The response should feel natural and conversational, not robotic or t
         # Check missing required fields to inform response email generation
         missing_fields = check_missing_required_fields(rowvals, header)
         
-        # Build contact name context (provided as info, not instruction)
+        # Build contact name context (provided as info for optional use, not required)
         contact_context = ""
         if contact_name:
-            contact_context = f"\nCONTACT NAME: {contact_name}"
+            contact_context = f"\nCONTACT NAME (optional - use contextually, not in every message): {contact_name}"
         
         prompt_parts = [f"""
 You are analyzing a conversation thread to suggest updates to ONE Google Sheet row, detect key events, and generate an appropriate response email.

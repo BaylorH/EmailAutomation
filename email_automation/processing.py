@@ -1058,6 +1058,15 @@ Could you please provide your phone number so I can give you a call?"""
                                     response_body = response_body.replace("Rent/SF /Yr", "").replace("Rent/SF/Yr", "")
                                     # Clean up any double newlines or formatting issues
                                     response_body = "\n".join(line for line in response_body.split("\n") if line.strip() and "Rent/SF" not in line)
+                                # Safety check: Remove "Looking forward to your response" phrases
+                                if "Looking forward to your response" in response_body or "Looking forward to hearing from you" in response_body:
+                                    print(f"   ⚠️ LLM response contained 'Looking forward' phrase, removing it...")
+                                    response_body = response_body.replace("Looking forward to your response", "").replace("Looking forward to hearing from you", "")
+                                    # Clean up any double newlines
+                                    response_body = "\n".join(line for line in response_body.split("\n") if line.strip())
+                                    # Ensure it ends with a simple closing if needed
+                                    if response_body.strip() and not response_body.strip().endswith("Thanks") and not response_body.strip().endswith("Thanks."):
+                                        response_body = response_body.strip() + "\n\nThanks."
                                 print(f"🤖 Using LLM-generated response for missing fields scenario")
                             else:
                                 field_list = "\n".join(f"- {field}" for field in missing_fields)
