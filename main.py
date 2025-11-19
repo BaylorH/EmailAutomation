@@ -4,7 +4,7 @@ from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token
 from email_automation.clients import list_user_ids, decode_token_payload
 from email_automation.email import send_outboxes
-from email_automation.processing import scan_inbox_against_index
+from email_automation.processing import scan_inbox_against_index, scan_sent_items_for_manual_replies
 from email_automation.app_config import CLIENT_ID, CLIENT_SECRET, AUTHORITY, SCOPES, TOKEN_CACHE, FIREBASE_API_KEY
 
 def refresh_and_process_user(user_id: str):
@@ -71,9 +71,13 @@ def refresh_and_process_user(user_id: str):
     # Process outbound emails (now with indexing)
     send_outboxes(user_id, headers)
     
-    # Scan for reply matches
-    print(f"\n🔍 Scanning inbox for replies...")
-    scan_inbox_against_index(user_id, headers, only_unread=True, top=50)
+    # Scan for client replies (inbox - catch all replies, not just unread)
+    print(f"\n🔍 Scanning inbox for client replies...")
+    scan_inbox_against_index(user_id, headers, only_unread=False, top=50)
+    
+    # Scan for Jill's manual replies (SentItems - catch manual replies we didn't index)
+    print(f"\n📤 Scanning SentItems for manual replies...")
+    scan_sent_items_for_manual_replies(user_id, headers, top=50)
 
 if __name__ == "__main__":
     all_users = list_user_ids()

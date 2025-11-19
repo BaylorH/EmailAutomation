@@ -25,8 +25,12 @@ def b64url_id(message_id: str) -> str:
     return base64.urlsafe_b64encode(message_id.encode('utf-8')).decode('ascii').rstrip('=')
 
 def normalize_message_id(msg_id: str) -> str:
-    """Normalize message ID - keep as-is but strip whitespace."""
-    return msg_id.strip() if msg_id else ""
+    """Normalize message ID - strip whitespace and angle brackets."""
+    if not msg_id:
+        return ""
+    # Remove angle brackets if present (email headers often wrap IDs in < >)
+    normalized = msg_id.strip().strip('<>')
+    return normalized
 
 def parse_references_header(references: str) -> List[str]:
     """Parse References header into list of message IDs."""

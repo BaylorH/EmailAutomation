@@ -28,10 +28,13 @@ from .email_operations import (
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
-    """Send a reply to the current message being processed"""
+    """Send a reply to the current message being processed and index it for future replies"""
     try:
-        from .utils import exponential_backoff_request
+        from .utils import exponential_backoff_request, normalize_message_id, safe_preview
+        from .messaging import save_message, index_message_id, index_conversation_id
+        from datetime import datetime, timezone
         import requests
+        import time
         
         base = "https://graph.microsoft.com/v1.0"
         
@@ -56,6 +59,93 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         # Verify successful response
         if resp and resp.status_code in [200, 201, 202]:
             print(f"   ✅ Sent reply to current message via /reply endpoint")
+            
+            # CRITICAL: Index the sent message so future replies can find the thread
+            # The /reply endpoint doesn't return the message ID, so we need to fetch it from SentItems
+            try:
+                # Wait a moment for the message to appear in SentItems
+                time.sleep(1)
+                
+                # Fetch the most recent message from SentItems for this conversation
+                # Get conversationId from the current message
+                current_msg_resp = exponential_backoff_request(
+                    lambda: requests.get(
+                        f"{base}/me/messages/{current_msg_id}",
+                        headers=headers,
+                        params={"$select": "conversationId"},
+                        timeout=30
+                    )
+                )
+                conversation_id = current_msg_resp.json().get("conversationId") if current_msg_resp.status_code == 200 else None
+                
+                if conversation_id:
+                    # Fetch recent sent messages in this conversation
+                    sent_resp = exponential_backoff_request(
+                        lambda: requests.get(
+                            f"{base}/me/mailFolders/SentItems/messages",
+                            headers=headers,
+                            params={
+                                "$filter": f"conversationId eq '{conversation_id}'",
+                                "$orderby": "sentDateTime desc",
+                                "$top": 1,
+                                "$select": "id,internetMessageId,conversationId,subject,toRecipients,sentDateTime,body,bodyPreview"
+                            },
+                            timeout=30
+                        )
+                    )
+                    
+                    if sent_resp.status_code == 200:
+                        sent_messages = sent_resp.json().get("value", [])
+                        if sent_messages:
+                            sent_msg = sent_messages[0]  # Most recent
+                            sent_internet_msg_id = sent_msg.get("internetMessageId")
+                            
+                            if sent_internet_msg_id:
+                                # Index this sent message
+                                normalized_id = normalize_message_id(sent_internet_msg_id)
+                                index_message_id(user_id, sent_internet_msg_id, thread_id)
+                                
+                                # Also save the message record
+                                to_recipients = [r.get("emailAddress", {}).get("address", "") for r in sent_msg.get("toRecipients", [])]
+                                body_obj = sent_msg.get("body", {}) or {}
+                                body_content = body_obj.get("content", "")
+                                
+                                message_record = {
+                                    "direction": "outbound",
+                                    "subject": sent_msg.get("subject", ""),
+                                    "from": "me",
+                                    "to": to_recipients,
+                                    "sentDateTime": sent_msg.get("sentDateTime"),
+                                    "receivedDateTime": None,
+                                    "headers": {
+                                        "internetMessageId": sent_internet_msg_id,
+                                        "inReplyTo": None,  # Would need to extract from headers
+                                        "references": []
+                                    },
+                                    "body": {
+                                        "contentType": body_obj.get("contentType", "HTML"),
+                                        "content": body_content,
+                                        "preview": sent_msg.get("bodyPreview", "")[:200] or safe_preview(body_content)
+                                    }
+                                }
+                                save_message(user_id, thread_id, normalized_id, message_record)
+                                
+                                # Index conversation ID if not already indexed
+                                if conversation_id:
+                                    index_conversation_id(user_id, conversation_id, thread_id)
+                                
+                                print(f"   📝 Indexed sent reply message: {sent_internet_msg_id[:50]}...")
+                            else:
+                                print(f"   ⚠️ Sent message has no internetMessageId, cannot index")
+                        else:
+                            print(f"   ⚠️ Could not find sent message in SentItems to index")
+                    else:
+                        print(f"   ⚠️ Failed to fetch sent message: {sent_resp.status_code}")
+                else:
+                    print(f"   ⚠️ Could not get conversationId to index sent message")
+            except Exception as e:
+                print(f"   ⚠️ Failed to index sent reply (non-fatal): {e}")
+            
             return True
         else:
             print(f"   ❌ Reply failed with status {resp.status_code if resp else 'None'}")
@@ -78,6 +168,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             # Verify successful response
             if resp and resp.status_code in [200, 201, 202]:
                 print(f"   ✅ Sent reply via /sendMail with threading headers")
+                # Note: sendMail also needs indexing, but that's more complex - would need to fetch from SentItems too
                 return True
             else:
                 print(f"   ❌ SendMail failed with status {resp.status_code if resp else 'None'}")
@@ -227,9 +318,38 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         if thread_id:
             matched_header = f"ConversationId: {conversation_id}"
     
+    # Final fallback: if we have conversationId but no thread, we might need to create one
+    # This can happen if the original message wasn't processed by our system
     if not thread_id:
-        print(f"❓ No thread match found for message from {from_addr}")
-        return
+        if conversation_id:
+            print(f"⚠️ No thread found for conversationId {conversation_id}, but conversation exists")
+            print(f"   This might be a reply to a message we didn't process. Creating new thread...")
+            # Create a new thread using the conversationId as the thread ID
+            from .messaging import save_thread_root, index_conversation_id
+            from .utils import normalize_message_id
+            
+            # Use conversationId as thread_id (normalized)
+            thread_id = normalize_message_id(conversation_id)
+            if not thread_id:
+                thread_id = conversation_id
+            
+            # Try to get subject from current message
+            subject = msg.get("subject", "Property information")
+            
+            # Save thread root
+            thread_meta = {
+                "subject": subject,
+                "email": [from_addr],
+                "conversationId": conversation_id,
+                "createdFromReply": True  # Flag to indicate this was created from a reply
+            }
+            save_thread_root(user_id, thread_id, thread_meta)
+            index_conversation_id(user_id, conversation_id, thread_id)
+            matched_header = f"New thread created from ConversationId: {conversation_id}"
+            print(f"   ✅ Created new thread: {thread_id}")
+        else:
+            print(f"❓ No thread match found for message from {from_addr} (no conversationId either)")
+            return
     
     print(f"🎯 Matched via {matched_header} -> thread {thread_id}")
     
@@ -996,3 +1116,159 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     
     # Summary log
     print(f"📥 Scanned {scanned_count} message(s); processed {processed_count}; skipped {skipped_count}")
+
+def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], top: int = 50):
+    """
+    Scan SentItems for Jill's manual replies to conversations we're tracking.
+    Indexes them so they appear in conversation history.
+    """
+    try:
+        from .utils import exponential_backoff_request, normalize_message_id, safe_preview, strip_html_tags
+        from .messaging import save_message, index_message_id, index_conversation_id, lookup_thread_by_conversation_id, save_thread_root
+        from datetime import datetime, timezone, timedelta
+        import requests
+        
+        base = "https://graph.microsoft.com/v1.0"
+        
+        # Calculate 5-hour cutoff
+        now_utc = datetime.now(timezone.utc)
+        cutoff_time = now_utc - timedelta(hours=5)
+        cutoff_iso = cutoff_time.isoformat().replace("+00:00", "Z")
+        
+        # Get all tracked conversation IDs from Firestore
+        threads_ref = _fs.collection("users").document(user_id).collection("threads")
+        threads = list(threads_ref.stream())
+        tracked_conversation_ids = set()
+        
+        for thread_doc in threads:
+            thread_data = thread_doc.to_dict() or {}
+            conv_id = thread_data.get("conversationId")
+            if conv_id:
+                tracked_conversation_ids.add(conv_id)
+        
+        if not tracked_conversation_ids:
+            print("📭 No tracked conversations found, skipping SentItems scan")
+            return
+        
+        print(f"📤 Scanning SentItems for manual replies in {len(tracked_conversation_ids)} tracked conversations...")
+        
+        # Scan SentItems for messages in tracked conversations
+        params = {
+            "$top": str(top),
+            "$orderby": "sentDateTime desc",
+            "$select": "id,subject,from,toRecipients,sentDateTime,conversationId,internetMessageId,body,bodyPreview",
+            "$filter": f"sentDateTime ge {cutoff_iso}"
+        }
+        
+        processed_count = 0
+        scanned_count = 0
+        
+        try:
+            url = f"{base}/me/mailFolders/SentItems/messages"
+            
+            while url:
+                response = exponential_backoff_request(
+                    lambda: requests.get(url, headers=headers, params=params, timeout=30)
+                )
+                data = response.json()
+                messages = data.get("value", [])
+                
+                if not messages:
+                    break
+                
+                for msg in messages:
+                    scanned_count += 1
+                    
+                    # Check if message is older than 5 hours
+                    sent_dt = msg.get("sentDateTime")
+                    if sent_dt:
+                        try:
+                            msg_time = datetime.fromisoformat(sent_dt.replace('Z', '+00:00'))
+                            if msg_time < cutoff_time:
+                                url = None  # Stop pagination
+                                break
+                        except Exception as e:
+                            print(f"⚠️ Failed to parse message time {sent_dt}: {e}")
+                    
+                    conversation_id = msg.get("conversationId")
+                    if not conversation_id or conversation_id not in tracked_conversation_ids:
+                        continue  # Not in a tracked conversation
+                    
+                    internet_message_id = msg.get("internetMessageId")
+                    if not internet_message_id:
+                        continue  # Need message ID to index
+                    
+                    # Check if already indexed
+                    normalized_id = normalize_message_id(internet_message_id)
+                    from .messaging import lookup_thread_by_message_id
+                    existing_thread = lookup_thread_by_message_id(user_id, internet_message_id)
+                    
+                    if existing_thread:
+                        continue  # Already indexed
+                    
+                    # Find or create thread for this conversation
+                    thread_id = lookup_thread_by_conversation_id(user_id, conversation_id)
+                    
+                    if not thread_id:
+                        # Create new thread from conversation
+                        thread_id = normalize_message_id(conversation_id) or conversation_id
+                        thread_meta = {
+                            "subject": msg.get("subject", "Property information"),
+                            "email": [r.get("emailAddress", {}).get("address", "") for r in msg.get("toRecipients", [])],
+                            "conversationId": conversation_id,
+                            "createdFromSentItem": True
+                        }
+                        save_thread_root(user_id, thread_id, thread_meta)
+                        index_conversation_id(user_id, conversation_id, thread_id)
+                        print(f"   📝 Created new thread from SentItem: {thread_id}")
+                    
+                    # Index this sent message
+                    to_recipients = [r.get("emailAddress", {}).get("address", "") for r in msg.get("toRecipients", [])]
+                    body_obj = msg.get("body", {}) or {}
+                    body_content = body_obj.get("content", "")
+                    body_type = body_obj.get("contentType", "Text")
+                    if body_type == "HTML":
+                        body_content = strip_html_tags(body_content)
+                    
+                    message_record = {
+                        "direction": "outbound",
+                        "subject": msg.get("subject", ""),
+                        "from": "me",
+                        "to": to_recipients,
+                        "sentDateTime": sent_dt,
+                        "receivedDateTime": None,
+                        "headers": {
+                            "internetMessageId": internet_message_id,
+                            "inReplyTo": None,
+                            "references": []
+                        },
+                        "body": {
+                            "contentType": body_type,
+                            "content": body_content,
+                            "preview": msg.get("bodyPreview", "")[:200] or safe_preview(body_content)
+                        }
+                    }
+                    
+                    save_message(user_id, thread_id, normalized_id, message_record)
+                    index_message_id(user_id, internet_message_id, thread_id)
+                    
+                    processed_count += 1
+                    print(f"   📝 Indexed manual reply: {internet_message_id[:50]}... -> thread {thread_id}")
+                
+                # Check for next page
+                url = data.get("@odata.nextLink")
+                if url:
+                    params = None  # NextLink includes all params
+                else:
+                    url = None
+            
+            if processed_count > 0:
+                print(f"📤 Indexed {processed_count} manual reply(s) from SentItems")
+            else:
+                print(f"📤 No new manual replies found in SentItems")
+                
+        except Exception as e:
+            print(f"❌ Failed to scan SentItems: {e}")
+            
+    except Exception as e:
+        print(f"❌ Failed to scan SentItems for manual replies: {e}")
