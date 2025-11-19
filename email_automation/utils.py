@@ -303,7 +303,7 @@ T +1 206 510 5575<br>
     footer += """</td>
 <td valign="top" style="vertical-align: top; font-size: 10pt; color: #000000;">
 <strong style="font-weight: bold; color: #000000;">Mohr Partners, Inc.</strong><br>
-<a href="https://mohrpartners.com/" target="_blank" style="color: #000000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">mohrpartners.com</a><br>
+<a href="https://mohrpartners.com/" target="_blank" style="color: #CC0000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">mohrpartners.com</a><br>
 <span style="color: #000000;">Seattle, WA</span>
 </td>
 </tr>
