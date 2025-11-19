@@ -261,7 +261,6 @@ def get_email_footer() -> str:
     # Build the footer HTML matching the professional signature layout
     # Uses sans-serif font (Arial/Helvetica), black text
     footer = """<br><br>
-Thanks!<br>
 Best,<br>
 <br>
 <table cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; margin-top: 10px; font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000;">

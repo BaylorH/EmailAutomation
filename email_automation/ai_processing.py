@@ -354,23 +354,77 @@ CRITICAL EXAMPLES:
 - "Can you call me?" = call_requested event
 """
 
+        RESPONSE_EMAIL_RULES = """
+RESPONSE EMAIL GENERATION:
+You must generate a professional, contextual response email based on the conversation history and current situation.
+
+CRITICAL: The email footer is automatically appended and includes:
+- "Best," (closing)
+- Full signature with logo, contact info, and LinkedIn icon
+
+Therefore, your response email body should:
+- Start with a greeting (e.g., "Hi,")
+- Contain the main message content
+- End with your content - DO NOT include "Best," or "Best regards" or any closing - the footer will add "Best," automatically
+- DO NOT include any signature, contact information, or footer content
+
+GUIDELINES:
+- Write in a professional, friendly tone matching Jill Ames' communication style
+- Reference specific details from the conversation to show you're paying attention
+- Avoid repeating the same message - vary your wording based on conversation context
+- Keep responses concise and to the point
+- If missing fields are identified, politely request them in a natural way
+- If all required information is complete, acknowledge and close appropriately
+- If property is unavailable, acknowledge and ask for alternatives if appropriate
+- If new property is suggested, thank them and indicate you'll review it
+
+SCENARIOS:
+1. Missing required fields: Thank them for the information, then list the missing fields naturally in a bulleted format.
+   EXAMPLE FORMAT:
+   "To complete the property details, could you please provide:
+   
+   - Total SF
+   - Ops Ex /SF
+   - Gross Rent
+   - Drive Ins
+   - Docks
+   - Ceiling Ht
+   - Power"
+   
+   IMPORTANT: NEVER request "Rent/SF /Yr" - this field should never be asked for.
+   
+2. All fields complete: Thank them and indicate you have everything needed
+3. Property unavailable + new property suggested: Thank them for both pieces of information
+4. Property unavailable (no alternative): Thank them and ask if they have other properties
+5. General acknowledgment: Thank them for their message and respond appropriately to their content
+
+IMPORTANT: The response should feel natural and conversational, not robotic or templated. Reference specific details from their message when possible. Remember: NO closing/signature - just end with your content, the footer will add "Best," and signature automatically.
+"""
+
         # ---- Build prompt -----------------------------------------------------
         target_anchor = get_row_anchor(rowvals, header)  # e.g., "1 Randolph Ct, Evans"
 
+        # Check missing required fields to inform response email generation
+        missing_fields = check_missing_required_fields(rowvals, header)
+        
         prompt_parts = [f"""
-You are analyzing a conversation thread to suggest updates to ONE Google Sheet row and detect key events.
+You are analyzing a conversation thread to suggest updates to ONE Google Sheet row, detect key events, and generate an appropriate response email.
 
 TARGET PROPERTY (canonical identity for matching): {target_anchor}
 
 {COLUMN_RULES}
 {DOC_SELECTION_RULES}
 {EVENT_RULES}
+{RESPONSE_EMAIL_RULES}
 
 SHEET HEADER (row 2):
 {json.dumps(header)}
 
 CURRENT ROW VALUES (row {rownum}):
 {json.dumps(rowvals)}
+
+MISSING REQUIRED FIELDS (if any):
+{json.dumps(missing_fields)}
 
 CONVERSATION HISTORY (latest last):
 {json.dumps(conversation, indent=2)}
@@ -415,6 +469,7 @@ OUTPUT ONLY valid JSON in this exact format:
       "notes": "<for new_property: additional context about the property>"
     }
   ],
+  "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation, reference specific details when possible, and vary wording to avoid repetition.>",
   "notes": "<optional general notes about the conversation>"
 }
 """)
@@ -467,6 +522,7 @@ OUTPUT ONLY valid JSON in this exact format:
 
         proposal.setdefault("updates", [])
         proposal.setdefault("events", [])
+        proposal.setdefault("response_email", None)  # LLM-generated response email
 
         # ---- Log + store in sheetChangeLog -----------------------------------
         print(f"\n🤖 OpenAI Proposal for {client_id}__{email}:")
@@ -479,6 +535,13 @@ OUTPUT ONLY valid JSON in this exact format:
                 print(f"   • {upd.get('column', 'Unknown')}: '{upd.get('value', '')}' (confidence: {upd.get('confidence', 'N/A')})")
         else:
             print(f"\n📝 No field updates proposed")
+        
+        # Log response email if generated
+        if proposal.get("response_email"):
+            print(f"\n📧 LLM-generated response email:")
+            print(f"   {proposal['response_email'][:200]}..." if len(proposal['response_email']) > 200 else f"   {proposal['response_email']}")
+        else:
+            print(f"\n📧 No LLM-generated response email (will use template fallback)")
 
         now_utc = datetime.now(timezone.utc)
         log_doc_id = f"{thread_id}__{now_utc.isoformat().replace(':','-').replace('.','-').replace('+00:00','Z')}"

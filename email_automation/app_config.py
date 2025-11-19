@@ -26,8 +26,9 @@ BODY = (
 THANK_YOU_BODY = "Thanks for your response."
 
 # Required fields for closing conversations
+# NOTE: "Rent/SF /Yr" is NOT included - it should never be requested from clients
 REQUIRED_FIELDS_FOR_CLOSE = [
-    "Total SF","Rent/SF /Yr","Ops Ex /SF","Gross Rent",
+    "Total SF","Ops Ex /SF","Gross Rent",
     "Drive Ins","Docks","Ceiling Ht","Power"
 ]
 

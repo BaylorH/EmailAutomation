@@ -683,18 +683,23 @@ Thanks!""",
             try:
                 response_sent = False
                 
+                # Check if LLM generated a response email
+                llm_response_email = proposal.get("response_email")
+                
                 # Scenario 1: Property became non-viable AND new property was suggested
                 if old_row_became_nonviable and new_row_created:
-                    # Send reply within the existing thread
-                    thank_you_body = """Hi,
+                    # Use LLM-generated response if available, otherwise use template
+                    if llm_response_email:
+                        response_body = llm_response_email
+                        print(f"🤖 Using LLM-generated response for non-viable + new property scenario")
+                    else:
+                        response_body = """Hi,
 
 Thank you for letting me know that property is no longer available, and thanks for suggesting the alternative property.
 
-I'll review the new property details and get back to you if I have any questions.
-
-Best regards"""
+I'll review the new property details and get back to you if I have any questions."""
                     
-                    sent = send_reply_in_thread(user_id, headers, thank_you_body, msg_id, from_addr_lower, thread_id)
+                    sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
                     if sent:
                         print(f"📧 Sent thank you + closing (new property suggested) to: {from_addr_lower}")
                         response_sent = True
@@ -703,16 +708,18 @@ Best regards"""
                 
                 # Scenario 2: Property became non-viable but NO new property suggested
                 elif old_row_became_nonviable and not new_row_created:
-                    # Send reply within the existing thread
-                    alternatives_body = """Hi,
+                    # Use LLM-generated response if available, otherwise use template
+                    if llm_response_email:
+                        response_body = llm_response_email
+                        print(f"🤖 Using LLM-generated response for non-viable scenario")
+                    else:
+                        response_body = """Hi,
 
 Thank you for letting me know that property is no longer available.
 
-Do you have any other properties that might be a good fit for our requirements?
-
-Best regards"""
+Do you have any other properties that might be a good fit for our requirements?"""
                     
-                    sent = send_reply_in_thread(user_id, headers, alternatives_body, msg_id, from_addr_lower, thread_id)
+                    sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
                     if sent:
                         print(f"📧 Sent thank you + ask for alternatives to: {from_addr_lower}")
                         response_sent = True
@@ -755,35 +762,39 @@ Best regards"""
                         
                         if missing_fields:
                             # Scenario 3: Thank you + request missing fields
-                            # Send reply within the existing thread
-                            field_list = "\n".join(f"- {field}" for field in missing_fields)
-                            reply_body = f"""Hi,
+                            # Use LLM-generated response if available, otherwise use template
+                            if llm_response_email:
+                                response_body = llm_response_email
+                                print(f"🤖 Using LLM-generated response for missing fields scenario")
+                            else:
+                                field_list = "\n".join(f"- {field}" for field in missing_fields)
+                                response_body = f"""Hi,
 
 Thank you for the information!
 
 To complete the property details, could you please provide:
 
-{field_list}
-
-Thanks!"""
+{field_list}"""
                             
-                            sent = send_reply_in_thread(user_id, headers, reply_body, msg_id, from_addr_lower, thread_id)
+                            sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
                             if sent:
                                 print(f"📧 Sent thank you + missing fields request to: {from_addr_lower}")
                             else:
                                 print(f"❌ Failed to send missing fields request")
                         else:
                             # Scenario 4: All fields complete - send closing
-                            # Send reply within the existing thread
-                            closing_body = """Hi,
+                            # Use LLM-generated response if available, otherwise use template
+                            if llm_response_email:
+                                response_body = llm_response_email
+                                print(f"🤖 Using LLM-generated response for all fields complete scenario")
+                            else:
+                                response_body = """Hi,
 
 Thank you for providing all the requested information! We now have everything we need for your property details.
 
-We'll be in touch if we need any additional information.
-
-Best regards"""
+We'll be in touch if we need any additional information."""
                             
-                            sent = send_reply_in_thread(user_id, headers, closing_body, msg_id, from_addr_lower, thread_id)
+                            sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
                             if sent:
                                 print(f"📧 Sent closing email - all fields complete to: {from_addr_lower}")
                             else:
