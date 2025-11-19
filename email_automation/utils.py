@@ -141,8 +141,8 @@ def _subject_to_address_city(subject: str) -> tuple[str, str]:
     city = parts[1] if len(parts) > 1 else ""
     return addr, city
 
-def _upload_logo_to_drive() -> str:
-    """Upload logo to Google Drive and return public direct image URL."""
+def _upload_logo_to_drive(image_filename: str = "logo.png") -> str:
+    """Upload image to Google Drive and return public direct image URL."""
     try:
         from .file_handling import ensure_drive_folder
         from .clients import _helper_google_creds
@@ -152,30 +152,40 @@ def _upload_logo_to_drive() -> str:
         
         # Get the directory of this file
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        logo_path = os.path.join(current_dir, "assets", "images", "logo.png")
+        image_path = os.path.join(current_dir, "assets", "images", image_filename)
         
-        if not os.path.exists(logo_path):
-            print(f"⚠️ Logo not found: {logo_path}")
+        if not os.path.exists(image_path):
+            print(f"⚠️ Image not found: {image_path}")
             return ""
         
-        # Read logo file
-        with open(logo_path, "rb") as img_file:
-            logo_bytes = img_file.read()
+        # Read image file
+        with open(image_path, "rb") as img_file:
+            image_bytes = img_file.read()
         
-        # Upload to Drive with correct MIME type for PNG
+        # Determine MIME type from extension
+        ext = os.path.splitext(image_filename)[1].lower()
+        mime_types = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif'
+        }
+        mime_type = mime_types.get(ext, 'image/png')
+        
+        # Upload to Drive with correct MIME type
         creds = _helper_google_creds()
         drive = build("drive", "v3", credentials=creds, cache_discovery=False)
         
         folder_id = ensure_drive_folder()
         
         file_metadata = {
-            "name": "jill_ames_logo.png",
+            "name": image_filename,
             "parents": [folder_id] if folder_id else []
         }
         
         media = MediaIoBaseUpload(
-            io.BytesIO(logo_bytes),
-            mimetype="image/png",
+            io.BytesIO(image_bytes),
+            mimetype=mime_type,
             resumable=True
         )
         
@@ -202,12 +212,12 @@ def _upload_logo_to_drive() -> str:
         if web_link and "/file/d/" in web_link:
             file_id = web_link.split("/file/d/")[1].split("/")[0]
             direct_link = f"https://drive.google.com/uc?export=view&id={file_id}"
-            print(f"✅ Logo uploaded to Drive: {direct_link}")
+            print(f"✅ {image_filename} uploaded to Drive: {direct_link}")
             return direct_link
         
         return web_link or ""
     except Exception as e:
-        print(f"⚠️ Failed to upload logo to Drive: {e}")
+        print(f"⚠️ Failed to upload {image_filename} to Drive: {e}")
         return ""
 
 def _image_to_base64(image_path: str) -> str:
@@ -245,6 +255,9 @@ def get_email_footer() -> str:
     # Upload logo to Drive and get public URL (more reliable than base64 for email clients)
     logo_url = _upload_logo_to_drive()
     
+    # Upload LinkedIn icon to Drive
+    linkedin_url = _upload_logo_to_drive("linkedin.png")
+    
     # Build the footer HTML matching the professional signature layout
     # Uses sans-serif font (Arial/Helvetica), black text
     footer = """<br><br>
@@ -281,8 +294,13 @@ Best,<br>
 <tr>
 <td valign="top" style="padding-right: 30px; vertical-align: top; font-size: 10pt; color: #000000;">
 T +1 206 510 5575<br>
-<a href="mailto:jill.ames@mohrpartners.com" style="color: #000000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">jill.ames@mohrpartners.com</a>
-</td>
+<a href="mailto:jill.ames@mohrpartners.com" style="color: #000000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">jill.ames@mohrpartners.com</a><br>"""
+    
+    # Add LinkedIn icon below email
+    if linkedin_url:
+        footer += f'<a href="https://www.linkedin.com/company/mohr-partners" target="_blank" style="text-decoration: none; display: inline-block; margin-top: 4px;"><img src="{linkedin_url}" alt="LinkedIn" style="width: 20px; height: 20px; border: 0; vertical-align: middle;" /></a>'
+    
+    footer += """</td>
 <td valign="top" style="vertical-align: top; font-size: 10pt; color: #000000;">
 <strong style="font-weight: bold; color: #000000;">Mohr Partners, Inc.</strong><br>
 <a href="https://mohrpartners.com/" target="_blank" style="color: #000000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">mohrpartners.com</a><br>
