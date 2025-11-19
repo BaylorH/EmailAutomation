@@ -7,7 +7,7 @@ from typing import Dict, Any, List
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .clients import _fs, _get_sheet_id_or_fail, _sheets_client
-from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, _header_index_map
+from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, _header_index_map, _find_row_by_email
 from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable
 from .messaging import (save_message, index_message_id, dump_thread_from_firestore, 
                        has_processed, mark_processed, set_last_scan_iso, 
@@ -178,6 +178,75 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         print(f"   ❌ Failed to send reply: {e}")
         return False
 
+def _find_client_id_by_email(uid: str, email: str) -> str | None:
+    """
+    Search through all clients (active and archived) to find which one has a sheet
+    with a row matching the given email address.
+    Returns clientId if found, None otherwise.
+    """
+    if not email:
+        return None
+    
+    email_lower = email.lower().strip()
+    
+    try:
+        # Search active clients
+        clients_ref = _fs.collection("users").document(uid).collection("clients")
+        clients = list(clients_ref.stream())
+        
+        for client_doc in clients:
+            client_id = client_doc.id
+            client_data = client_doc.to_dict() or {}
+            sheet_id = client_data.get("sheetId")
+            
+            if not sheet_id:
+                continue
+            
+            try:
+                # Try to find email in this client's sheet
+                sheets = _sheets_client()
+                tab_title = _get_first_tab_title(sheets, sheet_id)
+                header = _read_header_row2(sheets, sheet_id, tab_title)
+                rownum, rowvals = _find_row_by_email(sheets, sheet_id, tab_title, header, email_lower)
+                
+                if rownum is not None:
+                    print(f"   ✅ Found email {email_lower} in client {client_id}, sheet {sheet_id}, row {rownum}")
+                    return client_id
+            except Exception as e:
+                # Skip this client if sheet access fails
+                continue
+        
+        # Search archived clients
+        archived_clients_ref = _fs.collection("users").document(uid).collection("archivedClients")
+        archived_clients = list(archived_clients_ref.stream())
+        
+        for client_doc in archived_clients:
+            client_id = client_doc.id
+            client_data = client_doc.to_dict() or {}
+            sheet_id = client_data.get("sheetId")
+            
+            if not sheet_id:
+                continue
+            
+            try:
+                # Try to find email in this archived client's sheet
+                sheets = _sheets_client()
+                tab_title = _get_first_tab_title(sheets, sheet_id)
+                header = _read_header_row2(sheets, sheet_id, tab_title)
+                rownum, rowvals = _find_row_by_email(sheets, sheet_id, tab_title, header, email_lower)
+                
+                if rownum is not None:
+                    print(f"   ✅ Found email {email_lower} in archived client {client_id}, sheet {sheet_id}, row {rownum}")
+                    return client_id
+            except Exception as e:
+                # Skip this client if sheet access fails
+                continue
+        
+        return None
+    except Exception as e:
+        print(f"   ⚠️ Failed to search clients for email {email_lower}: {e}")
+        return None
+
 def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email: str | None):
     # Read thread (to get clientId)
     tdoc = (_fs.collection("users").document(uid)
@@ -335,6 +404,16 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             # Try to get subject from current message
             subject = msg.get("subject", "Property information")
             
+            # Try to find clientId by searching all clients for this email
+            client_id = None
+            if from_addr:
+                print(f"   🔍 Searching for clientId by email: {from_addr}")
+                client_id = _find_client_id_by_email(user_id, from_addr)
+                if client_id:
+                    print(f"   ✅ Found clientId: {client_id}")
+                else:
+                    print(f"   ⚠️ Could not find clientId for email {from_addr}")
+            
             # Save thread root
             thread_meta = {
                 "subject": subject,
@@ -342,10 +421,13 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 "conversationId": conversation_id,
                 "createdFromReply": True  # Flag to indicate this was created from a reply
             }
+            if client_id:
+                thread_meta["clientId"] = client_id
+            
             save_thread_root(user_id, thread_id, thread_meta)
             index_conversation_id(user_id, conversation_id, thread_id)
             matched_header = f"New thread created from ConversationId: {conversation_id}"
-            print(f"   ✅ Created new thread: {thread_id}")
+            print(f"   ✅ Created new thread: {thread_id}" + (f" with clientId: {client_id}" if client_id else ""))
         else:
             print(f"❓ No thread match found for message from {from_addr} (no conversationId either)")
             return
