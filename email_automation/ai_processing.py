@@ -398,7 +398,11 @@ SCENARIOS:
 2. All fields complete: Thank them and indicate you have everything needed
 3. Property unavailable + new property suggested: Thank them for both pieces of information
 4. Property unavailable (no alternative): Thank them and ask if they have other properties
-5. General acknowledgment: Thank them for their message and respond appropriately to their content
+5. Call requested: 
+   - If phone number is provided in the message: DO NOT generate a response_email (system will handle notification only)
+   - If no phone number: Keep response brief - just ask for their phone number
+   - Keep it short and direct, avoid wordy responses
+6. General acknowledgment: Thank them for their message and respond appropriately to their content
 
 IMPORTANT: The response should feel natural and conversational, not robotic or templated. Reference specific details from their message when possible. Remember: NO closing/signature - just end with your content, the footer will add "Best," and signature automatically.
 """
@@ -477,7 +481,7 @@ OUTPUT ONLY valid JSON in this exact format:
       "notes": "<for new_property: additional context about the property>"
     }
   ],
-  "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation, reference specific details when possible, and vary wording to avoid repetition.>",
+      "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation, reference specific details when possible, and vary wording to avoid repetition. IMPORTANT: If call_requested event is detected AND a phone number is provided in the message, set this field to null or empty string - the system will handle notification only without sending an email response.>",
   "notes": "<optional general notes about the conversation>"
 }
 """)

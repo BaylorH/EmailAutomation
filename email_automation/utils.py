@@ -260,8 +260,7 @@ def get_email_footer() -> str:
     
     # Build the footer HTML matching the professional signature layout
     # Uses sans-serif font (Arial/Helvetica), black text
-    footer = """<br><br>
-Best,<br>
+    footer = """Best,<br>
 <br>
 <table cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; margin-top: 10px; font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000;">
 <tr>
@@ -317,10 +316,27 @@ def format_email_body_with_footer(body: str) -> str:
     """
     Converts plain text email body to HTML and appends footer.
     Preserves line breaks and formatting.
+    Wraps in proper HTML structure to prevent email clients from collapsing the footer.
     """
     # Convert plain text to HTML
     # Replace double newlines with <br><br>, single newlines with <br>
     html_body = body.replace('\n\n', '<br><br>').replace('\n', '<br>')
     
-    # Append footer
-    return html_body + get_email_footer()
+    # Wrap in proper HTML structure to prevent email clients from collapsing footer
+    # Add a non-breaking separator before footer to prevent trimming
+    full_content = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+</head>
+<body style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000; margin: 0; padding: 0;">
+<div style="max-width: 600px;">
+{html_body}
+<div style="margin-top: 20px; padding-top: 20px;">
+{get_email_footer()}
+</div>
+</div>
+</body>
+</html>"""
+    
+    return full_content

@@ -438,8 +438,21 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 event_type = event.get("type")
                 
                 if event_type == "call_requested":
+                    # Check if phone number is mentioned in the message
+                    phone_pattern = r'(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})'
+                    phone_match = re.search(phone_pattern, _full_text)
+                    phone_number = phone_match.group(0) if phone_match else None
+                    
                     # Create action_needed notification
                     try:
+                        meta = {
+                            "reason": "call_requested",
+                            "details": "Call requested in conversation"
+                        }
+                        if phone_number:
+                            meta["phoneNumber"] = phone_number
+                            meta["details"] = f"Call requested - phone number provided: {phone_number}"
+                        
                         write_notification(
                             user_id, client_id,
                             kind="action_needed",
@@ -448,10 +461,17 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             thread_id=thread_id,
                             row_number=rownum,
                             row_anchor=row_anchor,
-                            meta={"reason": "call_requested", "details": "Call requested in conversation"},
+                            meta=meta,
                             dedupe_key=f"call_requested:{thread_id}"
                         )
-                        print(f"📞 Created call_requested notification")
+                        print(f"📞 Created call_requested notification" + (f" with phone: {phone_number}" if phone_number else ""))
+                        
+                        # If phone number is provided, skip email response (just notification)
+                        # If no phone number, we'll send a brief response asking for it
+                        if phone_number:
+                            print(f"📞 Phone number found - skipping email response, notification only")
+                            # Mark that we should skip the normal email response
+                            proposal["skip_response"] = True
                     except Exception as e:
                         print(f"❌ Failed to write call_requested notification: {e}")
                 
@@ -704,6 +724,22 @@ Thanks!""",
             try:
                 response_sent = False
                 
+                # Check if we should skip response (e.g., phone number provided in call request)
+                skip_response = proposal.get("skip_response", False)
+                if skip_response:
+                    print(f"⏭️ Skipping email response (notification only)")
+                    return  # Exit early, notification already created
+                
+                # Check if call was requested but no phone number provided
+                call_requested_no_phone = False
+                for event in events:
+                    if event.get("type") == "call_requested":
+                        phone_pattern = r'(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})'
+                        phone_match = re.search(phone_pattern, _full_text)
+                        if not phone_match:
+                            call_requested_no_phone = True
+                            break
+                
                 # Check if LLM generated a response email
                 llm_response_email = proposal.get("response_email")
                 
@@ -746,6 +782,18 @@ Do you have any other properties that might be a good fit for our requirements?"
                         response_sent = True
                     else:
                         print(f"❌ Failed to send alternatives request")
+                
+                # Handle call request without phone number - send brief response asking for number
+                if call_requested_no_phone and not response_sent:
+                    response_body = """Hi,
+
+Could you please provide your phone number so I can give you a call?"""
+                    sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
+                    if sent:
+                        print(f"📞 Sent request for phone number to: {from_addr_lower}")
+                        response_sent = True
+                    else:
+                        print(f"❌ Failed to send phone number request")
                 
                 # Scenario 3 & 4: Property is still viable - check missing fields
                 if not response_sent and not old_row_became_nonviable:

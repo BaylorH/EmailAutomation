@@ -79,10 +79,35 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
     # Append footer to all emails (signature with logo, contact info, etc.)
     from .utils import get_email_footer, format_email_body_with_footer
     if content_type == "HTML":
-        # If already HTML, just append footer
-        content = content + get_email_footer()
+        # If already HTML, wrap it properly and append footer
+        # Check if content is already wrapped in HTML structure
+        if not content.strip().startswith("<!DOCTYPE") and not content.strip().startswith("<html"):
+            # Wrap existing HTML content and add footer
+            content = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+</head>
+<body style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000; margin: 0; padding: 0;">
+<div style="max-width: 600px;">
+{content}
+<div style="margin-top: 20px; padding-top: 20px;">
+{get_email_footer()}
+</div>
+</div>
+</body>
+</html>"""
+        else:
+            # Content is already wrapped, just append footer before closing body tag
+            # Insert footer before </body> tag
+            if "</body>" in content:
+                footer_with_wrapper = f'<div style="margin-top: 20px; padding-top: 20px;">{get_email_footer()}</div>'
+                content = content.replace("</body>", footer_with_wrapper + "</body>")
+            else:
+                # No body tag, just append
+                content = content + f'<div style="margin-top: 20px; padding-top: 20px;">{get_email_footer()}</div>'
     else:
-        # Convert to HTML and add footer
+        # Convert to HTML and add footer (this function now wraps in proper HTML structure)
         content = format_email_body_with_footer(content)
         content_type = "HTML"
     results = {"sent": [], "errors": {}}
