@@ -257,7 +257,7 @@ Best,<br>
 <a href="https://mohrpartners.com/" target="_blank" style="text-decoration: none;">"""
     
     if logo_url:
-        footer += f'<img src="{logo_url}" alt="Mohr Partners" style="max-width: 180px; height: auto; display: block; border: 0;" />'
+        footer += f'<img src="{logo_url}" alt="Mohr Partners" style="width: 120px; height: auto; display: block; border: 0;" />'
     else:
         footer += "Mohr Partners"
     
@@ -281,7 +281,7 @@ Best,<br>
 <tr>
 <td valign="top" style="padding-right: 30px; vertical-align: top; font-size: 10pt; color: #000000;">
 T +1 206 510 5575<br>
-<a href="mailto:jill.ames@mohrpartners.com" style="color: #000000; text-decoration: underline; text-decoration-color: #FFD700; text-underline-offset: 2px;">jill.ames@mohrpartners.com</a>
+<a href="mailto:jill.ames@mohrpartners.com" style="color: #000000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">jill.ames@mohrpartners.com</a>
 </td>
 <td valign="top" style="vertical-align: top; font-size: 10pt; color: #000000;">
 <strong style="font-weight: bold; color: #000000;">Mohr Partners, Inc.</strong><br>
