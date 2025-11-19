@@ -30,7 +30,7 @@ from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     try:
-        from .utils import exponential_backoff_request, normalize_message_id, safe_preview
+        from .utils import exponential_backoff_request, safe_preview
         from .messaging import save_message, index_message_id, index_conversation_id
         from datetime import datetime, timezone
         import requests
@@ -326,7 +326,6 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             print(f"   This might be a reply to a message we didn't process. Creating new thread...")
             # Create a new thread using the conversationId as the thread ID
             from .messaging import save_thread_root, index_conversation_id
-            from .utils import normalize_message_id
             
             # Use conversationId as thread_id (normalized)
             thread_id = normalize_message_id(conversation_id)
@@ -1123,7 +1122,7 @@ def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], to
     Indexes them so they appear in conversation history.
     """
     try:
-        from .utils import exponential_backoff_request, normalize_message_id, safe_preview, strip_html_tags
+        from .utils import exponential_backoff_request, safe_preview, strip_html_tags
         from .messaging import save_message, index_message_id, index_conversation_id, lookup_thread_by_conversation_id, save_thread_root
         from datetime import datetime, timezone, timedelta
         import requests
