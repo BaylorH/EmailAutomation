@@ -141,6 +141,75 @@ def _subject_to_address_city(subject: str) -> tuple[str, str]:
     city = parts[1] if len(parts) > 1 else ""
     return addr, city
 
+def _upload_logo_to_drive() -> str:
+    """Upload logo to Google Drive and return public direct image URL."""
+    try:
+        from .file_handling import ensure_drive_folder
+        from .clients import _helper_google_creds
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+        import io
+        
+        # Get the directory of this file
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        logo_path = os.path.join(current_dir, "assets", "images", "logo.png")
+        
+        if not os.path.exists(logo_path):
+            print(f"⚠️ Logo not found: {logo_path}")
+            return ""
+        
+        # Read logo file
+        with open(logo_path, "rb") as img_file:
+            logo_bytes = img_file.read()
+        
+        # Upload to Drive with correct MIME type for PNG
+        creds = _helper_google_creds()
+        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+        
+        folder_id = ensure_drive_folder()
+        
+        file_metadata = {
+            "name": "jill_ames_logo.png",
+            "parents": [folder_id] if folder_id else []
+        }
+        
+        media = MediaIoBaseUpload(
+            io.BytesIO(logo_bytes),
+            mimetype="image/png",
+            resumable=True
+        )
+        
+        file = drive.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id,webViewLink"
+        ).execute()
+        
+        # Make link-shareable
+        drive.permissions().create(
+            fileId=file.get("id"),
+            body={
+                "role": "reader",
+                "type": "anyone"
+            }
+        ).execute()
+        
+        web_link = file.get("webViewLink")
+        
+        # Convert Drive link to direct image link
+        # Drive webViewLink format: https://drive.google.com/file/d/{file_id}/view
+        # Direct image format: https://drive.google.com/uc?export=view&id={file_id}
+        if web_link and "/file/d/" in web_link:
+            file_id = web_link.split("/file/d/")[1].split("/")[0]
+            direct_link = f"https://drive.google.com/uc?export=view&id={file_id}"
+            print(f"✅ Logo uploaded to Drive: {direct_link}")
+            return direct_link
+        
+        return web_link or ""
+    except Exception as e:
+        print(f"⚠️ Failed to upload logo to Drive: {e}")
+        return ""
+
 def _image_to_base64(image_path: str) -> str:
     """Convert image file to base64 data URI for email embedding."""
     try:
@@ -173,8 +242,8 @@ def _image_to_base64(image_path: str) -> str:
 
 def get_email_footer() -> str:
     """Returns HTML formatted email footer for Jill Ames matching the professional signature style."""
-    # Embed logo as base64
-    logo_base64 = _image_to_base64("logo.png")
+    # Upload logo to Drive and get public URL (more reliable than base64 for email clients)
+    logo_url = _upload_logo_to_drive()
     
     # Build the footer HTML matching the professional signature layout
     # Uses sans-serif font (Arial/Helvetica), black text
@@ -187,8 +256,8 @@ Best,<br>
 <td valign="top" style="padding-right: 30px; vertical-align: top;">
 <a href="https://mohrpartners.com/" target="_blank" style="text-decoration: none;">"""
     
-    if logo_base64:
-        footer += f'<img src="{logo_base64}" alt="Mohr Partners" style="max-width: 180px; height: auto; display: block;" />'
+    if logo_url:
+        footer += f'<img src="{logo_url}" alt="Mohr Partners" style="max-width: 180px; height: auto; display: block; border: 0;" />'
     else:
         footer += "Mohr Partners"
     
