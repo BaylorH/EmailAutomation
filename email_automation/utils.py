@@ -172,62 +172,58 @@ def _image_to_base64(image_path: str) -> str:
         return ""
 
 def get_email_footer() -> str:
-    """Returns HTML formatted email footer for Jill Ames matching the screenshot."""
-    # Embed images as base64
-    logos_base64 = _image_to_base64("logos.png")
-    fb_base64 = _image_to_base64("fb.png")
-    x_base64 = _image_to_base64("x.png")
-    linkedin_base64 = _image_to_base64("linkedin.png")
+    """Returns HTML formatted email footer for Jill Ames matching the professional signature style."""
+    # Embed logo as base64
+    logo_base64 = _image_to_base64("logo.png")
     
-    # Build the footer HTML matching the screenshot layout
-    # Entire footer uses Times New Roman, font size 10
-    footer = """<div style="font-family: 'Times New Roman', Times, serif; font-size: 10pt;">
-<br><br>
+    # Build the footer HTML matching the professional signature layout
+    # Uses sans-serif font (Arial/Helvetica), black text
+    footer = """<br><br>
 Thanks!<br>
 Best,<br>
 <br>
-<table cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; margin-top: 10px; font-family: 'Times New Roman', Times, serif; font-size: 10pt;">
+<table cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; margin-top: 10px; font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000;">
 <tr>
-<td valign="top" style="padding-right: 20px;">
-<a href="https://mohrpartners.com/" target="_blank">"""
+<td valign="top" style="padding-right: 30px; vertical-align: top;">
+<a href="https://mohrpartners.com/" target="_blank" style="text-decoration: none;">"""
     
-    if logos_base64:
-        footer += f'<img src="{logos_base64}" alt="Mohr Partners & NMSDC Certification" style="max-width: 200px; height: auto;" />'
+    if logo_base64:
+        footer += f'<img src="{logo_base64}" alt="Mohr Partners" style="max-width: 180px; height: auto; display: block;" />'
     else:
         footer += "Mohr Partners"
     
     footer += """</a>
 </td>
-<td valign="top" style="font-family: 'Times New Roman', Times, serif; font-size: 10pt;">
-<strong>Jill Ames</strong><br>
-Senior Commercial Real Estate Broker | National Accounts<br>
-<a href="http://www.jillames.com" target="_blank" style="color: #0000EE; text-decoration: underline;">www.jillames.com</a><br>
-Direct: 206 510 5575<br>
-<strong>Mohr Partners, Inc.</strong> <a href="https://mohrpartners.com/" target="_blank" style="color: #0000EE; text-decoration: underline;">mohrpartners.com</a><br>
-<br>"""
-    
-    # Social media icons
-    if fb_base64 or x_base64 or linkedin_base64:
-        footer += '<table cellpadding="0" cellspacing="5" border="0" style="border-collapse: collapse;"><tr>'
-        if fb_base64:
-            footer += f'<td><a href="https://www.facebook.com/mohrpartnersinc" target="_blank"><img src="{fb_base64}" alt="Facebook" style="width: 24px; height: 24px;" /></a></td>'
-        if x_base64:
-            # TODO: Update with correct Twitter/X link if different
-            footer += f'<td><a href="https://x.com/mohrpartners" target="_blank"><img src="{x_base64}" alt="Twitter/X" style="width: 24px; height: 24px;" /></a></td>'
-        if linkedin_base64:
-            footer += f'<td><a href="https://www.linkedin.com/company/mohr-partners" target="_blank"><img src="{linkedin_base64}" alt="LinkedIn" style="width: 24px; height: 24px;" /></a></td>'
-        footer += '</tr></table><br>'
-    
-    footer += """</td>
+<td valign="top" style="vertical-align: top; font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000;">
+<table cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; width: 100%;">
+<tr>
+<td colspan="2" style="padding-bottom: 8px;">
+<strong style="font-size: 12pt; font-weight: bold; color: #000000;">Jill Ames</strong><br>
+<span style="font-size: 10pt; color: #000000;">Senior Associate</span><br>
+<span style="font-size: 10pt; color: #000000;">National Accounts</span><br>
+<span style="font-size: 10pt; color: #000000;">License Nos. 127384 (WA), SP24646 (ID)</span>
+</td>
+</tr>
+<tr>
+<td colspan="2" style="padding: 8px 0;">
+<div style="border-top: 1px solid #CC0000; width: 100%;"></div>
+</td>
+</tr>
+<tr>
+<td valign="top" style="padding-right: 30px; vertical-align: top; font-size: 10pt; color: #000000;">
+T +1 206 510 5575<br>
+<a href="mailto:jill.ames@mohrpartners.com" style="color: #000000; text-decoration: underline; text-decoration-color: #FFD700; text-underline-offset: 2px;">jill.ames@mohrpartners.com</a>
+</td>
+<td valign="top" style="vertical-align: top; font-size: 10pt; color: #000000;">
+<strong style="font-weight: bold; color: #000000;">Mohr Partners, Inc.</strong><br>
+<a href="https://mohrpartners.com/" target="_blank" style="color: #000000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">mohrpartners.com</a><br>
+<span style="color: #000000;">Seattle, WA</span>
+</td>
 </tr>
 </table>
-<br>
-<div style="font-size: 10pt; color: #666666; line-height: 1.4; font-family: 'Times New Roman', Times, serif;">
-My goal is to have a healthy work life balance, so please note that my office hours are Monday through Friday 8am to 5pm MT. Our offices are closed for all major holidays. Emails, voicemails, and text messages that are business related will be returned during my office hours.<br>
-<br>
-This message and its contents are confidential. If you received this message in error, do not use or rely upon it. Instead, please inform the sender and then delete it. WA License 127384 held by Mohr Partners Inc. Idaho License SP24646 held by Western Idaho Realty, Inc.
-</div>
-</div>"""
+</td>
+</tr>
+</table>"""
     
     return footer
 
