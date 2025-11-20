@@ -148,6 +148,69 @@ def _append_ai_meta(sheets, spreadsheet_id: str, rownum: int, column: str, value
     except Exception as e:
         print(f"⚠️ Failed to append AI_META record: {e}")
 
+def _append_notes_to_comments(sheets, spreadsheet_id: str, tab_title: str, header: list[str], rownum: int, notes: str):
+    """
+    Append notes to the comments field (Listing Brokers Comments or Jill and Clients Comments).
+    Prefers 'Listing Brokers Comments' if available, otherwise uses 'Jill and Clients Comments'.
+    Appends to existing comments with a separator.
+    """
+    try:
+        idx_map = _header_index_map(header)
+        
+        # Try to find comments column (prefer Listing Brokers Comments, fallback to Jill and Clients Comments)
+        comments_col_idx = None
+        comments_col_name = None
+        
+        # First try "Listing Brokers Comments"
+        for key in ["listing brokers comments", "listing brokers comments "]:
+            if key in idx_map:
+                comments_col_idx = idx_map[key]
+                comments_col_name = key
+                break
+        
+        # Fallback to "Jill and Clients Comments"
+        if not comments_col_idx:
+            for key in ["jill and clients comments", "jill and clients comments "]:
+                if key in idx_map:
+                    comments_col_idx = idx_map[key]
+                    comments_col_name = key
+                    break
+        
+        if not comments_col_idx:
+            print(f"⚠️ Could not find comments column to append notes")
+            return
+        
+        # Get existing comments
+        col_letter = _col_letter(comments_col_idx)
+        existing_resp = sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!{col_letter}{rownum}"
+        ).execute()
+        
+        existing_comments = ""
+        if existing_resp.get("values") and len(existing_resp["values"]) > 0:
+            existing_comments = (existing_resp["values"][0][0] or "").strip()
+        
+        # Combine existing and new notes
+        if existing_comments:
+            # Append with separator if there's existing content
+            combined = f"{existing_comments} • {notes}"
+        else:
+            combined = notes
+        
+        # Update the comments cell
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!{col_letter}{rownum}",
+            valueInputOption="RAW",
+            body={"values": [[combined]]}
+        ).execute()
+        
+        print(f"📝 Appended notes to {comments_col_name} column: {notes[:100]}...")
+        
+    except Exception as e:
+        print(f"⚠️ Failed to append notes to comments: {e}")
+
 def apply_proposal_to_sheet(
     uid: str,
     client_id: str,
@@ -246,6 +309,11 @@ def apply_proposal_to_sheet(
         for a in applied:
             _append_ai_meta(sheets, sheet_id, rownum, a["column"], a["newValue"], override=False)
 
+        # Write notes to comments field if provided
+        notes = proposal.get("notes")
+        if notes and notes.strip():
+            _append_notes_to_comments(sheets, sheet_id, tab_title, header, rownum, notes.strip())
+
         # Enhanced logging for debugging
         print(f"\n✅ Applied {len(applied)} updates, skipped {len(skipped)}")
         if applied:
@@ -302,6 +370,7 @@ COLUMN SEMANTICS & MAPPING (use EXACT header names):
 - "Power": Electrical power specifications. Synonyms: electrical, power capacity, amperage, voltage, electrical service, power supply, electrical load, electrical capacity, power requirements, electrical specs.
 - "Listing Brokers Comments ": Short, non-numeric broker/client notes not covered by other columns. Use terse fragments separated by " • ".
   Do NOT put numeric data like square footage, rent, or ceiling height here if it belongs in dedicated columns.
+  IMPORTANT: Capture conversation details that don't map to specific columns - client preferences, timing, special requirements, concerns, negotiation points, relationship context, etc. These should be captured in the "notes" field of your output, which will be automatically written to this comments column.
 
 FORMATTING:
 - For money/area fields, output plain decimals (no "$", "SF", commas). Examples: "30", "14.29", "2400".
@@ -500,7 +569,7 @@ OUTPUT ONLY valid JSON in this exact format:
     }
   ],
       "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation, reference specific details when possible, and vary wording to avoid repetition. IMPORTANT: If call_requested event is detected AND a phone number is provided in the message, set this field to null or empty string - the system will handle notification only without sending an email response.>",
-  "notes": "<optional general notes about the conversation>"
+  "notes": "<Capture important conversation details that don't map to specific columns. Examples: client preferences, timing constraints, special requirements, relationship context, concerns mentioned, negotiation points, or any other relevant information that should be preserved in the comments field. Use terse fragments separated by ' • '. Only include if there's meaningful information beyond what's already captured in column updates.>"
 }
 """)
 
