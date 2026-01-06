@@ -387,50 +387,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         if thread_id:
             matched_header = f"ConversationId: {conversation_id}"
     
-    # Final fallback: if we have conversationId but no thread, we might need to create one
-    # This can happen if the original message wasn't processed by our system
+    # If no thread match found, this is a NEW conversation we didn't start - ignore it
+    # Only process emails that are actual replies to messages we sent
+    # (matched via In-Reply-To, References, or indexed conversationId)
     if not thread_id:
-        if conversation_id:
-            print(f"⚠️ No thread found for conversationId {conversation_id}, but conversation exists")
-            print(f"   This might be a reply to a message we didn't process. Creating new thread...")
-            # Create a new thread using the conversationId as the thread ID
-            from .messaging import save_thread_root, index_conversation_id
-            
-            # Use conversationId as thread_id (normalized)
-            thread_id = normalize_message_id(conversation_id)
-            if not thread_id:
-                thread_id = conversation_id
-            
-            # Try to get subject from current message
-            subject = msg.get("subject", "Property information")
-            
-            # Try to find clientId by searching all clients for this email
-            client_id = None
-            if from_addr:
-                print(f"   🔍 Searching for clientId by email: {from_addr}")
-                client_id = _find_client_id_by_email(user_id, from_addr)
-                if client_id:
-                    print(f"   ✅ Found clientId: {client_id}")
-                else:
-                    print(f"   ⚠️ Could not find clientId for email {from_addr}")
-            
-            # Save thread root
-            thread_meta = {
-                "subject": subject,
-                "email": [from_addr],
-                "conversationId": conversation_id,
-                "createdFromReply": True  # Flag to indicate this was created from a reply
-            }
-            if client_id:
-                thread_meta["clientId"] = client_id
-            
-            save_thread_root(user_id, thread_id, thread_meta)
-            index_conversation_id(user_id, conversation_id, thread_id)
-            matched_header = f"New thread created from ConversationId: {conversation_id}"
-            print(f"   ✅ Created new thread: {thread_id}" + (f" with clientId: {client_id}" if client_id else ""))
-        else:
-            print(f"❓ No thread match found for message from {from_addr} (no conversationId either)")
-            return
+        print(f"⏭️ Ignoring email from {from_addr} - not a reply to any tracked thread")
+        print(f"   Subject: {subject}")
+        print(f"   ConversationId: {conversation_id} (not in our index)")
+        return
     
     print(f"🎯 Matched via {matched_header} -> thread {thread_id}")
     
