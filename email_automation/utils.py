@@ -17,6 +17,43 @@ def _body_kind(script: str):
 def _normalize_email(s: str) -> str:
     return (s or "").strip().lower()
 
+# Email validation regex - RFC 5322 simplified
+_EMAIL_REGEX = re.compile(
+    r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+)
+
+def is_valid_email(email: str) -> bool:
+    """
+    Validate email address format.
+    Returns True if email is well-formed, False otherwise.
+    """
+    if not email:
+        return False
+    email = email.strip()
+    if not _EMAIL_REGEX.match(email):
+        return False
+    # Additional safety checks
+    if len(email) > 254:  # Max email length per RFC 5321
+        return False
+    local_part = email.split('@')[0]
+    if len(local_part) > 64:  # Max local part length
+        return False
+    return True
+
+def validate_recipient_emails(emails: list[str]) -> tuple[list[str], list[str]]:
+    """
+    Validate a list of email addresses.
+    Returns (valid_emails, invalid_emails).
+    """
+    valid = []
+    invalid = []
+    for email in emails:
+        if is_valid_email(email):
+            valid.append(email.strip().lower())
+        else:
+            invalid.append(email)
+    return valid, invalid
+
 def _norm_txt(x: str) -> str:
     return (x or "").strip().lower()
 

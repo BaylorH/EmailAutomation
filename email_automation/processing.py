@@ -9,8 +9,8 @@ from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 from .clients import _fs, _get_sheet_id_or_fail, _sheets_client
 from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, _header_index_map, _find_row_by_email
 from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable
-from .messaging import (save_message, index_message_id, dump_thread_from_firestore, 
-                       has_processed, mark_processed, set_last_scan_iso, 
+from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
+                       dump_thread_from_firestore, has_processed, mark_processed, set_last_scan_iso,
                        lookup_thread_by_message_id, lookup_thread_by_conversation_id)
 from .logging import write_message_order_test
 from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_row_anchor, check_missing_required_fields
@@ -25,13 +25,13 @@ from .email_operations import (
     send_thankyou_closing_with_new_property,
     send_thankyou_ask_alternatives
 )
-from .app_config import REQUIRED_FIELDS_FOR_CLOSE
+from .app_config import REQUIRED_FIELDS_FOR_CLOSE, INBOX_SCAN_WINDOW_HOURS
 
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     try:
         from .utils import exponential_backoff_request, safe_preview
-        from .messaging import save_message, index_message_id, index_conversation_id
+        from .messaging import save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
         from datetime import datetime, timezone
         import requests
         import time
@@ -101,15 +101,33 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                             sent_internet_msg_id = sent_msg.get("internetMessageId")
                             
                             if sent_internet_msg_id:
-                                # Index this sent message
+                                # Index this sent message with retry logic
                                 normalized_id = normalize_message_id(sent_internet_msg_id)
-                                index_message_id(user_id, sent_internet_msg_id, thread_id)
-                                
+
+                                # Retry indexing up to 3 times
+                                MAX_RETRIES = 3
+                                msg_indexed = False
+                                for attempt in range(MAX_RETRIES):
+                                    if index_message_id(user_id, sent_internet_msg_id, thread_id):
+                                        # Verify the index was written
+                                        time.sleep(0.2)
+                                        if lookup_thread_by_message_id(user_id, sent_internet_msg_id) == thread_id:
+                                            msg_indexed = True
+                                            break
+                                    print(f"   ⚠️ Reply index attempt {attempt + 1}/{MAX_RETRIES} failed, retrying...")
+                                    time.sleep(0.5 * (attempt + 1))
+
+                                if not msg_indexed:
+                                    print(f"   ⚠️ CRITICAL: Failed to index reply after {MAX_RETRIES} attempts - future replies may be orphaned")
+                                    # SAFETY: Return failure because email was sent but not indexed
+                                    # Caller should be aware that conversation tracking is broken
+                                    return False
+
                                 # Also save the message record
                                 to_recipients = [r.get("emailAddress", {}).get("address", "") for r in sent_msg.get("toRecipients", [])]
                                 body_obj = sent_msg.get("body", {}) or {}
                                 body_content = body_obj.get("content", "")
-                                
+
                                 message_record = {
                                     "direction": "outbound",
                                     "subject": sent_msg.get("subject", ""),
@@ -129,11 +147,14 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                                     }
                                 }
                                 save_message(user_id, thread_id, normalized_id, message_record)
-                                
-                                # Index conversation ID if not already indexed
+
+                                # Index conversation ID with retry
                                 if conversation_id:
-                                    index_conversation_id(user_id, conversation_id, thread_id)
-                                
+                                    for attempt in range(MAX_RETRIES):
+                                        if index_conversation_id(user_id, conversation_id, thread_id):
+                                            break
+                                        time.sleep(0.5 * (attempt + 1))
+
                                 print(f"   📝 Indexed sent reply message: {sent_internet_msg_id[:50]}...")
                             else:
                                 print(f"   ⚠️ Sent message has no internetMessageId, cannot index")
@@ -346,10 +367,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             print(f"⚠️ Could not fetch headers for {msg_id}: {e}")
             internet_message_headers = []
     
-    # Extract reply headers
+    # Extract reply headers and check for auto-replies
     in_reply_to = None
     references = []
-    
+    is_auto_reply = False
+
     for header in internet_message_headers or []:
         name = header.get("name", "").lower()
         value = header.get("value", "")
@@ -357,7 +379,32 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             in_reply_to = normalize_message_id(value)
         elif name == "references":
             references = parse_references_header(value)
-    
+        # Detect auto-reply headers (RFC 3834)
+        elif name == "auto-submitted" and value.lower() != "no":
+            is_auto_reply = True
+        elif name == "x-auto-response-suppress":
+            is_auto_reply = True
+        elif name == "x-autoreply" or name == "x-autorespond":
+            is_auto_reply = True
+        elif name == "precedence" and value.lower() in ["bulk", "junk", "auto_reply"]:
+            is_auto_reply = True
+
+    # Also check subject line for common auto-reply patterns
+    subject_lower = subject.lower()
+    auto_reply_subjects = [
+        "out of office", "automatic reply", "auto-reply", "auto reply",
+        "autoreply", "away from office", "on vacation", "ooo:",
+        "automatische antwort", "réponse automatique"  # German, French
+    ]
+    if any(pattern in subject_lower for pattern in auto_reply_subjects):
+        is_auto_reply = True
+
+    # SAFETY: Skip auto-replies to prevent processing OOO messages as real data
+    if is_auto_reply:
+        print(f"⏭️ Skipping auto-reply from {from_addr}: {subject}")
+        print(f"   Auto-reply emails are not processed to prevent data corruption")
+        return
+
     print(f"📧 Processing: {subject} from {from_addr}")
     print(f"   In-Reply-To: {in_reply_to}")
     print(f"   References: {references}")
@@ -418,10 +465,31 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         }
     }
     
-    # Save to Firestore
+    # Save to Firestore with retry logic for reliability
+    import time
+    MAX_RETRIES = 3
+
     if internet_message_id:
-        save_message(user_id, thread_id, internet_message_id, message_record)
-        index_message_id(user_id, internet_message_id, thread_id)
+        # Save message with retry
+        for attempt in range(MAX_RETRIES):
+            if save_message(user_id, thread_id, internet_message_id, message_record):
+                break
+            print(f"⚠️ Inbound message save attempt {attempt + 1}/{MAX_RETRIES} failed, retrying...")
+            time.sleep(0.5 * (attempt + 1))
+
+        # Index with retry and verification
+        msg_indexed = False
+        for attempt in range(MAX_RETRIES):
+            if index_message_id(user_id, internet_message_id, thread_id):
+                time.sleep(0.2)
+                if lookup_thread_by_message_id(user_id, internet_message_id) == thread_id:
+                    msg_indexed = True
+                    break
+            print(f"⚠️ Inbound message index attempt {attempt + 1}/{MAX_RETRIES} failed, retrying...")
+            time.sleep(0.5 * (attempt + 1))
+
+        if not msg_indexed:
+            print(f"⚠️ Failed to index inbound message after {MAX_RETRIES} attempts")
     else:
         # Use Graph message ID as fallback
         save_message(user_id, thread_id, msg_id, message_record)
@@ -479,24 +547,36 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             thread_doc = _fs.collection("users").document(user_id).collection("threads").document(thread_id).get()
             thread_data = thread_doc.to_dict() or {}
             thread_emails = thread_data.get("email", [])
-            
-            # Find the external contact email (the one in the sheet row)
-            # Look up the email from the matched row since that's the external contact
+
+            # Find the external contact email using header mapping (NOT hardcoded index)
+            # SAFETY: Use column header lookup instead of hardcoded position
             external_email = None
-            if rowvals and len(rowvals) > 5:  # Email is typically in column 6 (index 5)
-                sheet_email = (rowvals[5] or "").strip().lower()
-                if sheet_email and "@" in sheet_email:
-                    external_email = sheet_email
-            
+            if rowvals and header:
+                # Build header index map for reliable column lookup
+                idx_map = _header_index_map(header)
+                # Try common email column names
+                email_col_names = ["email", "email address", "contact email", "leasing email"]
+                for col_name in email_col_names:
+                    if col_name in idx_map:
+                        email_idx = idx_map[col_name] - 1  # Convert to 0-based
+                        if 0 <= email_idx < len(rowvals):
+                            sheet_email = (rowvals[email_idx] or "").strip().lower()
+                            if sheet_email and "@" in sheet_email:
+                                external_email = sheet_email
+                                break
+
             # Fallback: use thread participants if sheet email not found
             if not external_email and thread_emails:
                 external_email = thread_emails[0].lower()
-            
-            # Final fallback: use current sender
+
+            # Final fallback: use current sender (with warning)
             recipient_email = external_email or (from_addr or "").lower()
+            if not external_email:
+                print(f"⚠️ Could not find email in sheet row, falling back to sender")
+
             print(f"📧 Reply recipient determined: {recipient_email}")
             print(f"   Thread participants: {thread_emails}")
-            print(f"   Sheet email: {rowvals[5] if rowvals and len(rowvals) > 5 else 'N/A'}")
+            print(f"   Sheet email column found: {'Yes' if external_email else 'No'}")
             print(f"   Will reply to: {recipient_email}")
             
         except Exception as e:
@@ -1080,7 +1160,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     now_utc = datetime.now(timezone.utc)
     now_iso = now_utc.isoformat()  # ends with +00:00
 
-    cutoff_time = now_utc - timedelta(hours=5)
+    cutoff_time = now_utc - timedelta(hours=INBOX_SCAN_WINDOW_HOURS)
     cutoff_iso = cutoff_time.isoformat().replace("+00:00", "Z")
     
     # Build filter with time window
@@ -1208,7 +1288,7 @@ def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], to
         
         # Calculate 5-hour cutoff
         now_utc = datetime.now(timezone.utc)
-        cutoff_time = now_utc - timedelta(hours=5)
+        cutoff_time = now_utc - timedelta(hours=INBOX_SCAN_WINDOW_HOURS)
         cutoff_iso = cutoff_time.isoformat().replace("+00:00", "Z")
         
         # Get all tracked conversation IDs from Firestore
@@ -1294,8 +1374,16 @@ def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], to
                             "conversationId": conversation_id,
                             "createdFromSentItem": True
                         }
-                        save_thread_root(user_id, thread_id, thread_meta)
-                        index_conversation_id(user_id, conversation_id, thread_id)
+                        # Save thread with retry
+                        for attempt in range(3):
+                            if save_thread_root(user_id, thread_id, thread_meta):
+                                break
+                            time.sleep(0.5 * (attempt + 1))
+                        # Index conversation with retry
+                        for attempt in range(3):
+                            if index_conversation_id(user_id, conversation_id, thread_id):
+                                break
+                            time.sleep(0.5 * (attempt + 1))
                         print(f"   📝 Created new thread from SentItem: {thread_id}")
                     
                     # Index this sent message
@@ -1325,9 +1413,25 @@ def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], to
                         }
                     }
                     
-                    save_message(user_id, thread_id, normalized_id, message_record)
-                    index_message_id(user_id, internet_message_id, thread_id)
-                    
+                    # Save message with retry
+                    for attempt in range(3):
+                        if save_message(user_id, thread_id, normalized_id, message_record):
+                            break
+                        time.sleep(0.5 * (attempt + 1))
+
+                    # Index message with retry and verification
+                    msg_indexed = False
+                    for attempt in range(3):
+                        if index_message_id(user_id, internet_message_id, thread_id):
+                            time.sleep(0.2)
+                            if lookup_thread_by_message_id(user_id, internet_message_id) == thread_id:
+                                msg_indexed = True
+                                break
+                        time.sleep(0.5 * (attempt + 1))
+
+                    if not msg_indexed:
+                        print(f"   ⚠️ Failed to index manual reply after retries")
+
                     processed_count += 1
                     print(f"   📝 Indexed manual reply: {internet_message_id[:50]}... -> thread {thread_id}")
                 

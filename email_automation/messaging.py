@@ -4,21 +4,23 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs
 from .utils import b64url_id
 
-def save_thread_root(user_id: str, root_id: str, meta: Dict[str, Any]):
-    """Save or update thread root document."""
+def save_thread_root(user_id: str, root_id: str, meta: Dict[str, Any]) -> bool:
+    """Save or update thread root document. Returns True on success, False on failure."""
     try:
         thread_ref = _fs.collection("users").document(user_id).collection("threads").document(root_id)
         meta["updatedAt"] = SERVER_TIMESTAMP
         if "createdAt" not in meta:
             meta["createdAt"] = SERVER_TIMESTAMP
-        
+
         thread_ref.set(meta, merge=True)
         print(f"💾 Saved thread root: {root_id}")
+        return True
     except Exception as e:
         print(f"❌ Failed to save thread root {root_id}: {e}")
+        return False
 
-def save_message(user_id: str, thread_id: str, message_id: str, payload: Dict[str, Any]):
-    """Save message to thread."""
+def save_message(user_id: str, thread_id: str, message_id: str, payload: Dict[str, Any]) -> bool:
+    """Save message to thread. Returns True on success, False on failure."""
     try:
         msg_ref = (_fs.collection("users").document(user_id)
                    .collection("threads").document(thread_id)
@@ -26,18 +28,22 @@ def save_message(user_id: str, thread_id: str, message_id: str, payload: Dict[st
         payload["createdAt"] = SERVER_TIMESTAMP
         msg_ref.set(payload, merge=True)
         print(f"💾 Saved message {message_id} to thread {thread_id}")
+        return True
     except Exception as e:
         print(f"❌ Failed to save message {message_id}: {e}")
+        return False
 
-def index_message_id(user_id: str, message_id: str, thread_id: str):
-    """Index message ID for O(1) lookup."""
+def index_message_id(user_id: str, message_id: str, thread_id: str) -> bool:
+    """Index message ID for O(1) lookup. Returns True on success, False on failure."""
     try:
         encoded_id = b64url_id(message_id)
         index_ref = _fs.collection("users").document(user_id).collection("msgIndex").document(encoded_id)
         index_ref.set({"threadId": thread_id}, merge=True)
         print(f"🔍 Indexed message ID: {message_id[:50]}... -> {thread_id}")
+        return True
     except Exception as e:
         print(f"❌ Failed to index message {message_id}: {e}")
+        return False
 
 def lookup_thread_by_message_id(user_id: str, message_id: str) -> Optional[str]:
     """Look up thread ID by message ID."""
@@ -51,16 +57,18 @@ def lookup_thread_by_message_id(user_id: str, message_id: str) -> Optional[str]:
         print(f"❌ Failed to lookup message {message_id}: {e}")
         return None
 
-def index_conversation_id(user_id: str, conversation_id: str, thread_id: str):
-    """Index conversation ID for fallback lookup."""
+def index_conversation_id(user_id: str, conversation_id: str, thread_id: str) -> bool:
+    """Index conversation ID for fallback lookup. Returns True on success, False on failure."""
     if not conversation_id:
-        return
+        return True  # No-op is considered success
     try:
         conv_ref = _fs.collection("users").document(user_id).collection("convIndex").document(conversation_id)
         conv_ref.set({"threadId": thread_id}, merge=True)
         print(f"🔍 Indexed conversation ID: {conversation_id} -> {thread_id}")
+        return True
     except Exception as e:
         print(f"❌ Failed to index conversation {conversation_id}: {e}")
+        return False
 
 def lookup_thread_by_conversation_id(user_id: str, conversation_id: str) -> Optional[str]:
     """Look up thread ID by conversation ID (fallback)."""

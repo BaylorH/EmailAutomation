@@ -32,6 +32,12 @@ REQUIRED_FIELDS_FOR_CLOSE = [
     "Drive Ins","Docks","Ceiling Ht","Power"
 ]
 
+# Email scanning configuration
+# How far back to scan for emails (in hours)
+# Set higher to catch delayed/overnight emails, lower for faster processing
+# Default: 24 hours to handle overnight and weekend delays
+INBOX_SCAN_WINDOW_HOURS = int(os.getenv("INBOX_SCAN_WINDOW_HOURS", "24"))
+
 # Validation
 if not CLIENT_ID or not CLIENT_SECRET or not FIREBASE_API_KEY:
     raise RuntimeError("Missing required env vars")

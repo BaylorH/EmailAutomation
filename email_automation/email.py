@@ -1,12 +1,18 @@
 import json
 import requests
+import time
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
-from .utils import exponential_backoff_request, safe_preview, _body_kind
-from .messaging import save_thread_root, save_message, index_message_id, index_conversation_id
+from .utils import exponential_backoff_request, safe_preview, _body_kind, validate_recipient_emails, is_valid_email
+from .messaging import save_thread_root, save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
 from .clients import _get_sheet_id_or_fail, _sheets_client
 from .sheets import _find_row_by_email, _get_first_tab_title, _read_header_row2, _header_index_map
 from .utils import normalize_message_id
+
+# Maximum retry attempts before moving to dead-letter queue
+MAX_OUTBOX_ATTEMPTS = 5
+# Maximum retries for indexing operations
+MAX_INDEX_RETRIES = 3
 
 def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> str | None:
     """
@@ -62,17 +68,28 @@ def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> st
         print(f"⚠️ Subject lookup failed for {recipient_email}: {e}")
         return None
 
-def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, recipients: List[str], 
+def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, recipients: List[str],
                         client_id_or_none: Optional[str] = None, row_number: int = None):
     """
     Send email and immediately index it in Firestore for reply tracking.
-    
+
     Automatically appends the email footer (signature) to all emails.
     For outbox items: script content comes from frontend LLM, footer is appended here.
     For inbox replies: script content may come from backend LLM or templates, footer is appended here.
+
+    SAFETY: All recipient emails are validated before sending to prevent sending to malformed addresses.
     """
     if not recipients:
         return {"sent": [], "errors": {"_all": "No recipients"}}
+
+    # CRITICAL: Validate all recipient emails before sending
+    valid_recipients, invalid_recipients = validate_recipient_emails(recipients)
+
+    if invalid_recipients:
+        print(f"⚠️ REJECTED invalid email addresses: {invalid_recipients}")
+
+    if not valid_recipients:
+        return {"sent": [], "errors": {"_all": f"No valid recipients. Invalid: {invalid_recipients}"}}
 
     content_type, content = _body_kind(script)
     
@@ -117,7 +134,11 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
     results = {"sent": [], "errors": {}}
     base = "https://graph.microsoft.com/v1.0"
 
-    for addr in recipients:
+    # Add invalid recipients to errors
+    for invalid in invalid_recipients:
+        results["errors"][invalid] = "Invalid email address format"
+
+    for addr in valid_recipients:
         dynamic_subject = None
         if client_id_or_none:
             dynamic_subject = _subject_for_recipient(user_id, client_id_or_none, (addr or "").lower())
@@ -171,9 +192,11 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                 lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
             )
 
-            # 4. Index in Firestore
+            # 4. Index in Firestore with retry logic
+            # CRITICAL: Email is already sent at this point. We MUST index it successfully
+            # or future replies will be orphaned (unable to match to this thread).
             root_id = normalize_message_id(internet_message_id)
-            
+
             # Thread root
             thread_meta = {
                 "subject": subject,
@@ -181,13 +204,23 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                 "email": [addr],
                 "conversationId": conversation_id,
             }
-            
-            # NEW: Store row number for anchoring if provided
+
+            # Store row number for anchoring if provided
             if row_number:
                 thread_meta["rowNumber"] = row_number
-            
-            save_thread_root(user_id, root_id, thread_meta)
-            
+
+            # Save thread root with retry
+            thread_saved = False
+            for attempt in range(MAX_INDEX_RETRIES):
+                if save_thread_root(user_id, root_id, thread_meta):
+                    thread_saved = True
+                    break
+                print(f"⚠️ Thread save attempt {attempt + 1}/{MAX_INDEX_RETRIES} failed, retrying...")
+                time.sleep(0.5 * (attempt + 1))  # Backoff
+
+            if not thread_saved:
+                raise Exception(f"Failed to save thread root after {MAX_INDEX_RETRIES} attempts - replies will be orphaned")
+
             # Message record
             message_record = {
                 "direction": "outbound",
@@ -207,14 +240,48 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                     "preview": safe_preview(content)
                 }
             }
-            save_message(user_id, root_id, root_id, message_record)
-            
-            # Index message
-            index_message_id(user_id, internet_message_id, root_id)
-            
-            # Index conversation (optional fallback)
+
+            # Save message with retry
+            message_saved = False
+            for attempt in range(MAX_INDEX_RETRIES):
+                if save_message(user_id, root_id, root_id, message_record):
+                    message_saved = True
+                    break
+                print(f"⚠️ Message save attempt {attempt + 1}/{MAX_INDEX_RETRIES} failed, retrying...")
+                time.sleep(0.5 * (attempt + 1))
+
+            if not message_saved:
+                print(f"⚠️ Failed to save message record after {MAX_INDEX_RETRIES} attempts (thread exists, non-critical)")
+
+            # Index message ID with retry and verification (CRITICAL for reply matching)
+            msg_indexed = False
+            for attempt in range(MAX_INDEX_RETRIES):
+                if index_message_id(user_id, internet_message_id, root_id):
+                    # Verify the index was actually written
+                    time.sleep(0.2)  # Brief delay for consistency
+                    if lookup_thread_by_message_id(user_id, internet_message_id) == root_id:
+                        msg_indexed = True
+                        break
+                    print(f"⚠️ Index verification failed on attempt {attempt + 1}")
+                print(f"⚠️ Message index attempt {attempt + 1}/{MAX_INDEX_RETRIES} failed, retrying...")
+                time.sleep(0.5 * (attempt + 1))
+
+            if not msg_indexed:
+                raise Exception(f"CRITICAL: Failed to index message ID after {MAX_INDEX_RETRIES} attempts - replies will be orphaned")
+
+            # Index conversation ID with retry (fallback lookup, less critical but still important)
             if conversation_id:
-                index_conversation_id(user_id, conversation_id, root_id)
+                conv_indexed = False
+                for attempt in range(MAX_INDEX_RETRIES):
+                    if index_conversation_id(user_id, conversation_id, root_id):
+                        conv_indexed = True
+                        break
+                    print(f"⚠️ Conversation index attempt {attempt + 1}/{MAX_INDEX_RETRIES} failed, retrying...")
+                    time.sleep(0.5 * (attempt + 1))
+
+                if not conv_indexed:
+                    # Log but don't fail - message ID index is the primary lookup
+                    print(f"⚠️ Failed to index conversation ID (fallback) - primary index succeeded")
 
             results["sent"].append(addr)
             print(f"✅ Sent and indexed email to {addr} (threadId: {root_id})")
@@ -226,18 +293,41 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
 
     return results
 
+def _move_to_dead_letter(user_id: str, doc_ref, data: dict, reason: str):
+    """Move a failed outbox item to the dead-letter queue for manual review."""
+    from .clients import _fs
+    from google.cloud.firestore import SERVER_TIMESTAMP
+
+    dead_letter_ref = _fs.collection("users").document(user_id).collection("deadLetterQueue")
+
+    # Copy data to dead-letter queue with failure info
+    dead_letter_data = {
+        **data,
+        "originalDocId": doc_ref.id,
+        "failureReason": reason,
+        "movedAt": SERVER_TIMESTAMP,
+        "source": "outbox"
+    }
+
+    dead_letter_ref.add(dead_letter_data)
+    doc_ref.delete()
+    print(f"☠️ Moved item {doc_ref.id} to dead-letter queue: {reason}")
+
+
 def send_outboxes(user_id: str, headers):
     """
     Process outbox items: read script content (generated by frontend LLM), append footer, and send.
-    
+
     Flow:
     1. Frontend LLM generates email content and writes to Firestore outbox with 'script' field
     2. Backend reads script as-is (no LLM processing here)
     3. Footer is automatically appended by send_and_index_email()
     4. Email is sent and indexed for reply tracking
+
+    Items are retried up to MAX_OUTBOX_ATTEMPTS times, then moved to dead-letter queue.
     """
     from .clients import _fs
-    
+
     outbox_ref = _fs.collection("users").document(user_id).collection("outbox")
     docs = list(outbox_ref.stream())
 
@@ -251,8 +341,17 @@ def send_outboxes(user_id: str, headers):
         emails = data.get("assignedEmails") or []
         script = data.get("script") or ""  # Content generated by frontend LLM
         clientId = (data.get("clientId") or "").strip()
+        attempts = int(data.get("attempts") or 0)
 
-        print(f"→ Sending outbox item {d.id} to {len(emails)} recipient(s) (clientId={clientId or 'n/a'})")
+        # Check if this item has exceeded max attempts
+        if attempts >= MAX_OUTBOX_ATTEMPTS:
+            _move_to_dead_letter(
+                user_id, d.reference, data,
+                f"Exceeded max attempts ({MAX_OUTBOX_ATTEMPTS}): {data.get('lastError', 'unknown error')}"
+            )
+            continue
+
+        print(f"→ Sending outbox item {d.id} to {len(emails)} recipient(s) (clientId={clientId or 'n/a'}, attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
 
         try:
             # send_and_index_email automatically appends footer to script content
@@ -263,20 +362,30 @@ def send_outboxes(user_id: str, headers):
                 d.reference.delete()
                 print(f"🗑️ Deleted outbox item {d.id}")
             else:
-                attempts = int(data.get("attempts") or 0) + 1
-                d.reference.set(
-                    {"attempts": attempts, "lastError": json.dumps(res["errors"])[:1500]},
-                    merge=True,
-                )
-                print(f"⚠️ Kept item {d.id} with error; attempts={attempts}")
+                new_attempts = attempts + 1
+                error_msg = json.dumps(res["errors"])[:1500]
+
+                if new_attempts >= MAX_OUTBOX_ATTEMPTS:
+                    _move_to_dead_letter(user_id, d.reference, data, f"Send errors after {new_attempts} attempts: {error_msg}")
+                else:
+                    d.reference.set(
+                        {"attempts": new_attempts, "lastError": error_msg},
+                        merge=True,
+                    )
+                    print(f"⚠️ Kept item {d.id} with error; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
 
         except Exception as e:
-            attempts = int(data.get("attempts") or 0) + 1
-            d.reference.set(
-                {"attempts": attempts, "lastError": str(e)[:1500]},
-                merge=True,
-            )
-            print(f"💥 Error sending item {d.id}: {e}; attempts={attempts}")
+            new_attempts = attempts + 1
+            error_msg = str(e)[:1500]
+
+            if new_attempts >= MAX_OUTBOX_ATTEMPTS:
+                _move_to_dead_letter(user_id, d.reference, data, f"Exception after {new_attempts} attempts: {error_msg}")
+            else:
+                d.reference.set(
+                    {"attempts": new_attempts, "lastError": error_msg},
+                    merge=True,
+                )
+                print(f"💥 Error sending item {d.id}: {e}; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
 
 # Legacy Functions (kept for compatibility)
 def send_email(headers, script: str, emails: list[str], client_id: str | None = None):
