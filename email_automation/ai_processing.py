@@ -342,7 +342,7 @@ def propose_sheet_updates(uid: str,
                           rownum: int,
                           rowvals: list[str],
                           thread_id: str,
-                          file_manifest: list[dict] = None,   # [{"id": "...", "name": "..."}]
+                          pdf_manifest: list[dict] = None,   # [{"name": "...", "text": "...", "images": [...], "id": "..."}]
                           url_texts: list[dict] = None,
                           contact_name: str = None,
                           headers: dict = None) -> dict | None:
@@ -580,13 +580,23 @@ CONVERSATION HISTORY (latest last):
 {json.dumps(conversation, indent=2)}
 """.rstrip()]
 
-        # Attachment index (names only) helps the model choose the right file
-        if file_manifest:
-            prompt_parts.append("\nATTACHMENTS (names shown for grounding):")
-            for f in file_manifest:
-                # defensive: handle dicts with/without name
-                name = f.get("name") or "<unnamed.pdf>"
-                prompt_parts.append(f" - {name}")
+        # PDF attachments - include extracted text directly in prompt
+        if pdf_manifest:
+            prompt_parts.append("\n\n=== PDF ATTACHMENTS ===")
+            for pdf in pdf_manifest:
+                name = pdf.get("name") or "<unnamed.pdf>"
+                text = pdf.get("text") or ""
+                method = pdf.get("method", "unknown")
+
+                prompt_parts.append(f"\n--- PDF: {name} (extraction method: {method}) ---")
+                if text:
+                    # Include extracted text (truncate if too long)
+                    if len(text) > 8000:
+                        prompt_parts.append(text[:8000] + "\n... [text truncated] ...")
+                    else:
+                        prompt_parts.append(text)
+                else:
+                    prompt_parts.append("[No text extracted - see images below if available]")
 
         # URL content (already fetched)
         if url_texts:
@@ -628,13 +638,26 @@ OUTPUT ONLY valid JSON in this exact format:
 
         prompt = "".join(prompt_parts)
 
-        # ---- Prepare inputs (files first, then text) --------------------------
+        # ---- Prepare inputs (images for vision, files as fallback, then text) --------------------------
         input_content = []
-        if file_manifest:
-            for f in file_manifest:
-                # Each file is actual content; the earlier index gives the model the names.
-                if "id" in f and f["id"]:
-                    input_content.append({"type": "input_file", "file_id": f["id"]})
+
+        # Add PDF page images for vision processing (scanned PDFs, complex layouts)
+        if pdf_manifest:
+            for pdf in pdf_manifest:
+                images = pdf.get("images") or []
+                name = pdf.get("name", "PDF")
+
+                # Add images for vision (pages with little extractable text)
+                for i, img_b64 in enumerate(images[:3]):  # Max 3 pages per PDF
+                    input_content.append({
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{img_b64}"
+                    })
+                    print(f"📷 Added page {i+1} image from {name} for vision analysis")
+
+                # Add file_id as fallback if we have it and extraction was poor
+                if pdf.get("id") and pdf.get("method") in ("openai_upload", "openai_upload+images", "failed"):
+                    input_content.append({"type": "input_file", "file_id": pdf["id"]})
 
         input_content.append({"type": "input_text", "text": prompt})
 
@@ -712,8 +735,8 @@ OUTPUT ONLY valid JSON in this exact format:
             "proposalHash": proposal_hash,
             "status": "proposed",
             "threadId": thread_id,
-            "fileManifest": file_manifest or [],
-            "fileIds": [f["id"] for f in (file_manifest or [])],  # keep old field for compatibility
+            "pdfManifest": [{k: v for k, v in p.items() if k != 'images'} for p in (pdf_manifest or [])],  # exclude images from log
+            "fileIds": [p["id"] for p in (pdf_manifest or []) if p.get("id")],  # keep old field for compatibility
             "urlTexts": url_texts or [],
             "createdAt": SERVER_TIMESTAMP
         })

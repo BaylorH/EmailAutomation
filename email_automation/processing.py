@@ -14,7 +14,7 @@ from .messaging import (save_message, save_thread_root, index_message_id, index_
                        lookup_thread_by_message_id, lookup_thread_by_conversation_id)
 from .logging import write_message_order_test
 from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_row_anchor, check_missing_required_fields
-from .file_handling import fetch_pdf_attachments, upload_pdf_to_drive, upload_pdf_user_data
+from .file_handling import fetch_and_process_pdfs, upload_pdf_to_drive
 from .notifications import write_notification, add_client_notifications
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview, 
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
@@ -591,30 +591,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         new_row_created = False            # set true when we insert a new property row
         new_row_number = None              # track the newly created row number
 
-        # NEW: Handle PDF attachments for current message only
-        file_ids_for_this_run = []
-        file_manifest = []
-        pdf_attachments = fetch_pdf_attachments(headers, msg_id)
-        
-        if pdf_attachments:
-            drive_links = []
-            
-            for pdf in pdf_attachments:
-                try:
-                    # Upload to Drive
-                    drive_link = upload_pdf_to_drive(pdf["name"], pdf["bytes"])
-                    if drive_link:
-                        drive_links.append(drive_link)
-                    
-                    # Upload to OpenAI
-                    file_id = upload_pdf_user_data(pdf["name"], pdf["bytes"])
-                    file_ids_for_this_run.append(file_id)
-                    file_manifest.append({"id": file_id, "name": pdf["name"]})
-                    
-                except Exception as e:
-                    print(f"❌ Failed to process PDF {pdf['name']}: {e}")
-            
-            # Append Drive links to Flyer / Link column on the current row (keep existing behavior)
+        # NEW: Handle PDF attachments with enhanced extraction for current message only
+        pdf_manifest = fetch_and_process_pdfs(headers, msg_id)
+
+        if pdf_manifest:
+            # Collect drive links for sheet
+            drive_links = [p['drive_link'] for p in pdf_manifest if p.get('drive_link')]
+
+            # Append Drive links to Flyer / Link column on the current row
             if drive_links:
                 try:
                     sheets = _sheets_client()
@@ -644,10 +628,10 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)
         
-        # Step 3: get proposal using Responses API with URL content
+        # Step 3: get proposal using Responses API with URL content and PDF data
         proposal = propose_sheet_updates(
-            user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals, 
-            thread_id, file_manifest=file_manifest, url_texts=url_texts, contact_name=contact_name,
+            user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals,
+            thread_id, pdf_manifest=pdf_manifest, url_texts=url_texts, contact_name=contact_name,
             headers=headers
         )
         

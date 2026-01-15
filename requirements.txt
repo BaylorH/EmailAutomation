@@ -12,3 +12,6 @@ openai
 beautifulsoup4>=4.12.3
 lxml>=4.9
 packaging
+pdfplumber>=0.10.0
+PyMuPDF>=1.24.0
+Pillow>=10.0.0
