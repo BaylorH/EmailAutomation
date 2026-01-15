@@ -362,15 +362,13 @@ def propose_sheet_updates(uid: str,
 COLUMN SEMANTICS & MAPPING (use EXACT header names):
 - "Rent/SF /Yr": Base/asking rent per square foot per YEAR. Synonyms: asking, base rent, $/SF/yr.
 - "Ops Ex /SF": NNN/CAM/Operating Expenses per square foot per YEAR. Synonyms: NNN, CAM, OpEx, operating expenses.
-- "Gross Rent": If BOTH base rent and NNN are present, set to (Rent/SF /Yr + Ops Ex /SF), rounded to 2 decimals. Else leave unchanged.
+- "Gross Rent": DO NOT WRITE TO THIS COLUMN. It contains a formula that auto-calculates. NEVER include "Gross Rent" in updates.
 - "Total SF": Total square footage. Synonyms: sq footage, square feet, SF, size.
 - "Drive Ins": Number of drive-in doors. Synonyms: drive in doors, loading doors.
 - "Docks": Number of dock doors/loading docks. Synonyms: dock doors, loading docks, dock positions, loading positions, dock doors, dock bays.
 - "Ceiling Ht": Ceiling height. Synonyms: max ceiling height, ceiling clearance.
 - "Power": Electrical power specifications. Synonyms: electrical, power capacity, amperage, voltage, electrical service, power supply, electrical load, electrical capacity, power requirements, electrical specs.
-- "Listing Brokers Comments ": Short, non-numeric broker/client notes not covered by other columns. Use terse fragments separated by " • ".
-  Do NOT put numeric data like square footage, rent, or ceiling height here if it belongs in dedicated columns.
-  IMPORTANT: Capture conversation details that don't map to specific columns - client preferences, timing, special requirements, concerns, negotiation points, relationship context, etc. These should be captured in the "notes" field of your output, which will be automatically written to this comments column.
+- "Listing Brokers Comments ": DO NOT write directly to this column. Instead, use the "notes" field in your JSON output.
 
 FORMATTING:
 - For money/area fields, output plain decimals (no "$", "SF", commas). Examples: "30", "14.29", "2400".
@@ -399,7 +397,7 @@ FIELD MINING HINTS:
 - Drive Ins: count numerical values for drive-in doors/loading doors.
 - Docks: look for "4 dock doors", "6 loading docks", "8 dock positions", "12 dock doors", "dock doors: 6", "loading docks: 4", "dock bays: 8".
 - Power: look for "200A", "480V", "100A 3-phase", "208V/120V", "400A service", "electrical service", "power capacity", "amperage", "voltage", "electrical load", "power supply", "electrical specs", "electrical requirements".
-- Gross Rent: only compute if BOTH Rent/SF /Yr and Ops Ex /SF are present (sum, 2 decimals).
+- NEVER write to "Gross Rent" - it's a formula column.
 """
 
         EVENT_RULES = """
@@ -421,9 +419,32 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
 
 CRITICAL EXAMPLES:
 - "Below is the only current space we have" + URL = new_property event
-- "Here's an alternative location" = new_property event  
+- "Here's an alternative location" = new_property event
 - "This property isn't available" = property_unavailable event
 - "Can you call me?" = call_requested event
+"""
+
+        NOTES_RULES = """
+NOTES FIELD (IMPORTANT - always look for these):
+The "notes" field captures valuable information that doesn't fit in the standard columns. This helps the user understand the property without re-reading emails.
+
+ALWAYS capture these when mentioned:
+- Availability timing: "available immediately", "available March 1st", "60 days notice"
+- Lease terms: "flexible on term", "3-5 year lease preferred", "month-to-month available"
+- Zoning: "zoned M-1", "heavy industrial", "light manufacturing"
+- Special features: "fenced yard", "rail spur", "sprinklered", "ESFR", "food grade"
+- Parking: "10 trailer spots", "employee parking for 50"
+- Landlord notes: "owner motivated", "firm on price", "willing to do TI"
+- Building details not in columns: "built 2020", "renovated 2023", "tilt-up construction"
+- Location context: "near I-20", "airport adjacent", "in industrial park"
+- Divisibility: "can subdivide to 5,000 SF", "must take full space"
+- HVAC/Climate: "climate controlled", "AC in office only"
+- Office space: "1,500 SF office buildout", "includes 2 private offices"
+
+FORMAT: Use terse fragments separated by " • "
+EXAMPLE: "available immediately • 3-5 yr preferred • fenced yard • near I-20 • can subdivide"
+
+IMPORTANT: If the broker mentions ANY of these details, capture them. Don't leave notes empty if useful info exists.
 """
 
         RESPONSE_EMAIL_RULES = """
@@ -467,18 +488,18 @@ SCENARIOS:
 1. Missing required fields: Thank them for the information, then list the missing fields naturally in a bulleted format.
    EXAMPLE FORMAT:
    "Thank you for confirming the number of drive-in doors. To complete the property details, could you please provide:
-   
+
    - Total SF
    - Ops Ex /SF
-   - Gross Rent
    - Docks
    - Ceiling Ht
    - Power
-   
+
    Thanks."
-   
-   IMPORTANT: 
+
+   IMPORTANT:
    - NEVER request "Rent/SF /Yr" - this field should never be asked for
+   - NEVER request "Gross Rent" - this is a formula column that calculates automatically
    - Keep it short and concise
    - End with a simple "Thanks" - do NOT use "Looking forward to your response" or similar phrases
    
@@ -514,6 +535,7 @@ TARGET PROPERTY (canonical identity for matching): {target_anchor}
 {COLUMN_RULES}
 {DOC_SELECTION_RULES}
 {EVENT_RULES}
+{NOTES_RULES}
 {RESPONSE_EMAIL_RULES}
 
 SHEET HEADER (row 2):
@@ -569,7 +591,7 @@ OUTPUT ONLY valid JSON in this exact format:
     }
   ],
       "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation, reference specific details when possible, and vary wording to avoid repetition. IMPORTANT: If call_requested event is detected AND a phone number is provided in the message, set this field to null or empty string - the system will handle notification only without sending an email response.>",
-  "notes": "<Capture important conversation details that don't map to specific columns. Examples: client preferences, timing constraints, special requirements, relationship context, concerns mentioned, negotiation points, or any other relevant information that should be preserved in the comments field. Use terse fragments separated by ' • '. Only include if there's meaningful information beyond what's already captured in column updates.>"
+  "notes": "<IMPORTANT: Capture useful details not in columns - availability timing, lease terms, zoning, special features, parking, landlord notes, building age, location context, divisibility, HVAC, office space. Format: terse fragments separated by ' • '. Example: 'available immediately • 3-5 yr preferred • fenced yard'. Leave empty ONLY if conversation has no such details.>"
 }
 """)
 

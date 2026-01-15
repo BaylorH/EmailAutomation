@@ -27,9 +27,10 @@ THANK_YOU_BODY = "Thanks for your response."
 
 # Required fields for closing conversations
 # NOTE: "Rent/SF /Yr" is NOT included - it should never be requested from clients
+# NOTE: "Gross Rent" is NOT included - it's a formula on the sheet (H+I+G/12), not a value we collect
 REQUIRED_FIELDS_FOR_CLOSE = [
-    "Total SF","Ops Ex /SF","Gross Rent",
-    "Drive Ins","Docks","Ceiling Ht","Power"
+    "Total SF", "Ops Ex /SF",
+    "Drive Ins", "Docks", "Ceiling Ht", "Power"
 ]
 
 # Email scanning configuration

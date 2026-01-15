@@ -1,0 +1,268 @@
+{
+  "timestamp": "2026-01-15T05:42:43.007436+00:00",
+  "total": 10,
+  "passed": 10,
+  "failed": 0,
+  "results": [
+    {
+      "name": "complete_info",
+      "passed": true,
+      "api_time_ms": 7950,
+      "updates": [
+        {
+          "column": "Total SF",
+          "value": "15000",
+          "confidence": 0.9,
+          "reason": "Provided directly by Scott in the email."
+        },
+        {
+          "column": "Rent/SF /Yr",
+          "value": "8.50",
+          "confidence": 0.9,
+          "reason": "Provided directly by Scott in the email."
+        },
+        {
+          "column": "Ops Ex /SF",
+          "value": "2.25",
+          "confidence": 0.9,
+          "reason": "Provided directly by Scott in the email."
+        },
+        {
+          "column": "Gross Rent",
+          "value": "10.75",
+          "confidence": 0.9,
+          "reason": "Calculated as Rent/SF /Yr + Ops Ex /SF."
+        },
+        {
+          "column": "Drive Ins",
+          "value": "2",
+          "confidence": 0.9,
+          "reason": "Provided directly by Scott in the email."
+        },
+        {
+          "column": "Docks",
+          "value": "4",
+          "confidence": 0.9,
+          "reason": "Provided directly by Scott in the email."
+        },
+        {
+          "column": "Ceiling Ht",
+          "value": "24",
+          "confidence": 0.9,
+          "reason": "Provided directly by Scott in the email."
+        },
+        {
+          "column": "Power",
+          "value": "400 amps, 3-phase",
+          "confidence": 0.9,
+          "reason": "Provided directly by Scott in the email."
+        }
+      ],
+      "events": [],
+      "response": "Hi Scott,\n\nThank you for providing the details for 1 Randolph Ct. I appreciate your help.\n\nThanks",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "partial_info",
+      "passed": true,
+      "api_time_ms": 3274,
+      "updates": [
+        {
+          "column": "Total SF",
+          "value": "8500",
+          "confidence": 0.9,
+          "reason": "The inbound message explicitly states the space is 8,500 SF."
+        },
+        {
+          "column": "Rent/SF /Yr",
+          "value": "6.00",
+          "confidence": 0.9,
+          "reason": "The inbound message explicitly states the asking rent is $6.00/SF NNN."
+        }
+      ],
+      "events": [],
+      "response": "Hi Jeff,\n\nThank you for the information on 699 Industrial Park Dr. If there are any additional details or updates, please let me know.\n\nThanks",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "property_unavailable",
+      "passed": true,
+      "api_time_ms": 2666,
+      "updates": [],
+      "events": [
+        {
+          "type": "property_unavailable",
+          "address": "135 Trade Center Court",
+          "city": "Augusta",
+          "link": ""
+        }
+      ],
+      "response": "Hi Luke,\n\nThank you for letting me know about the status of 135 Trade Center Court. If there are any other properties that might fit our needs, please feel free to share.\n\nThanks",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "unavailable_with_alternative",
+      "passed": true,
+      "api_time_ms": 3946,
+      "updates": [],
+      "events": [
+        {
+          "type": "property_unavailable",
+          "address": "1 Randolph Ct",
+          "city": "Evans",
+          "link": ""
+        },
+        {
+          "type": "new_property",
+          "address": "456 Commerce Blvd",
+          "city": "Martinez",
+          "link": "https://example.com/456-commerce"
+        }
+      ],
+      "response": "Hi Scott,\n\nThank you for letting me know about 1 Randolph Ct. I appreciate the suggestion of the property at 456 Commerce Blvd. Could you please provide more details about it?\n\nThanks",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "call_requested_with_phone",
+      "passed": true,
+      "api_time_ms": 1422,
+      "updates": [],
+      "events": [
+        {
+          "type": "call_requested",
+          "address": "699 Industrial Park Dr",
+          "city": "Evans",
+          "link": ""
+        }
+      ],
+      "response": "Hi Jeff,\n\nSure, I can give you a call to discuss the details. I'll reach out shortly.\n\nThanks",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "call_requested_no_phone",
+      "passed": true,
+      "api_time_ms": 2685,
+      "updates": [],
+      "events": [
+        {
+          "type": "call_requested",
+          "address": "135 Trade Center Court",
+          "city": "Augusta",
+          "link": ""
+        }
+      ],
+      "response": "Hi Luke,\n\nThank you for reaching out. Let's schedule a call to discuss the options you have in mind.\n\nThanks",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "multi_turn_conversation",
+      "passed": true,
+      "api_time_ms": 11270,
+      "updates": [
+        {
+          "column": "Total SF",
+          "value": "20000",
+          "confidence": 0.9,
+          "reason": "Scott provided the total square footage as 20,000 SF."
+        },
+        {
+          "column": "Rent/SF /Yr",
+          "value": "7.50",
+          "confidence": 0.9,
+          "reason": "Scott stated the rent as $7.50/SF NNN."
+        },
+        {
+          "column": "Ops Ex /SF",
+          "value": "1.85",
+          "confidence": 0.9,
+          "reason": "Scott mentioned the NNN expenses as $1.85/SF."
+        },
+        {
+          "column": "Gross Rent",
+          "value": "9.35",
+          "confidence": 0.9,
+          "reason": "Calculated as Rent/SF /Yr + Ops Ex /SF = 7.50 + 1.85."
+        },
+        {
+          "column": "Drive Ins",
+          "value": "1",
+          "confidence": 0.9,
+          "reason": "Scott mentioned there is 1 drive-in door."
+        },
+        {
+          "column": "Docks",
+          "value": "3",
+          "confidence": 0.9,
+          "reason": "Scott mentioned there are 3 dock doors."
+        },
+        {
+          "column": "Ceiling Ht",
+          "value": "20",
+          "confidence": 0.9,
+          "reason": "Scott mentioned the ceiling height is 20' clear."
+        }
+      ],
+      "events": [],
+      "response": "Hi Scott,\n\nThank you for providing the details on 1 Randolph Ct. This information is very helpful.\n\nThanks",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "vague_response",
+      "passed": true,
+      "api_time_ms": 4210,
+      "updates": [],
+      "events": [],
+      "response": "Hi Jeff,\n\nThank you for the information. Could you please provide the specific square footage and any additional details like operating expenses or ceiling height for 699 Industrial Park Dr?\n\nThanks",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "new_property_suggestion",
+      "passed": true,
+      "api_time_ms": 4630,
+      "updates": [
+        {
+          "column": "Total SF",
+          "value": "25000",
+          "confidence": 0.9,
+          "reason": "Luke Coffey confirmed the availability and size of the property as 25,000 SF."
+        }
+      ],
+      "events": [
+        {
+          "type": "new_property",
+          "address": "200 Warehouse Way",
+          "city": "North Augusta",
+          "link": "https://example.com/200-warehouse-way"
+        }
+      ],
+      "response": "Hi Luke,\n\nThank you for the update on 135 Trade Center Court. It's great to know it's still available at 25,000 SF. I'll also take a look at the new listing at 200 Warehouse Way.\n\nThanks",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "close_conversation",
+      "passed": true,
+      "api_time_ms": 1804,
+      "updates": [],
+      "events": [
+        {
+          "type": "close_conversation",
+          "address": "135 Trade Center Court",
+          "city": "Augusta",
+          "link": ""
+        }
+      ],
+      "response": "Hi Luke,\n\nThank you for your assistance. I appreciate your help with the information on 135 Trade Center Court.\n\nThanks",
+      "issues": [],
+      "warnings": []
+    }
+  ]
+}

@@ -1896,14 +1896,13 @@ def propose_sheet_updates(uid: str,
 COLUMN SEMANTICS & MAPPING (use EXACT header names):
 - "Rent/SF /Yr": Base/asking rent per square foot per YEAR. Synonyms: asking, base rent, $/SF/yr.
 - "Ops Ex /SF": NNN/CAM/Operating Expenses per square foot per YEAR. Synonyms: NNN, CAM, OpEx, operating expenses.
-- "Gross Rent": If BOTH base rent and NNN are present, set to (Rent/SF /Yr + Ops Ex /SF), rounded to 2 decimals. Else leave unchanged.
+- "Gross Rent": DO NOT WRITE TO THIS COLUMN. It contains a formula that auto-calculates. NEVER include "Gross Rent" in updates.
 - "Total SF": Total square footage. Synonyms: sq footage, square feet, SF, size.
 - "Drive Ins": Number of drive-in doors. Synonyms: drive in doors, loading doors.
 - "Docks": Number of dock doors/loading docks. Synonyms: dock doors, loading docks, dock positions, loading positions, dock doors, dock bays.
 - "Ceiling Ht": Ceiling height. Synonyms: max ceiling height, ceiling clearance.
 - "Power": Electrical power specifications. Synonyms: electrical, power capacity, amperage, voltage, electrical service, power supply, electrical load, electrical capacity, power requirements, electrical specs.
-- "Listing Brokers Comments ": Short, non-numeric broker/client notes not covered by other columns. Use terse fragments separated by " • ".
-  Do NOT put numeric data like square footage, rent, or ceiling height here if it belongs in dedicated columns.
+- "Listing Brokers Comments ": DO NOT write directly to this column. Instead, use the "notes" field in your JSON output.
 
 FORMATTING:
 - For money/area fields, output plain decimals (no "$", "SF", commas). Examples: "30", "14.29", "2400".
@@ -1932,7 +1931,7 @@ FIELD MINING HINTS:
 - Drive Ins: count numerical values for drive-in doors/loading doors.
 - Docks: look for "4 dock doors", "6 loading docks", "8 dock positions", "12 dock doors", "dock doors: 6", "loading docks: 4", "dock bays: 8".
 - Power: look for "200A", "480V", "100A 3-phase", "208V/120V", "400A service", "electrical service", "power capacity", "amperage", "voltage", "electrical load", "power supply", "electrical specs", "electrical requirements".
-- Gross Rent: only compute if BOTH Rent/SF /Yr and Ops Ex /SF are present (sum, 2 decimals).
+- NEVER write to "Gross Rent" - it's a formula column.
 """
 
         EVENT_RULES = """
@@ -1950,6 +1949,29 @@ CRITICAL: If the LAST HUMAN message provides square footage, ceiling height, dri
 the CURRENT property unless it explicitly names a different address.
 """
 
+        NOTES_RULES = """
+NOTES FIELD (IMPORTANT - always look for these):
+The "notes" field captures valuable information that doesn't fit in the standard columns. This helps the user understand the property without re-reading emails.
+
+ALWAYS capture these when mentioned:
+- Availability timing: "available immediately", "available March 1st", "60 days notice"
+- Lease terms: "flexible on term", "3-5 year lease preferred", "month-to-month available"
+- Zoning: "zoned M-1", "heavy industrial", "light manufacturing"
+- Special features: "fenced yard", "rail spur", "sprinklered", "ESFR", "food grade"
+- Parking: "10 trailer spots", "employee parking for 50"
+- Landlord notes: "owner motivated", "firm on price", "willing to do TI"
+- Building details not in columns: "built 2020", "renovated 2023", "tilt-up construction"
+- Location context: "near I-20", "airport adjacent", "in industrial park"
+- Divisibility: "can subdivide to 5,000 SF", "must take full space"
+- HVAC/Climate: "climate controlled", "AC in office only"
+- Office space: "1,500 SF office buildout", "includes 2 private offices"
+
+FORMAT: Use terse fragments separated by " • "
+EXAMPLE: "available immediately • 3-5 yr preferred • fenced yard • near I-20 • can subdivide"
+
+IMPORTANT: If the broker mentions ANY of these details, capture them. Don't leave notes empty if useful info exists.
+"""
+
         # ---- Build prompt -----------------------------------------------------
         target_anchor = get_row_anchor(rowvals, header)  # e.g., "1 Randolph Ct, Evans"
 
@@ -1961,6 +1983,7 @@ TARGET PROPERTY (canonical identity for matching): {target_anchor}
 {COLUMN_RULES}
 {DOC_SELECTION_RULES}
 {EVENT_RULES}
+{NOTES_RULES}
 
 SHEET HEADER (row 2):
 {json.dumps(header)}
