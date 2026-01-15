@@ -413,15 +413,37 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • Extract the property identifier (address, name, or URL) as the "address" field
   • Try to infer city/location from context or URL
 
-- "call_requested": Only when someone explicitly asks for a call/phone conversation.
+- "call_requested": Only when someone explicitly asks for a call/phone conversation. Use this event (NOT needs_user_input) for phone call requests.
 
 - "close_conversation": When conversation appears complete and the sender indicates they're done.
+
+- "needs_user_input": CRITICAL - Emit when the AI CANNOT or SHOULD NOT respond automatically. Use this when:
+  • Client asks questions about the user's requirements (size needed, budget, timeline, move-in date, industry)
+  • Scheduling requests (tour times, in-person meeting requests - NOT phone calls, use call_requested for those)
+  • Negotiation attempts (counteroffers, "would you consider X price", lease term negotiations)
+  • Questions about client identity ("who is your client?", "what company?")
+  • Legal/contract questions ("when can you sign?", "send LOI", "what terms do you want?")
+  • Confusing or unclear messages where appropriate response is uncertain
+  • Messages requiring decisions the AI shouldn't make on behalf of the user
+
+  Include "reason" field explaining WHY user input is needed:
+  • "client_question" - broker asking about client's requirements
+  • "scheduling" - tour/meeting request
+  • "negotiation" - price or term negotiation
+  • "confidential" - asking for client identity/info
+  • "legal_contract" - contract/LOI/lease questions
+  • "unclear" - message is confusing or unclear
 
 CRITICAL EXAMPLES:
 - "Below is the only current space we have" + URL = new_property event
 - "Here's an alternative location" = new_property event
 - "This property isn't available" = property_unavailable event
 - "Can you call me?" = call_requested event
+- "What size space does your client need?" = needs_user_input (reason: client_question)
+- "Can you tour Tuesday at 2pm?" = needs_user_input (reason: scheduling)
+- "Would you consider $7/SF instead?" = needs_user_input (reason: negotiation)
+- "Who is your client?" = needs_user_input (reason: confidential)
+- "When can you sign the lease?" = needs_user_input (reason: legal_contract)
 """
 
         NOTES_RULES = """
@@ -506,11 +528,18 @@ SCENARIOS:
 2. All fields complete: Thank them and indicate you have everything needed
 3. Property unavailable + new property suggested: Thank them for both pieces of information
 4. Property unavailable (no alternative): Thank them and ask if they have other properties
-5. Call requested: 
+5. Call requested:
    - If phone number is provided in the message: DO NOT generate a response_email (system will handle notification only)
    - If no phone number: Keep response brief - just ask for their phone number
    - Keep it short and direct, avoid wordy responses
 6. General acknowledgment: Thank them for their message and respond appropriately to their content
+7. Needs user input (CRITICAL):
+   - If emitting "needs_user_input" event, set response_email to null or empty string
+   - The system will notify the user and let THEM respond
+   - DO NOT attempt to answer questions about client requirements, budgets, or timelines
+   - DO NOT commit to tours, meetings, or schedules
+   - DO NOT engage in negotiation
+   - DO NOT reveal client information
 
 IMPORTANT: The response should feel natural and conversational, not robotic or templated. Reference specific details from their message when possible. Remember: NO closing/signature - just end with your content, the footer will add "Best," and signature automatically.
 """
@@ -582,15 +611,17 @@ OUTPUT ONLY valid JSON in this exact format:
   ],
   "events": [
     {
-      "type": "call_requested | property_unavailable | new_property | close_conversation",
+      "type": "call_requested | property_unavailable | new_property | close_conversation | needs_user_input",
       "address": "<for new_property: extract property name, address, or identifier>",
       "city": "<for new_property: infer city/location if possible>",
       "email": "<for new_property if different email needed>",
       "link": "<for new_property: include URL if mentioned>",
-      "notes": "<for new_property: additional context about the property>"
+      "notes": "<for new_property: additional context about the property>",
+      "reason": "<for needs_user_input: client_question | scheduling | negotiation | confidential | legal_contract | unclear>",
+      "question": "<for needs_user_input: the specific question/request that needs user attention>"
     }
   ],
-      "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation, reference specific details when possible, and vary wording to avoid repetition. IMPORTANT: If call_requested event is detected AND a phone number is provided in the message, set this field to null or empty string - the system will handle notification only without sending an email response.>",
+  "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation, reference specific details when possible, and vary wording to avoid repetition. SET TO NULL when: (1) call_requested with phone number provided, (2) needs_user_input event detected. The system will notify the user instead of auto-responding.>",
   "notes": "<IMPORTANT: Capture useful details not in columns - availability timing, lease terms, zoning, special features, parking, landlord notes, building age, location context, divisibility, HVAC, office space. Format: terse fragments separated by ' • '. Example: 'available immediately • 3-5 yr preferred • fenced yard'. Leave empty ONLY if conversation has no such details.>"
 }
 """)

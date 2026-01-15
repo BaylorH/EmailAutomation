@@ -733,7 +733,49 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             proposal["skip_response"] = True
                     except Exception as e:
                         print(f"❌ Failed to write call_requested notification: {e}")
-                
+
+                elif event_type == "needs_user_input":
+                    # Client asked a question or made a request the AI cannot handle
+                    # Create notification and skip auto-response
+                    try:
+                        reason = event.get("reason", "unclear")
+                        question = event.get("question", "User input required")
+
+                        reason_labels = {
+                            "client_question": "Client asked about your requirements",
+                            "scheduling": "Tour/meeting scheduling request",
+                            "negotiation": "Price or term negotiation",
+                            "confidential": "Asked about client identity",
+                            "legal_contract": "Contract or legal question",
+                            "unclear": "Message needs your review"
+                        }
+
+                        meta = {
+                            "reason": f"needs_user_input:{reason}",
+                            "details": reason_labels.get(reason, reason_labels["unclear"]),
+                            "question": question,
+                            "originalMessage": _full_text[:500]  # Include message context
+                        }
+
+                        write_notification(
+                            user_id, client_id,
+                            kind="action_needed",
+                            priority="important",
+                            email=from_addr_lower,
+                            thread_id=thread_id,
+                            row_number=rownum,
+                            row_anchor=row_anchor,
+                            meta=meta,
+                            dedupe_key=f"needs_user_input:{thread_id}:{reason}"
+                        )
+                        print(f"⚠️ Created needs_user_input notification (reason: {reason})")
+
+                        # Always skip auto-response when user input is needed
+                        proposal["skip_response"] = True
+
+                    except Exception as e:
+                        print(f"❌ Failed to write needs_user_input notification: {e}")
+
                 elif event_type == "property_unavailable":
                     # Check if row is already below NON-VIABLE divider - if so, skip processing
                     try:

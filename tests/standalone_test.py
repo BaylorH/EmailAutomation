@@ -318,6 +318,144 @@ Luke"""}
         expected_events=["close_conversation"],
         expected_response_type="closing"
     ),
+
+    # ========================================================================
+    # EDGE CASES: When AI should NOT auto-respond (escalate to user)
+    # ========================================================================
+
+    TestScenario(
+        name="client_asks_requirements",
+        description="Broker asks about client's space requirements - AI cannot answer",
+        property_address="699 Industrial Park Dr",
+        messages=[
+            {"direction": "outbound", "content": "Hi Jeff, I'm interested in 699 Industrial Park Dr. What are the details?"},
+            {"direction": "inbound", "content": """Hi Jill,
+
+Before I send over the details, what size space does your client need? And what's their timeline for moving in?
+
+Thanks,
+Jeff"""}
+        ],
+        expected_updates=[],
+        expected_events=["needs_user_input"],
+        expected_response_type="escalate"
+        # AI should NOT respond - user needs to provide client requirements
+    ),
+
+    TestScenario(
+        name="scheduling_request",
+        description="Broker requests tour scheduling - AI cannot commit to times",
+        property_address="1 Randolph Ct",
+        messages=[
+            {"direction": "outbound", "content": "Hi Scott, interested in touring 1 Randolph Ct."},
+            {"direction": "inbound", "content": """Hi Jill,
+
+Great! Can you come by Tuesday at 2pm for a tour? Or would Wednesday morning work better?
+
+Scott"""}
+        ],
+        expected_updates=[],
+        expected_events=["needs_user_input"],
+        expected_response_type="escalate"
+        # AI should NOT respond - user needs to confirm schedule
+    ),
+
+    TestScenario(
+        name="negotiation_attempt",
+        description="Broker makes counteroffer - AI should not negotiate",
+        property_address="135 Trade Center Court",
+        messages=[
+            {"direction": "outbound", "content": "Hi Luke, is there flexibility on the $8.50/SF asking rent for 135 Trade Center Court?"},
+            {"direction": "inbound", "content": """Hi Jill,
+
+The landlord is firm at $8.50/SF, but if your client can commit to a 5-year term instead of 3, we could potentially do $7.75/SF. Would they consider that?
+
+Luke"""}
+        ],
+        expected_updates=[],
+        expected_events=["needs_user_input"],
+        expected_response_type="escalate"
+        # AI should NOT respond - user needs to handle negotiation
+    ),
+
+    TestScenario(
+        name="identity_question",
+        description="Broker asks who the client is - AI should not reveal",
+        property_address="699 Industrial Park Dr",
+        messages=[
+            {"direction": "outbound", "content": "Hi Jeff, following up on 699 Industrial Park Dr."},
+            {"direction": "inbound", "content": """Hi Jill,
+
+Happy to help. Can you tell me who your client is? What company are they with and what do they do? We want to make sure it's a good fit for the building.
+
+Jeff"""}
+        ],
+        expected_updates=[],
+        expected_events=["needs_user_input"],
+        expected_response_type="escalate"
+        # AI should NOT reveal client identity
+    ),
+
+    TestScenario(
+        name="legal_contract_question",
+        description="Broker asks about contract/LOI - AI cannot commit",
+        property_address="1 Randolph Ct",
+        messages=[
+            {"direction": "outbound", "content": "Hi Scott, the property looks good. What are the next steps?"},
+            {"direction": "inbound", "content": """Hi Jill,
+
+If your client is ready to move forward, can you send over an LOI with their proposed terms? We'd need the lease term, preferred start date, and any TI requirements.
+
+Scott"""}
+        ],
+        expected_updates=[],
+        expected_events=["needs_user_input"],
+        expected_response_type="escalate"
+        # AI should NOT respond to contract/legal requests
+    ),
+
+    TestScenario(
+        name="mixed_info_and_question",
+        description="Broker provides info but also asks question requiring user input",
+        property_address="135 Trade Center Court",
+        messages=[
+            {"direction": "outbound", "content": "Hi Luke, what are the specs for 135 Trade Center Court?"},
+            {"direction": "inbound", "content": """Hi Jill,
+
+The space is 18,000 SF with 24' clear height. We have 3 docks and 1 drive-in.
+
+By the way, what's your client's budget? And do they need heavy power or standard?
+
+Luke"""}
+        ],
+        expected_updates=[
+            {"column": "Total SF", "value": "18000"},
+            {"column": "Ceiling Ht", "value": "24"},
+            {"column": "Docks", "value": "3"},
+            {"column": "Drive Ins", "value": "1"},
+        ],
+        expected_events=["needs_user_input"],
+        expected_response_type="escalate"
+        # Should extract data BUT still escalate due to unanswerable questions
+    ),
+
+    TestScenario(
+        name="budget_question",
+        description="Broker asks about budget - AI cannot answer",
+        property_address="1 Randolph Ct",
+        messages=[
+            {"direction": "outbound", "content": "Hi Scott, can you send details on 1 Randolph Ct?"},
+            {"direction": "inbound", "content": """Hi Jill,
+
+Sure thing. Before I do, what's the budget range your client is working with? Just want to make sure this is in their price range.
+
+Scott"""}
+        ],
+        expected_updates=[],
+        expected_events=["needs_user_input"],
+        expected_response_type="escalate"
+        # AI should NOT reveal budget information
+    ),
 ]
 
 
@@ -355,6 +493,8 @@ def build_prompt(scenario: TestScenario) -> str:
     prompt = f"""
 You are analyzing a conversation thread to suggest updates to ONE Google Sheet row, detect key events, and generate an appropriate response email.
 
+You are acting on behalf of "Jill Ames", a commercial real estate broker assistant. You help gather property information but CANNOT make decisions for the client.
+
 TARGET PROPERTY: {target_anchor}
 CONTACT NAME: {contact_name}
 
@@ -373,19 +513,30 @@ FORMATTING: Plain decimals, no "$" or "SF" symbols. Just numbers like "15000", "
 EVENTS (analyze LAST HUMAN message only):
 - "property_unavailable": Property explicitly stated as unavailable/leased/off-market.
 - "new_property": Different property suggested (different address/URL).
-- "call_requested": Explicit request for phone call.
+- "call_requested": Explicit request for phone call (use this, NOT needs_user_input, for call requests).
 - "close_conversation": Conversation appears complete.
+- "needs_user_input": CRITICAL - Use when AI CANNOT or SHOULD NOT respond. Triggers when (but NOT for call requests - use call_requested for those):
+  * Broker asks about client requirements (size needed, budget, timeline, move-in date)
+  * Scheduling requests (tour times, in-person meeting requests - NOT phone calls)
+  * Negotiation attempts (counteroffers, price discussions, lease term negotiations)
+  * Questions about client identity ("who is your client?", "what company?")
+  * Legal/contract questions ("send LOI", "when can you sign?", "what terms?")
+  * Confusing or unclear messages
+  Include "reason" field: client_question | scheduling | negotiation | confidential | legal_contract | unclear
+  Include "question" field: the specific question/request needing user attention
 
 NOTES (capture useful details not in columns):
 ALWAYS capture when mentioned: availability timing, lease terms, zoning, special features (fenced yard, rail spur, sprinklered), parking, landlord notes (owner motivated, firm on price), building age, location context (near I-20), divisibility, HVAC, office space details.
 FORMAT: Terse fragments separated by " • ". Example: "available immediately • 3-5 yr preferred • fenced yard"
 IMPORTANT: Don't leave notes empty if useful info exists in the conversation.
 
-RESPONSE EMAIL:
+RESPONSE EMAIL RULES:
 - Start with "Hi," or similar greeting
 - NO closing like "Best," - footer adds it automatically
-- NEVER request "Rent/SF /Yr"
+- NEVER request "Rent/SF /Yr" or "Gross Rent"
 - End with simple "Thanks" not "Looking forward to..."
+- SET response_email TO NULL when needs_user_input event is emitted - let the user respond instead
+- You can still extract data updates even when escalating (e.g., broker provides some info but also asks questions)
 
 SHEET HEADER: {json.dumps(HEADER)}
 
@@ -399,8 +550,8 @@ CONVERSATION:
 OUTPUT valid JSON only:
 {{
   "updates": [{{"column": "...", "value": "...", "confidence": 0.9, "reason": "..."}}],
-  "events": [{{"type": "...", "address": "...", "city": "...", "link": "..."}}],
-  "response_email": "...",
+  "events": [{{"type": "...", "reason": "<for needs_user_input>", "question": "<specific question>"}}],
+  "response_email": "<null if needs_user_input event>",
   "notes": "<capture useful non-column info: timing, terms, features, etc. Use ' • ' separator>"
 }}
 """
@@ -488,6 +639,30 @@ def validate_result(scenario: TestScenario, result: Dict) -> tuple:
         if u.get("column", "").lower() == "gross rent":
             issues.append("AI tried to write to 'Gross Rent' (FORBIDDEN - it's a formula column)")
 
+    # Check escalation scenarios
+    if scenario.expected_response_type == "escalate":
+        # When escalating, AI should emit needs_user_input and NOT generate a response
+        if "needs_user_input" not in actual_event_types:
+            issues.append("Expected 'needs_user_input' event for escalation scenario")
+
+        # Response should be null/empty when escalating
+        if response and response.strip():
+            issues.append("Response email should be null/empty when escalating to user")
+
+        # Check that needs_user_input event has required fields
+        for e in events:
+            if e.get("type") == "needs_user_input":
+                if not e.get("reason"):
+                    warnings.append("needs_user_input event missing 'reason' field")
+                if not e.get("question"):
+                    warnings.append("needs_user_input event missing 'question' field")
+
+    # Check that response_email is present for non-escalation scenarios (except call_requested with phone)
+    elif scenario.expected_response_type not in ["escalate", "call_with_phone"]:
+        if "needs_user_input" in actual_event_types:
+            # AI escalated when it shouldn't have
+            warnings.append("AI escalated to user when it could have responded automatically")
+
     passed = len(issues) == 0
     return passed, issues, warnings
 
@@ -537,9 +712,18 @@ def run_test(scenario: TestScenario, verbose: bool = True) -> TestResult:
 
         print(f"   Events: {[e.get('type') for e in result.ai_events]}")
 
+        # Show details for needs_user_input events
+        for e in result.ai_events:
+            if e.get("type") == "needs_user_input":
+                print(f"   ⚠️ Escalation: reason={e.get('reason', 'N/A')}")
+                if e.get("question"):
+                    print(f"      Question: {e.get('question')[:80]}...")
+
         if result.ai_response:
             preview = result.ai_response[:80].replace('\n', ' ')
             print(f"   Response email: {preview}...")
+        else:
+            print(f"   Response email: (none - escalated to user)")
 
         if result.ai_notes:
             print(f"   Notes: {result.ai_notes}")

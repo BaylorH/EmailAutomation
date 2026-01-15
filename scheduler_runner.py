@@ -1936,14 +1936,22 @@ FIELD MINING HINTS:
 
         EVENT_RULES = """
 EVENTS DETECTION (very specific; consider ONLY the LAST HUMAN message):
-- "call_requested": Only when someone explicitly asks for a call/phone conversation.
+- "call_requested": Only when someone explicitly asks for a call/phone conversation. Use this event (NOT needs_user_input) for phone call requests.
 - "property_unavailable": ONLY when the current property is explicitly stated as unavailable/leased/off-market.
 - "new_property":
     • Emit ONLY if the LAST HUMAN message contains a SPECIFIC street address (or unambiguous property name)
       that is DIFFERENT from the TARGET PROPERTY.
     • Phrases like "new place", "another one", "I have something else" WITHOUT a concrete, different address DO NOT qualify.
     • If you cannot extract a specific, different address string, DO NOT emit new_property.
-- "close_conversation": When conversation appears complete and the sender indicates they’re done.
+- "close_conversation": When conversation appears complete and the sender indicates they're done.
+- "needs_user_input": CRITICAL - Emit when the AI CANNOT or SHOULD NOT respond automatically. Use this when:
+    • Client asks questions about user's requirements (size needed, budget, timeline, move-in date, industry)
+    • Scheduling requests (tour times, in-person meeting requests - NOT phone calls, use call_requested for those)
+    • Negotiation attempts (counteroffers, price discussions, lease term negotiations)
+    • Questions about client identity ("who is your client?", "what company?")
+    • Legal/contract questions ("send LOI", "when can you sign?", "what terms?")
+    Include "reason" field: client_question | scheduling | negotiation | confidential | legal_contract | unclear
+    Include "question" field: the specific question/request needing user attention
 
 CRITICAL: If the LAST HUMAN message provides square footage, ceiling height, drive-ins, etc., that is an update about
 the CURRENT property unless it explicitly names a different address.
@@ -2026,12 +2034,14 @@ OUTPUT ONLY valid JSON in this exact format:
   ],
   "events": [
     {
-      "type": "call_requested | property_unavailable | new_property | close_conversation",
+      "type": "call_requested | property_unavailable | new_property | close_conversation | needs_user_input",
       "address": "<for new_property only>",
       "city": "<for new_property only>",
       "email": "<for new_property if different>",
       "link": "<for new_property if mentioned>",
-      "notes": "<for new_property additional context>"
+      "notes": "<for new_property additional context>",
+      "reason": "<for needs_user_input: client_question | scheduling | negotiation | confidential | legal_contract | unclear>",
+      "question": "<for needs_user_input: the specific question/request needing user attention>"
     }
   ],
   "notes": "<optional general notes about the conversation>"
@@ -2991,7 +3001,44 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         )
                     except Exception as e:
                         print(f"❌ Failed to write notification: {e}")
-                
+
+                elif event_type == "needs_user_input":
+                    # Client asked a question or made a request the AI cannot handle
+                    try:
+                        reason = event.get("reason", "unclear")
+                        question = event.get("question", "User input required")
+
+                        reason_labels = {
+                            "client_question": "Client asked about your requirements",
+                            "scheduling": "Tour/meeting scheduling request",
+                            "negotiation": "Price or term negotiation",
+                            "confidential": "Asked about client identity",
+                            "legal_contract": "Contract or legal question",
+                            "unclear": "Message needs your review"
+                        }
+
+                        meta = {
+                            "reason": f"needs_user_input:{reason}",
+                            "details": reason_labels.get(reason, reason_labels["unclear"]),
+                            "question": question,
+                            "originalMessage": _full_text[:500]
+                        }
+
+                        write_notification(
+                            user_id, client_id,
+                            kind="action_needed",
+                            priority="important",
+                            email=from_addr_lower,
+                            thread_id=thread_id,
+                            row_number=rownum,
+                            row_anchor=row_anchor,
+                            meta=meta,
+                            dedupe_key=f"needs_user_input:{thread_id}:{reason}"
+                        )
+                        print(f"⚠️ Created needs_user_input notification (reason: {reason})")
+                    except Exception as e:
+                        print(f"❌ Failed to write needs_user_input notification: {e}")
+
                 elif event_type == "property_unavailable":
                     # Move row below divider and create notification
                     message_content = _full_text.lower()
