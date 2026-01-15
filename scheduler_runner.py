@@ -32,7 +32,7 @@ TOKEN_CACHE       = "msal_token_cache.bin"
 
 # OpenAI config
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_ASSISTANT_MODEL = os.getenv("OPENAI_ASSISTANT_MODEL", "gpt-4o")
+OPENAI_ASSISTANT_MODEL = os.getenv("OPENAI_ASSISTANT_MODEL", "gpt-5.2")
 
 SUBJECT = "Weekly Questions"
 BODY = (

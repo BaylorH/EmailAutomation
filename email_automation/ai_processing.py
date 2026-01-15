@@ -640,7 +640,7 @@ OUTPUT ONLY valid JSON in this exact format:
 
         # ---- Call OpenAI (low temperature for determinism) --------------------
         response = client.responses.create(
-            model="gpt-4o",  # Using the model from config
+            model="gpt-5.2",  # GPT-5.2 Thinking for complex extraction
             input=[{"role": "user", "content": input_content}],
             temperature=0.1
         )

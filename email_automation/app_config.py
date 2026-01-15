@@ -13,7 +13,7 @@ FIREBASE_BUCKET = "email-automation-cache.firebasestorage.app"
 
 # OpenAI Config
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_ASSISTANT_MODEL = os.getenv("OPENAI_ASSISTANT_MODEL", "gpt-4o")
+OPENAI_ASSISTANT_MODEL = os.getenv("OPENAI_ASSISTANT_MODEL", "gpt-5.2")
 
 # Email Templates
 SUBJECT = "Weekly Questions"

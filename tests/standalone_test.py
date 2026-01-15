@@ -563,7 +563,7 @@ def call_openai(prompt: str) -> tuple:
     start = time.time()
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.2",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1
         )
