@@ -297,168 +297,208 @@ def index():
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Email Access Setup</title>
+            <title>Email Access Setup - PropertyFlow</title>
+            <link rel="preconnect" href="https://fonts.googleapis.com">
+            <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+            <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
             <style>
                 * {
                     margin: 0;
                     padding: 0;
                     box-sizing: border-box;
                 }
-                
+
                 body {
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    background: linear-gradient(145deg, #0f172a 0%, #1e293b 50%, #334155 100%);
                     min-height: 100vh;
                     display: flex;
                     align-items: center;
                     justify-content: center;
                     padding: 20px;
                 }
-                
+
                 .container {
                     background: white;
                     border-radius: 16px;
-                    box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-                    padding: 40px;
-                    max-width: 500px;
+                    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+                    padding: 48px;
+                    max-width: 440px;
                     width: 100%;
-                    text-align: center;
                 }
-                
+
                 .header {
-                    margin-bottom: 30px;
+                    text-align: center;
+                    margin-bottom: 32px;
                 }
-                
+
+                .header-icon {
+                    width: 56px;
+                    height: 56px;
+                    background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+                    border-radius: 14px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    margin: 0 auto 20px;
+                }
+
+                .header-icon svg {
+                    width: 28px;
+                    height: 28px;
+                    color: white;
+                }
+
                 .header h1 {
-                    color: #2d3748;
-                    font-size: 28px;
-                    font-weight: 600;
+                    color: #0f172a;
+                    font-size: 1.75rem;
+                    font-weight: 700;
                     margin-bottom: 8px;
+                    letter-spacing: -0.025em;
                 }
-                
+
                 .header p {
-                    color: #718096;
-                    font-size: 16px;
+                    color: #64748b;
+                    font-size: 0.9375rem;
                     line-height: 1.5;
                 }
-                
+
                 .status-card {
                     padding: 20px;
                     border-radius: 12px;
-                    margin: 20px 0;
-                    text-align: left;
+                    margin: 24px 0;
                 }
-                
+
                 .status-connected {
-                    background: linear-gradient(135deg, #48bb78, #38a169);
-                    color: white;
+                    background: #f0fdf4;
+                    border: 1px solid #bbf7d0;
                 }
-                
+
+                .status-connected .status-header {
+                    color: #166534;
+                }
+
+                .status-connected .status-text {
+                    color: #15803d;
+                }
+
                 .status-pending {
-                    background: linear-gradient(135deg, #ed8936, #dd6b20);
-                    color: white;
+                    background: #fefce8;
+                    border: 1px solid #fef08a;
                 }
-                
-                .status-card h3 {
-                    font-size: 18px;
+
+                .status-pending .status-header {
+                    color: #854d0e;
+                }
+
+                .status-pending .status-text {
+                    color: #a16207;
+                }
+
+                .status-header {
+                    font-size: 1rem;
                     font-weight: 600;
                     margin-bottom: 8px;
                     display: flex;
                     align-items: center;
-                    gap: 8px;
+                    gap: 10px;
                 }
-                
-                .status-card p {
-                    margin-bottom: 6px;
-                    opacity: 0.9;
+
+                .status-header svg {
+                    width: 20px;
+                    height: 20px;
+                    flex-shrink: 0;
                 }
-                
-                .status-card .email {
-                    font-weight: 500;
-                    background: rgba(255,255,255,0.2);
-                    padding: 4px 8px;
-                    border-radius: 6px;
-                    display: inline-block;
-                    margin-top: 8px;
-                }
-                
-                .connect-section {
-                    background: #f7fafc;
-                    border: 2px dashed #cbd5e0;
-                    border-radius: 12px;
-                    padding: 30px;
-                    margin: 20px 0;
-                }
-                
-                .connect-section h3 {
-                    color: #2d3748;
-                    font-size: 20px;
-                    margin-bottom: 12px;
-                }
-                
-                .connect-section p {
-                    color: #4a5568;
-                    margin-bottom: 20px;
+
+                .status-text {
+                    font-size: 0.875rem;
                     line-height: 1.5;
                 }
-                
-                .btn {
-                    display: inline-block;
-                    padding: 12px 24px;
-                    font-size: 16px;
+
+                .email-badge {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 8px;
                     font-weight: 500;
-                    text-decoration: none;
+                    background: #dcfce7;
+                    color: #166534;
+                    padding: 8px 12px;
                     border-radius: 8px;
+                    margin-top: 12px;
+                    font-size: 0.875rem;
+                }
+
+                .sync-status {
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                    margin-top: 12px;
+                    font-size: 0.8125rem;
+                    color: #16a34a;
+                }
+
+                .sync-status svg {
+                    width: 16px;
+                    height: 16px;
+                }
+
+                .btn {
+                    width: 100%;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 10px;
+                    padding: 14px 24px;
+                    font-size: 0.9375rem;
+                    font-weight: 600;
+                    text-decoration: none;
+                    border-radius: 10px;
                     border: none;
                     cursor: pointer;
-                    transition: all 0.2s;
-                    margin: 8px;
+                    transition: all 0.15s ease;
                 }
-                
+
                 .btn-primary {
-                    background: linear-gradient(135deg, #4299e1, #3182ce);
+                    background: #0f172a;
                     color: white;
                 }
-                
+
                 .btn-primary:hover {
-                    transform: translateY(-2px);
-                    box-shadow: 0 8px 16px rgba(66, 153, 225, 0.3);
+                    background: #1e293b;
+                    transform: translateY(-1px);
+                    box-shadow: 0 4px 12px rgba(15, 23, 42, 0.15);
                 }
-                
-                .btn-danger {
-                    background: linear-gradient(135deg, #f56565, #e53e3e);
-                    color: white;
+
+                .btn-primary svg {
+                    width: 20px;
+                    height: 20px;
                 }
-                
-                .btn-danger:hover {
-                    transform: translateY(-2px);
-                    box-shadow: 0 8px 16px rgba(245, 101, 101, 0.3);
-                }
-                
-                .footer {
-                    margin-top: 30px;
-                    padding-top: 20px;
+
+                .security-badge {
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 8px;
+                    margin-top: 24px;
+                    padding-top: 24px;
                     border-top: 1px solid #e2e8f0;
-                    color: #718096;
-                    font-size: 14px;
+                    color: #64748b;
+                    font-size: 0.8125rem;
                 }
-                
-                .icon {
-                    font-size: 20px;
+
+                .security-badge svg {
+                    width: 16px;
+                    height: 16px;
+                    color: #22c55e;
                 }
-                
+
                 @media (max-width: 480px) {
                     .container {
-                        padding: 30px 20px;
+                        padding: 32px 24px;
                     }
-                    
+
                     .header h1 {
-                        font-size: 24px;
-                    }
-                    
-                    .btn {
-                        width: 100%;
-                        margin: 8px 0;
+                        font-size: 1.5rem;
                     }
                 }
             </style>
@@ -466,60 +506,76 @@ def index():
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>📧 Email Access Setup</h1>
+                    <div class="header-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+                            <polyline points="22,6 12,13 2,6"/>
+                        </svg>
+                    </div>
+                    <h1>Email Access Setup</h1>
                     <p>Connect your email account to enable automated email management</p>
                 </div>
-                
+
                 {% if status.status == 'valid' %}
                     <div class="status-card status-connected">
-                        <h3><span class="icon">✅</span> Email Access Connected</h3>
-                        <p>Your email account is successfully connected and ready to use.</p>
-                        <div class="email">{{ status.account }}</div>
+                        <div class="status-header">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                                <polyline points="22 4 12 14.01 9 11.01"/>
+                            </svg>
+                            Email Access Connected
+                        </div>
+                        <p class="status-text">Your email account is successfully connected and ready to use.</p>
+                        <div class="email-badge">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 16px; height: 16px;">
+                                <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+                                <polyline points="22,6 12,13 2,6"/>
+                            </svg>
+                            {{ status.account }}
+                        </div>
                         {% if upload_result and upload_result.success %}
-                        <p style="margin-top: 12px; font-size: 14px;">
-                            <span class="icon">☁️</span> Securely synced to cloud
-                        </p>
+                        <div class="sync-status">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <polyline points="20 6 9 17 4 12"/>
+                            </svg>
+                            Securely synced to cloud
+                        </div>
                         {% endif %}
                     </div>
-                    
-                    <!-- <button class="btn btn-danger" onclick="disconnectEmail()">
-                        🔓 Disconnect Email Access
-                    </button> -->
                 {% else %}
                     <div class="status-card status-pending">
-                        <h3><span class="icon">⏳</span> Email Access Required</h3>
-                        <p>To use automated email features, please connect your email account.</p>
+                        <div class="status-header">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <circle cx="12" cy="12" r="10"/>
+                                <polyline points="12 6 12 12 16 14"/>
+                            </svg>
+                            Email Access Required
+                        </div>
+                        <p class="status-text">To use automated email features, please connect your Microsoft email account.</p>
                     </div>
-                    
-                    <div class="connect-section">
-                        <h3>🔐 Connect Your Email</h3>
-                        <p>Click below to securely connect your Microsoft email account. You'll be redirected to Microsoft's secure login page.</p>
-                        <button class="btn btn-primary" onclick="connectEmail()">
-                            Connect Email Account
-                        </button>
-                    </div>
+
+                    <button class="btn btn-primary" onclick="connectEmail()">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 32 32" fill="none">
+                            <rect x="17" y="17" width="10" height="10" fill="#FEBA08"/>
+                            <rect x="5" y="17" width="10" height="10" fill="#05A6F0"/>
+                            <rect x="17" y="5" width="10" height="10" fill="#80BC06"/>
+                            <rect x="5" y="5" width="10" height="10" fill="#F25325"/>
+                        </svg>
+                        Connect with Microsoft
+                    </button>
                 {% endif %}
-                
-                <div class="footer">
-                    <p>🔒 Your email credentials are never stored. Only secure access tokens are used.</p>
+
+                <div class="security-badge">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                    </svg>
+                    Your credentials are never stored. Only secure tokens are used.
                 </div>
             </div>
-            
+
             <script>
                 function connectEmail() {
                     window.location.href = '/auth/login';
-                }
-                
-                async function disconnectEmail() {
-                    if (confirm('Are you sure you want to disconnect your email account? You will need to reconnect it to use email features.')) {
-                        try {
-                            const response = await fetch('/api/clear', { method: 'POST' });
-                            await response.json();
-                            setTimeout(() => location.reload(), 1000);
-                        } catch (error) {
-                            console.error('Error:', error);
-                        }
-                    }
                 }
             </script>
         </body>
@@ -979,11 +1035,15 @@ def auth_callback():
                     <head>
                         <meta charset="UTF-8">
                         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <title>Connection Failed</title>
+                        <title>Connection Failed - PropertyFlow</title>
+                        <link rel="preconnect" href="https://fonts.googleapis.com">
+                        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+                        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
                         <style>
+                            * { margin: 0; padding: 0; box-sizing: border-box; }
                             body {
-                                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                                background: linear-gradient(145deg, #0f172a 0%, #1e293b 50%, #334155 100%);
                                 min-height: 100vh;
                                 display: flex;
                                 align-items: center;
@@ -993,29 +1053,86 @@ def auth_callback():
                             .container {
                                 background: white;
                                 border-radius: 16px;
-                                padding: 40px;
+                                padding: 48px;
                                 text-align: center;
-                                max-width: 400px;
-                                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                                max-width: 420px;
+                                width: 100%;
+                                box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
                             }
-                            h2 { color: #e53e3e; margin-bottom: 16px; }
-                            p { color: #4a5568; margin-bottom: 24px; }
+                            .error-icon {
+                                width: 64px;
+                                height: 64px;
+                                background: #fef2f2;
+                                border-radius: 50%;
+                                display: flex;
+                                align-items: center;
+                                justify-content: center;
+                                margin: 0 auto 24px;
+                            }
+                            .error-icon svg {
+                                width: 32px;
+                                height: 32px;
+                                color: #dc2626;
+                            }
+                            h2 {
+                                color: #0f172a;
+                                margin-bottom: 8px;
+                                font-size: 1.5rem;
+                                font-weight: 700;
+                                letter-spacing: -0.025em;
+                            }
+                            .error-message {
+                                background: #fef2f2;
+                                border: 1px solid #fecaca;
+                                border-radius: 10px;
+                                padding: 16px;
+                                margin: 20px 0 24px;
+                                color: #991b1b;
+                                font-size: 0.875rem;
+                                line-height: 1.5;
+                            }
                             .btn {
-                                display: inline-block;
-                                padding: 12px 24px;
-                                background: linear-gradient(135deg, #4299e1, #3182ce);
+                                display: inline-flex;
+                                align-items: center;
+                                gap: 8px;
+                                padding: 14px 24px;
+                                background: #0f172a;
                                 color: white;
                                 text-decoration: none;
-                                border-radius: 8px;
-                                font-weight: 500;
+                                border-radius: 10px;
+                                font-weight: 600;
+                                font-size: 0.9375rem;
+                                transition: all 0.15s ease;
+                            }
+                            .btn:hover {
+                                background: #1e293b;
+                                transform: translateY(-1px);
+                                box-shadow: 0 4px 12px rgba(15, 23, 42, 0.15);
+                            }
+                            .btn svg {
+                                width: 18px;
+                                height: 18px;
                             }
                         </style>
                     </head>
                     <body>
                         <div class="container">
-                            <h2>❌ Connection Failed</h2>
-                            <p>{{ error }}</p>
-                            <a href="/?uid={{ uid }}" class="btn">← Try Again</a>
+                            <div class="error-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="12" cy="12" r="10"/>
+                                    <line x1="15" y1="9" x2="9" y2="15"/>
+                                    <line x1="9" y1="9" x2="15" y2="15"/>
+                                </svg>
+                            </div>
+                            <h2>Connection Failed</h2>
+                            <div class="error-message">{{ error }}</div>
+                            <a href="/?uid={{ uid }}" class="btn">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <line x1="19" y1="12" x2="5" y2="12"/>
+                                    <polyline points="12 19 5 12 12 5"/>
+                                </svg>
+                                Try Again
+                            </a>
                         </div>
                     </body>
                 </html>
@@ -1042,11 +1159,15 @@ def auth_callback():
                 <head>
                     <meta charset="UTF-8">
                     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Connection Successful</title>
+                    <title>Connection Successful - PropertyFlow</title>
+                    <link rel="preconnect" href="https://fonts.googleapis.com">
+                    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+                    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
                     <style>
+                        * { margin: 0; padding: 0; box-sizing: border-box; }
                         body {
-                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                            font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                            background: linear-gradient(145deg, #0f172a 0%, #1e293b 50%, #334155 100%);
                             min-height: 100vh;
                             display: flex;
                             align-items: center;
@@ -1056,50 +1177,103 @@ def auth_callback():
                         .container {
                             background: white;
                             border-radius: 16px;
-                            padding: 40px;
+                            padding: 48px;
                             text-align: center;
-                            max-width: 400px;
-                            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                            max-width: 420px;
+                            width: 100%;
+                            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
                         }
-                        h2 { 
-                            color: #38a169; 
-                            margin-bottom: 16px;
-                            font-size: 24px;
+                        .success-icon {
+                            width: 64px;
+                            height: 64px;
+                            background: #f0fdf4;
+                            border-radius: 50%;
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                            margin: 0 auto 24px;
                         }
-                        .email {
-                            background: #f7fafc;
-                            padding: 8px 16px;
-                            border-radius: 8px;
-                            color: #2d3748;
+                        .success-icon svg {
+                            width: 32px;
+                            height: 32px;
+                            color: #22c55e;
+                        }
+                        h2 {
+                            color: #0f172a;
+                            margin-bottom: 8px;
+                            font-size: 1.5rem;
+                            font-weight: 700;
+                            letter-spacing: -0.025em;
+                        }
+                        .subtitle {
+                            color: #64748b;
+                            font-size: 0.9375rem;
+                            margin-bottom: 24px;
+                        }
+                        .email-badge {
+                            display: inline-flex;
+                            align-items: center;
+                            gap: 8px;
+                            background: #f0fdf4;
+                            border: 1px solid #bbf7d0;
+                            padding: 12px 20px;
+                            border-radius: 10px;
+                            color: #166534;
                             font-weight: 500;
-                            margin: 16px 0;
+                            font-size: 0.9375rem;
+                            margin-bottom: 24px;
+                        }
+                        .email-badge svg {
+                            width: 18px;
+                            height: 18px;
+                        }
+                        .loading-section {
+                            padding-top: 24px;
+                            border-top: 1px solid #e2e8f0;
+                        }
+                        .loading-text {
+                            color: #64748b;
+                            font-size: 0.875rem;
+                            margin-bottom: 16px;
                         }
                         .spinner {
-                            width: 40px;
-                            height: 40px;
-                            border: 4px solid #e2e8f0;
-                            border-top: 4px solid #4299e1;
+                            width: 32px;
+                            height: 32px;
+                            border: 3px solid #e2e8f0;
+                            border-top: 3px solid #3b82f6;
                             border-radius: 50%;
-                            animation: spin 1s linear infinite;
-                            margin: 20px auto;
+                            animation: spin 0.8s linear infinite;
+                            margin: 0 auto;
                         }
                         @keyframes spin {
                             0% { transform: rotate(0deg); }
                             100% { transform: rotate(360deg); }
                         }
-                        p { color: #4a5568; margin-bottom: 16px; }
                     </style>
                 </head>
                 <body>
                     <div class="container">
-                        <h2>✅ Successfully Connected!</h2>
-                        <div class="email">{{ account }}</div>
-                        <p>Your email access has been set up successfully.</p>
-                        <p>Completing setup...</p>
-                        <div class="spinner"></div>
+                        <div class="success-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                <polyline points="20 6 9 17 4 12"/>
+                            </svg>
+                        </div>
+                        <h2>Successfully Connected</h2>
+                        <p class="subtitle">Your email access has been set up successfully</p>
+                        <div class="email-badge">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+                                <polyline points="22,6 12,13 2,6"/>
+                            </svg>
+                            {{ account }}
+                        </div>
+                        <div class="loading-section">
+                            <p class="loading-text">Completing setup...</p>
+                            <div class="spinner"></div>
+                        </div>
                     </div>
                     <script>
-                        setTimeout(() => window.location.href = '/?uid={{ uid }}', 3000);
+                        setTimeout(() => window.location.href = '/?uid={{ uid }}', 2500);
                     </script>
                 </body>
                 </html>
@@ -1113,11 +1287,15 @@ def auth_callback():
                     <head>
                         <meta charset="UTF-8">
                         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <title>Connection Failed</title>
+                        <title>Connection Failed - PropertyFlow</title>
+                        <link rel="preconnect" href="https://fonts.googleapis.com">
+                        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+                        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
                         <style>
+                            * { margin: 0; padding: 0; box-sizing: border-box; }
                             body {
-                                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                                background: linear-gradient(145deg, #0f172a 0%, #1e293b 50%, #334155 100%);
                                 min-height: 100vh;
                                 display: flex;
                                 align-items: center;
@@ -1127,34 +1305,91 @@ def auth_callback():
                             .container {
                                 background: white;
                                 border-radius: 16px;
-                                padding: 40px;
+                                padding: 48px;
                                 text-align: center;
-                                max-width: 400px;
-                                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                                max-width: 420px;
+                                width: 100%;
+                                box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
                             }
-                            h2 { color: #e53e3e; margin-bottom: 16px; }
-                            p { color: #4a5568; margin-bottom: 24px; }
+                            .error-icon {
+                                width: 64px;
+                                height: 64px;
+                                background: #fef2f2;
+                                border-radius: 50%;
+                                display: flex;
+                                align-items: center;
+                                justify-content: center;
+                                margin: 0 auto 24px;
+                            }
+                            .error-icon svg {
+                                width: 32px;
+                                height: 32px;
+                                color: #dc2626;
+                            }
+                            h2 {
+                                color: #0f172a;
+                                margin-bottom: 8px;
+                                font-size: 1.5rem;
+                                font-weight: 700;
+                                letter-spacing: -0.025em;
+                            }
+                            .error-message {
+                                background: #fef2f2;
+                                border: 1px solid #fecaca;
+                                border-radius: 10px;
+                                padding: 16px;
+                                margin: 20px 0 24px;
+                                color: #991b1b;
+                                font-size: 0.875rem;
+                                line-height: 1.5;
+                            }
                             .btn {
-                                display: inline-block;
-                                padding: 12px 24px;
-                                background: linear-gradient(135deg, #4299e1, #3182ce);
+                                display: inline-flex;
+                                align-items: center;
+                                gap: 8px;
+                                padding: 14px 24px;
+                                background: #0f172a;
                                 color: white;
                                 text-decoration: none;
-                                border-radius: 8px;
-                                font-weight: 500;
+                                border-radius: 10px;
+                                font-weight: 600;
+                                font-size: 0.9375rem;
+                                transition: all 0.15s ease;
+                            }
+                            .btn:hover {
+                                background: #1e293b;
+                                transform: translateY(-1px);
+                                box-shadow: 0 4px 12px rgba(15, 23, 42, 0.15);
+                            }
+                            .btn svg {
+                                width: 18px;
+                                height: 18px;
                             }
                         </style>
                     </head>
                     <body>
                         <div class="container">
-                            <h2>❌ Connection Failed</h2>
-                            <p>{{ error }}</p>
-                            <a href="/?uid={{ uid }}" class="btn">← Try Again</a>
+                            <div class="error-icon">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="12" cy="12" r="10"/>
+                                    <line x1="15" y1="9" x2="9" y2="15"/>
+                                    <line x1="9" y1="9" x2="15" y2="15"/>
+                                </svg>
+                            </div>
+                            <h2>Connection Failed</h2>
+                            <div class="error-message">{{ error }}</div>
+                            <a href="/?uid={{ uid }}" class="btn">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <line x1="19" y1="12" x2="5" y2="12"/>
+                                    <polyline points="12 19 5 12 12 5"/>
+                                </svg>
+                                Try Again
+                            </a>
                         </div>
                     </body>
                 </html>
             """, error=error, uid=uid)
-    
+
     except Exception as e:
         print(f"[CALLBACK] Exception: {str(e)}")
         uid = request.args.get("state", "web_user")  # Try to get UID for error page
@@ -1164,11 +1399,15 @@ def auth_callback():
                 <head>
                     <meta charset="UTF-8">
                     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Connection Error</title>
+                    <title>Connection Error - PropertyFlow</title>
+                    <link rel="preconnect" href="https://fonts.googleapis.com">
+                    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+                    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
                     <style>
+                        * { margin: 0; padding: 0; box-sizing: border-box; }
                         body {
-                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                            font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                            background: linear-gradient(145deg, #0f172a 0%, #1e293b 50%, #334155 100%);
                             min-height: 100vh;
                             display: flex;
                             align-items: center;
@@ -1178,29 +1417,87 @@ def auth_callback():
                         .container {
                             background: white;
                             border-radius: 16px;
-                            padding: 40px;
+                            padding: 48px;
                             text-align: center;
-                            max-width: 400px;
-                            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                            max-width: 420px;
+                            width: 100%;
+                            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
                         }
-                        h2 { color: #e53e3e; margin-bottom: 16px; }
-                        p { color: #4a5568; margin-bottom: 24px; }
+                        .error-icon {
+                            width: 64px;
+                            height: 64px;
+                            background: #fef2f2;
+                            border-radius: 50%;
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                            margin: 0 auto 24px;
+                        }
+                        .error-icon svg {
+                            width: 32px;
+                            height: 32px;
+                            color: #dc2626;
+                        }
+                        h2 {
+                            color: #0f172a;
+                            margin-bottom: 8px;
+                            font-size: 1.5rem;
+                            font-weight: 700;
+                            letter-spacing: -0.025em;
+                        }
+                        .error-message {
+                            background: #fef2f2;
+                            border: 1px solid #fecaca;
+                            border-radius: 10px;
+                            padding: 16px;
+                            margin: 20px 0 24px;
+                            color: #991b1b;
+                            font-size: 0.875rem;
+                            line-height: 1.5;
+                            word-break: break-word;
+                        }
                         .btn {
-                            display: inline-block;
-                            padding: 12px 24px;
-                            background: linear-gradient(135deg, #4299e1, #3182ce);
+                            display: inline-flex;
+                            align-items: center;
+                            gap: 8px;
+                            padding: 14px 24px;
+                            background: #0f172a;
                             color: white;
                             text-decoration: none;
-                            border-radius: 8px;
-                            font-weight: 500;
+                            border-radius: 10px;
+                            font-weight: 600;
+                            font-size: 0.9375rem;
+                            transition: all 0.15s ease;
+                        }
+                        .btn:hover {
+                            background: #1e293b;
+                            transform: translateY(-1px);
+                            box-shadow: 0 4px 12px rgba(15, 23, 42, 0.15);
+                        }
+                        .btn svg {
+                            width: 18px;
+                            height: 18px;
                         }
                     </style>
                 </head>
                 <body>
                     <div class="container">
-                        <h2>❌ Connection Error</h2>
-                        <p>{{ error }}</p>
-                        <a href="/?uid={{ uid }}" class="btn">← Try Again</a>
+                        <div class="error-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <circle cx="12" cy="12" r="10"/>
+                                <line x1="12" y1="8" x2="12" y2="12"/>
+                                <line x1="12" y1="16" x2="12.01" y2="16"/>
+                            </svg>
+                        </div>
+                        <h2>Connection Error</h2>
+                        <div class="error-message">{{ error }}</div>
+                        <a href="/?uid={{ uid }}" class="btn">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <line x1="19" y1="12" x2="5" y2="12"/>
+                                <polyline points="12 19 5 12 12 5"/>
+                            </svg>
+                            Try Again
+                        </a>
                     </div>
                 </body>
             </html>
