@@ -291,14 +291,43 @@ def _image_to_base64(image_path: str) -> str:
         print(f"⚠️ Failed to encode image {image_path}: {e}")
         return ""
 
-def get_email_footer() -> str:
-    """Returns HTML formatted email footer for Jill Ames matching the professional signature style."""
+def convert_plain_text_signature_to_html(plain_text_signature: str) -> str:
+    """
+    Converts a plain text email signature to HTML format.
+    Preserves line breaks and wraps in a styled container.
+    """
+    if not plain_text_signature or not plain_text_signature.strip():
+        return ""
+
+    # Convert line breaks to HTML
+    html_signature = plain_text_signature.replace('\n', '<br>')
+
+    # Wrap in styled container
+    return f"""<div style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000; line-height: 1.6;">
+{html_signature}
+</div>"""
+
+
+def get_email_footer(custom_signature: str = None) -> str:
+    """
+    Returns HTML formatted email footer.
+
+    Args:
+        custom_signature: Optional plain text signature from user settings.
+                         If provided, converts to HTML and uses it.
+                         If None or empty, uses the default Jill Ames signature.
+    """
+    # If a custom signature is provided, use it
+    if custom_signature and custom_signature.strip():
+        return convert_plain_text_signature_to_html(custom_signature)
+
+    # Otherwise use the default signature
     # Upload logo to Drive and get public URL (more reliable than base64 for email clients)
     logo_url = _upload_logo_to_drive()
-    
+
     # Upload LinkedIn icon to Drive
     linkedin_url = _upload_logo_to_drive("linkedin.png")
-    
+
     # Build the footer HTML matching the professional signature layout
     # Uses sans-serif font (Arial/Helvetica), black text
     footer = """Best,<br>
@@ -307,12 +336,12 @@ def get_email_footer() -> str:
 <tr>
 <td valign="top" style="padding-right: 30px; vertical-align: top;">
 <a href="https://mohrpartners.com/" target="_blank" style="text-decoration: none;">"""
-    
+
     if logo_url:
         footer += f'<img src="{logo_url}" alt="Mohr Partners" style="width: 120px; height: auto; display: block; border: 0;" />'
     else:
         footer += "Mohr Partners"
-    
+
     footer += """</a>
 </td>
 <td valign="top" style="vertical-align: top; font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000;">
@@ -334,11 +363,11 @@ def get_email_footer() -> str:
 <td valign="top" style="padding-right: 30px; vertical-align: top; font-size: 10pt; color: #000000;">
 T +1 206 510 5575<br>
 <a href="mailto:jill.ames@mohrpartners.com" style="color: #000000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">jill.ames@mohrpartners.com</a><br>"""
-    
+
     # Add LinkedIn icon below email
     if linkedin_url:
         footer += f'<a href="https://www.linkedin.com/company/mohr-partners" target="_blank" style="text-decoration: none; display: inline-block; margin-top: 4px;"><img src="{linkedin_url}" alt="LinkedIn" style="width: 20px; height: 20px; border: 0; vertical-align: middle;" /></a>'
-    
+
     footer += """</td>
 <td valign="top" style="vertical-align: top; font-size: 10pt; color: #000000;">
 <strong style="font-weight: bold; color: #000000;">Mohr Partners, Inc.</strong><br>
@@ -350,19 +379,41 @@ T +1 206 510 5575<br>
 </td>
 </tr>
 </table>"""
-    
+
     return footer
 
-def format_email_body_with_footer(body: str) -> str:
+
+def format_email_body_with_footer(body: str, custom_signature: str = None) -> str:
     """
     Converts plain text email body to HTML and appends footer.
     Preserves line breaks and formatting.
     Wraps in proper HTML structure to prevent email clients from collapsing the footer.
+
+    Args:
+        body: The email body text
+        custom_signature: Optional plain text signature from user settings
     """
     # Convert plain text to HTML
     # Replace double newlines with <br><br>, single newlines with <br>
     html_body = body.replace('\n\n', '<br><br>').replace('\n', '<br>')
-    
+
+    # Get the footer (custom or default)
+    footer_html = get_email_footer(custom_signature)
+
+    # If no signature at all, just return the body without footer section
+    if not footer_html:
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+</head>
+<body style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000; margin: 0; padding: 0;">
+<div style="max-width: 600px;">
+{html_body}
+</div>
+</body>
+</html>"""
+
     # Wrap in proper HTML structure to prevent email clients from collapsing footer
     # Add a visible separator and non-breaking content before footer to prevent trimming
     # This is especially important for replies where email clients may collapse signatures
@@ -377,11 +428,11 @@ def format_email_body_with_footer(body: str) -> str:
 <!-- Email signature separator - prevents collapse -->
 <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid transparent; min-height: 1px;">
 <div style="margin-top: 20px;">
-{get_email_footer()}
+{footer_html}
 </div>
 </div>
 </div>
 </body>
 </html>"""
-    
+
     return full_content
