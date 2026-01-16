@@ -740,6 +740,148 @@ def api_scheduler_status():
         "import_error": globals().get('IMPORT_ERROR', 'No import error recorded')
     })
 
+@app.route("/api/decline-property", methods=["POST"])
+def api_decline_property():
+    """
+    Delete a property row from a Google Sheet when user declines a new property suggestion.
+    Expects JSON body: { uid, clientId, rowNumber, sheetId }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        uid = data.get("uid")
+        client_id = data.get("clientId")
+        row_number = data.get("rowNumber")
+        sheet_id = data.get("sheetId")
+
+        if not all([uid, client_id, row_number, sheet_id]):
+            return jsonify({"success": False, "error": "Missing required fields: uid, clientId, rowNumber, sheetId"}), 400
+
+        # Import sheets client
+        from email_automation.clients import _sheets_client
+        from email_automation.sheets import _first_sheet_props
+
+        sheets = _sheets_client()
+        grid_id, tab_title = _first_sheet_props(sheets, sheet_id)
+
+        # Delete the row
+        delete_request = {
+            "requests": [{
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": grid_id,
+                        "dimension": "ROWS",
+                        "startIndex": row_number - 1,  # 0-based
+                        "endIndex": row_number
+                    }
+                }
+            }]
+        }
+
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body=delete_request
+        ).execute()
+
+        print(f"🗑️ Deleted row {row_number} from sheet {sheet_id} for client {client_id}")
+
+        return jsonify({
+            "success": True,
+            "message": f"Row {row_number} deleted successfully",
+            "deletedRow": row_number
+        })
+
+    except Exception as e:
+        print(f"❌ Failed to decline property: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/check-sheet-completion", methods=["POST"])
+def api_check_sheet_completion():
+    """
+    Check if all rows in a sheet have all required fields filled.
+    Returns completion status and details.
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        sheet_id = data.get("sheetId")
+        if not sheet_id:
+            return jsonify({"success": False, "error": "Missing sheetId"}), 400
+
+        from email_automation.clients import _sheets_client
+        from email_automation.sheets import _get_first_tab_title, _read_header_row2, _header_index_map
+        from email_automation.app_config import REQUIRED_FIELDS_FOR_CLOSE
+
+        sheets = _sheets_client()
+        tab_title = _get_first_tab_title(sheets, sheet_id)
+        header = _read_header_row2(sheets, sheet_id, tab_title)
+        idx_map = _header_index_map(header)
+
+        # Read all data rows
+        resp = sheets.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{tab_title}!A3:ZZZ"
+        ).execute()
+        rows = resp.get("values", [])
+
+        total_viable = 0
+        completed = 0
+        incomplete_rows = []
+
+        for row_offset, row in enumerate(rows, start=3):
+            # Skip NON-VIABLE divider and rows below it
+            if row and str(row[0]).strip().upper() == "NON-VIABLE":
+                break
+
+            # Skip empty rows
+            if not row or not any(cell.strip() for cell in row if cell):
+                continue
+
+            total_viable += 1
+            padded = row + [""] * (max(0, len(header) - len(row)))
+
+            # Check required fields
+            missing = []
+            for field in REQUIRED_FIELDS_FOR_CLOSE:
+                key = field.strip().lower()
+                if key in idx_map:
+                    i = idx_map[key] - 1  # 0-based
+                    if i >= len(padded) or not (padded[i] or "").strip():
+                        missing.append(field)
+
+            if missing:
+                # Get property address for context
+                addr_idx = idx_map.get("property address", idx_map.get("address", 1)) - 1
+                address = padded[addr_idx] if addr_idx < len(padded) else f"Row {row_offset}"
+                incomplete_rows.append({
+                    "rowNumber": row_offset,
+                    "address": address,
+                    "missingFields": missing
+                })
+            else:
+                completed += 1
+
+        is_complete = total_viable > 0 and completed == total_viable
+
+        return jsonify({
+            "success": True,
+            "isComplete": is_complete,
+            "totalViableProperties": total_viable,
+            "completedProperties": completed,
+            "incompleteRows": incomplete_rows[:10],  # Limit to first 10 for response size
+            "completionPercentage": round((completed / total_viable * 100) if total_viable > 0 else 0, 1)
+        })
+
+    except Exception as e:
+        print(f"❌ Failed to check sheet completion: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/debug-inbox", methods=["GET"])
 def api_debug_inbox():
     """Debug endpoint to check inbox status and email processing"""
