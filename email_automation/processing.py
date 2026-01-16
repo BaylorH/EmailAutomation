@@ -27,6 +27,59 @@ from .email_operations import (
 )
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE, INBOX_SCAN_WINDOW_HOURS
 
+def _store_contact_optout(user_id: str, email: str, reason: str, thread_id: str) -> bool:
+    """
+    Store a contact's opt-out status in Firestore.
+    This prevents future emails from being sent to this contact.
+    """
+    try:
+        import hashlib
+        from google.cloud.firestore import SERVER_TIMESTAMP
+
+        # Use email hash as document ID for consistent lookups
+        email_lower = email.lower().strip()
+        email_hash = hashlib.sha256(email_lower.encode('utf-8')).hexdigest()[:16]
+
+        optout_ref = _fs.collection("users").document(user_id).collection("optedOutContacts").document(email_hash)
+
+        optout_ref.set({
+            "email": email_lower,
+            "reason": reason,
+            "optedOutAt": SERVER_TIMESTAMP,
+            "threadId": thread_id
+        })
+
+        print(f"📝 Stored opt-out for {email_lower} (reason: {reason})")
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Failed to store opt-out for {email}: {e}")
+        return False
+
+
+def is_contact_opted_out(user_id: str, email: str) -> dict | None:
+    """
+    Check if a contact has opted out of communications.
+    Returns the opt-out record if found, None otherwise.
+    """
+    try:
+        import hashlib
+
+        email_lower = email.lower().strip()
+        email_hash = hashlib.sha256(email_lower.encode('utf-8')).hexdigest()[:16]
+
+        optout_ref = _fs.collection("users").document(user_id).collection("optedOutContacts").document(email_hash)
+        doc = optout_ref.get()
+
+        if doc.exists:
+            return doc.to_dict()
+        return None
+
+    except Exception as e:
+        print(f"⚠️ Failed to check opt-out status for {email}: {e}")
+        return None
+
+
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     try:
@@ -1004,6 +1057,144 @@ Thanks!""",
                     # This will be handled below in the required fields check
                     print(f"💬 Close conversation event detected")
 
+                elif event_type == "contact_optout":
+                    # Contact explicitly doesn't want further communication
+                    try:
+                        reason = event.get("reason", "not_interested")
+
+                        reason_labels = {
+                            "not_interested": "Contact is not interested",
+                            "unsubscribe": "Contact requested to be removed from mailing list",
+                            "do_not_contact": "Contact requested no further contact",
+                            "no_tenant_reps": "Contact doesn't work with tenant rep brokers",
+                            "direct_only": "Contact only deals directly with tenants",
+                            "hostile": "Contact responded negatively - requires review"
+                        }
+
+                        # Store opt-out in Firestore for future reference
+                        _store_contact_optout(user_id, from_addr_lower, reason, thread_id)
+
+                        # Move row to NON-VIABLE with reason
+                        try:
+                            tab_title = _get_first_tab_title(sheets, sheet_id)
+                            if not _is_row_below_nonviable(sheets, sheet_id, tab_title, rownum):
+                                divider_row = ensure_nonviable_divider(sheets, sheet_id, tab_title)
+                                new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
+
+                                # Add comment explaining why
+                                from datetime import datetime
+                                current_date = datetime.now().strftime("%m/%d/%Y")
+                                optout_comment = f"[{current_date}] Contact opted out: {reason_labels.get(reason, reason)}"
+
+                                # Find comments column
+                                comments_col_idx = None
+                                for i, col_name in enumerate(header):
+                                    if col_name and "jill and clients comments" in col_name.lower():
+                                        comments_col_idx = i + 1
+                                        break
+
+                                if comments_col_idx:
+                                    existing_resp = sheets.spreadsheets().values().get(
+                                        spreadsheetId=sheet_id,
+                                        range=f"{tab_title}!{chr(64 + comments_col_idx)}{new_rownum}"
+                                    ).execute()
+                                    existing_comment = ""
+                                    if existing_resp.get("values"):
+                                        existing_comment = existing_resp["values"][0][0] if existing_resp["values"][0] else ""
+
+                                    final_comment = f"{existing_comment.strip()} | {optout_comment}" if existing_comment.strip() else optout_comment
+
+                                    sheets.spreadsheets().values().update(
+                                        spreadsheetId=sheet_id,
+                                        range=f"{tab_title}!{chr(64 + comments_col_idx)}{new_rownum}",
+                                        valueInputOption="RAW",
+                                        body={"values": [[final_comment]]}
+                                    ).execute()
+
+                                format_sheet_columns_autosize_with_exceptions(sheet_id, header)
+                                old_row_became_nonviable = True
+                                rownum = new_rownum
+                                print(f"🚫 Moved opted-out contact row to NON-VIABLE")
+                        except Exception as move_err:
+                            print(f"⚠️ Could not move row to NON-VIABLE: {move_err}")
+
+                        # Create notification for user awareness
+                        write_notification(
+                            user_id, client_id,
+                            kind="action_needed",
+                            priority="important",
+                            email=from_addr_lower,
+                            thread_id=thread_id,
+                            row_number=rownum,
+                            row_anchor=row_anchor,
+                            meta={
+                                "reason": f"contact_optout:{reason}",
+                                "details": reason_labels.get(reason, reason),
+                                "contact": from_addr_lower,
+                                "originalMessage": _full_text[:500]
+                            },
+                            dedupe_key=f"contact_optout:{thread_id}:{from_addr_lower}"
+                        )
+                        print(f"🚫 Contact opted out ({reason}): {from_addr_lower}")
+
+                        # Skip auto-response - don't email someone who asked not to be contacted
+                        proposal["skip_response"] = True
+
+                    except Exception as e:
+                        print(f"❌ Failed to handle contact_optout: {e}")
+
+                elif event_type == "wrong_contact":
+                    # This isn't the right person to contact
+                    try:
+                        reason = event.get("reason", "wrong_person")
+                        suggested_contact = event.get("suggestedContact", "")
+                        suggested_email = event.get("suggestedEmail", "")
+                        suggested_phone = event.get("suggestedPhone", "")
+
+                        reason_labels = {
+                            "no_longer_handles": "Contact no longer handles this property",
+                            "wrong_person": "Wrong contact for this property",
+                            "forwarded": "Message being forwarded to correct person",
+                            "left_company": "Contact no longer with company"
+                        }
+
+                        # Build details string
+                        details = reason_labels.get(reason, reason)
+                        if suggested_contact:
+                            details += f". Suggested contact: {suggested_contact}"
+                        if suggested_email:
+                            details += f" ({suggested_email})"
+                        if suggested_phone:
+                            details += f" - {suggested_phone}"
+
+                        # Create actionable notification
+                        write_notification(
+                            user_id, client_id,
+                            kind="action_needed",
+                            priority="important",
+                            email=from_addr_lower,
+                            thread_id=thread_id,
+                            row_number=rownum,
+                            row_anchor=row_anchor,
+                            meta={
+                                "reason": f"wrong_contact:{reason}",
+                                "details": details,
+                                "originalContact": from_addr_lower,
+                                "suggestedContact": suggested_contact,
+                                "suggestedEmail": suggested_email,
+                                "suggestedPhone": suggested_phone,
+                                "originalMessage": _full_text[:500]
+                            },
+                            dedupe_key=f"wrong_contact:{thread_id}:{suggested_email or suggested_contact or from_addr_lower}"
+                        )
+                        print(f"👤 Wrong contact detected - redirect to: {suggested_contact or 'unknown'} ({suggested_email or 'no email'})")
+
+                        # Skip auto-response - don't reply to wrong person
+                        proposal["skip_response"] = True
+
+                    except Exception as e:
+                        print(f"❌ Failed to handle wrong_contact: {e}")
+
             # Required fields check and remaining questions flow
             # Automatic response logic based on property state
             try:
@@ -1179,125 +1370,297 @@ We'll be in touch if we need any additional information."""
             print("ℹ️ No proposal generated; nothing to apply.")
 
 def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread: bool = True, top: int = 50):
-    """Idempotent scan of inbox for replies with early exit on processed messages."""
+    """
+    Idempotent scan of inbox for replies with early exit on processed messages.
+
+    BATCHING: Groups multiple unprocessed messages in the same thread together
+    to prevent conflicting auto-responses when contact sends multiple emails quickly.
+    """
     base = "https://graph.microsoft.com/v1.0"
-    
+
     # Calculate 5-hour cutoff
     now_utc = datetime.now(timezone.utc)
     now_iso = now_utc.isoformat()  # ends with +00:00
 
     cutoff_time = now_utc - timedelta(hours=INBOX_SCAN_WINDOW_HOURS)
     cutoff_iso = cutoff_time.isoformat().replace("+00:00", "Z")
-    
+
     # Build filter with time window
     filters = [f"receivedDateTime ge {cutoff_iso}"]
     if only_unread:
         filters.append("isRead eq false")
-    
+
     filter_str = " and ".join(filters)
-    
+
     params = {
         "$top": str(top),
-        "$orderby": "receivedDateTime desc",
+        "$orderby": "receivedDateTime asc",  # CHANGED: oldest first for proper batching
         "$select": "id,subject,from,toRecipients,receivedDateTime,sentDateTime,conversationId,internetMessageId,internetMessageHeaders,bodyPreview",
         "$filter": filter_str
     }
 
-    processed_count = 0
+    # PHASE 1: Collect all unprocessed messages and group by thread
+    from collections import defaultdict
+    thread_messages = defaultdict(list)  # thread_id -> [messages in order]
+    orphan_messages = []  # Messages we couldn't match to a thread
+
     scanned_count = 0
     skipped_count = 0
-    hit_known = False
-    peek_counter = 0
-    
+
     try:
         url = f"{base}/me/mailFolders/Inbox/messages"
-        
+
         while url:
             response = exponential_backoff_request(
                 lambda: requests.get(url, headers=headers, params=params, timeout=30)
             )
             data = response.json()
             messages = data.get("value", [])
-            
+
             if not messages:
                 break
-                
+
             if scanned_count == 0:  # First batch
-                print(f"📥 Found {len(messages)} inbox messages to process")
-            
+                print(f"📥 Found {len(messages)} inbox messages to scan")
+
             for msg in messages:
                 scanned_count += 1
-                
-                # Check if message is older than 5 hours
+
+                # Check if message is older than scan window
                 received_dt = msg.get("receivedDateTime")
                 if received_dt:
                     try:
                         msg_time = datetime.fromisoformat(received_dt.replace('Z', '+00:00'))
                         if msg_time < cutoff_time:
-                            print(f"⏰ Message older than 5 hours, stopping scan")
-                            url = None  # Stop pagination
-                            break
+                            continue  # Skip but don't stop - we're going oldest first
                     except Exception as e:
                         print(f"⚠️ Failed to parse message time {received_dt}: {e}")
-                
+
                 # Determine processed key (internetMessageId or id)
                 processed_key = msg.get("internetMessageId") or msg.get("id")
                 if not processed_key:
                     print(f"⚠️ Message has no internetMessageId or id, skipping")
                     continue
-                
+
                 # Check if already processed
                 if has_processed(user_id, processed_key):
-                    if not hit_known:
-                        hit_known = True
-                        print(f"⛳ Hit already-processed message; peeking 3 more and stopping")
-                    
-                    # Count this as skipped and increment peek counter
                     skipped_count += 1
-                    peek_counter += 1
-                    
-                    # Stop after peeking 3 more
-                    if peek_counter >= 3:
-                        url = None  # Stop pagination
-                        break
                     continue
-                
-                # If we're in peek mode but this message isn't processed, still process it
-                # but continue counting down the peek
-                if hit_known:
-                    peek_counter += 1
-                
-                # Process the message
-                try:
-                    process_inbox_message(user_id, headers, msg)
-                    processed_count += 1
-                except Exception as e:
-                    print(f"❌ Failed to process message {msg.get('id', 'unknown')}: {e}")
-                finally:
-                    # Always mark as processed to avoid reprocessing
-                    mark_processed(user_id, processed_key)
-                
-                # Stop after peeking if we hit known messages
-                if hit_known and peek_counter >= 3:
-                    url = None  # Stop pagination
-                    break
-            
-            # Handle pagination - but stop if we hit processed messages and finished peeking
-            if url and not hit_known:
-                url = data.get("@odata.nextLink")
+
+                # Try to match to a thread
+                thread_id = _match_message_to_thread(user_id, msg, headers)
+
+                if thread_id:
+                    thread_messages[thread_id].append(msg)
+                else:
+                    orphan_messages.append(msg)
+
+            # Handle pagination
+            url = data.get("@odata.nextLink")
+            if url:
                 params = {}  # nextLink includes all parameters
-            else:
-                url = None
-                
+
     except Exception as e:
         print(f"❌ Failed to scan inbox: {e}")
         return
-    
+
+    # PHASE 2: Process messages - batched by thread
+    processed_count = 0
+    batched_count = 0
+
+    # Process thread batches (multiple messages in same thread)
+    for thread_id, messages in thread_messages.items():
+        if len(messages) > 1:
+            # BATCH PROCESSING: Multiple messages in same thread
+            print(f"📦 Batching {len(messages)} messages for thread {thread_id[:20]}...")
+            batched_count += len(messages) - 1  # Count the extras
+
+            # Process only the LAST message (most recent), but include all message content
+            # in the conversation history (which is already handled by build_conversation_payload)
+            # First, save all the messages to Firestore so they appear in conversation
+            for msg in messages[:-1]:  # All but the last
+                try:
+                    _save_message_to_thread(user_id, thread_id, msg, headers)
+                    processed_key = msg.get("internetMessageId") or msg.get("id")
+                    mark_processed(user_id, processed_key)
+                except Exception as e:
+                    print(f"⚠️ Failed to save batched message: {e}")
+
+            # Process the last message (which will see all previous in conversation)
+            last_msg = messages[-1]
+            try:
+                process_inbox_message(user_id, headers, last_msg)
+                processed_count += 1
+            except Exception as e:
+                print(f"❌ Failed to process batched message: {e}")
+            finally:
+                processed_key = last_msg.get("internetMessageId") or last_msg.get("id")
+                mark_processed(user_id, processed_key)
+        else:
+            # Single message - process normally
+            msg = messages[0]
+            try:
+                process_inbox_message(user_id, headers, msg)
+                processed_count += 1
+            except Exception as e:
+                print(f"❌ Failed to process message {msg.get('id', 'unknown')}: {e}")
+            finally:
+                processed_key = msg.get("internetMessageId") or msg.get("id")
+                mark_processed(user_id, processed_key)
+
+    # Process orphan messages (couldn't match to thread - will be ignored by process_inbox_message)
+    for msg in orphan_messages:
+        try:
+            process_inbox_message(user_id, headers, msg)
+        except Exception as e:
+            print(f"❌ Failed to process orphan message: {e}")
+        finally:
+            processed_key = msg.get("internetMessageId") or msg.get("id")
+            mark_processed(user_id, processed_key)
+
     # Set last scan timestamp
     set_last_scan_iso(user_id, now_utc.isoformat().replace("+00:00", "Z"))
-    
+
     # Summary log
-    print(f"📥 Scanned {scanned_count} message(s); processed {processed_count}; skipped {skipped_count}")
+    if batched_count > 0:
+        print(f"📥 Scanned {scanned_count}; processed {processed_count}; batched {batched_count} extra messages; skipped {skipped_count}")
+    else:
+        print(f"📥 Scanned {scanned_count}; processed {processed_count}; skipped {skipped_count}")
+
+
+def _match_message_to_thread(user_id: str, msg: dict, headers: dict) -> str | None:
+    """
+    Try to match an inbox message to an existing thread.
+    Returns thread_id if found, None otherwise.
+    """
+    # Get headers if not present
+    internet_message_headers = msg.get("internetMessageHeaders")
+    if not internet_message_headers:
+        try:
+            response = exponential_backoff_request(
+                lambda: requests.get(
+                    f"https://graph.microsoft.com/v1.0/me/messages/{msg.get('id')}",
+                    headers=headers,
+                    params={"$select": "internetMessageHeaders"},
+                    timeout=30
+                )
+            )
+            internet_message_headers = response.json().get("internetMessageHeaders", [])
+        except Exception:
+            internet_message_headers = []
+
+    # Extract reply headers
+    in_reply_to = None
+    references = []
+
+    for header in internet_message_headers or []:
+        name = header.get("name", "").lower()
+        value = header.get("value", "")
+        if name == "in-reply-to":
+            in_reply_to = normalize_message_id(value)
+        elif name == "references":
+            references = parse_references_header(value)
+
+    conversation_id = msg.get("conversationId")
+
+    # Try In-Reply-To first
+    if in_reply_to:
+        thread_id = lookup_thread_by_message_id(user_id, in_reply_to)
+        if thread_id:
+            return thread_id
+
+    # Try References (newest to oldest)
+    if references:
+        for ref in reversed(references):
+            ref = normalize_message_id(ref)
+            thread_id = lookup_thread_by_message_id(user_id, ref)
+            if thread_id:
+                return thread_id
+
+    # Fallback to conversation ID
+    if conversation_id:
+        thread_id = lookup_thread_by_conversation_id(user_id, conversation_id)
+        if thread_id:
+            return thread_id
+
+    return None
+
+
+def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: dict):
+    """
+    Save a message to a thread without full processing.
+    Used for batching - saves earlier messages so they appear in conversation history.
+    """
+    from_info = msg.get("from", {}).get("emailAddress", {})
+    from_addr = from_info.get("address", "")
+    internet_message_id = msg.get("internetMessageId")
+    received_dt = msg.get("receivedDateTime")
+    sent_dt = msg.get("sentDateTime")
+    subject = msg.get("subject", "")
+    to_recipients = [r.get("emailAddress", {}).get("address", "") for r in msg.get("toRecipients", [])]
+
+    # Fetch full body
+    try:
+        full_body_resp = exponential_backoff_request(
+            lambda: requests.get(
+                f"https://graph.microsoft.com/v1.0/me/messages/{msg.get('id')}",
+                headers=headers,
+                params={"$select": "body"},
+                timeout=30
+            )
+        ).json().get("body", {}) or {}
+        _raw_content = full_body_resp.get("content", "") or ""
+        _ctype = (full_body_resp.get("contentType") or "Text").upper()
+        _full_text = strip_html_tags(_raw_content) if _ctype == "HTML" else _raw_content
+    except Exception:
+        _full_text = msg.get("bodyPreview", "")
+
+    # Get headers for in_reply_to and references
+    internet_message_headers = msg.get("internetMessageHeaders", [])
+    in_reply_to = None
+    references = []
+
+    for header in internet_message_headers or []:
+        name = header.get("name", "").lower()
+        value = header.get("value", "")
+        if name == "in-reply-to":
+            in_reply_to = normalize_message_id(value)
+        elif name == "references":
+            references = parse_references_header(value)
+
+    # Create message record
+    message_record = {
+        "direction": "inbound",
+        "subject": subject,
+        "from": from_addr,
+        "to": to_recipients,
+        "sentDateTime": sent_dt,
+        "receivedDateTime": received_dt,
+        "headers": {
+            "internetMessageId": internet_message_id,
+            "inReplyTo": in_reply_to,
+            "references": references
+        },
+        "body": {
+            "contentType": "Text",
+            "content": _full_text,
+            "preview": safe_preview(_full_text)
+        }
+    }
+
+    # Save to Firestore
+    if internet_message_id:
+        save_message(user_id, thread_id, internet_message_id, message_record)
+        index_message_id(user_id, internet_message_id, thread_id)
+
+    # Update thread timestamp
+    try:
+        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+        thread_ref.set({"updatedAt": SERVER_TIMESTAMP}, merge=True)
+    except Exception:
+        pass
+
+    print(f"  📝 Saved batched message from {from_addr} to thread {thread_id[:20]}...")
 
 def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], top: int = 50):
     """

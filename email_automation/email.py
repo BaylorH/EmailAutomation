@@ -14,6 +14,162 @@ MAX_OUTBOX_ATTEMPTS = 5
 # Maximum retries for indexing operations
 MAX_INDEX_RETRIES = 3
 
+
+def get_contact_email_count(user_id: str, recipient_email: str) -> int:
+    """
+    Count how many outbound emails have been sent to this contact.
+    Used to determine whether to use primary or secondary script.
+    """
+    from .clients import _fs
+
+    threads_ref = _fs.collection("users").document(user_id).collection("threads")
+
+    # Query threads where this email was a recipient
+    # The 'email' field is an array of recipient emails
+    query = threads_ref.where("email", "array_contains", recipient_email.lower().strip())
+    results = list(query.stream())
+
+    return len(results)
+
+
+def _extract_requirements_from_primary(primary_script: str) -> str:
+    """
+    Extract the requirements section from a primary script for reuse in fallback scenarios.
+    Returns just the requirements bullets/section, not the full script.
+    """
+    if not primary_script:
+        return ""
+
+    # Look for common requirement markers
+    markers = ["requirements are:", "requirements:", "looking for:", "they need:", "their requirements"]
+
+    script_lower = primary_script.lower()
+    for marker in markers:
+        if marker in script_lower:
+            idx = script_lower.index(marker)
+            # Extract from marker to end of bullet list or paragraph
+            requirements_section = primary_script[idx:]
+
+            # Find end (next paragraph break or common closing phrases)
+            end_markers = ["if you think", "if it is no longer", "please let me know",
+                          "alternatively", "if this might", "thanks"]
+            for end in end_markers:
+                if end in requirements_section.lower():
+                    end_idx = requirements_section.lower().index(end)
+                    return requirements_section[:end_idx].strip()
+
+            # No end marker found, return the section (up to reasonable length)
+            lines = requirements_section.split('\n')
+            result_lines = []
+            for line in lines:
+                if line.strip() == "":
+                    # Empty line might signal end of requirements
+                    if len(result_lines) > 0:
+                        break
+                result_lines.append(line)
+            return '\n'.join(result_lines).strip()
+
+    # No requirement marker found, return empty
+    return ""
+
+
+def _select_script_for_recipient(user_id: str, recipient_email: str,
+                                  scripts: List[str]) -> str:
+    """
+    Select appropriate script based on contact history.
+
+    scripts is an array where:
+    - scripts[0] = Primary script (1st contact)
+    - scripts[1] = Secondary script (2nd contact)
+    - scripts[2] = 3rd contact script
+    - etc.
+
+    If no script exists for the contact count, uses the last available script
+    with a "staying organized" note for 3rd+ contacts.
+    """
+    if not scripts or len(scripts) == 0:
+        return ""
+
+    email_count = get_contact_email_count(user_id, recipient_email)
+    print(f"📊 Contact history for {recipient_email}: {email_count} previous email(s)")
+
+    # Primary script for first contact
+    primary_script = scripts[0]
+
+    if email_count == 0:
+        print(f"  → Using script[0] - PRIMARY (first contact)")
+        return primary_script
+
+    # For subsequent contacts, try to use the matching script index
+    script_index = email_count  # 1st contact uses [0], 2nd uses [1], etc.
+
+    if script_index < len(scripts) and scripts[script_index] and scripts[script_index].strip():
+        print(f"  → Using script[{script_index}] ({script_index + 1}{'st' if script_index == 0 else 'nd' if script_index == 1 else 'rd' if script_index == 2 else 'th'} contact)")
+        script_to_use = scripts[script_index]
+
+        # Add organized note for 3rd+ contacts
+        if email_count >= 2:
+            organized_note = "\n\nI want to keep things organized for both of us, so I'm sending separate emails for each of your properties I'm inquiring about."
+            return script_to_use.rstrip() + organized_note
+
+        return script_to_use
+
+    # Fallback: use the last available script
+    last_script = None
+    for s in reversed(scripts):
+        if s and s.strip():
+            last_script = s
+            break
+
+    if last_script and last_script != primary_script:
+        print(f"  → Using last available script (fallback for contact #{email_count + 1})")
+        if email_count >= 2:
+            organized_note = "\n\nI want to keep things organized for both of us, so I'm sending separate emails for each of your properties I'm inquiring about."
+            return last_script.rstrip() + organized_note
+        return last_script
+
+    # Ultimate fallback: generate from primary
+    print(f"  → Using GENERATED fallback (contact #{email_count + 1})")
+    requirements = _extract_requirements_from_primary(primary_script)
+
+    if email_count == 1:
+        if requirements:
+            return f"""Hi,
+
+I just emailed you about another one of your listings, but I was wondering if you think there might be a fit at the above address as well.
+
+As a reminder, {requirements}
+
+Thanks!"""
+        else:
+            return f"""Hi,
+
+I just emailed you about another one of your listings, but I was wondering if you think there might be a fit at the above address as well.
+
+Please let me know if you have any information on this property, or if it's no longer available.
+
+Thanks!"""
+    else:
+        organized_note = "\n\nI want to keep things organized for both of us, so I'm sending separate emails for each of your properties I'm inquiring about."
+        if requirements:
+            return f"""Hi,
+
+I've reached out about a couple of your other listings. I'm also interested in the property at the above address.
+
+As a reminder, {requirements}
+{organized_note}
+
+Thanks!"""
+        else:
+            return f"""Hi,
+
+I've reached out about a couple of your other listings. I'm also interested in the property at the above address.
+
+Please let me know if you have any information on this property, or if it's no longer available.
+{organized_note}
+
+Thanks!"""
+
 def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> str | None:
     """
     Look up the row by email and return 'property address, city' as subject.
@@ -78,9 +234,35 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
     For inbox replies: script content may come from backend LLM or templates, footer is appended here.
 
     SAFETY: All recipient emails are validated before sending to prevent sending to malformed addresses.
+    SAFETY: Opted-out contacts are filtered out before sending.
     """
     if not recipients:
         return {"sent": [], "errors": {"_all": "No recipients"}}
+
+    # CRITICAL: Check for opted-out contacts before sending
+    from .processing import is_contact_opted_out
+    opted_out_recipients = []
+    active_recipients = []
+
+    for recipient in recipients:
+        optout_record = is_contact_opted_out(user_id, recipient)
+        if optout_record:
+            opted_out_recipients.append({
+                "email": recipient,
+                "reason": optout_record.get("reason", "unknown"),
+                "optedOutAt": str(optout_record.get("optedOutAt", ""))
+            })
+            print(f"🚫 Skipping opted-out contact: {recipient} (reason: {optout_record.get('reason')})")
+        else:
+            active_recipients.append(recipient)
+
+    if not active_recipients:
+        errors = {"_all": "All recipients have opted out"}
+        for optout in opted_out_recipients:
+            errors[optout["email"]] = f"Contact opted out ({optout['reason']})"
+        return {"sent": [], "errors": errors, "opted_out": opted_out_recipients}
+
+    recipients = active_recipients  # Continue with non-opted-out recipients
 
     # CRITICAL: Validate all recipient emails before sending
     valid_recipients, invalid_recipients = validate_recipient_emails(recipients)
@@ -92,7 +274,14 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         return {"sent": [], "errors": {"_all": f"No valid recipients. Invalid: {invalid_recipients}"}}
 
     content_type, content = _body_kind(script)
-    
+
+    # Initialize results with opted_out info
+    results = {"sent": [], "errors": {}, "opted_out": opted_out_recipients}
+
+    # Add opted-out recipients to errors for visibility
+    for optout in opted_out_recipients:
+        results["errors"][optout["email"]] = f"Contact opted out ({optout['reason']})"
+
     # Append footer to all emails (signature with logo, contact info, etc.)
     from .utils import get_email_footer, format_email_body_with_footer
     if content_type == "HTML":
@@ -131,7 +320,6 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         # Convert to HTML and add footer (this function now wraps in proper HTML structure)
         content = format_email_body_with_footer(content)
         content_type = "HTML"
-    results = {"sent": [], "errors": {}}
     base = "https://graph.microsoft.com/v1.0"
 
     # Add invalid recipients to errors
@@ -382,9 +570,21 @@ def send_outboxes(user_id: str, headers):
 
 def _send_multi_property_email(user_id: str, headers, recipient_email: str, items: list):
     """
-    Send a combined email for multiple properties to the same broker.
-    Creates a natural email that acknowledges all properties being inquired about.
+    Send SEPARATE emails for multiple properties to the same broker.
+    Each property gets its own thread for clean tracking.
+    The first email acknowledges there are multiple and explains the organization strategy.
     """
+    # Check for opted-out contacts first
+    from .processing import is_contact_opted_out
+    optout_record = is_contact_opted_out(user_id, recipient_email)
+    if optout_record:
+        print(f"🚫 Skipping multi-property emails to opted-out contact: {recipient_email}")
+        # Delete all outbox items for this recipient
+        for item in items:
+            item['doc'].reference.delete()
+        print(f"🗑️ Deleted {len(items)} outbox items (recipient opted out)")
+        return
+
     # Extract property info from each item
     properties = []
     for item in items:
@@ -396,121 +596,152 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
             'item': item,
             'name': property_name,
             'clientId': data.get("clientId", ""),
-            'script': data.get("script", "")
+            'script': data.get("script", ""),
+            'rowNumber': data.get("rowNumber")
         })
 
-    # Build combined email
-    primary_prop = properties[0]
-    other_props = properties[1:]
+    print(f"📬 Sending {len(properties)} separate property emails to {recipient_email}")
 
-    # Create natural combined script
-    other_names = [p['name'] for p in other_props if p['name']]
-    if other_names:
-        other_list = ", ".join(other_names[:-1]) + (" and " + other_names[-1] if len(other_names) > 1 else other_names[0] if other_names else "")
-        # Combine into one email - lead with the first property, mention others
-        combined_script = f"""Hi,
+    # Send each property as its own email/thread
+    for idx, prop in enumerate(properties):
+        item = prop['item']
+        data = item['data']
+        clientId = (data.get("clientId") or "").strip()
+        attempts = int(data.get("attempts") or 0)
+        row_number = prop.get('rowNumber')
 
-I noticed you have several properties that caught our attention. While I'm reaching out about {primary_prop['name'] or 'one of your listings'}, I also saw you have {other_list} available.
+        # For the FIRST email, add context about multiple properties
+        if idx == 0 and len(properties) > 1:
+            other_names = [p['name'] for p in properties[1:] if p['name']]
+            other_bullets = "\n".join(f"  - {name}" for name in other_names)
 
-{primary_prop['script']}
+            # Prepend organization message to the first email
+            script = f"""Hi,
 
-If you have any details on the other properties as well, we'd be interested in those too.
+I know I'm reaching out about a few of your listings, so I want to keep things organized for both of us. I'll keep each property as its own email thread so we don't get crossed up.
 
-Thanks"""
-    else:
-        combined_script = primary_prop['script']
+Starting with {prop['name'] or 'this property'}:
 
-    first_item = items[0]
-    data = first_item['data']
-    clientId = (data.get("clientId") or "").strip()
-    attempts = int(data.get("attempts") or 0)
+{prop['script']}
 
-    print(f"→ Sending combined email to {recipient_email} for {len(items)} properties (attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
+I'm also sending separate emails about:
+{other_bullets}
 
-    try:
-        res = send_and_index_email(user_id, headers, combined_script, [recipient_email], client_id_or_none=clientId)
-        any_errors = bool(res["errors"])
-
-        if not any_errors and res["sent"]:
-            # Delete all outbox items for this combined send
-            for item in items:
-                item['doc'].reference.delete()
-            print(f"🗑️ Deleted {len(items)} outbox items (combined send)")
+Feel free to respond to whichever is most relevant, and we can take it from there."""
         else:
-            # Error - update attempts on all items
-            new_attempts = attempts + 1
-            error_msg = json.dumps(res["errors"])[:1500]
+            # Subsequent emails just use their original script
+            script = prop['script']
 
-            for item in items:
+        print(f"  → Property {idx + 1}/{len(properties)}: {prop['name'] or 'Unknown'} (attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
+
+        try:
+            res = send_and_index_email(user_id, headers, script, [recipient_email],
+                                       client_id_or_none=clientId, row_number=row_number)
+            any_errors = bool([e for e in res.get("errors", {}) if "opted out" not in str(res["errors"].get(e, ""))])
+
+            if not any_errors and res["sent"]:
+                item['doc'].reference.delete()
+                print(f"  ✅ Sent and deleted outbox item for {prop['name']}")
+            else:
+                new_attempts = attempts + 1
+                error_msg = json.dumps(res["errors"])[:1500]
+
                 if new_attempts >= MAX_OUTBOX_ATTEMPTS:
-                    _move_to_dead_letter(user_id, item['doc'].reference, item['data'],
+                    _move_to_dead_letter(user_id, item['doc'].reference, data,
                         f"Send errors after {new_attempts} attempts: {error_msg}")
                 else:
                     item['doc'].reference.set(
                         {"attempts": new_attempts, "lastError": error_msg},
                         merge=True,
                     )
-            print(f"⚠️ Kept items with error; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
+                print(f"  ⚠️ Kept item with error; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
 
-    except Exception as e:
-        new_attempts = attempts + 1
-        error_msg = str(e)[:1500]
+        except Exception as e:
+            new_attempts = attempts + 1
+            error_msg = str(e)[:1500]
 
-        for item in items:
             if new_attempts >= MAX_OUTBOX_ATTEMPTS:
-                _move_to_dead_letter(user_id, item['doc'].reference, item['data'],
+                _move_to_dead_letter(user_id, item['doc'].reference, data,
                     f"Exception after {new_attempts} attempts: {error_msg}")
             else:
                 item['doc'].reference.set(
                     {"attempts": new_attempts, "lastError": error_msg},
                     merge=True,
                 )
-        print(f"💥 Error sending combined email: {e}; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
+            print(f"  💥 Error: {e}; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
+
+        # Small delay between emails to avoid rate limiting and ensure they're clearly separate
+        if idx < len(properties) - 1:
+            time.sleep(1)
 
 
 def _send_single_outbox_item(user_id: str, headers, item: dict):
-    """Send a single outbox item (standard path)."""
+    """
+    Send a single outbox item with smart script selection based on contact history.
+
+    The script selection logic:
+    - scripts[0] = 1st contact (primary)
+    - scripts[1] = 2nd contact (follow-up)
+    - scripts[2] = 3rd contact, etc.
+    """
     d = item['doc']
     data = item['data']
     emails = data.get("assignedEmails") or []
-    script = data.get("script") or ""
     clientId = (data.get("clientId") or "").strip()
     attempts = int(data.get("attempts") or 0)
+    row_number = data.get("rowNumber")
 
-    print(f"→ Sending outbox item {d.id} to {len(emails)} recipient(s) (clientId={clientId or 'n/a'}, attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
+    # Get scripts array (new format) or build from legacy fields
+    email_scripts = data.get("emailScripts")
+    if not email_scripts or len(email_scripts) == 0:
+        # Fallback to legacy script/secondaryScript fields
+        primary_script = data.get("script") or ""
+        secondary_script = data.get("secondaryScript")
+        email_scripts = [primary_script]
+        if secondary_script:
+            email_scripts.append(secondary_script)
 
-    try:
-        res = send_and_index_email(user_id, headers, script, emails, client_id_or_none=clientId)
-        any_errors = bool(res["errors"])
+    print(f"→ Sending outbox item {d.id} to {len(emails)} recipient(s) (clientId={clientId or 'n/a'}, {len(email_scripts)} script(s), attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
 
-        if not any_errors and res["sent"]:
-            d.reference.delete()
-            print(f"🗑️ Deleted outbox item {d.id}")
-        else:
-            new_attempts = attempts + 1
-            error_msg = json.dumps(res["errors"])[:1500]
+    # Track results for all recipients
+    all_sent = []
+    all_errors = {}
 
-            if new_attempts >= MAX_OUTBOX_ATTEMPTS:
-                _move_to_dead_letter(user_id, d.reference, data, f"Send errors after {new_attempts} attempts: {error_msg}")
-            else:
-                d.reference.set(
-                    {"attempts": new_attempts, "lastError": error_msg},
-                    merge=True,
-                )
-                print(f"⚠️ Kept item {d.id} with error; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
+    # For each recipient, select the appropriate script based on contact history
+    for recipient_email in emails:
+        selected_script = _select_script_for_recipient(
+            user_id, recipient_email, email_scripts
+        )
 
-    except Exception as e:
+        try:
+            res = send_and_index_email(user_id, headers, selected_script, [recipient_email],
+                                       client_id_or_none=clientId, row_number=row_number)
+
+            all_sent.extend(res.get("sent", []))
+            all_errors.update(res.get("errors", {}))
+
+        except Exception as e:
+            all_errors[recipient_email] = str(e)
+            print(f"💥 Error sending to {recipient_email}: {e}")
+
+    # Determine success/failure for the outbox item
+    any_errors = bool(all_errors)
+
+    if not any_errors and all_sent:
+        d.reference.delete()
+        print(f"🗑️ Deleted outbox item {d.id}")
+    else:
         new_attempts = attempts + 1
-        error_msg = str(e)[:1500]
+        error_msg = json.dumps(all_errors)[:1500]
 
         if new_attempts >= MAX_OUTBOX_ATTEMPTS:
-            _move_to_dead_letter(user_id, d.reference, data, f"Exception after {new_attempts} attempts: {error_msg}")
+            _move_to_dead_letter(user_id, d.reference, data, f"Send errors after {new_attempts} attempts: {error_msg}")
         else:
             d.reference.set(
                 {"attempts": new_attempts, "lastError": error_msg},
                 merge=True,
             )
-            print(f"💥 Error sending item {d.id}: {e}; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
+            print(f"⚠️ Kept item {d.id} with error; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
 
 
 def _extract_property_from_script(script: str) -> str:

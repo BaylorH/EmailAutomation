@@ -434,6 +434,32 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • "legal_contract" - contract/LOI/lease questions
   • "unclear" - message is confusing or unclear
 
+- "contact_optout": Emit when the contact explicitly indicates they don't want further communication.
+  • Look for: "not interested", "no thanks", "please stop", "unsubscribe", "remove me from your list",
+    "don't contact me", "stop emailing", "opt out", "take me off your list", "no longer interested"
+  • Also detect professional refusals: "I don't work with tenant rep brokers", "we only deal direct with tenants",
+    "we don't work with buyer's agents", "not taking inquiries"
+  • Include "reason" field:
+    - "not_interested" - general disinterest
+    - "unsubscribe" - explicit removal request
+    - "do_not_contact" - firm request to stop contact
+    - "no_tenant_reps" - policy against working with tenant reps
+    - "direct_only" - only deals directly with tenants
+    - "hostile" - rude or aggressive response
+
+- "wrong_contact": Emit when the message indicates this person is NOT the right contact for this property.
+  • Look for: "I don't handle that property", "wrong person", "contact [name] instead", "no longer with [company]",
+    "I'm not the leasing agent", "forwarding to", "you should reach out to", "try [name/email]"
+  • Extract suggested contact info if provided:
+    - "suggestedContact" - name of correct person
+    - "suggestedEmail" - email if provided
+    - "suggestedPhone" - phone if provided
+  • Include "reason" field:
+    - "no_longer_handles" - used to handle but doesn't anymore
+    - "wrong_person" - never handled this property
+    - "forwarded" - forwarding to correct person
+    - "left_company" - no longer with the company
+
 CRITICAL EXAMPLES:
 - "Below is the only current space we have" + URL = new_property event
 - "Here's an alternative location" = new_property event
@@ -444,6 +470,11 @@ CRITICAL EXAMPLES:
 - "Would you consider $7/SF instead?" = needs_user_input (reason: negotiation)
 - "Who is your client?" = needs_user_input (reason: confidential)
 - "When can you sign the lease?" = needs_user_input (reason: legal_contract)
+- "Not interested, thanks" = contact_optout (reason: not_interested)
+- "Please remove me from your mailing list" = contact_optout (reason: unsubscribe)
+- "We don't work with tenant reps" = contact_optout (reason: no_tenant_reps)
+- "I don't handle that property anymore, contact John Smith" = wrong_contact (reason: no_longer_handles)
+- "Wrong person - try sarah@broker.com" = wrong_contact (reason: wrong_person)
 """
 
         NOTES_RULES = """
@@ -621,17 +652,20 @@ OUTPUT ONLY valid JSON in this exact format:
   ],
   "events": [
     {
-      "type": "call_requested | property_unavailable | new_property | close_conversation | needs_user_input",
+      "type": "call_requested | property_unavailable | new_property | close_conversation | needs_user_input | contact_optout | wrong_contact",
       "address": "<for new_property: extract property name, address, or identifier>",
       "city": "<for new_property: infer city/location if possible>",
       "email": "<for new_property if different email needed>",
       "link": "<for new_property: include URL if mentioned>",
       "notes": "<for new_property: additional context about the property>",
-      "reason": "<for needs_user_input: client_question | scheduling | negotiation | confidential | legal_contract | unclear>",
-      "question": "<for needs_user_input: the specific question/request that needs user attention>"
+      "reason": "<for needs_user_input: client_question | scheduling | negotiation | confidential | legal_contract | unclear> OR <for contact_optout: not_interested | unsubscribe | do_not_contact | no_tenant_reps | direct_only | hostile> OR <for wrong_contact: no_longer_handles | wrong_person | forwarded | left_company>",
+      "question": "<for needs_user_input: the specific question/request that needs user attention>",
+      "suggestedContact": "<for wrong_contact: name of correct person to contact>",
+      "suggestedEmail": "<for wrong_contact: email of correct person if provided>",
+      "suggestedPhone": "<for wrong_contact: phone of correct person if provided>"
     }
   ],
-  "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation, reference specific details when possible, and vary wording to avoid repetition. SET TO NULL when: (1) call_requested with phone number provided, (2) needs_user_input event detected. The system will notify the user instead of auto-responding.>",
+  "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation, reference specific details when possible, and vary wording to avoid repetition. SET TO NULL when: (1) call_requested with phone number provided, (2) needs_user_input event detected, (3) contact_optout event detected, (4) wrong_contact event detected. The system will notify the user instead of auto-responding.>",
   "notes": "<IMPORTANT: Capture useful details not in columns - availability timing, lease terms, zoning, special features, parking, landlord notes, building age, location context, divisibility, HVAC, office space. Format: terse fragments separated by ' • '. Example: 'available immediately • 3-5 yr preferred • fenced yard'. Leave empty ONLY if conversation has no such details.>"
 }
 """)
