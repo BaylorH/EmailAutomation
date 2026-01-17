@@ -566,7 +566,8 @@ def send_outboxes(user_id: str, headers):
             })
 
     # Process each unique recipient
-    for recipient_email, items in email_groups.items():
+    recipients_list = list(email_groups.items())
+    for idx, (recipient_email, items) in enumerate(recipients_list):
         # Filter out items that have exceeded max attempts
         valid_items = []
         for item in items:
@@ -591,6 +592,11 @@ def send_outboxes(user_id: str, headers):
             # Single property - send normally
             item = valid_items[0]
             _send_single_outbox_item(user_id, headers, item, user_signature)
+
+        # 2-minute delay between ALL emails to avoid spam detection
+        if idx < len(recipients_list) - 1:
+            print(f"  ⏳ Waiting 2 minutes before next recipient to avoid spam detection...")
+            time.sleep(120)
 
 
 def _send_multi_property_email(user_id: str, headers, recipient_email: str, items: list, user_signature: str = None):
@@ -681,10 +687,10 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
                 )
             print(f"  💥 Error: {e}; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
 
-        # 60-second delay between emails to same recipient to avoid spam flags
+        # 2-minute delay between emails to same recipient to avoid spam flags
         if idx < len(properties) - 1:
-            print(f"  ⏳ Waiting 60 seconds before sending next email to avoid spam detection...")
-            time.sleep(60)
+            print(f"  ⏳ Waiting 2 minutes before sending next email to avoid spam detection...")
+            time.sleep(120)
 
 
 def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: str = None):
