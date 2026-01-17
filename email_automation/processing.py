@@ -718,13 +718,17 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 except Exception as e:
                     print(f"⚠️ Failed to store applied record: {e}")
 
+                # Get property address for notifications
+                property_address = get_row_anchor(rowvals, header)
+
                 # Write client notifications (one per field)
                 add_client_notifications(
                     user_id, client_id, from_addr_lower, thread_id,
                     applied_updates=apply_result.get("applied", []),
-                    notes=proposal.get("notes")
+                    notes=proposal.get("notes"),
+                    address=property_address
                 )
-            
+
             # Process events from the proposal
             sheets = _sheets_client()
             row_anchor = get_row_anchor(rowvals, header)

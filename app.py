@@ -61,7 +61,12 @@ try:
         print("🔍 Importing email_automation.processing...")
         from email_automation.processing import scan_inbox_against_index
         print("✅ Successfully imported processing")
-        
+
+        # Import the SINGLE source of truth for processing logic
+        print("🔍 Importing refresh_and_process_user from main...")
+        from main import refresh_and_process_user
+        print("✅ Successfully imported refresh_and_process_user from main.py")
+
         SCHEDULER_AVAILABLE = True
         print("✅ Scheduler functionality available")
     else:
@@ -80,11 +85,14 @@ except (ImportError, RuntimeError) as e:
 if not SCHEDULER_AVAILABLE:
     def list_user_ids():
         return []
-    
+
     def decode_token_payload(token):
         return {}
-    
+
     def send_outboxes(user_id, headers):
+        return {"success": False, "error": "Scheduler not available"}
+
+    def refresh_and_process_user(user_id):
         return {"success": False, "error": "Scheduler not available"}
     
 
@@ -170,89 +178,6 @@ def auto_upload_token():
     except Exception as e:
         return {"success": False, "error": str(e)}
     return {"success": False, "error": "No token file found"}
-
-def refresh_and_process_user(user_id: str):
-    """Process a single user - same logic as main.py"""
-    if not SCHEDULER_AVAILABLE:
-        return {"success": False, "error": "Scheduler functionality not available - missing dependencies"}
-    
-    print(f"\n🔄 Processing user: {user_id}")
-    
-    try:
-        from firebase_helpers import download_token, upload_token
-        import atexit
-        
-        download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
-
-        cache = SerializableTokenCache()
-        with open(TOKEN_CACHE, "r") as f:
-            cache.deserialize(f.read())
-
-        def _save_cache():
-            if cache.has_state_changed:
-                with open(TOKEN_CACHE, "w") as f:
-                    f.write(cache.serialize())
-                upload_token(FIREBASE_API_KEY, input_file=TOKEN_CACHE, user_id=user_id)
-                print(f"✅ Token cache uploaded for {user_id}")
-
-        atexit.unregister(_save_cache)
-        atexit.register(_save_cache)
-
-        app_obj = ConfidentialClientApplication(
-            CLIENT_ID,
-            client_credential=CLIENT_SECRET,
-            authority=AUTHORITY,
-            token_cache=cache
-        )
-
-        accounts = app_obj.get_accounts()
-        if not accounts:
-            print(f"⚠️ No account found for {user_id}")
-            return {"success": False, "error": f"No account found for {user_id}"}
-
-        # Try to get access token
-        before_state = cache.has_state_changed
-        result = app_obj.acquire_token_silent(SCOPES, account=accounts[0])
-        after_state = cache.has_state_changed
-
-        if not result or "access_token" not in result:
-            print(f"❌ Silent auth failed for {user_id}")
-            return {"success": False, "error": f"Silent auth failed for {user_id}"}
-
-        access_token = result["access_token"]
-
-        # Helpful logging
-        token_source = "refreshed_via_refresh_token" if (not before_state and after_state) else "cached_access_token"
-        exp_secs = result.get("expires_in")
-        print(f"🎯 Using {token_source}; expires_in≈{exp_secs}s – preview: {access_token[:40]}")
-
-        # Optional sanity check on JWT-shaped token & appid
-        if access_token.count(".") == 2:
-            decoded = decode_token_payload(access_token)
-            appid = decoded.get("appid", "unknown")
-            if not appid.startswith("54cec"):
-                print(f"⚠️ Unexpected appid: {appid}")
-            else:
-                print("✅ Token appid matches expected prefix")
-
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-
-        # Process outbound emails
-        send_outboxes(user_id, headers)
-        
-        # Scan for reply matches
-        print(f"\n🔍 Scanning inbox for replies...")
-        scan_inbox_against_index(user_id, headers, only_unread=True, top=50)
-        
-        return {"success": True, "message": f"Successfully processed user {user_id}"}
-        
-    except Exception as e:
-        error_msg = f"Error processing user {user_id}: {str(e)}"
-        print(f"💥 {error_msg}")
-        return {"success": False, "error": error_msg}
 
 def run_scheduler():
     """Run the full scheduler for all users - same logic as main.py"""

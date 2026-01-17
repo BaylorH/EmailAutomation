@@ -85,6 +85,7 @@ def add_client_notifications(
     thread_id: str,
     applied_updates: list[dict],
     notes: str | None = None,
+    address: str | None = None,
 ):
     """
     UPDATED: Writes one notification doc per applied field change.
@@ -94,7 +95,7 @@ def add_client_notifications(
         # Write one notification per applied update
         for update in applied_updates:
             dedupe_key = f"{thread_id}:{update.get('range', '')}:{update.get('column', '')}:{update.get('newValue', '')}"
-            
+
             write_notification(
                 uid, client_id,
                 kind="sheet_update",
@@ -102,13 +103,14 @@ def add_client_notifications(
                 email=email,
                 thread_id=thread_id,
                 row_number=None,  # Could extract from range if needed
-                row_anchor=None,
+                row_anchor=address,
                 meta={
                     "column": update.get("column", ""),
                     "oldValue": update.get("oldValue", ""),
                     "newValue": update.get("newValue", ""),
                     "reason": update.get("reason", ""),
-                    "confidence": update.get("confidence", 0.0)
+                    "confidence": update.get("confidence", 0.0),
+                    "address": address or ""
                 },
                 dedupe_key=dedupe_key
             )

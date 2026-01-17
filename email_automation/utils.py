@@ -393,6 +393,9 @@ def format_email_body_with_footer(body: str, custom_signature: str = None) -> st
         body: The email body text
         custom_signature: Optional plain text signature from user settings
     """
+    # Strip trailing whitespace/newlines from body before converting
+    body = body.rstrip()
+
     # Convert plain text to HTML
     # Replace double newlines with <br><br>, single newlines with <br>
     html_body = body.replace('\n\n', '<br><br>').replace('\n', '<br>')
@@ -415,8 +418,7 @@ def format_email_body_with_footer(body: str, custom_signature: str = None) -> st
 </html>"""
 
     # Wrap in proper HTML structure to prevent email clients from collapsing footer
-    # Add a visible separator and non-breaking content before footer to prevent trimming
-    # This is especially important for replies where email clients may collapse signatures
+    # Single spacer div with minimal margin to separate body from signature
     full_content = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -425,11 +427,9 @@ def format_email_body_with_footer(body: str, custom_signature: str = None) -> st
 <body style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000; margin: 0; padding: 0;">
 <div style="max-width: 600px;">
 {html_body}
-<!-- Email signature separator - prevents collapse -->
-<div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid transparent; min-height: 1px;">
-<div style="margin-top: 20px;">
+<br>
+<div style="min-height: 1px;">
 {footer_html}
-</div>
 </div>
 </div>
 </body>
