@@ -629,6 +629,7 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
     print(f"📬 Sending {len(properties)} separate property emails to {recipient_email}")
 
     # Send each property as its own email/thread
+    # Each email uses the exact script that was approved in the frontend
     for idx, prop in enumerate(properties):
         item = prop['item']
         data = item['data']
@@ -636,27 +637,8 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
         attempts = int(data.get("attempts") or 0)
         row_number = prop.get('rowNumber')
 
-        # For the FIRST email, add context about multiple properties
-        if idx == 0 and len(properties) > 1:
-            other_names = [p['name'] for p in properties[1:] if p['name']]
-            other_bullets = "\n".join(f"  - {name}" for name in other_names)
-
-            # Prepend organization message to the first email
-            script = f"""Hi,
-
-I know I'm reaching out about a few of your listings, so I want to keep things organized for both of us. I'll keep each property as its own email thread so we don't get crossed up.
-
-Starting with {prop['name'] or 'this property'}:
-
-{prop['script']}
-
-I'm also sending separate emails about:
-{other_bullets}
-
-Feel free to respond to whichever is most relevant, and we can take it from there."""
-        else:
-            # Subsequent emails just use their original script
-            script = prop['script']
+        # Use the original approved script without modification
+        script = prop['script']
 
         print(f"  → Property {idx + 1}/{len(properties)}: {prop['name'] or 'Unknown'} (attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
 
