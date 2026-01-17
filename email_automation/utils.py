@@ -411,22 +411,22 @@ def format_email_body_with_footer(body: str, custom_signature: str = None) -> st
 <meta charset="UTF-8">
 </head>
 <body style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000; margin: 0; padding: 0;">
-<div style="max-width: 600px;">
-{html_body}
+<div style="max-width: 600px; font-family: Arial, Helvetica, sans-serif; font-size: 10pt;">
+<span style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt;">{html_body}</span>
 </div>
 </body>
 </html>"""
 
     # Wrap in proper HTML structure to prevent email clients from collapsing footer
-    # Single spacer div with minimal margin to separate body from signature
+    # Apply font-family inline to every level (Outlook ignores parent styles)
     full_content = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
 </head>
 <body style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000; margin: 0; padding: 0;">
-<div style="max-width: 600px;">
-{html_body}
+<div style="max-width: 600px; font-family: Arial, Helvetica, sans-serif; font-size: 10pt;">
+<span style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt;">{html_body}</span>
 <br>
 <div style="min-height: 1px;">
 {footer_html}
