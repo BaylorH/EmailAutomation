@@ -681,9 +681,10 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
                 )
             print(f"  💥 Error: {e}; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
 
-        # Small delay between emails to avoid rate limiting and ensure they're clearly separate
+        # 60-second delay between emails to same recipient to avoid spam flags
         if idx < len(properties) - 1:
-            time.sleep(1)
+            print(f"  ⏳ Waiting 60 seconds before sending next email to avoid spam detection...")
+            time.sleep(60)
 
 
 def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: str = None):
