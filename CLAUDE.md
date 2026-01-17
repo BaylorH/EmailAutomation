@@ -128,6 +128,84 @@ Hosted on Render.com (`https://email-token-manager.onrender.com`) with GitHub Ac
 
 ---
 
+## Development Workflow (MUST FOLLOW)
+
+### For Frontend Changes (email-admin-ui)
+
+```
+1. MAKE CHANGES
+   └─> Edit files in src/, styles/, components/
+
+2. BUILD & VERIFY
+   └─> cd ~/Documents/GitHub/email-admin-ui
+   └─> CI=true npm run build
+   └─> Check for errors/warnings (CI=true treats warnings as errors)
+
+3. COMMIT & PUSH
+   └─> git add -A && git commit -m "description" && git push
+
+4. AUTOMATIC DEPLOYMENT (GitHub Actions)
+   └─> Builds React app
+   └─> Deploys to Firebase Hosting
+   └─> Deploys Firebase Functions (functions/index.js)
+   └─> NO manual firebase deploy needed!
+```
+
+### For Firebase Functions Changes (email-admin-ui/functions)
+
+```
+1. MAKE CHANGES
+   └─> Edit functions/index.js
+
+2. BUILD FRONTEND (includes functions)
+   └─> cd ~/Documents/GitHub/email-admin-ui
+   └─> CI=true npm run build
+
+3. COMMIT & PUSH
+   └─> git add -A && git commit -m "description" && git push
+
+4. AUTOMATIC DEPLOYMENT
+   └─> GitHub Actions deploys functions automatically
+   └─> Check: https://console.firebase.google.com/project/email-automation-cache/functions
+```
+
+### For Backend Changes (EmailAutomation)
+
+```
+1. MAKE CHANGES
+   └─> Edit files in email_automation/
+
+2. VERIFY SYNTAX
+   └─> python3 -m py_compile email_automation/<file>.py
+
+3. RUN TESTS (if AI/processing changes)
+   └─> python tests/standalone_test.py
+
+4. COMMIT & PUSH
+   └─> git add -A && git commit -m "description" && git push
+
+5. DEPLOYMENT
+   └─> Render auto-deploys on push (if configured)
+   └─> GitHub Actions runs email.yml every 30 mins
+```
+
+### CI/CD Summary
+
+| Repo | On Push to Main | Manual Deploy Needed? |
+|------|-----------------|----------------------|
+| email-admin-ui | Builds React + deploys Hosting + deploys Functions | NO |
+| EmailAutomation | Nothing (cron-based) | Render auto-deploys |
+
+### Pre-Push Checklist
+
+- [ ] `CI=true npm run build` passes (frontend)
+- [ ] `python3 -m py_compile <file>` passes (backend)
+- [ ] Tests pass (if applicable)
+- [ ] Commit message is descriptive
+- [ ] No secrets/credentials in code
+
+---
+
 ## Testing Framework
 
 ### Overview
