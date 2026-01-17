@@ -2,10 +2,48 @@ import atexit
 import json
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token
-from email_automation.clients import list_user_ids, decode_token_payload
+from email_automation.clients import list_user_ids, decode_token_payload, _fs
 from email_automation.email import send_outboxes
 from email_automation.processing import scan_inbox_against_index, scan_sent_items_for_manual_replies
 from email_automation.app_config import CLIENT_ID, CLIENT_SECRET, AUTHORITY, SCOPES, TOKEN_CACHE, FIREBASE_API_KEY
+
+# Thresholds for auto-cleanup (to stay within Firebase free tier)
+PROCESSED_MESSAGES_THRESHOLD = 500
+SHEET_CHANGELOG_THRESHOLD = 100
+
+
+def auto_cleanup_firestore(user_id: str):
+    """
+    Automatically clean up Firestore collections if they exceed thresholds.
+    This helps stay within Firebase free tier limits.
+    """
+    try:
+        # Check processedMessages count
+        pm_ref = _fs.collection("users").document(user_id).collection("processedMessages")
+        pm_docs = list(pm_ref.limit(PROCESSED_MESSAGES_THRESHOLD + 1).stream())
+
+        if len(pm_docs) > PROCESSED_MESSAGES_THRESHOLD:
+            print(f"🧹 Auto-cleanup: processedMessages ({len(pm_docs)}+) exceeds threshold ({PROCESSED_MESSAGES_THRESHOLD})")
+            # Delete all - safe to clear, just prevents duplicate processing temporarily
+            all_pm = list(pm_ref.stream())
+            for doc in all_pm:
+                doc.reference.delete()
+            print(f"   ✅ Deleted {len(all_pm)} processedMessages docs")
+
+        # Check sheetChangeLog count
+        cl_ref = _fs.collection("users").document(user_id).collection("sheetChangeLog")
+        cl_docs = list(cl_ref.limit(SHEET_CHANGELOG_THRESHOLD + 1).stream())
+
+        if len(cl_docs) > SHEET_CHANGELOG_THRESHOLD:
+            print(f"🧹 Auto-cleanup: sheetChangeLog ({len(cl_docs)}+) exceeds threshold ({SHEET_CHANGELOG_THRESHOLD})")
+            # Delete all - just audit logs
+            all_cl = list(cl_ref.stream())
+            for doc in all_cl:
+                doc.reference.delete()
+            print(f"   ✅ Deleted {len(all_cl)} sheetChangeLog docs")
+
+    except Exception as e:
+        print(f"⚠️ Auto-cleanup error for {user_id}: {e}")
 
 def refresh_and_process_user(user_id: str):
     print(f"\n🔄 Processing user: {user_id}")
@@ -78,6 +116,10 @@ def refresh_and_process_user(user_id: str):
     # Scan for Jill's manual replies (SentItems - catch manual replies we didn't index)
     print(f"\n📤 Scanning SentItems for manual replies...")
     scan_sent_items_for_manual_replies(user_id, headers, top=50)
+
+    # Auto-cleanup Firestore if collections are getting large (stay within free tier)
+    auto_cleanup_firestore(user_id)
+
 
 if __name__ == "__main__":
     all_users = list_user_ids()
