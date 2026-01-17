@@ -1570,6 +1570,197 @@ def auth_callback():
             </html>
         """, error=str(e), uid=uid)
 
+
+@app.route("/api/firestore-inspect", methods=["GET"])
+def api_firestore_inspect():
+    """
+    Inspect Firestore database structure and count documents.
+    Useful for understanding what data exists and what can be cleaned up.
+    """
+    if not SCHEDULER_AVAILABLE:
+        return jsonify({"success": False, "error": "Scheduler not available"}), 503
+
+    try:
+        from email_automation.clients import _fs, list_user_ids
+
+        result = {"users": {}}
+        users = list_user_ids()
+
+        for uid in users:
+            user_data = {"collections": {}}
+
+            subcollections = [
+                "clients",
+                "archivedClients",
+                "threads",
+                "msgIndex",
+                "convIndex",
+                "outbox",
+                "deadLetterQueue",
+                "processedMessages",
+                "sheetChangeLog",
+                "optedOutContacts",
+                "sync"
+            ]
+
+            for coll_name in subcollections:
+                try:
+                    coll_ref = _fs.collection("users").document(uid).collection(coll_name)
+                    docs = list(coll_ref.limit(500).stream())
+                    if docs:
+                        coll_data = {"count": len(docs), "sample_ids": [d.id[:30] for d in docs[:5]]}
+
+                        # Add more detail for specific collections
+                        if coll_name == "outbox":
+                            coll_data["items"] = [{"id": d.id, "subject": d.to_dict().get("subject", "")[:50]} for d in docs]
+                        elif coll_name == "deadLetterQueue":
+                            coll_data["items"] = [{"id": d.id, "reason": d.to_dict().get("reason", "")[:80]} for d in docs]
+                        elif coll_name == "clients":
+                            coll_data["items"] = [{"id": d.id, "name": d.to_dict().get("name", "")} for d in docs]
+
+                        user_data["collections"][coll_name] = coll_data
+                except Exception as e:
+                    user_data["collections"][coll_name] = {"error": str(e)}
+
+            # Count notifications across all clients
+            try:
+                clients_ref = _fs.collection("users").document(uid).collection("clients")
+                clients = list(clients_ref.stream())
+                total_notifs = 0
+                notif_details = []
+                for client in clients:
+                    notifs_ref = _fs.collection("users").document(uid).collection("clients").document(client.id).collection("notifications")
+                    notifs = list(notifs_ref.stream())
+                    if notifs:
+                        total_notifs += len(notifs)
+                        notif_details.append({"client": client.id, "count": len(notifs)})
+                if total_notifs > 0:
+                    user_data["collections"]["notifications_total"] = {"count": total_notifs, "by_client": notif_details}
+            except Exception as e:
+                user_data["collections"]["notifications_total"] = {"error": str(e)}
+
+            result["users"][uid] = user_data
+
+        return jsonify({"success": True, "data": result})
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/firestore-cleanup", methods=["POST"])
+def api_firestore_cleanup():
+    """
+    Clean up stale Firestore data.
+    Accepts JSON body with options:
+    - clear_dead_letter: bool - Clear dead letter queue
+    - clear_processed_messages: bool - Clear processed messages log
+    - clear_sheet_change_log: bool - Clear sheet change log (older than 30 days)
+    - clear_old_threads: int - Clear threads older than N days (0 = don't clear)
+    - user_id: str - Specific user ID (optional, defaults to all users)
+    """
+    if not SCHEDULER_AVAILABLE:
+        return jsonify({"success": False, "error": "Scheduler not available"}), 503
+
+    try:
+        from email_automation.clients import _fs, list_user_ids
+        from datetime import datetime, timedelta
+
+        data = request.get_json() or {}
+        clear_dead_letter = data.get("clear_dead_letter", False)
+        clear_processed = data.get("clear_processed_messages", False)
+        clear_changelog = data.get("clear_sheet_change_log", False)
+        clear_old_threads_days = data.get("clear_old_threads", 0)
+        target_user = data.get("user_id")
+
+        users = [target_user] if target_user else list_user_ids()
+        results = {}
+
+        for uid in users:
+            user_results = {}
+
+            # Clear dead letter queue
+            if clear_dead_letter:
+                try:
+                    dl_ref = _fs.collection("users").document(uid).collection("deadLetterQueue")
+                    docs = list(dl_ref.stream())
+                    for doc in docs:
+                        doc.reference.delete()
+                    user_results["deadLetterQueue"] = f"Deleted {len(docs)} docs"
+                except Exception as e:
+                    user_results["deadLetterQueue"] = f"Error: {e}"
+
+            # Clear processed messages
+            if clear_processed:
+                try:
+                    pm_ref = _fs.collection("users").document(uid).collection("processedMessages")
+                    docs = list(pm_ref.stream())
+                    for doc in docs:
+                        doc.reference.delete()
+                    user_results["processedMessages"] = f"Deleted {len(docs)} docs"
+                except Exception as e:
+                    user_results["processedMessages"] = f"Error: {e}"
+
+            # Clear old sheet change log (older than 30 days)
+            if clear_changelog:
+                try:
+                    cl_ref = _fs.collection("users").document(uid).collection("sheetChangeLog")
+                    docs = list(cl_ref.stream())
+                    cutoff = datetime.now() - timedelta(days=30)
+                    deleted = 0
+                    for doc in docs:
+                        doc_data = doc.to_dict()
+                        created_at = doc_data.get("createdAt")
+                        if created_at:
+                            # Handle Firestore timestamp
+                            if hasattr(created_at, 'timestamp'):
+                                doc_time = datetime.fromtimestamp(created_at.timestamp())
+                            else:
+                                doc_time = datetime.now()  # Keep if can't parse
+                            if doc_time < cutoff:
+                                doc.reference.delete()
+                                deleted += 1
+                        else:
+                            # No timestamp, delete it
+                            doc.reference.delete()
+                            deleted += 1
+                    user_results["sheetChangeLog"] = f"Deleted {deleted} old docs (kept {len(docs) - deleted})"
+                except Exception as e:
+                    user_results["sheetChangeLog"] = f"Error: {e}"
+
+            # Clear old threads
+            if clear_old_threads_days > 0:
+                try:
+                    threads_ref = _fs.collection("users").document(uid).collection("threads")
+                    docs = list(threads_ref.stream())
+                    cutoff = datetime.now() - timedelta(days=clear_old_threads_days)
+                    deleted = 0
+                    for doc in docs:
+                        doc_data = doc.to_dict()
+                        updated_at = doc_data.get("updatedAt") or doc_data.get("createdAt")
+                        if updated_at:
+                            if hasattr(updated_at, 'timestamp'):
+                                doc_time = datetime.fromtimestamp(updated_at.timestamp())
+                            else:
+                                doc_time = datetime.now()
+                            if doc_time < cutoff:
+                                # Also delete messages subcollection
+                                msgs_ref = doc.reference.collection("messages")
+                                for msg in msgs_ref.stream():
+                                    msg.reference.delete()
+                                doc.reference.delete()
+                                deleted += 1
+                    user_results["threads"] = f"Deleted {deleted} old threads (kept {len(docs) - deleted})"
+                except Exception as e:
+                    user_results["threads"] = f"Error: {e}"
+
+            results[uid] = user_results
+
+        return jsonify({"success": True, "results": results})
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
