@@ -225,7 +225,8 @@ def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> st
         return None
 
 def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, recipients: List[str],
-                        client_id_or_none: Optional[str] = None, row_number: int = None, user_signature: str = None):
+                        client_id_or_none: Optional[str] = None, row_number: int = None, user_signature: str = None,
+                        subject_override: str = None):
     """
     Send email and immediately index it in Firestore for reply tracking.
 
@@ -241,6 +242,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         client_id_or_none: Optional client ID for tracking
         row_number: Optional row number for thread anchoring
         user_signature: Optional custom signature from user settings
+        subject_override: Optional pre-computed subject (e.g., from property data)
 
     SAFETY: All recipient emails are validated before sending to prevent sending to malformed addresses.
     SAFETY: Opted-out contacts are filtered out before sending.
@@ -338,11 +340,14 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         results["errors"][invalid] = "Invalid email address format"
 
     for addr in valid_recipients:
-        dynamic_subject = None
-        if client_id_or_none:
-            dynamic_subject = _subject_for_recipient(user_id, client_id_or_none, (addr or "").lower())
-
-        subject_to_use = dynamic_subject or "Client Outreach"
+        # Use pre-computed subject if provided, otherwise look up from sheet
+        if subject_override:
+            subject_to_use = subject_override
+        else:
+            dynamic_subject = None
+            if client_id_or_none:
+                dynamic_subject = _subject_for_recipient(user_id, client_id_or_none, (addr or "").lower())
+            subject_to_use = dynamic_subject or "Client Outreach"
 
         msg = {
             "subject": subject_to_use,
@@ -615,6 +620,7 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
         properties.append({
             'item': item,
             'name': property_name,
+            'subject': subject,  # Pre-computed subject from property data
             'clientId': data.get("clientId", ""),
             'script': data.get("script", ""),
             'rowNumber': data.get("rowNumber")
@@ -655,8 +661,11 @@ Feel free to respond to whichever is most relevant, and we can take it from ther
         print(f"  → Property {idx + 1}/{len(properties)}: {prop['name'] or 'Unknown'} (attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
 
         try:
+            # Use pre-computed subject from property data
+            subject_override = prop.get('subject') or None
             res = send_and_index_email(user_id, headers, script, [recipient_email],
-                                       client_id_or_none=clientId, row_number=row_number, user_signature=user_signature)
+                                       client_id_or_none=clientId, row_number=row_number,
+                                       user_signature=user_signature, subject_override=subject_override)
             any_errors = bool([e for e in res.get("errors", {}) if "opted out" not in str(res["errors"].get(e, ""))])
 
             if not any_errors and res["sent"]:
@@ -710,6 +719,8 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     clientId = (data.get("clientId") or "").strip()
     attempts = int(data.get("attempts") or 0)
     row_number = data.get("rowNumber")
+    # Get pre-computed subject from outbox data (property-specific)
+    subject_override = data.get("subject")
 
     # Get scripts array (new format) or build from legacy fields
     email_scripts = data.get("emailScripts")
@@ -735,7 +746,8 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
 
         try:
             res = send_and_index_email(user_id, headers, selected_script, [recipient_email],
-                                       client_id_or_none=clientId, row_number=row_number, user_signature=user_signature)
+                                       client_id_or_none=clientId, row_number=row_number,
+                                       user_signature=user_signature, subject_override=subject_override)
 
             all_sent.extend(res.get("sent", []))
             all_errors.update(res.get("errors", {}))
