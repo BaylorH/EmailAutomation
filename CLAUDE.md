@@ -306,5 +306,5 @@ Jill and Clients comments
 ```python
 ["Total SF", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]
 # NEVER request: "Rent/SF /Yr" (provided voluntarily, not requested)
-# NEVER write: "Gross Rent" (formula column: =H+I+G/12, auto-calculates)
+# NEVER write: "Gross Rent" (formula column: =(H+I)*G/12, auto-calculates monthly rent)
 ```
