@@ -921,96 +921,65 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     try:
                         address = event.get("address", "")
                         city = event.get("city", "")
-                        
+
                         # Skip if no address provided
                         if not address or not address.strip():
                             print("⚠️ No address provided for new_property event, skipping")
                             continue
-                        
+
                         address = address.strip()
                         city = city.strip() if city else ""
-                        
+
                         # Check if property already exists in sheet
                         tab_title = _get_first_tab_title(sheets, sheet_id)
                         resp = sheets.spreadsheets().values().get(
                             spreadsheetId=sheet_id,
                             range=f"{tab_title}!3:1000"  # Skip header rows, read data rows
                         ).execute()
-                        
+
                         existing_rows = resp.get("values", [])
                         property_exists = False
-                        
+
                         # Build header index map to find address/city columns
                         idx_map = _header_index_map(header)
                         addr_col = idx_map.get("property address") or idx_map.get("address")
                         city_col = idx_map.get("city")
-                        
+
                         if addr_col is not None:
                             # Check each row for existing property
                             for row_idx, row in enumerate(existing_rows, start=3):
                                 if len(row) > (addr_col - 1):  # -1 because idx_map is 1-based
                                     existing_addr = (row[addr_col - 1] or "").strip().lower()
                                     existing_city = ""
-                                    
+
                                     if city_col is not None and len(row) > (city_col - 1):
                                         existing_city = (row[city_col - 1] or "").strip().lower()
-                                    
+
                                     # Match both address and city
-                                    if (existing_addr == address.lower() and 
+                                    if (existing_addr == address.lower() and
                                         existing_city == city.lower()):
                                         property_exists = True
                                         print(f"ℹ️ Property '{address}, {city}' already exists in row {row_idx}, skipping")
                                         break
-                        
+
                         if property_exists:
                             continue  # Skip this event - property already exists
-                        
-                        # Property doesn't exist, proceed with creation
+
+                        # Property doesn't exist - store for approval (DON'T create row yet)
                         link = event.get("link", "")
                         notes = event.get("notes", "")
-                        
-                        # Prepare values for new row
-                        values_by_header = {}
-                        if address:
-                            values_by_header["property address"] = address
-                            values_by_header["address"] = address
-                        if city:
-                            values_by_header["city"] = city
-                        if from_addr_lower:
-                            values_by_header["email"] = from_addr_lower
-                            values_by_header["email address"] = from_addr_lower
-                        
-                        # Copy leasing company and contact from current row
+
+                        # Extract leasing company and contact from current row for later use
+                        leasing_company = ""
+                        leasing_contact = ""
                         leasing_company_idx = idx_map.get("leasing company") or idx_map.get("leasing company ")
-                        leasing_contact_idx = idx_map.get("leasing contact") 
-                        
+                        leasing_contact_idx = idx_map.get("leasing contact")
+
                         if leasing_company_idx and (leasing_company_idx - 1) < len(rowvals):
-                            leasing_company = rowvals[leasing_company_idx - 1]
-                            if leasing_company:
-                                values_by_header["leasing company"] = leasing_company
-                                values_by_header["leasing company "] = leasing_company
-                        
+                            leasing_company = rowvals[leasing_company_idx - 1] or ""
+
                         if leasing_contact_idx and (leasing_contact_idx - 1) < len(rowvals):
-                            leasing_contact = rowvals[leasing_contact_idx - 1]
-                            if leasing_contact:
-                                values_by_header["leasing contact"] = leasing_contact
-                        
-                        # Put the URL itself in Flyer / Link initially
-                        if link:
-                            values_by_header["flyer / link"] = link
-
-                        # Keep human-readable notes (without the URL) in Listing Brokers Comments 
-                        if notes:
-                            values_by_header["listing brokers comments"] = notes
-
-                        new_rownum = insert_property_row_above_divider(sheets, sheet_id, tab_title, values_by_header)
-
-                        # Reformat after insert
-                        format_sheet_columns_autosize_with_exceptions(sheet_id, header)
-
-                        # remember the new row to target links later
-                        new_row_created = True
-                        new_row_number = new_rownum
+                            leasing_contact = rowvals[leasing_contact_idx - 1] or ""
 
                         # Build suggested (not sent) email payload
                         email_payload = {
@@ -1025,34 +994,43 @@ If you think this might be a good fit:
 > Provide any floor plans or flyers you may have.
 > When will the space be available?
 
-Just like before — if this one’s no longer available or not a fit, feel free to let me know so I can cross it off and stop bugging you. And of course, if you know of any others that might be a good fit, I’d love to hear about them.
+Just like before — if this one's no longer available or not a fit, feel free to let me know so I can cross it off and stop bugging you. And of course, if you know of any others that might be a good fit, I'd love to hear about them.
 
 Thanks!""",
                             "clientId": client_id,
-                            "rowNumber": new_rownum
+                            "rowNumber": None  # No row yet - created on accept
                         }
 
-                        # Create ACTION_NEEDED notification with draft email
+                        # Create ACTION_NEEDED notification for approval (no row created yet)
                         write_notification(
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
                             email=from_addr_lower,
                             thread_id=thread_id,   # keep context with original thread
-                            row_number=new_rownum,
+                            row_number=None,  # No row yet
                             row_anchor=f"{address}, {city}" if city else address,
                             meta={
-                                "reason": "new_property_pending_send",
-                                "status": "pending_send",
+                                "reason": "new_property_pending_approval",
+                                "status": "pending_approval",
                                 "address": address,
                                 "city": city,
                                 "link": link,
                                 "notes": notes,
-                                "suggestedEmail": email_payload
+                                "leasingCompany": leasing_company,
+                                "leasingContact": leasing_contact,
+                                "brokerEmail": from_addr_lower,
+                                "sheetId": sheet_id,
+                                "tabTitle": tab_title,
+                                "suggestedEmail": email_payload,
+                                "conversationContext": {
+                                    "threadId": thread_id,
+                                    "originalMessage": body[:500] if body else ""  # First 500 chars of original message
+                                }
                             },
                             dedupe_key=f"new_property_pending:{thread_id}:{address}:{city}:{from_addr_lower}"
                         )
-                        print(f"🏢 Created new property row and pending notification")
+                        print(f"🏢 Created new property pending approval notification (no row created yet)")
 
                     except Exception as e:
                         print(f"❌ Failed to handle new_property: {e}")

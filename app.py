@@ -723,6 +723,97 @@ def api_decline_property():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/accept-new-property", methods=["POST"])
+def api_accept_new_property():
+    """
+    Accept a new property suggestion - creates the row in the sheet.
+    Called when user clicks 'Accept' on a pending_approval notification.
+    Expects JSON body: { uid, clientId, notificationId, propertyData }
+    propertyData: { address, city, link, notes, leasingCompany, leasingContact, brokerEmail, sheetId, tabTitle }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        uid = data.get("uid")
+        client_id = data.get("clientId")
+        notification_id = data.get("notificationId")
+        property_data = data.get("propertyData", {})
+
+        if not all([uid, client_id, notification_id]):
+            return jsonify({"success": False, "error": "Missing required fields: uid, clientId, notificationId"}), 400
+
+        # Extract property data
+        address = property_data.get("address", "")
+        city = property_data.get("city", "")
+        link = property_data.get("link", "")
+        notes = property_data.get("notes", "")
+        leasing_company = property_data.get("leasingCompany", "")
+        leasing_contact = property_data.get("leasingContact", "")
+        broker_email = property_data.get("brokerEmail", "")
+        sheet_id = property_data.get("sheetId")
+        tab_title = property_data.get("tabTitle")
+
+        if not sheet_id:
+            return jsonify({"success": False, "error": "Missing sheetId in propertyData"}), 400
+
+        if not address:
+            return jsonify({"success": False, "error": "Missing address in propertyData"}), 400
+
+        # Import required modules
+        from email_automation.clients import _sheets_client
+        from email_automation.sheets import _get_first_tab_title, _read_header_row2, format_sheet_columns_autosize_with_exceptions
+        from email_automation.sheet_operations import insert_property_row_above_divider
+
+        sheets = _sheets_client()
+
+        # Get tab title if not provided
+        if not tab_title:
+            tab_title = _get_first_tab_title(sheets, sheet_id)
+
+        # Build values_by_header for the new row
+        values_by_header = {}
+        if address:
+            values_by_header["property address"] = address
+            values_by_header["address"] = address
+        if city:
+            values_by_header["city"] = city
+        if broker_email:
+            values_by_header["email"] = broker_email
+            values_by_header["email address"] = broker_email
+        if leasing_company:
+            values_by_header["leasing company"] = leasing_company
+            values_by_header["leasing company "] = leasing_company
+        if leasing_contact:
+            values_by_header["leasing contact"] = leasing_contact
+        if link:
+            values_by_header["flyer / link"] = link
+        if notes:
+            values_by_header["listing brokers comments"] = notes
+
+        # Create the row
+        new_rownum = insert_property_row_above_divider(sheets, sheet_id, tab_title, values_by_header)
+
+        # Read header and format sheet
+        header = _read_header_row2(sheets, sheet_id, tab_title)
+        format_sheet_columns_autosize_with_exceptions(sheet_id, header)
+
+        print(f"✅ Created new property row {new_rownum} for '{address}' in sheet {sheet_id}")
+
+        return jsonify({
+            "success": True,
+            "message": f"Property row created successfully",
+            "rowNumber": new_rownum
+        })
+
+    except Exception as e:
+        print(f"❌ Failed to accept new property: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/check-sheet-completion", methods=["POST"])
 def api_check_sheet_completion():
     """
