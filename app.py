@@ -817,6 +817,105 @@ def api_accept_new_property():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/clear-optout", methods=["POST"])
+def api_clear_optout():
+    """
+    Clear an opt-out record for a contact, allowing emails to be sent again.
+    Expects JSON body: { uid, email }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        uid = data.get("uid")
+        email = data.get("email")
+
+        if not uid or not email:
+            return jsonify({"success": False, "error": "Missing required fields: uid, email"}), 400
+
+        import hashlib
+        from email_automation.clients import _fs
+
+        # Hash the email to find the document
+        email_lower = email.lower().strip()
+        email_hash = hashlib.sha256(email_lower.encode('utf-8')).hexdigest()[:16]
+
+        # Delete the opt-out record
+        optout_ref = _fs.collection("users").document(uid).collection("optedOutContacts").document(email_hash)
+        doc = optout_ref.get()
+
+        if not doc.exists:
+            return jsonify({
+                "success": False,
+                "error": f"No opt-out record found for {email_lower}"
+            }), 404
+
+        # Get the record details before deleting
+        record_data = doc.to_dict()
+        optout_ref.delete()
+
+        print(f"✅ Cleared opt-out for {email_lower} (was: {record_data.get('reason', 'unknown')})", flush=True)
+
+        return jsonify({
+            "success": True,
+            "message": f"Opt-out cleared for {email_lower}",
+            "previousRecord": {
+                "email": record_data.get("email"),
+                "reason": record_data.get("reason"),
+                "optedOutAt": str(record_data.get("optedOutAt", ""))
+            }
+        })
+
+    except Exception as e:
+        print(f"❌ Failed to clear opt-out: {e}", flush=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/list-optouts", methods=["POST"])
+def api_list_optouts():
+    """
+    List all opted-out contacts for a user.
+    Expects JSON body: { uid }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        uid = data.get("uid")
+        if not uid:
+            return jsonify({"success": False, "error": "Missing required field: uid"}), 400
+
+        from email_automation.clients import _fs
+
+        # Get all opt-out records
+        optouts_ref = _fs.collection("users").document(uid).collection("optedOutContacts")
+        docs = optouts_ref.stream()
+
+        optouts = []
+        for doc in docs:
+            record = doc.to_dict()
+            optouts.append({
+                "id": doc.id,
+                "email": record.get("email"),
+                "reason": record.get("reason"),
+                "optedOutAt": str(record.get("optedOutAt", ""))
+            })
+
+        print(f"📋 Listed {len(optouts)} opt-outs for user {uid}", flush=True)
+
+        return jsonify({
+            "success": True,
+            "count": len(optouts),
+            "optouts": optouts
+        })
+
+    except Exception as e:
+        print(f"❌ Failed to list opt-outs: {e}", flush=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/check-sheet-completion", methods=["POST"])
 def api_check_sheet_completion():
     """
