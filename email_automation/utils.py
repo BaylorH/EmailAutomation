@@ -308,17 +308,34 @@ def convert_plain_text_signature_to_html(plain_text_signature: str) -> str:
 </div>"""
 
 
-def get_email_footer(custom_signature: str = None) -> str:
+def get_email_footer(custom_signature: str = None, signature_mode: str = None) -> str:
     """
     Returns HTML formatted email footer.
 
     Args:
         custom_signature: Optional plain text signature from user settings.
-                         If provided, converts to HTML and uses it.
-                         If None or empty, uses the default Jill Ames signature.
+        signature_mode: Signature mode - "none", "custom", or "professional" (default).
+                       - "none": No signature at all
+                       - "custom": Use the custom_signature text (converted to HTML)
+                       - "professional": Use the default Jill Ames signature with logo/images
+                       - None/empty: Falls back to "professional" if no custom_signature,
+                                    or "custom" if custom_signature is provided
     """
-    # If a custom signature is provided, use it
-    if custom_signature and custom_signature.strip():
+    # Handle explicit signature modes
+    if signature_mode == "none":
+        return ""
+
+    if signature_mode == "custom":
+        if custom_signature and custom_signature.strip():
+            return convert_plain_text_signature_to_html(custom_signature)
+        # Custom mode but no signature text - return empty
+        return ""
+
+    if signature_mode == "professional":
+        # Force professional signature regardless of custom_signature
+        pass  # Fall through to professional signature below
+    elif custom_signature and custom_signature.strip():
+        # No explicit mode but custom signature provided - use it (legacy behavior)
         return convert_plain_text_signature_to_html(custom_signature)
 
     # Otherwise use the default signature
@@ -383,7 +400,7 @@ T +1 206 510 5575<br>
     return footer
 
 
-def format_email_body_with_footer(body: str, custom_signature: str = None) -> str:
+def format_email_body_with_footer(body: str, custom_signature: str = None, signature_mode: str = None) -> str:
     """
     Converts plain text email body to HTML and appends footer.
     Preserves line breaks and formatting.
@@ -392,6 +409,7 @@ def format_email_body_with_footer(body: str, custom_signature: str = None) -> st
     Args:
         body: The email body text
         custom_signature: Optional plain text signature from user settings
+        signature_mode: Signature mode - "none", "custom", or "professional"
     """
     # Strip trailing whitespace/newlines from body before converting
     body = body.rstrip()
@@ -400,8 +418,8 @@ def format_email_body_with_footer(body: str, custom_signature: str = None) -> st
     # Replace double newlines with <br><br>, single newlines with <br>
     html_body = body.replace('\n\n', '<br><br>').replace('\n', '<br>')
 
-    # Get the footer (custom or default)
-    footer_html = get_email_footer(custom_signature)
+    # Get the footer (custom or default based on mode)
+    footer_html = get_email_footer(custom_signature, signature_mode)
 
     # If no signature at all, just return the body without footer section
     if not footer_html:

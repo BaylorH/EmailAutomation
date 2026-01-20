@@ -226,7 +226,7 @@ def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> st
 
 def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, recipients: List[str],
                         client_id_or_none: Optional[str] = None, row_number: int = None, user_signature: str = None,
-                        subject_override: str = None):
+                        subject_override: str = None, signature_mode: str = None):
     """
     Send email and immediately index it in Firestore for reply tracking.
 
@@ -243,6 +243,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         row_number: Optional row number for thread anchoring
         user_signature: Optional custom signature from user settings
         subject_override: Optional pre-computed subject (e.g., from property data)
+        signature_mode: Signature mode - "none", "custom", or "professional"
 
     SAFETY: All recipient emails are validated before sending to prevent sending to malformed addresses.
     SAFETY: Opted-out contacts are filtered out before sending.
@@ -301,7 +302,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         if not content.strip().startswith("<!DOCTYPE") and not content.strip().startswith("<html"):
             # Wrap existing HTML content and add footer
             # Add separator to prevent email clients from collapsing signature
-            footer_html = get_email_footer(user_signature)
+            footer_html = get_email_footer(user_signature, signature_mode)
             content = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -322,7 +323,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         else:
             # Content is already wrapped, just append footer before closing body tag
             # Insert footer before </body> tag with separator to prevent collapse
-            footer_html = get_email_footer(user_signature)
+            footer_html = get_email_footer(user_signature, signature_mode)
             if "</body>" in content:
                 footer_with_wrapper = f'<!-- Email signature separator - prevents collapse --><div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid transparent; min-height: 1px;"><div style="margin-top: 20px;">{footer_html}</div></div>'
                 content = content.replace("</body>", footer_with_wrapper + "</body>")
@@ -331,7 +332,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                 content = content + f'<!-- Email signature separator - prevents collapse --><div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid transparent; min-height: 1px;"><div style="margin-top: 20px;">{footer_html}</div></div>'
     else:
         # Convert to HTML and add footer (this function now wraps in proper HTML structure)
-        content = format_email_body_with_footer(content, user_signature)
+        content = format_email_body_with_footer(content, user_signature, signature_mode)
         content_type = "HTML"
     base = "https://graph.microsoft.com/v1.0"
 
@@ -534,13 +535,17 @@ def send_outboxes(user_id: str, headers):
     from .clients import _fs
     from collections import defaultdict
 
-    # Fetch user's email signature from settings
+    # Fetch user's email signature settings
     user_doc = _fs.collection("users").document(user_id).get()
     user_signature = None
+    signature_mode = None
     if user_doc.exists:
         user_data = user_doc.to_dict() or {}
         user_signature = user_data.get("emailSignature")
-        if user_signature:
+        signature_mode = user_data.get("signatureMode")  # "none", "custom", or "professional"
+        if signature_mode:
+            print(f"📝 Signature mode: {signature_mode}")
+        elif user_signature:
             print(f"📝 Using custom email signature for user")
 
     outbox_ref = _fs.collection("users").document(user_id).collection("outbox")
@@ -587,11 +592,11 @@ def send_outboxes(user_id: str, headers):
         # Check if multiple properties for same broker
         if len(valid_items) > 1:
             print(f"🔗 Detected {len(valid_items)} properties for same broker: {recipient_email}")
-            _send_multi_property_email(user_id, headers, recipient_email, valid_items, user_signature)
+            _send_multi_property_email(user_id, headers, recipient_email, valid_items, user_signature, signature_mode)
         else:
             # Single property - send normally
             item = valid_items[0]
-            _send_single_outbox_item(user_id, headers, item, user_signature)
+            _send_single_outbox_item(user_id, headers, item, user_signature, signature_mode)
 
         # 2-minute delay between ALL emails to avoid spam detection
         if idx < len(recipients_list) - 1:
@@ -599,7 +604,7 @@ def send_outboxes(user_id: str, headers):
             time.sleep(120)
 
 
-def _send_multi_property_email(user_id: str, headers, recipient_email: str, items: list, user_signature: str = None):
+def _send_multi_property_email(user_id: str, headers, recipient_email: str, items: list, user_signature: str = None, signature_mode: str = None):
     """
     Send SEPARATE emails for multiple properties to the same broker.
     Each property gets its own thread for clean tracking.
@@ -653,7 +658,8 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
             subject_override = prop.get('subject') or None
             res = send_and_index_email(user_id, headers, script, [recipient_email],
                                        client_id_or_none=clientId, row_number=row_number,
-                                       user_signature=user_signature, subject_override=subject_override)
+                                       user_signature=user_signature, subject_override=subject_override,
+                                       signature_mode=signature_mode)
             any_errors = bool([e for e in res.get("errors", {}) if "opted out" not in str(res["errors"].get(e, ""))])
 
             if not any_errors and res["sent"]:
@@ -693,7 +699,7 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
             time.sleep(120)
 
 
-def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: str = None):
+def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: str = None, signature_mode: str = None):
     """
     Send a single outbox item with smart script selection based on contact history.
 
@@ -736,7 +742,8 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
         try:
             res = send_and_index_email(user_id, headers, selected_script, [recipient_email],
                                        client_id_or_none=clientId, row_number=row_number,
-                                       user_signature=user_signature, subject_override=subject_override)
+                                       user_signature=user_signature, subject_override=subject_override,
+                                       signature_mode=signature_mode)
 
             all_sent.extend(res.get("sent", []))
             all_errors.update(res.get("errors", {}))

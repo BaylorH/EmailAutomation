@@ -345,17 +345,27 @@ def propose_sheet_updates(uid: str,
                           pdf_manifest: list[dict] = None,   # [{"name": "...", "text": "...", "images": [...], "id": "..."}]
                           url_texts: list[dict] = None,
                           contact_name: str = None,
-                          headers: dict = None) -> dict | None:
+                          headers: dict = None,
+                          conversation: list[dict] = None,   # Optional: pass conversation directly (for testing)
+                          dry_run: bool = False) -> dict | None:
     """
     Uses OpenAI Responses API to propose sheet updates.
     - Grounds on the current row's (address, city) as TARGET PROPERTY.
     - Shows the model the attachment names so it can pick the right PDF.
     - Enforces strict event and document-selection rules.
+
+    Args:
+        conversation: Optional pre-built conversation payload. If provided, skips Firestore fetch.
+                     Format: [{"direction": "inbound/outbound", "from": "...", "to": [...],
+                              "subject": "...", "timestamp": "...", "content": "..."}]
+        dry_run: If True, skips Firestore logging (useful for testing).
     """
     try:
         # Build conversation payload (chronological; latest last)
-        # Pass headers to fetch from Graph API (includes manual emails we didn't index)
-        conversation = build_conversation_payload(uid, thread_id, limit=10, headers=headers)
+        # If conversation is provided directly (e.g., from tests), use it; otherwise fetch from Firestore
+        if conversation is None:
+            # Pass headers to fetch from Graph API (includes manual emails we didn't index)
+            conversation = build_conversation_payload(uid, thread_id, limit=10, headers=headers)
 
         # ---- Rules sections ---------------------------------------------------
         COLUMN_RULES = """
@@ -460,6 +470,18 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
     - "forwarded" - forwarding to correct person
     - "left_company" - no longer with the company
 
+- "property_issue": CRITICAL - Emit when the broker mentions ANY negative condition, problem, or concern about the property.
+  • Physical condition issues: "smells bad", "odor", "mold", "water damage", "roof leak", "foundation issues",
+    "structural problems", "pest issues", "rat problem", "contamination", "asbestos", "needs repairs"
+  • Environmental concerns: "flood zone", "environmental issues", "soil contamination", "hazmat", "UST"
+  • Building problems: "HVAC not working", "electrical issues", "plumbing problems", "fire damage"
+  • Site issues: "drainage problems", "parking issues", "access problems", "security concerns"
+  • Compliance issues: "code violations", "permit issues", "zoning problems", "ADA non-compliant"
+  • Landlord/tenant issues: "difficult landlord", "tenant disputes", "eviction in progress"
+  • Include "issue" field with the specific problem mentioned
+  • Include "severity" field: "critical" (health/safety), "major" (significant repair), "minor" (cosmetic/inconvenience)
+  • This event is IMPORTANT because it flags properties that may need additional consideration before proceeding
+
 CRITICAL EXAMPLES:
 - "Below is the only current space we have" + URL = new_property event
 - "Here's an alternative location" = new_property event
@@ -475,6 +497,11 @@ CRITICAL EXAMPLES:
 - "We don't work with tenant reps" = contact_optout (reason: no_tenant_reps)
 - "I don't handle that property anymore, contact John Smith" = wrong_contact (reason: no_longer_handles)
 - "Wrong person - try sarah@broker.com" = wrong_contact (reason: wrong_person)
+- "The property smells bad" = property_issue (issue: "odor problem", severity: major)
+- "There's some water damage in the warehouse" = property_issue (issue: "water damage", severity: major)
+- "FYI there was a small roof leak last year but it's been fixed" = property_issue (issue: "previous roof leak", severity: minor)
+- "The building has asbestos that needs abatement" = property_issue (issue: "asbestos", severity: critical)
+- "The HVAC system is old and needs replacement" = property_issue (issue: "HVAC needs replacement", severity: major)
 """
 
         NOTES_RULES = """
@@ -652,7 +679,7 @@ OUTPUT ONLY valid JSON in this exact format:
   ],
   "events": [
     {
-      "type": "call_requested | property_unavailable | new_property | close_conversation | needs_user_input | contact_optout | wrong_contact",
+      "type": "call_requested | property_unavailable | new_property | close_conversation | needs_user_input | contact_optout | wrong_contact | property_issue",
       "address": "<for new_property: extract property name, address, or identifier>",
       "city": "<for new_property: infer city/location if possible>",
       "email": "<for new_property if different email needed>",
@@ -662,7 +689,9 @@ OUTPUT ONLY valid JSON in this exact format:
       "question": "<for needs_user_input: the specific question/request that needs user attention>",
       "suggestedContact": "<for wrong_contact: name of correct person to contact>",
       "suggestedEmail": "<for wrong_contact: email of correct person if provided>",
-      "suggestedPhone": "<for wrong_contact: phone of correct person if provided>"
+      "suggestedPhone": "<for wrong_contact: phone of correct person if provided>",
+      "issue": "<for property_issue: specific description of the problem/concern>",
+      "severity": "<for property_issue: critical | major | minor>"
     }
   ],
   "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation, reference specific details when possible, and vary wording to avoid repetition. SET TO NULL when: (1) call_requested with phone number provided, (2) needs_user_input event detected, (3) contact_optout event detected, (4) wrong_contact event detected. The system will notify the user instead of auto-responding.>",
@@ -752,29 +781,33 @@ OUTPUT ONLY valid JSON in this exact format:
         else:
             print(f"\n📧 No LLM-generated response email (will use template fallback)")
 
-        now_utc = datetime.now(timezone.utc)
-        log_doc_id = f"{thread_id}__{now_utc.isoformat().replace(':','-').replace('.','-').replace('+00:00','Z')}"
+        # Log to Firestore (skip in dry_run mode for testing)
+        if not dry_run:
+            now_utc = datetime.now(timezone.utc)
+            log_doc_id = f"{thread_id}__{now_utc.isoformat().replace(':','-').replace('.','-').replace('+00:00','Z')}"
 
-        proposal_hash = hashlib.sha256(
-            json.dumps(proposal, sort_keys=True).encode('utf-8')
-        ).hexdigest()[:16]
+            proposal_hash = hashlib.sha256(
+                json.dumps(proposal, sort_keys=True).encode('utf-8')
+            ).hexdigest()[:16]
 
-        _fs.collection("users").document(uid).collection("sheetChangeLog").document(log_doc_id).set({
-            "clientId": client_id,
-            "email": email,
-            "sheetId": sheet_id,
-            "rowNumber": rownum,
-            "targetAnchor": target_anchor,
-            "proposalJson": proposal,
-            "proposalHash": proposal_hash,
-            "status": "proposed",
-            "threadId": thread_id,
-            "pdfManifest": [{k: v for k, v in p.items() if k != 'images'} for p in (pdf_manifest or [])],  # exclude images from log
-            "fileIds": [p["id"] for p in (pdf_manifest or []) if p.get("id")],  # keep old field for compatibility
-            "urlTexts": url_texts or [],
-            "createdAt": SERVER_TIMESTAMP
-        })
-        print(f"💾 Stored proposal in sheetChangeLog/{log_doc_id}")
+            _fs.collection("users").document(uid).collection("sheetChangeLog").document(log_doc_id).set({
+                "clientId": client_id,
+                "email": email,
+                "sheetId": sheet_id,
+                "rowNumber": rownum,
+                "targetAnchor": target_anchor,
+                "proposalJson": proposal,
+                "proposalHash": proposal_hash,
+                "status": "proposed",
+                "threadId": thread_id,
+                "pdfManifest": [{k: v for k, v in p.items() if k != 'images'} for p in (pdf_manifest or [])],  # exclude images from log
+                "fileIds": [p["id"] for p in (pdf_manifest or []) if p.get("id")],  # keep old field for compatibility
+                "urlTexts": url_texts or [],
+                "createdAt": SERVER_TIMESTAMP
+            })
+            print(f"💾 Stored proposal in sheetChangeLog/{log_doc_id}")
+        else:
+            print(f"🧪 Dry run - skipped Firestore logging")
 
         return proposal
 

@@ -183,10 +183,10 @@ def run_scheduler():
     """Run the full scheduler for all users - same logic as main.py"""
     if not SCHEDULER_AVAILABLE:
         return {"success": False, "error": "Scheduler functionality not available - missing dependencies"}
-    
+
     try:
         all_users = list_user_ids()
-        print(f"📦 Found {len(all_users)} token cache users: {all_users}")
+        print(f"📦 Found {len(all_users)} token cache users: {all_users}", flush=True)
         
         results = []
         for uid in all_users:
@@ -200,7 +200,7 @@ def run_scheduler():
         }
     except Exception as e:
         error_msg = f"Scheduler failed: {str(e)}"
-        print(f"💥 {error_msg}")
+        print(f"💥 {error_msg}", flush=True)
         return {"success": False, "error": error_msg}
 
 @app.route("/")
@@ -615,22 +615,25 @@ def api_trigger_scheduler():
     def run_scheduler_async():
         """Run scheduler in background thread"""
         global scheduler_status
+        import sys
         try:
             scheduler_status["running"] = True
             scheduler_status["last_run"] = datetime.now().isoformat()
-            
-            print("🚀 Manual scheduler trigger initiated")
+
+            print("🚀 Manual scheduler trigger initiated", flush=True)
             result = run_scheduler()
-            
+
             scheduler_status["last_result"] = result
             scheduler_status["running"] = False
-            
-            print(f"✅ Manual scheduler completed: {result}")
-            
+
+            print(f"✅ Manual scheduler completed: {result}", flush=True)
+            sys.stdout.flush()
+
         except Exception as e:
             scheduler_status["last_result"] = {"success": False, "error": str(e)}
             scheduler_status["running"] = False
-            print(f"💥 Manual scheduler failed: {e}")
+            print(f"💥 Manual scheduler failed: {e}", flush=True)
+            sys.stdout.flush()
     
     # Start scheduler in background thread
     thread = threading.Thread(target=run_scheduler_async)

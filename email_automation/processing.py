@@ -1177,6 +1177,78 @@ Thanks!""",
                     except Exception as e:
                         print(f"❌ Failed to handle wrong_contact: {e}")
 
+                elif event_type == "property_issue":
+                    # Property has a notable issue/concern that the user should be aware of
+                    try:
+                        issue = event.get("issue", "Unknown issue")
+                        severity = event.get("severity", "major")  # critical, major, minor
+
+                        severity_labels = {
+                            "critical": "Critical Issue (health/safety concern)",
+                            "major": "Major Issue (significant concern)",
+                            "minor": "Minor Issue (cosmetic/inconvenience)"
+                        }
+
+                        priority = "urgent" if severity == "critical" else "important"
+
+                        # Add issue to comments column
+                        try:
+                            tab_title = _get_first_tab_title(sheets, sheet_id)
+                            comments_col_idx = None
+                            for i, col_name in enumerate(header):
+                                if col_name and "jill and clients comments" in col_name.lower():
+                                    comments_col_idx = i + 1
+                                    break
+
+                            if comments_col_idx:
+                                from datetime import datetime
+                                current_date = datetime.now().strftime("%m/%d/%Y")
+                                issue_comment = f"[{current_date}] ⚠️ PROPERTY ISSUE ({severity.upper()}): {issue}"
+
+                                existing_resp = sheets.spreadsheets().values().get(
+                                    spreadsheetId=sheet_id,
+                                    range=f"{tab_title}!{chr(64 + comments_col_idx)}{rownum}"
+                                ).execute()
+                                existing_comment = ""
+                                if existing_resp.get("values"):
+                                    existing_comment = existing_resp["values"][0][0] if existing_resp["values"][0] else ""
+
+                                final_comment = f"{existing_comment.strip()} | {issue_comment}" if existing_comment.strip() else issue_comment
+
+                                sheets.spreadsheets().values().update(
+                                    spreadsheetId=sheet_id,
+                                    range=f"{tab_title}!{chr(64 + comments_col_idx)}{rownum}",
+                                    valueInputOption="RAW",
+                                    body={"values": [[final_comment]]}
+                                ).execute()
+                                print(f"💬 Added property issue comment: {issue}")
+                        except Exception as comment_err:
+                            print(f"⚠️ Could not add issue comment: {comment_err}")
+
+                        # Create notification to alert user
+                        write_notification(
+                            user_id, client_id,
+                            kind="action_needed",
+                            priority=priority,
+                            email=from_addr_lower,
+                            thread_id=thread_id,
+                            row_number=rownum,
+                            row_anchor=row_anchor,
+                            meta={
+                                "reason": f"property_issue:{severity}",
+                                "issue": issue,
+                                "severity": severity,
+                                "severityLabel": severity_labels.get(severity, severity),
+                                "contact": from_addr_lower,
+                                "originalMessage": _full_text[:500]
+                            },
+                            dedupe_key=f"property_issue:{thread_id}:{issue[:50]}"
+                        )
+                        print(f"⚠️ Property issue detected ({severity}): {issue}")
+
+                    except Exception as e:
+                        print(f"❌ Failed to handle property_issue: {e}")
+
             # Required fields check and remaining questions flow
             # Automatic response logic based on property state
             try:
