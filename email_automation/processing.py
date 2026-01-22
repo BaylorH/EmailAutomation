@@ -85,14 +85,27 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
     try:
         from .utils import exponential_backoff_request, safe_preview
         from .messaging import save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
+        from .clients import _fs
         from datetime import datetime, timezone
         import requests
         import time
-        
+
         base = "https://graph.microsoft.com/v1.0"
-        
-        # Format body as HTML with footer
-        html_body = format_email_body_with_footer(body)
+
+        # Fetch user's signature settings to use the same signature as outbox emails
+        user_signature = None
+        signature_mode = None
+        try:
+            user_doc = _fs.collection("users").document(user_id).get()
+            if user_doc.exists:
+                user_data = user_doc.to_dict() or {}
+                user_signature = user_data.get("emailSignature")
+                signature_mode = user_data.get("signatureMode")
+        except Exception as e:
+            print(f"   ⚠️ Failed to fetch user signature settings: {e}")
+
+        # Format body as HTML with footer (uses user's signature settings)
+        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
         
         # Reply directly to the current message we're processing
         # Use message structure to preserve line breaks properly

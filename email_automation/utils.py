@@ -314,13 +314,16 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None) -
 
     Args:
         custom_signature: Optional plain text signature from user settings.
-        signature_mode: Signature mode - "none", "custom", or "professional" (default).
+        signature_mode: Signature mode - "none", "custom", or "professional".
                        - "none": No signature at all
                        - "custom": Use the custom_signature text (converted to HTML)
                        - "professional": Use the default Jill Ames signature with logo/images
-                       - None/empty: Falls back to "professional" if no custom_signature,
-                                    or "custom" if custom_signature is provided
+                       - None/empty: Defaults to "none" (user must explicitly configure)
     """
+    # Default to "none" when mode is not set - user must explicitly configure signature in settings
+    if not signature_mode:
+        return ""
+
     # Handle explicit signature modes
     if signature_mode == "none":
         return ""
@@ -332,11 +335,11 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None) -
         return ""
 
     if signature_mode == "professional":
-        # Force professional signature regardless of custom_signature
+        # Use professional signature with logo
         pass  # Fall through to professional signature below
-    elif custom_signature and custom_signature.strip():
-        # No explicit mode but custom signature provided - use it (legacy behavior)
-        return convert_plain_text_signature_to_html(custom_signature)
+    else:
+        # Unknown mode - treat as none
+        return ""
 
     # Otherwise use the default signature
     # Upload logo to Drive and get public URL (more reliable than base64 for email clients)
