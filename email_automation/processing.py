@@ -1045,6 +1045,9 @@ Thanks!""",
                         )
                         print(f"🏢 Created new property pending approval notification (no row created yet)")
 
+                        # Skip auto-response - user must approve/send from frontend
+                        proposal["skip_response"] = True
+
                     except Exception as e:
                         print(f"❌ Failed to handle new_property: {e}")
                 
