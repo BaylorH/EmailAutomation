@@ -982,6 +982,18 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         link = event.get("link", "")
                         notes = event.get("notes", "")
 
+                        # Fetch client criteria from Firestore for AI email generation
+                        client_criteria = ""
+                        try:
+                            client_doc = _fs.collection("users").document(user_id).collection("clients").document(client_id).get()
+                            if client_doc.exists:
+                                client_data = client_doc.to_dict() or {}
+                                # Get primary criteria (the email script template)
+                                client_criteria = client_data.get("criteria", "")
+                                print(f"📋 Fetched client criteria for AI generation ({len(client_criteria)} chars)")
+                        except Exception as ce:
+                            print(f"⚠️ Could not fetch client criteria: {ce}")
+
                         # Extract leasing company and contact from current row for later use
                         leasing_company = ""
                         leasing_contact = ""
@@ -1039,7 +1051,9 @@ Thanks!""",
                                 "conversationContext": {
                                     "threadId": thread_id,
                                     "originalMessage": body[:500] if body else ""  # First 500 chars of original message
-                                }
+                                },
+                                # Client criteria for AI email generation on frontend
+                                "clientCriteria": client_criteria
                             },
                             dedupe_key=f"new_property_pending:{thread_id}:{address}:{city}:{from_addr_lower}"
                         )
