@@ -1,11 +1,26 @@
 import hashlib
 import requests
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 from google.cloud.firestore import FieldFilter
 from .clients import _fs
 from .notifications import write_notification
 from .utils import exponential_backoff_request, format_email_body_with_footer
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
+
+
+def _get_user_signature_settings(uid: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Fetch user's signature settings from Firestore.
+    Returns (email_signature, signature_mode) tuple.
+    """
+    try:
+        user_doc = _fs.collection("users").document(uid).get()
+        if user_doc.exists:
+            user_data = user_doc.to_dict() or {}
+            return user_data.get("emailSignature"), user_data.get("signatureMode")
+    except Exception as e:
+        print(f"⚠️ Failed to fetch user signature settings: {e}")
+    return None, None
 
 def send_remaining_questions_email(uid: str, client_id: str, headers: dict, recipient: str, 
                                  missing_fields: list[str], thread_id: str, row_number: int,
@@ -47,9 +62,10 @@ We still need the following information to complete your property details:
 {field_list}
 
 Could you please provide these details when you have a moment?"""
-        
-        # Format as HTML with footer
-        html_body = format_email_body_with_footer(body)
+
+        # Format as HTML with footer using user's signature settings
+        user_signature, signature_mode = _get_user_signature_settings(uid)
+        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
         
         base = "https://graph.microsoft.com/v1.0"
         # 1) Find Graph message id by our stored internetMessageId (thread_id)
@@ -122,10 +138,11 @@ def send_closing_email(uid: str, client_id: str, headers: dict, recipient: str,
 Thank you for providing all the requested information! We now have everything we need for your property details.
 
 We'll be in touch if we need any additional information."""
-        
-        # Format as HTML with footer
-        html_body = format_email_body_with_footer(body)
-        
+
+        # Format as HTML with footer using user's signature settings
+        user_signature, signature_mode = _get_user_signature_settings(uid)
+        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+
         # Send email using sendMail endpoint
         base = "https://graph.microsoft.com/v1.0"
         msg = {
@@ -192,10 +209,11 @@ Could you please provide the following details for this property:
 - Number of dock doors  
 - Ceiling height
 - Power specifications"""
-        
-        # Format as HTML with footer
-        html_body = format_email_body_with_footer(body)
-        
+
+        # Format as HTML with footer using user's signature settings
+        user_signature, signature_mode = _get_user_signature_settings(uid)
+        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+
         # Send as new email (not a reply)
         base = "https://graph.microsoft.com/v1.0"
         msg = {
@@ -293,12 +311,13 @@ def send_thankyou_closing_with_new_property(uid: str, client_id: str, headers: d
 Thank you for letting me know that property is no longer available, and thanks for suggesting the alternative property.
 
 I'll review the new property details and get back to you if I have any questions."""
-        
-        # Format as HTML with footer
-        html_body = format_email_body_with_footer(body)
-        
+
+        # Format as HTML with footer using user's signature settings
+        user_signature, signature_mode = _get_user_signature_settings(uid)
+        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+
         base = "https://graph.microsoft.com/v1.0"
-        
+
         # Try to find the original message to reply to
         q = {"$filter": f"internetMessageId eq '{thread_id}'", "$select": "id"}
         lookup = exponential_backoff_request(
@@ -369,12 +388,13 @@ def send_thankyou_ask_alternatives(uid: str, client_id: str, headers: dict,
 Thank you for letting me know that property is no longer available.
 
 Do you have any other properties that might be a good fit for our requirements?"""
-        
-        # Format as HTML with footer
-        html_body = format_email_body_with_footer(body)
-        
+
+        # Format as HTML with footer using user's signature settings
+        user_signature, signature_mode = _get_user_signature_settings(uid)
+        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+
         base = "https://graph.microsoft.com/v1.0"
-        
+
         # Try to find the original message to reply to
         q = {"$filter": f"internetMessageId eq '{thread_id}'", "$select": "id"}
         lookup = exponential_backoff_request(
