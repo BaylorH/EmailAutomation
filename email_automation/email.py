@@ -1,6 +1,7 @@
 import json
 import requests
 import time
+import uuid
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
 from .utils import exponential_backoff_request, safe_preview, _body_kind, validate_recipient_emails, is_valid_email
@@ -13,6 +14,78 @@ from .utils import normalize_message_id
 MAX_OUTBOX_ATTEMPTS = 5
 # Maximum retries for indexing operations
 MAX_INDEX_RETRIES = 3
+# Claim timeout in seconds (if a claim is older than this, it's considered stale)
+CLAIM_TIMEOUT_SECONDS = 300  # 5 minutes
+
+# Unique worker ID for this process
+WORKER_ID = str(uuid.uuid4())[:8]
+
+
+def _claim_outbox_item(doc_ref, data: dict) -> bool:
+    """
+    Attempt to claim an outbox item for processing using a transaction.
+    Prevents duplicate sends when multiple processes run concurrently.
+
+    Returns True if successfully claimed, False if already being processed.
+    """
+    from .clients import _fs
+    from google.cloud.firestore import transactional
+
+    @transactional
+    def claim_transaction(transaction, doc_ref):
+        # Read current state
+        snapshot = doc_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            # Item was already deleted
+            return False
+
+        current_data = snapshot.to_dict() or {}
+        processing_by = current_data.get("processingBy")
+        processing_at = current_data.get("processingAt")
+
+        now = datetime.now(timezone.utc)
+
+        # Check if already being processed
+        if processing_by and processing_at:
+            # Check if claim is stale (older than CLAIM_TIMEOUT_SECONDS)
+            if hasattr(processing_at, 'timestamp'):
+                # Firestore timestamp
+                claim_age = (now - processing_at.replace(tzinfo=timezone.utc)).total_seconds()
+            else:
+                # Already a datetime
+                claim_age = (now - processing_at).total_seconds()
+
+            if claim_age < CLAIM_TIMEOUT_SECONDS:
+                # Claim is still valid, skip this item
+                print(f"   ⏭️ Item {doc_ref.id} already being processed by {processing_by} ({int(claim_age)}s ago)")
+                return False
+            else:
+                print(f"   ⚠️ Stale claim on {doc_ref.id} by {processing_by} ({int(claim_age)}s ago), reclaiming")
+
+        # Claim the item
+        transaction.update(doc_ref, {
+            "processingBy": WORKER_ID,
+            "processingAt": now
+        })
+        return True
+
+    try:
+        transaction = _fs.transaction()
+        return claim_transaction(transaction, doc_ref)
+    except Exception as e:
+        print(f"   ⚠️ Failed to claim {doc_ref.id}: {e}")
+        return False
+
+
+def _release_claim(doc_ref):
+    """Release claim on an outbox item (called on failure to allow retry)."""
+    try:
+        doc_ref.update({
+            "processingBy": None,
+            "processingAt": None
+        })
+    except Exception as e:
+        print(f"   ⚠️ Failed to release claim on {doc_ref.id}: {e}")
 
 
 def get_contact_email_count(user_id: str, recipient_email: str) -> int:
@@ -657,6 +730,12 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
     for idx, prop in enumerate(properties):
         item = prop['item']
         data = item['data']
+
+        # CRITICAL: Claim the item before processing to prevent duplicate sends
+        if not _claim_outbox_item(item['doc'].reference, data):
+            print(f"   ⏭️ Skipping property {idx + 1} - already being processed by another worker")
+            continue
+
         clientId = (data.get("clientId") or "").strip()
         attempts = int(data.get("attempts") or 0)
         row_number = prop.get('rowNumber')
@@ -686,8 +765,9 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
                     _move_to_dead_letter(user_id, item['doc'].reference, data,
                         f"Send errors after {new_attempts} attempts: {error_msg}")
                 else:
+                    # Release claim and update attempts so it can be retried
                     item['doc'].reference.set(
-                        {"attempts": new_attempts, "lastError": error_msg},
+                        {"attempts": new_attempts, "lastError": error_msg, "processingBy": None, "processingAt": None},
                         merge=True,
                     )
                 print(f"  ⚠️ Kept item with error; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
@@ -700,8 +780,9 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
                 _move_to_dead_letter(user_id, item['doc'].reference, data,
                     f"Exception after {new_attempts} attempts: {error_msg}")
             else:
+                # Release claim and update attempts so it can be retried
                 item['doc'].reference.set(
-                    {"attempts": new_attempts, "lastError": error_msg},
+                    {"attempts": new_attempts, "lastError": error_msg, "processingBy": None, "processingAt": None},
                     merge=True,
                 )
             print(f"  💥 Error: {e}; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
@@ -720,9 +801,17 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     - scripts[0] = 1st contact (primary)
     - scripts[1] = 2nd contact (follow-up)
     - scripts[2] = 3rd contact, etc.
+
+    Uses claim mechanism to prevent duplicate sends when multiple processes run concurrently.
     """
     d = item['doc']
     data = item['data']
+
+    # CRITICAL: Claim the item before processing to prevent duplicate sends
+    if not _claim_outbox_item(d.reference, data):
+        print(f"   ⏭️ Skipping {d.id} - already being processed by another worker")
+        return
+
     emails = data.get("assignedEmails") or []
     clientId = (data.get("clientId") or "").strip()
     attempts = int(data.get("attempts") or 0)
@@ -778,8 +867,9 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
         if new_attempts >= MAX_OUTBOX_ATTEMPTS:
             _move_to_dead_letter(user_id, d.reference, data, f"Send errors after {new_attempts} attempts: {error_msg}")
         else:
+            # Release claim and update attempts so it can be retried
             d.reference.set(
-                {"attempts": new_attempts, "lastError": error_msg},
+                {"attempts": new_attempts, "lastError": error_msg, "processingBy": None, "processingAt": None},
                 merge=True,
             )
             print(f"⚠️ Kept item {d.id} with error; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
