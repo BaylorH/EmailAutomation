@@ -635,7 +635,8 @@ def send_outboxes(user_id: str, headers):
             print(f"📝 Using custom email signature for user")
 
     outbox_ref = _fs.collection("users").document(user_id).collection("outbox")
-    docs = list(outbox_ref.stream())
+    # Order by createdAt to send emails in the order they were queued (oldest first)
+    docs = list(outbox_ref.order_by("createdAt").stream())
 
     if not docs:
         print("📭 Outbox empty")
