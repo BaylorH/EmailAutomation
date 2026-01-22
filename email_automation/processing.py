@@ -1050,7 +1050,7 @@ Thanks!""",
                                 "suggestedEmail": email_payload,
                                 "conversationContext": {
                                     "threadId": thread_id,
-                                    "originalMessage": body[:500] if body else ""  # First 500 chars of original message
+                                    "originalMessage": _full_text[:500] if _full_text else ""  # First 500 chars of original message
                                 },
                                 # Client criteria for AI email generation on frontend
                                 "clientCriteria": client_criteria
