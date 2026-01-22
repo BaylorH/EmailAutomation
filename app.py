@@ -1069,12 +1069,29 @@ def api_debug_inbox():
         
         emails_data = response.json()
         emails = emails_data.get("value", [])
-        
+
+        # Get the current user's email address to verify which account we're connected to
+        me_response = requests.get(
+            "https://graph.microsoft.com/v1.0/me",
+            headers=headers,
+            params={"$select": "mail,userPrincipalName,displayName"},
+            timeout=30
+        )
+        account_info = {}
+        if me_response.status_code == 200:
+            me_data = me_response.json()
+            account_info = {
+                "email": me_data.get("mail") or me_data.get("userPrincipalName"),
+                "displayName": me_data.get("displayName"),
+                "userPrincipalName": me_data.get("userPrincipalName")
+            }
+
         # Check processed status for each email
         from email_automation.messaging import has_processed
-        
+
         debug_info = {
             "user_id": user_id,
+            "connected_account": account_info,
             "cutoff_time": cutoff_iso,
             "total_emails_in_window": len(emails),
             "emails": []

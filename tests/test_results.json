@@ -1,238 +1,285 @@
 {
-  "timestamp": "2026-01-15T05:42:43.007436+00:00",
-  "total": 10,
-  "passed": 10,
+  "timestamp": "2026-01-19T22:23:21.975518+00:00",
+  "mode": "production",
+  "total": 17,
+  "passed": 17,
   "failed": 0,
   "results": [
     {
       "name": "complete_info",
       "passed": true,
-      "api_time_ms": 7950,
+      "api_time_ms": 6902,
       "updates": [
         {
           "column": "Total SF",
           "value": "15000",
-          "confidence": 0.9,
-          "reason": "Provided directly by Scott in the email."
+          "confidence": 0.95,
+          "reason": "Broker provided 'Total SF: 15,000' for 1 Randolph Ct."
         },
         {
           "column": "Rent/SF /Yr",
           "value": "8.50",
           "confidence": 0.9,
-          "reason": "Provided directly by Scott in the email."
+          "reason": "Broker stated 'Asking rent: $8.50/SF/yr NNN'."
         },
         {
           "column": "Ops Ex /SF",
           "value": "2.25",
           "confidence": 0.9,
-          "reason": "Provided directly by Scott in the email."
-        },
-        {
-          "column": "Gross Rent",
-          "value": "10.75",
-          "confidence": 0.9,
-          "reason": "Calculated as Rent/SF /Yr + Ops Ex /SF."
+          "reason": "Broker stated 'NNN/CAM: $2.25/SF/yr'."
         },
         {
           "column": "Drive Ins",
           "value": "2",
           "confidence": 0.9,
-          "reason": "Provided directly by Scott in the email."
+          "reason": "Broker stated '2 drive-in doors'."
         },
         {
           "column": "Docks",
           "value": "4",
           "confidence": 0.9,
-          "reason": "Provided directly by Scott in the email."
+          "reason": "Broker stated '4 dock doors'."
         },
         {
           "column": "Ceiling Ht",
           "value": "24",
           "confidence": 0.9,
-          "reason": "Provided directly by Scott in the email."
+          "reason": "Broker stated 'Clear height: 24 feet'."
         },
         {
           "column": "Power",
           "value": "400 amps, 3-phase",
-          "confidence": 0.9,
-          "reason": "Provided directly by Scott in the email."
+          "confidence": 0.85,
+          "reason": "Broker stated 'Power: 400 amps, 3-phase'."
         }
       ],
       "events": [],
-      "response": "Hi Scott,\n\nThank you for providing the details for 1 Randolph Ct. I appreciate your help.\n\nThanks",
+      "response": "Hi Scott,\n\nThank you for sending the details on 1 Randolph Ct. I have everything I need (15,000 SF, $8.50/SF NNN with $2.25 NNN/CAM, 2 drive-ins, 4 docks, 24\u2019 clear, and 400A 3-phase), and I appreciate the notes on immediate availability, the fenced yard, and trailer parking.\n\nThanks",
+      "notes": "available immediately \u2022 built 2019 \u2022 fenced yard \u2022 ~15 trailer parking spots \u2022 landlord motivated \u2022 flexible lease term (3-5 yrs considered) \u2022 right off I-20",
       "issues": [],
       "warnings": []
     },
     {
       "name": "partial_info",
       "passed": true,
-      "api_time_ms": 3274,
+      "api_time_ms": 2979,
       "updates": [
         {
           "column": "Total SF",
           "value": "8500",
-          "confidence": 0.9,
-          "reason": "The inbound message explicitly states the space is 8,500 SF."
+          "confidence": 0.95,
+          "reason": "Inbound email states: \"The space is 8,500 SF\"."
         },
         {
           "column": "Rent/SF /Yr",
           "value": "6.00",
           "confidence": 0.9,
-          "reason": "The inbound message explicitly states the asking rent is $6.00/SF NNN."
+          "reason": "Inbound email states: \"asking rent of $6.00/SF NNN\" (base rent)."
         }
       ],
       "events": [],
-      "response": "Hi Jeff,\n\nThank you for the information on 699 Industrial Park Dr. If there are any additional details or updates, please let me know.\n\nThanks",
+      "response": "Hi Jeff,\n\nThanks for the details on 699 Industrial Park Dr. I have it as 8,500 SF at $6.00/SF NNN.\n\nTo complete our property sheet, could you please confirm:\n\n- Estimated Ops Ex /SF (NNN/CAM)\n- # of drive-in doors\n- # of dock doors\n- Clear ceiling height\n- Power (amps/voltage/phase)\n\nThanks,",
+      "notes": "asking rent 6.00/SF NNN",
       "issues": [],
       "warnings": []
     },
     {
       "name": "property_unavailable",
       "passed": true,
-      "api_time_ms": 2666,
+      "api_time_ms": 2238,
       "updates": [],
       "events": [
         {
           "type": "property_unavailable",
-          "address": "135 Trade Center Court",
-          "city": "Augusta",
-          "link": ""
+          "address": "",
+          "city": "",
+          "email": "",
+          "link": "",
+          "notes": "",
+          "reason": "",
+          "question": "",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
         }
       ],
-      "response": "Hi Luke,\n\nThank you for letting me know about the status of 135 Trade Center Court. If there are any other properties that might fit our needs, please feel free to share.\n\nThanks",
+      "response": "Hi Luke,\n\nThanks for letting me know\u2014appreciate the update. If anything else comes available in that Trade Center area (or nearby Augusta industrial), please feel free to send it over.\n\nThanks,",
+      "notes": "property leased last week \u2022 no longer available",
       "issues": [],
       "warnings": []
     },
     {
       "name": "unavailable_with_alternative",
       "passed": true,
-      "api_time_ms": 3946,
+      "api_time_ms": 4620,
       "updates": [],
       "events": [
         {
           "type": "property_unavailable",
           "address": "1 Randolph Ct",
           "city": "Evans",
-          "link": ""
+          "email": "",
+          "link": "",
+          "notes": "no longer available \u2022 lease signed yesterday",
+          "reason": "",
+          "question": "",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
         },
         {
           "type": "new_property",
           "address": "456 Commerce Blvd",
           "city": "Martinez",
-          "link": "https://example.com/456-commerce"
+          "email": "bp21harrison@gmail.com",
+          "link": "https://example.com/456-commerce",
+          "notes": "similar size \u2022 around 12000 SF",
+          "reason": "",
+          "question": "",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
         }
       ],
-      "response": "Hi Scott,\n\nThank you for letting me know about 1 Randolph Ct. I appreciate the suggestion of the property at 456 Commerce Blvd. Could you please provide more details about it?\n\nThanks",
+      "response": "Hi Scott,\n\nThanks for the update\u2014understood on 1 Randolph Ct being leased.\n\nYes, please send over the details on 456 Commerce Blvd in Martinez (I\u2019ll also review the link). If you have a flyer/floorplan and the asking terms/NNN estimate, that would be helpful.\n\nThanks",
+      "notes": "1 Randolph Ct no longer available \u2022 lease signed yesterday \u2022 alternative: 456 Commerce Blvd, Martinez \u2022 around 12000 SF \u2022 listing link provided",
       "issues": [],
       "warnings": []
     },
     {
       "name": "call_requested_with_phone",
       "passed": true,
-      "api_time_ms": 1422,
+      "api_time_ms": 1997,
       "updates": [],
       "events": [
         {
           "type": "call_requested",
-          "address": "699 Industrial Park Dr",
-          "city": "Evans",
-          "link": ""
+          "address": "",
+          "city": "",
+          "email": "",
+          "link": "",
+          "notes": "Requested phone call to discuss details; provided phone number (706) 555-1234.",
+          "reason": "",
+          "question": "",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
         }
       ],
-      "response": "Hi Jeff,\n\nSure, I can give you a call to discuss the details. I'll reach out shortly.\n\nThanks",
+      "response": null,
+      "notes": "prefers phone call to discuss details \u2022 call (706) 555-1234",
       "issues": [],
       "warnings": []
     },
     {
       "name": "call_requested_no_phone",
       "passed": true,
-      "api_time_ms": 2685,
+      "api_time_ms": 2076,
       "updates": [],
       "events": [
         {
           "type": "call_requested",
-          "address": "135 Trade Center Court",
-          "city": "Augusta",
-          "link": ""
+          "address": "",
+          "city": "",
+          "email": "",
+          "link": "",
+          "notes": "Luke asked to schedule a call and mentioned he has several options that might work.",
+          "reason": "",
+          "question": "",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
         }
       ],
-      "response": "Hi Luke,\n\nThank you for reaching out. Let's schedule a call to discuss the options you have in mind.\n\nThanks",
+      "response": "Hi Luke,\n\nYes\u2014happy to connect. What\u2019s the best number to reach you, and a couple windows that work for a quick call?\n\nThanks,",
+      "notes": "broker requested a call \u2022 mentioned several alternative options",
       "issues": [],
       "warnings": []
     },
     {
       "name": "multi_turn_conversation",
       "passed": true,
-      "api_time_ms": 11270,
+      "api_time_ms": 4315,
       "updates": [
         {
           "column": "Total SF",
           "value": "20000",
-          "confidence": 0.9,
-          "reason": "Scott provided the total square footage as 20,000 SF."
+          "confidence": 0.95,
+          "reason": "Broker stated: \"it's 20,000 SF\" for 1 Randolph Ct, Evans."
         },
         {
           "column": "Rent/SF /Yr",
           "value": "7.50",
-          "confidence": 0.9,
-          "reason": "Scott stated the rent as $7.50/SF NNN."
+          "confidence": 0.95,
+          "reason": "Broker stated: \"$7.50/SF NNN\"."
         },
         {
           "column": "Ops Ex /SF",
           "value": "1.85",
-          "confidence": 0.9,
-          "reason": "Scott mentioned the NNN expenses as $1.85/SF."
-        },
-        {
-          "column": "Gross Rent",
-          "value": "9.35",
-          "confidence": 0.9,
-          "reason": "Calculated as Rent/SF /Yr + Ops Ex /SF = 7.50 + 1.85."
-        },
-        {
-          "column": "Drive Ins",
-          "value": "1",
-          "confidence": 0.9,
-          "reason": "Scott mentioned there is 1 drive-in door."
+          "confidence": 0.95,
+          "reason": "Broker stated: \"NNN is $1.85/SF.\""
         },
         {
           "column": "Docks",
           "value": "3",
-          "confidence": 0.9,
-          "reason": "Scott mentioned there are 3 dock doors."
+          "confidence": 0.95,
+          "reason": "Broker stated: \"We have 3 dock doors\"."
+        },
+        {
+          "column": "Drive Ins",
+          "value": "1",
+          "confidence": 0.95,
+          "reason": "Broker stated: \"and 1 drive-in.\""
         },
         {
           "column": "Ceiling Ht",
           "value": "20",
           "confidence": 0.9,
-          "reason": "Scott mentioned the ceiling height is 20' clear."
+          "reason": "Broker stated: \"Ceiling is 20' clear.\""
         }
       ],
       "events": [],
-      "response": "Hi Scott,\n\nThank you for providing the details on 1 Randolph Ct. This information is very helpful.\n\nThanks",
+      "response": "Thanks Scott \u2014 appreciate the details.\n\nI have 20,000 SF at $7.50/SF NNN with NNN at $1.85/SF, 3 dock doors, 1 drive-in, and 20\u2019 clear.\n\nOne last item: do you have the power/electrical specs for the building?\n\nThanks",
+      "notes": "NNN lease \u2022 20' clear",
       "issues": [],
       "warnings": []
     },
     {
       "name": "vague_response",
       "passed": true,
-      "api_time_ms": 4210,
+      "api_time_ms": 1964,
       "updates": [],
-      "events": [],
-      "response": "Hi Jeff,\n\nThank you for the information. Could you please provide the specific square footage and any additional details like operating expenses or ceiling height for 699 Industrial Park Dr?\n\nThanks",
+      "events": [
+        {
+          "type": "needs_user_input",
+          "address": "",
+          "city": "",
+          "email": "",
+          "link": "",
+          "notes": "",
+          "reason": "scheduling",
+          "question": "Let me know if you want to tour."
+        }
+      ],
+      "response": null,
+      "notes": "broker says rent is competitive \u2022 nice sized building \u2022 good loading \u2022 tour offered",
       "issues": [],
-      "warnings": []
+      "warnings": [
+        "Extra events: {'needs_user_input'}",
+        "AI escalated to user when it could have responded automatically",
+        "Extra escalation notification: action_needed (needs_user_input:scheduling)"
+      ]
     },
     {
       "name": "new_property_suggestion",
       "passed": true,
-      "api_time_ms": 4630,
+      "api_time_ms": 3589,
       "updates": [
         {
           "column": "Total SF",
           "value": "25000",
           "confidence": 0.9,
-          "reason": "Luke Coffey confirmed the availability and size of the property as 25,000 SF."
+          "reason": "Luke stated: '135 Trade Center is still available at 25,000 SF.'"
         }
       ],
       "events": [
@@ -240,27 +287,240 @@
           "type": "new_property",
           "address": "200 Warehouse Way",
           "city": "North Augusta",
-          "link": "https://example.com/200-warehouse-way"
+          "email": "",
+          "link": "https://example.com/200-warehouse-way",
+          "notes": "new listing mentioned by Luke \u2022 30,000 SF",
+          "reason": "",
+          "question": "",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
         }
       ],
-      "response": "Hi Luke,\n\nThank you for the update on 135 Trade Center Court. It's great to know it's still available at 25,000 SF. I'll also take a look at the new listing at 200 Warehouse Way.\n\nThanks",
+      "response": "Hi Luke,\n\nThanks for confirming 135 Trade Center Court is still available and that it\u2019s 25,000 SF.\n\nTo complete our property details, could you please share:\n- Ops Ex /SF\n- Drive Ins\n- Docks\n- Ceiling Ht\n- Power\n\nAlso, thank you for sending over 200 Warehouse Way in North Augusta\u2014I\u2019ll take a look at the link.\n\nThanks",
+      "notes": "still available",
       "issues": [],
       "warnings": []
     },
     {
       "name": "close_conversation",
       "passed": true,
-      "api_time_ms": 1804,
+      "api_time_ms": 2399,
       "updates": [],
       "events": [
         {
           "type": "close_conversation",
-          "address": "135 Trade Center Court",
-          "city": "Augusta",
-          "link": ""
+          "address": "",
+          "city": "",
+          "email": "",
+          "link": "",
+          "notes": "Contact indicated no further info needed and wished luck.",
+          "reason": "",
+          "question": "",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
         }
       ],
-      "response": "Hi Luke,\n\nThank you for your assistance. I appreciate your help with the information on 135 Trade Center Court.\n\nThanks",
+      "response": "Thanks Luke \u2014 appreciate it. If anything changes on 135 Trade Center Court (availability, specs, or pricing), please keep me posted.\n\nThanks",
+      "notes": "",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "client_asks_requirements",
+      "passed": true,
+      "api_time_ms": 1585,
+      "updates": [],
+      "events": [
+        {
+          "type": "needs_user_input",
+          "address": "",
+          "city": "",
+          "email": "",
+          "link": "",
+          "notes": "",
+          "reason": "client_question",
+          "question": "What size space does your client need? And what's their timeline for moving in?",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
+        }
+      ],
+      "response": null,
+      "notes": "",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "scheduling_request",
+      "passed": true,
+      "api_time_ms": 2015,
+      "updates": [],
+      "events": [
+        {
+          "type": "needs_user_input",
+          "address": "",
+          "city": "",
+          "email": "",
+          "link": "",
+          "notes": "",
+          "reason": "scheduling",
+          "question": "Scott asked if you can come by Tuesday at 2pm for a tour, or if Wednesday morning works better.",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
+        }
+      ],
+      "response": null,
+      "notes": "",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "negotiation_attempt",
+      "passed": true,
+      "api_time_ms": 3124,
+      "updates": [],
+      "events": [
+        {
+          "type": "needs_user_input",
+          "address": "",
+          "city": "",
+          "email": "",
+          "link": "",
+          "notes": "",
+          "reason": "negotiation",
+          "question": "The landlord is firm at $8.50/SF, but could potentially do $7.75/SF if your client commits to a 5-year term instead of 3. Would they consider that?",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
+        }
+      ],
+      "response": null,
+      "notes": "landlord firm at 8.50/SF \u2022 potential 7.75/SF with 5-year term (vs 3-year)",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "identity_question",
+      "passed": true,
+      "api_time_ms": 1594,
+      "updates": [],
+      "events": [
+        {
+          "type": "needs_user_input",
+          "address": "",
+          "city": "",
+          "email": "",
+          "link": "",
+          "notes": "",
+          "reason": "confidential",
+          "question": "Can you tell me who your client is? What company are they with and what do they do?",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
+        }
+      ],
+      "response": null,
+      "notes": "",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "legal_contract_question",
+      "passed": true,
+      "api_time_ms": 2291,
+      "updates": [],
+      "events": [
+        {
+          "type": "needs_user_input",
+          "address": "",
+          "city": "",
+          "email": "",
+          "link": "",
+          "notes": "",
+          "reason": "legal_contract",
+          "question": "Broker is requesting an LOI and proposed terms (lease term, preferred start date, and any TI requirements) to move forward."
+        }
+      ],
+      "response": null,
+      "notes": "broker requesting LOI \u2022 needs proposed lease term \u2022 preferred start date \u2022 TI requirements",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "mixed_info_and_question",
+      "passed": true,
+      "api_time_ms": 5321,
+      "updates": [
+        {
+          "column": "Total SF",
+          "value": "18000",
+          "confidence": 0.95,
+          "reason": "Luke stated: 'The space is 18,000 SF.'"
+        },
+        {
+          "column": "Ceiling Ht",
+          "value": "24",
+          "confidence": 0.95,
+          "reason": "Luke stated: '24' clear height.'"
+        },
+        {
+          "column": "Docks",
+          "value": "3",
+          "confidence": 0.95,
+          "reason": "Luke stated: 'We have 3 docks.'"
+        },
+        {
+          "column": "Drive Ins",
+          "value": "1",
+          "confidence": 0.95,
+          "reason": "Luke stated: '1 drive-in.'"
+        }
+      ],
+      "events": [
+        {
+          "type": "needs_user_input",
+          "address": "",
+          "city": "",
+          "email": "",
+          "link": "",
+          "notes": "",
+          "reason": "client_question",
+          "question": "What's your client's budget? And do they need heavy power or standard?",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
+        }
+      ],
+      "response": null,
+      "notes": "",
+      "issues": [],
+      "warnings": []
+    },
+    {
+      "name": "budget_question",
+      "passed": true,
+      "api_time_ms": 2164,
+      "updates": [],
+      "events": [
+        {
+          "type": "needs_user_input",
+          "address": "",
+          "city": "",
+          "email": "",
+          "link": "",
+          "notes": "",
+          "reason": "client_question",
+          "question": "Before I do, what's the budget range your client is working with? Just want to make sure this is in their price range.",
+          "suggestedContact": "",
+          "suggestedEmail": "",
+          "suggestedPhone": ""
+        }
+      ],
+      "response": null,
+      "notes": "",
       "issues": [],
       "warnings": []
     }

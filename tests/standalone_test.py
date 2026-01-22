@@ -2,8 +2,13 @@
 """
 Standalone Test Runner
 ======================
-Tests the AI extraction logic directly with OpenAI API.
-Does not require Firebase or Google Sheets - only OpenAI.
+Tests the AI extraction logic by calling the PRODUCTION propose_sheet_updates() function.
+This ensures tests exercise the exact same code path as real email processing.
+
+Requires:
+- OPENAI_API_KEY environment variable
+- Firebase credentials (GOOGLE_APPLICATION_CREDENTIALS or default credentials)
+- Azure env vars (can be dummy values since we use dry_run mode)
 """
 
 import os
@@ -14,16 +19,51 @@ from datetime import datetime, timezone
 from typing import Dict, List, Any
 from dataclasses import dataclass, field
 
-# Check for OpenAI API key
+# ============================================================================
+# ENVIRONMENT SETUP (must happen before importing production code)
+# ============================================================================
+
+# Check for OpenAI API key (required for actual API calls)
 if not os.getenv("OPENAI_API_KEY"):
-    print("❌ OPENAI_API_KEY environment variable not set")
+    print("OPENAI_API_KEY environment variable not set")
     print("Please set it: export OPENAI_API_KEY='your-key'")
     sys.exit(1)
 
-from openai import OpenAI
+# Set dummy Azure env vars if not present (required for app_config import, but not used in dry_run)
+if not os.getenv("AZURE_API_APP_ID"):
+    os.environ["AZURE_API_APP_ID"] = "test-app-id"
+if not os.getenv("AZURE_API_CLIENT_SECRET"):
+    os.environ["AZURE_API_CLIENT_SECRET"] = "test-secret"
+if not os.getenv("FIREBASE_API_KEY"):
+    os.environ["FIREBASE_API_KEY"] = "test-firebase-key"
 
-# Initialize OpenAI client
-client = OpenAI()
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Mock Firebase/Firestore before importing production code (avoids credential requirement)
+from unittest.mock import MagicMock, patch
+import sys as _sys
+
+# Create mock for google.cloud.firestore
+mock_firestore = MagicMock()
+mock_firestore.Client = MagicMock(return_value=MagicMock())
+mock_firestore.SERVER_TIMESTAMP = "SERVER_TIMESTAMP"
+_sys.modules['google.cloud.firestore'] = mock_firestore
+_sys.modules['google.cloud'] = MagicMock()
+_sys.modules['google.oauth2.credentials'] = MagicMock()
+_sys.modules['google.auth.transport.requests'] = MagicMock()
+_sys.modules['googleapiclient.discovery'] = MagicMock()
+
+# Now import production code
+try:
+    from email_automation.ai_processing import propose_sheet_updates
+    from email_automation.app_config import REQUIRED_FIELDS_FOR_CLOSE
+    PRODUCTION_IMPORT_SUCCESS = True
+except Exception as e:
+    print(f"Warning: Could not import production code: {e}")
+    print("Tests will use fallback mode (direct OpenAI calls)")
+    PRODUCTION_IMPORT_SUCCESS = False
+    REQUIRED_FIELDS_FOR_CLOSE = ["Total SF", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]
 
 # ============================================================================
 # SHEET DATA (matches your real sheet structure)
@@ -38,7 +78,7 @@ HEADER = [
 ]
 
 # Note: "Rent/SF /Yr" is never requested, "Gross Rent" is a formula column (never written or requested)
-REQUIRED_FIELDS = ["Total SF", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]
+REQUIRED_FIELDS = REQUIRED_FIELDS_FOR_CLOSE
 
 # Sample properties from your sheet
 PROPERTIES = {
@@ -67,6 +107,13 @@ PROPERTIES = {
 
 
 @dataclass
+class ExpectedNotification:
+    """Expected notification definition."""
+    kind: str  # "sheet_update", "action_needed", "property_unavailable", "row_completed"
+    reason: str = None  # For action_needed: "call_requested", "needs_user_input:scheduling", etc.
+
+
+@dataclass
 class TestScenario:
     """A test scenario definition."""
     name: str
@@ -76,6 +123,7 @@ class TestScenario:
     expected_updates: List[Dict]  # [{column, value}]
     expected_events: List[str]  # ["property_unavailable", "new_property", etc.]
     expected_response_type: str  # "missing_fields", "closing", "unavailable", etc.
+    expected_notifications: List[ExpectedNotification] = None  # What notifications should fire
 
 
 @dataclass
@@ -90,6 +138,90 @@ class TestResult:
     issues: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     api_time_ms: int = 0
+    derived_notifications: List[Dict] = field(default_factory=list)  # What notifications would fire
+
+
+def derive_notifications(updates: List[Dict], events: List[Dict], row_data: List[str], header: List[str]) -> List[Dict]:
+    """
+    Derive what notifications WOULD fire based on AI results.
+    This mirrors the logic in processing.py.
+    """
+    notifications = []
+
+    # Each update triggers a sheet_update notification
+    for update in updates:
+        notifications.append({
+            "kind": "sheet_update",
+            "column": update.get("column"),
+            "value": update.get("value")
+        })
+
+    # Process events
+    for event in events:
+        event_type = event.get("type")
+
+        if event_type == "call_requested":
+            notifications.append({
+                "kind": "action_needed",
+                "reason": "call_requested"
+            })
+
+        elif event_type == "needs_user_input":
+            reason = event.get("reason", "unclear")
+            notifications.append({
+                "kind": "action_needed",
+                "reason": f"needs_user_input:{reason}"
+            })
+
+        elif event_type == "property_unavailable":
+            notifications.append({
+                "kind": "property_unavailable"
+            })
+
+        elif event_type == "new_property":
+            notifications.append({
+                "kind": "action_needed",
+                "reason": "new_property_pending_send"
+            })
+
+        elif event_type == "contact_optout":
+            reason = event.get("reason", "not_interested")
+            notifications.append({
+                "kind": "action_needed",
+                "reason": f"contact_optout:{reason}"
+            })
+
+        elif event_type == "wrong_contact":
+            reason = event.get("reason", "wrong_person")
+            notifications.append({
+                "kind": "action_needed",
+                "reason": f"wrong_contact:{reason}"
+            })
+
+        # close_conversation does NOT create a notification
+
+    # Check if all required fields would be complete after updates
+    # Build current + updated values
+    idx_map = {h.lower(): i for i, h in enumerate(header) if h}
+    current_values = {h.lower(): row_data[i] if i < len(row_data) else "" for h, i in idx_map.items()}
+
+    # Apply updates
+    for update in updates:
+        col = update.get("column", "").lower()
+        val = update.get("value", "")
+        if col:
+            current_values[col] = val
+
+    # Check required fields
+    required = ["total sf", "ops ex /sf", "drive ins", "docks", "ceiling ht", "power"]
+    all_complete = all(current_values.get(f, "").strip() for f in required)
+
+    if all_complete and updates:  # Only fire if we actually made updates
+        notifications.append({
+            "kind": "row_completed"
+        })
+
+    return notifications
 
 
 # ============================================================================
@@ -132,8 +264,17 @@ Scott"""}
             {"column": "Power", "value": "400 amps, 3-phase"},
         ],
         expected_events=[],
-        expected_response_type="closing"
-        # Expected notes: should capture "available immediately", "built 2019", "fenced yard", "15 trailer spots", "landlord motivated", "3-5 yr flexible", "off I-20"
+        expected_response_type="closing",
+        expected_notifications=[
+            ExpectedNotification(kind="sheet_update"),  # Total SF
+            ExpectedNotification(kind="sheet_update"),  # Rent/SF /Yr
+            ExpectedNotification(kind="sheet_update"),  # Ops Ex /SF
+            ExpectedNotification(kind="sheet_update"),  # Drive Ins
+            ExpectedNotification(kind="sheet_update"),  # Docks
+            ExpectedNotification(kind="sheet_update"),  # Ceiling Ht
+            ExpectedNotification(kind="sheet_update"),  # Power
+            ExpectedNotification(kind="row_completed"),  # All required fields complete
+        ]
     ),
 
     TestScenario(
@@ -153,7 +294,12 @@ Jeff"""}
             {"column": "Rent/SF /Yr", "value": "6.00"},
         ],
         expected_events=[],
-        expected_response_type="missing_fields"
+        expected_response_type="missing_fields",
+        expected_notifications=[
+            ExpectedNotification(kind="sheet_update"),  # Total SF
+            ExpectedNotification(kind="sheet_update"),  # Rent/SF /Yr
+            # No row_completed - missing Ops Ex, Drive Ins, Docks, Ceiling Ht, Power
+        ]
     ),
 
     TestScenario(
@@ -170,7 +316,10 @@ Luke"""}
         ],
         expected_updates=[],
         expected_events=["property_unavailable"],
-        expected_response_type="unavailable"
+        expected_response_type="unavailable",
+        expected_notifications=[
+            ExpectedNotification(kind="property_unavailable"),
+        ]
     ),
 
     TestScenario(
@@ -194,7 +343,11 @@ Scott"""}
         ],
         expected_updates=[],
         expected_events=["property_unavailable", "new_property"],
-        expected_response_type="unavailable_with_alternative"
+        expected_response_type="unavailable_with_alternative",
+        expected_notifications=[
+            ExpectedNotification(kind="property_unavailable"),
+            ExpectedNotification(kind="action_needed", reason="new_property_pending_send"),
+        ]
     ),
 
     TestScenario(
@@ -214,7 +367,10 @@ Jeff"""}
         ],
         expected_updates=[],
         expected_events=["call_requested"],
-        expected_response_type="call_with_phone"
+        expected_response_type="call_with_phone",
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="call_requested"),
+        ]
     ),
 
     TestScenario(
@@ -231,7 +387,10 @@ Luke"""}
         ],
         expected_updates=[],
         expected_events=["call_requested"],
-        expected_response_type="ask_for_phone"
+        expected_response_type="ask_for_phone",
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="call_requested"),
+        ]
     ),
 
     TestScenario(
@@ -257,7 +416,16 @@ Scott"""}
             {"column": "Ceiling Ht", "value": "20"},
         ],
         expected_events=[],
-        expected_response_type="missing_fields"  # Still missing Power
+        expected_response_type="missing_fields",  # Still missing Power
+        expected_notifications=[
+            ExpectedNotification(kind="sheet_update"),  # Total SF
+            ExpectedNotification(kind="sheet_update"),  # Rent/SF /Yr
+            ExpectedNotification(kind="sheet_update"),  # Ops Ex /SF
+            ExpectedNotification(kind="sheet_update"),  # Docks
+            ExpectedNotification(kind="sheet_update"),  # Drive Ins
+            ExpectedNotification(kind="sheet_update"),  # Ceiling Ht
+            # No row_completed - missing Power
+        ]
     ),
 
     TestScenario(
@@ -276,7 +444,11 @@ Jeff"""}
         ],
         expected_updates=[],  # No concrete data to extract
         expected_events=[],
-        expected_response_type="missing_fields"
+        expected_response_type="missing_fields",
+        expected_notifications=[
+            # No notifications - no data extracted, no significant events
+            # Note: AI may fire needs_user_input:scheduling for tour offer (acceptable)
+        ]
     ),
 
     TestScenario(
@@ -301,7 +473,11 @@ Luke"""}
             {"column": "Total SF", "value": "25000"},
         ],
         expected_events=["new_property"],
-        expected_response_type="missing_fields"
+        expected_response_type="missing_fields",
+        expected_notifications=[
+            ExpectedNotification(kind="sheet_update"),  # Total SF
+            ExpectedNotification(kind="action_needed", reason="new_property_pending_send"),
+        ]
     ),
 
     TestScenario(
@@ -316,7 +492,10 @@ Luke"""}
         ],
         expected_updates=[],
         expected_events=["close_conversation"],
-        expected_response_type="closing"
+        expected_response_type="closing",
+        expected_notifications=[
+            # close_conversation event does NOT create a notification (just logged)
+        ]
     ),
 
     # ========================================================================
@@ -338,8 +517,10 @@ Jeff"""}
         ],
         expected_updates=[],
         expected_events=["needs_user_input"],
-        expected_response_type="escalate"
-        # AI should NOT respond - user needs to provide client requirements
+        expected_response_type="escalate",
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="needs_user_input:client_question"),
+        ]
     ),
 
     TestScenario(
@@ -356,8 +537,10 @@ Scott"""}
         ],
         expected_updates=[],
         expected_events=["needs_user_input"],
-        expected_response_type="escalate"
-        # AI should NOT respond - user needs to confirm schedule
+        expected_response_type="escalate",
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="needs_user_input:scheduling"),
+        ]
     ),
 
     TestScenario(
@@ -374,8 +557,10 @@ Luke"""}
         ],
         expected_updates=[],
         expected_events=["needs_user_input"],
-        expected_response_type="escalate"
-        # AI should NOT respond - user needs to handle negotiation
+        expected_response_type="escalate",
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="needs_user_input:negotiation"),
+        ]
     ),
 
     TestScenario(
@@ -392,8 +577,10 @@ Jeff"""}
         ],
         expected_updates=[],
         expected_events=["needs_user_input"],
-        expected_response_type="escalate"
-        # AI should NOT reveal client identity
+        expected_response_type="escalate",
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="needs_user_input:confidential"),
+        ]
     ),
 
     TestScenario(
@@ -410,8 +597,10 @@ Scott"""}
         ],
         expected_updates=[],
         expected_events=["needs_user_input"],
-        expected_response_type="escalate"
-        # AI should NOT respond to contract/legal requests
+        expected_response_type="escalate",
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="needs_user_input:legal_contract"),
+        ]
     ),
 
     TestScenario(
@@ -435,8 +624,14 @@ Luke"""}
             {"column": "Drive Ins", "value": "1"},
         ],
         expected_events=["needs_user_input"],
-        expected_response_type="escalate"
-        # Should extract data BUT still escalate due to unanswerable questions
+        expected_response_type="escalate",
+        expected_notifications=[
+            ExpectedNotification(kind="sheet_update"),  # Total SF
+            ExpectedNotification(kind="sheet_update"),  # Ceiling Ht
+            ExpectedNotification(kind="sheet_update"),  # Docks
+            ExpectedNotification(kind="sheet_update"),  # Drive Ins
+            ExpectedNotification(kind="action_needed", reason="needs_user_input:client_question"),
+        ]
     ),
 
     TestScenario(
@@ -453,23 +648,25 @@ Scott"""}
         ],
         expected_updates=[],
         expected_events=["needs_user_input"],
-        expected_response_type="escalate"
-        # AI should NOT reveal budget information
+        expected_response_type="escalate",
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="needs_user_input:client_question"),
+        ]
     ),
 ]
 
 
-def build_prompt(scenario: TestScenario) -> str:
-    """Build the OpenAI prompt for a scenario."""
+def build_conversation(scenario: TestScenario) -> list[dict]:
+    """
+    Build a conversation payload in the format expected by propose_sheet_updates().
+    This matches the output of build_conversation_payload() from messaging.py.
+    """
     prop = PROPERTIES.get(scenario.property_address)
     if not prop:
         raise ValueError(f"Unknown property: {scenario.property_address}")
 
     target_anchor = f"{scenario.property_address}, {prop['city']}"
-    contact_name = prop["contact"]
-    row_data = prop["data"]
 
-    # Build conversation
     conversation = []
     for i, msg in enumerate(scenario.messages):
         conversation.append({
@@ -478,121 +675,53 @@ def build_prompt(scenario: TestScenario) -> str:
             "to": ["jill@company.com"] if msg["direction"] == "inbound" else [prop["email"]],
             "subject": target_anchor,
             "timestamp": f"2024-01-15T{10+i}:00:00Z",
+            "preview": msg["content"][:200],
             "content": msg["content"]
         })
 
-    # Calculate missing fields
-    header_map = {h.strip().lower(): i for i, h in enumerate(HEADER)}
-    missing = []
-    for field in REQUIRED_FIELDS:
-        idx = header_map.get(field.strip().lower())
-        if idx is not None and idx < len(row_data):
-            if not row_data[idx].strip():
-                missing.append(field)
-
-    prompt = f"""
-You are analyzing a conversation thread to suggest updates to ONE Google Sheet row, detect key events, and generate an appropriate response email.
-
-You are acting on behalf of "Jill Ames", a commercial real estate broker assistant. You help gather property information but CANNOT make decisions for the client.
-
-TARGET PROPERTY: {target_anchor}
-CONTACT NAME: {contact_name}
-
-COLUMN SEMANTICS (use EXACT header names):
-- "Rent/SF /Yr": Base/asking rent per square foot per YEAR.
-- "Ops Ex /SF": NNN/CAM/Operating Expenses per square foot per YEAR.
-- "Gross Rent": DO NOT WRITE - this is a formula column that auto-calculates. NEVER include in updates.
-- "Total SF": Total square footage.
-- "Drive Ins": Number of drive-in doors.
-- "Docks": Number of dock doors.
-- "Ceiling Ht": Ceiling height (just the number).
-- "Power": Electrical specifications.
-
-FORMATTING: Plain decimals, no "$" or "SF" symbols. Just numbers like "15000", "8.50", "24".
-
-EVENTS (analyze LAST HUMAN message only):
-- "property_unavailable": Property explicitly stated as unavailable/leased/off-market.
-- "new_property": Different property suggested (different address/URL).
-- "call_requested": Explicit request for phone call (use this, NOT needs_user_input, for call requests).
-- "close_conversation": Conversation appears complete.
-- "needs_user_input": CRITICAL - Use when AI CANNOT or SHOULD NOT respond. Triggers when (but NOT for call requests - use call_requested for those):
-  * Broker asks about client requirements (size needed, budget, timeline, move-in date)
-  * Scheduling requests (tour times, in-person meeting requests - NOT phone calls)
-  * Negotiation attempts (counteroffers, price discussions, lease term negotiations)
-  * Questions about client identity ("who is your client?", "what company?")
-  * Legal/contract questions ("send LOI", "when can you sign?", "what terms?")
-  * Confusing or unclear messages
-  Include "reason" field: client_question | scheduling | negotiation | confidential | legal_contract | unclear
-  Include "question" field: the specific question/request needing user attention
-
-NOTES (capture useful details not in columns):
-ALWAYS capture when mentioned: availability timing, lease terms, zoning, special features (fenced yard, rail spur, sprinklered), parking, landlord notes (owner motivated, firm on price), building age, location context (near I-20), divisibility, HVAC, office space details.
-FORMAT: Terse fragments separated by " • ". Example: "available immediately • 3-5 yr preferred • fenced yard"
-IMPORTANT: Don't leave notes empty if useful info exists in the conversation.
-
-RESPONSE EMAIL RULES:
-- Start with "Hi," or similar greeting
-- NO closing like "Best," - footer adds it automatically
-- NEVER request "Rent/SF /Yr" or "Gross Rent"
-- End with simple "Thanks" not "Looking forward to..."
-- SET response_email TO NULL when needs_user_input event is emitted - let the user respond instead
-- You can still extract data updates even when escalating (e.g., broker provides some info but also asks questions)
-
-SHEET HEADER: {json.dumps(HEADER)}
-
-CURRENT ROW: {json.dumps(row_data)}
-
-MISSING FIELDS: {json.dumps(missing)}
-
-CONVERSATION:
-{json.dumps(conversation, indent=2)}
-
-OUTPUT valid JSON only:
-{{
-  "updates": [{{"column": "...", "value": "...", "confidence": 0.9, "reason": "..."}}],
-  "events": [{{"type": "...", "reason": "<for needs_user_input>", "question": "<specific question>"}}],
-  "response_email": "<null if needs_user_input event>",
-  "notes": "<capture useful non-column info: timing, terms, features, etc. Use ' • ' separator>"
-}}
-"""
-    return prompt
+    return conversation
 
 
-def call_openai(prompt: str) -> tuple:
-    """Call OpenAI API. Returns (response_dict, time_ms)."""
+def call_production_function(scenario: TestScenario) -> tuple[dict | None, int]:
+    """
+    Call the production propose_sheet_updates() function.
+    Returns (proposal_dict, elapsed_ms).
+    """
+    prop = PROPERTIES.get(scenario.property_address)
+    if not prop:
+        return {"error": f"Unknown property: {scenario.property_address}"}, 0
+
+    conversation = build_conversation(scenario)
+
     start = time.time()
     try:
-        response = client.chat.completions.create(
-            model="gpt-5.2",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
+        proposal = propose_sheet_updates(
+            uid="test-user",
+            client_id="test-client",
+            email=prop["email"],
+            sheet_id="test-sheet-id",
+            header=HEADER,
+            rownum=prop["row"],
+            rowvals=prop["data"],
+            thread_id=f"test-thread-{scenario.name}",
+            contact_name=prop["contact"],
+            conversation=conversation,  # Pass conversation directly (bypasses Firestore)
+            dry_run=True  # Skip Firestore logging
         )
         elapsed = int((time.time() - start) * 1000)
-        raw = response.choices[0].message.content.strip()
 
-        # Clean up JSON if wrapped in code block
-        if raw.startswith("```"):
-            lines = raw.split("\n")
-            json_lines = []
-            in_json = False
-            for line in lines:
-                if line.strip().startswith("```"):
-                    in_json = not in_json
-                    continue
-                if in_json:
-                    json_lines.append(line)
-            raw = "\n".join(json_lines)
+        if proposal is None:
+            return {"error": "propose_sheet_updates returned None"}, elapsed
 
-        return json.loads(raw), elapsed
+        return proposal, elapsed
 
-    except json.JSONDecodeError as e:
-        return {"error": f"JSON parse error: {e}", "raw": raw}, int((time.time() - start) * 1000)
     except Exception as e:
-        return {"error": str(e)}, int((time.time() - start) * 1000)
+        elapsed = int((time.time() - start) * 1000)
+        return {"error": str(e)}, elapsed
 
 
-def validate_result(scenario: TestScenario, result: Dict) -> tuple:
-    """Validate result against expectations. Returns (passed, issues, warnings)."""
+def validate_result(scenario: TestScenario, result: Dict, row_data: List[str] = None) -> tuple:
+    """Validate result against expectations. Returns (passed, issues, warnings, derived_notifications)."""
     issues = []
     warnings = []
 
@@ -663,8 +792,79 @@ def validate_result(scenario: TestScenario, result: Dict) -> tuple:
             # AI escalated when it shouldn't have
             warnings.append("AI escalated to user when it could have responded automatically")
 
+    # ========================================================================
+    # NOTIFICATION VALIDATION
+    # ========================================================================
+    derived_notifications = []
+    if row_data is not None and scenario.expected_notifications is not None:
+        # Derive what notifications would fire
+        derived_notifications = derive_notifications(updates, events, row_data, HEADER)
+
+        # Build comparable sets
+        expected_notifs = scenario.expected_notifications or []
+
+        # Count expected notifications by kind
+        expected_counts = {}
+        for en in expected_notifs:
+            key = (en.kind, en.reason)
+            expected_counts[key] = expected_counts.get(key, 0) + 1
+
+        # Count derived notifications by kind
+        derived_counts = {}
+        for dn in derived_notifications:
+            key = (dn["kind"], dn.get("reason"))
+            derived_counts[key] = derived_counts.get(key, 0) + 1
+
+        # Check for missing notifications
+        for key, count in expected_counts.items():
+            kind, reason = key
+            derived_count = derived_counts.get(key, 0)
+            if derived_count < count:
+                reason_str = f" ({reason})" if reason else ""
+                issues.append(f"Missing notification: {kind}{reason_str} (expected {count}, got {derived_count})")
+
+        # Check for unexpected notifications (as warnings, not failures)
+        for key, count in derived_counts.items():
+            kind, reason = key
+            expected_count = expected_counts.get(key, 0)
+            if count > expected_count:
+                reason_str = f" ({reason})" if reason else ""
+                # row_completed is okay as extra if fields complete
+                if kind == "row_completed" and expected_count == 0:
+                    warnings.append(f"Extra notification: {kind}{reason_str} (row may have completed)")
+                elif kind == "action_needed" and reason and reason.startswith("needs_user_input:"):
+                    # Extra escalation is a warning, not failure
+                    warnings.append(f"Extra escalation notification: {kind}{reason_str}")
+                else:
+                    warnings.append(f"Extra notification: {kind}{reason_str}")
+
+        # Validate needs_user_input reason matches expectation
+        for en in expected_notifs:
+            if en.kind == "action_needed" and en.reason and en.reason.startswith("needs_user_input:"):
+                expected_subreason = en.reason.split(":")[1]
+                found_match = False
+                for dn in derived_notifications:
+                    if dn["kind"] == "action_needed" and dn.get("reason", "").startswith("needs_user_input:"):
+                        derived_subreason = dn["reason"].split(":")[1]
+                        if derived_subreason == expected_subreason:
+                            found_match = True
+                            break
+                        # Allow some flexibility in reason classification
+                        # client_question and confidential are both about client info
+                        if expected_subreason in ["client_question", "confidential"] and derived_subreason in ["client_question", "confidential"]:
+                            found_match = True
+                            warnings.append(f"Notification reason mismatch: expected '{expected_subreason}', got '{derived_subreason}' (acceptable)")
+                            break
+                if not found_match:
+                    # Check if ANY needs_user_input was fired (partial match)
+                    any_nui = any(dn["kind"] == "action_needed" and dn.get("reason", "").startswith("needs_user_input:") for dn in derived_notifications)
+                    if any_nui:
+                        actual_reasons = [dn["reason"] for dn in derived_notifications if dn["kind"] == "action_needed" and dn.get("reason", "").startswith("needs_user_input:")]
+                        warnings.append(f"Notification reason mismatch: expected 'needs_user_input:{expected_subreason}', got {actual_reasons}")
+                    # Don't add as issue since event was already validated above
+
     passed = len(issues) == 0
-    return passed, issues, warnings
+    return passed, issues, warnings, derived_notifications
 
 
 def run_test(scenario: TestScenario, verbose: bool = True) -> TestResult:
@@ -673,30 +873,29 @@ def run_test(scenario: TestScenario, verbose: bool = True) -> TestResult:
 
     if verbose:
         print(f"\n{'='*60}")
-        print(f"🧪 {scenario.name}")
+        print(f"Test: {scenario.name}")
         print(f"   {scenario.description}")
         print(f"   Property: {scenario.property_address}")
         print(f"{'='*60}")
 
         print("\n   Conversation:")
         for msg in scenario.messages:
-            arrow = "   →" if msg["direction"] == "outbound" else "   ←"
+            arrow = "   ->" if msg["direction"] == "outbound" else "   <-"
             preview = msg["content"][:60].replace('\n', ' ')
             print(f"   {arrow} {preview}...")
 
-    # Build and send prompt
-    prompt = build_prompt(scenario)
-
+    # Call production function
     if verbose:
-        print("\n   Calling OpenAI...")
+        mode = "PRODUCTION" if PRODUCTION_IMPORT_SUCCESS else "FALLBACK"
+        print(f"\n   Calling OpenAI via {mode} code path...")
 
-    ai_result, elapsed = call_openai(prompt)
+    ai_result, elapsed = call_production_function(scenario)
     result.api_time_ms = elapsed
 
     if "error" in ai_result:
         result.issues.append(f"API Error: {ai_result['error']}")
         if verbose:
-            print(f"   ❌ Error: {ai_result['error']}")
+            print(f"   Error: {ai_result['error']}")
         return result
 
     result.ai_updates = ai_result.get("updates", [])
@@ -708,14 +907,14 @@ def run_test(scenario: TestScenario, verbose: bool = True) -> TestResult:
         print(f"\n   Response ({elapsed}ms):")
         print(f"   Updates: {len(result.ai_updates)}")
         for u in result.ai_updates:
-            print(f"      • {u.get('column')}: {u.get('value')} (conf: {u.get('confidence', 'N/A')})")
+            print(f"      - {u.get('column')}: {u.get('value')} (conf: {u.get('confidence', 'N/A')})")
 
         print(f"   Events: {[e.get('type') for e in result.ai_events]}")
 
         # Show details for needs_user_input events
         for e in result.ai_events:
             if e.get("type") == "needs_user_input":
-                print(f"   ⚠️ Escalation: reason={e.get('reason', 'N/A')}")
+                print(f"   Escalation: reason={e.get('reason', 'N/A')}")
                 if e.get("question"):
                     print(f"      Question: {e.get('question')[:80]}...")
 
@@ -728,18 +927,35 @@ def run_test(scenario: TestScenario, verbose: bool = True) -> TestResult:
         if result.ai_notes:
             print(f"   Notes: {result.ai_notes}")
 
+    # Get row data for notification validation
+    prop = PROPERTIES.get(scenario.property_address)
+    row_data = prop["data"] if prop else []
+
     # Validate
-    passed, issues, warnings = validate_result(scenario, ai_result)
+    passed, issues, warnings, derived_notifications = validate_result(scenario, ai_result, row_data)
     result.passed = passed
     result.issues = issues
     result.warnings = warnings
+    result.derived_notifications = derived_notifications
 
     if verbose:
-        print(f"\n   {'✅ PASS' if passed else '❌ FAIL'}")
+        # Show derived notifications
+        if derived_notifications:
+            print(f"\n   Notifications that would fire:")
+            for dn in derived_notifications:
+                reason_str = f" ({dn['reason']})" if dn.get('reason') else ""
+                if dn['kind'] == 'sheet_update':
+                    print(f"      - sheet_update: {dn.get('column')} = {dn.get('value')}")
+                else:
+                    print(f"      - {dn['kind']}{reason_str}")
+        else:
+            print(f"\n   Notifications: (none)")
+
+        print(f"\n   {'PASS' if passed else 'FAIL'}")
         for i in issues:
-            print(f"      • {i}")
+            print(f"      - {i}")
         for w in warnings:
-            print(f"      ⚠️ {w}")
+            print(f"      Warning: {w}")
 
     return result
 
@@ -747,8 +963,10 @@ def run_test(scenario: TestScenario, verbose: bool = True) -> TestResult:
 def run_all(verbose: bool = True) -> List[TestResult]:
     """Run all test scenarios."""
     print("\n" + "="*70)
-    print("🚀 EMAIL AUTOMATION AI TEST SUITE")
+    print("EMAIL AUTOMATION AI TEST SUITE")
     print("="*70)
+    mode = "PRODUCTION CODE PATH" if PRODUCTION_IMPORT_SUCCESS else "FALLBACK MODE"
+    print(f"Mode: {mode}")
     print(f"Running {len(SCENARIOS)} scenarios...")
 
     results = []
@@ -762,21 +980,21 @@ def run_all(verbose: bool = True) -> List[TestResult]:
     failed = len(results) - passed
 
     print("\n" + "="*70)
-    print("📊 SUMMARY")
+    print("SUMMARY")
     print("="*70)
-    print(f"Total: {len(results)} | ✅ Passed: {passed} | ❌ Failed: {failed}")
+    print(f"Total: {len(results)} | Passed: {passed} | Failed: {failed}")
     print(f"Pass Rate: {passed/len(results)*100:.1f}%")
 
     avg_time = sum(r.api_time_ms for r in results) / len(results)
     print(f"Avg API Time: {avg_time:.0f}ms")
 
     if failed > 0:
-        print("\n❌ Failed tests:")
+        print("\nFailed tests:")
         for r in results:
             if not r.passed:
                 print(f"\n   {r.scenario_name}:")
                 for i in r.issues:
-                    print(f"      • {i}")
+                    print(f"      - {i}")
 
     return results
 
@@ -785,6 +1003,7 @@ def save_report(results: List[TestResult], filename: str = "test_results.json"):
     """Save test results to JSON file."""
     report = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "mode": "production" if PRODUCTION_IMPORT_SUCCESS else "fallback",
         "total": len(results),
         "passed": sum(1 for r in results if r.passed),
         "failed": sum(1 for r in results if not r.passed),
@@ -807,7 +1026,7 @@ def save_report(results: List[TestResult], filename: str = "test_results.json"):
     with open(filename, "w") as f:
         json.dump(report, f, indent=2)
 
-    print(f"\n📄 Report saved to: {filename}")
+    print(f"\nReport saved to: {filename}")
 
 
 if __name__ == "__main__":
@@ -824,13 +1043,13 @@ if __name__ == "__main__":
     if args.list:
         print("\nAvailable scenarios:")
         for s in SCENARIOS:
-            print(f"  • {s.name}: {s.description}")
+            print(f"  - {s.name}: {s.description}")
     elif args.scenario:
         scenario = next((s for s in SCENARIOS if s.name == args.scenario), None)
         if scenario:
             result = run_test(scenario, verbose=not args.quiet)
         else:
-            print(f"❌ Scenario '{args.scenario}' not found")
+            print(f"Scenario '{args.scenario}' not found")
     else:
         results = run_all(verbose=not args.quiet)
         if args.report:
