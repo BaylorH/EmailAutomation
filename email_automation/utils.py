@@ -182,27 +182,69 @@ def _subject_to_address_city(subject: str) -> tuple[str, str]:
     city = parts[1] if len(parts) > 1 else ""
     return addr, city
 
+# Cache for uploaded image URLs - populated on first use, persists for process lifetime
+_CACHED_IMAGE_URLS = {}
+
 def _upload_logo_to_drive(image_filename: str = "logo.png") -> str:
-    """Upload image to Google Drive and return public direct image URL."""
+    """
+    Get or upload image to Google Drive and return public direct image URL.
+
+    1. Checks in-memory cache first (fastest)
+    2. Searches Drive for existing file by name (avoids duplicates)
+    3. Uploads new file only if not found
+    """
+    global _CACHED_IMAGE_URLS
+
+    # Check in-memory cache first - return immediately if we have a URL
+    if image_filename in _CACHED_IMAGE_URLS:
+        return _CACHED_IMAGE_URLS[image_filename]
+
     try:
         from .file_handling import ensure_drive_folder
         from .clients import _helper_google_creds
         from googleapiclient.discovery import build
+
+        creds = _helper_google_creds()
+        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+        folder_id = ensure_drive_folder()
+
+        # Search for existing file by name in our folder
+        query = f"name = '{image_filename}' and trashed = false"
+        if folder_id:
+            query += f" and '{folder_id}' in parents"
+
+        results = drive.files().list(
+            q=query,
+            fields="files(id, webViewLink)",
+            pageSize=1
+        ).execute()
+
+        existing_files = results.get("files", [])
+
+        if existing_files:
+            # File already exists - use it
+            file_id = existing_files[0].get("id")
+            direct_link = f"https://drive.google.com/uc?export=view&id={file_id}"
+            _CACHED_IMAGE_URLS[image_filename] = direct_link
+            print(f"✅ {image_filename} found in Drive (reusing): {direct_link}")
+            return direct_link
+
+        # File doesn't exist - upload it
         from googleapiclient.http import MediaIoBaseUpload
         import io
-        
+
         # Get the directory of this file
         current_dir = os.path.dirname(os.path.abspath(__file__))
         image_path = os.path.join(current_dir, "assets", "images", image_filename)
-        
+
         if not os.path.exists(image_path):
             print(f"⚠️ Image not found: {image_path}")
             return ""
-        
+
         # Read image file
         with open(image_path, "rb") as img_file:
             image_bytes = img_file.read()
-        
+
         # Determine MIME type from extension
         ext = os.path.splitext(image_filename)[1].lower()
         mime_types = {
@@ -212,30 +254,25 @@ def _upload_logo_to_drive(image_filename: str = "logo.png") -> str:
             '.gif': 'image/gif'
         }
         mime_type = mime_types.get(ext, 'image/png')
-        
-        # Upload to Drive with correct MIME type
-        creds = _helper_google_creds()
-        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-        
-        folder_id = ensure_drive_folder()
-        
+
+        # Upload to Drive (reuse drive client and folder_id from above)
         file_metadata = {
             "name": image_filename,
             "parents": [folder_id] if folder_id else []
         }
-        
+
         media = MediaIoBaseUpload(
             io.BytesIO(image_bytes),
             mimetype=mime_type,
             resumable=True
         )
-        
+
         file = drive.files().create(
             body=file_metadata,
             media_body=media,
             fields="id,webViewLink"
         ).execute()
-        
+
         # Make link-shareable
         drive.permissions().create(
             fileId=file.get("id"),
@@ -244,21 +281,27 @@ def _upload_logo_to_drive(image_filename: str = "logo.png") -> str:
                 "type": "anyone"
             }
         ).execute()
-        
+
         web_link = file.get("webViewLink")
-        
+
         # Convert Drive link to direct image link
         # Drive webViewLink format: https://drive.google.com/file/d/{file_id}/view
         # Direct image format: https://drive.google.com/uc?export=view&id={file_id}
         if web_link and "/file/d/" in web_link:
             file_id = web_link.split("/file/d/")[1].split("/")[0]
             direct_link = f"https://drive.google.com/uc?export=view&id={file_id}"
-            print(f"✅ {image_filename} uploaded to Drive: {direct_link}")
+            # Cache the URL for future use within this process
+            _CACHED_IMAGE_URLS[image_filename] = direct_link
+            print(f"✅ {image_filename} uploaded to Drive (cached): {direct_link}")
             return direct_link
-        
+
+        # Cache whatever we got
+        if web_link:
+            _CACHED_IMAGE_URLS[image_filename] = web_link
         return web_link or ""
     except Exception as e:
         print(f"⚠️ Failed to upload {image_filename} to Drive: {e}")
+        # Don't cache failures - allow retry on next call
         return ""
 
 def _image_to_base64(image_path: str) -> str:
