@@ -299,11 +299,11 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
     if content_type == "HTML":
         # If already HTML, wrap it properly and append footer
         # Check if content is already wrapped in HTML structure
+        footer_html = get_email_footer(user_signature, signature_mode)
         if not content.strip().startswith("<!DOCTYPE") and not content.strip().startswith("<html"):
-            # Wrap existing HTML content and add footer
-            # Add separator to prevent email clients from collapsing signature
-            footer_html = get_email_footer(user_signature, signature_mode)
-            content = f"""<!DOCTYPE html>
+            # Wrap existing HTML content and add footer (only if footer exists)
+            if footer_html:
+                content = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
@@ -320,16 +320,29 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
 </div>
 </body>
 </html>"""
-        else:
-            # Content is already wrapped, just append footer before closing body tag
-            # Insert footer before </body> tag with separator to prevent collapse
-            footer_html = get_email_footer(user_signature, signature_mode)
-            if "</body>" in content:
-                footer_with_wrapper = f'<!-- Email signature separator - prevents collapse --><div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid transparent; min-height: 1px;"><div style="margin-top: 20px;">{footer_html}</div></div>'
-                content = content.replace("</body>", footer_with_wrapper + "</body>")
             else:
-                # No body tag, just append
-                content = content + f'<!-- Email signature separator - prevents collapse --><div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid transparent; min-height: 1px;"><div style="margin-top: 20px;">{footer_html}</div></div>'
+                # No footer - just wrap in HTML structure
+                content = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+</head>
+<body style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000; margin: 0; padding: 0;">
+<div style="max-width: 600px;">
+{content}
+</div>
+</body>
+</html>"""
+        else:
+            # Content is already wrapped, only append footer if it exists
+            if footer_html:
+                if "</body>" in content:
+                    footer_with_wrapper = f'<!-- Email signature separator - prevents collapse --><div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid transparent; min-height: 1px;"><div style="margin-top: 20px;">{footer_html}</div></div>'
+                    content = content.replace("</body>", footer_with_wrapper + "</body>")
+                else:
+                    # No body tag, just append
+                    content = content + f'<!-- Email signature separator - prevents collapse --><div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid transparent; min-height: 1px;"><div style="margin-top: 20px;">{footer_html}</div></div>'
+            # If no footer, leave content as-is
     else:
         # Convert to HTML and add footer (this function now wraps in proper HTML structure)
         content = format_email_body_with_footer(content, user_signature, signature_mode)
