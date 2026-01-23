@@ -7,6 +7,13 @@ from .clients import client, _sheets_client, _fs
 from .messaging import build_conversation_payload
 from .sheets import _header_index_map, _get_first_tab_title, _col_letter
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
+from .column_config import (
+    CANONICAL_FIELDS,
+    get_default_column_config,
+    build_column_rules_prompt,
+    get_required_fields_for_close,
+    REQUIRED_FOR_CLOSE,
+)
 
 def get_row_anchor(rowvals: list[str], header: list[str]) -> str:
     """Create a brief row anchor from property address and city."""
@@ -41,13 +48,22 @@ def get_row_anchor(rowvals: list[str], header: list[str]) -> str:
     except Exception:
         return "Unknown property"
 
-def check_missing_required_fields(rowvals: list[str], header: list[str]) -> list[str]:
-    """Check which required fields are missing from the row."""
+def check_missing_required_fields(rowvals: list[str], header: list[str], column_config: dict = None) -> list[str]:
+    """
+    Check which required fields are missing from the row.
+    Uses dynamic column config if provided, otherwise falls back to defaults.
+    """
     try:
         idx_map = _header_index_map(header)
         missing = []
-        
-        for field in REQUIRED_FIELDS_FOR_CLOSE:
+
+        # Get required fields from config or use defaults
+        if column_config:
+            required_fields = get_required_fields_for_close(column_config)
+        else:
+            required_fields = REQUIRED_FIELDS_FOR_CLOSE
+
+        for field in required_fields:
             key = field.strip().lower()
             if key in idx_map:
                 i = idx_map[key] - 1  # 0-based
@@ -55,7 +71,7 @@ def check_missing_required_fields(rowvals: list[str], header: list[str]) -> list
                     missing.append(field)
             else:
                 missing.append(field)  # Column doesn't exist
-        
+
         return missing
     except Exception as e:
         print(f"❌ Failed to check missing fields: {e}")
@@ -347,6 +363,7 @@ def propose_sheet_updates(uid: str,
                           contact_name: str = None,
                           headers: dict = None,
                           conversation: list[dict] = None,   # Optional: pass conversation directly (for testing)
+                          column_config: dict = None,        # Optional: dynamic column configuration
                           dry_run: bool = False) -> dict | None:
     """
     Uses OpenAI Responses API to propose sheet updates.
@@ -368,26 +385,9 @@ def propose_sheet_updates(uid: str,
             conversation = build_conversation_payload(uid, thread_id, limit=10, headers=headers)
 
         # ---- Rules sections ---------------------------------------------------
-        COLUMN_RULES = """
-COLUMN SEMANTICS & MAPPING (use EXACT header names):
-- "Rent/SF /Yr": Base/asking rent per square foot per YEAR. Synonyms: asking, base rent, $/SF/yr.
-- "Ops Ex /SF": NNN/CAM/Operating Expenses per square foot per YEAR. Synonyms: NNN, CAM, OpEx, operating expenses.
-- "Gross Rent": DO NOT WRITE TO THIS COLUMN. It contains a formula that auto-calculates. NEVER include "Gross Rent" in updates.
-- "Total SF": Total square footage. Synonyms: sq footage, square feet, SF, size.
-- "Drive Ins": Number of drive-in doors. Synonyms: drive in doors, loading doors.
-- "Docks": Number of dock doors/loading docks. Synonyms: dock doors, loading docks, dock positions, loading positions, dock doors, dock bays.
-- "Ceiling Ht": Ceiling height. Synonyms: max ceiling height, ceiling clearance.
-- "Power": Electrical power specifications. Synonyms: electrical, power capacity, amperage, voltage, electrical service, power supply, electrical load, electrical capacity, power requirements, electrical specs.
-- "Listing Brokers Comments ": DO NOT write directly to this column. Instead, use the "notes" field in your JSON output.
-
-FORMATTING:
-- For money/area fields, output plain decimals (no "$", "SF", commas). Examples: "30", "14.29", "2400".
-- For square footage, output just the number: "2000" not "2000 SF".
-- For ceiling height, output just the number: "9" not "9 feet" or "9'".
-- For drive-ins, output just the number: "3" not "3 doors".
-- For docks, output just the number: "6" not "6 dock doors" or "6 docks".
-- For power, output the electrical specification as provided: "200A", "480V", "100A 3-phase", "208V/120V", "400A service", etc.
-"""
+        # Use dynamic column config if provided, otherwise use defaults
+        effective_config = column_config or get_default_column_config()
+        COLUMN_RULES = build_column_rules_prompt(effective_config)
 
         DOC_SELECTION_RULES = """
 DOCUMENT SELECTION & EXTRACTION (strict):
@@ -606,7 +606,7 @@ IMPORTANT: The response should feel natural and conversational, not robotic or t
         target_anchor = get_row_anchor(rowvals, header)  # e.g., "1 Randolph Ct, Evans"
 
         # Check missing required fields to inform response email generation
-        missing_fields = check_missing_required_fields(rowvals, header)
+        missing_fields = check_missing_required_fields(rowvals, header, effective_config)
         
         # Build contact name context (provided as info for optional use, not required)
         contact_context = ""

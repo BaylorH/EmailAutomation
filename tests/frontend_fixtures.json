@@ -1,0 +1,1109 @@
+{
+  "proposals": [
+    {
+      "name": "complete_info",
+      "proposal": {
+        "updates": [
+          {
+            "column": "Total SF",
+            "value": "15000",
+            "confidence": 0.95,
+            "reason": "Scott provided '15,000 SF' for 1 Randolph Ct, Evans."
+          },
+          {
+            "column": "Rent/SF /Yr",
+            "value": "8.50",
+            "confidence": 0.9,
+            "reason": "Scott quoted '$8.50/SF/yr NNN'."
+          },
+          {
+            "column": "Ops Ex /SF",
+            "value": "2.25",
+            "confidence": 0.9,
+            "reason": "Scott provided 'NNN: $2.25/SF'."
+          },
+          {
+            "column": "Drive Ins",
+            "value": "2",
+            "confidence": 0.95,
+            "reason": "Scott stated '2 drive-in doors'."
+          },
+          {
+            "column": " Docks",
+            "value": "4",
+            "confidence": 0.95,
+            "reason": "Scott stated '4 dock doors'."
+          },
+          {
+            "column": "Ceiling Ht",
+            "value": "24",
+            "confidence": 0.95,
+            "reason": "Scott stated \"24' clear\"."
+          },
+          {
+            "column": "Power",
+            "value": "400A 3-phase",
+            "confidence": 0.9,
+            "reason": "Scott provided '400A 3-phase'."
+          }
+        ],
+        "events": [],
+        "response_email": "Hi Scott,\n\nThank you\u2014this is very helpful. I\u2019ve noted 15,000 SF at $8.50/SF NNN with $2.25/SF OpEx, 2 drive-ins, 4 docks, 24\u2019 clear, and 400A 3-phase, available immediately.\n\nThanks",
+        "notes": "available immediately"
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-complete_info",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Total SF",
+            "newValue": "15000",
+            "reason": "Scott provided '15,000 SF' for 1 Randolph Ct, Evans.",
+            "confidence": 0.95
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-complete_info",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Rent/SF /Yr",
+            "newValue": "8.50",
+            "reason": "Scott quoted '$8.50/SF/yr NNN'.",
+            "confidence": 0.9
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-complete_info",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Ops Ex /SF",
+            "newValue": "2.25",
+            "reason": "Scott provided 'NNN: $2.25/SF'.",
+            "confidence": 0.9
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-complete_info",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Drive Ins",
+            "newValue": "2",
+            "reason": "Scott stated '2 drive-in doors'.",
+            "confidence": 0.95
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-complete_info",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": " Docks",
+            "newValue": "4",
+            "reason": "Scott stated '4 dock doors'.",
+            "confidence": 0.95
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-complete_info",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Ceiling Ht",
+            "newValue": "24",
+            "reason": "Scott stated \"24' clear\".",
+            "confidence": 0.95
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-complete_info",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Power",
+            "newValue": "400A 3-phase",
+            "reason": "Scott provided '400A 3-phase'.",
+            "confidence": 0.9
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "row_completed",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-complete_info",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "message": "All required fields are complete"
+          },
+          "dedupe_key": null
+        }
+      ]
+    },
+    {
+      "name": "partial_info",
+      "proposal": {
+        "updates": [
+          {
+            "column": "Total SF",
+            "value": "15000",
+            "confidence": 0.95,
+            "reason": "Inbound email states: \"It's 15,000 SF\" for 1 Randolph Ct, Evans."
+          },
+          {
+            "column": "Rent/SF /Yr",
+            "value": "8.50",
+            "confidence": 0.95,
+            "reason": "Inbound email states: \"$8.50/SF NNN\" (base rent per SF per year)."
+          }
+        ],
+        "events": [],
+        "response_email": "Hi Scott,\n\nThanks\u2014got it at 15,000 SF and $8.50/SF NNN.\n\nTo complete our property details, could you please confirm:\n- Estimated OpEx/NNN ($/SF/year)\n- Number of dock-high doors\n- Number of drive-in doors\n- Clear height\n- Electrical service (amps/voltage/phase)\n\nThanks",
+        "notes": "NNN"
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-partial_info",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Total SF",
+            "newValue": "15000",
+            "reason": "Inbound email states: \"It's 15,000 SF\" for 1 Randolph Ct, Evans.",
+            "confidence": 0.95
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-partial_info",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Rent/SF /Yr",
+            "newValue": "8.50",
+            "reason": "Inbound email states: \"$8.50/SF NNN\" (base rent per SF per year).",
+            "confidence": 0.95
+          },
+          "dedupe_key": null
+        }
+      ]
+    },
+    {
+      "name": "escalate_scheduling",
+      "proposal": {
+        "updates": [],
+        "events": [
+          {
+            "type": "needs_user_input",
+            "address": "",
+            "city": "",
+            "email": "",
+            "link": "",
+            "notes": "",
+            "reason": "scheduling",
+            "question": "Can you come by Tuesday at 2pm?",
+            "suggestedContact": "",
+            "suggestedEmail": "",
+            "suggestedPhone": "",
+            "issue": "",
+            "severity": ""
+          }
+        ],
+        "response_email": null,
+        "notes": ""
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "action_needed",
+          "priority": "high",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-escalate_scheduling",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "event_type": "needs_user_input",
+            "reason": "scheduling",
+            "question": null
+          },
+          "dedupe_key": null
+        }
+      ]
+    },
+    {
+      "name": "escalate_negotiation",
+      "proposal": {
+        "updates": [
+          {
+            "column": "Rent/SF /Yr",
+            "value": "7.75",
+            "confidence": 0.78,
+            "reason": "Scott indicated they could do $7.75/SF for a 5-year term."
+          }
+        ],
+        "events": [
+          {
+            "type": "needs_user_input",
+            "address": "",
+            "city": "",
+            "email": "",
+            "link": "",
+            "notes": "",
+            "reason": "negotiation",
+            "question": "Scott offered $7.75/SF for a 5-year term and asked if that would work.",
+            "suggestedContact": "",
+            "suggestedEmail": "",
+            "suggestedPhone": "",
+            "issue": "",
+            "severity": ""
+          }
+        ],
+        "response_email": null,
+        "notes": "5-year term \u2022 rent flexibility to 7.75/SF"
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-escalate_negotiation",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Rent/SF /Yr",
+            "newValue": "7.75",
+            "reason": "Scott indicated they could do $7.75/SF for a 5-year term.",
+            "confidence": 0.78
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "action_needed",
+          "priority": "high",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-escalate_negotiation",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "event_type": "needs_user_input",
+            "reason": "negotiation",
+            "question": null
+          },
+          "dedupe_key": null
+        }
+      ]
+    },
+    {
+      "name": "escalate_client_question",
+      "proposal": {
+        "updates": [],
+        "events": [
+          {
+            "type": "needs_user_input",
+            "address": "1 Randolph Ct",
+            "city": "Evans",
+            "email": "",
+            "link": "",
+            "notes": "",
+            "reason": "client_question",
+            "question": "What size does your client need? And what's their timeline?",
+            "suggestedContact": "",
+            "suggestedEmail": "",
+            "suggestedPhone": "",
+            "issue": "",
+            "severity": ""
+          }
+        ],
+        "response_email": null,
+        "notes": ""
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "action_needed",
+          "priority": "high",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-escalate_client_question",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "event_type": "needs_user_input",
+            "reason": "client_question",
+            "question": null
+          },
+          "dedupe_key": null
+        }
+      ]
+    },
+    {
+      "name": "property_unavailable",
+      "proposal": {
+        "updates": [],
+        "events": [
+          {
+            "type": "property_unavailable",
+            "address": "1 Randolph Ct",
+            "city": "Evans",
+            "email": "",
+            "link": "",
+            "notes": "leased last week",
+            "reason": "",
+            "question": "",
+            "suggestedContact": "",
+            "suggestedEmail": "",
+            "suggestedPhone": "",
+            "issue": "",
+            "severity": ""
+          }
+        ],
+        "response_email": "Hi Scott,\n\nThanks for confirming \u2014 understood that 1 Randolph Ct was leased last week. If you have any similar industrial spaces in Evans (or nearby) that are currently available, please send them over and I\u2019ll take a look.\n\nThanks",
+        "notes": "leased last week"
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "property_unavailable",
+          "priority": "high",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-property_unavailable",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "event_type": "property_unavailable"
+          },
+          "dedupe_key": null
+        }
+      ]
+    },
+    {
+      "name": "new_property_suggestion",
+      "proposal": {
+        "updates": [
+          {
+            "column": "Total SF",
+            "value": "15000",
+            "confidence": 0.9,
+            "reason": "Scott confirmed the space at 1 Randolph Ct is still available at 15,000 SF."
+          }
+        ],
+        "events": [
+          {
+            "type": "new_property",
+            "address": "200 Commerce Dr",
+            "city": "",
+            "email": "",
+            "link": "https://example.com/200-commerce",
+            "notes": "just listed \u2022 20000 SF \u2022 similar area",
+            "reason": "",
+            "question": "",
+            "suggestedContact": "",
+            "suggestedEmail": "",
+            "suggestedPhone": "",
+            "issue": "",
+            "severity": ""
+          }
+        ],
+        "response_email": "Hi Scott,\n\nThanks for the update \u2014 I noted 1 Randolph Ct is still available at 15,000 SF. I\u2019ll also take a look at 200 Commerce Dr.\n\nWhen you have a moment, can you confirm for 1 Randolph Ct:\n- Operating expenses (NNN/CAM) per SF per year\n- # of drive-in doors\n- # of dock-high doors\n- Clear height\n- Electrical service/power\n\nThanks",
+        "notes": "still available \u2022 15000 SF"
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-new_property_suggestion",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Total SF",
+            "newValue": "15000",
+            "reason": "Scott confirmed the space at 1 Randolph Ct is still available at 15,000 SF.",
+            "confidence": 0.9
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "new_property_suggestion",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-new_property_suggestion",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "event_type": "new_property",
+            "suggested_address": "200 Commerce Dr",
+            "suggested_link": "https://example.com/200-commerce"
+          },
+          "dedupe_key": null
+        }
+      ]
+    },
+    {
+      "name": "call_requested",
+      "proposal": {
+        "updates": [],
+        "events": [
+          {
+            "type": "call_requested",
+            "address": "",
+            "city": "",
+            "email": "",
+            "link": "",
+            "notes": "",
+            "reason": "",
+            "question": "",
+            "suggestedContact": "",
+            "suggestedEmail": "",
+            "suggestedPhone": "",
+            "issue": "",
+            "severity": ""
+          }
+        ],
+        "response_email": null,
+        "notes": ""
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "action_needed",
+          "priority": "high",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-call_requested",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "event_type": "call_requested",
+            "phone": null
+          },
+          "dedupe_key": null
+        }
+      ]
+    },
+    {
+      "name": "contact_optout",
+      "proposal": {
+        "updates": [],
+        "events": [
+          {
+            "type": "contact_optout",
+            "address": "",
+            "city": "",
+            "email": "",
+            "link": "",
+            "notes": "",
+            "reason": "unsubscribe",
+            "question": "",
+            "suggestedContact": "",
+            "suggestedEmail": "",
+            "suggestedPhone": "",
+            "issue": "",
+            "severity": ""
+          }
+        ],
+        "response_email": null,
+        "notes": ""
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "contact_optout",
+          "priority": "high",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-contact_optout",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "event_type": "contact_optout",
+            "reason": "unsubscribe"
+          },
+          "dedupe_key": null
+        }
+      ]
+    },
+    {
+      "name": "wrong_contact",
+      "proposal": {
+        "updates": [],
+        "events": [
+          {
+            "type": "wrong_contact",
+            "address": "1 Randolph Ct, Evans",
+            "city": "Evans",
+            "email": "",
+            "link": "",
+            "notes": "",
+            "reason": "no_longer_handles",
+            "question": "",
+            "suggestedContact": "Sarah",
+            "suggestedEmail": "sarah@atkins.com",
+            "suggestedPhone": "",
+            "issue": "",
+            "severity": ""
+          }
+        ],
+        "response_email": null,
+        "notes": ""
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "wrong_contact",
+          "priority": "high",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-wrong_contact",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "event_type": "wrong_contact",
+            "reason": "no_longer_handles",
+            "new_contact_email": null
+          },
+          "dedupe_key": null
+        }
+      ]
+    },
+    {
+      "name": "property_issue",
+      "proposal": {
+        "updates": [
+          {
+            "column": "Listing Brokers Comments ",
+            "value": "Water damage in the back corner from a roof leak; being repaired.",
+            "confidence": 0.86,
+            "reason": "Inbound email from Scott states there is water damage from a roof leak and it is being repaired."
+          }
+        ],
+        "events": [
+          {
+            "type": "property_issue",
+            "address": "1 Randolph Ct",
+            "city": "Evans",
+            "email": "",
+            "link": "",
+            "notes": "",
+            "reason": "",
+            "question": "",
+            "suggestedContact": "",
+            "suggestedEmail": "",
+            "suggestedPhone": "",
+            "issue": "Water damage in the back corner from a roof leak (being repaired).",
+            "severity": "major"
+          }
+        ],
+        "response_email": "Hi Scott,\n\nThanks for the heads up. Do you know the status/timeline on the roof leak repair and remediation of the water-damaged area (and whether there\u2019s any remaining active leak)?\n\nAlso, when you have a moment, could you confirm for 1 Randolph Ct:\n- Operating expenses (NNN/CAM) per SF per year\n- # drive-in doors\n- # dock doors\n- clear height\n- electrical service/power\n\nThanks",
+        "notes": "water damage in back corner from roof leak \u2022 being repaired"
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-property_issue",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Listing Brokers Comments ",
+            "newValue": "Water damage in the back corner from a roof leak; being repaired.",
+            "reason": "Inbound email from Scott states there is water damage from a roof leak and it is being repaired.",
+            "confidence": 0.86
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "property_issue",
+          "priority": "high",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-property_issue",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "event_type": "property_issue",
+            "issue": "Water damage in the back corner from a roof leak (being repaired).",
+            "severity": "major"
+          },
+          "dedupe_key": null
+        }
+      ]
+    },
+    {
+      "name": "mixed_info_and_escalation",
+      "proposal": {
+        "updates": [
+          {
+            "column": "Total SF",
+            "value": "18000",
+            "confidence": 0.9,
+            "reason": "Inbound email states: \"It's 18,000 SF\" for 1 Randolph Ct, Evans."
+          },
+          {
+            "column": "Ceiling Ht",
+            "value": "24",
+            "confidence": 0.9,
+            "reason": "Inbound email states: \"with 24' clear\"."
+          }
+        ],
+        "events": [
+          {
+            "type": "needs_user_input",
+            "address": "",
+            "city": "",
+            "email": "",
+            "link": "",
+            "notes": "",
+            "reason": "client_question",
+            "question": "What's your client's budget range?",
+            "suggestedContact": "",
+            "suggestedEmail": "",
+            "suggestedPhone": "",
+            "issue": "",
+            "severity": ""
+          }
+        ],
+        "response_email": null,
+        "notes": ""
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-mixed_info_and_escalation",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Total SF",
+            "newValue": "18000",
+            "reason": "Inbound email states: \"It's 18,000 SF\" for 1 Randolph Ct, Evans.",
+            "confidence": 0.9
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "sheet_update",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-mixed_info_and_escalation",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "column": "Ceiling Ht",
+            "newValue": "24",
+            "reason": "Inbound email states: \"with 24' clear\".",
+            "confidence": 0.9
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "action_needed",
+          "priority": "high",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-mixed_info_and_escalation",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "event_type": "needs_user_input",
+            "reason": "client_question",
+            "question": null
+          },
+          "dedupe_key": null
+        }
+      ]
+    },
+    {
+      "name": "unavailable_with_alternative",
+      "proposal": {
+        "updates": [],
+        "events": [
+          {
+            "type": "property_unavailable",
+            "address": "1 Randolph Ct",
+            "city": "Evans",
+            "email": "",
+            "link": "",
+            "notes": "just got leased",
+            "reason": "",
+            "question": "",
+            "suggestedContact": "",
+            "suggestedEmail": "",
+            "suggestedPhone": "",
+            "issue": "",
+            "severity": ""
+          },
+          {
+            "type": "new_property",
+            "address": "500 Trade Center",
+            "city": "",
+            "email": "scott@atkinscommercial.com",
+            "link": "https://example.com/500-trade",
+            "notes": "similar specs",
+            "reason": "",
+            "question": "",
+            "suggestedContact": "",
+            "suggestedEmail": "",
+            "suggestedPhone": "",
+            "issue": "",
+            "severity": ""
+          }
+        ],
+        "response_email": "Hi Scott,\n\nThanks for the update \u2014 understood that 1 Randolph Ct just got leased.\n\nAppreciate you sending 500 Trade Center as an alternative. I\u2019ll review the link and follow up with any questions.\n\nThanks",
+        "notes": "1 Randolph Ct just got leased \u2022 alternative suggested: 500 Trade Center (similar specs) \u2022 link provided"
+      },
+      "notifications": [
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "property_unavailable",
+          "priority": "high",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-unavailable_with_alternative",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "event_type": "property_unavailable"
+          },
+          "dedupe_key": null
+        },
+        {
+          "uid": "test-user",
+          "client_id": "test-client",
+          "kind": "new_property_suggestion",
+          "priority": "normal",
+          "email": "scott@atkinscommercial.com",
+          "thread_id": "test-unavailable_with_alternative",
+          "row_number": null,
+          "row_anchor": "1 Randolph Ct, Evans",
+          "meta": {
+            "event_type": "new_property",
+            "suggested_address": "500 Trade Center",
+            "suggested_link": "https://example.com/500-trade"
+          },
+          "dedupe_key": null
+        }
+      ]
+    }
+  ],
+  "notifications": [],
+  "column_analysis": {
+    "headers": [
+      "Property Address",
+      "City",
+      "Property Name",
+      "Leasing Company ",
+      "Leasing Contact",
+      "Email",
+      "Total SF",
+      "Rent/SF /Yr",
+      "Ops Ex /SF",
+      "Gross Rent",
+      "Drive Ins",
+      " Docks",
+      "Ceiling Ht",
+      "Power",
+      "Listing Brokers Comments ",
+      "Flyer / Link",
+      "Floorplan",
+      "Jill and Clients comments"
+    ],
+    "proposedConfig": {
+      "mappings": {
+        "property_address": "Property Address",
+        "city": "City",
+        "property_name": "Property Name",
+        "leasing_company": "Leasing Company ",
+        "leasing_contact": "Leasing Contact",
+        "email": "Email",
+        "total_sf": "Total SF",
+        "rent_sf_yr": "Rent/SF /Yr",
+        "ops_ex_sf": "Ops Ex /SF",
+        "gross_rent": "Gross Rent",
+        "drive_ins": "Drive Ins",
+        "docks": " Docks",
+        "ceiling_ht": "Ceiling Ht",
+        "power": "Power",
+        "listing_comments": "Listing Brokers Comments ",
+        "flyer_link": "Flyer / Link",
+        "floorplan": "Floorplan",
+        "client_comments": "Jill and Clients comments"
+      },
+      "requiredFields": [
+        "ops_ex_sf",
+        "drive_ins",
+        "docks",
+        "ceiling_ht",
+        "power"
+      ],
+      "formulaFields": [
+        "gross_rent"
+      ],
+      "neverRequest": [
+        "rent_sf_yr"
+      ]
+    },
+    "confidence": {
+      "property_address": 1.0,
+      "city": 1.0,
+      "property_name": 1.0,
+      "leasing_company": 1.0,
+      "leasing_contact": 1.0,
+      "email": 1.0,
+      "total_sf": 1.0,
+      "rent_sf_yr": 1.0,
+      "ops_ex_sf": 1.0,
+      "gross_rent": 1.0,
+      "drive_ins": 1.0,
+      "docks": 1.0,
+      "ceiling_ht": 1.0,
+      "power": 1.0,
+      "listing_comments": 1.0,
+      "flyer_link": 1.0,
+      "floorplan": 1.0,
+      "client_comments": 1.0
+    },
+    "unmapped": [],
+    "canonicalFields": {
+      "property_address": {
+        "label": "Property Address",
+        "description": "Street address of the property",
+        "required": true,
+        "extractable": null,
+        "requiredForClose": null,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "city": {
+        "label": "City",
+        "description": "City where property is located",
+        "required": true,
+        "extractable": null,
+        "requiredForClose": null,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "property_name": {
+        "label": "Property Name",
+        "description": "Name of the property or building",
+        "required": false,
+        "extractable": null,
+        "requiredForClose": null,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "leasing_company": {
+        "label": "Leasing Company",
+        "description": "Company handling leasing",
+        "required": false,
+        "extractable": null,
+        "requiredForClose": null,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "leasing_contact": {
+        "label": "Leasing Contact",
+        "description": "Contact person name",
+        "required": false,
+        "extractable": null,
+        "requiredForClose": null,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "email": {
+        "label": "Email",
+        "description": "Contact email address",
+        "required": true,
+        "extractable": null,
+        "requiredForClose": null,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "total_sf": {
+        "label": "Total SF",
+        "description": "Total square footage",
+        "required": false,
+        "extractable": true,
+        "requiredForClose": null,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "rent_sf_yr": {
+        "label": "Rent/SF /Yr",
+        "description": "Base rent per square foot per year",
+        "required": false,
+        "extractable": true,
+        "requiredForClose": null,
+        "isFormula": null,
+        "neverRequest": true
+      },
+      "ops_ex_sf": {
+        "label": "Ops Ex /SF",
+        "description": "Operating expenses per SF per year (NNN/CAM)",
+        "required": false,
+        "extractable": true,
+        "requiredForClose": true,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "gross_rent": {
+        "label": "Gross Rent",
+        "description": "Calculated gross rent (FORMULA - never write)",
+        "required": false,
+        "extractable": false,
+        "requiredForClose": null,
+        "isFormula": true,
+        "neverRequest": null
+      },
+      "drive_ins": {
+        "label": "Drive Ins",
+        "description": "Number of drive-in doors",
+        "required": false,
+        "extractable": true,
+        "requiredForClose": true,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "docks": {
+        "label": "Docks",
+        "description": "Number of dock doors",
+        "required": false,
+        "extractable": true,
+        "requiredForClose": true,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "ceiling_ht": {
+        "label": "Ceiling Ht",
+        "description": "Clear ceiling height",
+        "required": false,
+        "extractable": true,
+        "requiredForClose": true,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "power": {
+        "label": "Power",
+        "description": "Electrical power specifications",
+        "required": false,
+        "extractable": true,
+        "requiredForClose": true,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "listing_comments": {
+        "label": "Listing Brokers Comments",
+        "description": "Broker's notes and comments",
+        "required": false,
+        "extractable": false,
+        "requiredForClose": null,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "flyer_link": {
+        "label": "Flyer / Link",
+        "description": "Links to flyers or listings",
+        "required": false,
+        "extractable": true,
+        "requiredForClose": null,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "floorplan": {
+        "label": "Floorplan",
+        "description": "Links to floor plans",
+        "required": false,
+        "extractable": true,
+        "requiredForClose": null,
+        "isFormula": null,
+        "neverRequest": null
+      },
+      "client_comments": {
+        "label": "Jill and Clients comments",
+        "description": "Internal client notes",
+        "required": false,
+        "extractable": false,
+        "requiredForClose": null,
+        "isFormula": null,
+        "neverRequest": null
+      }
+    }
+  }
+}

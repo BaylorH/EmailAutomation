@@ -23,10 +23,20 @@ from dataclasses import dataclass, field
 # ENVIRONMENT SETUP (must happen before importing production code)
 # ============================================================================
 
+# Load .env file if it exists
+env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+if os.path.exists(env_path):
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                os.environ[key] = value
+
 # Check for OpenAI API key (required for actual API calls)
 if not os.getenv("OPENAI_API_KEY"):
     print("OPENAI_API_KEY environment variable not set")
-    print("Please set it: export OPENAI_API_KEY='your-key'")
+    print("Please set it: export OPENAI_API_KEY='your-key' or add to .env file")
     sys.exit(1)
 
 # Set dummy Azure env vars if not present (required for app_config import, but not used in dry_run)
