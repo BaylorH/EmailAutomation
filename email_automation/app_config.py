@@ -1,18 +1,21 @@
 import os
 
+# E2E Test Mode - skips validation and uses mock values where needed
+E2E_TEST_MODE = os.getenv("E2E_TEST_MODE") == "true"
+
 # Azure/Microsoft Graph Config
-CLIENT_ID = os.getenv("AZURE_API_APP_ID")
-CLIENT_SECRET = os.getenv("AZURE_API_CLIENT_SECRET")
+CLIENT_ID = os.getenv("AZURE_API_APP_ID") or ("mock-client-id" if E2E_TEST_MODE else None)
+CLIENT_SECRET = os.getenv("AZURE_API_CLIENT_SECRET") or ("mock-client-secret" if E2E_TEST_MODE else None)
 AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Mail.ReadWrite", "Mail.Send"]
 TOKEN_CACHE = "msal_token_cache.bin"
 
 # Firebase Config
-FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
+FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY") or ("mock-firebase-key" if E2E_TEST_MODE else None)
 FIREBASE_BUCKET = "email-automation-cache.firebasestorage.app"
 
 # OpenAI Config
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ("mock-openai-key" if E2E_TEST_MODE else None)
 OPENAI_ASSISTANT_MODEL = os.getenv("OPENAI_ASSISTANT_MODEL", "gpt-5.2")
 
 # Email Templates
@@ -39,9 +42,10 @@ REQUIRED_FIELDS_FOR_CLOSE = [
 # Default: 24 hours to handle overnight and weekend delays
 INBOX_SCAN_WINDOW_HOURS = int(os.getenv("INBOX_SCAN_WINDOW_HOURS", "24"))
 
-# Validation
-if not CLIENT_ID or not CLIENT_SECRET or not FIREBASE_API_KEY:
-    raise RuntimeError("Missing required env vars")
+# Validation (skip in E2E test mode - mock values are used)
+if not E2E_TEST_MODE:
+    if not CLIENT_ID or not CLIENT_SECRET or not FIREBASE_API_KEY:
+        raise RuntimeError("Missing required env vars")
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY env var")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY env var")
