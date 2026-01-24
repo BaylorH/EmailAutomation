@@ -124,7 +124,7 @@ OpenAI: `OPENAI_API_KEY`, `OPENAI_ASSISTANT_MODEL`
 
 ## Deployment
 
-Hosted on Render.com (`https://email-token-manager.onrender.com`) with GitHub Actions keep-alive pings every 14 minutes to prevent free tier sleeping.
+Hosted on Render.com (`https://email-token-manager.onrender.com`).
 
 ---
 

@@ -8,14 +8,6 @@ jobs:
   email:
     runs-on: ubuntu-latest
     steps:
-      - name: Keep Render Server Awake
-        run: |
-          echo "🏓 Pinging server to keep it awake during email processing..."
-          curl -f -s -o /dev/null -w "Status: %{http_code}, Time: %{time_total}s\n" \
-            https://email-token-manager.onrender.com/api/scheduler-status || \
-            echo "⚠️ Ping failed, but continuing with email processing"
-        continue-on-error: true
-
       - name: Checkout
         uses: actions/checkout@v4
         
