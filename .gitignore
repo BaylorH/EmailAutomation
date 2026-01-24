@@ -45,6 +45,11 @@ Thumbs.db
 # Test outputs
 *.log
 test_results.json
+tests/results/run_*/
+tests/conversations/generated/*/
+
+# Test data files (Excel)
+*.xlsx
 
 # Credentials (safety net)
 *credentials*.json
