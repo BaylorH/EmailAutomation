@@ -257,7 +257,7 @@ python tests/e2e_test.py --list
 | `new_property_suggestion` | Original available + new property mentioned |
 | `close_conversation` | Natural conversation ending |
 | `client_asks_requirements` | Broker asks about client's space requirements - AI escalates |
-| `scheduling_request` | Broker requests tour scheduling - AI escalates |
+| `scheduling_request` | Broker offers tour - triggers tour_requested with suggested email |
 | `negotiation_attempt` | Broker makes counteroffer - AI escalates |
 | `identity_question` | Broker asks who the client is - AI escalates |
 | `legal_contract_question` | Broker asks about contract/LOI - AI escalates |
@@ -532,10 +532,11 @@ Jill and Clients comments
 |-------|---------|-----------------|
 | `sheet_update` | AI extracts a field value | Shows in notification sidebar |
 | `row_completed` | All required fields filled | Marks property complete |
-| `action_needed` | Call requested, new property suggested | Shows action button |
+| `action_needed` | Call requested, tour offered, new property suggested | Shows action button |
 | `property_unavailable` | Broker says not available | Moves row below NON-VIABLE |
 | `new_property` | Broker suggests new property | Creates pending approval notification |
 | `call_requested` | Broker wants to talk | Creates action_needed notification |
+| `tour_requested` | Broker offers tour/showing | Creates notification with suggested email for approval |
 | `close_conversation` | Natural end of thread | Stops processing thread |
 
 ### Firebase Cloud Functions (in email-admin-ui/functions)
