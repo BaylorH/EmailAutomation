@@ -1,7 +1,7 @@
 {
   "property": "135 Trade Center Court",
   "city": "Augusta",
-  "description": "Broker says all info provided, ready to wrap up - should trigger close_conversation",
+  "description": "Broker offers tour - should trigger tour_requested with suggested email",
 
   "messages": [
     {
@@ -15,12 +15,12 @@
   ],
 
   "expected_updates": [],
-  "expected_events": ["needs_user_input"],
+  "expected_events": ["tour_requested"],
   "forbidden_updates": ["Leasing Contact", "Leasing Company", "Email"],
 
   "expected_notifications": [
-    {"kind": "action_needed", "reason": "needs_user_input:scheduling"}
+    {"kind": "action_needed", "reason": "tour_requested"}
   ],
 
-  "notes": "AI correctly detects the tour offer as something user needs to respond to"
+  "notes": "AI detects tour offer and creates notification with suggested response email for user to approve"
 }

@@ -427,18 +427,26 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
 
 - "close_conversation": When conversation appears complete and the sender indicates they're done.
 
+- "tour_requested": Emit when broker offers or requests a property tour/showing. This is DIFFERENT from needs_user_input.
+  • Look for: "schedule a tour", "would you like to see it", "happy to show you", "can arrange a tour",
+    "want to come by", "stop by and take a look", "walk through the property", "showing available"
+  • The user needs to decide whether to schedule the tour, so DO NOT auto-respond
+  • Instead, GENERATE a suggested response email in the "suggestedEmail" field that the user can approve/edit
+  • Example suggestedEmail: "Hi [broker], Thank you for the offer! I'd like to schedule a tour. Are you available [suggest a few time options]? Looking forward to seeing the space."
+  • Include "question" field with the specific tour offer/request
+  • Set response_email to null (user will send the approved email)
+
 - "needs_user_input": CRITICAL - Emit when the AI CANNOT or SHOULD NOT respond automatically. Use this when:
   • Client asks questions about the user's requirements (size needed, budget, timeline, move-in date, industry)
-  • Scheduling requests (tour times, in-person meeting requests - NOT phone calls, use call_requested for those)
   • Negotiation attempts (counteroffers, "would you consider X price", lease term negotiations)
   • Questions about client identity ("who is your client?", "what company?")
   • Legal/contract questions ("when can you sign?", "send LOI", "what terms do you want?")
   • Confusing or unclear messages where appropriate response is uncertain
   • Messages requiring decisions the AI shouldn't make on behalf of the user
+  • NOTE: Tour/meeting requests should use "tour_requested" event instead
 
   Include "reason" field explaining WHY user input is needed:
   • "client_question" - broker asking about client's requirements
-  • "scheduling" - tour/meeting request
   • "negotiation" - price or term negotiation
   • "confidential" - asking for client identity/info
   • "legal_contract" - contract/LOI/lease questions
@@ -488,7 +496,8 @@ CRITICAL EXAMPLES:
 - "This property isn't available" = property_unavailable event
 - "Can you call me?" = call_requested event
 - "What size space does your client need?" = needs_user_input (reason: client_question)
-- "Can you tour Tuesday at 2pm?" = needs_user_input (reason: scheduling)
+- "Can you tour Tuesday at 2pm?" = tour_requested event (with suggestedEmail)
+- "Would you like to see the space?" = tour_requested event (with suggestedEmail)
 - "Would you consider $7/SF instead?" = needs_user_input (reason: negotiation)
 - "Who is your client?" = needs_user_input (reason: confidential)
 - "When can you sign the lease?" = needs_user_input (reason: legal_contract)
@@ -679,7 +688,7 @@ OUTPUT ONLY valid JSON in this exact format:
   ],
   "events": [
     {
-      "type": "call_requested | property_unavailable | new_property | close_conversation | needs_user_input | contact_optout | wrong_contact | property_issue",
+      "type": "call_requested | property_unavailable | new_property | close_conversation | needs_user_input | contact_optout | wrong_contact | property_issue | tour_requested",
       "address": "<for new_property: extract property name, address, or identifier>",
       "city": "<for new_property: infer city/location if possible>",
       "email": "<for new_property if different email needed>",

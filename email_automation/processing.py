@@ -799,6 +799,60 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     except Exception as e:
                         print(f"❌ Failed to write call_requested notification: {e}")
 
+                elif event_type == "tour_requested":
+                    # Broker offered a tour - create notification with suggested response
+                    try:
+                        question = event.get("question", "Tour requested")
+                        suggested_email = event.get("suggestedEmail", "")
+
+                        # If AI didn't generate a suggested email, create a default one
+                        if not suggested_email:
+                            broker_name = from_addr_lower.split('@')[0].split('.')[0].title()
+                            suggested_email = f"""Hi {broker_name},
+
+Thank you for offering to show me the property! I'd love to schedule a tour.
+
+Would any of the following times work for you?
+- [Day/Time option 1]
+- [Day/Time option 2]
+- [Day/Time option 3]
+
+Please let me know what works best, and I'll confirm.
+
+Thanks!"""
+
+                        meta = {
+                            "reason": "tour_requested",
+                            "details": "Tour/showing offered - review and approve response",
+                            "question": question,
+                            "originalMessage": _full_text[:500],
+                            "status": "pending_approval",
+                            "suggestedEmail": {
+                                "to": [from_addr_lower],
+                                "subject": f"RE: {address}" if address else "RE: Property Tour",
+                                "body": suggested_email
+                            }
+                        }
+
+                        write_notification(
+                            user_id, client_id,
+                            kind="action_needed",
+                            priority="important",
+                            email=from_addr_lower,
+                            thread_id=thread_id,
+                            row_number=rownum,
+                            row_anchor=row_anchor,
+                            meta=meta,
+                            dedupe_key=f"tour_requested:{thread_id}"
+                        )
+                        print(f"🏠 Created tour_requested notification with suggested email")
+
+                        # Don't auto-respond - user will send the approved email
+                        proposal["skip_response"] = True
+
+                    except Exception as e:
+                        print(f"❌ Failed to write tour_requested notification: {e}")
+
                 elif event_type == "needs_user_input":
                     # Client asked a question or made a request the AI cannot handle
                     # Create notification and skip auto-response

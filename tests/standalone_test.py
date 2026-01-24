@@ -294,6 +294,12 @@ def derive_notifications(updates: List[Dict], events: List[Dict], row_data: List
                 "reason": f"wrong_contact:{reason}"
             })
 
+        elif event_type == "tour_requested":
+            notifications.append({
+                "kind": "action_needed",
+                "reason": "tour_requested"
+            })
+
         # close_conversation does NOT create a notification
 
     # Check if all required fields would be complete after updates
@@ -621,7 +627,7 @@ Jeff"""}
 
     TestScenario(
         name="scheduling_request",
-        description="Broker requests tour scheduling - AI cannot commit to times",
+        description="Broker offers tour times - creates tour_requested notification with suggested email",
         property_address="1 Randolph Ct",
         messages=[
             {"direction": "outbound", "content": "Hi Scott, interested in touring 1 Randolph Ct."},
@@ -632,10 +638,10 @@ Great! Can you come by Tuesday at 2pm for a tour? Or would Wednesday morning wor
 Scott"""}
         ],
         expected_updates=[],
-        expected_events=["needs_user_input"],
+        expected_events=["tour_requested"],
         expected_response_type="escalate",
         expected_notifications=[
-            ExpectedNotification(kind="action_needed", reason="needs_user_input:scheduling"),
+            ExpectedNotification(kind="action_needed", reason="tour_requested"),
         ]
     ),
 
@@ -920,9 +926,10 @@ def validate_result(scenario: TestScenario, result: Dict, row_data: List[str] = 
 
     # Check escalation scenarios
     if scenario.expected_response_type == "escalate":
-        # When escalating, AI should emit needs_user_input and NOT generate a response
-        if "needs_user_input" not in actual_event_types:
-            issues.append("Expected 'needs_user_input' event for escalation scenario")
+        # When escalating, AI should emit needs_user_input OR tour_requested and NOT generate a response
+        escalation_events = {"needs_user_input", "tour_requested"}
+        if not (escalation_events & set(actual_event_types)):
+            issues.append("Expected 'needs_user_input' or 'tour_requested' event for escalation scenario")
 
         # Response should be null/empty when escalating
         if response and response.strip():
@@ -935,6 +942,9 @@ def validate_result(scenario: TestScenario, result: Dict, row_data: List[str] = 
                     warnings.append("needs_user_input event missing 'reason' field")
                 if not e.get("question"):
                     warnings.append("needs_user_input event missing 'question' field")
+            elif e.get("type") == "tour_requested":
+                if not e.get("question"):
+                    warnings.append("tour_requested event missing 'question' field")
 
     # Check that response_email is present for non-escalation scenarios (except call_requested with phone)
     elif scenario.expected_response_type not in ["escalate", "call_with_phone"]:
