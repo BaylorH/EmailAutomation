@@ -2,7 +2,7 @@ import os
 import base64
 import requests
 import tempfile
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io

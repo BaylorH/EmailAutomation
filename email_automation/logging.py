@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from typing import Optional
 from .clients import _sheets_client, _fs
 from .sheets import _get_first_tab_title
 from .messaging import _get_thread_messages_chronological
