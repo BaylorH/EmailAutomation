@@ -272,13 +272,28 @@ python tests/e2e_test.py --list
 tests/
 ├── standalone_test.py       # AI extraction tests (19 scenarios)
 ├── e2e_test.py              # Full pipeline E2E tests
+├── results_manager.py       # Results file management
+├── conversation_generator.py # Programmatic conversation generation
 ├── conversations/           # Broker reply fixtures (JSON)
 │   ├── 699_industrial_park_dr.json
 │   ├── 135_trade_center_court.json
 │   ├── 2058_gordon_hwy.json
 │   ├── 1_kuhlke_dr.json
-│   └── 1_randolph_ct.json
-└── test_results.json        # Last test run results
+│   ├── 1_randolph_ct.json
+│   ├── edge_cases/          # Edge case scenarios
+│   │   ├── hostile_response.json
+│   │   ├── forward_to_colleague.json
+│   │   └── ...
+│   └── generated/           # Programmatically generated (90 scenarios)
+│       ├── response_type/
+│       ├── event/
+│       ├── edge_case/
+│       └── format/
+└── results/                 # Saved test run outputs
+    └── run_YYYYMMDD_HHMMSS/
+        ├── manifest.json    # Run metadata + input file hash
+        ├── summary.json     # Campaign-level results
+        └── {property}.json  # Per-property results
 ```
 
 ### Test Data File
@@ -294,6 +309,62 @@ The E2E tests simulate a **complete campaign**:
 4. Verify outputs: sheet state, notifications, response emails
 
 This ensures tests are a **1:1 reflection** of production behavior.
+
+### Saving Results to Files
+
+Run tests with `--save` to output structured JSON result files:
+
+```bash
+python3 tests/e2e_test.py --all --save
+```
+
+Results are saved to `tests/results/run_YYYYMMDD_HHMMSS/`:
+
+| File | Contents |
+|------|----------|
+| `manifest.json` | Run metadata, input file hash, property list |
+| `summary.json` | Pass/fail counts, coverage (events, columns, notifications) |
+| `{property}.json` | Full result: input, conversation, output, sheet state, validation |
+
+Each result file contains:
+- **input**: Property data from Excel (row, columns, values)
+- **conversation**: Message exchange used for testing
+- **output**: AI response (updates, events, response email)
+- **sheet_state**: Before/after column values
+- **notifications**: Derived notifications
+- **validation**: Expected vs actual comparison
+
+### Comparing Runs
+
+```bash
+# List previous runs
+python3 tests/e2e_test.py --list-runs
+
+# Compare two runs to detect behavioral changes
+python3 tests/e2e_test.py --compare run_20240115_100000 run_20240115_110000
+```
+
+### Generating Conversations Programmatically
+
+Use `conversation_generator.py` to create conversations for all real-world scenarios:
+
+```bash
+# List available scenarios
+python3 tests/conversation_generator.py --list-scenarios
+
+# Generate all conversations (5 properties x 18 scenarios = 90 files)
+python3 tests/conversation_generator.py --generate-all
+
+# Run generated conversations
+python3 tests/e2e_test.py --generated response_type --save
+python3 tests/e2e_test.py --generated all --save
+```
+
+Generated scenario categories:
+- **response_type**: complete_info, partial_info, vague_response, terse_response
+- **event**: call_requested, property_unavailable, new_property, contact_optout
+- **edge_case**: forward_to_colleague, out_of_office, flyer_link_only, tour_offer
+- **format**: numbers_with_words, numbers_with_mixed_formats
 
 ### Adding New Conversation Tests
 

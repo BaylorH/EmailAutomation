@@ -10,10 +10,18 @@ Tests the FULL production pipeline by:
 
 This ensures tests are a 1:1 reflection of what happens in production.
 
+Results Output:
+    When --save is used, results are saved to tests/results/run_YYYYMMDD_HHMMSS/
+    Each result file contains: input data, conversation, AI output, sheet state,
+    notifications, and validation results.
+
 Usage:
     python tests/e2e_test.py                    # Run all E2E tests
+    python tests/e2e_test.py --save             # Run and save results to files
     python tests/e2e_test.py -p "699 Industrial" # Run specific property
     python tests/e2e_test.py --list             # List available conversations
+    python tests/e2e_test.py --list-runs        # List previous test runs
+    python tests/e2e_test.py --compare run1 run2 # Compare two runs
 """
 
 import os
@@ -24,6 +32,8 @@ from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Results management - import after path setup below
 
 # ============================================================================
 # ENVIRONMENT SETUP
@@ -50,6 +60,17 @@ for var in ["AZURE_API_APP_ID", "AZURE_API_CLIENT_SECRET", "FIREBASE_API_KEY"]:
         os.environ[var] = f"test-{var.lower()}"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Results management - import now that path is set up
+from tests.results_manager import (
+    create_run_directory,
+    create_manifest,
+    save_result,
+    save_summary,
+    list_runs,
+    load_run,
+    compare_runs
+)
 
 # ============================================================================
 # MOCK INFRASTRUCTURE
@@ -195,6 +216,36 @@ def list_available_conversations() -> List[str]:
         conversations.append(f.stem.replace("_", " ").title())
 
     return sorted(conversations)
+
+
+def load_generated_conversations(category: str = "all") -> List[Tuple[str, Dict]]:
+    """
+    Load generated conversation files from tests/conversations/generated/.
+
+    Args:
+        category: 'response_type', 'event', 'edge_case', 'format', or 'all'
+
+    Returns: [(label, conversation_dict), ...]
+    """
+    gen_dir = get_conversations_dir() / "generated"
+    if not gen_dir.exists():
+        return []
+
+    conversations = []
+    categories = ["response_type", "event", "edge_case", "format"] if category == "all" else [category]
+
+    for cat in categories:
+        cat_dir = gen_dir / cat
+        if not cat_dir.exists():
+            continue
+
+        for f in sorted(cat_dir.glob("*.json")):
+            with open(f) as fp:
+                conv = json.load(fp)
+                label = f"[GEN:{cat}] {f.stem}"
+                conversations.append((label, conv))
+
+    return conversations
 
 # ============================================================================
 # TEST EXECUTION
@@ -445,7 +496,62 @@ def main():
     parser.add_argument("-q", "--quiet", action="store_true", help="Minimal output")
     parser.add_argument("--edge-cases", action="store_true", help="Run edge case tests")
     parser.add_argument("--all", action="store_true", help="Run all tests including edge cases")
+    parser.add_argument("--save", action="store_true", help="Save results to tests/results/")
+    parser.add_argument("--list-runs", action="store_true", help="List previous test runs")
+    parser.add_argument("--compare", nargs=2, metavar=("RUN1", "RUN2"), help="Compare two runs")
+    parser.add_argument("--scrub", help="Path to custom Scrub Excel file")
+    parser.add_argument("--generated", help="Run generated conversations from category (response_type, event, edge_case, format, or 'all')")
     args = parser.parse_args()
+
+    # List previous runs
+    if args.list_runs:
+        runs = list_runs()
+        if not runs:
+            print("\nNo previous test runs found.")
+            print("Run with --save to create result files.")
+            return
+
+        print("\nPrevious test runs:")
+        print(f"{'─'*70}")
+        for run in runs:
+            status = f"{run.get('tests_passed', 0)}/{run.get('tests_run', 0)} passed"
+            input_file = run.get('input_file', {}).get('filename', 'unknown')
+            print(f"  {run['run_name']}")
+            print(f"    Input: {input_file} | {status}")
+            print(f"    Created: {run.get('created_at', 'unknown')}")
+        return
+
+    # Compare two runs
+    if args.compare:
+        comparison = compare_runs(args.compare[0], args.compare[1])
+        if "error" in comparison:
+            print(f"Error: {comparison['error']}")
+            return
+
+        print(f"\nComparing {args.compare[0]} vs {args.compare[1]}")
+        print(f"{'─'*70}")
+
+        if comparison.get("input_file_changed"):
+            print("  ⚠️  Input Excel file has changed between runs")
+
+        changes = comparison.get("changes", [])
+        if not changes:
+            print("  ✅ No differences found")
+        else:
+            for change in changes:
+                prop = change.get("property")
+                change_type = change.get("change")
+                if change_type == "added_in_run2":
+                    print(f"  + {prop} (new in {args.compare[1]})")
+                elif change_type == "removed_in_run2":
+                    print(f"  - {prop} (removed in {args.compare[1]})")
+                elif change_type == "status_changed":
+                    old = "✅" if change.get("run1_passed") else "❌"
+                    new = "✅" if change.get("run2_passed") else "❌"
+                    print(f"  Δ {prop}: {old} → {new}")
+                elif change_type == "output_changed":
+                    print(f"  Δ {prop}: output changed")
+        return
 
     # List conversations
     if args.list:
@@ -467,13 +573,25 @@ def main():
         return
 
     # Load scrub file
-    print("Loading Scrub file...")
+    scrub_filepath = args.scrub or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "Scrub Augusta GA.xlsx"
+    )
+    print(f"Loading Scrub file: {os.path.basename(scrub_filepath)}...")
     try:
-        properties = load_scrub_file()
+        properties = load_scrub_file(scrub_filepath)
         print(f"Loaded {len(properties)} properties from Scrub file")
     except Exception as e:
         print(f"Failed to load Scrub file: {e}")
         sys.exit(1)
+
+    # Setup results saving if requested
+    run_dir = None
+    manifest = None
+    if args.save:
+        run_dir = create_run_directory()
+        manifest = create_manifest(run_dir, scrub_filepath, properties)
+        print(f"Results will be saved to: {run_dir}")
 
     # Ensure conversations directory exists
     conv_dir = get_conversations_dir()
@@ -517,6 +635,10 @@ def main():
             if not args.quiet:
                 display_result(result, prop_data["header"])
 
+            # Save result if requested
+            if run_dir:
+                save_result(run_dir, result, prop_data, conversation, prop_data["header"])
+
     # Run edge case tests
     if args.edge_cases or args.all:
         edge_cases = load_all_edge_case_conversations()
@@ -544,6 +666,44 @@ def main():
                 if not args.quiet:
                     display_result(result, prop_data["header"])
 
+                # Save result if requested
+                if run_dir:
+                    save_result(run_dir, result, prop_data, conv, prop_data["header"])
+
+    # Run generated conversation tests
+    if args.generated:
+        generated = load_generated_conversations(args.generated)
+        if generated:
+            print(f"\n{'='*70}")
+            print(f"GENERATED TESTS ({args.generated})")
+            print(f"{'='*70}")
+
+            for label, conv in generated:
+                prop_address = conv.get("property", "")
+                if prop_address not in properties:
+                    if not args.quiet:
+                        print(f"\n⏭️  Skipping '{label}' (property '{prop_address}' not in Scrub)")
+                    continue
+
+                prop_data = properties[prop_address]
+
+                if not args.quiet:
+                    print(f"\n🧪 Generated: {label}")
+                    print(f"   {conv.get('description', '')}")
+
+                result = run_e2e_test(label, prop_data, conv)
+                results.append(result)
+
+                if not args.quiet:
+                    display_result(result, prop_data["header"])
+
+                # Save result if requested
+                if run_dir:
+                    save_result(run_dir, result, prop_data, conv, prop_data["header"])
+        else:
+            print(f"\nNo generated conversations found for category: {args.generated}")
+            print("Run: python3 tests/conversation_generator.py --generate-all")
+
     # Summary
     if results:
         passed = sum(1 for r in results if r.passed)
@@ -560,6 +720,14 @@ def main():
                     print(f"  ❌ {r.property_address}")
                     for issue in r.issues:
                         print(f"      - {issue}")
+
+        # Save summary if requested
+        if run_dir and manifest:
+            summary = save_summary(run_dir, results, manifest)
+            print(f"\n📁 Results saved to: {run_dir}")
+            print(f"   - manifest.json (run metadata)")
+            print(f"   - summary.json (campaign summary)")
+            print(f"   - {len(results)} individual result files")
     else:
         print("\nNo tests run. Create conversation files in tests/conversations/")
         print("Example filename: 699_industrial_park_dr.json")
