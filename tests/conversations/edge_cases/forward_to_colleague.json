@@ -1,0 +1,22 @@
+{
+  "property": "2058 Gordon Hwy",
+  "city": "Augusta",
+  "description": "Broker forwards to colleague - should NOT update original contact info",
+
+  "messages": [
+    {
+      "direction": "outbound",
+      "content": "Hi Jonathan, I'm interested in 2058 Gordon Hwy. What are the specs?"
+    },
+    {
+      "direction": "inbound",
+      "content": "Hi Jill,\n\nI'm forwarding this to my colleague Sarah who handles this property. She'll reach out to you directly.\n\nBest,\nJonathan"
+    }
+  ],
+
+  "expected_updates": [],
+  "expected_events": ["wrong_contact"],
+  "forbidden_updates": ["Leasing Contact", "Leasing Company", "Email"],
+
+  "notes": "AI should NOT update contact to Sarah, should escalate since we're waiting for someone else"
+}

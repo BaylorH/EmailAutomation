@@ -178,8 +178,10 @@ Hosted on Render.com (`https://email-token-manager.onrender.com`) with GitHub Ac
 2. VERIFY SYNTAX
    └─> python3 -m py_compile email_automation/<file>.py
 
-3. RUN TESTS (if AI/processing changes)
-   └─> python tests/standalone_test.py
+3. RUN TESTS (MANDATORY - ALWAYS DO THIS)
+   └─> python tests/standalone_test.py    # AI extraction tests (19 scenarios)
+   └─> python tests/e2e_test.py           # Full pipeline E2E tests (5+ properties)
+   └─> ALL TESTS MUST PASS before committing!
 
 4. COMMIT & PUSH
    └─> git add -A && git commit -m "description" && git push
@@ -188,6 +190,8 @@ Hosted on Render.com (`https://email-token-manager.onrender.com`) with GitHub Ac
    └─> Render auto-deploys on push (if configured)
    └─> GitHub Actions runs email.yml every 30 mins
 ```
+
+**⚠️ CRITICAL: Run BOTH test suites after ANY code change. The tests are the source of truth for production behavior.**
 
 ### CI/CD Summary
 
@@ -208,9 +212,16 @@ Hosted on Render.com (`https://email-token-manager.onrender.com`) with GitHub Ac
 
 ## Testing Framework
 
-### Overview
+### ⚠️ MANDATORY TESTING RULE
 
-The `tests/` directory contains a comprehensive test suite that validates the AI extraction and conversation handling logic WITHOUT needing Firebase, Google Sheets, or actual emails. It calls OpenAI directly with simulated conversations.
+**ALWAYS run tests after ANY code change.** The test framework hits the SAME production code paths - the only difference is email sending is mocked. Tests are the source of truth for what will happen in production.
+
+### Test Types
+
+| Test Suite | Purpose | Command |
+|------------|---------|---------|
+| `standalone_test.py` | AI extraction tests (19 scenarios) | `python tests/standalone_test.py` |
+| `e2e_test.py` | Full pipeline E2E tests (uses Scrub file) | `python tests/e2e_test.py` |
 
 ### Running Tests
 
@@ -218,17 +229,17 @@ The `tests/` directory contains a comprehensive test suite that validates the AI
 # Set API key (required)
 export OPENAI_API_KEY='sk-...'
 
-# Run all 10 scenarios
-python tests/standalone_test.py
+# ALWAYS run BOTH test suites:
+python tests/standalone_test.py    # Must show: 19/19 PASS
+python tests/e2e_test.py           # Must show: 5/5 PASS (or all available)
 
-# Run specific scenario
+# Run specific scenarios:
 python tests/standalone_test.py -s complete_info
+python tests/e2e_test.py -p "699 Industrial"
 
-# List all scenarios
+# List available tests:
 python tests/standalone_test.py -l
-
-# Save results to JSON
-python tests/standalone_test.py -r results.json
+python tests/e2e_test.py --list
 ```
 
 ### Test Scenarios (19 total)
@@ -259,15 +270,51 @@ python tests/standalone_test.py -r results.json
 
 ```
 tests/
-├── standalone_test.py    # Main test runner (self-contained, only needs OpenAI)
-├── mock_data.py          # Sheet structure + all scenario definitions
-├── test_results.json     # Last test run results
-└── TEST_SCENARIOS.md     # Detailed scenario documentation
+├── standalone_test.py       # AI extraction tests (19 scenarios)
+├── e2e_test.py              # Full pipeline E2E tests
+├── conversations/           # Broker reply fixtures (JSON)
+│   ├── 699_industrial_park_dr.json
+│   ├── 135_trade_center_court.json
+│   ├── 2058_gordon_hwy.json
+│   ├── 1_kuhlke_dr.json
+│   └── 1_randolph_ct.json
+└── test_results.json        # Last test run results
 ```
 
 ### Test Data File
 
-**`Scrub Augusta GA.xlsx`** (in project root) - Real-world property data for testing. Use this file when testing sheet operations, column mapping, or AI extraction against actual data formats.
+**`Scrub Augusta GA.xlsx`** (in project root) - Real-world property data for E2E testing. The `e2e_test.py` loads this file and processes it with the conversation files to simulate complete campaigns.
+
+### E2E Test Architecture
+
+The E2E tests simulate a **complete campaign**:
+1. Load `Scrub Augusta GA.xlsx` → Gets real property data
+2. Load `conversations/*.json` → Gets simulated broker replies
+3. Call **ACTUAL production code** (`propose_sheet_updates`)
+4. Verify outputs: sheet state, notifications, response emails
+
+This ensures tests are a **1:1 reflection** of production behavior.
+
+### Adding New Conversation Tests
+
+Create a JSON file in `tests/conversations/` matching the property address:
+
+```json
+{
+  "property": "123 New Street",
+  "city": "Augusta",
+  "description": "What this tests",
+  "messages": [
+    {"direction": "outbound", "content": "Initial email sent..."},
+    {"direction": "inbound", "content": "Broker reply..."}
+  ],
+  "expected_updates": [
+    {"column": "Total SF", "value": "10000"}
+  ],
+  "expected_events": [],
+  "forbidden_updates": ["Leasing Contact", "Email"]
+}
+```
 
 ### Adding/Modifying Scenarios
 

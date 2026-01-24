@@ -1,0 +1,24 @@
+{
+  "property": "1 Randolph Ct",
+  "city": "Evans",
+  "description": "Broker mentions two different SF values - AI should use the most recent/confident one",
+
+  "messages": [
+    {
+      "direction": "outbound",
+      "content": "Hi Scott, what's the SF for 1 Randolph Ct?"
+    },
+    {
+      "direction": "inbound",
+      "content": "Hi Jill,\n\nI think it's around 12,000 SF... actually let me check... yes it's 15,000 SF total.\n\nScott"
+    }
+  ],
+
+  "expected_updates": [
+    {"column": "Total SF", "value": "15000"}
+  ],
+  "expected_events": [],
+  "forbidden_updates": ["Leasing Contact", "Leasing Company", "Email"],
+
+  "notes": "AI should use the corrected/final value (15000) not the initial estimate (12000)"
+}

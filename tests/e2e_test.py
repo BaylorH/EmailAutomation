@@ -141,12 +141,18 @@ def get_conversations_dir() -> Path:
     """Get the conversations directory path."""
     return Path(__file__).parent / "conversations"
 
-def load_conversation(property_address: str) -> Optional[Dict]:
+def load_conversation(property_address: str, subdir: str = None) -> Optional[Dict]:
     """
     Load a conversation file for a property.
     Returns: {messages: [...], expected_updates: [...], expected_events: [...], ...}
+
+    Args:
+        property_address: The property address to load conversation for
+        subdir: Optional subdirectory (e.g., "edge_cases")
     """
     conv_dir = get_conversations_dir()
+    if subdir:
+        conv_dir = conv_dir / subdir
 
     # Normalize address to filename
     filename = property_address.lower().replace(" ", "_").replace(",", "")
@@ -159,6 +165,24 @@ def load_conversation(property_address: str) -> Optional[Dict]:
                 return json.load(f)
 
     return None
+
+
+def load_all_edge_case_conversations() -> List[Tuple[str, Dict]]:
+    """
+    Load all edge case conversation files.
+    Returns: [(filename, conversation_dict), ...]
+    """
+    edge_dir = get_conversations_dir() / "edge_cases"
+    if not edge_dir.exists():
+        return []
+
+    conversations = []
+    for f in sorted(edge_dir.glob("*.json")):
+        with open(f) as fp:
+            conv = json.load(fp)
+            conversations.append((f.stem, conv))
+
+    return conversations
 
 def list_available_conversations() -> List[str]:
     """List all available conversation files."""
@@ -419,6 +443,8 @@ def main():
     parser.add_argument("-p", "--property", help="Run test for specific property")
     parser.add_argument("--list", action="store_true", help="List available conversations")
     parser.add_argument("-q", "--quiet", action="store_true", help="Minimal output")
+    parser.add_argument("--edge-cases", action="store_true", help="Run edge case tests")
+    parser.add_argument("--all", action="store_true", help="Run all tests including edge cases")
     args = parser.parse_args()
 
     # List conversations
@@ -426,8 +452,15 @@ def main():
         print("\nAvailable conversation files:")
         conv_dir = get_conversations_dir()
         if conv_dir.exists():
+            print("\n  Main scenarios:")
             for f in sorted(conv_dir.glob("*.json")):
-                print(f"  - {f.stem}")
+                print(f"    - {f.stem}")
+
+            edge_dir = conv_dir / "edge_cases"
+            if edge_dir.exists():
+                print("\n  Edge cases:")
+                for f in sorted(edge_dir.glob("*.json")):
+                    print(f"    - edge_cases/{f.stem}")
         else:
             print(f"  (No conversations directory at {conv_dir})")
             print(f"  Create it and add JSON conversation files.")
@@ -451,34 +484,65 @@ def main():
         print("Example: conversations/699_industrial_park_dr.json")
         sys.exit(0)
 
-    # Filter to specific property if requested
-    if args.property:
-        matching = {k: v for k, v in properties.items() if args.property.lower() in k.lower()}
-        if not matching:
-            print(f"No properties matching '{args.property}'")
-            print("Available properties:")
-            for addr in properties:
-                print(f"  - {addr}")
-            sys.exit(1)
-        properties = matching
-
-    # Run tests
     results = []
-    for address, prop_data in properties.items():
-        conversation = load_conversation(address)
-        if not conversation:
+
+    # Run main property tests (unless --edge-cases only)
+    if not args.edge_cases:
+        # Filter to specific property if requested
+        test_properties = properties
+        if args.property:
+            matching = {k: v for k, v in properties.items() if args.property.lower() in k.lower()}
+            if not matching:
+                print(f"No properties matching '{args.property}'")
+                print("Available properties:")
+                for addr in properties:
+                    print(f"  - {addr}")
+                sys.exit(1)
+            test_properties = matching
+
+        # Run tests
+        for address, prop_data in test_properties.items():
+            conversation = load_conversation(address)
+            if not conversation:
+                if not args.quiet:
+                    print(f"\n⏭️  Skipping {address} (no conversation file)")
+                continue
+
             if not args.quiet:
-                print(f"\n⏭️  Skipping {address} (no conversation file)")
-            continue
+                print(f"\n🧪 Testing: {address}")
 
-        if not args.quiet:
-            print(f"\n🧪 Testing: {address}")
+            result = run_e2e_test(address, prop_data, conversation)
+            results.append(result)
 
-        result = run_e2e_test(address, prop_data, conversation)
-        results.append(result)
+            if not args.quiet:
+                display_result(result, prop_data["header"])
 
-        if not args.quiet:
-            display_result(result, prop_data["header"])
+    # Run edge case tests
+    if args.edge_cases or args.all:
+        edge_cases = load_all_edge_case_conversations()
+        if edge_cases:
+            print(f"\n{'='*70}")
+            print("EDGE CASE TESTS")
+            print(f"{'='*70}")
+
+            for filename, conv in edge_cases:
+                prop_address = conv.get("property", "")
+                if prop_address not in properties:
+                    if not args.quiet:
+                        print(f"\n⏭️  Skipping edge case '{filename}' (property '{prop_address}' not in Scrub)")
+                    continue
+
+                prop_data = properties[prop_address]
+
+                if not args.quiet:
+                    print(f"\n🧪 Edge case: {filename}")
+                    print(f"   {conv.get('description', '')}")
+
+                result = run_e2e_test(f"[EDGE] {filename}", prop_data, conv)
+                results.append(result)
+
+                if not args.quiet:
+                    display_result(result, prop_data["header"])
 
     # Summary
     if results:
@@ -488,6 +552,14 @@ def main():
         print(f"{'='*70}")
         print(f"Total: {len(results)} | Passed: {passed} | Failed: {len(results) - passed}")
         print(f"Pass Rate: {passed/len(results)*100:.1f}%")
+
+        if passed < len(results):
+            print("\nFailed tests:")
+            for r in results:
+                if not r.passed:
+                    print(f"  ❌ {r.property_address}")
+                    for issue in r.issues:
+                        print(f"      - {issue}")
     else:
         print("\nNo tests run. Create conversation files in tests/conversations/")
         print("Example filename: 699_industrial_park_dr.json")

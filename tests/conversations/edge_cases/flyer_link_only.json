@@ -1,0 +1,24 @@
+{
+  "property": "1 Randolph Ct",
+  "city": "Evans",
+  "description": "Broker sends only a flyer link - should extract link and ask for specs",
+
+  "messages": [
+    {
+      "direction": "outbound",
+      "content": "Hi Scott, can you send over the details for 1 Randolph Ct?"
+    },
+    {
+      "direction": "inbound",
+      "content": "Here's the flyer: https://example.com/flyers/1-randolph-ct.pdf\n\nLet me know if you have questions.\n\nScott"
+    }
+  ],
+
+  "expected_updates": [
+    {"column": "Flyer / Link", "value": "https://example.com/flyers/1-randolph-ct.pdf"}
+  ],
+  "expected_events": [],
+  "forbidden_updates": ["Leasing Contact", "Leasing Company", "Email"],
+
+  "notes": "AI should extract the flyer link AND request the actual specs (SF, rent, etc.)"
+}

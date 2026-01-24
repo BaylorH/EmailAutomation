@@ -1,0 +1,25 @@
+{
+  "property": "699 Industrial Park Dr",
+  "city": "Evans",
+  "description": "Broker gives extremely short response with just numbers",
+
+  "messages": [
+    {
+      "direction": "outbound",
+      "content": "Hi Jeff, what are the specs for 699 Industrial Park Dr?"
+    },
+    {
+      "direction": "inbound",
+      "content": "8500sf $6/ft 2docks"
+    }
+  ],
+
+  "expected_updates": [
+    {"column": "Total SF", "value": "8500"},
+    {"column": "Rent/SF /Yr", "value": "6"}
+  ],
+  "expected_events": [],
+  "forbidden_updates": ["Leasing Contact", "Leasing Company", "Email"],
+
+  "notes": "AI should extract data even from terse, informal responses"
+}

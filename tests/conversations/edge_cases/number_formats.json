@@ -1,0 +1,30 @@
+{
+  "property": "135 Trade Center Court",
+  "city": "Augusta",
+  "description": "Broker uses various number formats - AI should normalize all to plain numbers",
+
+  "messages": [
+    {
+      "direction": "outbound",
+      "content": "Hi Luke, what are the full specs for 135 Trade Center Court?"
+    },
+    {
+      "direction": "inbound",
+      "content": "Hey Jill,\n\nHere you go:\n- Size: 18,500 square feet\n- Rent: $7.50 per square foot per year NNN\n- CAM/NNN: approximately $2.15/SF/YR\n- Doors: three (3) dock doors, one drive-in\n- Clear: twenty-four feet\n- Electrical: 200 amp 3-phase\n\nLuke"
+    }
+  ],
+
+  "expected_updates": [
+    {"column": "Total SF", "value": "18500"},
+    {"column": "Rent/SF /Yr", "value": "7.50"},
+    {"column": "Ops Ex /SF", "value": "2.15"},
+    {"column": " Docks", "value": "3"},
+    {"column": "Drive Ins", "value": "1"},
+    {"column": "Ceiling Ht", "value": "24"},
+    {"column": "Power", "value": "200 amp 3-phase"}
+  ],
+  "expected_events": [],
+  "forbidden_updates": ["Leasing Contact", "Leasing Company", "Email"],
+
+  "notes": "AI should normalize 'three (3)' to '3', 'twenty-four' to '24', etc."
+}

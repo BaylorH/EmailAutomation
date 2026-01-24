@@ -1,0 +1,22 @@
+{
+  "property": "699 Industrial Park Dr",
+  "city": "Evans",
+  "description": "Broker responds negatively/hostilely - should trigger contact_optout event",
+
+  "messages": [
+    {
+      "direction": "outbound",
+      "content": "Hi Jeff, following up on 699 Industrial Park Dr availability."
+    },
+    {
+      "direction": "inbound",
+      "content": "Please stop emailing me. I don't work with tenant reps. Remove me from your list."
+    }
+  ],
+
+  "expected_updates": [],
+  "expected_events": ["contact_optout"],
+  "forbidden_updates": ["Leasing Contact", "Leasing Company", "Email"],
+
+  "notes": "AI should detect opt-out request and NOT send any auto-response"
+}
