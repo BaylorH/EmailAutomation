@@ -123,6 +123,84 @@ PROPERTIES = {
 }
 
 
+def show_simulated_sheet_row(scenario_name: str, property_address: str, updates: List[Dict], header: List[str] = None):
+    """
+    Display a simulated sheet row showing before/after state.
+    Shows only columns that have data or were updated.
+    """
+    if header is None:
+        header = HEADER
+
+    prop = PROPERTIES.get(property_address)
+    if not prop:
+        print(f"   Unknown property: {property_address}")
+        return
+
+    row_data = list(prop["data"])  # Copy to avoid mutation
+
+    # Build column index map
+    col_idx = {h.lower().strip(): i for i, h in enumerate(header)}
+
+    # Apply updates
+    updated_cols = set()
+    for update in updates:
+        col_name = update.get("column", "")
+        value = update.get("value", "")
+        idx = col_idx.get(col_name.lower().strip())
+        if idx is not None and idx < len(row_data):
+            updated_cols.add(idx)
+            row_data[idx] = value
+
+    # Display columns that have data
+    print(f"\n   📊 SIMULATED SHEET ROW (after updates applied):")
+    print(f"   " + "─" * 56)
+
+    for i, (col, val) in enumerate(zip(header, row_data)):
+        if val or i in updated_cols:
+            marker = " ✏️" if i in updated_cols else ""
+            val_display = val if val else "(empty)"
+            print(f"   │ {col:25} │ {val_display:25} │{marker}")
+
+    print(f"   " + "─" * 56)
+
+    # Show which required fields are complete
+    required = ["Total SF", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]
+    complete = []
+    missing = []
+    for req in required:
+        idx = col_idx.get(req.lower().strip())
+        if idx is not None and idx < len(row_data) and row_data[idx]:
+            complete.append(req)
+        else:
+            missing.append(req)
+
+    if complete:
+        print(f"   ✅ Complete: {', '.join(complete)}")
+    if missing:
+        print(f"   ❌ Missing: {', '.join(missing)}")
+
+    return row_data
+
+
+def show_full_email_response(response_email: str, contact_name: str = ""):
+    """Display the full email response with proper formatting."""
+    if not response_email:
+        print(f"\n   📧 RESPONSE EMAIL: (none - escalated to user)")
+        return
+
+    print(f"\n   📧 RESPONSE EMAIL:")
+    print(f"   " + "─" * 56)
+    # Add proper line breaks
+    lines = response_email.split('\n')
+    for line in lines:
+        print(f"   │ {line}")
+    # Show what would be appended (signature)
+    print(f"   │ ")
+    print(f"   │ Best,")
+    print(f"   │ Jill")
+    print(f"   " + "─" * 56)
+
+
 @dataclass
 class ExpectedNotification:
     """Expected notification definition."""
@@ -999,8 +1077,18 @@ def run_test(scenario: TestScenario, verbose: bool = True) -> TestResult:
         if result.ai_notes:
             print(f"   Notes: {result.ai_notes}")
 
-    # Get row data for notification validation
-    prop = PROPERTIES.get(scenario.property_address)
+        # Get property data for display
+        prop = PROPERTIES.get(scenario.property_address)
+
+        # Show simulated sheet row (visual representation)
+        show_simulated_sheet_row(scenario.name, scenario.property_address, result.ai_updates)
+
+        # Show full email response
+        show_full_email_response(result.ai_response, prop["contact"] if prop else "")
+
+    # Get row data for notification validation (prop may already be set if verbose)
+    if not verbose:
+        prop = PROPERTIES.get(scenario.property_address)
     row_data = prop["data"] if prop else []
 
     # Validate
