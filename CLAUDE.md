@@ -231,7 +231,7 @@ python tests/standalone_test.py -l
 python tests/standalone_test.py -r results.json
 ```
 
-### Test Scenarios (10 total)
+### Test Scenarios (19 total)
 
 | Scenario | Tests |
 |----------|-------|
@@ -245,6 +245,15 @@ python tests/standalone_test.py -r results.json
 | `vague_response` | No concrete data → re-request specifics |
 | `new_property_suggestion` | Original available + new property mentioned |
 | `close_conversation` | Natural conversation ending |
+| `client_asks_requirements` | Broker asks about client's space requirements - AI escalates |
+| `scheduling_request` | Broker requests tour scheduling - AI escalates |
+| `negotiation_attempt` | Broker makes counteroffer - AI escalates |
+| `identity_question` | Broker asks who the client is - AI escalates |
+| `legal_contract_question` | Broker asks about contract/LOI - AI escalates |
+| `mixed_info_and_question` | Broker provides info but also asks question requiring user input |
+| `budget_question` | Broker asks about budget - AI escalates |
+| `different_person_replies` | Different person signs email - Leasing Contact NOT updated |
+| `new_property_suggestion_with_different_contact` | New property suggested - original contact NOT changed |
 
 ### Key Files
 
@@ -255,6 +264,10 @@ tests/
 ├── test_results.json     # Last test run results
 └── TEST_SCENARIOS.md     # Detailed scenario documentation
 ```
+
+### Test Data File
+
+**`Scrub Augusta GA.xlsx`** (in project root) - Real-world property data for testing. Use this file when testing sheet operations, column mapping, or AI extraction against actual data formats.
 
 ### Adding/Modifying Scenarios
 
@@ -308,3 +321,159 @@ Jill and Clients comments
 # NEVER request: "Rent/SF /Yr" (provided voluntarily, not requested)
 # NEVER write: "Gross Rent" (formula column: =(H+I)*G/12, auto-calculates monthly rent)
 ```
+
+---
+
+## Frontend Integration (email-admin-ui)
+
+### Key Frontend Components
+
+| Component | Purpose |
+|-----------|---------|
+| `ClientsPage.jsx` | Client management, upload Excel, create Google Sheets |
+| `Dashboard.jsx` | Main dashboard with stats and client table |
+| `ClientsTable.jsx` | Lists clients with actions (Get Started, View) |
+| `StartProjectModal.jsx` | Launch outreach campaigns, personalize emails |
+| `NewPropertyRequestModal.jsx` | Handle new property suggestions from backend |
+| `NotificationsSidebar.jsx` | Real-time notification display |
+| `useNotifications.js` | Hook for listening to backend notifications |
+
+### Frontend → Backend Data Flow
+
+```
+1. User uploads Excel (AddClientModal)
+   └─> Firebase Function `analyzeSheetColumns` (AI maps columns)
+   └─> Firebase Function `api` (creates Google Sheet)
+   └─> Frontend saves to `users/{uid}/clients/{clientId}`
+
+2. User launches campaign (StartProjectModal)
+   └─> Frontend creates outbox entries per property/broker
+   └─> Backend reads outbox every 30 min, sends emails, deletes entries
+
+3. Backend detects reply
+   └─> Writes to `threads/`, `msgIndex/`, `convIndex/`
+   └─> Extracts data via OpenAI
+   └─> Writes to Google Sheets
+   └─> Creates `notifications/` for frontend
+```
+
+### Outbox Document Structure (Frontend writes, Backend consumes)
+
+```javascript
+{
+  id: string,                    // Firestore doc ID
+  clientId: string,              // Reference to client
+  assignedEmails: string[],      // Recipients (single email if personalized)
+  script: string,                // Email body
+  secondaryScript: string|null,  // Follow-up script
+  subject: string,
+  contactName: string,           // Full contact name
+  firstName: string,             // For [NAME] personalization
+  property: {
+    address: string,
+    city: string,
+    propertyName: string,
+    rowIndex: number             // Sheet row to track
+  },
+  isPersonalized: boolean,       // True if [NAME] was replaced
+  createdAt: Timestamp           // For send ordering
+}
+```
+
+### Notification Structure (Backend writes, Frontend reads)
+
+```javascript
+{
+  id: string,
+  kind: "sheet_update" | "action_needed" | "row_completed" | "property_unavailable",
+  createdAt: Timestamp,
+  priority: "important" | "normal",
+
+  // For sheet_update:
+  meta: { column: string, address: string, newValue: any },
+
+  // For action_needed:
+  meta: {
+    reason: "new_property_pending_approval" | "call_requested" | "missing_fields",
+    address: string,
+    city: string,
+    link: string,
+    notes: string,
+    status: "pending_approval" | "pending_send",
+    suggestedEmail: { to: string[], subject: string, body: string }
+  },
+
+  // For row_completed:
+  rowAnchor: string
+}
+```
+
+### Event Types (Backend → Frontend)
+
+| Event | Trigger | Frontend Action |
+|-------|---------|-----------------|
+| `sheet_update` | AI extracts a field value | Shows in notification sidebar |
+| `row_completed` | All required fields filled | Marks property complete |
+| `action_needed` | Call requested, new property suggested | Shows action button |
+| `property_unavailable` | Broker says not available | Moves row below NON-VIABLE |
+| `new_property` | Broker suggests new property | Creates pending approval notification |
+| `call_requested` | Broker wants to talk | Creates action_needed notification |
+| `close_conversation` | Natural end of thread | Stops processing thread |
+
+### Firebase Cloud Functions (in email-admin-ui/functions)
+
+| Function | Purpose |
+|----------|---------|
+| `api` | Creates Google Sheet from uploaded Excel |
+| `deleteSheet` | Deletes Google Sheet when client removed |
+| `analyzeSheetColumns` | AI maps Excel columns to canonical fields |
+| `generateAllScripts` | Batch generates follow-up emails |
+| `generateSecondaryScript` | Regenerates single follow-up |
+| `chatWithPropertyContext` | AI chat for email composition |
+
+---
+
+## AI Processing Rules
+
+### Forbidden Actions
+- **Never write** `Gross Rent` (formula column)
+- **Never request** `Rent/SF /Yr` or `Gross Rent` from brokers
+- **Never reveal** client identity or budget
+- **Never commit** to tours, contracts, or negotiations
+- **Never answer** questions requiring user input (forward to user instead)
+
+### Read-Only Fields (AI should NEVER update)
+These fields contain pre-existing client data that should NEVER be changed by AI:
+- `Property Address`
+- `City`
+- `Property Name`
+- `Leasing Company`
+- `Leasing Contact` ← Even if someone else signs the email!
+- `Email`
+
+The AI may ONLY update extractable property specs (Total SF, Ops Ex, Drive Ins, Docks, Ceiling Ht, Power, etc.)
+
+### Response Types
+| Type | When | Action |
+|------|------|--------|
+| `closing` | All required fields complete | Send thank-you, close thread |
+| `missing_fields` | Some fields still needed | Request missing info |
+| `unavailable` | Property not available | Ask for alternatives |
+| `new_property` | Broker suggests new property | Create notification for approval |
+| `call_requested` | Broker wants to call | Create action_needed notification |
+| `forward_to_user` | Question AI can't answer | Create notification for user |
+
+---
+
+## Sheet Operations
+
+### NON-VIABLE Divider
+- Row in sheet separating viable from non-viable properties
+- Properties marked unavailable are moved BELOW this divider
+- New properties are inserted ABOVE this divider
+- `sheet_operations.py` handles row movement
+
+### Column Mapping
+- `column_config.py` defines canonical field names
+- AI maps broker responses to canonical fields
+- Case-insensitive matching with normalization

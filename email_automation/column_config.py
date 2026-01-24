@@ -387,6 +387,12 @@ def build_column_rules_prompt(column_config: Dict[str, Any]) -> str:
     lines.append('- For ceiling height, output just the number: "24" not "24 feet".')
     lines.append('- For drive-ins/docks, output just the number: "3" not "3 doors".')
     lines.append('- For power, output the electrical specification as provided: "200A", "480V", "100A 3-phase".')
+    lines.append("")
+    lines.append("CRITICAL - ALLOWED COLUMNS ONLY:")
+    lines.append("- You may ONLY propose updates to columns listed above in COLUMN SEMANTICS.")
+    lines.append("- DO NOT update: Property Address, City, Property Name, Leasing Company, Leasing Contact, Email, or any other column not listed above.")
+    lines.append("- These fields contain pre-existing client data that should NEVER be changed based on email content.")
+    lines.append("- Even if someone signs their email differently than the Leasing Contact field, DO NOT change it.")
 
     return "\n".join(lines)
 

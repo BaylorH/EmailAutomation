@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs
@@ -83,7 +83,7 @@ def lookup_thread_by_conversation_id(user_id: str, conversation_id: str) -> Opti
         print(f"❌ Failed to lookup conversation {conversation_id}: {e}")
         return None
 
-def _get_thread_messages_chronological(uid: str, thread_id: str) -> list[dict]:
+def _get_thread_messages_chronological(uid: str, thread_id: str) -> List[dict]:
     """Get all messages in thread in chronological order."""
     try:
         messages_ref = (_fs.collection("users").document(uid)
@@ -120,7 +120,7 @@ def _get_thread_messages_chronological(uid: str, thread_id: str) -> list[dict]:
         print(f"❌ Failed to get thread messages: {e}")
         return []
 
-def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, headers: dict = None) -> list[dict]:
+def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, headers: dict = None) -> List[dict]:
     """
     Return last N messages in chronological order. Each item includes:
     direction, from, to, subject, timestamp, preview (short), content (full text, bounded)
@@ -366,7 +366,7 @@ def _sync_ref(user_id: str):
     """Get reference to sync document."""
     return _fs.collection("users").document(user_id).collection("sync").document("inbox")
 
-def get_last_scan_iso(user_id: str) -> str | None:
+def get_last_scan_iso(user_id: str) -> Optional[str]:
     """Get the last scan timestamp."""
     try:
         doc = _sync_ref(user_id).get()

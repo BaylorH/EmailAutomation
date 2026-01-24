@@ -16,7 +16,7 @@ import sys
 import json
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
 # ============================================================================
@@ -112,6 +112,13 @@ PROPERTIES = {
         "contact": "Scott A. Atkins CCIM, SIOR",
         "email": "bp21harrison@gmail.com",
         "data": ["1 Randolph Ct", "Evans", "", "Atkins Commercial Properties", "Scott A. Atkins CCIM, SIOR", "bp21harrison@gmail.com", "", "", "", "", "", "", "", "", "", "", "", ""]
+    },
+    "2058 Gordon Hwy": {
+        "row": 5,
+        "city": "Augusta",
+        "contact": "Jonathan Aceves",
+        "email": "baylor@manifoldengineering.ai",
+        "data": ["2058 Gordon Hwy", "Augusta", "Battery Clinic", "Meybohm Commercial Properties", "Jonathan Aceves", "baylor@manifoldengineering.ai", "", "", "", "", "", "", "", "", "", "", "", ""]
     }
 }
 
@@ -134,6 +141,7 @@ class TestScenario:
     expected_events: List[str]  # ["property_unavailable", "new_property", etc.]
     expected_response_type: str  # "missing_fields", "closing", "unavailable", etc.
     expected_notifications: List[ExpectedNotification] = None  # What notifications should fire
+    forbidden_updates: List[str] = None  # Columns that should NEVER be updated (e.g., Leasing Contact)
 
 
 @dataclass
@@ -663,6 +671,53 @@ Scott"""}
             ExpectedNotification(kind="action_needed", reason="needs_user_input:client_question"),
         ]
     ),
+
+    TestScenario(
+        name="different_person_replies",
+        description="Different person replies but Leasing Contact should NOT be updated",
+        property_address="2058 Gordon Hwy",  # Jonathan Aceves is the contact
+        messages=[
+            {"direction": "outbound", "content": "Hi Jonathan, I'm interested in 2058 Gordon Hwy. Can you provide property details?"},
+            {"direction": "inbound", "content": """Hey yeah I can help ya on this property.
+
+The space is 10,000 SF with $6.50/SF NNN asking rent.
+
+Thanks,
+Baylor Harrison"""}  # Different person signing!
+        ],
+        expected_updates=[
+            {"column": "Total SF", "value": "10000"},
+            {"column": "Rent/SF /Yr", "value": "6.50"},
+            # CRITICAL: NO Leasing Contact update!
+        ],
+        forbidden_updates=["Leasing Contact", "Leasing Company", "Email"],  # These should NEVER be updated
+        expected_events=[],
+        expected_response_type="missing_fields",
+        expected_notifications=[
+            ExpectedNotification(kind="sheet_update"),  # Total SF
+            ExpectedNotification(kind="sheet_update"),  # Rent/SF /Yr
+        ]
+    ),
+
+    TestScenario(
+        name="new_property_suggestion_with_different_contact",
+        description="Broker suggests new property with different contact - should NOT update original Leasing Contact",
+        property_address="2058 Gordon Hwy",
+        messages=[
+            {"direction": "outbound", "content": "Hi Jonathan, is 2058 Gordon Hwy still available?"},
+            {"direction": "inbound", "content": """Hey yeah I can help ya on this property but here's another property reach out to Baylor bp21harrison@gmail.com about 435 sicko street
+
+Thanks,
+Someone Else"""}
+        ],
+        expected_updates=[],  # No updates to original property - they didn't provide specs
+        forbidden_updates=["Leasing Contact", "Leasing Company"],  # NEVER update these
+        expected_events=["new_property"],
+        expected_response_type="new_property",
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="new_property_pending_send"),
+        ]
+    ),
 ]
 
 
@@ -692,7 +747,7 @@ def build_conversation(scenario: TestScenario) -> list[dict]:
     return conversation
 
 
-def call_production_function(scenario: TestScenario) -> tuple[dict | None, int]:
+def call_production_function(scenario: TestScenario) -> Tuple[Optional[dict], int]:
     """
     Call the production propose_sheet_updates() function.
     Returns (proposal_dict, elapsed_ms).
@@ -777,6 +832,13 @@ def validate_result(scenario: TestScenario, result: Dict, row_data: List[str] = 
     for u in updates:
         if u.get("column", "").lower() == "gross rent":
             issues.append("AI tried to write to 'Gross Rent' (FORBIDDEN - it's a formula column)")
+
+    # Check AI didn't try to write to forbidden columns (like Leasing Contact)
+    if scenario.forbidden_updates:
+        for u in updates:
+            col = u.get("column", "")
+            if col in scenario.forbidden_updates:
+                issues.append(f"AI tried to update '{col}' (FORBIDDEN - pre-existing client data that should NEVER be changed)")
 
     # Check escalation scenarios
     if scenario.expected_response_type == "escalate":

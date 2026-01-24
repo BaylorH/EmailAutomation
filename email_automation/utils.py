@@ -40,7 +40,7 @@ def is_valid_email(email: str) -> bool:
         return False
     return True
 
-def validate_recipient_emails(emails: list[str]) -> tuple[list[str], list[str]]:
+def validate_recipient_emails(emails: List[str]) -> tuple[List[str], List[str]]:
     """
     Validate a list of email addresses.
     Returns (valid_emails, invalid_emails).
@@ -124,7 +124,7 @@ def exponential_backoff_request(func, max_retries: int = 3):
             raise
     raise Exception(f"Request failed after {max_retries} attempts")
 
-def fetch_url_as_text(url: str) -> str | None:
+def fetch_url_as_text(url: str) -> Optional[str]:
     """
     Try to fetch URL content and extract visible text using BeautifulSoup.
     Returns None on any failure (fail-safe).
@@ -491,7 +491,7 @@ def format_email_body_with_footer(body: str, custom_signature: str = None, signa
 <body style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000; margin: 0; padding: 0;">
 <div style="max-width: 600px; font-family: Arial, Helvetica, sans-serif; font-size: 10pt;">
 <span style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt;">{html_body}</span>
-<br>
+<br><br>
 <div style="min-height: 1px;">
 {footer_html}
 </div>

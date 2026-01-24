@@ -23,7 +23,7 @@ def _get_user_signature_settings(uid: str) -> Tuple[Optional[str], Optional[str]
     return None, None
 
 def send_remaining_questions_email(uid: str, client_id: str, headers: dict, recipient: str, 
-                                 missing_fields: list[str], thread_id: str, row_number: int,
+                                 missing_fields: List[str], thread_id: str, row_number: int,
                                  row_anchor: str) -> bool:
     """
     Send a remaining questions email in the same thread (idempotent).
@@ -188,7 +188,7 @@ We'll be in touch if we need any additional information."""
         return False
 
 def send_new_property_email(uid: str, client_id: str, headers: dict, recipient: str, 
-                          address: str, city: str, row_number: int) -> str | None:
+                          address: str, city: str, row_number: int) -> Optional[str]:
     """
     Send a new thread email for a new property suggestion.
     Returns the new thread ID if successful.

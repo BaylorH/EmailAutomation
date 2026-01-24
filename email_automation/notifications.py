@@ -83,9 +83,9 @@ def add_client_notifications(
     client_id: str,
     email: str,
     thread_id: str,
-    applied_updates: list[dict],
-    notes: str | None = None,
-    address: str | None = None,
+    applied_updates: List[dict],
+    notes: Optional[str] = None,
+    address: Optional[str] = None,
 ):
     """
     UPDATED: Writes one notification doc per applied field change.

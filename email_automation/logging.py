@@ -32,7 +32,7 @@ def _ensure_log_tab_exists(sheets, spreadsheet_id: str) -> str:
         meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
         return meta["sheets"][0]["properties"]["title"]
 
-def _get_last_logged_message_id(sheets, spreadsheet_id: str, tab_title: str, thread_id: str) -> str | None:
+def _get_last_logged_message_id(sheets, spreadsheet_id: str, tab_title: str, thread_id: str) -> Optional[str]:
     """Get the last message ID that was logged for this thread."""
     try:
         # Read all values from Log tab

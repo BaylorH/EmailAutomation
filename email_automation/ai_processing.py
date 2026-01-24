@@ -15,7 +15,7 @@ from .column_config import (
     REQUIRED_FOR_CLOSE,
 )
 
-def get_row_anchor(rowvals: list[str], header: list[str]) -> str:
+def get_row_anchor(rowvals: List[str], header: List[str]) -> str:
     """Create a brief row anchor from property address and city."""
     try:
         idx_map = _header_index_map(header)
@@ -24,7 +24,7 @@ def get_row_anchor(rowvals: list[str], header: list[str]) -> str:
         addr_keys = ["property address", "address", "street address", "property"]
         city_keys = ["city", "town", "municipality"]
         
-        def _get_val(keys: list[str]) -> str:
+        def _get_val(keys: List[str]) -> str:
             for k in keys:
                 if k in idx_map:
                     i = idx_map[k] - 1  # 0-based for rowvals
@@ -48,7 +48,7 @@ def get_row_anchor(rowvals: list[str], header: list[str]) -> str:
     except Exception:
         return "Unknown property"
 
-def check_missing_required_fields(rowvals: list[str], header: list[str], column_config: dict = None) -> list[str]:
+def check_missing_required_fields(rowvals: List[str], header: List[str], column_config: dict = None) -> List[str]:
     """
     Check which required fields are missing from the row.
     Uses dynamic column config if provided, otherwise falls back to defaults.
@@ -113,7 +113,7 @@ def _ensure_ai_meta_tab(sheets, spreadsheet_id: str) -> None:
     except Exception as e:
         print(f"⚠️ Could not create AI_META tab: {e}")
 
-def _read_ai_meta_row(sheets, spreadsheet_id: str, rownum: int, column: str) -> dict | None:
+def _read_ai_meta_row(sheets, spreadsheet_id: str, rownum: int, column: str) -> Optional[Dict]:
     """Read AI_META record for specific row/column."""
     try:
         _ensure_ai_meta_tab(sheets, spreadsheet_id)
@@ -164,7 +164,7 @@ def _append_ai_meta(sheets, spreadsheet_id: str, rownum: int, column: str, value
     except Exception as e:
         print(f"⚠️ Failed to append AI_META record: {e}")
 
-def _append_notes_to_comments(sheets, spreadsheet_id: str, tab_title: str, header: list[str], rownum: int, notes: str):
+def _append_notes_to_comments(sheets, spreadsheet_id: str, tab_title: str, header: List[str], rownum: int, notes: str):
     """
     Append notes to the comments field (Listing Brokers Comments or Jill and Clients Comments).
     Prefers 'Listing Brokers Comments' if available, otherwise uses 'Jill and Clients Comments'.
@@ -231,9 +231,9 @@ def apply_proposal_to_sheet(
     uid: str,
     client_id: str,
     sheet_id: str,
-    header: list[str],
+    header: List[str],
     rownum: int,
-    current_rowvals: list[str],
+    current_rowvals: List[str],
     proposal: dict,
 ) -> dict:
     """
@@ -354,17 +354,17 @@ def propose_sheet_updates(uid: str,
                           client_id: str,
                           email: str,
                           sheet_id: str,
-                          header: list[str],
+                          header: List[str],
                           rownum: int,
-                          rowvals: list[str],
+                          rowvals: List[str],
                           thread_id: str,
-                          pdf_manifest: list[dict] = None,   # [{"name": "...", "text": "...", "images": [...], "id": "..."}]
-                          url_texts: list[dict] = None,
+                          pdf_manifest: List[dict] = None,   # [{"name": "...", "text": "...", "images": [...], "id": "..."}]
+                          url_texts: List[dict] = None,
                           contact_name: str = None,
                           headers: dict = None,
-                          conversation: list[dict] = None,   # Optional: pass conversation directly (for testing)
+                          conversation: List[dict] = None,   # Optional: pass conversation directly (for testing)
                           column_config: dict = None,        # Optional: dynamic column configuration
-                          dry_run: bool = False) -> dict | None:
+                          dry_run: bool = False) -> Optional[Dict]:
     """
     Uses OpenAI Responses API to propose sheet updates.
     - Grounds on the current row's (address, city) as TARGET PROPERTY.

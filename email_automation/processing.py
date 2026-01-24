@@ -2,6 +2,7 @@ import re
 import requests
 import hashlib
 import json
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
@@ -57,7 +58,7 @@ def _store_contact_optout(user_id: str, email: str, reason: str, thread_id: str)
         return False
 
 
-def is_contact_opted_out(user_id: str, email: str) -> dict | None:
+def is_contact_opted_out(user_id: str, email: str) -> Optional[Dict]:
     """
     Check if a contact has opted out of communications.
     Returns the opt-out record if found, None otherwise.
@@ -265,7 +266,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         print(f"   ❌ Failed to send reply: {e}")
         return False
 
-def _find_client_id_by_email(uid: str, email: str) -> str | None:
+def _find_client_id_by_email(uid: str, email: str) -> Optional[str]:
     """
     Search through all clients (active and archived) to find which one has a sheet
     with a row matching the given email address.
@@ -334,7 +335,7 @@ def _find_client_id_by_email(uid: str, email: str) -> str | None:
         print(f"   ⚠️ Failed to search clients for email {email_lower}: {e}")
         return None
 
-def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email: str | None):
+def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email: Optional[str]):
     # Read thread (to get clientId)
     tdoc = (_fs.collection("users").document(uid)
             .collection("threads").document(thread_id).get())
@@ -716,6 +717,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
                     from datetime import datetime as dt, timezone as tz
                     now_id = dt.now(tz.utc).isoformat().replace(":", "-").replace(".", "-").replace("+00:00", "Z")
+                    # Extract file IDs from PDF manifest if available
+                    file_ids = [p.get('id') for p in (pdf_manifest or []) if p.get('id')]
+
                     _fs.collection("users").document(user_id).collection("sheetChangeLog").document(f"{thread_id}__applied__{now_id}").set({
                         "clientId": client_id,
                         "email": from_addr_lower,
@@ -725,7 +729,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         "status": "applied",
                         "threadId": thread_id,
                         "createdAt": SERVER_TIMESTAMP,
-                        "fileIds": file_ids_for_this_run,
+                        "fileIds": file_ids,
                         "proposalHash": applied_hash,
                     })
                 except Exception as e:
@@ -824,8 +828,13 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         )
                         print(f"⚠️ Created needs_user_input notification (reason: {reason})")
 
-                        # Always skip auto-response when user input is needed
-                        proposal["skip_response"] = True
+                        # Only skip response if AI didn't generate one
+                        # If AI generated a response (e.g., acknowledging info while deferring the question), send it
+                        if not proposal.get("response_email"):
+                            proposal["skip_response"] = True
+                            print(f"   ℹ️ No AI response generated, will skip email")
+                        else:
+                            print(f"   ℹ️ AI generated response, will send acknowledgment email")
 
                     except Exception as e:
                         print(f"❌ Failed to write needs_user_input notification: {e}")
@@ -934,6 +943,10 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     try:
                         address = event.get("address", "")
                         city = event.get("city", "")
+                        # AI can provide specific email for new property contact (different from current sender)
+                        new_property_email = event.get("email", "").strip().lower() or from_addr_lower
+                        if new_property_email != from_addr_lower:
+                            print(f"📧 New property has different contact: {new_property_email} (current sender: {from_addr_lower})")
 
                         # Skip if no address provided
                         if not address or not address.strip():
@@ -1007,8 +1020,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             leasing_contact = rowvals[leasing_contact_idx - 1] or ""
 
                         # Build suggested (not sent) email payload
+                        # Use the specific contact email if AI provided one, otherwise use the current sender
                         email_payload = {
-                            "to": [from_addr_lower],
+                            "to": [new_property_email],
                             "subject": f"{address}, {city}" if city else address,
                             "body": f"""Hi,
 
@@ -1031,7 +1045,7 @@ Thanks!""",
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
-                            email=from_addr_lower,
+                            email=new_property_email,  # Use the specific contact for the new property
                             thread_id=thread_id,   # keep context with original thread
                             row_number=None,  # No row yet
                             row_anchor=f"{address}, {city}" if city else address,
@@ -1044,7 +1058,7 @@ Thanks!""",
                                 "notes": notes,
                                 "leasingCompany": leasing_company,
                                 "leasingContact": leasing_contact,
-                                "brokerEmail": from_addr_lower,
+                                "brokerEmail": new_property_email,  # Email for the new property contact
                                 "sheetId": sheet_id,
                                 "tabTitle": tab_title,
                                 "suggestedEmail": email_payload,
@@ -1055,12 +1069,17 @@ Thanks!""",
                                 # Client criteria for AI email generation on frontend
                                 "clientCriteria": client_criteria
                             },
-                            dedupe_key=f"new_property_pending:{thread_id}:{address}:{city}:{from_addr_lower}"
+                            dedupe_key=f"new_property_pending:{thread_id}:{address}:{city}:{new_property_email}"
                         )
                         print(f"🏢 Created new property pending approval notification (no row created yet)")
 
-                        # Skip auto-response - user must approve/send from frontend
-                        proposal["skip_response"] = True
+                        # Only skip response if AI didn't generate one for the ORIGINAL property
+                        # If broker said "I can help on this property AND here's another" - we should respond about the original
+                        if not proposal.get("response_email"):
+                            proposal["skip_response"] = True
+                            print(f"   ℹ️ No AI response for original property, will skip email")
+                        else:
+                            print(f"   ℹ️ AI generated response for original property, will send it")
 
                     except Exception as e:
                         print(f"❌ Failed to handle new_property: {e}")
@@ -1612,7 +1631,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
         print(f"📥 Scanned {scanned_count}; processed {processed_count}; skipped {skipped_count}")
 
 
-def _match_message_to_thread(user_id: str, msg: dict, headers: dict) -> str | None:
+def _match_message_to_thread(user_id: str, msg: dict, headers: dict) -> Optional[str]:
     """
     Try to match an inbox message to an existing thread.
     Returns thread_id if found, None otherwise.

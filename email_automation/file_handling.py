@@ -261,7 +261,7 @@ def ensure_drive_folder():
         print(f"❌ Failed to ensure Drive folder: {e}")
         return None
 
-def upload_pdf_to_drive(name: str, content: bytes, folder_id: str = None) -> str | None:
+def upload_pdf_to_drive(name: str, content: bytes, folder_id: str = None) -> Optional[str]:
     """Upload PDF to Drive and return webViewLink."""
     try:
         creds = _helper_google_creds()

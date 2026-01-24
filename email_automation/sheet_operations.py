@@ -3,7 +3,7 @@ from .clients import _fs, _sheets_client
 from .sheets import _get_first_tab_title, _read_header_row2, _header_index_map, _first_sheet_props, _find_row_by_address_city, _find_row_by_email
 from .utils import _subject_to_address_city
 
-def _find_nonviable_divider_row(sheets, spreadsheet_id: str, tab_title: str) -> int | None:
+def _find_nonviable_divider_row(sheets, spreadsheet_id: str, tab_title: str) -> Optional[int]:
     """Return the divider row index if it exists, else None (no creation)."""
     try:
         resp = sheets.spreadsheets().values().get(
@@ -262,7 +262,7 @@ def insert_property_row_above_divider(sheets, sheet_id: str, tab_title: str, val
         raise
 
 def _find_row_by_anchor(uid: str, thread_id: str, sheets, spreadsheet_id: str, tab_title: str, 
-                       header: list[str], fallback_email: str):
+                       header: List[str], fallback_email: str):
     try:
         # 1) Prefer explicit stored rowNumber (unchanged)
         thread_doc = _fs.collection("users").document(uid).collection("threads").document(thread_id).get()

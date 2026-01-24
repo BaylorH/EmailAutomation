@@ -243,7 +243,7 @@ Please let me know if you have any information on this property, or if it's no l
 
 Thanks!"""
 
-def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> str | None:
+def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> Optional[str]:
     """
     Look up the row by email and return 'property address, city' as subject.
     Falls back to None if sheet/row/columns not found.
@@ -270,7 +270,7 @@ def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> st
             "city", "town", "municipality"
         ]
 
-        def _get_val(keys: list[str]) -> str | None:
+        def _get_val(keys: List[str]) -> Optional[str]:
             for k in keys:
                 if k in idx_map:
                     i = idx_map[k] - 1  # 0-based for rowvals
@@ -891,7 +891,7 @@ def _extract_property_from_script(script: str) -> str:
     return ""
 
 # Legacy Functions (kept for compatibility)
-def send_email(headers, script: str, emails: list[str], client_id: str | None = None):
+def send_email(headers, script: str, emails: List[str], client_id: Optional[str] = None):
     """Legacy function - redirects to send_and_index_email"""
     # Note: This legacy function doesn't have user_id, so it can't use the new pipeline
     # Users should migrate to send_and_index_email directly
