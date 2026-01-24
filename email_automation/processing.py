@@ -567,7 +567,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         thread_ref.set({"updatedAt": SERVER_TIMESTAMP}, merge=True)
     except Exception as e:
         print(f"⚠️ Failed to update thread timestamp: {e}")
-    
+
+    # Cancel/pause any pending follow-ups since broker responded
+    try:
+        from .followup import cancel_followup_on_response
+        cancel_followup_on_response(user_id, thread_id)
+    except Exception as e:
+        print(f"⚠️ Failed to cancel follow-up: {e}")
+
     # Dump the conversation
     dump_thread_from_firestore(user_id, thread_id)
     

@@ -299,7 +299,8 @@ def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> Op
 
 def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, recipients: List[str],
                         client_id_or_none: Optional[str] = None, row_number: int = None, user_signature: str = None,
-                        subject_override: str = None, signature_mode: str = None):
+                        subject_override: str = None, signature_mode: str = None, followup_config: Dict = None,
+                        contact_name: str = None):
     """
     Send email and immediately index it in Firestore for reply tracking.
 
@@ -317,6 +318,8 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         user_signature: Optional custom signature from user settings
         subject_override: Optional pre-computed subject (e.g., from property data)
         signature_mode: Signature mode - "none", "custom", or "professional"
+        followup_config: Optional follow-up configuration from outbox
+        contact_name: Optional contact name for follow-up personalization
 
     SAFETY: All recipient emails are validated before sending to prevent sending to malformed addresses.
     SAFETY: Opted-out contacts are filtered out before sending.
@@ -576,7 +579,17 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
 
             results["sent"].append(addr)
             print(f"✅ Sent and indexed email to {addr} (threadId: {root_id})")
-            
+
+            # Schedule follow-up if configured
+            if followup_config and followup_config.get("enabled", False):
+                from .followup import schedule_followup_for_thread
+                # Store contact name on thread for follow-up personalization
+                if contact_name:
+                    _fs.collection("users").document(user_id).collection("threads").document(root_id).update({
+                        "contactName": contact_name
+                    })
+                schedule_followup_for_thread(user_id, root_id, followup_config)
+
         except Exception as e:
             msg = str(e)
             print(f"❌ Failed to send/index to {addr}: {msg}")
@@ -749,10 +762,13 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
         try:
             # Use pre-computed subject from property data
             subject_override = prop.get('subject') or None
+            followup_config = data.get("followUpConfig")
+            contact_name = data.get("contactName") or data.get("firstName")
             res = send_and_index_email(user_id, headers, script, [recipient_email],
                                        client_id_or_none=clientId, row_number=row_number,
                                        user_signature=user_signature, subject_override=subject_override,
-                                       signature_mode=signature_mode)
+                                       signature_mode=signature_mode, followup_config=followup_config,
+                                       contact_name=contact_name)
             any_errors = bool([e for e in res.get("errors", {}) if "opted out" not in str(res["errors"].get(e, ""))])
 
             if not any_errors and res["sent"]:
@@ -836,6 +852,10 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     all_sent = []
     all_errors = {}
 
+    # Get follow-up config if present
+    followup_config = data.get("followUpConfig")
+    contact_name = data.get("contactName") or data.get("firstName")
+
     # For each recipient, select the appropriate script based on contact history
     for recipient_email in emails:
         selected_script = _select_script_for_recipient(
@@ -846,7 +866,8 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
             res = send_and_index_email(user_id, headers, selected_script, [recipient_email],
                                        client_id_or_none=clientId, row_number=row_number,
                                        user_signature=user_signature, subject_override=subject_override,
-                                       signature_mode=signature_mode)
+                                       signature_mode=signature_mode, followup_config=followup_config,
+                                       contact_name=contact_name)
 
             all_sent.extend(res.get("sent", []))
             all_errors.update(res.get("errors", {}))

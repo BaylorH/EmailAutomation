@@ -5,6 +5,7 @@ from firebase_helpers import download_token, upload_token
 from email_automation.clients import list_user_ids, decode_token_payload, _fs
 from email_automation.email import send_outboxes
 from email_automation.processing import scan_inbox_against_index, scan_sent_items_for_manual_replies
+from email_automation.followup import check_and_send_followups
 from email_automation.app_config import CLIENT_ID, CLIENT_SECRET, AUTHORITY, SCOPES, TOKEN_CACHE, FIREBASE_API_KEY
 
 # Thresholds for auto-cleanup (to stay within Firebase free tier)
@@ -116,6 +117,9 @@ def refresh_and_process_user(user_id: str):
     # Scan for Jill's manual replies (SentItems - catch manual replies we didn't index)
     print(f"\n📤 Scanning SentItems for manual replies...")
     scan_sent_items_for_manual_replies(user_id, headers, top=50)
+
+    # Check and send follow-up emails for threads without responses
+    check_and_send_followups(user_id, headers)
 
     # Auto-cleanup Firestore if collections are getting large (stay within free tier)
     auto_cleanup_firestore(user_id)
