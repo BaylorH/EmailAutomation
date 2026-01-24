@@ -1,0 +1,30 @@
+{
+  "property": "2058 Gordon Hwy",
+  "city": "Augusta",
+  "description": "Different person replies with partial info - should extract data but NOT update Leasing Contact",
+
+  "messages": [
+    {
+      "direction": "outbound",
+      "content": "Hi Jonathan, I'm interested in 2058 Gordon Hwy in Augusta. Can you provide the property specifications?"
+    },
+    {
+      "direction": "inbound",
+      "content": "Hey yeah I can help ya on this property.\n\nThe space is 10,000 SF with $6.50/SF NNN asking rent.\n\nThanks,\nBaylor Harrison"
+    }
+  ],
+
+  "expected_updates": [
+    {"column": "Total SF", "value": "10000"},
+    {"column": "Rent/SF /Yr", "value": "6.50"}
+  ],
+  "expected_events": [],
+  "forbidden_updates": ["Leasing Contact", "Leasing Company", "Email"],
+
+  "expected_notifications": [
+    {"kind": "sheet_update", "column": "Total SF"},
+    {"kind": "sheet_update", "column": "Rent/SF /Yr"}
+  ],
+
+  "notes": "CRITICAL: Even though 'Baylor Harrison' signed the email, Leasing Contact must remain 'Jonathan Aceves'"
+}

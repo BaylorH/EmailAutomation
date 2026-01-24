@@ -1,0 +1,26 @@
+{
+  "property": "699 Industrial Park Dr",
+  "city": "Evans",
+  "description": "Broker requests a phone call - should create call_requested notification only",
+
+  "messages": [
+    {
+      "direction": "outbound",
+      "content": "Hi Jeff, I'm reaching out regarding 699 Industrial Park Dr in Evans. Could you provide the property specifications including SF, rent, NNN, door count, clear height, and power?"
+    },
+    {
+      "direction": "inbound",
+      "content": "Hi Jill,\n\nI'd prefer to discuss this over the phone - there are some details that would be easier to explain in a conversation.\n\nCan you give me a call at (706) 555-1234?\n\nThanks,\nJeff Wilson"
+    }
+  ],
+
+  "expected_updates": [],
+  "expected_events": ["call_requested"],
+  "forbidden_updates": ["Leasing Contact", "Leasing Company", "Email"],
+
+  "expected_notifications": [
+    {"kind": "action_needed", "reason": "call_requested"}
+  ],
+
+  "notes": "Phone number provided so AI should NOT send email response, only notification"
+}

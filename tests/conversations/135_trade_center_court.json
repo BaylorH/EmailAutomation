@@ -1,0 +1,26 @@
+{
+  "property": "135 Trade Center Court",
+  "city": "Augusta",
+  "description": "Broker says all info provided, ready to wrap up - should trigger close_conversation",
+
+  "messages": [
+    {
+      "direction": "outbound",
+      "content": "Hi Luke, thanks for all the details on 135 Trade Center Court!"
+    },
+    {
+      "direction": "inbound",
+      "content": "You're welcome Jill! Let me know if your client wants to schedule a tour or if there's anything else you need. Good luck with your search!\n\nBest,\nLuke"
+    }
+  ],
+
+  "expected_updates": [],
+  "expected_events": ["needs_user_input"],
+  "forbidden_updates": ["Leasing Contact", "Leasing Company", "Email"],
+
+  "expected_notifications": [
+    {"kind": "action_needed", "reason": "needs_user_input:scheduling"}
+  ],
+
+  "notes": "AI correctly detects the tour offer as something user needs to respond to"
+}

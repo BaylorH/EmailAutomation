@@ -1,0 +1,35 @@
+{
+  "property": "1 Randolph Ct",
+  "city": "Evans",
+  "description": "Broker provides partial info and asks a question - should extract data AND escalate",
+
+  "messages": [
+    {
+      "direction": "outbound",
+      "content": "Hi Scott, I'm interested in 1 Randolph Ct in Evans. What are the property specifications?"
+    },
+    {
+      "direction": "inbound",
+      "content": "Hi Jill,\n\nThe property is 15,000 SF with 24' clear height. We have 2 drive-ins and 4 docks.\n\nBy the way, what size space is your client actually looking for? And what's their timeline?\n\nThanks,\nScott"
+    }
+  ],
+
+  "expected_updates": [
+    {"column": "Total SF", "value": "15000"},
+    {"column": "Ceiling Ht", "value": "24"},
+    {"column": "Drive Ins", "value": "2"},
+    {"column": " Docks", "value": "4"}
+  ],
+  "expected_events": ["needs_user_input"],
+  "forbidden_updates": ["Leasing Contact", "Leasing Company", "Email"],
+
+  "expected_notifications": [
+    {"kind": "sheet_update", "column": "Total SF"},
+    {"kind": "sheet_update", "column": "Ceiling Ht"},
+    {"kind": "sheet_update", "column": "Drive Ins"},
+    {"kind": "sheet_update", "column": "Docks"},
+    {"kind": "action_needed", "reason": "needs_user_input:client_question"}
+  ],
+
+  "notes": "Mixed scenario: broker provides data BUT also asks questions AI can't answer - should extract AND escalate"
+}

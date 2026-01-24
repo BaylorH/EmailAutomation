@@ -1,0 +1,41 @@
+{
+  "property": "1 Kuhlke Dr",
+  "city": "Augusta",
+  "description": "Broker provides complete property information - should fill all fields",
+
+  "messages": [
+    {
+      "direction": "outbound",
+      "content": "Hi Robert, I'm reaching out about 1 Kuhlke Dr in Augusta. Could you share the property details including SF, asking rent, NNN, loading doors, clear height, and power?"
+    },
+    {
+      "direction": "inbound",
+      "content": "Hi Jill,\n\nHappy to help! Here are the specs for 1 Kuhlke Dr:\n\n- Total SF: 22,500\n- Asking: $7.25/SF/yr NNN\n- NNN Estimate: $1.95/SF/yr\n- 2 drive-in doors\n- 3 dock-high doors\n- 28' clear height\n- 400A 3-phase power\n\nThe space is move-in ready. Let me know if you'd like to tour!\n\nRobert McCrary"
+    }
+  ],
+
+  "expected_updates": [
+    {"column": "Total SF", "value": "22500"},
+    {"column": "Rent/SF /Yr", "value": "7.25"},
+    {"column": "Ops Ex /SF", "value": "1.95"},
+    {"column": "Drive Ins", "value": "2"},
+    {"column": " Docks", "value": "3"},
+    {"column": "Ceiling Ht", "value": "28"},
+    {"column": "Power", "value": "400A 3-phase"}
+  ],
+  "expected_events": [],
+  "forbidden_updates": ["Leasing Contact", "Leasing Company", "Email"],
+
+  "expected_notifications": [
+    {"kind": "sheet_update", "column": "Total SF"},
+    {"kind": "sheet_update", "column": "Rent/SF /Yr"},
+    {"kind": "sheet_update", "column": "Ops Ex /SF"},
+    {"kind": "sheet_update", "column": "Drive Ins"},
+    {"kind": "sheet_update", "column": "Docks"},
+    {"kind": "sheet_update", "column": "Ceiling Ht"},
+    {"kind": "sheet_update", "column": "Power"},
+    {"kind": "row_completed"}
+  ],
+
+  "notes": "All required fields provided - should trigger row_completed. Note: Power value may include 'power' suffix"
+}
