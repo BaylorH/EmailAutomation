@@ -7,20 +7,9 @@ Wipes all operational data from Firebase while preserving:
 - User profile (display name, signature, profile pic)
 - MSAL OAuth tokens (in Firebase Storage)
 
-This gives users a "fresh dashboard" without needing to re-authenticate.
-
 Usage:
-    # Dry run (shows what would be deleted)
-    python scripts/production_reset.py --dry-run
-
-    # Wipe specific user
-    python scripts/production_reset.py --user-id abc123
-
-    # Wipe all users (DANGEROUS)
+    export GOOGLE_APPLICATION_CREDENTIALS=~/Downloads/firebase-keys/email-automation-cache-firebase-adminsdk-fbsvc-d27630c820.json
     python scripts/production_reset.py --all-users --confirm
-
-    # List all users first
-    python scripts/production_reset.py --list-users
 """
 
 import os
@@ -28,17 +17,26 @@ import sys
 import argparse
 from datetime import datetime
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import warnings
+warnings.filterwarnings("ignore")
 
-from email_automation.clients import get_firestore_client
+from google.cloud import firestore
+
+
+def get_firestore_client():
+    """Initialize Firestore client."""
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if not creds_path:
+        print("Error: GOOGLE_APPLICATION_CREDENTIALS not set")
+        sys.exit(1)
+    return firestore.Client()
 
 
 # Collections to wipe (relative to users/{uid}/)
 COLLECTIONS_TO_WIPE = [
-    "clients",           # Includes nested notifications
+    "clients",
     "outbox",
-    "threads",           # Includes nested messages
+    "threads",
     "msgIndex",
     "convIndex",
     "processedMessages",
@@ -46,54 +44,48 @@ COLLECTIONS_TO_WIPE = [
     "sheetChangeLog",
     "sync",
     "archivedClients",
-    "archivedThreads",   # Includes nested messages
+    "archivedThreads",
     "archivedMsgIndex",
     "archivedConvIndex",
 ]
 
-# Nested collections (parent -> children)
 NESTED_COLLECTIONS = {
     "clients": ["notifications"],
     "threads": ["messages"],
     "archivedThreads": ["messages"],
 }
 
-# User document fields to preserve
-USER_FIELDS_TO_KEEP = [
-    "displayName",
-    "preferredDisplayName",
-    "profilePic",
-    "profilePicShape",
-    "emailSignature",
-    "signatureMode",
-    "organizationName",
-    "createdAt",  # Keep original signup date
-]
 
-
-def delete_collection(db, collection_ref, batch_size=100, dry_run=True):
-    """Delete all documents in a collection."""
+def delete_collection_batched(db, collection_ref, batch_size=50, dry_run=True):
+    """Delete all documents in a collection using batched deletes."""
     deleted = 0
-    docs = collection_ref.limit(batch_size).stream()
 
-    for doc in docs:
-        if dry_run:
-            print(f"    [DRY RUN] Would delete: {doc.reference.path}")
-        else:
-            doc.reference.delete()
-        deleted += 1
+    while True:
+        # Get a batch of documents
+        docs = list(collection_ref.limit(batch_size).stream())
 
-    # Recurse if there might be more
-    if deleted >= batch_size:
-        deleted += delete_collection(db, collection_ref, batch_size, dry_run)
+        if not docs:
+            break
+
+        # Use a batch for efficient deletes
+        batch = db.batch()
+
+        for doc in docs:
+            if dry_run:
+                print(f"    [DRY RUN] Would delete: {doc.reference.path}")
+            else:
+                batch.delete(doc.reference)
+            deleted += 1
+
+        if not dry_run:
+            batch.commit()
+            print(f"    Deleted batch of {len(docs)} documents...")
+
+        # If we got fewer than batch_size, we're done
+        if len(docs) < batch_size:
+            break
 
     return deleted
-
-
-def delete_nested_collection(db, parent_ref, nested_name, batch_size=100, dry_run=True):
-    """Delete a nested collection from a parent document."""
-    nested_ref = parent_ref.collection(nested_name)
-    return delete_collection(db, nested_ref, batch_size, dry_run)
 
 
 def wipe_user_data(db, user_id, dry_run=True):
@@ -112,28 +104,28 @@ def wipe_user_data(db, user_id, dry_run=True):
 
     for collection_name in COLLECTIONS_TO_WIPE:
         collection_ref = user_ref.collection(collection_name)
-
-        # Check if collection has nested collections
         nested = NESTED_COLLECTIONS.get(collection_name, [])
 
         if nested:
-            # First delete nested collections for each document
             print(f"\n  Processing {collection_name} (with nested: {nested})...")
-            docs = collection_ref.stream()
-            for doc in docs:
+            # Get parent docs first, then delete nested
+            parent_docs = list(collection_ref.limit(500).stream())
+
+            for parent_doc in parent_docs:
                 for nested_name in nested:
-                    nested_deleted = delete_nested_collection(
-                        db, doc.reference, nested_name, dry_run=dry_run
+                    nested_ref = parent_doc.reference.collection(nested_name)
+                    nested_deleted = delete_collection_batched(
+                        db, nested_ref, batch_size=100, dry_run=dry_run
                     )
                     stats["nested_deleted"] += nested_deleted
 
-        # Then delete the parent collection
         print(f"  Deleting {collection_name}...")
-        deleted = delete_collection(db, collection_ref, dry_run=dry_run)
+        deleted = delete_collection_batched(db, collection_ref, batch_size=100, dry_run=dry_run)
+
         if deleted > 0:
             stats["collections_wiped"] += 1
             stats["documents_deleted"] += deleted
-            print(f"    {'Would delete' if dry_run else 'Deleted'}: {deleted} documents")
+            print(f"    Total deleted from {collection_name}: {deleted}")
 
     return stats
 
@@ -165,11 +157,10 @@ def main():
     parser.add_argument("--user-id", help="Specific user ID to wipe")
     parser.add_argument("--all-users", action="store_true", help="Wipe all users")
     parser.add_argument("--list-users", action="store_true", help="List all users")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be deleted without actually deleting")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be deleted")
     parser.add_argument("--confirm", action="store_true", help="Skip confirmation prompts")
     args = parser.parse_args()
 
-    # Initialize Firebase
     db = get_firestore_client()
 
     print("\n" + "="*60)
@@ -182,14 +173,13 @@ def main():
         list_users(db)
         return
 
-    # Determine which users to process
     user_ids = []
 
     if args.user_id:
         user_ids = [args.user_id]
     elif args.all_users:
         user_ids = list_users(db)
-        if not args.confirm:
+        if not args.confirm and not args.dry_run:
             if not confirm_action(f"This will wipe data for {len(user_ids)} users. Are you sure?"):
                 print("Aborted.")
                 return
@@ -198,7 +188,6 @@ def main():
         parser.print_help()
         return
 
-    # Process each user
     total_stats = {
         "users_processed": 0,
         "collections_wiped": 0,
@@ -207,18 +196,12 @@ def main():
     }
 
     for user_id in user_ids:
-        if not args.dry_run and not args.confirm:
-            if not confirm_action(f"Wipe data for user {user_id}?"):
-                print(f"  Skipped {user_id}")
-                continue
-
         stats = wipe_user_data(db, user_id, dry_run=args.dry_run)
         total_stats["users_processed"] += 1
         total_stats["collections_wiped"] += stats["collections_wiped"]
         total_stats["documents_deleted"] += stats["documents_deleted"]
         total_stats["nested_deleted"] += stats["nested_deleted"]
 
-    # Summary
     print("\n" + "="*60)
     print("SUMMARY")
     print("="*60)
@@ -229,14 +212,12 @@ def main():
 
     if args.dry_run:
         print("\n[DRY RUN] No data was actually deleted.")
-        print("Run without --dry-run to perform actual deletion.")
     else:
-        print("\nData has been deleted.")
-
-    print("\nPreserved for each user:")
-    print("  - Firebase Auth (sign-in credentials)")
-    print("  - User profile (display name, signature, profile pic)")
-    print("  - MSAL OAuth tokens (no Microsoft re-auth needed)")
+        print("\n✅ Data has been deleted.")
+        print("\nPreserved for each user:")
+        print("  - Firebase Auth (sign-in credentials)")
+        print("  - User profile (display name, signature, profile pic)")
+        print("  - MSAL OAuth tokens (no Microsoft re-auth needed)")
 
 
 if __name__ == "__main__":
