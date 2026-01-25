@@ -1006,8 +1006,31 @@ Thanks!"""
                         city = event.get("city", "")
                         # AI can provide specific email for new property contact (different from current sender)
                         new_property_email = event.get("email", "").strip().lower() or from_addr_lower
-                        if new_property_email != from_addr_lower:
-                            print(f"📧 New property has different contact: {new_property_email} (current sender: {from_addr_lower})")
+                        # Extract contact name if AI provided one (e.g., "Joe" from "email Joe at joe@email.com")
+                        new_contact_name = event.get("contactName", "").strip()
+
+                        # Determine if this is a different contact than the original sender
+                        is_different_contact = new_property_email != from_addr_lower
+
+                        # Get the referrer name (the person who suggested this new contact)
+                        # Use the leasing contact from the current row, or extract from sender email
+                        referrer_name = ""
+                        if is_different_contact:
+                            # Try to get leasing contact name from current row first
+                            idx_map_temp = _header_index_map(header)
+                            leasing_contact_idx_temp = idx_map_temp.get("leasing contact")
+                            if leasing_contact_idx_temp and (leasing_contact_idx_temp - 1) < len(rowvals):
+                                referrer_name = (rowvals[leasing_contact_idx_temp - 1] or "").strip()
+                            # Fallback: extract first name from sender email (before @ and first part)
+                            if not referrer_name:
+                                email_name = from_addr_lower.split('@')[0]
+                                # Handle formats like "john.doe" or "jdoe"
+                                referrer_name = email_name.split('.')[0].title()
+
+                        if is_different_contact:
+                            print(f"📧 New property has different contact: {new_property_email} (referred by: {referrer_name or from_addr_lower})")
+                            if new_contact_name:
+                                print(f"   👤 Contact name extracted: {new_contact_name}")
 
                         # Skip if no address provided
                         if not address or not address.strip():
@@ -1082,12 +1105,25 @@ Thanks!"""
 
                         # Build suggested (not sent) email payload
                         # Use the specific contact email if AI provided one, otherwise use the current sender
+
+                        # Build personalized greeting and intro
+                        if new_contact_name:
+                            greeting = f"Hi {new_contact_name},"
+                        else:
+                            greeting = "Hi,"
+
+                        # Build intro with referral context if this is a different contact
+                        if is_different_contact and referrer_name:
+                            intro = f"{referrer_name} mentioned you might be able to help with a property: {address}{', ' + city if city else ''}."
+                        else:
+                            intro = f"You mentioned a new property: {address}{', ' + city if city else ''}."
+
                         email_payload = {
                             "to": [new_property_email],
                             "subject": f"{address}, {city}" if city else address,
-                            "body": f"""Hi,
+                            "body": f"""{greeting}
 
-You mentioned a new property: {address}{', ' + city if city else ''}.
+{intro}
 
 If you think this might be a good fit:
 > Can you please verify the current asking rent rates and NNN's?
@@ -1120,6 +1156,9 @@ Thanks!""",
                                 "leasingCompany": leasing_company,
                                 "leasingContact": leasing_contact,
                                 "brokerEmail": new_property_email,  # Email for the new property contact
+                                "contactName": new_contact_name,  # Extracted name (e.g., "Joe" from "email Joe at...")
+                                "referrerName": referrer_name if is_different_contact else "",  # Who suggested this contact
+                                "isDifferentContact": is_different_contact,  # Flag for frontend to know context
                                 "sheetId": sheet_id,
                                 "tabTitle": tab_title,
                                 "suggestedEmail": email_payload,

@@ -1,0 +1,30 @@
+{
+  "run_id": "run_20260124_202220",
+  "started_at": "2026-01-25T03:22:20.298858+00:00",
+  "completed_at": "2026-01-25T03:25:51.990837+00:00",
+  "total_tests": 279,
+  "passed": 279,
+  "failed": 0,
+  "pass_rate": 100.0,
+  "avg_latency_ms": 3028.4372759856633,
+  "p50_latency_ms": 2515,
+  "p90_latency_ms": 5145,
+  "p99_latency_ms": 7336,
+  "by_category": {
+    "escalations": {
+      "total": 120,
+      "passed": 120,
+      "failed": 0
+    },
+    "edge_cases": {
+      "total": 70,
+      "passed": 70,
+      "failed": 0
+    },
+    "response_types": {
+      "total": 89,
+      "passed": 89,
+      "failed": 0
+    }
+  }
+}

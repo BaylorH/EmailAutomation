@@ -422,6 +422,10 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • If mentioning "forestville", "centre", "woodmore" or other location names different from TARGET, this likely indicates new_property
   • Extract the property identifier (address, name, or URL) as the "address" field
   • Try to infer city/location from context or URL
+  • IMPORTANT: If a DIFFERENT contact person is mentioned (e.g., "email Joe at joe@email.com", "contact Sarah", "reach out to Mike"):
+    - Extract the contact NAME as "contactName" (e.g., "Joe", "Sarah", "Mike")
+    - Extract their email as "email" field
+  • The contactName is CRITICAL for personalized outreach - extract first name when available
 
 - "call_requested": Only when someone explicitly asks for a call/phone conversation. Use this event (NOT needs_user_input) for phone call requests.
 
@@ -607,6 +611,10 @@ SCENARIOS:
    - DO NOT commit to tours, meetings, or schedules
    - DO NOT engage in negotiation
    - DO NOT reveal client information
+8. Tour requested (CRITICAL):
+   - If emitting "tour_requested" event, set response_email to null
+   - The user must approve/edit the suggested email before it's sent
+   - DO NOT auto-respond to tour offers - the user decides whether to schedule
 
 IMPORTANT: The response should feel natural and conversational, not robotic or templated. Reference specific details from their message when possible. Remember: NO closing/signature - just end with your content, the footer will add "Best," and signature automatically.
 """
@@ -691,7 +699,8 @@ OUTPUT ONLY valid JSON in this exact format:
       "type": "call_requested | property_unavailable | new_property | close_conversation | needs_user_input | contact_optout | wrong_contact | property_issue | tour_requested",
       "address": "<for new_property: extract property name, address, or identifier>",
       "city": "<for new_property: infer city/location if possible>",
-      "email": "<for new_property if different email needed>",
+      "email": "<for new_property if different email/contact needed>",
+      "contactName": "<for new_property: first name of the new contact if mentioned, e.g., 'Joe' from 'email Joe at joe@email.com'>",
       "link": "<for new_property: include URL if mentioned>",
       "notes": "<for new_property: additional context about the property>",
       "reason": "<for needs_user_input: client_question | scheduling | negotiation | confidential | legal_contract | unclear> OR <for contact_optout: not_interested | unsubscribe | do_not_contact | no_tenant_reps | direct_only | hostile> OR <for wrong_contact: no_longer_handles | wrong_person | forwarded | left_company>",

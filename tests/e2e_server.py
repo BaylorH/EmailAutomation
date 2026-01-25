@@ -33,10 +33,133 @@ from urllib.parse import urlparse, parse_qs
 os.environ['E2E_TEST_MODE'] = 'true'
 os.environ['FIRESTORE_EMULATOR_HOST'] = os.environ.get('FIRESTORE_EMULATOR_HOST', '127.0.0.1:8080')
 
+# Load .env file for API keys
+env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+if os.path.exists(env_path):
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                if key not in os.environ:  # Don't override existing env vars
+                    os.environ[key] = value
+
+# Set dummy values for required env vars if not present
+for var in ["AZURE_API_APP_ID", "AZURE_API_CLIENT_SECRET", "FIREBASE_API_KEY"]:
+    if not os.environ.get(var):
+        os.environ[var] = f"test-{var.lower()}"
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.e2e_harness import E2EHarness, create_test_thread
+
+# Try to import AI processing for simulate-response endpoint
+try:
+    from email_automation.ai_processing import propose_sheet_updates
+    AI_AVAILABLE = True
+    print("✅ AI processing available")
+except (ImportError, RuntimeError) as e:
+    AI_AVAILABLE = False
+    print(f"⚠️ AI processing not available: {e}")
+
+# In-memory state for simulation testing
+MOCK_STATE = {"notifications": [], "sheet_data": {}, "threads": {}}
+
+# Response templates for broker simulation
+BROKER_RESPONSES = {
+    "complete_info": """Hi,
+
+Happy to help with {address}. Here are the complete details:
+
+- Total SF: 15,000
+- Rent: $7.50/SF NNN
+- NNN/CAM: $2.25/SF
+- Drive-ins: 2
+- Dock doors: 4
+- Ceiling height: 24'
+- Power: 400 amps, 3-phase
+
+Available immediately. Let me know if you have questions.
+
+{contact}""",
+
+    "partial_info": """Hi,
+
+The space at {address} is 12,000 SF with asking rent of $6.50/SF NNN.
+
+Let me know if you need anything else.
+
+{contact}""",
+
+    "complete_remaining": """Hi,
+
+Sure, here are the additional details for {address}:
+
+- NNN/CAM: $1.85/SF
+- 2 dock doors, 1 drive-in
+- Clear height: 22'
+- Power: 200 amps
+
+Thanks,
+{contact}""",
+
+    "property_unavailable": """Hi,
+
+Unfortunately {address} is no longer available - we just signed a lease last week.
+
+If anything else comes up in the area I'll let you know.
+
+{contact}""",
+
+    "new_property_different_contact": """Hey,
+
+I can help with {address}, but you should also reach out to Joe at joe@otherbroker.com about 789 Warehouse Way - it's a great option too.
+
+{contact}""",
+
+    "call_requested": """Hi,
+
+I'd prefer to discuss {address} over the phone - there are some details that would be easier to explain.
+
+Can you call me at 555-123-4567?
+
+{contact}""",
+
+    "tour_offered": """Hi,
+
+{address} is available. Would you like to schedule a tour? I'm free Tuesday at 2pm or Wednesday morning.
+
+{contact}""",
+
+    "identity_question": """Hi,
+
+Before I send the details on {address}, can you tell me who your client is? What company are they with?
+
+{contact}""",
+
+    "budget_question": """Hi,
+
+The property at {address} is 18,000 SF with 24' clear.
+
+What's the budget range your client is working with? That'll help me know if this is a good fit.
+
+{contact}""",
+
+    "negotiation_attempt": """Hi,
+
+Regarding {address} - the landlord is firm at $8.50/SF, but if your client can commit to a 5-year term instead of 3, they could potentially do $7.75/SF. Would they consider that?
+
+{contact}"""
+}
+
+SHEET_HEADER = [
+    "Property Address", "City", "Property Name", "Leasing Company",
+    "Leasing Contact", "Email", "Total SF", "Rent/SF /Yr", "Ops Ex /SF",
+    "Gross Rent", "Drive Ins", "Docks", "Ceiling Ht", "Power",
+    "Listing Brokers Comments", "Flyer / Link", "Floorplan",
+    "Jill and Clients comments"
+]
 
 
 class E2ERequestHandler(BaseHTTPRequestHandler):
@@ -77,6 +200,33 @@ class E2ERequestHandler(BaseHTTPRequestHandler):
             self._set_headers()
             # This would need session tracking - for now return empty
             self.wfile.write(json.dumps({"emails": []}).encode())
+
+        elif parsed.path == '/api/campaign-state':
+            # Get current campaign state for frontend tests
+            self._set_headers()
+            result = self._get_campaign_state()
+            self.wfile.write(json.dumps(result).encode())
+
+        elif parsed.path == '/api/notifications':
+            # Get all notifications
+            self._set_headers()
+            self.wfile.write(json.dumps({
+                "notifications": MOCK_STATE.get('notifications', [])
+            }).encode())
+
+        elif parsed.path.startswith('/api/property/'):
+            # Get specific property state
+            property_key = parsed.path.replace('/api/property/', '')
+            self._set_headers()
+            if property_key in MOCK_STATE.get('sheet_data', {}):
+                self.wfile.write(json.dumps({
+                    "key": property_key,
+                    "row": MOCK_STATE['sheet_data'][property_key],
+                    "header": SHEET_HEADER,
+                    "conversation": MOCK_STATE.get('threads', {}).get(property_key, [])
+                }).encode())
+            else:
+                self.wfile.write(json.dumps({"error": "Property not found"}).encode())
 
         else:
             self._set_headers(404)
@@ -213,6 +363,20 @@ class E2ERequestHandler(BaseHTTPRequestHandler):
                     "threadId": thread_id
                 }).encode())
 
+            elif parsed.path == '/api/simulate-response':
+                # Simulate a broker response with AI processing
+                # Used by frontend E2E tests for campaign flow testing
+                result = self._handle_simulate_response(body)
+                self._set_headers()
+                self.wfile.write(json.dumps(result, default=str).encode())
+
+            elif parsed.path == '/api/reset':
+                # Reset test state
+                global MOCK_STATE
+                MOCK_STATE = {"notifications": [], "sheet_data": {}, "threads": {}}
+                self._set_headers()
+                self.wfile.write(json.dumps({"status": "reset complete"}).encode())
+
             else:
                 self._set_headers(404)
                 self.wfile.write(json.dumps({"error": "Not found"}).encode())
@@ -231,6 +395,205 @@ class E2ERequestHandler(BaseHTTPRequestHandler):
         """Custom log format."""
         print(f"📨 {self.address_string()} - {format % args}")
 
+    def _get_campaign_state(self):
+        """Get current campaign state summary."""
+        global MOCK_STATE
+
+        required = ["total sf", "ops ex /sf", "drive ins", "docks", "ceiling ht", "power"]
+        header_map = {h.lower().strip(): i for i, h in enumerate(SHEET_HEADER)}
+
+        properties = []
+        for key, row in MOCK_STATE.get('sheet_data', {}).items():
+            complete_count = sum(1 for f in required if row[header_map.get(f, 0)].strip())
+            properties.append({
+                "key": key,
+                "address": row[0],
+                "city": row[1],
+                "contact": row[4],
+                "email": row[5],
+                "fieldsComplete": complete_count,
+                "fieldsRequired": len(required),
+                "isComplete": complete_count == len(required),
+                "row": row
+            })
+
+        return {
+            "properties": properties,
+            "notifications": MOCK_STATE.get('notifications', []),
+            "summary": {
+                "total": len(properties),
+                "complete": sum(1 for p in properties if p["isComplete"]),
+                "inProgress": sum(1 for p in properties if 0 < p["fieldsComplete"] < p["fieldsRequired"]),
+                "pending": sum(1 for p in properties if p["fieldsComplete"] == 0)
+            }
+        }
+
+    def _handle_simulate_response(self, body):
+        """
+        Handle /api/simulate-response endpoint.
+        Simulates a broker response and processes it through AI.
+        """
+        global MOCK_STATE
+
+        if not AI_AVAILABLE:
+            return {"error": "AI processing not available"}
+
+        client_id = body.get('clientId', 'e2e-test-client')
+        property_data = body.get('property', {})
+        response_type = body.get('responseType', 'complete_info')
+
+        if not property_data.get('address'):
+            return {"error": "Property address required"}
+
+        # Get response template
+        template = BROKER_RESPONSES.get(response_type)
+        if not template:
+            return {"error": f"Unknown response type: {response_type}"}
+
+        # Generate broker response
+        contact_first = property_data.get('contact', '').split()[0] if property_data.get('contact') else 'Best'
+        broker_response = template.format(
+            address=property_data['address'],
+            contact=contact_first
+        )
+
+        # Initialize property state
+        property_key = f"{property_data['address']}_{property_data.get('city', '')}".lower().replace(' ', '_')
+
+        if property_key not in MOCK_STATE['sheet_data']:
+            row = [""] * len(SHEET_HEADER)
+            row[0] = property_data.get('address', '')
+            row[1] = property_data.get('city', '')
+            row[4] = property_data.get('contact', '')
+            row[5] = property_data.get('email', '')
+            MOCK_STATE['sheet_data'][property_key] = row
+
+        row = MOCK_STATE['sheet_data'][property_key]
+
+        # Build conversation
+        if property_key not in MOCK_STATE['threads']:
+            MOCK_STATE['threads'][property_key] = [{
+                "direction": "outbound",
+                "content": f"Hi, I'm interested in {property_data['address']}. Could you provide availability and details?"
+            }]
+
+        MOCK_STATE['threads'][property_key].append({
+            "direction": "inbound",
+            "content": broker_response
+        })
+
+        # Build conversation payload
+        conv_payload = []
+        for i, msg in enumerate(MOCK_STATE['threads'][property_key]):
+            conv_payload.append({
+                "direction": msg["direction"],
+                "from": property_data['email'] if msg["direction"] == "inbound" else "jill@company.com",
+                "to": ["jill@company.com"] if msg["direction"] == "inbound" else [property_data['email']],
+                "subject": f"{property_data['address']}, {property_data.get('city', '')}",
+                "timestamp": f"2024-01-15T{10+i}:00:00Z",
+                "preview": msg["content"][:200],
+                "content": msg["content"]
+            })
+
+        # Call AI processing
+        try:
+            proposal = propose_sheet_updates(
+                uid="e2e-test-user",
+                client_id=client_id,
+                email=property_data['email'],
+                sheet_id="e2e-test-sheet",
+                header=SHEET_HEADER,
+                rownum=property_data.get('rowIndex', 3),
+                rowvals=row,
+                thread_id=f"thread-{property_key}",
+                contact_name=property_data.get('contact', ''),
+                conversation=conv_payload,
+                dry_run=True
+            )
+        except Exception as e:
+            import traceback
+            return {"error": str(e), "traceback": traceback.format_exc()}
+
+        # Process proposal
+        notifications = []
+        if proposal:
+            # Apply updates
+            header_map = {h.lower().strip(): i for i, h in enumerate(SHEET_HEADER)}
+            for update in proposal.get('updates', []):
+                col = update.get('column', '').lower().strip()
+                if col in header_map:
+                    idx = header_map[col]
+                    row[idx] = update.get('value', '')
+
+                notif = {
+                    "kind": "sheet_update",
+                    "column": update.get("column"),
+                    "value": update.get("value"),
+                    "address": property_data['address']
+                }
+                notifications.append(notif)
+                MOCK_STATE['notifications'].append(notif)
+
+            # Process events
+            for event in proposal.get('events', []):
+                event_type = event.get('type', '')
+
+                if event_type == 'property_unavailable':
+                    notif = {"kind": "property_unavailable", "address": property_data['address']}
+                elif event_type == 'new_property':
+                    notif = {
+                        "kind": "action_needed",
+                        "reason": "new_property_pending_approval",
+                        "meta": {
+                            "address": event.get("address"),
+                            "contactName": event.get("contactName"),
+                            "email": event.get("email")
+                        }
+                    }
+                elif event_type == 'call_requested':
+                    notif = {"kind": "action_needed", "reason": "call_requested"}
+                elif event_type == 'tour_requested':
+                    notif = {
+                        "kind": "action_needed",
+                        "reason": "tour_requested",
+                        "meta": {"question": event.get("question", "")}
+                    }
+                elif event_type == 'needs_user_input':
+                    reason = event.get('reason', 'unknown')
+                    notif = {
+                        "kind": "action_needed",
+                        "reason": f"needs_user_input:{reason}",
+                        "meta": {"question": event.get("question", "")}
+                    }
+                else:
+                    continue
+
+                notifications.append(notif)
+                MOCK_STATE['notifications'].append(notif)
+
+            # Check row completion
+            required = ["total sf", "ops ex /sf", "drive ins", "docks", "ceiling ht", "power"]
+            complete = sum(1 for f in required if row[header_map.get(f, 0)].strip())
+            if complete == len(required):
+                notif = {"kind": "row_completed", "address": property_data['address']}
+                notifications.append(notif)
+                MOCK_STATE['notifications'].append(notif)
+
+            # Add AI response to conversation
+            if proposal.get('response_email'):
+                MOCK_STATE['threads'][property_key].append({
+                    "direction": "outbound",
+                    "content": proposal['response_email']
+                })
+
+        return {
+            "success": True,
+            "proposal": proposal,
+            "notifications": notifications,
+            "sheetRow": row,
+            "conversationLength": len(MOCK_STATE['threads'].get(property_key, []))
+        }
+
 
 def run_server(port: int = 5002):
     """Run the E2E test server."""
@@ -239,12 +602,19 @@ def run_server(port: int = 5002):
     print(f"   Firestore Emulator: {os.environ.get('FIRESTORE_EMULATOR_HOST')}")
     print("")
     print("Endpoints:")
-    print("  GET  /health           - Health check")
-    print("  POST /process-outbox   - Process outbox emails")
-    print("  POST /inject-reply     - Inject broker reply and process")
-    print("  POST /process-message  - Process single message")
-    print("  POST /process-user     - Full processing cycle")
-    print("  POST /create-thread    - Create test thread for reply matching")
+    print("  GET  /health              - Health check")
+    print("  POST /process-outbox      - Process outbox emails")
+    print("  POST /inject-reply        - Inject broker reply and process")
+    print("  POST /process-message     - Process single message")
+    print("  POST /process-user        - Full processing cycle")
+    print("  POST /create-thread       - Create test thread for reply matching")
+    print("")
+    print("Campaign Simulation (for frontend E2E tests):")
+    print("  POST /api/simulate-response - Simulate broker response with AI")
+    print("  POST /api/reset             - Reset test state")
+    print("  GET  /api/campaign-state    - Get campaign state")
+    print("  GET  /api/notifications     - Get all notifications")
+    print("  GET  /api/property/<key>    - Get property details")
     print("")
     try:
         server.serve_forever()

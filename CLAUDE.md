@@ -222,6 +222,8 @@ Hosted on Render.com (`https://email-token-manager.onrender.com`).
 |------------|---------|---------|
 | `standalone_test.py` | AI extraction tests (19 scenarios) | `python tests/standalone_test.py` |
 | `e2e_test.py` | Full pipeline E2E tests (uses Scrub file) | `python tests/e2e_test.py` |
+| `campaign_lifecycle_test.py` | Campaign lifecycle tests (6 scenarios) | `python tests/campaign_lifecycle_test.py` |
+| `batch_runner.py` | Large-scale batch testing (279+ scenarios) | `python tests/batch_runner.py --suite tests/generated_suite/` |
 
 ### Running Tests
 
@@ -266,34 +268,96 @@ python tests/e2e_test.py --list
 | `different_person_replies` | Different person signs email - Leasing Contact NOT updated |
 | `new_property_suggestion_with_different_contact` | New property suggested - original contact NOT changed |
 
+### Campaign Lifecycle Tests
+
+Tests the FULL campaign lifecycle from start to finish:
+- Multiple properties going through various scenarios simultaneously
+- Multi-turn conversations until resolution
+- Sheet state changes (rows filled, moved below NON-VIABLE divider)
+- Notification flow at each stage
+- Campaign completion detection
+
+```bash
+# Run all campaign scenarios
+python tests/campaign_lifecycle_test.py
+
+# Run specific scenario
+python tests/campaign_lifecycle_test.py -s mixed_outcomes
+
+# List available scenarios
+python tests/campaign_lifecycle_test.py -l
+```
+
+| Scenario | Description | Expected Outcome |
+|----------|-------------|------------------|
+| `mixed_outcomes` | 5 properties: 2 complete, 1 unavailable, 1 needs input, 1 multi-turn | 3 complete, 1 non-viable, 1 needs action |
+| `all_complete` | 3 properties all provide complete info | 3 complete, campaign done |
+| `all_unavailable` | 3 properties all unavailable | 3 non-viable, campaign done |
+| `new_properties_suggested` | Brokers suggest alternatives | Creates new property notifications |
+| `escalation_scenarios` | Various user input required | 5 needs action |
+| `multi_turn_completion` | Properties require 2+ turns | 2 complete after multi-turn |
+
+### Batch Testing (Large Scale)
+
+For comprehensive testing at scale (279+ test cases):
+
+```bash
+# Generate test suite (creates 279 test cases)
+python tests/generate_test_suite.py --output tests/generated_suite/ --properties 15
+
+# Run full batch with parallel execution
+python tests/batch_runner.py --suite tests/generated_suite/ --parallel 4 --output tests/results/full_run/
+
+# Analyze results and generate HTML report
+python tests/analyze_results.py --results tests/results/full_run/ --export-html tests/results/full_run/report.html
+
+# Compare runs for regression testing
+python tests/analyze_results.py --results tests/results/run1/ --compare tests/results/run2/
+```
+
+**Latest Batch Test Results (2026-01-24):**
+- Total Tests: 279
+- Pass Rate: 100%
+- P50 Latency: 2515ms
+- P99 Latency: 7336ms
+
+See `tests/TESTING_PLAN.md` for the comprehensive testing plan and methodology.
+
 ### Key Files
 
 ```
 tests/
-├── standalone_test.py       # AI extraction tests (19 scenarios)
-├── e2e_test.py              # Full pipeline E2E tests
-├── results_manager.py       # Results file management
-├── conversation_generator.py # Programmatic conversation generation
-├── conversations/           # Broker reply fixtures (JSON)
+├── standalone_test.py         # AI extraction tests (19 scenarios)
+├── e2e_test.py                # Full pipeline E2E tests
+├── campaign_lifecycle_test.py # Campaign lifecycle tests (6 scenarios)
+├── batch_runner.py            # Large-scale batch test execution
+├── generate_test_suite.py     # Generate 279+ test cases
+├── analyze_results.py         # Analyze results, generate reports
+├── TESTING_PLAN.md            # Comprehensive testing plan
+├── e2e_server.py              # HTTP server for frontend E2E tests
+├── e2e_harness.py             # Test harness for processing
+├── results_manager.py         # Results file management
+├── conversation_generator.py  # Programmatic conversation generation
+├── conversations/             # Broker reply fixtures (JSON)
 │   ├── 699_industrial_park_dr.json
 │   ├── 135_trade_center_court.json
 │   ├── 2058_gordon_hwy.json
 │   ├── 1_kuhlke_dr.json
 │   ├── 1_randolph_ct.json
-│   ├── edge_cases/          # Edge case scenarios
+│   ├── edge_cases/            # Edge case scenarios
 │   │   ├── hostile_response.json
 │   │   ├── forward_to_colleague.json
 │   │   └── ...
-│   └── generated/           # Programmatically generated (90 scenarios)
+│   └── generated/             # Programmatically generated (90 scenarios)
 │       ├── response_type/
 │       ├── event/
 │       ├── edge_case/
 │       └── format/
-└── results/                 # Saved test run outputs
+└── results/                   # Saved test run outputs
     └── run_YYYYMMDD_HHMMSS/
-        ├── manifest.json    # Run metadata + input file hash
-        ├── summary.json     # Campaign-level results
-        └── {property}.json  # Per-property results
+        ├── manifest.json      # Run metadata + input file hash
+        ├── summary.json       # Campaign-level results
+        └── {property}.json    # Per-property results
 ```
 
 ### Test Data File
@@ -439,6 +503,236 @@ Jill and Clients comments
 # NEVER request: "Rent/SF /Yr" (provided voluntarily, not requested)
 # NEVER write: "Gross Rent" (formula column: =(H+I)*G/12, auto-calculates monthly rent)
 ```
+
+---
+
+## Full E2E Integration Testing
+
+### Overview
+
+The E2E testing setup allows running the complete frontend + backend flow with:
+- Firebase Emulators (Auth, Firestore, Functions, Storage)
+- Python backend server (real AI processing)
+- React frontend in test mode
+- Playwright for UI automation
+
+### Quick Start
+
+```bash
+# Terminal 1: Start all services
+cd ~/Documents/GitHub/email-admin-ui
+./e2e/run-e2e.sh manual
+
+# This starts:
+# - Firebase Emulators on ports 8080 (Firestore), 9099 (Auth), etc.
+# - Python E2E Server on port 5002
+# - React dev server on port 3000
+
+# Test credentials (emulator mode):
+# Email: test@example.com
+# Password: testpassword123
+```
+
+### Running E2E Tests
+
+```bash
+# Run all E2E tests
+./e2e/run-e2e.sh test
+
+# Run only modal interaction tests
+./e2e/run-e2e.sh test-modal
+
+# Run full journey tests
+./e2e/run-e2e.sh test-journey
+
+# Run with specific filter
+./e2e/run-e2e.sh test --filter "new_property"
+```
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     PLAYWRIGHT TESTS                        │
+│  (e2e/tests/*.spec.js)                                      │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│   FRONTEND   │  │   BACKEND    │  │   FIREBASE   │
+│   (React)    │  │   (Python)   │  │  EMULATORS   │
+│ localhost:   │  │ localhost:   │  │              │
+│   3000       │  │   5002       │  │ Auth: 9099   │
+└──────┬───────┘  └──────┬───────┘  │ FS: 8080     │
+       │                 │          │ Fn: 5001     │
+       │   Firestore     │          └──────┬───────┘
+       └─────────────────┴─────────────────┘
+```
+
+### Test Files
+
+| File | Purpose |
+|------|---------|
+| `e2e/run-e2e.sh` | Orchestration script to start/stop all services |
+| `e2e/backend-simulator.js` | Mock or real backend for testing |
+| `e2e/test-utils.js` | Test utilities (seed data, clear data) |
+| `e2e/tests/modal-interactions.spec.js` | Modal UI interaction tests |
+| `e2e/tests/full-journey.spec.js` | Complete workflow tests |
+| `tests/e2e_server.py` | Python HTTP server for real backend |
+| `tests/e2e_harness.py` | Backend test harness with mocked Graph API |
+
+### Test Scenarios
+
+The modal interaction tests cover:
+
+1. **New Property Suggestion** (`new_property_pending_approval`)
+   - Notification appears in sidebar
+   - Modal opens with property context
+   - Contact name personalization works
+   - Referral context shown (e.g., "Marcus mentioned...")
+   - Send email creates outbox entry
+
+2. **Needs User Input** (`needs_user_input:*`)
+   - Identity questions (`needs_user_input:confidential`)
+   - Requirements questions (`needs_user_input:client_question`)
+   - Negotiation requests (`needs_user_input:negotiation`)
+   - Chatbot shows proactive message asking for user input
+
+3. **Tour Requested** (`tour_requested`)
+   - Tour offer shown in context
+   - Suggested response email pre-filled
+   - User can modify via AI chat
+
+### Manual Testing Workflow
+
+1. **Start services**: `./e2e/run-e2e.sh manual`
+2. **Open browser**: http://localhost:3000
+3. **Login** with test credentials
+4. **Create a client** using the Scrub file
+5. **Launch a campaign** (sends emails via backend)
+6. **Trigger backend processing**: The Python server processes outbox
+7. **Simulate broker reply**: Use the backend API to inject a reply
+8. **See notification**: Frontend picks up notification in real-time
+9. **Interact with modal**: Click notification, compose response, send
+
+### Using Real Backend
+
+To use the real Python backend with actual OpenAI processing:
+
+```bash
+# Set your OpenAI API key
+export OPENAI_API_KEY='sk-...'
+
+# Start with real backend
+./e2e/run-e2e.sh manual
+
+# Or run tests with real backend
+USE_REAL_BACKEND=true ./e2e/run-e2e.sh test
+```
+
+### Injecting Test Data
+
+From the tests or manually:
+
+```javascript
+// Create a notification directly
+await db.collection('users').doc('test-user-123')
+  .collection('clients').doc(clientId)
+  .collection('notifications').add({
+    kind: 'action_needed',
+    priority: 'important',
+    meta: {
+      reason: 'needs_user_input:confidential',
+      question: 'What company is this for?',
+    },
+    createdAt: new Date(),
+  });
+
+// Or via Python backend API:
+// POST http://localhost:5002/inject-reply
+// { "userId": "test-user-123", "fromEmail": "broker@test.com", "body": "..." }
+```
+
+### Campaign Simulation API
+
+The E2E server provides endpoints for simulating broker responses:
+
+```bash
+# Simulate a broker response with AI processing
+curl -X POST http://localhost:5002/api/simulate-response \
+  -H "Content-Type: application/json" \
+  -d '{
+    "clientId": "test-client",
+    "property": {
+      "address": "100 Industrial Way",
+      "city": "Augusta",
+      "contact": "John Smith",
+      "email": "john@broker.com",
+      "rowIndex": 3
+    },
+    "responseType": "complete_info"
+  }'
+
+# Response types available:
+# - complete_info        : All fields → row complete, closing email
+# - partial_info         : Some fields → follow-up request
+# - complete_remaining   : Second turn completing partial
+# - property_unavailable : Moved to non-viable
+# - new_property_different_contact : New property + contact
+# - call_requested       : Escalates to user
+# - tour_offered         : Tour notification
+# - identity_question    : needs_user_input:confidential
+# - budget_question      : needs_user_input:client_question
+# - negotiation_attempt  : needs_user_input:negotiation
+
+# Get campaign state
+curl http://localhost:5002/api/campaign-state
+
+# Get all notifications
+curl http://localhost:5002/api/notifications
+
+# Reset test state
+curl -X POST http://localhost:5002/api/reset
+```
+
+### Comprehensive Testing Workflow
+
+For rigorous campaign lifecycle testing:
+
+1. **Backend unit tests** (no frontend needed):
+   ```bash
+   python tests/standalone_test.py      # 19 AI scenarios
+   python tests/campaign_lifecycle_test.py  # 6 campaign lifecycle scenarios
+   ```
+
+2. **Full integration tests** (frontend + backend):
+   ```bash
+   cd ~/Documents/GitHub/email-admin-ui
+   ./e2e/run-e2e.sh test
+   ```
+
+3. **Manual exploration**:
+   ```bash
+   ./e2e/run-e2e.sh manual
+   # Then manually:
+   # - Create client with Scrub file
+   # - Launch campaign
+   # - Use /api/simulate-response to inject broker replies
+   # - Watch notifications appear in real-time
+   # - Interact with modals
+   # - Verify sheet updates
+   ```
+
+### Expected Campaign Outcomes
+
+| Scenario | Sheet State | Notifications |
+|----------|-------------|---------------|
+| 3 complete_info | 3 rows filled, all fields | 3 row_completed |
+| 2 complete + 1 unavailable | 2 filled, 1 below NON-VIABLE | 2 row_completed + 1 property_unavailable |
+| 1 partial + 1 complete | 1 in progress, 1 filled | Multiple sheet_update + 1 row_completed |
+| 1 needs_user_input | Unchanged | 1 action_needed |
+| Campaign complete | All rows resolved (complete OR non-viable) | Campaign complete indicator |
 
 ---
 

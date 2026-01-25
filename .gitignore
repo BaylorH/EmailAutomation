@@ -45,7 +45,8 @@ Thumbs.db
 # Test outputs
 *.log
 test_results.json
-tests/results/run_*/
+tests/results/
+tests/generated_suite/
 tests/conversations/generated/*/
 
 # Test data files (Excel)

@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Results Analysis - run_20260124_202220</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; }
+        h2 { color: #555; margin-top: 30px; }
+        .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin: 20px 0; }
+        .stat-card { background: #f8f9fa; padding: 20px; border-radius: 8px; text-align: center; }
+        .stat-value { font-size: 2em; font-weight: bold; color: #007bff; }
+        .stat-label { color: #666; margin-top: 5px; }
+        .pass { color: #28a745; }
+        .fail { color: #dc3545; }
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; font-weight: 600; }
+        tr:hover { background: #f8f9fa; }
+        .progress-bar { width: 100%; height: 8px; background: #e9ecef; border-radius: 4px; overflow: hidden; }
+        .progress-fill { height: 100%; background: #28a745; }
+        .issue-list { background: #fff3cd; padding: 15px; border-radius: 4px; margin: 10px 0; }
+        .latency-dist { display: flex; gap: 10px; flex-wrap: wrap; }
+        .latency-bucket { padding: 10px 15px; background: #e9ecef; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Test Results Analysis</h1>
+        <p>Run ID: run_20260124_202220 | Generated: 2026-01-24 20:25:56</p>
+
+        <div class="summary">
+            <div class="stat-card">
+                <div class="stat-value">279</div>
+                <div class="stat-label">Total Tests</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value pass">279</div>
+                <div class="stat-label">Passed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value fail">0</div>
+                <div class="stat-label">Failed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">100.0%</div>
+                <div class="stat-label">Pass Rate</div>
+            </div>
+        </div>
+
+        <h2>Performance</h2>
+        <div class="latency-dist">
+            <div class="latency-bucket">Avg: 3028ms</div>
+            <div class="latency-bucket">P50: 2515ms</div>
+            <div class="latency-bucket">P90: 5145ms</div>
+            <div class="latency-bucket">P99: 7336ms</div>
+        </div>
+
+        <h2>Results by Category</h2>
+        <table>
+            <tr><th>Category</th><th>Total</th><th>Passed</th><th>Failed</th><th>Pass Rate</th></tr>
+            <tr>
+                <td>escalations</td>
+                <td>120</td>
+                <td class="pass">120</td>
+                <td class="fail">0</td>
+                <td>
+                    <div class="progress-bar"><div class="progress-fill" style="width: 100.0%"></div></div>
+                    100.0%
+                </td>
+            </tr>
+            <tr>
+                <td>edge_cases</td>
+                <td>70</td>
+                <td class="pass">70</td>
+                <td class="fail">0</td>
+                <td>
+                    <div class="progress-bar"><div class="progress-fill" style="width: 100.0%"></div></div>
+                    100.0%
+                </td>
+            </tr>
+            <tr>
+                <td>response_types</td>
+                <td>89</td>
+                <td class="pass">89</td>
+                <td class="fail">0</td>
+                <td>
+                    <div class="progress-bar"><div class="progress-fill" style="width: 100.0%"></div></div>
+                    100.0%
+                </td>
+            </tr>
+        </table>
+
+        <h2>Field Extraction Stats</h2>
+        <table>
+            <tr><th>Field</th><th>Count</th><th>Avg Confidence</th><th>Sample Values</th></tr>
+            <tr>
+                <td>Total SF</td>
+                <td>96</td>
+                <td>0.92</td>
+                <td>15000, 50000, 18000</td>
+            </tr>
+            <tr>
+                <td>Rent/SF /Yr</td>
+                <td>69</td>
+                <td>0.88</td>
+                <td>7.56, 9.74, 8.56</td>
+            </tr>
+            <tr>
+                <td>Ceiling Ht</td>
+                <td>65</td>
+                <td>0.92</td>
+                <td>28, 18, 22</td>
+            </tr>
+            <tr>
+                <td>Docks</td>
+                <td>62</td>
+                <td>0.93</td>
+                <td>4, 6, 3</td>
+            </tr>
+            <tr>
+                <td>Drive Ins</td>
+                <td>55</td>
+                <td>0.93</td>
+                <td>4, 3, 0</td>
+            </tr>
+            <tr>
+                <td>Ops Ex /SF</td>
+                <td>45</td>
+                <td>0.91</td>
+                <td>3.21, 1.9, 2.24</td>
+            </tr>
+            <tr>
+                <td>Power</td>
+                <td>45</td>
+                <td>0.88</td>
+                <td>600 amps, 800 amps 3-phase, 800 amps</td>
+            </tr>
+            <tr>
+                <td>Flyer / Link</td>
+                <td>1</td>
+                <td>0.55</td>
+                <td>https://example.com/3465-manufacturing-pkwy</td>
+            </tr>
+        </table>
+
+        <h2>Event Distribution</h2>
+        <table>
+            <tr><th>Event Type</th><th>Count</th></tr>
+            <tr><td>needs_user_input</td><td>85</td></tr>
+            <tr><td>tour_requested</td><td>37</td></tr>
+            <tr><td>call_requested</td><td>33</td></tr>
+            <tr><td>wrong_contact</td><td>20</td></tr>
+            <tr><td>property_unavailable</td><td>16</td></tr>
+            <tr><td>new_property</td><td>14</td></tr>
+            <tr><td>contact_optout</td><td>10</td></tr>
+            <tr><td>property_issue</td><td>10</td></tr>
+        </table>
+    </div>
+</body>
+</html>
