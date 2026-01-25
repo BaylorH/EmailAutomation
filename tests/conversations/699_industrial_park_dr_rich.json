@@ -1,0 +1,27 @@
+{
+  "property": "699 Industrial Park Dr",
+  "city": "Evans",
+  "description": "Rich broker response with lots of contextual details - tests ideal notes generation",
+  "messages": [
+    {
+      "direction": "outbound",
+      "content": "Hi Jeff, I'm reaching out about 699 Industrial Park Dr in Evans. Could you share the property specs including SF, asking rent, NNN, loading doors, clear height, and power?"
+    },
+    {
+      "direction": "inbound",
+      "content": "Jill,\n\nGreat timing! 699 Industrial Park is a fantastic space. Here are the details:\n\n- 18,500 SF flex/warehouse\n- Asking $6.75/SF/yr triple net\n- NNN estimate: $2.10/SF/yr\n- 2 grade-level doors (10x12)\n- 3 dock-high doors with levelers\n- 24' clear height throughout\n- 400A 3-phase power, recently upgraded\n\nA few things that make this one special:\n- Building was fully renovated in 2021 with new roof, LED lighting, and HVAC\n- Fully fenced and secured yard with room for 8-10 trailers\n- Owner is motivated and flexible on lease term (will do 3-7 years)\n- Located right off I-20 Exit 194, 5 minutes from the port\n- ESFR sprinkler system throughout\n- Current tenant vacating Feb 1st - available immediately after\n- Zoned M-2 heavy industrial, outdoor storage permitted\n\nThe landlord mentioned he'd consider a small TI allowance for the right tenant. Happy to set up a tour whenever works for your client.\n\nLet me know!\n\nJeff Wilson\nWilson Commercial\n706-555-1234"
+    }
+  ],
+  "expected_updates": [
+    {"column": "Total SF", "value": "18500"},
+    {"column": "Rent/SF /Yr", "value": "6.75"},
+    {"column": "Ops Ex /SF", "value": "2.10"},
+    {"column": "Drive Ins", "value": "2"},
+    {"column": "Docks", "value": "3"},
+    {"column": "Ceiling Ht", "value": "24"},
+    {"column": "Power", "value": "400A 3-phase"}
+  ],
+  "expected_events": ["tour_requested"],
+  "ideal_notes": "NNN • renovated 2021 • fenced yard • 8-10 trailer spots • owner motivated • flexible 3-7 yr term • near I-20 Exit 194 • ESFR sprinklers • available Feb 1st • M-2 zoning • TI allowance possible",
+  "forbidden_updates": ["Leasing Contact", "Email"]
+}
