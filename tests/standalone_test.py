@@ -300,7 +300,18 @@ def derive_notifications(updates: List[Dict], events: List[Dict], row_data: List
                 "reason": "tour_requested"
             })
 
-        # close_conversation does NOT create a notification
+        elif event_type == "close_conversation":
+            notifications.append({
+                "kind": "conversation_closed",
+                "reason": "natural_end"
+            })
+
+        elif event_type == "property_issue":
+            severity = event.get("severity", "major")
+            notifications.append({
+                "kind": "action_needed",
+                "reason": f"property_issue:{severity}"
+            })
 
     # Check if all required fields would be complete after updates
     # Build current + updated values
@@ -596,7 +607,7 @@ Luke"""}
         expected_events=["close_conversation"],
         expected_response_type="closing",
         expected_notifications=[
-            # close_conversation event does NOT create a notification (just logged)
+            ExpectedNotification(kind="conversation_closed", reason="natural_end"),
         ]
     ),
 
@@ -800,6 +811,156 @@ Someone Else"""}
         expected_response_type="new_property",
         expected_notifications=[
             ExpectedNotification(kind="action_needed", reason="new_property_pending_send"),
+        ]
+    ),
+
+    # ========================================================================
+    # CONTACT OPT-OUT SCENARIOS
+    # ========================================================================
+
+    TestScenario(
+        name="contact_optout_not_interested",
+        description="Contact explicitly says not interested",
+        property_address="699 Industrial Park Dr",
+        messages=[
+            {"direction": "outbound", "content": "Hi Jeff, I'm reaching out about 699 Industrial Park Dr."},
+            {"direction": "inbound", "content": """Not interested, thanks.
+
+Jeff"""}
+        ],
+        expected_updates=[],
+        expected_events=["contact_optout"],
+        expected_response_type="escalate",  # No auto-response to opted-out contacts
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="contact_optout:not_interested"),
+        ]
+    ),
+
+    TestScenario(
+        name="contact_optout_no_tenant_reps",
+        description="Contact says they don't work with tenant reps",
+        property_address="135 Trade Center Court",
+        messages=[
+            {"direction": "outbound", "content": "Hi Luke, inquiring about 135 Trade Center Court."},
+            {"direction": "inbound", "content": """Hi,
+
+We don't work with tenant rep brokers. Please remove us from your list.
+
+Thanks,
+Luke"""}
+        ],
+        expected_updates=[],
+        expected_events=["contact_optout"],
+        expected_response_type="escalate",
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="contact_optout:no_tenant_reps"),
+        ]
+    ),
+
+    # ========================================================================
+    # WRONG CONTACT SCENARIOS
+    # ========================================================================
+
+    TestScenario(
+        name="wrong_contact_redirected",
+        description="Contact says they no longer handle property and redirects to someone else",
+        property_address="2058 Gordon Hwy",
+        messages=[
+            {"direction": "outbound", "content": "Hi Jonathan, is 2058 Gordon Hwy still available?"},
+            {"direction": "inbound", "content": """Hi Jill,
+
+I don't handle that property anymore. You should reach out to Sarah Johnson at sarah.johnson@cbre.com - she took over our industrial portfolio.
+
+Best,
+Jonathan"""}
+        ],
+        expected_updates=[],
+        expected_events=["wrong_contact"],
+        expected_response_type="escalate",
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="wrong_contact:no_longer_handles"),
+        ]
+    ),
+
+    TestScenario(
+        name="wrong_contact_left_company",
+        description="Contact has left the company",
+        property_address="1 Randolph Ct",
+        messages=[
+            {"direction": "outbound", "content": "Hi Scott, following up on 1 Randolph Ct."},
+            {"direction": "inbound", "content": """Hi,
+
+Scott no longer works here. He left the company last month.
+Try reaching out to our main office at info@broker.com.
+
+Thanks,
+Reception"""}
+        ],
+        expected_updates=[],
+        expected_events=["wrong_contact"],
+        expected_response_type="escalate",
+        expected_notifications=[
+            ExpectedNotification(kind="action_needed", reason="wrong_contact:left_company"),
+        ]
+    ),
+
+    # ========================================================================
+    # PROPERTY ISSUE SCENARIOS
+    # ========================================================================
+
+    TestScenario(
+        name="property_issue_major",
+        description="Broker mentions significant property issue",
+        property_address="699 Industrial Park Dr",
+        messages=[
+            {"direction": "outbound", "content": "Hi Jeff, what are the specs for 699 Industrial Park Dr?"},
+            {"direction": "inbound", "content": """Hi Jill,
+
+The property is 15,000 SF at $5.50/SF NNN. Clear height is 20ft.
+
+FYI - there's been some water damage in the northeast corner that the landlord is getting quotes to repair. The HVAC is also original from 1992.
+
+Let me know if you still want to proceed.
+
+Jeff"""}
+        ],
+        expected_updates=[
+            {"column": "Total SF", "value": "15000"},
+            {"column": "Rent/SF /Yr", "value": "5.50"},
+            {"column": "Ceiling Ht", "value": "20"},
+        ],
+        expected_events=["property_issue"],
+        expected_response_type="missing_fields",  # Still asks for remaining fields
+        expected_notifications=[
+            ExpectedNotification(kind="sheet_update"),  # Total SF
+            ExpectedNotification(kind="sheet_update"),  # Rent
+            ExpectedNotification(kind="sheet_update"),  # Ceiling Ht
+            ExpectedNotification(kind="action_needed", reason="property_issue:major"),
+        ]
+    ),
+
+    TestScenario(
+        name="property_issue_critical",
+        description="Broker mentions critical health/safety issue",
+        property_address="135 Trade Center Court",
+        messages=[
+            {"direction": "outbound", "content": "Hi Luke, can you send details on 135 Trade Center Court?"},
+            {"direction": "inbound", "content": """Hi Jill,
+
+Just want to give you a heads up - the building has asbestos that would need professional abatement before occupancy. Cost estimates have been around $50-75k.
+
+The space is 20,000 SF otherwise nice.
+
+Luke"""}
+        ],
+        expected_updates=[
+            {"column": "Total SF", "value": "20000"},
+        ],
+        expected_events=["property_issue"],
+        expected_response_type="missing_fields",
+        expected_notifications=[
+            ExpectedNotification(kind="sheet_update"),  # Total SF
+            ExpectedNotification(kind="action_needed", reason="property_issue:critical"),
         ]
     ),
 ]

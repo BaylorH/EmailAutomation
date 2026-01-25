@@ -1185,8 +1185,41 @@ Thanks!""",
                         print(f"❌ Failed to handle new_property: {e}")
                 
                 elif event_type == "close_conversation":
-                    # This will be handled below in the required fields check
-                    print(f"💬 Close conversation event detected")
+                    # Mark thread as closed and notify user
+                    try:
+                        from datetime import datetime
+
+                        # Update thread status to closed
+                        if thread_ref:
+                            thread_ref.update({
+                                "status": "closed",
+                                "closedAt": datetime.now().isoformat(),
+                                "closeReason": "natural_end"
+                            })
+                            print(f"💬 Thread marked as closed")
+
+                        # Create notification for user awareness
+                        write_notification(
+                            user_id, client_id,
+                            kind="conversation_closed",
+                            priority="normal",
+                            email=from_addr_lower,
+                            thread_id=thread_id,
+                            row_number=rownum,
+                            row_anchor=row_anchor,
+                            meta={
+                                "reason": "natural_end",
+                                "details": "Broker indicated conversation is complete",
+                                "lastMessage": _full_text[:300] if _full_text else ""
+                            },
+                            dedupe_key=f"conversation_closed:{thread_id}"
+                        )
+
+                        # Skip auto-response - conversation is done
+                        proposal["skip_response"] = True
+
+                    except Exception as e:
+                        print(f"❌ Failed to handle close_conversation: {e}")
 
                 elif event_type == "contact_optout":
                     # Contact explicitly doesn't want further communication
