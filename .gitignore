@@ -60,3 +60,4 @@ tests/conversations/generated/*/
 
 # Local token caches
 msal_token_cache.bin
+tests/generated_suite*/
