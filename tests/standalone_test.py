@@ -1087,10 +1087,10 @@ def validate_result(scenario: TestScenario, result: Dict, row_data: List[str] = 
 
     # Check escalation scenarios
     if scenario.expected_response_type == "escalate":
-        # When escalating, AI should emit needs_user_input OR tour_requested and NOT generate a response
-        escalation_events = {"needs_user_input", "tour_requested"}
+        # When escalating, AI should emit an escalation event and NOT generate a response
+        escalation_events = {"needs_user_input", "tour_requested", "contact_optout", "wrong_contact"}
         if not (escalation_events & set(actual_event_types)):
-            issues.append("Expected 'needs_user_input' or 'tour_requested' event for escalation scenario")
+            issues.append(f"Expected escalation event ({', '.join(escalation_events)}) for escalation scenario")
 
         # Response should be null/empty when escalating
         if response and response.strip():
