@@ -276,6 +276,7 @@ Tests the FULL campaign lifecycle from start to finish:
 - Sheet state changes (rows filled, moved below NON-VIABLE divider)
 - Notification flow at each stage
 - Campaign completion detection
+- **Threading logic**: pause when escalated, resume after user input
 
 ```bash
 # Run all campaign scenarios
@@ -296,6 +297,16 @@ python tests/campaign_lifecycle_test.py -l
 | `new_properties_suggested` | Brokers suggest alternatives | Creates new property notifications |
 | `escalation_scenarios` | Various user input required | 5 needs action |
 | `multi_turn_completion` | Properties require 2+ turns | 2 complete after multi-turn |
+
+**Threading Logic Scenarios (NEW)**:
+
+| Scenario | Description | What It Tests |
+|----------|-------------|---------------|
+| `pause_on_escalation` | 3 properties all trigger escalation | Verifies all pause in NEEDS_ACTION state |
+| `resume_after_user_input` | Escalation → user input → broker reply | Tests full pause→resume→complete cycle |
+| `pause_resume_complete_cycle` | 2 properties go through full cycle | Both complete after user provides input |
+| `mixed_pause_and_complete` | 2 complete + 1 paused | Campaign NOT complete while 1 is paused |
+| `close_conversation_terminates` | Broker closes conversation naturally | Terminates without needing user action |
 
 ### Batch Testing (Large Scale)
 

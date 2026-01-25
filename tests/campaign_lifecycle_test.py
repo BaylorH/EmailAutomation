@@ -9,6 +9,8 @@ Tests the FULL campaign lifecycle from start to finish:
 4. Sheet state changes (rows filled, moved below NON-VIABLE)
 5. Notification flow at each stage
 6. Campaign completion detection
+7. Threading logic: pause when escalated, resume after user input
+8. Timestamp-based processing order validation
 
 This simulates what happens in production when a user launches a campaign
 and processes broker responses over time.
@@ -483,6 +485,58 @@ class CampaignSimulator:
 
         return summary
 
+    def simulate_user_response(self, address: str, user_message: str) -> Dict:
+        """
+        Simulate a user providing input to resume a paused conversation.
+        This mimics what happens when:
+        1. Property is in NEEDS_ACTION state (conversation paused)
+        2. User provides the requested information via the modal
+        3. System sends an email and resumes processing
+
+        Returns the AI proposal after the next broker reply.
+        """
+        prop = self.state.properties[address]
+
+        # Verify property is in a paused state
+        if prop.status != PropertyStatus.NEEDS_ACTION:
+            raise ValueError(f"Property {address} is not in NEEDS_ACTION state (current: {prop.status})")
+
+        # Clear the pending action (user has addressed it)
+        prop.pending_action = None
+
+        # Add user's response to conversation
+        prop.conversation.append({
+            "direction": "outbound",
+            "content": user_message
+        })
+
+        # Property is now back in progress (waiting for broker reply)
+        prop.status = PropertyStatus.IN_PROGRESS
+
+        return {"status": "resumed", "awaiting_broker_reply": True}
+
+    def is_property_paused(self, address: str) -> bool:
+        """Check if a property conversation is paused (needs user action)."""
+        prop = self.state.properties.get(address)
+        if not prop:
+            return False
+        return prop.status == PropertyStatus.NEEDS_ACTION
+
+    def get_paused_properties(self) -> List[str]:
+        """Get list of all properties currently in paused state."""
+        return [addr for addr, prop in self.state.properties.items()
+                if prop.status == PropertyStatus.NEEDS_ACTION]
+
+    def get_active_properties(self) -> List[str]:
+        """Get list of properties with active (non-paused, non-complete) conversations."""
+        return [addr for addr, prop in self.state.properties.items()
+                if prop.status in [PropertyStatus.PENDING, PropertyStatus.IN_PROGRESS]]
+
+    def get_resolved_properties(self) -> List[str]:
+        """Get list of fully resolved properties (complete, non-viable, or closed)."""
+        return [addr for addr, prop in self.state.properties.items()
+                if prop.status in [PropertyStatus.COMPLETE, PropertyStatus.NON_VIABLE, PropertyStatus.CLOSED]]
+
 
 # ============================================================================
 # TEST SCENARIOS
@@ -711,6 +765,157 @@ CAMPAIGN_SCENARIOS = [
             "needs_action": 0,
             "campaign_complete": True
         }
+    ),
+
+    # =========================================================================
+    # THREADING LOGIC TEST SCENARIOS
+    # Tests pause/resume/complete conversation flow
+    # =========================================================================
+
+    CampaignScenario(
+        name="pause_on_escalation",
+        description="Conversations correctly pause when escalated (needs user action)",
+        properties=[
+            {
+                "address": "601 Pause St",
+                "city": "Augusta",
+                "contact": "Paul",
+                "email": "paul@broker.com",
+                "response_type": "identity_question",  # Triggers needs_user_input
+                "threading_test": "verify_paused"  # Special marker for threading test
+            },
+            {
+                "address": "602 Pause St",
+                "city": "Evans",
+                "contact": "Quinn",
+                "email": "quinn@broker.com",
+                "response_type": "tour_offered",  # Triggers tour_requested
+                "threading_test": "verify_paused"
+            },
+            {
+                "address": "603 Pause St",
+                "city": "Martinez",
+                "contact": "Rita",
+                "email": "rita@broker.com",
+                "response_type": "call_requested",  # Triggers call_requested
+                "threading_test": "verify_paused"
+            }
+        ],
+        expected_final_state={
+            "needs_action": 3,  # All three should be paused
+            "complete": 0,
+            "in_progress": 0,
+            "paused_count": 3  # Custom check for threading test
+        }
+    ),
+
+    CampaignScenario(
+        name="resume_after_user_input",
+        description="Conversations resume after user provides requested input",
+        properties=[
+            {
+                "address": "701 Resume St",
+                "city": "Augusta",
+                "contact": "Steve",
+                "email": "steve@broker.com",
+                "response_type": "identity_question",
+                "threading_test": "pause_then_resume",
+                "user_response": "This inquiry is for a confidential client in the logistics industry. They prefer to remain anonymous until we identify suitable properties.",
+                "follow_up_response": "complete_info"  # After resume, broker provides complete info
+            }
+        ],
+        expected_final_state={
+            "complete": 1,  # Should complete after resume + broker reply
+            "needs_action": 0,
+            "campaign_complete": True
+        }
+    ),
+
+    CampaignScenario(
+        name="pause_resume_complete_cycle",
+        description="Full cycle: pause → user input → resume → complete for multiple properties",
+        properties=[
+            {
+                "address": "801 Cycle St",
+                "city": "Augusta",
+                "contact": "Tara",
+                "email": "tara@broker.com",
+                "response_type": "tour_offered",
+                "threading_test": "full_cycle",
+                "user_response": "Yes, we would like to schedule a tour. Please let us know available times next week.",
+                "follow_up_response": "complete_info"
+            },
+            {
+                "address": "802 Cycle St",
+                "city": "Evans",
+                "contact": "Uma",
+                "email": "uma@broker.com",
+                "response_type": "budget_question",
+                "threading_test": "full_cycle",
+                "user_response": "The client's budget is flexible within market range. What rates are you seeing for this type of space?",
+                "follow_up_response": "complete_info"
+            }
+        ],
+        expected_final_state={
+            "complete": 2,  # Both complete after full cycle
+            "needs_action": 0,
+            "campaign_complete": True,
+            "total_turns_min": 4  # At least 2 turns per property
+        }
+    ),
+
+    CampaignScenario(
+        name="mixed_pause_and_complete",
+        description="Some properties complete immediately, others pause - campaign not complete until all resolved",
+        properties=[
+            {
+                "address": "901 Mix St",
+                "city": "Augusta",
+                "contact": "Victor",
+                "email": "victor@broker.com",
+                "response_type": "complete_info"  # Completes immediately
+            },
+            {
+                "address": "902 Mix St",
+                "city": "Evans",
+                "contact": "Wendy",
+                "email": "wendy@broker.com",
+                "response_type": "identity_question",  # Pauses
+                "threading_test": "verify_blocks_campaign"
+            },
+            {
+                "address": "903 Mix St",
+                "city": "Martinez",
+                "contact": "Xavier",
+                "email": "xavier@broker.com",
+                "response_type": "complete_info"  # Completes immediately
+            }
+        ],
+        expected_final_state={
+            "complete": 2,
+            "needs_action": 1,  # One still paused
+            "campaign_complete": False  # Campaign NOT complete because one is paused
+        }
+    ),
+
+    CampaignScenario(
+        name="close_conversation_terminates",
+        description="Close conversation event properly terminates without needing user action",
+        properties=[
+            {
+                "address": "1001 Close St",
+                "city": "Augusta",
+                "contact": "Yara",
+                "email": "yara@broker.com",
+                "response_type": "close_conversation",
+                "threading_test": "verify_closed"
+            }
+        ],
+        expected_final_state={
+            "closed": 1,
+            "needs_action": 0,  # Should NOT need action - just closed
+            "campaign_complete": True
+        }
     )
 ]
 
@@ -812,6 +1017,59 @@ def run_campaign_scenario(scenario: CampaignScenario, verbose: bool = True) -> T
             if verbose:
                 print(f"  Turn 2: Extracted {len(proposal.get('updates', []))} more fields")
 
+        elif response_type == "close_conversation":
+            response = BrokerResponseGenerator.close_conversation(prop)
+            proposal = sim.process_broker_response(address, response)
+
+        # Handle threading test scenarios (pause → resume → complete cycles)
+        threading_test = prop_def.get("threading_test")
+
+        if threading_test in ["pause_then_resume", "full_cycle"]:
+            # Verify property is now paused
+            if not sim.is_property_paused(address):
+                if verbose:
+                    print(f"  ⚠️ Expected property to be paused but status is {prop.status}")
+            else:
+                if verbose:
+                    print(f"  ✓ Property correctly paused (NEEDS_ACTION)")
+
+                # Simulate user providing input
+                user_response = prop_def.get("user_response", "Thank you for your patience. Here is the information you requested.")
+                sim.simulate_user_response(address, user_response)
+
+                if verbose:
+                    print(f"  → User responded, conversation resumed")
+
+                # Now simulate broker's follow-up response
+                follow_up_type = prop_def.get("follow_up_response", "complete_info")
+                if follow_up_type == "complete_info":
+                    follow_up = BrokerResponseGenerator.complete_info(prop)
+                elif follow_up_type == "partial_info":
+                    follow_up = BrokerResponseGenerator.partial_info_turn1(prop)
+                else:
+                    follow_up = BrokerResponseGenerator.complete_info(prop)
+
+                proposal = sim.process_broker_response(address, follow_up)
+
+                if verbose:
+                    print(f"  → Broker replied with {follow_up_type}, status now: {prop.status.name}")
+
+        elif threading_test == "verify_paused":
+            # Just verify the property is paused - don't resume
+            if not sim.is_property_paused(address):
+                if verbose:
+                    print(f"  ❌ THREADING FAIL: Expected paused but got {prop.status}")
+
+        elif threading_test == "verify_blocks_campaign":
+            # This property being paused should prevent campaign completion
+            pass  # Will be validated in final summary check
+
+        elif threading_test == "verify_closed":
+            # Verify property is in CLOSED state (not NEEDS_ACTION)
+            if prop.status != PropertyStatus.CLOSED:
+                if verbose:
+                    print(f"  ❌ THREADING FAIL: Expected CLOSED but got {prop.status}")
+
         if verbose:
             print(f"  Status: {prop.status.name}")
             print(f"  Fields filled: {sum(1 for f in sim.REQUIRED_FIELDS if prop.values.get(f))}/{len(sim.REQUIRED_FIELDS)}")
@@ -845,6 +1103,19 @@ def run_campaign_scenario(scenario: CampaignScenario, verbose: bool = True) -> T
                         if n.get("reason") == "new_property_pending_approval")
             if actual != expected_val:
                 issues.append(f"new_property_notifications: expected {expected_val}, got {actual}")
+
+        elif key == "paused_count":
+            # Count properties currently in NEEDS_ACTION (paused) state
+            actual = len(sim.get_paused_properties())
+            if actual != expected_val:
+                issues.append(f"paused_count: expected {expected_val}, got {actual}")
+
+        elif key == "total_turns_min":
+            # Verify minimum total turns across all properties
+            actual_turns = sum(p.turn_count for p in sim.state.properties.values())
+            if actual_turns < expected_val:
+                issues.append(f"total_turns: expected at least {expected_val}, got {actual_turns}")
+
         elif key in summary:
             actual = summary[key]
             if actual != expected_val:
