@@ -518,26 +518,32 @@ CRITICAL EXAMPLES:
 """
 
         NOTES_RULES = """
-NOTES FIELD (IMPORTANT - always look for these):
-The "notes" field captures valuable information that doesn't fit in the standard columns. This helps the user understand the property without re-reading emails.
+NOTES FIELD (IMPORTANT - avoid redundancy):
+The "notes" field captures contextual information that DOES NOT go in other columns.
 
-ALWAYS capture these when mentioned:
-- Availability timing: "available immediately", "available March 1st", "60 days notice"
-- Lease terms: "flexible on term", "3-5 year lease preferred", "month-to-month available"
-- Zoning: "zoned M-1", "heavy industrial", "light manufacturing"
+NEVER INCLUDE IN NOTES (these go in columns):
+- Rent amounts (goes in Rent/SF column)
+- Square footage (goes in Total SF column)
+- Operating expenses (goes in Ops Ex column)
+- Dock/drive-in counts (go in Docks/Drive Ins columns)
+- Ceiling height (goes in Ceiling Ht column)
+- Power specs (goes in Power column)
+
+ALWAYS CAPTURE IN NOTES (context not in columns):
+- Lease type: "NNN", "gross lease", "modified gross"
+- Availability timing: "available immediately", "60 days notice", "available March 1st"
+- Landlord motivation: "owner motivated", "firm on price", "willing to negotiate"
+- TI/buildout: "TI allowance available", "$10/SF TI", "as-is condition"
 - Special features: "fenced yard", "rail spur", "sprinklered", "ESFR", "food grade"
-- Parking: "10 trailer spots", "employee parking for 50"
-- Landlord notes: "owner motivated", "firm on price", "willing to do TI"
-- Building details not in columns: "built 2020", "renovated 2023", "tilt-up construction"
+- Zoning/use: "zoned M-1", "heavy industrial allowed", "no outdoor storage"
 - Location context: "near I-20", "airport adjacent", "in industrial park"
-- Divisibility: "can subdivide to 5,000 SF", "must take full space"
-- HVAC/Climate: "climate controlled", "AC in office only"
-- Office space: "1,500 SF office buildout", "includes 2 private offices"
+- Divisibility: "can subdivide", "must take full space"
+- Building info: "built 2020", "renovated 2023", "tilt-up construction"
+- Sublease details: "sublease through 2025", "direct lease preferred"
 
-FORMAT: Use terse fragments separated by " • "
-EXAMPLE: "available immediately • 3-5 yr preferred • fenced yard • near I-20 • can subdivide"
-
-IMPORTANT: If the broker mentions ANY of these details, capture them. Don't leave notes empty if useful info exists.
+FORMAT: Terse fragments separated by " • "
+GOOD: "NNN • available immediately • owner motivated • fenced yard"
+BAD: "40,000 SF • $8.50/SF rent • 2 docks" (these belong in columns, not notes!)
 """
 
         RESPONSE_EMAIL_RULES = """
@@ -713,7 +719,7 @@ OUTPUT ONLY valid JSON in this exact format:
     }
   ],
   "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation, reference specific details when possible, and vary wording to avoid repetition. SET TO NULL when: (1) call_requested with phone number provided, (2) needs_user_input event detected, (3) contact_optout event detected, (4) wrong_contact event detected. The system will notify the user instead of auto-responding.>",
-  "notes": "<IMPORTANT: Capture useful details not in columns - availability timing, lease terms, zoning, special features, parking, landlord notes, building age, location context, divisibility, HVAC, office space. Format: terse fragments separated by ' • '. Example: 'available immediately • 3-5 yr preferred • fenced yard'. Leave empty ONLY if conversation has no such details.>"
+  "notes": "<IMPORTANT: Capture contextual details NOT already in columns. NEVER repeat values being written to columns (rent amounts, SF, ops ex, docks, power, etc.). DO capture: lease type (NNN/gross), availability timing, landlord motivation (motivated/firm), building features (fenced yard, rail spur, sprinklered), zoning, location context, divisibility, TI allowance, sublease terms. Format: terse fragments separated by ' • '. Example: 'NNN • available immediately • owner motivated • fenced yard • near I-20'. Leave empty if no additional context beyond column data.>"
 }
 """)
 
