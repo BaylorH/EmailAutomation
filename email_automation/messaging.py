@@ -60,7 +60,8 @@ def lookup_thread_by_message_id(user_id: str, message_id: str) -> Optional[str]:
 def index_conversation_id(user_id: str, conversation_id: str, thread_id: str) -> bool:
     """Index conversation ID for fallback lookup. Returns True on success, False on failure."""
     if not conversation_id:
-        return True  # No-op is considered success
+        print(f"⚠️ Empty conversation_id provided, skipping index")
+        return False  # Don't pretend success when nothing was indexed
     try:
         conv_ref = _fs.collection("users").document(user_id).collection("convIndex").document(conversation_id)
         conv_ref.set({"threadId": thread_id}, merge=True)
@@ -81,6 +82,39 @@ def lookup_thread_by_conversation_id(user_id: str, conversation_id: str) -> Opti
         return None
     except Exception as e:
         print(f"❌ Failed to lookup conversation {conversation_id}: {e}")
+        return None
+
+def lookup_thread_by_conversation_id_exhaustive(user_id: str, conversation_id: str) -> Optional[str]:
+    """
+    Exhaustive search for thread by conversation ID.
+
+    First tries the fast convIndex lookup, then falls back to scanning
+    all threads for matching conversationId field. This prevents duplicate
+    thread creation when convIndex is missing but thread exists.
+    """
+    if not conversation_id:
+        return None
+
+    # Fast path: try convIndex first
+    indexed_thread = lookup_thread_by_conversation_id(user_id, conversation_id)
+    if indexed_thread:
+        return indexed_thread
+
+    # Slow path: scan all threads for matching conversationId
+    try:
+        threads_ref = _fs.collection("users").document(user_id).collection("threads")
+        # Query threads where conversationId matches
+        query = threads_ref.where("conversationId", "==", conversation_id).limit(1)
+        results = list(query.stream())
+        if results:
+            found_thread_id = results[0].id
+            print(f"🔍 Found thread {found_thread_id} via exhaustive search for convId {conversation_id[:30]}...")
+            # Repair the missing index
+            index_conversation_id(user_id, conversation_id, found_thread_id)
+            return found_thread_id
+        return None
+    except Exception as e:
+        print(f"❌ Exhaustive conversation lookup failed: {e}")
         return None
 
 def _get_thread_messages_chronological(uid: str, thread_id: str) -> List[dict]:
@@ -144,30 +178,32 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, header
                     conversation_id = thread_data.get("conversationId")
                     
                     if conversation_id:
-                        # Fetch all messages in this conversation from Graph API
-                        # This includes messages we didn't index (e.g., Jill's manual emails)
+                        # Fetch messages from Graph API and filter by conversationId client-side
+                        # NOTE: We avoid using conversationId in $filter because Graph API has
+                        # issues parsing base64-encoded IDs that end with '=' characters
                         import requests
                         from .utils import exponential_backoff_request
                         from .utils import strip_html_tags
-                        
+
                         try:
                             response = exponential_backoff_request(
                                 lambda: requests.get(
                                     "https://graph.microsoft.com/v1.0/me/messages",
                                     headers=headers,
                                     params={
-                                        "$filter": f"conversationId eq '{conversation_id}'",
-                                        "$orderby": "sentDateTime asc",
-                                        "$select": "id,subject,from,toRecipients,sentDateTime,receivedDateTime,body,bodyPreview,internetMessageId",
-                                        "$top": 50  # Limit to prevent huge responses
+                                        "$orderby": "sentDateTime desc",
+                                        "$select": "id,subject,from,toRecipients,sentDateTime,receivedDateTime,body,bodyPreview,internetMessageId,conversationId",
+                                        "$top": 100  # Fetch more to filter client-side
                                     },
                                     timeout=30
                                 )
                             )
-                            
+
                             if response.status_code == 200:
                                 graph_data = response.json()
-                                for msg in graph_data.get("value", []):
+                                # Filter client-side by conversationId
+                                matching_msgs = [m for m in graph_data.get("value", []) if m.get("conversationId") == conversation_id]
+                                for msg in matching_msgs:
                                     # Determine direction
                                     from_addr = msg.get("from", {}).get("emailAddress", {}).get("address", "")
                                     to_recipients = [r.get("emailAddress", {}).get("address", "") for r in msg.get("toRecipients", [])]

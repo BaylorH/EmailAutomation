@@ -450,7 +450,8 @@ class CampaignSimulator:
     def check_campaign_complete(self) -> bool:
         """Check if the campaign is complete (all properties resolved)."""
         for prop in self.state.properties.values():
-            if prop.status in [PropertyStatus.PENDING, PropertyStatus.IN_PROGRESS]:
+            # Campaign is NOT complete if any property is still pending, in progress, or needs user action
+            if prop.status in [PropertyStatus.PENDING, PropertyStatus.IN_PROGRESS, PropertyStatus.NEEDS_ACTION]:
                 return False
         self.state.campaign_complete = True
         return True

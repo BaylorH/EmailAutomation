@@ -146,25 +146,28 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                 conversation_id = current_msg_resp.json().get("conversationId") if current_msg_resp.status_code == 200 else None
                 
                 if conversation_id:
-                    # Fetch recent sent messages in this conversation
+                    # Fetch recent sent messages and filter client-side by conversationId
+                    # NOTE: We avoid using conversationId in $filter because Graph API has
+                    # issues parsing base64-encoded IDs that end with '=' characters
                     sent_resp = exponential_backoff_request(
                         lambda: requests.get(
                             f"{base}/me/mailFolders/SentItems/messages",
                             headers=headers,
                             params={
-                                "$filter": f"conversationId eq '{conversation_id}'",
                                 "$orderby": "sentDateTime desc",
-                                "$top": 1,
+                                "$top": 10,  # Fetch more to filter client-side
                                 "$select": "id,internetMessageId,conversationId,subject,toRecipients,sentDateTime,body,bodyPreview"
                             },
                             timeout=30
                         )
                     )
-                    
+
                     if sent_resp.status_code == 200:
-                        sent_messages = sent_resp.json().get("value", [])
+                        all_sent = sent_resp.json().get("value", [])
+                        # Filter client-side by conversationId
+                        sent_messages = [m for m in all_sent if m.get("conversationId") == conversation_id]
                         if sent_messages:
-                            sent_msg = sent_messages[0]  # Most recent
+                            sent_msg = sent_messages[0]  # Most recent matching
                             sent_internet_msg_id = sent_msg.get("internetMessageId")
                             
                             if sent_internet_msg_id:
@@ -1988,8 +1991,10 @@ def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], to
                         continue  # Already indexed
                     
                     # Find or create thread for this conversation
-                    thread_id = lookup_thread_by_conversation_id(user_id, conversation_id)
-                    
+                    # Use exhaustive search to prevent duplicate thread creation
+                    from .messaging import lookup_thread_by_conversation_id_exhaustive
+                    thread_id = lookup_thread_by_conversation_id_exhaustive(user_id, conversation_id)
+
                     if not thread_id:
                         # Create new thread from conversation
                         thread_id = normalize_message_id(conversation_id) or conversation_id

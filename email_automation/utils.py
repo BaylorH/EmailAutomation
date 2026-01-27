@@ -385,11 +385,9 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None) -
         return ""
 
     # Otherwise use the default signature
-    # Upload logo to Drive and get public URL (more reliable than base64 for email clients)
-    logo_url = _upload_logo_to_drive()
-
-    # Upload LinkedIn icon to Drive
-    linkedin_url = _upload_logo_to_drive("linkedin.png")
+    # Use base64 data URIs - more reliable than Google Drive URLs which get blocked by email clients
+    logo_url = _image_to_base64("logo.png")
+    linkedin_url = _image_to_base64("linkedin.png")
 
     # Build the footer HTML matching the professional signature layout
     # Uses sans-serif font (Arial/Helvetica), black text

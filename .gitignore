@@ -61,3 +61,7 @@ tests/conversations/generated/*/
 # Local token caches
 msal_token_cache.bin
 tests/generated_suite*/
+
+# Credentials - DO NOT COMMIT
+service-account.json
+.env
