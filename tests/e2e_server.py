@@ -370,6 +370,12 @@ class E2ERequestHandler(BaseHTTPRequestHandler):
                 self._set_headers()
                 self.wfile.write(json.dumps(result, default=str).encode())
 
+            elif parsed.path == '/api/campaign-grade':
+                # Grade campaign results using quality_benchmark scoring
+                result = self._handle_campaign_grade(body)
+                self._set_headers()
+                self.wfile.write(json.dumps(result, default=str).encode())
+
             elif parsed.path == '/api/reset':
                 # Reset test state
                 global MOCK_STATE
@@ -426,6 +432,95 @@ class E2ERequestHandler(BaseHTTPRequestHandler):
                 "inProgress": sum(1 for p in properties if 0 < p["fieldsComplete"] < p["fieldsRequired"]),
                 "pending": sum(1 for p in properties if p["fieldsComplete"] == 0)
             }
+        }
+
+    def _handle_campaign_grade(self, body):
+        """
+        Handle /api/campaign-grade endpoint.
+        Grades a set of property results using the quality_benchmark scoring functions.
+
+        Body: {
+            properties: [{
+                actualUpdates: [{column, value}],
+                expectedUpdates: [{column, value}],
+                actualNotes: str,
+                expectedNotes: str,
+                forbiddenInNotes: [str],
+                actualEvents: [str],
+                expectedEvents: [str],
+                response: str,
+                expectedResponseType: str,
+                responseShouldMention: [str],
+            }]
+        }
+        """
+        try:
+            from tests.quality_benchmark import (
+                score_field_accuracy,
+                score_field_completeness,
+                score_notes_quality,
+                score_response_quality,
+                score_event_accuracy,
+            )
+        except ImportError:
+            return {"error": "quality_benchmark module not available"}
+
+        properties = body.get("properties", [])
+        results = []
+
+        for prop in properties:
+            actual_updates = prop.get("actualUpdates", [])
+            expected_updates = prop.get("expectedUpdates", [])
+            actual_notes = prop.get("actualNotes", "")
+            expected_notes = prop.get("expectedNotes", "")
+            forbidden_in_notes = prop.get("forbiddenInNotes", [])
+            actual_events = prop.get("actualEvents", [])
+            expected_events = prop.get("expectedEvents", [])
+            response = prop.get("response", "")
+            expected_response_type = prop.get("expectedResponseType", "")
+            response_should_mention = prop.get("responseShouldMention", [])
+
+            field_acc, field_acc_details = score_field_accuracy(actual_updates, expected_updates)
+            field_comp, field_comp_details = score_field_completeness(actual_updates, expected_updates)
+            notes_qual, notes_details = score_notes_quality(actual_notes, expected_notes, forbidden_in_notes)
+            resp_qual, resp_details = score_response_quality(response, expected_response_type, response_should_mention)
+            event_acc, event_details = score_event_accuracy(actual_events, expected_events)
+
+            overall = (
+                field_acc * 0.3 +
+                field_comp * 0.2 +
+                notes_qual * 0.2 +
+                resp_qual * 0.2 +
+                event_acc * 0.1
+            )
+
+            results.append({
+                "address": prop.get("address", "unknown"),
+                "scores": {
+                    "fieldAccuracy": round(field_acc, 3),
+                    "fieldCompleteness": round(field_comp, 3),
+                    "notesQuality": round(notes_qual, 3),
+                    "responseQuality": round(resp_qual, 3),
+                    "eventAccuracy": round(event_acc, 3),
+                    "overall": round(overall, 3),
+                },
+                "details": {
+                    "fieldAccuracy": field_acc_details,
+                    "fieldCompleteness": field_comp_details,
+                    "notesQuality": notes_details,
+                    "responseQuality": resp_details,
+                    "eventAccuracy": event_details,
+                },
+            })
+
+        # Campaign average
+        avg_overall = sum(r["scores"]["overall"] for r in results) / max(1, len(results))
+
+        return {
+            "success": True,
+            "propertyCount": len(results),
+            "averageOverall": round(avg_overall, 3),
+            "properties": results,
         }
 
     def _handle_simulate_response(self, body):
@@ -611,6 +706,7 @@ def run_server(port: int = 5002):
     print("")
     print("Campaign Simulation (for frontend E2E tests):")
     print("  POST /api/simulate-response - Simulate broker response with AI")
+    print("  POST /api/campaign-grade    - Grade campaign results using quality_benchmark scoring")
     print("  POST /api/reset             - Reset test state")
     print("  GET  /api/campaign-state    - Get campaign state")
     print("  GET  /api/notifications     - Get all notifications")
