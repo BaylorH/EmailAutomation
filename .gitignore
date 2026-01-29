@@ -65,3 +65,16 @@ tests/generated_suite*/
 # Credentials - DO NOT COMMIT
 service-account.json
 .env
+
+# Local run scripts (contain credentials)
+run_production.sh
+
+# Debug/utility scripts (ad-hoc, not part of test suite)
+check_thread.py
+run_full_campaign_test.py
+
+# Image assets (signatures, etc.)
+sig.png
+
+# Multi-turn test state (temporary resume file)
+tests/.multi_turn_state.json
