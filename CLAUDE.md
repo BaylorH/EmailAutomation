@@ -52,24 +52,31 @@ python scheduler_runner.py
 
 ```
 Entry Points:
-  main.py           → Runs processing for all users
-  app.py            → Flask server for OAuth + APIs
-  scheduler_runner.py → Alternative extended scheduler
+  main.py              → Runs processing for all users
+  app.py               → Flask server for OAuth + APIs
+  scheduler_runner.py  → Alternative extended scheduler
 
 Core Pipeline (email_automation/):
-  1. email.py           → Outbox processing, send drafts
-  2. processing.py      → Inbox scanning, thread matching (main logic)
-  3. ai_processing.py   → OpenAI extraction, field validation
-  4. sheets.py          → Google Sheets updates
-  5. messaging.py       → Firestore thread/message storage
+  1. email.py            → Outbox processing, send drafts, follow-up scheduling
+  2. processing.py       → Inbox scanning, thread matching, event handling (main logic)
+  3. ai_processing.py    → OpenAI extraction, field validation, event detection
+  4. sheets.py           → Google Sheets read/write operations
+  5. messaging.py        → Firestore thread/message storage and indexing
 
 Support Modules:
-  clients.py          → Firestore & Google API client init
-  email_operations.py → Specialized email sending (replies, templates)
-  sheet_operations.py → Advanced sheet manipulation
-  utils.py            → Retry logic, HTML parsing, encoding helpers
-  notifications.py    → User notifications
-  file_handling.py    → PDF attachment handling
+  clients.py           → Firestore & Google API client init
+  email_operations.py  → Specialized email sending (replies, closing, follow-ups)
+  sheet_operations.py  → NON-VIABLE divider, row movement, new property insertion
+  utils.py             → Retry logic, HTML parsing, encoding helpers
+  notifications.py     → User notifications (sheet_update, action_needed, etc.)
+  file_handling.py     → PDF attachment handling, Google Drive upload
+
+Configuration & Infrastructure:
+  app_config.py        → Azure/Firebase/OpenAI config constants, E2E test mode flag
+  column_config.py     → Dynamic column mapping, canonical field definitions, extraction rules
+  followup.py          → Automatic follow-up emails for non-responsive brokers
+  logging.py           → Google Sheets "Log" tab management, message processing history
+  service_providers.py → Abstraction layer for external services (prod vs test mode)
 ```
 
 ## Data Flow
@@ -96,7 +103,7 @@ Written by frontend, read by backend:
 - `outbox/` - Queued emails to send
 
 Written by backend, read by frontend:
-- `notifications/` - Per-client notifications (sheet_update, action_needed, row_completed)
+- `notifications/` - Per-client notifications (sheet_update, action_needed, row_completed, property_unavailable, conversation_closed)
 
 ## Key External Services
 
@@ -115,12 +122,39 @@ OpenAI: `OPENAI_API_KEY`, `OPENAI_ASSISTANT_MODEL`
 
 ## Flask API Endpoints
 
-- `/auth/login` - Initiate MSAL OAuth flow (stores token in Firebase Storage)
-- `/auth/callback` - OAuth completion
-- `/api/status` - Token status check
-- `/api/trigger-scheduler` - Manually run processing
-- `/api/debug-inbox` - Debug incoming emails
-- `/api/debug-thread-matching` - Debug conversation matching
+### Authentication
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/auth/login` | GET | Initiate Microsoft OAuth flow via MSAL |
+| `/auth/callback` | GET | OAuth callback, save token to Firestore |
+
+### Core API
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/` | GET | Home page: token status, OAuth setup UI |
+| `/api/status` | GET | Check if Microsoft Graph token is valid |
+| `/api/upload` | POST | Upload MSAL token cache to Firebase Storage |
+| `/api/clear` | POST | Clear local MSAL token cache file |
+| `/api/refresh` | POST | Force refresh Microsoft Graph access token |
+| `/api/trigger-scheduler` | POST | Manually trigger email processing |
+| `/api/scheduler-status` | GET | Get scheduler status, last run result |
+
+### Property & Sheet Management
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/decline-property` | POST | Delete property row when user rejects suggestion |
+| `/api/accept-new-property` | POST | Create new property row when user accepts suggestion |
+| `/api/check-sheet-completion` | POST | Check required field completion percentage |
+| `/api/clear-optout` | POST | Remove email from opt-out list |
+| `/api/list-optouts` | POST | Retrieve all opted-out contacts for user |
+
+### Debug
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/debug-inbox` | GET | Fetch recent inbox emails, check processing status |
+| `/api/debug-thread-matching` | GET | Test conversation/message ID matching logic |
+| `/api/firestore-inspect` | GET | Inspect Firestore database structure |
+| `/api/firestore-cleanup` | POST | Clean up test/malformed data in Firestore |
 
 ## Deployment
 
@@ -179,7 +213,7 @@ Hosted on Render.com (`https://email-token-manager.onrender.com`).
    └─> python3 -m py_compile email_automation/<file>.py
 
 3. RUN TESTS (MANDATORY - ALWAYS DO THIS)
-   └─> python tests/standalone_test.py    # AI extraction tests (19 scenarios)
+   └─> python tests/standalone_test.py    # AI extraction tests (25 scenarios)
    └─> python tests/e2e_test.py           # Full pipeline E2E tests (5+ properties)
    └─> ALL TESTS MUST PASS before committing!
 
@@ -220,9 +254,10 @@ Hosted on Render.com (`https://email-token-manager.onrender.com`).
 
 | Test Suite | Purpose | Command |
 |------------|---------|---------|
-| `standalone_test.py` | AI extraction tests (19 scenarios) | `python tests/standalone_test.py` |
+| `standalone_test.py` | AI extraction tests (25 scenarios) | `python tests/standalone_test.py` |
 | `e2e_test.py` | Full pipeline E2E tests (uses Scrub file) | `python tests/e2e_test.py` |
-| `campaign_lifecycle_test.py` | Campaign lifecycle tests (6 scenarios) | `python tests/campaign_lifecycle_test.py` |
+| `campaign_lifecycle_test.py` | Campaign lifecycle tests (11 scenarios) | `python tests/campaign_lifecycle_test.py` |
+| `multi_turn_live_test.py` | Live email integration tests (3 scenarios) | `python tests/multi_turn_live_test.py` |
 | `batch_runner.py` | Large-scale batch testing (279+ scenarios) | `python tests/batch_runner.py --suite tests/generated_suite/` |
 
 ### Running Tests
@@ -232,7 +267,7 @@ Hosted on Render.com (`https://email-token-manager.onrender.com`).
 export OPENAI_API_KEY='sk-...'
 
 # ALWAYS run BOTH test suites:
-python tests/standalone_test.py    # Must show: 19/19 PASS
+python tests/standalone_test.py    # Must show: 25/25 PASS
 python tests/e2e_test.py           # Must show: 5/5 PASS (or all available)
 
 # Run specific scenarios:
@@ -244,7 +279,7 @@ python tests/standalone_test.py -l
 python tests/e2e_test.py --list
 ```
 
-### Test Scenarios (19 total)
+### Test Scenarios (25 total)
 
 | Scenario | Tests |
 |----------|-------|
@@ -267,6 +302,12 @@ python tests/e2e_test.py --list
 | `budget_question` | Broker asks about budget - AI escalates |
 | `different_person_replies` | Different person signs email - Leasing Contact NOT updated |
 | `new_property_suggestion_with_different_contact` | New property suggested - original contact NOT changed |
+| `contact_optout_not_interested` | Broker says not interested → contact_optout event |
+| `contact_optout_no_tenant_reps` | Broker refuses tenant reps → contact_optout:no_tenant_reps |
+| `wrong_contact_redirected` | Wrong person, forwards to colleague → wrong_contact:forwarded |
+| `wrong_contact_left_company` | Contact left company → wrong_contact:left_company |
+| `property_issue_major` | Broker mentions significant property issue → property_issue:major |
+| `property_issue_critical` | Health/safety concern → property_issue:critical |
 
 ### Campaign Lifecycle Tests
 
@@ -289,6 +330,8 @@ python tests/campaign_lifecycle_test.py -s mixed_outcomes
 python tests/campaign_lifecycle_test.py -l
 ```
 
+**Campaign Scenarios (6):**
+
 | Scenario | Description | Expected Outcome |
 |----------|-------------|------------------|
 | `mixed_outcomes` | 5 properties: 2 complete, 1 unavailable, 1 needs input, 1 multi-turn | 3 complete, 1 non-viable, 1 needs action |
@@ -298,7 +341,7 @@ python tests/campaign_lifecycle_test.py -l
 | `escalation_scenarios` | Various user input required | 5 needs action |
 | `multi_turn_completion` | Properties require 2+ turns | 2 complete after multi-turn |
 
-**Threading Logic Scenarios (NEW)**:
+**Threading Logic Scenarios (5):**
 
 | Scenario | Description | What It Tests |
 |----------|-------------|---------------|
@@ -338,10 +381,12 @@ See `tests/TESTING_PLAN.md` for the comprehensive testing plan and methodology.
 
 ```
 tests/
-├── standalone_test.py         # AI extraction tests (19 scenarios)
-├── e2e_test.py                # Full pipeline E2E tests
-├── campaign_lifecycle_test.py # Campaign lifecycle tests (6 scenarios)
-├── batch_runner.py            # Large-scale batch test execution
+├── standalone_test.py           # AI extraction tests (25 scenarios)
+├── e2e_test.py                  # Full pipeline E2E tests
+├── campaign_lifecycle_test.py   # Campaign lifecycle tests (11 scenarios)
+├── multi_turn_live_test.py      # Live email integration tests (3 scenarios)
+├── multi_turn_scenarios.py      # Multi-turn scenario definitions
+├── batch_runner.py              # Large-scale batch test execution
 ├── generate_test_suite.py     # Generate 279+ test cases
 ├── analyze_results.py         # Analyze results, generate reports
 ├── TESTING_PLAN.md            # Comprehensive testing plan
@@ -365,10 +410,11 @@ tests/
 │       ├── edge_case/
 │       └── format/
 └── results/                   # Saved test run outputs
-    └── run_YYYYMMDD_HHMMSS/
-        ├── manifest.json      # Run metadata + input file hash
-        ├── summary.json       # Campaign-level results
-        └── {property}.json    # Per-property results
+    ├── run_YYYYMMDD_HHMMSS/   # E2E/batch results
+    │   ├── manifest.json
+    │   ├── summary.json
+    │   └── {property}.json
+    └── multi_turn_*.json      # Multi-turn live test results
 ```
 
 ### Test Data File
@@ -483,13 +529,61 @@ TestScenario(
 )
 ```
 
+### Multi-Turn Live Email Tests
+
+End-to-end tests that send **real emails** between Outlook (Microsoft Graph) and Gmail (SMTP), running through the actual production pipeline (`main.py`) each turn. Tests thread matching, AI extraction, escalation flow, and response quality with real email delivery.
+
+```bash
+# Run all 3 scenarios
+python tests/multi_turn_live_test.py
+
+# Run specific scenario
+python tests/multi_turn_live_test.py --scenario gradual_info_gathering
+
+# Resume interrupted run
+python tests/multi_turn_live_test.py --resume
+
+# Custom wait time for email delivery (default: 75s)
+python tests/multi_turn_live_test.py --wait 90
+
+# List available scenarios
+python tests/multi_turn_live_test.py --list
+
+# Clean up test data from Firestore
+python tests/multi_turn_live_test.py --cleanup
+```
+
+**Scenarios:**
+
+| Scenario | Turns | Description |
+|----------|-------|-------------|
+| `gradual_info_gathering` | 4 | Broker provides info across 3 replies, AI gathers until complete |
+| `escalation_and_resume` | 4 | Broker asks identity → AI escalates → user replies via frontend → broker completes |
+| `mixed_info_and_question` | 4 | Broker provides data AND asks question → AI extracts AND escalates |
+
+**Per-turn verification:**
+- Thread message count in Firestore
+- Sheet field extraction accuracy (expected vs actual values)
+- Notification kinds (sheet_update, action_needed, row_completed)
+- Escalation reason matching (e.g., `needs_user_input:confidential`)
+- No duplicate emails sent
+- Listing Brokers Comments quality (contextual notes, no redundant column data)
+
+**Escalation flow tested:**
+1. AI detects `needs_user_input` → creates `action_needed` notification → does NOT auto-reply
+2. Test creates outbox entry (simulating frontend "Send Email" button)
+3. Pipeline sends via Graph API → `scan_sent_items_for_manual_replies` indexes it
+4. Next broker reply processed with full conversation history
+
 ### What Tests Validate
 
 1. **Field extraction** - Correct columns and values parsed
 2. **Forbidden fields** - Never writes "Gross Rent" (formula), never requests "Rent/SF /Yr" or "Gross Rent"
-3. **Event detection** - `property_unavailable`, `new_property`, `call_requested`, `close_conversation`
+3. **Event detection** - All 9 event types: `property_unavailable`, `new_property`, `call_requested`, `close_conversation`, `tour_requested`, `needs_user_input`, `contact_optout`, `wrong_contact`, `property_issue`
 4. **Response quality** - Professional, concise, doesn't request forbidden fields
 5. **Number formatting** - Plain decimals, no "$" or "SF" symbols
+6. **Read-only field protection** - Leasing Contact, Email never overwritten even when different person replies
+7. **Escalation subreasons** - Correct subreason detected (e.g., `needs_user_input:confidential` vs `needs_user_input:client_question`)
 
 ### Workflow for Changes
 
@@ -713,8 +807,8 @@ For rigorous campaign lifecycle testing:
 
 1. **Backend unit tests** (no frontend needed):
    ```bash
-   python tests/standalone_test.py      # 19 AI scenarios
-   python tests/campaign_lifecycle_test.py  # 6 campaign lifecycle scenarios
+   python tests/standalone_test.py          # 25 AI scenarios
+   python tests/campaign_lifecycle_test.py  # 11 campaign lifecycle scenarios
    ```
 
 2. **Full integration tests** (frontend + backend):
@@ -808,41 +902,81 @@ For rigorous campaign lifecycle testing:
 ```javascript
 {
   id: string,
-  kind: "sheet_update" | "action_needed" | "row_completed" | "property_unavailable",
+  kind: "sheet_update" | "action_needed" | "row_completed" | "property_unavailable" | "conversation_closed",
   createdAt: Timestamp,
   priority: "important" | "normal",
 
   // For sheet_update:
-  meta: { column: string, address: string, newValue: any },
+  meta: { column: string, address: string, oldValue: any, newValue: any, reason: string, confidence: string },
 
   // For action_needed:
   meta: {
-    reason: "new_property_pending_approval" | "call_requested" | "missing_fields",
+    reason: string,  // See reason values below
     address: string,
     city: string,
     link: string,
     notes: string,
     status: "pending_approval" | "pending_send",
-    suggestedEmail: { to: string[], subject: string, body: string }
+    suggestedEmail: { to: string[], subject: string, body: string }  // For tour_requested
   },
 
   // For row_completed:
-  rowAnchor: string
+  rowAnchor: string,
+
+  // For conversation_closed:
+  meta: { reason: "natural_end", details: string, lastMessage: string }
 }
 ```
 
-### Event Types (Backend → Frontend)
+**`action_needed` reason values:**
 
-| Event | Trigger | Frontend Action |
-|-------|---------|-----------------|
+| Reason | Trigger |
+|--------|---------|
+| `call_requested` | Broker explicitly asks for a phone call |
+| `tour_requested` | Broker offers property tour/showing |
+| `new_property_pending_approval` | Broker suggests a different property |
+| `missing_fields` | Required fields still missing after follow-up |
+| `needs_user_input:confidential` | Broker asks who the client is |
+| `needs_user_input:client_question` | Broker asks about requirements/budget |
+| `needs_user_input:scheduling` | Tour/meeting scheduling request |
+| `needs_user_input:negotiation` | Price or term negotiation |
+| `needs_user_input:legal_contract` | Contract/LOI/lease questions |
+| `needs_user_input:unclear` | Ambiguous message (fallback) |
+| `contact_optout:not_interested` | General disinterest |
+| `contact_optout:unsubscribe` | Explicit removal request |
+| `contact_optout:do_not_contact` | Firm request to stop contact |
+| `contact_optout:no_tenant_reps` | Policy against tenant reps |
+| `contact_optout:direct_only` | Only deals directly with tenants |
+| `contact_optout:hostile` | Rude/aggressive response |
+| `wrong_contact:no_longer_handles` | Used to handle but doesn't anymore |
+| `wrong_contact:wrong_person` | Never handled this property |
+| `wrong_contact:forwarded` | Forwarding to correct person |
+| `wrong_contact:left_company` | No longer with the company |
+| `property_issue:critical` | Health/safety concern |
+| `property_issue:major` | Significant repair needed |
+| `property_issue:minor` | Cosmetic/inconvenience |
+```
+
+### Event Types (AI-detected → Backend → Frontend)
+
+| Event | Trigger | Backend Action | Frontend Action |
+|-------|---------|----------------|-----------------|
+| `property_unavailable` | Broker says not available | Moves row below NON-VIABLE | Shows property_unavailable notification |
+| `new_property` | Broker suggests different property | Creates pending approval entry | Shows approval modal with suggested email |
+| `call_requested` | Broker wants to talk | Creates action_needed notification | Shows action button |
+| `tour_requested` | Broker offers tour/showing | Creates notification + suggested email | Shows pre-filled response for approval |
+| `close_conversation` | Natural end of thread | Creates conversation_closed notification | Stops processing thread |
+| `needs_user_input` | Question AI can't answer | Creates action_needed + pauses thread | Shows chatbot for user to compose reply |
+| `contact_optout` | Contact refuses communication | Adds to opt-out list | Shows action_needed notification |
+| `wrong_contact` | Wrong person for property | Creates action_needed notification | Shows redirect info |
+| `property_issue` | Broker mentions property problem | Creates action_needed notification | Shows issue details by severity |
+
+**Notification kinds (not AI events):**
+
+| Kind | Trigger | Frontend Action |
+|------|---------|-----------------|
 | `sheet_update` | AI extracts a field value | Shows in notification sidebar |
 | `row_completed` | All required fields filled | Marks property complete |
-| `action_needed` | Call requested, tour offered, new property suggested | Shows action button |
-| `property_unavailable` | Broker says not available | Moves row below NON-VIABLE |
-| `new_property` | Broker suggests new property | Creates pending approval notification |
-| `call_requested` | Broker wants to talk | Creates action_needed notification |
-| `tour_requested` | Broker offers tour/showing | Creates notification with suggested email for approval |
-| `close_conversation` | Natural end of thread | Stops processing thread |
 
 ### Firebase Cloud Functions (in email-admin-ui/functions)
 
@@ -897,7 +1031,39 @@ The AI may ONLY update extractable property specs (Total SF, Ops Ex, Drive Ins, 
 - New properties are inserted ABOVE this divider
 - `sheet_operations.py` handles row movement
 
-### Column Mapping
-- `column_config.py` defines canonical field names
-- AI maps broker responses to canonical fields
-- Case-insensitive matching with normalization
+### Column Mapping (`column_config.py`)
+
+Dynamic column mapping system that translates between canonical field names and actual sheet column headers:
+
+**Canonical Fields:**
+- `property_address`, `city`, `property_name`, `leasing_company`, `leasing_contact`, `email` (read-only, matching)
+- `total_sf`, `rent_sf_yr`, `ops_ex_sf`, `gross_rent`, `drive_ins`, `docks`, `ceiling_ht`, `power` (extractable)
+- `listing_comments` (append-only with "•" separator, contextual notes only)
+- `flyer_link`, `floorplan` (append-only, extractable)
+- `client_comments` (read-only)
+
+**Key functions:**
+- `detect_column_mapping(headers)` - Maps sheet columns to canonical fields (exact match then AI semantic match)
+- `build_column_rules_prompt(column_config)` - Generates AI extraction rules from config
+- `get_required_fields_for_close(column_config)` - Returns fields needed for conversation completion
+
+**Required for close:** `Total SF`, `Ops Ex /SF`, `Drive Ins`, `Docks`, `Ceiling Ht`, `Power`
+**Never request:** `Rent/SF /Yr` (accepted if volunteered, never asked for)
+**Never write:** `Gross Rent` (formula column: `=(H+I)*G/12`)
+
+### Follow-Up System (`followup.py`)
+
+Automatic follow-up emails for non-responsive brokers:
+- 0-3 configurable follow-ups per thread with custom wait times
+- Sends as replies to maintain thread continuity
+- **Pauses** when broker responds; **resumes** if broker goes silent again
+- Default escalation: friendly reminder → gentle nudge → final attempt
+- Called from `main.py` every 30 minutes via `check_and_send_followups()`
+
+### Listing Brokers Comments
+
+The "Listing Brokers Comments" column stores contextual notes about properties:
+- Written via AI's `notes` field using `_append_notes_to_comments()`
+- Uses "•" bullet separator, append mode (never overwrites)
+- Should contain contextual info: NNN, lease terms, building features, zoning, condition
+- Should NOT contain redundant column data (SF, rent, docks, ceiling, power values)
