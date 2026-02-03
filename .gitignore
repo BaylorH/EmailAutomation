@@ -78,3 +78,5 @@ sig.png
 
 # Multi-turn test state (temporary resume file)
 tests/.multi_turn_state.json
+# Test state files with spaces in names
+tests/.multi_turn_state*.json
