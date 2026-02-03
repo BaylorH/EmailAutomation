@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
-from .clients import _fs, _get_sheet_id_or_fail, _sheets_client
+from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
 from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, _header_index_map, _find_row_by_email
 from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable
 from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
@@ -344,20 +344,20 @@ def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email:
             .collection("threads").document(thread_id).get())
     if not tdoc.exists:
         print("⚠️ Thread doc not found; cannot fetch sheet")
-        return None, None, None, None, None  # Return tuple for unpacking
+        return None, None, None, None, None, None, None  # Return tuple for unpacking
 
     tdata = tdoc.to_dict() or {}
     client_id = tdata.get("clientId")
     if not client_id:
         print("⚠️ Thread has no clientId; cannot fetch sheet")
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
-    # Required: sheetId on client doc
+    # Required: sheetId on client doc, also get columnConfig and extractionFields
     try:
-        sheet_id = _get_sheet_id_or_fail(uid, client_id)
+        sheet_id, column_config, extraction_fields = _get_client_config(uid, client_id)
     except RuntimeError as e:
         print(str(e))
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     # Counterparty email fallback: use thread's stored recipients if missing
     if not counterparty_email:
@@ -379,14 +379,14 @@ def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email:
 
     # NEW: Use row anchoring for enhanced row matching
     rownum, rowvals = _find_row_by_anchor(uid, thread_id, sheets, sheet_id, tab_title, header, counterparty_email or "")
-    
+
     if rownum is not None:
         print(f"📌 Matched row {rownum}: {rowvals}")
-        return client_id, sheet_id, header, rownum, rowvals
+        return client_id, sheet_id, header, rownum, rowvals, column_config, extraction_fields
     else:
         # Be loud – row must exist for our workflow
         print(f"❌ No sheet row found with email = {counterparty_email}")
-        return client_id, sheet_id, header, None, None
+        return client_id, sheet_id, header, None, None, column_config, extraction_fields
 
 def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, Any]):
     """ENHANCED: Process a single inbox message with full pipeline including events."""
@@ -580,10 +580,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
     # Dump the conversation
     dump_thread_from_firestore(user_id, thread_id)
-    
+
     # Step 1: fetch Google Sheet (required) and log header + counterparty email
-    client_id, sheet_id, header, rownum, rowvals = fetch_and_log_sheet_for_thread(user_id, thread_id, counterparty_email=from_addr)
-    
+    # Also retrieve columnConfig and extractionFields for per-client AI configuration
+    client_id, sheet_id, header, rownum, rowvals, column_config, extraction_fields = fetch_and_log_sheet_for_thread(user_id, thread_id, counterparty_email=from_addr)
+
     # If no clientId found, try to find it by email and update the thread
     if not client_id and from_addr:
         print(f"   🔍 Retrying clientId lookup for email: {from_addr}")
@@ -594,7 +595,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
             thread_ref.set({"clientId": client_id}, merge=True)
             # Retry fetching sheet
-            client_id, sheet_id, header, rownum, rowvals = fetch_and_log_sheet_for_thread(user_id, thread_id, counterparty_email=from_addr)
+            client_id, sheet_id, header, rownum, rowvals, column_config, extraction_fields = fetch_and_log_sheet_for_thread(user_id, thread_id, counterparty_email=from_addr)
     
     # Extract contact name: try email name first, then sheet row
     contact_name = None
@@ -704,12 +705,13 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)
-        
+
         # Step 3: get proposal using Responses API with URL content and PDF data
+        # Pass column_config and extraction_fields for per-client AI configuration
         proposal = propose_sheet_updates(
             user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals,
             thread_id, pdf_manifest=pdf_manifest, url_texts=url_texts, contact_name=contact_name,
-            headers=headers
+            headers=headers, column_config=column_config, extraction_fields=extraction_fields
         )
         
         if proposal:

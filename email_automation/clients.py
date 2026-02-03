@@ -62,6 +62,38 @@ def _get_sheet_id_or_fail(uid: str, client_id: str) -> str:
     # Required by design → fail loudly
     raise RuntimeError(f"sheetId not found for uid={uid} clientId={client_id}. This field is required.")
 
+
+def _get_client_config(uid: str, client_id: str) -> tuple:
+    """
+    Retrieve sheet_id and column_config from client doc.
+    Returns (sheet_id, column_config) tuple.
+    column_config may be None if not set (will use defaults).
+    """
+    # Try active clients first
+    doc_ref = _fs.collection("users").document(uid).collection("clients").document(client_id)
+    doc_snapshot = doc_ref.get()
+    if doc_snapshot.exists:
+        doc_data = doc_snapshot.to_dict() or {}
+        sid = doc_data.get("sheetId")
+        column_config = doc_data.get("columnConfig")
+        extraction_fields = doc_data.get("extractionFields")
+        if sid:
+            return sid, column_config, extraction_fields
+
+    # Try archived clients (emails might keep flowing after archive)
+    archived_doc_ref = _fs.collection("users").document(uid).collection("archivedClients").document(client_id)
+    archived_doc_snapshot = archived_doc_ref.get()
+    if archived_doc_snapshot.exists:
+        archived_doc_data = archived_doc_snapshot.to_dict() or {}
+        sid = archived_doc_data.get("sheetId")
+        column_config = archived_doc_data.get("columnConfig")
+        extraction_fields = archived_doc_data.get("extractionFields")
+        if sid:
+            return sid, column_config, extraction_fields
+
+    # Required by design → fail loudly
+    raise RuntimeError(f"sheetId not found for uid={uid} clientId={client_id}. This field is required.")
+
 def list_user_ids():
     url = f"https://firebasestorage.googleapis.com/v0/b/email-automation-cache.firebasestorage.app/o?prefix=msal_caches%2F&key={FIREBASE_API_KEY}"
     r = requests.get(url)

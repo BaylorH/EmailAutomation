@@ -15,6 +15,53 @@ from .column_config import (
     REQUIRED_FOR_CLOSE,
 )
 
+def _filter_config_by_extraction_fields(column_config: dict, extraction_fields: List[str]) -> dict:
+    """
+    Filter column_config to only include fields specified in extraction_fields.
+
+    This allows users to toggle which fields the AI should extract (e.g., if they don't
+    care about Power or Docks, they can disable those fields in their client settings).
+
+    Args:
+        column_config: Full column configuration dict with mappings, requiredFields, etc.
+        extraction_fields: List of canonical field keys to include (e.g., ["total_sf", "ops_ex_sf"])
+
+    Returns:
+        Filtered column_config with only the specified extractable fields in mappings.
+    """
+    if not extraction_fields:
+        return column_config
+
+    # Create a copy to avoid mutating the original
+    filtered = {
+        "mappings": {},
+        "requiredFields": column_config.get("requiredFields", []),
+        "formulaFields": column_config.get("formulaFields", []),
+        "neverRequest": column_config.get("neverRequest", []),
+    }
+
+    extraction_set = set(extraction_fields)
+    original_mappings = column_config.get("mappings", {})
+
+    # Always include non-extractable fields (matching fields like address, city, email)
+    # Only filter extractable fields based on user preference
+    for canonical_key, actual_column in original_mappings.items():
+        field_def = CANONICAL_FIELDS.get(canonical_key, {})
+        is_extractable = field_def.get("extractable", False)
+
+        # Include if: not extractable (always needed for matching), or in extraction_fields list
+        if not is_extractable or canonical_key in extraction_set:
+            filtered["mappings"][canonical_key] = actual_column
+
+    # Also filter requiredFields to only include fields that are still in mappings
+    filtered["requiredFields"] = [
+        f for f in filtered["requiredFields"]
+        if f in filtered["mappings"]
+    ]
+
+    return filtered
+
+
 def get_row_anchor(rowvals: List[str], header: List[str]) -> str:
     """Create a brief row anchor from property address and city."""
     try:
@@ -364,6 +411,7 @@ def propose_sheet_updates(uid: str,
                           headers: dict = None,
                           conversation: List[dict] = None,   # Optional: pass conversation directly (for testing)
                           column_config: dict = None,        # Optional: dynamic column configuration
+                          extraction_fields: List[str] = None,  # Optional: list of canonical field keys user wants extracted
                           dry_run: bool = False) -> Optional[Dict]:
     """
     Uses OpenAI Responses API to propose sheet updates.
@@ -375,6 +423,9 @@ def propose_sheet_updates(uid: str,
         conversation: Optional pre-built conversation payload. If provided, skips Firestore fetch.
                      Format: [{"direction": "inbound/outbound", "from": "...", "to": [...],
                               "subject": "...", "timestamp": "...", "content": "..."}]
+        extraction_fields: Optional list of canonical field keys (e.g., ["total_sf", "ops_ex_sf"]) that the user
+                          wants extracted. If provided, only these fields will be included in extraction rules.
+                          If None, all extractable fields are used.
         dry_run: If True, skips Firestore logging (useful for testing).
     """
     try:
@@ -387,6 +438,11 @@ def propose_sheet_updates(uid: str,
         # ---- Rules sections ---------------------------------------------------
         # Use dynamic column config if provided, otherwise use defaults
         effective_config = column_config or get_default_column_config()
+
+        # If extraction_fields is specified, filter the config to only include those fields
+        if extraction_fields:
+            effective_config = _filter_config_by_extraction_fields(effective_config, extraction_fields)
+
         COLUMN_RULES = build_column_rules_prompt(effective_config)
 
         DOC_SELECTION_RULES = """
