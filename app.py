@@ -1243,6 +1243,127 @@ def api_debug_thread_matching():
     except Exception as e:
         return jsonify({"error": f"Debug failed: {str(e)}"}), 500
 
+
+@app.route("/api/console-logs", methods=["GET"])
+def api_console_logs():
+    """Read browser console logs forwarded from frontend to Firestore.
+
+    Query params:
+        user_id: (optional) specific user ID, defaults to first user
+        limit: (optional) max logs to return, defaults to 50
+        level: (optional) filter by level (error, warn, log)
+        since: (optional) ISO timestamp to get logs after
+        clear: (optional) if 'true', delete logs after reading
+    """
+    from google.cloud import firestore
+    from datetime import datetime
+
+    try:
+        user_id = request.args.get("user_id")
+        limit = int(request.args.get("limit", 50))
+        level_filter = request.args.get("level")
+        since = request.args.get("since")
+        clear = request.args.get("clear", "false").lower() == "true"
+
+        # If no user_id provided, try to get from available users
+        if not user_id:
+            from email_automation.clients import list_user_ids
+            user_ids = list_user_ids()
+            if not user_ids:
+                return jsonify({"error": "No users found", "logs": []}), 404
+            user_id = user_ids[0]
+
+        # Get Firestore client
+        fs = firestore.Client()
+        logs_ref = fs.collection("users").document(user_id).collection("consoleLogs")
+
+        # Build query
+        query = logs_ref.order_by("createdAt", direction=firestore.Query.DESCENDING)
+
+        if level_filter:
+            query = query.where("level", "==", level_filter)
+
+        if since:
+            try:
+                since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                query = query.where("createdAt", ">", since_dt)
+            except ValueError:
+                pass  # Ignore invalid timestamp
+
+        query = query.limit(limit)
+
+        # Execute query
+        docs = list(query.stream())
+
+        logs = []
+        doc_ids = []
+        for doc in docs:
+            data = doc.to_dict()
+            data["id"] = doc.id
+            # Convert Firestore timestamp to ISO string
+            if data.get("createdAt"):
+                data["createdAt"] = data["createdAt"].isoformat() if hasattr(data["createdAt"], "isoformat") else str(data["createdAt"])
+            logs.append(data)
+            doc_ids.append(doc.id)
+
+        # Optionally clear logs after reading
+        deleted_count = 0
+        if clear and doc_ids:
+            batch = fs.batch()
+            for doc_id in doc_ids:
+                batch.delete(logs_ref.document(doc_id))
+            batch.commit()
+            deleted_count = len(doc_ids)
+
+        return jsonify({
+            "user_id": user_id,
+            "count": len(logs),
+            "deleted": deleted_count,
+            "logs": logs
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"Failed to fetch console logs: {str(e)}", "logs": []}), 500
+
+
+@app.route("/api/console-logs/clear", methods=["POST"])
+def api_console_logs_clear():
+    """Clear all console logs for a user."""
+    from google.cloud import firestore
+
+    try:
+        data = request.get_json() or {}
+        user_id = data.get("user_id")
+
+        if not user_id:
+            from email_automation.clients import list_user_ids
+            user_ids = list_user_ids()
+            if not user_ids:
+                return jsonify({"error": "No users found"}), 404
+            user_id = user_ids[0]
+
+        fs = firestore.Client()
+        logs_ref = fs.collection("users").document(user_id).collection("consoleLogs")
+
+        # Delete all documents in batches
+        deleted = 0
+        while True:
+            docs = list(logs_ref.limit(100).stream())
+            if not docs:
+                break
+
+            batch = fs.batch()
+            for doc in docs:
+                batch.delete(doc.reference)
+            batch.commit()
+            deleted += len(docs)
+
+        return jsonify({"success": True, "deleted": deleted, "user_id": user_id})
+
+    except Exception as e:
+        return jsonify({"error": f"Failed to clear logs: {str(e)}"}), 500
+
+
 # Web-based authentication routes
 @app.route("/auth/login")
 def auth_login():
