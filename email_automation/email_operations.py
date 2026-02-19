@@ -4,7 +4,7 @@ from typing import List, Dict, Tuple, Optional
 from google.cloud.firestore import FieldFilter
 from .clients import _fs
 from .notifications import write_notification
-from .utils import exponential_backoff_request, format_email_body_with_footer
+from .utils import exponential_backoff_request, format_email_body_with_footer, get_signature_attachments, needs_signature_attachments
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 
 
@@ -21,6 +21,35 @@ def _get_user_signature_settings(uid: str) -> Tuple[Optional[str], Optional[str]
     except Exception as e:
         print(f"⚠️ Failed to fetch user signature settings: {e}")
     return None, None
+
+
+def _add_signature_attachments_to_draft(headers: dict, draft_id: str, signature_mode: str) -> None:
+    """
+    Add signature image attachments to a draft message.
+    Only adds attachments if signature_mode is 'professional'.
+    """
+    if not needs_signature_attachments(signature_mode):
+        return
+
+    base = "https://graph.microsoft.com/v1.0"
+    attachments = get_signature_attachments()
+
+    for attachment in attachments:
+        try:
+            resp = exponential_backoff_request(
+                lambda att=attachment: requests.post(
+                    f"{base}/me/messages/{draft_id}/attachments",
+                    headers=headers,
+                    json=att,
+                    timeout=30
+                )
+            )
+            if resp.status_code in [200, 201]:
+                print(f"   📎 Attached {attachment['name']}")
+            else:
+                print(f"   ⚠️ Failed to attach {attachment['name']}: {resp.status_code}")
+        except Exception as e:
+            print(f"   ⚠️ Error attaching {attachment['name']}: {e}")
 
 def send_remaining_questions_email(uid: str, client_id: str, headers: dict, recipient: str, 
                                  missing_fields: List[str], thread_id: str, row_number: int,
@@ -76,34 +105,75 @@ Could you please provide these details when you have a moment?"""
 
         if vals:
             graph_id = vals[0]["id"]
-            # 2) Reply in-thread (this preserves proper headers)
-            reply_payload = {
-                "message": {
-                    "body": {
-                        "contentType": "HTML",
-                        "content": html_body
+
+            # Check if we need signature attachments (professional mode)
+            if needs_signature_attachments(signature_mode):
+                # Use createReply to get a draft, add attachments, then send
+                create_reply_resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{graph_id}/createReply", headers=headers, timeout=30)
+                )
+                reply_draft = create_reply_resp.json()
+                reply_draft_id = reply_draft.get("id")
+
+                # Update draft body
+                update_resp = exponential_backoff_request(
+                    lambda: requests.patch(
+                        f"{base}/me/messages/{reply_draft_id}",
+                        headers=headers,
+                        json={"body": {"contentType": "HTML", "content": html_body}},
+                        timeout=30
+                    )
+                )
+
+                # Add signature attachments
+                _add_signature_attachments_to_draft(headers, reply_draft_id, signature_mode)
+
+                # Send the reply
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30)
+                )
+            else:
+                # No attachments needed - use simple reply endpoint
+                reply_payload = {
+                    "message": {
+                        "body": {
+                            "contentType": "HTML",
+                            "content": html_body
+                        }
                     }
                 }
-            }
-            resp = requests.post(f"{base}/me/messages/{graph_id}/reply",
-                                 headers=headers, json=reply_payload, timeout=30)
-            resp.raise_for_status()
-            # Verify successful response
-            if not resp or resp.status_code not in [200, 201, 202]:
-                raise Exception(f"Reply failed with status {resp.status_code if resp else 'None'}")
+                resp = requests.post(f"{base}/me/messages/{graph_id}/reply",
+                                     headers=headers, json=reply_payload, timeout=30)
+                resp.raise_for_status()
+                # Verify successful response
+                if not resp or resp.status_code not in [200, 201, 202]:
+                    raise Exception(f"Reply failed with status {resp.status_code if resp else 'None'}")
         else:
-            # 3) Fallback: send a new email (no custom In-Reply-To headers)
+            # 3) Fallback: send a new email via draft (to support attachments)
             msg = {
                 "subject": "Remaining questions",
                 "body": {"contentType": "HTML", "content": html_body},
                 "toRecipients": [{"emailAddress": {"address": recipient}}],
             }
-            send_payload = {"message": msg, "saveToSentItems": True}
-            resp = requests.post(f"{base}/me/sendMail", headers=headers, json=send_payload, timeout=30)
-            resp.raise_for_status()
-            # Verify successful response
-            if not resp or resp.status_code not in [200, 201, 202]:
-                raise Exception(f"SendMail failed with status {resp.status_code if resp else 'None'}")
+
+            if needs_signature_attachments(signature_mode):
+                # Create draft, add attachments, send
+                create_resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
+                )
+                draft_id = create_resp.json()["id"]
+                _add_signature_attachments_to_draft(headers, draft_id, signature_mode)
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
+                )
+            else:
+                # No attachments - use simple sendMail
+                send_payload = {"message": msg, "saveToSentItems": True}
+                resp = requests.post(f"{base}/me/sendMail", headers=headers, json=send_payload, timeout=30)
+                resp.raise_for_status()
+                # Verify successful response
+                if not resp or resp.status_code not in [200, 201, 202]:
+                    raise Exception(f"SendMail failed with status {resp.status_code if resp else 'None'}")
         
         # Create action_needed notification
         write_notification(
@@ -143,7 +213,7 @@ We'll be in touch if we need any additional information."""
         user_signature, signature_mode = _get_user_signature_settings(uid)
         html_body = format_email_body_with_footer(body, user_signature, signature_mode)
 
-        # Send email using sendMail endpoint
+        # Send email using draft + send to support signature attachments
         base = "https://graph.microsoft.com/v1.0"
         msg = {
             "subject": "Re: Property information complete",
@@ -154,14 +224,25 @@ We'll be in touch if we need any additional information."""
                 {"name": "x-row-anchor", "value": f"rowNumber={row_number}"}
             ]
         }
-        
-        send_payload = {"message": msg, "saveToSentItems": True}
-        response = requests.post(f"{base}/me/sendMail", headers=headers, json=send_payload, timeout=30)
-        response.raise_for_status()
-        
-        # Verify successful response
-        if not response or response.status_code not in [200, 201, 202]:
-            raise Exception(f"SendMail failed with status {response.status_code if response else 'None'}")
+
+        if needs_signature_attachments(signature_mode):
+            # Create draft, add attachments, send
+            create_resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
+            )
+            draft_id = create_resp.json()["id"]
+            _add_signature_attachments_to_draft(headers, draft_id, signature_mode)
+            response = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
+            )
+        else:
+            # No attachments - use simple sendMail
+            send_payload = {"message": msg, "saveToSentItems": True}
+            response = requests.post(f"{base}/me/sendMail", headers=headers, json=send_payload, timeout=30)
+            response.raise_for_status()
+            # Verify successful response
+            if not response or response.status_code not in [200, 201, 202]:
+                raise Exception(f"SendMail failed with status {response.status_code if response else 'None'}")
         
         # Create row_completed notification
         write_notification(
@@ -227,28 +308,35 @@ Could you please provide the following details for this property:
         }
         
         # Create draft first to get message ID
-        create_response = requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
-        create_response.raise_for_status()
-        draft_id = create_response.json()["id"]
-        
-        # Get message identifiers
-        get_response = requests.get(
-            f"{base}/me/messages/{draft_id}",
-            headers=headers,
-            params={"$select": "internetMessageId,conversationId,subject,toRecipients"},
-            timeout=30
+        create_response = exponential_backoff_request(
+            lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
         )
-        get_response.raise_for_status()
+        draft_id = create_response.json()["id"]
+
+        # Add signature attachments if needed
+        _add_signature_attachments_to_draft(headers, draft_id, signature_mode)
+
+        # Get message identifiers
+        get_response = exponential_backoff_request(
+            lambda: requests.get(
+                f"{base}/me/messages/{draft_id}",
+                headers=headers,
+                params={"$select": "internetMessageId,conversationId,subject,toRecipients"},
+                timeout=30
+            )
+        )
         message_data = get_response.json()
-        
+
         internet_message_id = message_data.get("internetMessageId")
         conversation_id = message_data.get("conversationId")
-        
+
         if not internet_message_id:
             raise Exception("No internetMessageId returned from Graph")
-        
+
         # Send draft
-        requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
+        exponential_backoff_request(
+            lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
+        )
         
         # Index in Firestore
         from utils import normalize_message_id
@@ -326,25 +414,53 @@ I'll review the new property details and get back to you if I have any questions
         vals = lookup.json().get("value", [])
 
         if vals:
-            # Reply in-thread
             graph_id = vals[0]["id"]
-            reply_payload = {
-                "message": {
-                    "body": {
-                        "contentType": "HTML",
-                        "content": html_body
+
+            if needs_signature_attachments(signature_mode):
+                # Use createReply to get a draft, add attachments, then send
+                create_reply_resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{graph_id}/createReply", headers=headers, timeout=30)
+                )
+                reply_draft = create_reply_resp.json()
+                reply_draft_id = reply_draft.get("id")
+
+                # Update draft body
+                exponential_backoff_request(
+                    lambda: requests.patch(
+                        f"{base}/me/messages/{reply_draft_id}",
+                        headers=headers,
+                        json={"body": {"contentType": "HTML", "content": html_body}},
+                        timeout=30
+                    )
+                )
+
+                # Add signature attachments
+                _add_signature_attachments_to_draft(headers, reply_draft_id, signature_mode)
+
+                # Send the reply
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30)
+                )
+                print(f"📧 Sent thank you + closing (new property suggested) via reply with attachments")
+            else:
+                # No attachments - use simple reply endpoint
+                reply_payload = {
+                    "message": {
+                        "body": {
+                            "contentType": "HTML",
+                            "content": html_body
+                        }
                     }
                 }
-            }
-            resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
-                                     headers=headers, json=reply_payload, timeout=30)
-            )
-            # Only log success if we get a successful response
-            if resp and resp.status_code in [200, 201, 202]:
-                print(f"📧 Sent thank you + closing (new property suggested) via reply")
-            else:
-                raise Exception(f"Reply failed with status {resp.status_code if resp else 'None'}")
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
+                                         headers=headers, json=reply_payload, timeout=30)
+                )
+                # Only log success if we get a successful response
+                if resp and resp.status_code in [200, 201, 202]:
+                    print(f"📧 Sent thank you + closing (new property suggested) via reply")
+                else:
+                    raise Exception(f"Reply failed with status {resp.status_code if resp else 'None'}")
         else:
             # Fallback: send new email with proper threading headers
             msg = {
@@ -356,19 +472,32 @@ I'll review the new property details and get back to you if I have any questions
                     {"name": "References", "value": thread_id}
                 ]
             }
-            send_payload = {"message": msg, "saveToSentItems": True}
-            resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/sendMail", headers=headers, 
-                                     json=send_payload, timeout=30)
-            )
-            # Only log success if we get a successful response
-            if resp and resp.status_code in [200, 201, 202]:
-                print(f"📧 Sent thank you + closing (new property suggested) via sendMail")
+
+            if needs_signature_attachments(signature_mode):
+                # Create draft, add attachments, send
+                create_resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
+                )
+                draft_id = create_resp.json()["id"]
+                _add_signature_attachments_to_draft(headers, draft_id, signature_mode)
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
+                )
+                print(f"📧 Sent thank you + closing (new property suggested) via sendMail with attachments")
             else:
-                raise Exception(f"SendMail failed with status {resp.status_code if resp else 'None'}")
-        
+                send_payload = {"message": msg, "saveToSentItems": True}
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/sendMail", headers=headers,
+                                         json=send_payload, timeout=30)
+                )
+                # Only log success if we get a successful response
+                if resp and resp.status_code in [200, 201, 202]:
+                    print(f"📧 Sent thank you + closing (new property suggested) via sendMail")
+                else:
+                    raise Exception(f"SendMail failed with status {resp.status_code if resp else 'None'}")
+
         return True
-        
+
     except Exception as e:
         print(f"❌ Failed to send thank you email: {e}")
         # Add more detailed error information for debugging
@@ -403,25 +532,53 @@ Do you have any other properties that might be a good fit for our requirements?"
         vals = lookup.json().get("value", [])
 
         if vals:
-            # Reply in-thread
             graph_id = vals[0]["id"]
-            reply_payload = {
-                "message": {
-                    "body": {
-                        "contentType": "HTML",
-                        "content": html_body
+
+            if needs_signature_attachments(signature_mode):
+                # Use createReply to get a draft, add attachments, then send
+                create_reply_resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{graph_id}/createReply", headers=headers, timeout=30)
+                )
+                reply_draft = create_reply_resp.json()
+                reply_draft_id = reply_draft.get("id")
+
+                # Update draft body
+                exponential_backoff_request(
+                    lambda: requests.patch(
+                        f"{base}/me/messages/{reply_draft_id}",
+                        headers=headers,
+                        json={"body": {"contentType": "HTML", "content": html_body}},
+                        timeout=30
+                    )
+                )
+
+                # Add signature attachments
+                _add_signature_attachments_to_draft(headers, reply_draft_id, signature_mode)
+
+                # Send the reply
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30)
+                )
+                print(f"📧 Sent thank you + ask for alternatives via reply with attachments")
+            else:
+                # No attachments - use simple reply endpoint
+                reply_payload = {
+                    "message": {
+                        "body": {
+                            "contentType": "HTML",
+                            "content": html_body
+                        }
                     }
                 }
-            }
-            resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
-                                     headers=headers, json=reply_payload, timeout=30)
-            )
-            # Only log success if we get a successful response
-            if resp and resp.status_code in [200, 201, 202]:
-                print(f"📧 Sent thank you + ask for alternatives via reply")
-            else:
-                raise Exception(f"Reply failed with status {resp.status_code if resp else 'None'}")
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{graph_id}/reply",
+                                         headers=headers, json=reply_payload, timeout=30)
+                )
+                # Only log success if we get a successful response
+                if resp and resp.status_code in [200, 201, 202]:
+                    print(f"📧 Sent thank you + ask for alternatives via reply")
+                else:
+                    raise Exception(f"Reply failed with status {resp.status_code if resp else 'None'}")
         else:
             # Fallback: send new email with proper threading headers
             msg = {
@@ -433,19 +590,32 @@ Do you have any other properties that might be a good fit for our requirements?"
                     {"name": "References", "value": thread_id}
                 ]
             }
-            send_payload = {"message": msg, "saveToSentItems": True}
-            resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/sendMail", headers=headers, 
-                                     json=send_payload, timeout=30)
-            )
-            # Only log success if we get a successful response
-            if resp and resp.status_code in [200, 201, 202]:
-                print(f"📧 Sent thank you + ask for alternatives via sendMail")
+
+            if needs_signature_attachments(signature_mode):
+                # Create draft, add attachments, send
+                create_resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
+                )
+                draft_id = create_resp.json()["id"]
+                _add_signature_attachments_to_draft(headers, draft_id, signature_mode)
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
+                )
+                print(f"📧 Sent thank you + ask for alternatives via sendMail with attachments")
             else:
-                raise Exception(f"SendMail failed with status {resp.status_code if resp else 'None'}")
-        
+                send_payload = {"message": msg, "saveToSentItems": True}
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/sendMail", headers=headers,
+                                         json=send_payload, timeout=30)
+                )
+                # Only log success if we get a successful response
+                if resp and resp.status_code in [200, 201, 202]:
+                    print(f"📧 Sent thank you + ask for alternatives via sendMail")
+                else:
+                    raise Exception(f"SendMail failed with status {resp.status_code if resp else 'None'}")
+
         return True
-        
+
     except Exception as e:
         print(f"❌ Failed to send alternatives request: {e}")
         # Add more detailed error information for debugging

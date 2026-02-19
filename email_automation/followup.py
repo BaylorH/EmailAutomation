@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
 
 from .clients import _fs
-from .utils import exponential_backoff_request
+from .utils import exponential_backoff_request, format_email_body_with_footer, get_signature_attachments, needs_signature_attachments
 
 
 def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
@@ -219,24 +219,77 @@ def _send_followup_email(
             first_name = contact_name.split()[0] if contact_name else ""
             followup_message = followup_message.replace("[NAME]", first_name)
 
-        # Send as reply
-        reply_body = {
-            "message": {
-                "body": {
-                    "contentType": "HTML",
-                    "content": followup_message.replace("\n", "<br>")
+        # Get user's signature settings
+        user_doc = _fs.collection("users").document(user_id).get()
+        user_signature = None
+        signature_mode = None
+        if user_doc.exists:
+            user_data = user_doc.to_dict() or {}
+            user_signature = user_data.get("emailSignature")
+            signature_mode = user_data.get("signatureMode")
+
+        # Format as HTML with signature
+        html_content = format_email_body_with_footer(followup_message, user_signature, signature_mode)
+
+        # Send as reply with signature attachments
+        if needs_signature_attachments(signature_mode):
+            # Use createReply to get a draft, add attachments, then send
+            create_reply_resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages/{graph_msg_id}/createReply", headers=headers, timeout=30)
+            )
+            reply_draft = create_reply_resp.json()
+            reply_draft_id = reply_draft.get("id")
+
+            # Update draft body
+            exponential_backoff_request(
+                lambda: requests.patch(
+                    f"{base}/me/messages/{reply_draft_id}",
+                    headers=headers,
+                    json={"body": {"contentType": "HTML", "content": html_content}},
+                    timeout=30
+                )
+            )
+
+            # Add signature attachments
+            signature_attachments = get_signature_attachments()
+            for attachment in signature_attachments:
+                try:
+                    att_resp = exponential_backoff_request(
+                        lambda att=attachment: requests.post(
+                            f"{base}/me/messages/{reply_draft_id}/attachments",
+                            headers=headers,
+                            json=att,
+                            timeout=30
+                        )
+                    )
+                    if att_resp.status_code in [200, 201]:
+                        print(f"      📎 Attached {attachment['name']}")
+                except Exception as e:
+                    print(f"      ⚠️ Error attaching {attachment['name']}: {e}")
+
+            # Send the reply
+            reply_resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30)
+            )
+        else:
+            # No attachments - use simple reply endpoint
+            reply_body = {
+                "message": {
+                    "body": {
+                        "contentType": "HTML",
+                        "content": html_content
+                    }
                 }
             }
-        }
 
-        reply_resp = exponential_backoff_request(
-            lambda: requests.post(
-                f"{base}/me/messages/{graph_msg_id}/reply",
-                headers=headers,
-                json=reply_body,
-                timeout=30
+            reply_resp = exponential_backoff_request(
+                lambda: requests.post(
+                    f"{base}/me/messages/{graph_msg_id}/reply",
+                    headers=headers,
+                    json=reply_body,
+                    timeout=30
+                )
             )
-        )
 
         if reply_resp.status_code in [200, 201, 202]:
             print(f"   Sent follow-up #{followup_index + 1} for thread {thread_id[:20]}...")

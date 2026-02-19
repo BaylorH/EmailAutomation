@@ -310,15 +310,15 @@ def _image_to_base64(image_path: str) -> str:
         # Get the directory of this file
         current_dir = os.path.dirname(os.path.abspath(__file__))
         full_path = os.path.join(current_dir, "assets", "images", image_path)
-        
+
         if not os.path.exists(full_path):
             print(f"⚠️ Image not found: {full_path}")
             return ""
-        
+
         with open(full_path, "rb") as img_file:
             img_data = img_file.read()
             img_base64 = base64.b64encode(img_data).decode('utf-8')
-            
+
             # Determine MIME type from extension
             ext = os.path.splitext(image_path)[1].lower()
             mime_types = {
@@ -328,11 +328,65 @@ def _image_to_base64(image_path: str) -> str:
                 '.gif': 'image/gif'
             }
             mime_type = mime_types.get(ext, 'image/png')
-            
+
             return f"data:{mime_type};base64,{img_base64}"
     except Exception as e:
         print(f"⚠️ Failed to encode image {image_path}: {e}")
         return ""
+
+
+def get_signature_attachments() -> List[dict]:
+    """
+    Get signature images as inline attachments for Microsoft Graph API.
+    Returns list of attachment objects with contentId for CID references.
+
+    These attachments should be added to the email via Graph API's attachments endpoint
+    after creating the draft, allowing the HTML to reference them via cid: URLs.
+    """
+    attachments = []
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    images = [
+        {"filename": "logo.png", "content_id": "signature-logo"},
+        {"filename": "linkedin.png", "content_id": "signature-linkedin"},
+    ]
+
+    for img in images:
+        full_path = os.path.join(current_dir, "assets", "images", img["filename"])
+
+        if not os.path.exists(full_path):
+            print(f"⚠️ Signature image not found: {full_path}")
+            continue
+
+        try:
+            with open(full_path, "rb") as f:
+                content_bytes = base64.b64encode(f.read()).decode('utf-8')
+
+            # Determine MIME type
+            ext = os.path.splitext(img["filename"])[1].lower()
+            mime_types = {
+                '.png': 'image/png',
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.gif': 'image/gif'
+            }
+            content_type = mime_types.get(ext, 'image/png')
+
+            # Create Graph API attachment object for inline image
+            attachment = {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": img["filename"],
+                "contentType": content_type,
+                "contentBytes": content_bytes,
+                "contentId": img["content_id"],
+                "isInline": True
+            }
+            attachments.append(attachment)
+
+        except Exception as e:
+            print(f"⚠️ Failed to read signature image {img['filename']}: {e}")
+
+    return attachments
 
 def convert_plain_text_signature_to_html(plain_text_signature: str) -> str:
     """
@@ -384,26 +438,17 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None) -
         # Unknown mode - treat as none
         return ""
 
-    # Otherwise use the default signature
-    # Use base64 data URIs - more reliable than Google Drive URLs which get blocked by email clients
-    logo_url = _image_to_base64("logo.png")
-    linkedin_url = _image_to_base64("linkedin.png")
-
     # Build the footer HTML matching the professional signature layout
-    # Uses sans-serif font (Arial/Helvetica), black text
+    # Uses CID references for images - the actual attachments are added by send_and_index_email()
+    # CID (Content-ID) is the most reliable way to embed images in emails across all clients
     footer = """Best,<br>
 <br>
 <table cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; margin-top: 10px; font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000;">
 <tr>
 <td valign="top" style="padding-right: 30px; vertical-align: top;">
-<a href="https://mohrpartners.com/" target="_blank" style="text-decoration: none;">"""
-
-    if logo_url:
-        footer += f'<img src="{logo_url}" alt="Mohr Partners" style="width: 120px; height: auto; display: block; border: 0;" />'
-    else:
-        footer += "Mohr Partners"
-
-    footer += """</a>
+<a href="https://mohrpartners.com/" target="_blank" style="text-decoration: none;">
+<img src="cid:signature-logo" alt="Mohr Partners" style="width: 120px; height: auto; display: block; border: 0;" />
+</a>
 </td>
 <td valign="top" style="vertical-align: top; font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000;">
 <table cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; width: 100%;">
@@ -423,13 +468,9 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None) -
 <tr>
 <td valign="top" style="padding-right: 30px; vertical-align: top; font-size: 10pt; color: #000000;">
 T +1 206 510 5575<br>
-<a href="mailto:jill.ames@mohrpartners.com" style="color: #000000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">jill.ames@mohrpartners.com</a><br>"""
-
-    # Add LinkedIn icon below email
-    if linkedin_url:
-        footer += f'<a href="https://www.linkedin.com/company/mohr-partners" target="_blank" style="text-decoration: none; display: inline-block; margin-top: 4px;"><img src="{linkedin_url}" alt="LinkedIn" style="width: 20px; height: 20px; border: 0; vertical-align: middle;" /></a>'
-
-    footer += """</td>
+<a href="mailto:jill.ames@mohrpartners.com" style="color: #000000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">jill.ames@mohrpartners.com</a><br>
+<a href="https://www.linkedin.com/company/mohr-partners" target="_blank" style="text-decoration: none; display: inline-block; margin-top: 4px;"><img src="cid:signature-linkedin" alt="LinkedIn" style="width: 20px; height: 20px; border: 0; vertical-align: middle;" /></a>
+</td>
 <td valign="top" style="vertical-align: top; font-size: 10pt; color: #000000;">
 <strong style="font-weight: bold; color: #000000;">Mohr Partners, Inc.</strong><br>
 <a href="https://mohrpartners.com/" target="_blank" style="color: #CC0000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">mohrpartners.com</a><br>
@@ -442,6 +483,11 @@ T +1 206 510 5575<br>
 </table>"""
 
     return footer
+
+
+def needs_signature_attachments(signature_mode: str) -> bool:
+    """Check if the signature mode requires inline image attachments."""
+    return signature_mode == "professional"
 
 
 def format_email_body_with_footer(body: str, custom_signature: str = None, signature_mode: str = None) -> str:

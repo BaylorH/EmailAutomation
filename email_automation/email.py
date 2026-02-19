@@ -371,7 +371,14 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         results["errors"][optout["email"]] = f"Contact opted out ({optout['reason']})"
 
     # Append footer to all emails (signature with logo, contact info, etc.)
-    from .utils import get_email_footer, format_email_body_with_footer
+    from .utils import get_email_footer, format_email_body_with_footer, get_signature_attachments, needs_signature_attachments
+
+    # Check if we need to attach signature images (for professional mode)
+    signature_attachments = []
+    if needs_signature_attachments(signature_mode):
+        signature_attachments = get_signature_attachments()
+        print(f"📎 Will attach {len(signature_attachments)} signature image(s)")
+
     if content_type == "HTML":
         # If already HTML, wrap it properly and append footer
         # Check if content is already wrapped in HTML structure
@@ -463,6 +470,23 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             draft_id = create_response.json()["id"]
             print(f"📝 Created draft {draft_id} for {addr}")
 
+            # 1b. Add signature image attachments (for professional mode)
+            # CID (Content-ID) attachments are the most reliable way to embed images in emails
+            if signature_attachments:
+                for attachment in signature_attachments:
+                    attach_response = exponential_backoff_request(
+                        lambda att=attachment: requests.post(
+                            f"{base}/me/messages/{draft_id}/attachments",
+                            headers=headers,
+                            json=att,
+                            timeout=30
+                        )
+                    )
+                    if attach_response.status_code in [200, 201]:
+                        print(f"   📎 Attached {attachment['name']}")
+                    else:
+                        print(f"   ⚠️ Failed to attach {attachment['name']}: {attach_response.status_code}")
+
             # 2. Get message identifiers
             get_response = exponential_backoff_request(
                 lambda: requests.get(
@@ -473,7 +497,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                 )
             )
             message_data = get_response.json()
-            
+
             internet_message_id = message_data.get("internetMessageId")
             conversation_id = message_data.get("conversationId")
             subject = message_data.get("subject", "")
