@@ -84,7 +84,7 @@ def is_contact_opted_out(user_id: str, email: str) -> Optional[Dict]:
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     try:
-        from .utils import exponential_backoff_request, safe_preview
+        from .utils import exponential_backoff_request, safe_preview, get_signature_attachments, needs_signature_attachments
         from .messaging import save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
         from .clients import _fs
         from datetime import datetime, timezone
@@ -107,27 +107,136 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
 
         # Format body as HTML with footer (uses user's signature settings)
         html_body = format_email_body_with_footer(body, user_signature, signature_mode)
-        
-        # Reply directly to the current message we're processing
-        # Use message structure to preserve line breaks properly
-        reply_payload = {
-            "message": {
-                "body": {
-                    "contentType": "HTML",
-                    "content": html_body
+
+        # Track if reply was sent successfully
+        reply_sent_successfully = False
+
+        # Check if we need to attach signature images (for professional mode)
+        # CID attachments require using createReply + draft + send pattern
+        if needs_signature_attachments(signature_mode):
+            # Use createReply to get a draft, add attachments, then send
+            create_reply_resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages/{current_msg_id}/createReply", headers=headers, timeout=30)
+            )
+
+            if create_reply_resp.status_code in [200, 201]:
+                reply_draft = create_reply_resp.json()
+                reply_draft_id = reply_draft.get("id")
+
+                # Update draft body
+                exponential_backoff_request(
+                    lambda: requests.patch(
+                        f"{base}/me/messages/{reply_draft_id}",
+                        headers=headers,
+                        json={"body": {"contentType": "HTML", "content": html_body}},
+                        timeout=30
+                    )
+                )
+
+                # Add signature attachments
+                signature_attachments = get_signature_attachments()
+                for attachment in signature_attachments:
+                    try:
+                        att_resp = exponential_backoff_request(
+                            lambda att=attachment: requests.post(
+                                f"{base}/me/messages/{reply_draft_id}/attachments",
+                                headers=headers,
+                                json=att,
+                                timeout=30
+                            )
+                        )
+                        if att_resp.status_code in [200, 201]:
+                            print(f"   📎 Attached {attachment['name']}")
+                    except Exception as e:
+                        print(f"   ⚠️ Error attaching {attachment['name']}: {e}")
+
+                # Send the reply
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30)
+                )
+
+                if resp and resp.status_code in [200, 202]:
+                    print(f"   ✅ Sent reply with signature attachments via createReply+send")
+                    reply_sent_successfully = True
+                else:
+                    print(f"   ❌ Send draft failed: {resp.status_code if resp else 'None'}")
+            else:
+                print(f"   ⚠️ createReply failed: {create_reply_resp.status_code}, trying simple reply")
+
+        # If professional mode failed or not needed, try simple /reply endpoint
+        if not reply_sent_successfully:
+            reply_payload = {
+                "message": {
+                    "body": {
+                        "contentType": "HTML",
+                        "content": html_body
+                    }
                 }
             }
-        }
-        resp = exponential_backoff_request(
-            lambda: requests.post(f"{base}/me/messages/{current_msg_id}/reply",
-                                 headers=headers, json=reply_payload, timeout=30)
-        )
-        
-        # Verify successful response
-        if resp and resp.status_code in [200, 201, 202]:
-            print(f"   ✅ Sent reply to current message via /reply endpoint")
-            
-            # CRITICAL: Index the sent message so future replies can find the thread
+            resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages/{current_msg_id}/reply",
+                                     headers=headers, json=reply_payload, timeout=30)
+            )
+            reply_sent_successfully = resp and resp.status_code in [200, 201, 202]
+            if reply_sent_successfully:
+                print(f"   ✅ Sent reply via /reply endpoint")
+
+        # Check if reply was sent successfully (either path)
+        if not reply_sent_successfully:
+            print(f"   ❌ Reply failed")
+            # Fallback: send a new email with proper threading headers
+            msg = {
+                "subject": "Re: Property information",
+                "body": {"contentType": "HTML", "content": html_body},
+                "toRecipients": [{"emailAddress": {"address": recipient}}],
+                "internetMessageHeaders": [
+                    {"name": "In-Reply-To", "value": thread_id},
+                    {"name": "References", "value": thread_id}
+                ]
+            }
+
+            if needs_signature_attachments(signature_mode):
+                # Create draft, add attachments, send
+                create_resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
+                )
+                if create_resp.status_code in [200, 201]:
+                    draft_id = create_resp.json()["id"]
+                    signature_attachments = get_signature_attachments()
+                    for attachment in signature_attachments:
+                        try:
+                            exponential_backoff_request(
+                                lambda att=attachment: requests.post(
+                                    f"{base}/me/messages/{draft_id}/attachments",
+                                    headers=headers,
+                                    json=att,
+                                    timeout=30
+                                )
+                            )
+                        except:
+                            pass
+                    resp = exponential_backoff_request(
+                        lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
+                    )
+                    if resp and resp.status_code in [200, 202]:
+                        print(f"   ✅ Sent reply via sendMail fallback with attachments")
+                        reply_sent_successfully = True
+            else:
+                send_payload = {"message": msg, "saveToSentItems": True}
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/sendMail", headers=headers,
+                                         json=send_payload, timeout=30)
+                )
+                if resp and resp.status_code in [200, 201, 202]:
+                    print(f"   ✅ Sent reply via /sendMail fallback")
+                    reply_sent_successfully = True
+
+            if not reply_sent_successfully:
+                print(f"   ❌ All reply methods failed")
+                return False
+
+        # Reply was sent successfully - now index it
+        # CRITICAL: Index the sent message so future replies can find the thread
             # The /reply endpoint doesn't return the message ID, so we need to fetch it from SentItems
             try:
                 # Wait a moment for the message to appear in SentItems
@@ -238,33 +347,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                 print(f"   ⚠️ Failed to index sent reply (non-fatal): {e}")
             
             return True
-        else:
-            print(f"   ❌ Reply failed with status {resp.status_code if resp else 'None'}")
-            # Fallback: send a new email with proper threading headers
-            msg = {
-                "subject": "Re: Property information",
-                "body": {"contentType": "HTML", "content": html_body},
-                "toRecipients": [{"emailAddress": {"address": recipient}}],
-                "internetMessageHeaders": [
-                    {"name": "In-Reply-To", "value": thread_id},
-                    {"name": "References", "value": thread_id}
-                ]
-            }
-            send_payload = {"message": msg, "saveToSentItems": True}
-            resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/sendMail", headers=headers, 
-                                     json=send_payload, timeout=30)
-            )
-            
-            # Verify successful response
-            if resp and resp.status_code in [200, 201, 202]:
-                print(f"   ✅ Sent reply via /sendMail with threading headers")
-                # Note: sendMail also needs indexing, but that's more complex - would need to fetch from SentItems too
-                return True
-            else:
-                print(f"   ❌ SendMail failed with status {resp.status_code if resp else 'None'}")
-                return False
-        
+
     except Exception as e:
         print(f"   ❌ Failed to send reply: {e}")
         return False
