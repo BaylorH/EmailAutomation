@@ -1793,7 +1793,11 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     batched_count = 0
 
     # Process thread batches (multiple messages in same thread)
-    for thread_id, messages in thread_messages.items():
+    # Add delay between processing to avoid Google Sheets rate limits (60 reads/min)
+    RATE_LIMIT_DELAY = 3  # seconds between processing each thread
+
+    thread_list = list(thread_messages.items())
+    for idx, (thread_id, messages) in enumerate(thread_list):
         if len(messages) > 1:
             # BATCH PROCESSING: Multiple messages in same thread
             print(f"📦 Batching {len(messages)} messages for thread {thread_id[:20]}...")
@@ -1832,8 +1836,12 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
                 processed_key = msg.get("internetMessageId") or msg.get("id")
                 mark_processed(user_id, processed_key)
 
+        # Rate limit delay between threads (skip delay after last one)
+        if idx < len(thread_list) - 1:
+            time.sleep(RATE_LIMIT_DELAY)
+
     # Process orphan messages (couldn't match to thread - will be ignored by process_inbox_message)
-    for msg in orphan_messages:
+    for idx, msg in enumerate(orphan_messages):
         try:
             process_inbox_message(user_id, headers, msg)
         except Exception as e:
@@ -1841,6 +1849,10 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
         finally:
             processed_key = msg.get("internetMessageId") or msg.get("id")
             mark_processed(user_id, processed_key)
+
+        # Rate limit delay between orphan messages (skip delay after last one)
+        if idx < len(orphan_messages) - 1:
+            time.sleep(RATE_LIMIT_DELAY)
 
     # Set last scan timestamp
     set_last_scan_iso(user_id, now_utc.isoformat().replace("+00:00", "Z"))
