@@ -917,7 +917,7 @@ Thanks!"""
                             "status": "pending_approval",
                             "suggestedEmail": {
                                 "to": [from_addr_lower],
-                                "subject": f"RE: {address}" if address else "RE: Property Tour",
+                                "subject": f"RE: {row_anchor}" if row_anchor else "RE: Property Tour",
                                 "body": suggested_email
                             }
                         }
