@@ -9,7 +9,7 @@ from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
 from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, _header_index_map, _find_row_by_email
-from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable
+from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move
 from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
                        dump_thread_from_firestore, has_processed, mark_processed, set_last_scan_iso,
                        lookup_thread_by_message_id, lookup_thread_by_conversation_id)
@@ -1020,7 +1020,10 @@ Thanks!"""
                             
                             divider_row = ensure_nonviable_divider(sheets, sheet_id, tab_title)
                             new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
-                            
+
+                            # Sync thread rowNumbers after row movement to prevent stale anchors
+                            sync_thread_row_numbers_after_move(user_id, rownum, divider_row, new_rownum)
+
                             # Add comment to "Jill and Clients comments" column explaining why it was marked unviable
                             try:
                                 # Find the comments column index
@@ -1336,6 +1339,9 @@ Thanks!""",
                             if not _is_row_below_nonviable(sheets, sheet_id, tab_title, rownum):
                                 divider_row = ensure_nonviable_divider(sheets, sheet_id, tab_title)
                                 new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
+
+                                # Sync thread rowNumbers after row movement
+                                sync_thread_row_numbers_after_move(user_id, rownum, divider_row, new_rownum)
 
                                 # Add comment explaining why
                                 from datetime import datetime

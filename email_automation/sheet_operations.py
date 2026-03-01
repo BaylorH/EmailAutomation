@@ -3,6 +3,49 @@ from .clients import _fs, _sheets_client
 from .sheets import _get_first_tab_title, _read_header_row2, _header_index_map, _first_sheet_props, _find_row_by_address_city, _find_row_by_email
 from .utils import _subject_to_address_city
 
+
+def sync_thread_row_numbers_after_move(user_id: str, src_row: int, divider_row: int, new_row: int) -> int:
+    """
+    Update thread rowNumbers after a row is moved below the NON-VIABLE divider.
+
+    When a row moves from src_row to new_row (below divider):
+    - All threads with rowNumber > src_row AND rowNumber <= divider_row shift UP by 1
+    - The moved thread itself gets updated to new_row
+
+    Returns the number of threads updated.
+    """
+    try:
+        updated_count = 0
+        threads_ref = _fs.collection("users").document(user_id).collection("threads")
+        threads = list(threads_ref.stream())
+
+        for thread in threads:
+            data = thread.to_dict()
+            current_row = data.get("rowNumber")
+
+            if current_row is None:
+                continue
+
+            # If this thread was at the source row, update to new row
+            if current_row == src_row:
+                threads_ref.document(thread.id).update({"rowNumber": new_row})
+                print(f"   📍 Updated thread rowNumber: {src_row} -> {new_row} (moved row)")
+                updated_count += 1
+            # If this thread was between src and divider, shift up by 1
+            elif current_row > src_row and current_row <= divider_row:
+                new_row_num = current_row - 1
+                threads_ref.document(thread.id).update({"rowNumber": new_row_num})
+                print(f"   📍 Updated thread rowNumber: {current_row} -> {new_row_num} (shifted up)")
+                updated_count += 1
+
+        if updated_count > 0:
+            print(f"✅ Synchronized {updated_count} thread rowNumbers after row move")
+        return updated_count
+
+    except Exception as e:
+        print(f"⚠️ Failed to sync thread row numbers: {e}")
+        return 0
+
 def _find_nonviable_divider_row(sheets, spreadsheet_id: str, tab_title: str) -> Optional[int]:
     """Return the divider row index if it exists, else None (no creation)."""
     try:
