@@ -2,7 +2,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs
-from .utils import b64url_id
+from .utils import b64url_id, clean_email_content
 
 def save_thread_root(user_id: str, root_id: str, meta: Dict[str, Any]) -> bool:
     """Save or update thread root document. Returns True on success, False on failure."""
@@ -229,6 +229,8 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, header
                                     body_type = body_obj.get("contentType", "Text")
                                     if body_type == "HTML":
                                         body_content = strip_html_tags(body_content)
+                                    # Always clean content (handles &nbsp; and other entities even in "Text" type)
+                                    body_content = clean_email_content(body_content)
                                     
                                     graph_messages.append({
                                         "data": {
@@ -307,8 +309,9 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, header
                 ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
             body = data.get("body", {}) or {}
-            full_text = (body.get("content") or "")[:CUT]
-            preview = (body.get("preview") or "")[:200]
+            raw_content = body.get("content") or ""
+            full_text = clean_email_content(raw_content)[:CUT]
+            preview = clean_email_content(body.get("preview") or "")[:200]
 
             payload.append({
                 "direction": data.get("direction", "unknown"),

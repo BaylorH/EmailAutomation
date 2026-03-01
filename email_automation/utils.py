@@ -87,6 +87,31 @@ def strip_html_tags(html: str) -> str:
     # Decode common HTML entities
     clean = clean.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
     clean = clean.replace('&quot;', '"').replace('&#39;', "'")
+    clean = clean.replace('&nbsp;', ' ')  # Non-breaking spaces
+    # Collapse multiple spaces into single space
+    clean = re.sub(r' +', ' ', clean)
+    return clean.strip()
+
+
+def clean_email_content(content: str) -> str:
+    """
+    Clean email content for AI processing.
+    Handles HTML entities, excessive whitespace, and other formatting issues.
+    """
+    if not content:
+        return ""
+
+    # Replace HTML entities
+    clean = content.replace('&nbsp;', ' ')
+    clean = clean.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+    clean = clean.replace('&quot;', '"').replace('&#39;', "'")
+
+    # Collapse multiple spaces into single space (but preserve newlines)
+    clean = re.sub(r'[ \t]+', ' ', clean)
+
+    # Collapse multiple newlines into max 2
+    clean = re.sub(r'\n{3,}', '\n\n', clean)
+
     return clean.strip()
 
 def safe_preview(content: str, max_len: int = 200) -> str:
