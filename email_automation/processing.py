@@ -238,116 +238,116 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
 
         # Reply was sent successfully - now index it
         # CRITICAL: Index the sent message so future replies can find the thread
-            # The /reply endpoint doesn't return the message ID, so we need to fetch it from SentItems
-            try:
-                # Wait a moment for the message to appear in SentItems
-                time.sleep(1)
-                
-                # Fetch the most recent message from SentItems for this conversation
-                # Get conversationId from the current message
-                current_msg_resp = exponential_backoff_request(
+        # The /reply endpoint doesn't return the message ID, so we need to fetch it from SentItems
+        try:
+            # Wait a moment for the message to appear in SentItems
+            time.sleep(1)
+
+            # Fetch the most recent message from SentItems for this conversation
+            # Get conversationId from the current message
+            current_msg_resp = exponential_backoff_request(
+                lambda: requests.get(
+                    f"{base}/me/messages/{current_msg_id}",
+                    headers=headers,
+                    params={"$select": "conversationId"},
+                    timeout=30
+                )
+            )
+            conversation_id = current_msg_resp.json().get("conversationId") if current_msg_resp.status_code == 200 else None
+
+            if conversation_id:
+                # Fetch recent sent messages and filter client-side by conversationId
+                # NOTE: We avoid using conversationId in $filter because Graph API has
+                # issues parsing base64-encoded IDs that end with '=' characters
+                sent_resp = exponential_backoff_request(
                     lambda: requests.get(
-                        f"{base}/me/messages/{current_msg_id}",
+                        f"{base}/me/mailFolders/SentItems/messages",
                         headers=headers,
-                        params={"$select": "conversationId"},
+                        params={
+                            "$orderby": "sentDateTime desc",
+                            "$top": 10,  # Fetch more to filter client-side
+                            "$select": "id,internetMessageId,conversationId,subject,toRecipients,sentDateTime,body,bodyPreview"
+                        },
                         timeout=30
                     )
                 )
-                conversation_id = current_msg_resp.json().get("conversationId") if current_msg_resp.status_code == 200 else None
-                
-                if conversation_id:
-                    # Fetch recent sent messages and filter client-side by conversationId
-                    # NOTE: We avoid using conversationId in $filter because Graph API has
-                    # issues parsing base64-encoded IDs that end with '=' characters
-                    sent_resp = exponential_backoff_request(
-                        lambda: requests.get(
-                            f"{base}/me/mailFolders/SentItems/messages",
-                            headers=headers,
-                            params={
-                                "$orderby": "sentDateTime desc",
-                                "$top": 10,  # Fetch more to filter client-side
-                                "$select": "id,internetMessageId,conversationId,subject,toRecipients,sentDateTime,body,bodyPreview"
-                            },
-                            timeout=30
-                        )
-                    )
 
-                    if sent_resp.status_code == 200:
-                        all_sent = sent_resp.json().get("value", [])
-                        # Filter client-side by conversationId
-                        sent_messages = [m for m in all_sent if m.get("conversationId") == conversation_id]
-                        if sent_messages:
-                            sent_msg = sent_messages[0]  # Most recent matching
-                            sent_internet_msg_id = sent_msg.get("internetMessageId")
-                            
-                            if sent_internet_msg_id:
-                                # Index this sent message with retry logic
-                                normalized_id = normalize_message_id(sent_internet_msg_id)
+                if sent_resp.status_code == 200:
+                    all_sent = sent_resp.json().get("value", [])
+                    # Filter client-side by conversationId
+                    sent_messages = [m for m in all_sent if m.get("conversationId") == conversation_id]
+                    if sent_messages:
+                        sent_msg = sent_messages[0]  # Most recent matching
+                        sent_internet_msg_id = sent_msg.get("internetMessageId")
 
-                                # Retry indexing up to 3 times
-                                MAX_RETRIES = 3
-                                msg_indexed = False
+                        if sent_internet_msg_id:
+                            # Index this sent message with retry logic
+                            normalized_id = normalize_message_id(sent_internet_msg_id)
+
+                            # Retry indexing up to 3 times
+                            MAX_RETRIES = 3
+                            msg_indexed = False
+                            for attempt in range(MAX_RETRIES):
+                                if index_message_id(user_id, sent_internet_msg_id, thread_id):
+                                    # Verify the index was written
+                                    time.sleep(0.2)
+                                    if lookup_thread_by_message_id(user_id, sent_internet_msg_id) == thread_id:
+                                        msg_indexed = True
+                                        break
+                                print(f"   ⚠️ Reply index attempt {attempt + 1}/{MAX_RETRIES} failed, retrying...")
+                                time.sleep(0.5 * (attempt + 1))
+
+                            if not msg_indexed:
+                                print(f"   ⚠️ CRITICAL: Failed to index reply after {MAX_RETRIES} attempts - future replies may be orphaned")
+                                # SAFETY: Return failure because email was sent but not indexed
+                                # Caller should be aware that conversation tracking is broken
+                                return False
+
+                            # Also save the message record
+                            to_recipients = [r.get("emailAddress", {}).get("address", "") for r in sent_msg.get("toRecipients", [])]
+                            body_obj = sent_msg.get("body", {}) or {}
+                            body_content = body_obj.get("content", "")
+
+                            message_record = {
+                                "direction": "outbound",
+                                "subject": sent_msg.get("subject", ""),
+                                "from": "me",
+                                "to": to_recipients,
+                                "sentDateTime": sent_msg.get("sentDateTime"),
+                                "receivedDateTime": None,
+                                "headers": {
+                                    "internetMessageId": sent_internet_msg_id,
+                                    "inReplyTo": None,  # Would need to extract from headers
+                                    "references": []
+                                },
+                                "body": {
+                                    "contentType": body_obj.get("contentType", "HTML"),
+                                    "content": body_content,
+                                    "preview": sent_msg.get("bodyPreview", "")[:200] or safe_preview(body_content)
+                                }
+                            }
+                            save_message(user_id, thread_id, normalized_id, message_record)
+
+                            # Index conversation ID with retry
+                            if conversation_id:
                                 for attempt in range(MAX_RETRIES):
-                                    if index_message_id(user_id, sent_internet_msg_id, thread_id):
-                                        # Verify the index was written
-                                        time.sleep(0.2)
-                                        if lookup_thread_by_message_id(user_id, sent_internet_msg_id) == thread_id:
-                                            msg_indexed = True
-                                            break
-                                    print(f"   ⚠️ Reply index attempt {attempt + 1}/{MAX_RETRIES} failed, retrying...")
+                                    if index_conversation_id(user_id, conversation_id, thread_id):
+                                        break
                                     time.sleep(0.5 * (attempt + 1))
 
-                                if not msg_indexed:
-                                    print(f"   ⚠️ CRITICAL: Failed to index reply after {MAX_RETRIES} attempts - future replies may be orphaned")
-                                    # SAFETY: Return failure because email was sent but not indexed
-                                    # Caller should be aware that conversation tracking is broken
-                                    return False
-
-                                # Also save the message record
-                                to_recipients = [r.get("emailAddress", {}).get("address", "") for r in sent_msg.get("toRecipients", [])]
-                                body_obj = sent_msg.get("body", {}) or {}
-                                body_content = body_obj.get("content", "")
-
-                                message_record = {
-                                    "direction": "outbound",
-                                    "subject": sent_msg.get("subject", ""),
-                                    "from": "me",
-                                    "to": to_recipients,
-                                    "sentDateTime": sent_msg.get("sentDateTime"),
-                                    "receivedDateTime": None,
-                                    "headers": {
-                                        "internetMessageId": sent_internet_msg_id,
-                                        "inReplyTo": None,  # Would need to extract from headers
-                                        "references": []
-                                    },
-                                    "body": {
-                                        "contentType": body_obj.get("contentType", "HTML"),
-                                        "content": body_content,
-                                        "preview": sent_msg.get("bodyPreview", "")[:200] or safe_preview(body_content)
-                                    }
-                                }
-                                save_message(user_id, thread_id, normalized_id, message_record)
-
-                                # Index conversation ID with retry
-                                if conversation_id:
-                                    for attempt in range(MAX_RETRIES):
-                                        if index_conversation_id(user_id, conversation_id, thread_id):
-                                            break
-                                        time.sleep(0.5 * (attempt + 1))
-
-                                print(f"   📝 Indexed sent reply message: {sent_internet_msg_id[:50]}...")
-                            else:
-                                print(f"   ⚠️ Sent message has no internetMessageId, cannot index")
+                            print(f"   📝 Indexed sent reply message: {sent_internet_msg_id[:50]}...")
                         else:
-                            print(f"   ⚠️ Could not find sent message in SentItems to index")
+                            print(f"   ⚠️ Sent message has no internetMessageId, cannot index")
                     else:
-                        print(f"   ⚠️ Failed to fetch sent message: {sent_resp.status_code}")
+                        print(f"   ⚠️ Could not find sent message in SentItems to index")
                 else:
-                    print(f"   ⚠️ Could not get conversationId to index sent message")
-            except Exception as e:
-                print(f"   ⚠️ Failed to index sent reply (non-fatal): {e}")
-            
-            return True
+                    print(f"   ⚠️ Failed to fetch sent message: {sent_resp.status_code}")
+            else:
+                print(f"   ⚠️ Could not get conversationId to index sent message")
+        except Exception as e:
+            print(f"   ⚠️ Failed to index sent reply (non-fatal): {e}")
+
+        return True
 
     except Exception as e:
         print(f"   ❌ Failed to send reply: {e}")
