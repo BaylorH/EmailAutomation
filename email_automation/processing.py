@@ -860,7 +860,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     try:
                         meta = {
                             "reason": "call_requested",
-                            "details": "Call requested in conversation"
+                            "details": "Call requested in conversation",
+                            "replyToMessageId": msg_id  # Graph API message ID for sending reply
                         }
                         if phone_number:
                             meta["phoneNumber"] = phone_number
@@ -916,6 +917,7 @@ Thanks!"""
                             "question": question,
                             "originalMessage": _full_text[:500],
                             "status": "pending_approval",
+                            "replyToMessageId": msg_id,  # Graph API message ID for sending reply
                             "suggestedEmail": {
                                 "to": [from_addr_lower],
                                 "subject": f"RE: {row_anchor}" if row_anchor else "RE: Property Tour",
@@ -962,7 +964,8 @@ Thanks!"""
                             "reason": f"needs_user_input:{reason}",
                             "details": reason_labels.get(reason, reason_labels["unclear"]),
                             "question": question,
-                            "originalMessage": _full_text[:500]  # Include message context
+                            "originalMessage": _full_text[:500],  # Include message context
+                            "replyToMessageId": msg_id  # Graph API message ID for sending reply
                         }
 
                         write_notification(

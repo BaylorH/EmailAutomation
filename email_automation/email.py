@@ -88,6 +88,105 @@ def _release_claim(doc_ref):
         print(f"   ⚠️ Failed to release claim on {doc_ref.id}: {e}")
 
 
+def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_id: str,
+                          thread_id: str, user_signature: str = None, signature_mode: str = None) -> dict:
+    """
+    Send an outbox item as a reply to an existing message in a thread.
+
+    Used when user responds via frontend to an action_needed notification.
+    The email is sent as a reply to maintain thread continuity.
+
+    Returns: dict with 'sent' (bool) and 'error' (str or None)
+    """
+    from .utils import get_signature_attachments, needs_signature_attachments, format_email_body_with_footer
+
+    base = "https://graph.microsoft.com/v1.0"
+
+    # Format body as HTML with footer
+    html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+
+    try:
+        # Check if we need signature attachments (professional mode)
+        if needs_signature_attachments(signature_mode):
+            # Use createReply to get a draft, add attachments, then send
+            create_reply_resp = exponential_backoff_request(
+                lambda: requests.post(f"{base}/me/messages/{reply_to_msg_id}/createReply", headers=headers, timeout=30)
+            )
+
+            if create_reply_resp.status_code in [200, 201]:
+                reply_draft = create_reply_resp.json()
+                reply_draft_id = reply_draft.get("id")
+
+                # Update draft body
+                exponential_backoff_request(
+                    lambda: requests.patch(
+                        f"{base}/me/messages/{reply_draft_id}",
+                        headers=headers,
+                        json={"body": {"contentType": "HTML", "content": html_body}},
+                        timeout=30
+                    )
+                )
+
+                # Add signature attachments
+                signature_attachments = get_signature_attachments()
+                for attachment in signature_attachments:
+                    try:
+                        att_resp = exponential_backoff_request(
+                            lambda att=attachment: requests.post(
+                                f"{base}/me/messages/{reply_draft_id}/attachments",
+                                headers=headers,
+                                json=att,
+                                timeout=30
+                            )
+                        )
+                        if att_resp.status_code in [200, 201]:
+                            print(f"   📎 Attached {attachment['name']}")
+                    except Exception as e:
+                        print(f"   ⚠️ Error attaching {attachment['name']}: {e}")
+
+                # Send the reply
+                resp = exponential_backoff_request(
+                    lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30)
+                )
+
+                if resp and resp.status_code in [200, 202]:
+                    print(f"   ✅ Sent reply (with attachments) to thread {thread_id}")
+                    return {"sent": True, "error": None}
+                else:
+                    error_msg = f"Send draft failed: {resp.status_code if resp else 'None'}"
+                    print(f"   ❌ {error_msg}")
+                    return {"sent": False, "error": error_msg}
+            else:
+                print(f"   ⚠️ createReply failed: {create_reply_resp.status_code}, trying simple reply")
+
+        # Simple reply without attachments
+        reply_payload = {
+            "message": {
+                "body": {
+                    "contentType": "HTML",
+                    "content": html_body
+                }
+            }
+        }
+        resp = exponential_backoff_request(
+            lambda: requests.post(f"{base}/me/messages/{reply_to_msg_id}/reply",
+                                 headers=headers, json=reply_payload, timeout=30)
+        )
+
+        if resp and resp.status_code in [200, 201, 202]:
+            print(f"   ✅ Sent reply to thread {thread_id}")
+            return {"sent": True, "error": None}
+        else:
+            error_msg = f"Reply failed: {resp.status_code if resp else 'None'}"
+            print(f"   ❌ {error_msg}")
+            return {"sent": False, "error": error_msg}
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"   ❌ Error sending reply: {error_msg}")
+        return {"sent": False, "error": error_msg}
+
+
 def get_contact_email_count(user_id: str, recipient_email: str) -> int:
     """
     Count how many outbound emails have been sent to this contact.
@@ -860,6 +959,11 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     # Get pre-computed subject from outbox data (property-specific)
     subject_override = data.get("subject")
 
+    # Threading support: check if this is a reply to an existing thread
+    thread_id = data.get("threadId")
+    reply_to_msg_id = data.get("replyToMessageId")
+    is_thread_reply = bool(thread_id and reply_to_msg_id)
+
     # Get scripts array (new format) or build from legacy fields
     email_scripts = data.get("emailScripts")
     if not email_scripts or len(email_scripts) == 0:
@@ -870,7 +974,10 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
         if secondary_script:
             email_scripts.append(secondary_script)
 
-    print(f"→ Sending outbox item {d.id} to {len(emails)} recipient(s) (clientId={clientId or 'n/a'}, {len(email_scripts)} script(s), attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
+    if is_thread_reply:
+        print(f"→ Sending outbox item {d.id} as REPLY to thread {thread_id} (attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
+    else:
+        print(f"→ Sending outbox item {d.id} to {len(emails)} recipient(s) (clientId={clientId or 'n/a'}, {len(email_scripts)} script(s), attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
 
     # Track results for all recipients
     all_sent = []
@@ -880,25 +987,45 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     followup_config = data.get("followUpConfig")
     contact_name = data.get("contactName") or data.get("firstName")
 
-    # For each recipient, select the appropriate script based on contact history
-    for recipient_email in emails:
-        selected_script = _select_script_for_recipient(
-            user_id, recipient_email, email_scripts
-        )
+    # If this is a reply to an existing thread, use _send_outbox_as_reply
+    if is_thread_reply:
+        # For replies, use the script directly (already personalized by frontend)
+        script_content = email_scripts[0] if email_scripts else ""
 
         try:
-            res = send_and_index_email(user_id, headers, selected_script, [recipient_email],
-                                       client_id_or_none=clientId, row_number=row_number,
-                                       user_signature=user_signature, subject_override=subject_override,
-                                       signature_mode=signature_mode, followup_config=followup_config,
-                                       contact_name=contact_name)
+            res = _send_outbox_as_reply(
+                user_id, headers, script_content, reply_to_msg_id,
+                thread_id, user_signature=user_signature, signature_mode=signature_mode
+            )
 
-            all_sent.extend(res.get("sent", []))
-            all_errors.update(res.get("errors", {}))
+            if res.get("sent"):
+                all_sent.append(emails[0] if emails else "unknown")
+            else:
+                all_errors[emails[0] if emails else "unknown"] = res.get("error", "Unknown error")
 
         except Exception as e:
-            all_errors[recipient_email] = str(e)
-            print(f"💥 Error sending to {recipient_email}: {e}")
+            all_errors[emails[0] if emails else "unknown"] = str(e)
+            print(f"💥 Error sending reply: {e}")
+    else:
+        # For each recipient, select the appropriate script based on contact history
+        for recipient_email in emails:
+            selected_script = _select_script_for_recipient(
+                user_id, recipient_email, email_scripts
+            )
+
+            try:
+                res = send_and_index_email(user_id, headers, selected_script, [recipient_email],
+                                           client_id_or_none=clientId, row_number=row_number,
+                                           user_signature=user_signature, subject_override=subject_override,
+                                           signature_mode=signature_mode, followup_config=followup_config,
+                                           contact_name=contact_name)
+
+                all_sent.extend(res.get("sent", []))
+                all_errors.update(res.get("errors", {}))
+
+            except Exception as e:
+                all_errors[recipient_email] = str(e)
+                print(f"💥 Error sending to {recipient_email}: {e}")
 
     # Determine success/failure for the outbox item
     any_errors = bool(all_errors)
