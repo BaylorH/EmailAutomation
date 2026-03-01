@@ -21,11 +21,12 @@ from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
                    format_email_body_with_footer)
 from .email_operations import (
-    send_remaining_questions_email, 
+    send_remaining_questions_email,
     send_closing_email,
     send_thankyou_closing_with_new_property,
     send_thankyou_ask_alternatives
 )
+from .pending_responses import queue_pending_response
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE, INBOX_SCAN_WINDOW_HOURS
 
 def _store_contact_optout(user_id: str, email: str, reason: str, thread_id: str) -> bool:
@@ -1562,6 +1563,7 @@ I'll review the new property details and get back to you if I have any questions
                         response_sent = True
                     else:
                         print(f"❌ Failed to send thank you email")
+                        queue_pending_response(user_id, thread_id, msg_id, from_addr_lower, response_body, client_id)
                 
                 # Scenario 2: Property became non-viable but NO new property suggested
                 elif old_row_became_nonviable and not new_row_created:
@@ -1582,6 +1584,7 @@ Do you have any other properties that might be a good fit for our requirements?"
                         response_sent = True
                     else:
                         print(f"❌ Failed to send alternatives request")
+                        queue_pending_response(user_id, thread_id, msg_id, from_addr_lower, response_body, client_id)
                 
                 # Handle call request without phone number - send brief response asking for number
                 if call_requested_no_phone and not response_sent:
@@ -1594,6 +1597,7 @@ Could you please provide your phone number so I can give you a call?"""
                         response_sent = True
                     else:
                         print(f"❌ Failed to send phone number request")
+                        queue_pending_response(user_id, thread_id, msg_id, from_addr_lower, response_body, client_id)
                 
                 # Scenario 3 & 4: Property is still viable - check missing fields
                 if not response_sent and not old_row_became_nonviable:
@@ -1668,6 +1672,7 @@ To complete the property details, could you please provide:
                                 print(f"📧 Sent thank you + missing fields request to: {from_addr_lower}")
                             else:
                                 print(f"❌ Failed to send missing fields request")
+                                queue_pending_response(user_id, thread_id, msg_id, from_addr_lower, response_body, client_id)
                         else:
                             # Scenario 4: All fields complete - send closing
                             # Use LLM-generated response if available, otherwise use template
@@ -1680,12 +1685,13 @@ To complete the property details, could you please provide:
 Thank you for providing all the requested information! We now have everything we need for your property details.
 
 We'll be in touch if we need any additional information."""
-                            
+
                             sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
                             if sent:
                                 print(f"📧 Sent closing email - all fields complete to: {from_addr_lower}")
                             else:
                                 print(f"❌ Failed to send closing email")
+                                queue_pending_response(user_id, thread_id, msg_id, from_addr_lower, response_body, client_id)
                         
             except Exception as e:
                 print(f"❌ Failed to send automatic response: {e}")
