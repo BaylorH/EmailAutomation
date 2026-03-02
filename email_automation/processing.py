@@ -1754,6 +1754,25 @@ We'll be in touch if we need any additional information."""
                             sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
                             if sent:
                                 print(f"📧 Sent closing email - all fields complete to: {from_addr_lower}")
+                                # Create row_completed notification for dashboard stats
+                                try:
+                                    write_notification(
+                                        user_id, client_id,
+                                        kind="row_completed",
+                                        priority="important",
+                                        email=from_addr_lower,
+                                        thread_id=thread_id,
+                                        row_number=rownum,
+                                        row_anchor=row_anchor,
+                                        meta={
+                                            "completedFields": REQUIRED_FIELDS_FOR_CLOSE,
+                                            "missingFields": []
+                                        },
+                                        dedupe_key=f"row_completed:{thread_id}:{rownum}"
+                                    )
+                                    print(f"✅ Created row_completed notification")
+                                except Exception as e:
+                                    print(f"⚠️ Could not create row_completed notification: {e}")
                                 # Clear highlight - row is complete, no longer under system control
                                 try:
                                     clear_row_highlight(sheet_id, rownum)
