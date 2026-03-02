@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '*/30 * * * *'  # Every 30 minutes
 
+# Prevent concurrent runs - cancel in-progress if new one starts
+concurrency:
+  group: email-automation
+  cancel-in-progress: true
+
 jobs:
   email:
     runs-on: ubuntu-latest
