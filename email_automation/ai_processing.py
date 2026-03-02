@@ -485,7 +485,13 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
 
 - "call_requested": Only when someone explicitly asks for a call/phone conversation. Use this event (NOT needs_user_input) for phone call requests.
 
-- "close_conversation": When conversation appears complete and the sender indicates they're done.
+- "close_conversation": When the broker ends the conversation but the property isn't truly unavailable. Use this instead of property_unavailable when:
+  • "Going exclusive" with another party/tenant rep
+  • Already have a deal/tenant lined up ("likely signing next week", "in negotiations with someone")
+  • Broker declines to continue without making property unavailable ("can't help right now", "not a good fit")
+  • Natural conversation ending ("thanks for reaching out", "good luck with your search")
+  IMPORTANT: Do NOT emit response_email for close_conversation - the conversation is OVER.
+  Use "notes" to capture reason: "exclusive_with_another", "deal_pending", "not_a_fit", "natural_end"
 
 - "tour_requested": Emit when broker offers or requests a property tour/showing. This is DIFFERENT from needs_user_input.
   • Look for: "schedule a tour", "would you like to see it", "happy to show you", "can arrange a tour",
