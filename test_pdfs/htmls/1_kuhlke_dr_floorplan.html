@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>1 Kuhlke Drive - Floor Plan</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
+        h1 { text-align: center; color: #2c3e50; }
+        .floorplan { position: relative; width: 600px; height: 450px; margin: 30px auto; border: 3px solid #2c3e50; }
+        .warehouse { position: absolute; top: 80px; left: 150px; width: 400px; height: 300px; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+        .warehouse-label { font-size: 24px; font-weight: bold; color: #2c3e50; }
+        .warehouse-specs { font-size: 14px; color: #7f8c8d; }
+        .office { position: absolute; top: 0; left: 0; width: 150px; height: 150px; background: #ecf0f1; border-right: 2px solid #2c3e50; border-bottom: 2px solid #2c3e50; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+        .office-label { font-weight: bold; }
+        .dock { position: absolute; right: -30px; top: 150px; width: 30px; height: 80px; background: #3498db; display: flex; align-items: center; justify-content: center; color: white; font-size: 10px; writing-mode: vertical-rl; }
+        .drive-in { position: absolute; bottom: -25px; width: 60px; height: 25px; background: #e74c3c; display: flex; align-items: center; justify-content: center; color: white; font-size: 9px; }
+        .drive-in-1 { left: 180px; }
+        .drive-in-2 { left: 320px; }
+        .dimensions { text-align: center; margin-top: 20px; color: #7f8c8d; }
+        .legend { display: flex; justify-content: center; gap: 30px; margin-top: 30px; }
+        .legend-item { display: flex; align-items: center; gap: 8px; }
+        .legend-color { width: 20px; height: 20px; }
+        @media print { body { margin: 0; } }
+    </style>
+</head>
+<body>
+    <h1>1 KUHLKE DRIVE - FLOOR PLAN</h1>
+
+    <div class="floorplan">
+        <div class="office">
+            <span class="office-label">OFFICE</span>
+            <span>2,000 SF</span>
+        </div>
+        <div class="warehouse">
+            <span class="warehouse-label">WAREHOUSE</span>
+            <span class="warehouse-specs">6,000 SF</span>
+            <span class="warehouse-specs">18' Clear Height</span>
+        </div>
+        <div class="dock">DOCK</div>
+        <div class="drive-in drive-in-1">DRIVE-IN</div>
+        <div class="drive-in drive-in-2">DRIVE-IN</div>
+    </div>
+
+    <p class="dimensions">100' x 80' = <strong>8,000 SF Total</strong></p>
+
+    <div class="legend">
+        <div class="legend-item">
+            <div class="legend-color" style="background: #ecf0f1; border: 1px solid #bdc3c7;"></div>
+            <span>Office (2,000 SF)</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #3498db;"></div>
+            <span>Dock Door (1)</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #e74c3c;"></div>
+            <span>Drive-In Doors (2)</span>
+        </div>
+    </div>
+
+    <p style="margin-top: 40px; font-size: 12px; color: #95a5a6; text-align: center;">
+        To save as PDF: Press Cmd+P (Mac) or Ctrl+P (Windows), then select "Save as PDF"
+    </p>
+</body>
+</html>

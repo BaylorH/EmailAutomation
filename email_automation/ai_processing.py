@@ -312,6 +312,17 @@ def apply_proposal_to_sheet(
                 skipped.append({"column": col_name, "reason": "unknown header"})
                 continue
 
+            # Skip Flyer/Floorplan columns - these are handled directly via Drive upload
+            # AI sometimes proposes local file:// paths from PDF metadata which we don't want
+            if key in ("flyer / link", "floorplan", "flyer/link", "flyer"):
+                skipped.append({"column": col_name, "reason": "handled-by-drive-upload"})
+                continue
+
+            # Reject any file:// URLs - these are local paths that shouldn't be in the sheet
+            if new_val.startswith("file://"):
+                skipped.append({"column": col_name, "reason": "invalid-local-path"})
+                continue
+
             col_idx = idx_map[key]                     # 1-based
             col_letter = _col_letter(col_idx)          # A1
             rng = f"{tab_title}!{col_letter}{rownum}"

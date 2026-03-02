@@ -80,3 +80,4 @@ sig.png
 tests/.multi_turn_state.json
 # Test state files with spaces in names
 tests/.multi_turn_state*.json
+token_cache.bin

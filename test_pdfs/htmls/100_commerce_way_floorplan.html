@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>100 Commerce Way - Floor Plan</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 20px; }
+        h1 { color: #2c3e50; margin-bottom: 5px; text-align: center; }
+        .subtitle { color: #7f8c8d; margin-bottom: 30px; text-align: center; }
+        .floorplan { border: 2px solid #2c3e50; margin: 20px 0; padding: 20px; background: #fafafa; }
+        .warehouse { background: #ecf0f1; border: 1px dashed #95a5a6; height: 280px; display: flex; align-items: center; justify-content: center; position: relative; }
+        .warehouse-label { font-size: 24px; color: #7f8c8d; text-align: center; }
+        .office { position: absolute; top: 10px; left: 10px; width: 120px; height: 80px; background: #3498db; color: white; display: flex; align-items: center; justify-content: center; font-size: 12px; }
+        .docks { display: flex; justify-content: space-around; background: #2c3e50; color: white; padding: 10px; }
+        .dock { text-align: center; font-size: 12px; }
+        .drive-ins { display: flex; justify-content: flex-end; gap: 20px; padding: 10px; background: #34495e; color: white; }
+        .dims { margin-top: 20px; }
+        .dims table { width: 100%; border-collapse: collapse; }
+        .dims td { padding: 8px; border: 1px solid #ddd; }
+        .dims td:first-child { background: #f5f5f5; font-weight: bold; width: 50%; }
+        @media print { body { margin: 0; } }
+    </style>
+</head>
+<body>
+    <h1>FLOOR PLAN</h1>
+    <p class="subtitle">100 Commerce Way, Augusta, GA 30901</p>
+
+    <div class="floorplan">
+        <div class="docks">
+            <div class="dock">DOCK 1</div>
+            <div class="dock">DOCK 2</div>
+            <div class="dock">DOCK 3</div>
+            <div class="dock">DOCK 4</div>
+        </div>
+        <div class="warehouse">
+            <div class="office">OFFICE<br>2,000 SF</div>
+            <span class="warehouse-label">WAREHOUSE<br>23,000 SF<br>24' Clear</span>
+        </div>
+        <div class="drive-ins">
+            <div class="dock">DRIVE-IN 1</div>
+            <div class="dock">DRIVE-IN 2</div>
+        </div>
+    </div>
+
+    <div class="dims">
+        <h3>Specifications</h3>
+        <table>
+            <tr><td>Total SF:</td><td>25,000 SF</td></tr>
+            <tr><td>Clear Height:</td><td>24 ft</td></tr>
+            <tr><td>Dock Doors:</td><td>4</td></tr>
+            <tr><td>Drive-In Doors:</td><td>2</td></tr>
+            <tr><td>Power:</td><td>800 amps, 3-phase</td></tr>
+        </table>
+    </div>
+</body>
+</html>
