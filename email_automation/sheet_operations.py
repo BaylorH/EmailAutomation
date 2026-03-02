@@ -1,6 +1,6 @@
 from typing import Optional, List, Dict, Any
 from .clients import _fs, _sheets_client
-from .sheets import _get_first_tab_title, _read_header_row2, _header_index_map, _first_sheet_props, _find_row_by_address_city, _find_row_by_email
+from .sheets import _get_first_tab_title, _read_header_row2, _header_index_map, _first_sheet_props, _find_row_by_address_city, _find_row_by_email, _execute_with_retry
 from .utils import _subject_to_address_city
 
 
@@ -49,9 +49,12 @@ def sync_thread_row_numbers_after_move(user_id: str, src_row: int, divider_row: 
 def _find_nonviable_divider_row(sheets, spreadsheet_id: str, tab_title: str) -> Optional[int]:
     """Return the divider row index if it exists, else None (no creation)."""
     try:
-        resp = sheets.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=f"{tab_title}!A:A"
-        ).execute()
+        resp = _execute_with_retry(
+            sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id, range=f"{tab_title}!A:A"
+            ),
+            "find_nonviable_divider"
+        )
         rows = resp.get("values", [])
         for i, row in enumerate(rows, start=1):
             if row and str(row[0]).strip().upper() == "NON-VIABLE":
@@ -71,17 +74,23 @@ def _ensure_divider_conditional_formatting(sheets, spreadsheet_id: str) -> None:
     when column A equals 'NON-VIABLE'. Idempotent enough for repeated calls.
     """
     # Figure out sheet + a reasonable column span
-    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = _execute_with_retry(
+        sheets.spreadsheets().get(spreadsheetId=spreadsheet_id),
+        "ensure_cf_get_meta"
+    )
     first = meta["sheets"][0]
     sheet_id = first["properties"]["sheetId"]
     tab_title = first["properties"]["title"]
 
     # Use header width to decide how many columns to cover (fallback to 26)
     try:
-        header_resp = sheets.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=f"{tab_title}!2:2"
-        ).execute()
+        header_resp = _execute_with_retry(
+            sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"{tab_title}!2:2"
+            ),
+            "ensure_cf_get_header"
+        )
         header = header_resp.get("values", [[]])[0] if header_resp.get("values") else []
         num_cols = max(26, len(header) or 0)
     except Exception:
@@ -117,10 +126,13 @@ def _ensure_divider_conditional_formatting(sheets, spreadsheet_id: str) -> None:
         }]
     }
 
-    sheets.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body=add_rule
-    ).execute()
+    _execute_with_retry(
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body=add_rule
+        ),
+        "ensure_cf_batch_update"
+    )
 
 def ensure_nonviable_divider(sheets, spreadsheet_id: str, tab_title: str) -> int:
     """
@@ -130,10 +142,13 @@ def ensure_nonviable_divider(sheets, spreadsheet_id: str, tab_title: str) -> int
     """
     try:
         # Scan column A for existing divider
-        resp = sheets.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=f"{tab_title}!A:A"
-        ).execute()
+        resp = _execute_with_retry(
+            sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"{tab_title}!A:A"
+            ),
+            "ensure_divider_scan"
+        )
         rows = resp.get("values", [])
 
         for i, row in enumerate(rows, start=1):
@@ -145,12 +160,15 @@ def ensure_nonviable_divider(sheets, spreadsheet_id: str, tab_title: str) -> int
 
         # Not found: create at the end by setting ONLY column A
         divider_row = (len(rows) + 1) if rows else 1
-        sheets.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{tab_title}!A{divider_row}",
-            valueInputOption="RAW",
-            body={"values": [["NON-VIABLE"]]}
-        ).execute()
+        _execute_with_retry(
+            sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{tab_title}!A{divider_row}",
+                valueInputOption="RAW",
+                body={"values": [["NON-VIABLE"]]}
+            ),
+            "ensure_divider_create"
+        )
 
         # Ensure the conditional formatting (styling follows the text)
         _ensure_divider_conditional_formatting(sheets, spreadsheet_id)
@@ -221,7 +239,10 @@ def move_row_below_divider(sheets, spreadsheet_id: str, tab_title: str, src_row:
             }
         })
 
-        sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
+        _execute_with_retry(
+            sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}),
+            "move_row_below_divider"
+        )
 
         # After deletion of a row above the divider, the divider shifts up by 1.
         # The moved row sits immediately below the (new) divider.
@@ -243,10 +264,13 @@ def insert_property_row_above_divider(sheets, sheet_id: str, tab_title: str, val
         header = _read_header_row2(sheets, sheet_id, tab_title)
         
         # Find divider
-        resp = sheets.spreadsheets().values().get(
-            spreadsheetId=sheet_id,
-            range=f"{tab_title}!A:A"
-        ).execute()
+        resp = _execute_with_retry(
+            sheets.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=f"{tab_title}!A:A"
+            ),
+            "insert_row_find_divider"
+        )
         rows = resp.get("values", [])
         
         divider_row = None
@@ -283,20 +307,26 @@ def insert_property_row_above_divider(sheets, sheet_id: str, tab_title: str, val
             }]
         }
         
-        sheets.spreadsheets().batchUpdate(
-            spreadsheetId=sheet_id,
-            body=insert_request
-        ).execute()
-        
+        _execute_with_retry(
+            sheets.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body=insert_request
+            ),
+            "insert_row_batch"
+        )
+
         # Fill the new row with values - FIXED: Use sheet_id consistently
         if row_values:
-            sheets.spreadsheets().values().update(
-                spreadsheetId=sheet_id,
-                range=f"{tab_title}!{insert_row}:{insert_row}",
-                valueInputOption="RAW",
-                body={"values": [row_values]}
-            ).execute()
-        
+            _execute_with_retry(
+                sheets.spreadsheets().values().update(
+                    spreadsheetId=sheet_id,
+                    range=f"{tab_title}!{insert_row}:{insert_row}",
+                    valueInputOption="RAW",
+                    body={"values": [row_values]}
+                ),
+                "insert_row_fill_values"
+            )
+
         print(f"✨ Inserted new property row {insert_row} above divider")
         return insert_row
         
@@ -313,10 +343,13 @@ def _find_row_by_anchor(uid: str, thread_id: str, sheets, spreadsheet_id: str, t
             thread_data = thread_doc.to_dict() or {}
             stored_row_num = thread_data.get("rowNumber")
             if stored_row_num:
-                resp = sheets.spreadsheets().values().get(
-                    spreadsheetId=spreadsheet_id,
-                    range=f"{tab_title}!{stored_row_num}:{stored_row_num}"
-                ).execute()
+                resp = _execute_with_retry(
+                    sheets.spreadsheets().values().get(
+                        spreadsheetId=spreadsheet_id,
+                        range=f"{tab_title}!{stored_row_num}:{stored_row_num}"
+                    ),
+                    "find_row_by_anchor"
+                )
                 rows = resp.get("values", [])
                 if rows and rows[0]:
                     padded = rows[0] + [""] * (max(0, len(header) - len(rows[0])))

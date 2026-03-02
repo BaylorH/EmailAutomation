@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import client, _sheets_client, _fs
 from .messaging import build_conversation_payload
-from .sheets import _header_index_map, _get_first_tab_title, _col_letter
+from .sheets import _header_index_map, _get_first_tab_title, _col_letter, _execute_with_retry
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 from .column_config import (
     CANONICAL_FIELDS,
@@ -127,12 +127,15 @@ def check_missing_required_fields(rowvals: List[str], header: List[str], column_
 def _ensure_ai_meta_tab(sheets, spreadsheet_id: str) -> None:
     """Ensure AI_META tab exists with proper headers."""
     try:
-        meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        meta = _execute_with_retry(
+            sheets.spreadsheets().get(spreadsheetId=spreadsheet_id),
+            "ensure_ai_meta_get"
+        )
         sheet_names = [sheet["properties"]["title"] for sheet in meta["sheets"]]
-        
+
         if "AI_META" in sheet_names:
             return
-        
+
         # Create AI_META tab
         request = {
             "requests": [{
@@ -144,19 +147,25 @@ def _ensure_ai_meta_tab(sheets, spreadsheet_id: str) -> None:
                 }
             }]
         }
-        sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=request).execute()
-        
+        _execute_with_retry(
+            sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=request),
+            "ensure_ai_meta_create"
+        )
+
         # Add headers
         headers = ["rowNumber", "columnName", "last_ai_value", "last_ai_write_iso", "human_override"]
-        sheets.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range="AI_META!A1:E1",
-            valueInputOption="RAW",
-            body={"values": [headers]}
-        ).execute()
-        
+        _execute_with_retry(
+            sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range="AI_META!A1:E1",
+                valueInputOption="RAW",
+                body={"values": [headers]}
+            ),
+            "ensure_ai_meta_headers"
+        )
+
         print("📋 Created 'AI_META' tab")
-        
+
     except Exception as e:
         print(f"⚠️ Could not create AI_META tab: {e}")
 
@@ -164,13 +173,16 @@ def _read_ai_meta_row(sheets, spreadsheet_id: str, rownum: int, column: str) -> 
     """Read AI_META record for specific row/column."""
     try:
         _ensure_ai_meta_tab(sheets, spreadsheet_id)
-        
+
         # Read all AI_META data
-        resp = sheets.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range="AI_META!A:E"
-        ).execute()
-        
+        resp = _execute_with_retry(
+            sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range="AI_META!A:E"
+            ),
+            "read_ai_meta"
+        )
+
         rows = resp.get("values", [])
         if len(rows) <= 1:  # Only header or empty
             return None
@@ -196,18 +208,21 @@ def _append_ai_meta(sheets, spreadsheet_id: str, rownum: int, column: str, value
     """Append new AI_META record."""
     try:
         _ensure_ai_meta_tab(sheets, spreadsheet_id)
-        
+
         now_iso = datetime.now(timezone.utc).isoformat()
-        
+
         row_data = [rownum, column, value, now_iso, override]
-        
-        sheets.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
-            range="AI_META!A:E",
-            valueInputOption="RAW",
-            body={"values": [row_data]}
-        ).execute()
-        
+
+        _execute_with_retry(
+            sheets.spreadsheets().values().append(
+                spreadsheetId=spreadsheet_id,
+                range="AI_META!A:E",
+                valueInputOption="RAW",
+                body={"values": [row_data]}
+            ),
+            "append_ai_meta"
+        )
+
     except Exception as e:
         print(f"⚠️ Failed to append AI_META record: {e}")
 
@@ -245,30 +260,36 @@ def _append_notes_to_comments(sheets, spreadsheet_id: str, tab_title: str, heade
         
         # Get existing comments
         col_letter = _col_letter(comments_col_idx)
-        existing_resp = sheets.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=f"{tab_title}!{col_letter}{rownum}"
-        ).execute()
-        
+        existing_resp = _execute_with_retry(
+            sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"{tab_title}!{col_letter}{rownum}"
+            ),
+            "append_notes_get_existing"
+        )
+
         existing_comments = ""
         if existing_resp.get("values") and len(existing_resp["values"]) > 0:
             existing_comments = (existing_resp["values"][0][0] or "").strip()
-        
+
         # Combine existing and new notes
         if existing_comments:
             # Append with separator if there's existing content
             combined = f"{existing_comments} • {notes}"
         else:
             combined = notes
-        
+
         # Update the comments cell
-        sheets.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{tab_title}!{col_letter}{rownum}",
-            valueInputOption="RAW",
-            body={"values": [[combined]]}
-        ).execute()
-        
+        _execute_with_retry(
+            sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{tab_title}!{col_letter}{rownum}",
+                valueInputOption="RAW",
+                body={"values": [[combined]]}
+            ),
+            "append_notes_update"
+        )
+
         print(f"📝 Appended notes to {comments_col_name} column: {notes[:100]}...")
         
     except Exception as e:
@@ -371,13 +392,16 @@ def apply_proposal_to_sheet(
             return {"applied": [], "skipped": skipped}
 
         # Execute batch update
-        sheets.spreadsheets().values().batchUpdate(
-            spreadsheetId=sheet_id,
-            body={
-                "valueInputOption": "RAW",
-                "data": data_payload
-            }
-        ).execute()
+        _execute_with_retry(
+            sheets.spreadsheets().values().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={
+                    "valueInputOption": "RAW",
+                    "data": data_payload
+                }
+            ),
+            "apply_proposal_batch_update"
+        )
 
         # Update AI_META for each applied change
         for a in applied:

@@ -1,7 +1,53 @@
 import re
+import time
+import random
 from typing import Optional, List, Dict, Any
+from googleapiclient.errors import HttpError
 from .clients import _sheets_client
 from .utils import _norm_txt, _normalize_email
+
+# Rate limit handling configuration
+MAX_RETRIES = 5
+BASE_DELAY_SECONDS = 1.0
+MAX_DELAY_SECONDS = 60.0
+
+
+def _execute_with_retry(request, operation_name: str = "Sheets API"):
+    """
+    Execute a Google Sheets API request with exponential backoff retry on rate limits.
+
+    Args:
+        request: The prepared API request (before .execute())
+        operation_name: Human-readable name for logging
+
+    Returns:
+        The API response
+
+    Raises:
+        HttpError: If all retries are exhausted or non-retryable error occurs
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            return request.execute()
+        except HttpError as e:
+            if e.resp.status == 429:
+                # Rate limit hit - calculate backoff with jitter
+                delay = min(BASE_DELAY_SECONDS * (2 ** attempt), MAX_DELAY_SECONDS)
+                jitter = random.uniform(0, delay * 0.25)
+                total_delay = delay + jitter
+
+                if attempt < MAX_RETRIES - 1:
+                    print(f"⏳ Rate limit hit on {operation_name}, retrying in {total_delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    time.sleep(total_delay)
+                else:
+                    print(f"❌ Rate limit exceeded for {operation_name} after {MAX_RETRIES} attempts")
+                    raise
+            else:
+                # Non-rate-limit error, don't retry
+                raise
+
+    # Should not reach here, but just in case
+    raise Exception(f"Unexpected error in retry loop for {operation_name}")
 
 def _header_index_map(header: list[str]) -> dict:
     """Normalize headers for exact match regardless of spacing/case."""
@@ -16,20 +62,29 @@ def _col_letter(n: int) -> str:
     return s
 
 def _get_first_tab_title(sheets, spreadsheet_id: str) -> str:
-    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = _execute_with_retry(
+        sheets.spreadsheets().get(spreadsheetId=spreadsheet_id),
+        "get_first_tab_title"
+    )
     return meta["sheets"][0]["properties"]["title"]
 
 def _read_header_row2(sheets, spreadsheet_id: str, tab_title: str) -> list[str]:
     # Entire row 2 regardless of width
-    resp = sheets.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"{tab_title}!2:2"
-    ).execute()
+    resp = _execute_with_retry(
+        sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!2:2"
+        ),
+        "read_header_row2"
+    )
     vals = resp.get("values", [[]])
     return vals[0] if vals else []
 
 def _first_sheet_props(sheets, spreadsheet_id):
-    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = _execute_with_retry(
+        sheets.spreadsheets().get(spreadsheetId=spreadsheet_id),
+        "first_sheet_props"
+    )
     p = meta["sheets"][0]["properties"]
     return p["sheetId"], p["title"]
 
@@ -49,10 +104,13 @@ def _find_row_by_email(sheets, spreadsheet_id: str, tab_title: str, header: list
         return None, None
 
     # Pull header + all data rows with a very wide column cap
-    resp = sheets.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"{tab_title}!A2:ZZZ"
-    ).execute()
+    resp = _execute_with_retry(
+        sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!A2:ZZZ"
+        ),
+        "find_row_by_email"
+    )
     rows = resp.get("values", [])
     if not rows:
         return None, None
@@ -91,10 +149,13 @@ def _find_row_by_address_city(sheets, spreadsheet_id: str, tab_title: str,
     if not addr_idx:
         return None, None
 
-    resp = sheets.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"{tab_title}!A2:ZZZ"
-    ).execute()
+    resp = _execute_with_retry(
+        sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!A2:ZZZ"
+        ),
+        "find_row_by_address_city"
+    )
     rows = resp.get("values", [])
     data_rows = rows[1:] if rows else []  # row 3+
 
@@ -148,7 +209,10 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
     LINK_KEYS = {"flyer / link", "floorplan", "floor plan"}
 
     sheets = _sheets_client()
-    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = _execute_with_retry(
+        sheets.spreadsheets().get(spreadsheetId=spreadsheet_id),
+        "format_columns_get_meta"
+    )
     first_sheet = meta["sheets"][0]
     grid_id     = first_sheet["properties"]["sheetId"]
     tab_title   = first_sheet["properties"]["title"]
@@ -156,10 +220,13 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
     # Get A1 (client name) so col A can respect it
     a1_val = ""
     try:
-        a1_resp = sheets.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=f"{tab_title}!A1:A1"
-        ).execute()
+        a1_resp = _execute_with_retry(
+            sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"{tab_title}!A1:A1"
+            ),
+            "format_columns_get_a1"
+        )
         a1_vals = a1_resp.get("values", [])
         if a1_vals and a1_vals[0]:
             a1_val = str(a1_vals[0][0]) or ""
@@ -169,10 +236,13 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
     a1_px = len(a1_val) * CHAR_PX + BASE_PADDING_PX + EXTRA_FUDGE_PX if a1_val else 0
 
     # Read header row (2) + data (rows 3+)
-    values_resp = sheets.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"{tab_title}!A2:ZZZ"
-    ).execute()
+    values_resp = _execute_with_retry(
+        sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!A2:ZZZ"
+        ),
+        "format_columns_get_values"
+    )
     rows = values_resp.get("values", [])
     hdr  = rows[0] if rows else header
     data = rows[1:] if len(rows) > 1 else []
@@ -242,10 +312,13 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
         })
 
     if requests:
-        sheets.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests": requests}
-        ).execute()
+        _execute_with_retry(
+            sheets.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": requests}
+            ),
+            "format_columns_batch_update"
+        )
 
 def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]):
     """Find/create Flyer / Link column and append unique links (no duplicates)."""
@@ -265,12 +338,15 @@ def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[
         if col_idx is None:
             col_idx = len(header) + 1  # add at end
             col_letter = _col_letter(col_idx)
-            sheets.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range=f"{tab_title}!{col_letter}2",
-                valueInputOption="RAW",
-                body={"values": [["Flyer / Link"]]}
-            ).execute()
+            _execute_with_retry(
+                sheets.spreadsheets().values().update(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"{tab_title}!{col_letter}2",
+                    valueInputOption="RAW",
+                    body={"values": [["Flyer / Link"]]}
+                ),
+                "append_links_create_column"
+            )
             print(f"📋 Created 'Flyer / Link' column at {col_letter}")
 
         # Cell range for this row/column
@@ -278,10 +354,13 @@ def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[
         cell_range = f"{tab_title}!{col_letter}{rownum}"
 
         # Current cell value
-        resp = sheets.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=cell_range
-        ).execute()
+        resp = _execute_with_retry(
+            sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=cell_range
+            ),
+            "append_links_get_current"
+        )
         current_value = ""
         values = resp.get("values", [])
         if values and values[0]:
@@ -311,12 +390,15 @@ def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[
         updated_lines = existing_lines + additions
         updated_value = "\n".join(updated_lines)
 
-        sheets.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=cell_range,
-            valueInputOption="RAW",
-            body={"values": [[updated_value]]}
-        ).execute()
+        _execute_with_retry(
+            sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=cell_range,
+                valueInputOption="RAW",
+                body={"values": [[updated_value]]}
+            ),
+            "append_links_update"
+        )
 
         print(f"🔗 Appended {len(additions)} new link(s) to Flyer / Link")
 
@@ -351,7 +433,10 @@ def highlight_row(spreadsheet_id: str, rownum: int, color: dict = None) -> bool:
 
     try:
         sheets = _sheets_client()
-        meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        meta = _execute_with_retry(
+            sheets.spreadsheets().get(spreadsheetId=spreadsheet_id),
+            "highlight_row_get_meta"
+        )
         grid_id = meta["sheets"][0]["properties"]["sheetId"]
 
         # Apply background color to entire row
@@ -373,10 +458,13 @@ def highlight_row(spreadsheet_id: str, rownum: int, color: dict = None) -> bool:
             }
         }
 
-        sheets.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests": [request]}
-        ).execute()
+        _execute_with_retry(
+            sheets.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": [request]}
+            ),
+            "highlight_row_update"
+        )
 
         print(f"🟡 Highlighted row {rownum}")
         return True
@@ -399,7 +487,10 @@ def clear_row_highlight(spreadsheet_id: str, rownum: int) -> bool:
     """
     try:
         sheets = _sheets_client()
-        meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        meta = _execute_with_retry(
+            sheets.spreadsheets().get(spreadsheetId=spreadsheet_id),
+            "clear_highlight_get_meta"
+        )
         grid_id = meta["sheets"][0]["properties"]["sheetId"]
 
         # Set background to white (removing highlight)
@@ -421,10 +512,13 @@ def clear_row_highlight(spreadsheet_id: str, rownum: int) -> bool:
             }
         }
 
-        sheets.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests": [request]}
-        ).execute()
+        _execute_with_retry(
+            sheets.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": [request]}
+            ),
+            "clear_highlight_update"
+        )
 
         print(f"⬜ Cleared highlight from row {rownum}")
         return True
@@ -455,7 +549,10 @@ def highlight_rows_batch(spreadsheet_id: str, rownums: List[int], color: dict = 
 
     try:
         sheets = _sheets_client()
-        meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        meta = _execute_with_retry(
+            sheets.spreadsheets().get(spreadsheetId=spreadsheet_id),
+            "highlight_rows_batch_get_meta"
+        )
         grid_id = meta["sheets"][0]["properties"]["sheetId"]
 
         requests = []
@@ -478,10 +575,13 @@ def highlight_rows_batch(spreadsheet_id: str, rownums: List[int], color: dict = 
                 }
             })
 
-        sheets.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests": requests}
-        ).execute()
+        _execute_with_retry(
+            sheets.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": requests}
+            ),
+            "highlight_rows_batch_update"
+        )
 
         print(f"🟡 Highlighted {len(rownums)} rows")
         return True
