@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from .utils import exponential_backoff_request, safe_preview, _body_kind, validate_recipient_emails, is_valid_email
 from .messaging import save_thread_root, save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
 from .clients import _get_sheet_id_or_fail, _sheets_client
-from .sheets import _find_row_by_email, _get_first_tab_title, _read_header_row2, _header_index_map
+from .sheets import _find_row_by_email, _get_first_tab_title, _read_header_row2, _header_index_map, highlight_row
 from .utils import normalize_message_id
 
 # Maximum retry attempts before moving to dead-letter queue
@@ -957,6 +957,13 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
             if not any_errors and res["sent"]:
                 item['doc'].reference.delete()
                 print(f"  ✅ Sent and deleted outbox item for {prop['name']}")
+                # Highlight row yellow to show system is managing this conversation
+                if row_number and clientId:
+                    try:
+                        sheet_id = _get_sheet_id_or_fail(user_id, clientId)
+                        highlight_row(sheet_id, row_number)
+                    except Exception as e:
+                        print(f"  ⚠️ Could not highlight row {row_number}: {e}")
             else:
                 new_attempts = attempts + 1
                 error_msg = json.dumps(res["errors"])[:1500]
@@ -1102,6 +1109,13 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     if not any_errors and all_sent:
         d.reference.delete()
         print(f"🗑️ Deleted outbox item {d.id}")
+        # Highlight row yellow to show system is managing this conversation
+        if row_number and clientId:
+            try:
+                sheet_id = _get_sheet_id_or_fail(user_id, clientId)
+                highlight_row(sheet_id, row_number)
+            except Exception as e:
+                print(f"⚠️ Could not highlight row {row_number}: {e}")
     else:
         new_attempts = attempts + 1
         error_msg = json.dumps(all_errors)[:1500]

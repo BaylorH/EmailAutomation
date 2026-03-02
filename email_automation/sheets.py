@@ -322,3 +322,170 @@ def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[
 
     except Exception as e:
         print(f"❌ Failed to append links to Flyer / Link column: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Row Highlighting - Visual indicator of row status in sheet
+# ─────────────────────────────────────────────────────────────────────────────
+# Yellow = system is actively managing (conversation in progress)
+# No highlight = needs user attention, complete, or non-viable
+
+# Light yellow RGB values (0-1 scale for Sheets API)
+ROW_HIGHLIGHT_COLOR = {"red": 1.0, "green": 0.95, "blue": 0.6}  # Soft yellow
+
+
+def highlight_row(spreadsheet_id: str, rownum: int, color: dict = None) -> bool:
+    """
+    Apply background color highlight to an entire row.
+
+    Args:
+        spreadsheet_id: Google Sheets ID
+        rownum: 1-based row number to highlight
+        color: RGB dict with values 0-1 (defaults to light yellow)
+
+    Returns:
+        True on success, False on failure
+    """
+    if color is None:
+        color = ROW_HIGHLIGHT_COLOR
+
+    try:
+        sheets = _sheets_client()
+        meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        grid_id = meta["sheets"][0]["properties"]["sheetId"]
+
+        # Apply background color to entire row
+        request = {
+            "repeatCell": {
+                "range": {
+                    "sheetId": grid_id,
+                    "startRowIndex": rownum - 1,  # 0-indexed
+                    "endRowIndex": rownum,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 50  # Cover plenty of columns
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": color
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor"
+            }
+        }
+
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [request]}
+        ).execute()
+
+        print(f"🟡 Highlighted row {rownum}")
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Failed to highlight row {rownum}: {e}")
+        return False
+
+
+def clear_row_highlight(spreadsheet_id: str, rownum: int) -> bool:
+    """
+    Remove background color from an entire row (set to white/default).
+
+    Args:
+        spreadsheet_id: Google Sheets ID
+        rownum: 1-based row number to clear
+
+    Returns:
+        True on success, False on failure
+    """
+    try:
+        sheets = _sheets_client()
+        meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        grid_id = meta["sheets"][0]["properties"]["sheetId"]
+
+        # Set background to white (removing highlight)
+        request = {
+            "repeatCell": {
+                "range": {
+                    "sheetId": grid_id,
+                    "startRowIndex": rownum - 1,  # 0-indexed
+                    "endRowIndex": rownum,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 50  # Cover plenty of columns
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}  # White
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor"
+            }
+        }
+
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [request]}
+        ).execute()
+
+        print(f"⬜ Cleared highlight from row {rownum}")
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Failed to clear row highlight {rownum}: {e}")
+        return False
+
+
+def highlight_rows_batch(spreadsheet_id: str, rownums: List[int], color: dict = None) -> bool:
+    """
+    Apply background color highlight to multiple rows in a single API call.
+    More efficient than calling highlight_row multiple times.
+
+    Args:
+        spreadsheet_id: Google Sheets ID
+        rownums: List of 1-based row numbers to highlight
+        color: RGB dict with values 0-1 (defaults to light yellow)
+
+    Returns:
+        True on success, False on failure
+    """
+    if not rownums:
+        return True
+
+    if color is None:
+        color = ROW_HIGHLIGHT_COLOR
+
+    try:
+        sheets = _sheets_client()
+        meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        grid_id = meta["sheets"][0]["properties"]["sheetId"]
+
+        requests = []
+        for rownum in rownums:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": grid_id,
+                        "startRowIndex": rownum - 1,  # 0-indexed
+                        "endRowIndex": rownum,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 50
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": color
+                        }
+                    },
+                    "fields": "userEnteredFormat.backgroundColor"
+                }
+            })
+
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests}
+        ).execute()
+
+        print(f"🟡 Highlighted {len(rownums)} rows")
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Failed to highlight rows: {e}")
+        return False

@@ -425,3 +425,113 @@ def set_last_scan_iso(user_id: str, iso_str: str):
         }, merge=True)
     except Exception as e:
         print(f"❌ Failed to set last scan ISO: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Handled Events Tracking - Prevents duplicate notifications for same event
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_handled_events(user_id: str, thread_id: str) -> Dict[str, Any]:
+    """
+    Get all previously handled events for a thread.
+    Returns dict like {"needs_user_input:confidential": {...}, "call_requested": {...}}
+    """
+    try:
+        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+        thread_doc = thread_ref.get()
+        if thread_doc.exists:
+            return thread_doc.to_dict().get("handledEvents", {})
+        return {}
+    except Exception as e:
+        print(f"⚠️ Failed to get handled events for thread {thread_id}: {e}")
+        return {}
+
+
+def is_event_handled(user_id: str, thread_id: str, event_key: str) -> bool:
+    """
+    Check if a specific event has already been handled for this thread.
+
+    Args:
+        user_id: The user's Firebase UID
+        thread_id: The thread document ID
+        event_key: Event identifier like "needs_user_input:confidential" or "call_requested"
+
+    Returns:
+        True if event was already handled, False otherwise
+    """
+    handled = get_handled_events(user_id, thread_id)
+    return event_key in handled
+
+
+def mark_event_handled(user_id: str, thread_id: str, event_key: str,
+                       msg_id: str = None, notif_id: str = None) -> bool:
+    """
+    Record that an event has been handled for this thread.
+    Prevents duplicate notifications when AI re-detects the same event from history.
+
+    Args:
+        user_id: The user's Firebase UID
+        thread_id: The thread document ID
+        event_key: Event identifier like "needs_user_input:confidential" or "call_requested"
+        msg_id: Optional message ID where event was first detected
+        notif_id: Optional notification ID that was created
+
+    Returns:
+        True on success, False on failure
+    """
+    try:
+        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+        thread_ref.set({
+            f"handledEvents.{event_key}": {
+                "detectedAt": SERVER_TIMESTAMP,
+                "detectedInMessageId": msg_id,
+                "notificationId": notif_id
+            }
+        }, merge=True)
+        print(f"📌 Marked event as handled: {event_key}")
+        return True
+    except Exception as e:
+        print(f"⚠️ Failed to mark event handled: {e}")
+        return False
+
+
+def build_event_key(event_type: str, event: dict = None, thread_id: str = None) -> str:
+    """
+    Build a unique event key for deduplication.
+
+    Different event types have different uniqueness requirements:
+    - needs_user_input: unique per reason (confidential, scheduling, etc.)
+    - call_requested, tour_requested: unique per thread
+    - property_unavailable: unique per thread
+    - new_property: unique per address+city
+    - contact_optout: unique per thread
+    - wrong_contact: unique per suggested contact
+    - property_issue: unique per issue text
+    - close_conversation: unique per thread
+    """
+    if event_type == "needs_user_input":
+        reason = (event or {}).get("reason", "unclear")
+        return f"needs_user_input:{reason}"
+
+    elif event_type == "new_property":
+        address = (event or {}).get("address", "")
+        city = (event or {}).get("city", "")
+        email = (event or {}).get("email", "")
+        return f"new_property:{address}:{city}:{email}"
+
+    elif event_type == "wrong_contact":
+        suggested = (event or {}).get("suggestedEmail") or (event or {}).get("suggestedContact", "")
+        return f"wrong_contact:{suggested}"
+
+    elif event_type == "property_issue":
+        issue = (event or {}).get("issue", "")[:50]  # Truncate for key
+        return f"property_issue:{issue}"
+
+    elif event_type == "contact_optout":
+        reason = (event or {}).get("reason", "not_interested")
+        return f"contact_optout:{reason}"
+
+    else:
+        # For call_requested, tour_requested, property_unavailable, close_conversation
+        # These are unique per thread (one of each type per conversation)
+        return event_type

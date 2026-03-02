@@ -8,11 +8,12 @@ from typing import Dict, Any, List, Optional
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
-from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, _header_index_map, _find_row_by_email
+from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, _header_index_map, _find_row_by_email, clear_row_highlight
 from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move
 from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
                        dump_thread_from_firestore, has_processed, mark_processed, set_last_scan_iso,
-                       lookup_thread_by_message_id, lookup_thread_by_conversation_id)
+                       lookup_thread_by_message_id, lookup_thread_by_conversation_id,
+                       is_event_handled, mark_event_handled, build_event_key)
 from .logging import write_message_order_test
 from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_row_anchor, check_missing_required_fields
 from .file_handling import fetch_and_process_pdfs, upload_pdf_to_drive
@@ -849,7 +850,16 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             events = proposal.get("events", [])
             for event in events:
                 event_type = event.get("type")
-                
+
+                # Build event key for deduplication
+                event_key = build_event_key(event_type, event, thread_id)
+
+                # Check if this event was already handled - prevents duplicate notifications
+                # when AI re-detects the same event from conversation history
+                if is_event_handled(user_id, thread_id, event_key):
+                    print(f"✅ Event already handled, skipping: {event_key}")
+                    continue
+
                 if event_type == "call_requested":
                     # Check if phone number is mentioned in the message
                     phone_pattern = r'(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})'
@@ -867,7 +877,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             meta["phoneNumber"] = phone_number
                             meta["details"] = f"Call requested - phone number provided: {phone_number}"
                         
-                        write_notification(
+                        notif_id = write_notification(
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
@@ -878,6 +888,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             meta=meta,
                             dedupe_key=f"call_requested:{thread_id}"
                         )
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                         print(f"📞 Created call_requested notification" + (f" with phone: {phone_number}" if phone_number else ""))
                         
                         # If phone number is provided, skip email response (just notification)
@@ -886,6 +897,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             print(f"📞 Phone number found - skipping email response, notification only")
                             # Mark that we should skip the normal email response
                             proposal["skip_response"] = True
+                            # Clear highlight - row needs user attention
+                            try:
+                                clear_row_highlight(sheet_id, rownum)
+                            except Exception as e:
+                                print(f"⚠️ Could not clear row highlight: {e}")
                     except Exception as e:
                         print(f"❌ Failed to write call_requested notification: {e}")
 
@@ -925,7 +941,7 @@ Thanks!"""
                             }
                         }
 
-                        write_notification(
+                        notif_id = write_notification(
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
@@ -936,10 +952,16 @@ Thanks!"""
                             meta=meta,
                             dedupe_key=f"tour_requested:{thread_id}"
                         )
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                         print(f"🏠 Created tour_requested notification with suggested email")
 
                         # Don't auto-respond - user will send the approved email
                         proposal["skip_response"] = True
+                        # Clear highlight - row needs user attention
+                        try:
+                            clear_row_highlight(sheet_id, rownum)
+                        except Exception as e:
+                            print(f"⚠️ Could not clear row highlight: {e}")
 
                     except Exception as e:
                         print(f"❌ Failed to write tour_requested notification: {e}")
@@ -968,7 +990,7 @@ Thanks!"""
                             "replyToMessageId": msg_id  # Graph API message ID for sending reply
                         }
 
-                        write_notification(
+                        notif_id = write_notification(
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
@@ -979,6 +1001,7 @@ Thanks!"""
                             meta=meta,
                             dedupe_key=f"needs_user_input:{thread_id}:{reason}"
                         )
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                         print(f"⚠️ Created needs_user_input notification (reason: {reason})")
 
                         # Only skip response if AI didn't generate one
@@ -986,6 +1009,11 @@ Thanks!"""
                         if not proposal.get("response_email"):
                             proposal["skip_response"] = True
                             print(f"   ℹ️ No AI response generated, will skip email")
+                            # Clear highlight - row needs user attention
+                            try:
+                                clear_row_highlight(sheet_id, rownum)
+                            except Exception as e:
+                                print(f"⚠️ Could not clear row highlight: {e}")
                         else:
                             print(f"   ℹ️ AI generated response, will send acknowledgment email")
 
@@ -1077,8 +1105,14 @@ Thanks!"""
                             old_row_became_nonviable = True
                             rownum = new_rownum  # keep our pointer accurate if used later
 
+                            # Clear highlight - row is NON-VIABLE, no longer under system control
+                            try:
+                                clear_row_highlight(sheet_id, new_rownum)
+                            except Exception as e:
+                                print(f"⚠️ Could not clear row highlight: {e}")
+
                             # Create notification only after successful move
-                            write_notification(
+                            notif_id = write_notification(
                                 user_id, client_id,
                                 kind="property_unavailable",
                                 priority="important",
@@ -1089,6 +1123,7 @@ Thanks!"""
                                 meta={"address": event.get("address", ""), "city": event.get("city", "")},
                                 dedupe_key=f"property_unavailable:{thread_id}:{new_rownum}:moved"
                             )
+                            mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                             print(f"🚫 Moved property to non-viable and created notification")
                         except Exception as e:
                             print(f"❌ Failed to handle property_unavailable: {e}")
@@ -1233,7 +1268,7 @@ Thanks!""",
                         }
 
                         # Create ACTION_NEEDED notification for approval (no row created yet)
-                        write_notification(
+                        notif_id = write_notification(
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
@@ -1266,6 +1301,7 @@ Thanks!""",
                             },
                             dedupe_key=f"new_property_pending:{thread_id}:{address}:{city}:{new_property_email}"
                         )
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                         print(f"🏢 Created new property pending approval notification (no row created yet)")
 
                         # Only skip response if AI didn't generate one for the ORIGINAL property
@@ -1294,7 +1330,7 @@ Thanks!""",
                             print(f"💬 Thread marked as closed")
 
                         # Create notification for user awareness
-                        write_notification(
+                        notif_id = write_notification(
                             user_id, client_id,
                             kind="conversation_closed",
                             priority="normal",
@@ -1309,9 +1345,15 @@ Thanks!""",
                             },
                             dedupe_key=f"conversation_closed:{thread_id}"
                         )
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
 
                         # Skip auto-response - conversation is done
                         proposal["skip_response"] = True
+                        # Clear highlight - row is complete
+                        try:
+                            clear_row_highlight(sheet_id, rownum)
+                        except Exception as e:
+                            print(f"⚠️ Could not clear row highlight: {e}")
 
                     except Exception as e:
                         print(f"❌ Failed to handle close_conversation: {e}")
@@ -1377,11 +1419,17 @@ Thanks!""",
                                 old_row_became_nonviable = True
                                 rownum = new_rownum
                                 print(f"🚫 Moved opted-out contact row to NON-VIABLE")
+
+                                # Clear highlight - row is NON-VIABLE
+                                try:
+                                    clear_row_highlight(sheet_id, new_rownum)
+                                except Exception as e:
+                                    print(f"⚠️ Could not clear row highlight: {e}")
                         except Exception as move_err:
                             print(f"⚠️ Could not move row to NON-VIABLE: {move_err}")
 
                         # Create notification for user awareness
-                        write_notification(
+                        notif_id = write_notification(
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
@@ -1397,6 +1445,7 @@ Thanks!""",
                             },
                             dedupe_key=f"contact_optout:{thread_id}:{from_addr_lower}"
                         )
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                         print(f"🚫 Contact opted out ({reason}): {from_addr_lower}")
 
                         # Skip auto-response - don't email someone who asked not to be contacted
@@ -1430,7 +1479,7 @@ Thanks!""",
                             details += f" - {suggested_phone}"
 
                         # Create actionable notification
-                        write_notification(
+                        notif_id = write_notification(
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
@@ -1449,10 +1498,16 @@ Thanks!""",
                             },
                             dedupe_key=f"wrong_contact:{thread_id}:{suggested_email or suggested_contact or from_addr_lower}"
                         )
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                         print(f"👤 Wrong contact detected - redirect to: {suggested_contact or 'unknown'} ({suggested_email or 'no email'})")
 
                         # Skip auto-response - don't reply to wrong person
                         proposal["skip_response"] = True
+                        # Clear highlight - row needs user attention
+                        try:
+                            clear_row_highlight(sheet_id, rownum)
+                        except Exception as e:
+                            print(f"⚠️ Could not clear row highlight: {e}")
 
                     except Exception as e:
                         print(f"❌ Failed to handle wrong_contact: {e}")
@@ -1506,7 +1561,7 @@ Thanks!""",
                             print(f"⚠️ Could not add issue comment: {comment_err}")
 
                         # Create notification to alert user
-                        write_notification(
+                        notif_id = write_notification(
                             user_id, client_id,
                             kind="action_needed",
                             priority=priority,
@@ -1524,6 +1579,7 @@ Thanks!""",
                             },
                             dedupe_key=f"property_issue:{thread_id}:{issue[:50]}"
                         )
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                         print(f"⚠️ Property issue detected ({severity}): {issue}")
 
                     except Exception as e:
@@ -1698,6 +1754,11 @@ We'll be in touch if we need any additional information."""
                             sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
                             if sent:
                                 print(f"📧 Sent closing email - all fields complete to: {from_addr_lower}")
+                                # Clear highlight - row is complete, no longer under system control
+                                try:
+                                    clear_row_highlight(sheet_id, rownum)
+                                except Exception as e:
+                                    print(f"⚠️ Could not clear row highlight: {e}")
                             else:
                                 print(f"❌ Failed to send closing email")
                                 queue_pending_response(user_id, thread_id, msg_id, from_addr_lower, response_body, client_id)
