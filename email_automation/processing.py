@@ -916,7 +916,7 @@ Thanks!"""
                             "details": "Tour/showing offered - review and approve response",
                             "question": question,
                             "originalMessage": _full_text[:500],
-                            "status": "pending_approval",
+                            "status": "pending_response",  # Not pending_approval - no row creation needed
                             "replyToMessageId": msg_id,  # Graph API message ID for sending reply
                             "suggestedEmail": {
                                 "to": [from_addr_lower],
