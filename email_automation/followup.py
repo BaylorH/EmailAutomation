@@ -331,7 +331,9 @@ def _schedule_next_followup(
     wait_time = next_followup.get("waitTime", 3)
     wait_unit = next_followup.get("waitUnit", "days")
 
-    if wait_unit == "hours":
+    if wait_unit == "minutes":
+        delta = timedelta(minutes=wait_time)
+    elif wait_unit == "hours":
         delta = timedelta(hours=wait_time)
     else:
         delta = timedelta(days=wait_time)
@@ -395,7 +397,9 @@ def schedule_followup_for_thread(
     wait_time = first_followup.get("waitTime", 5)
     wait_unit = first_followup.get("waitUnit", "days")
 
-    if wait_unit == "hours":
+    if wait_unit == "minutes":
+        delta = timedelta(minutes=wait_time)
+    elif wait_unit == "hours":
         delta = timedelta(hours=wait_time)
     else:
         delta = timedelta(days=wait_time)

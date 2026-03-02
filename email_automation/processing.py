@@ -13,7 +13,8 @@ from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, mov
 from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
                        dump_thread_from_firestore, has_processed, mark_processed, set_last_scan_iso,
                        lookup_thread_by_message_id, lookup_thread_by_conversation_id,
-                       is_event_handled, mark_event_handled, build_event_key)
+                       is_event_handled, mark_event_handled, build_event_key,
+                       update_thread_status, get_thread_status, THREAD_STATUS)
 from .logging import write_message_order_test
 from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_row_anchor, check_missing_required_fields
 from .file_handling import fetch_and_process_pdfs, upload_pdf_to_drive
@@ -599,7 +600,17 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         return
     
     print(f"🎯 Matched via {matched_header} -> thread {thread_id}")
-    
+
+    # Check if thread is stopped - if so, skip processing but still save the message for record
+    thread_status = get_thread_status(user_id, thread_id)
+    if thread_status == THREAD_STATUS["stopped"]:
+        print(f"⏹️ Thread {thread_id[:20]}... is stopped - saving message but skipping processing")
+        # Still save the message for conversation history, but don't process or auto-reply
+        # Fall through to message saving, but set a flag to skip processing
+        skip_processing_for_stopped = True
+    else:
+        skip_processing_for_stopped = False
+
     # Create message record
     message_record = {
         "direction": "inbound",
@@ -665,6 +676,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
     # Dump the conversation
     dump_thread_from_firestore(user_id, thread_id)
+
+    # If thread is stopped, skip further processing (AI, sheet updates, auto-replies)
+    if skip_processing_for_stopped:
+        print(f"⏹️ Skipping processing for stopped thread - message saved for history only")
+        return
 
     # Step 1: fetch Google Sheet (required) and log header + counterparty email
     # Also retrieve columnConfig and extractionFields for per-client AI configuration
@@ -890,7 +906,10 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         )
                         mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                         print(f"📞 Created call_requested notification" + (f" with phone: {phone_number}" if phone_number else ""))
-                        
+
+                        # Update thread status to paused - waiting for user to handle call
+                        update_thread_status(user_id, thread_id, THREAD_STATUS["paused"], "call_requested")
+
                         # If phone number is provided, skip email response (just notification)
                         # If no phone number, we'll send a brief response asking for it
                         if phone_number:
@@ -955,6 +974,9 @@ Thanks!"""
                         mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                         print(f"🏠 Created tour_requested notification with suggested email")
 
+                        # Update thread status to paused - waiting for user to handle tour
+                        update_thread_status(user_id, thread_id, THREAD_STATUS["paused"], "tour_requested")
+
                         # Don't auto-respond - user will send the approved email
                         proposal["skip_response"] = True
                         # Clear highlight - row needs user attention
@@ -1003,6 +1025,9 @@ Thanks!"""
                         )
                         mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                         print(f"⚠️ Created needs_user_input notification (reason: {reason})")
+
+                        # Update thread status to paused - waiting for user action
+                        update_thread_status(user_id, thread_id, THREAD_STATUS["paused"], f"needs_user_input:{reason}")
 
                         # Only skip response if AI didn't generate one
                         # If AI generated a response (e.g., acknowledging info while deferring the question), send it
@@ -1320,14 +1345,15 @@ Thanks!""",
                     try:
                         from datetime import datetime
 
-                        # Update thread status to closed
+                        # Update thread status to completed using the status system
+                        update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], "natural_end")
+                        # Also update legacy fields for backwards compatibility
                         if thread_ref:
                             thread_ref.update({
-                                "status": "closed",
                                 "closedAt": datetime.now().isoformat(),
                                 "closeReason": "natural_end"
                             })
-                            print(f"💬 Thread marked as closed")
+                            print(f"💬 Thread marked as completed")
 
                         # Create notification for user awareness
                         notif_id = write_notification(
@@ -1773,6 +1799,8 @@ We'll be in touch if we need any additional information."""
                                     print(f"✅ Created row_completed notification")
                                 except Exception as e:
                                     print(f"⚠️ Could not create row_completed notification: {e}")
+                                # Update thread status to completed
+                                update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], "all_fields_gathered")
                                 # Clear highlight - row is complete, no longer under system control
                                 try:
                                     clear_row_highlight(sheet_id, rownum)

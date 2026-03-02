@@ -817,6 +817,86 @@ def api_accept_new_property():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/stop-conversation", methods=["POST"])
+def api_stop_conversation():
+    """
+    Stop monitoring a conversation thread.
+    - Sets thread status to 'stopped'
+    - Pauses any pending follow-ups
+    - Clears row highlight in Google Sheet
+
+    Expects JSON body: { uid, threadId, clientId? }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        uid = data.get("uid")
+        thread_id = data.get("threadId")
+        client_id = data.get("clientId")  # Optional, used to find sheet
+
+        if not uid or not thread_id:
+            return jsonify({"success": False, "error": "Missing required fields: uid, threadId"}), 400
+
+        from email_automation.clients import _fs, _get_client_config, _sheets_client
+        from email_automation.messaging import update_thread_status, THREAD_STATUS
+        from email_automation.sheets import clear_row_highlight
+        from google.cloud.firestore import SERVER_TIMESTAMP
+
+        # Get thread data
+        thread_ref = _fs.collection("users").document(uid).collection("threads").document(thread_id)
+        thread_doc = thread_ref.get()
+
+        if not thread_doc.exists:
+            return jsonify({"success": False, "error": "Thread not found"}), 404
+
+        thread_data = thread_doc.to_dict()
+
+        # Update thread status to stopped
+        if not update_thread_status(uid, thread_id, THREAD_STATUS["stopped"], "user_requested"):
+            return jsonify({"success": False, "error": "Failed to update thread status"}), 500
+
+        # Pause follow-ups
+        try:
+            thread_ref.update({
+                "followUpStatus": "paused",
+                "followUpConfig.pausedAt": SERVER_TIMESTAMP,
+                "updatedAt": SERVER_TIMESTAMP
+            })
+            print(f"⏹️ Paused follow-ups for thread {thread_id[:20]}...", flush=True)
+        except Exception as e:
+            print(f"⚠️ Could not pause follow-ups: {e}", flush=True)
+
+        # Clear row highlight in Google Sheet
+        client_id = client_id or thread_data.get("clientId")
+        row_number = thread_data.get("rowNumber")
+
+        if client_id and row_number:
+            try:
+                sheet_id, _, _ = _get_client_config(uid, client_id)
+                if sheet_id:
+                    clear_row_highlight(sheet_id, row_number)
+                    print(f"✨ Cleared highlight for row {row_number}", flush=True)
+            except Exception as e:
+                print(f"⚠️ Could not clear row highlight: {e}", flush=True)
+
+        print(f"⏹️ Stopped monitoring thread {thread_id[:20]}...", flush=True)
+
+        return jsonify({
+            "success": True,
+            "message": "Conversation monitoring stopped",
+            "threadId": thread_id,
+            "newStatus": "stopped"
+        })
+
+    except Exception as e:
+        print(f"❌ Failed to stop conversation: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/clear-optout", methods=["POST"])
 def api_clear_optout():
     """

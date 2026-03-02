@@ -4,6 +4,71 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs
 from .utils import b64url_id, clean_email_content
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Thread Status Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+THREAD_STATUS = {
+    "active": "active",           # System is monitoring, will auto-reply
+    "paused": "paused",           # Waiting for user action (escalated)
+    "stopped": "stopped",         # Manually stopped by user
+    "completed": "completed"      # All info gathered, closing email sent
+}
+
+
+def update_thread_status(user_id: str, thread_id: str, status: str, reason: str = None) -> bool:
+    """
+    Update the status of a thread.
+
+    Args:
+        user_id: Firebase user ID
+        thread_id: Thread document ID
+        status: One of THREAD_STATUS values (active, paused, stopped, completed)
+        reason: Optional reason for status change
+
+    Returns:
+        True on success, False on failure
+    """
+    if status not in THREAD_STATUS.values():
+        print(f"⚠️ Invalid thread status: {status}")
+        return False
+
+    try:
+        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+        update_data = {
+            "status": status,
+            "statusUpdatedAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP
+        }
+        if reason:
+            update_data["statusReason"] = reason
+
+        thread_ref.update(update_data)
+        print(f"📊 Updated thread {thread_id[:20]}... status to: {status}" + (f" ({reason})" if reason else ""))
+        return True
+    except Exception as e:
+        print(f"❌ Failed to update thread status: {e}")
+        return False
+
+
+def get_thread_status(user_id: str, thread_id: str) -> Optional[str]:
+    """
+    Get the current status of a thread.
+
+    Returns:
+        Thread status string, or None if not found/error
+    """
+    try:
+        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+        thread_doc = thread_ref.get()
+        if thread_doc.exists:
+            return thread_doc.to_dict().get("status", "active")  # Default to active for legacy threads
+        return None
+    except Exception as e:
+        print(f"❌ Failed to get thread status: {e}")
+        return None
+
 def save_thread_root(user_id: str, root_id: str, meta: Dict[str, Any]) -> bool:
     """Save or update thread root document. Returns True on success, False on failure."""
     try:

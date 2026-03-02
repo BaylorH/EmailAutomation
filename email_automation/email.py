@@ -672,6 +672,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                 "clientId": client_id_or_none,
                 "email": [addr],
                 "conversationId": conversation_id,
+                "status": "active",  # New threads start as active
             }
 
             # Store row number for anchoring if provided
