@@ -210,7 +210,7 @@ def _subject_to_address_city(subject: str) -> tuple[str, str]:
 # Cache for uploaded image URLs - populated on first use, persists for process lifetime
 _CACHED_IMAGE_URLS = {}
 
-def _upload_logo_to_drive(image_filename: str = "logo.png") -> str:
+def _upload_logo_to_drive(image_filename: str = "mohr-partners-logo.png") -> str:
     """
     Get or upload image to Google Drive and return public direct image URL.
 
@@ -372,7 +372,7 @@ def get_signature_attachments() -> List[dict]:
     current_dir = os.path.dirname(os.path.abspath(__file__))
 
     images = [
-        {"filename": "logo.png", "content_id": "signature-logo"},
+        {"filename": "mohr-partners-logo.png", "content_id": "signature-logo"},
         {"filename": "linkedin.png", "content_id": "signature-linkedin"},
     ]
 
