@@ -4,21 +4,29 @@
 
 | Row | Property | Contact | Email Account | Test Scenario |
 |-----|----------|---------|---------------|---------------|
-| 3 | 699 Industrial Park Dr, Evans | Jeff Wilson | bp21harrison@gmail.com | **Complete Info (1 turn)** |
+| 3 | 699 Industrial Park Dr, Evans | Jeff Wilson | bp21harrison@gmail.com | **Complete Info (1 turn)** + Voluntary Rent |
 | 4 | 135 Trade Center Court, Augusta | Luke Coffey | bp21harrison@gmail.com | **Partial → Complete (2 turns)** |
 | 5 | 2058 Gordon Hwy, Augusta | Jonathan Aceves | baylor@manifoldengineering.ai | **Unavailable + New Property** |
-| 6 | 1 Kuhlke Dr, Augusta | Robert McCrary | baylor@manifoldengineering.ai | **Long Conversation (5+ turns)** |
-| 7 | 1 Randolph Ct, Evans | Scott Atkins | bp21harrison@gmail.com | **Escalation (Identity Question)** |
+| 6 | 1 Kuhlke Dr, Augusta | Robert McCrary | baylor@manifoldengineering.ai | **Long Conversation (5+ turns)** + Tour Offer |
+| 7 | 1 Randolph Ct, Evans | Scott Atkins | bp21harrison@gmail.com | **Escalation (Identity Question)** + ChatWithAI |
+| NEW | 500 Bobby Jones Expressway | Mike Johnson | bp21harrison@gmail.com | **New Property Reply** + Tour Requested |
+
+### Additional Edge Case Tests (Post-Scenarios)
+| Test | Property | What We Test |
+|------|----------|--------------|
+| Tour Requested | 500 Bobby Jones | `tour_requested` event, suggested email modal |
+| Contact Optout | Any closed thread | Broker says "remove me" after conversation |
+| Forbidden Fields | All | Verify rent NEVER requested, Gross Rent NEVER written |
 
 ---
 
-## Scenario A: Complete Info (1 Turn)
+## Scenario A: Complete Info (1 Turn) + Voluntary Rent Verification
 **Property:** 699 Industrial Park Dr, Evans
 **Send from:** bp21harrison@gmail.com
 **Send to:** baylor.freelance@outlook.com
 **Reply to thread:** "699 Industrial Park Dr, Evans"
 
-### Turn 1 - Broker Reply (provides all info):
+### Turn 1 - Broker Reply (provides all info INCLUDING rent voluntarily):
 ```
 Hi Jill,
 
@@ -30,6 +38,7 @@ Happy to help! Here's the info on 699 Industrial Park Dr:
 - Drive-ins: 1 grade-level door
 - Power: 400 amps, 3-phase
 - Ops Ex: $2.50/SF NNN
+- Asking Rent: $7.50/SF/yr
 
 The space is available immediately. I can send over the flyer if you'd like.
 
@@ -39,8 +48,15 @@ Jeff Wilson
 
 **Expected Result:**
 - Sheet row 3 filled with all values
+- **Rent/SF /Yr: 7.50** (captured because voluntarily provided)
+- **Gross Rent: AUTO-CALCULATED** (formula field, never written directly)
 - Closing/thank you email sent
 - `row_completed` notification created
+
+**CRITICAL VERIFICATION:**
+- ✅ AI captured rent because broker volunteered it
+- ✅ AI did NOT request rent (check response email has no rent question)
+- ✅ Gross Rent column is formula-calculated, not AI-written
 
 ---
 
@@ -117,9 +133,9 @@ Jonathan
 - Row created for 500 Bobby Jones Expressway
 - Email sent to mike@augusta-realty.com
 
-### Turn 2 - New Property Broker Reply (from Mike):
-**Send from:** (you'll need to simulate or use another account)
-**Note:** For testing, you can reply from bp21harrison@gmail.com pretending to be Mike
+### Turn 2 - New Property Broker Reply (from Mike) - WITH TOUR OFFER:
+**Send from:** bp21harrison@gmail.com (simulating Mike)
+**Reply to thread:** "500 Bobby Jones Expressway, Augusta"
 
 ```
 Hi,
@@ -131,18 +147,26 @@ Thanks for reaching out about 500 Bobby Jones Expressway. Here's what I have:
 - Docks: 3 dock-high
 - Drive-ins: 1
 - Power: 600 amps, 3-phase
-- Asking: $5.50/SF NNN
 - OpEx: $2.25/SF
 
-Flyer attached. Happy to schedule a tour.
+I'd love to show this space to your client. I have availability this Thursday or Friday afternoon. Would either of those work for a tour?
 
 Mike Johnson
 Augusta Commercial Realty
 ```
 
 **Expected Result:**
-- 500 Bobby Jones row completed
-- Closing email sent
+- Sheet fields extracted: Total SF=22000, Ceiling Ht=20, Docks=3, Drive Ins=1, Power=600 amps 3-phase, Ops Ex=2.25
+- **`tour_requested` event detected**
+- **`action_needed` notification created with `reason=tour_requested`**
+- **Suggested response email generated** (pre-filled in modal)
+- AI does NOT auto-reply (waits for user to confirm tour)
+
+**MODAL TEST: Tour Request Modal**
+- Modal shows the tour offer context
+- Shows suggested response email (e.g., "Thank you for the offer. Let me check with my client...")
+- User can edit response before sending
+- Approve button sends the response
 
 ---
 
@@ -286,12 +310,77 @@ Sarah
 
 ---
 
+## Scenario F: Tour Requested (500 Bobby Jones - Follow-up)
+**Property:** 500 Bobby Jones Expressway (created in Scenario C)
+**Send from:** bp21harrison@gmail.com (simulating Mike)
+
+This scenario continues from Scenario C Turn 2 above. After processing Mike's tour offer:
+
+### User Action: Respond to Tour Request via Modal
+
+1. Open Dashboard notification sidebar
+2. Click the `tour_requested` notification for 500 Bobby Jones
+3. Modal should show:
+   - Tour offer context ("Thursday or Friday afternoon")
+   - Pre-filled suggested response
+4. Edit or approve the response
+5. Click Send
+
+**Expected Result:**
+- Response sent as threaded reply
+- `action_needed` notification resolved
+- If all fields complete, row may be marked complete
+
+---
+
+## Scenario G: Contact Optout (Edge Case)
+**Purpose:** Test what happens when a broker says "don't contact me"
+**Property:** Any completed property (we'll use 699 Industrial Park Dr)
+**Send from:** bp21harrison@gmail.com (as Jeff Wilson)
+
+### Setup:
+After completing all main scenarios, send a follow-up hostile reply:
+
+```
+Please remove me from your mailing list. We don't work with tenant reps.
+
+Jeff Wilson
+```
+
+**Expected Result:**
+- `contact_optout` event detected with subreason `no_tenant_reps`
+- Contact added to opt-out list
+- `action_needed` notification created
+- Future campaigns should skip this contact
+
+---
+
+## Scenario H: Call Requested (Edge Case)
+**Purpose:** Test call request escalation (different from identity question)
+**Property:** Can be tested on any property mid-conversation
+
+### Example Reply:
+```
+I'd rather discuss this over the phone. Can you give me a call at (706) 555-1234?
+
+Thanks,
+[Broker]
+```
+
+**Expected Result:**
+- `call_requested` event detected
+- `action_needed` notification with phone number captured
+- AI does NOT auto-reply
+- User must decide to call or decline
+
+---
+
 ## Email Account Reference
 
 | Account | Used For |
 |---------|----------|
 | baylor.freelance@outlook.com | **System account** - sends all outbound |
-| bp21harrison@gmail.com | Simulate brokers: Jeff Wilson, Luke Coffey, Scott Atkins |
+| bp21harrison@gmail.com | Simulate brokers: Jeff Wilson, Luke Coffey, Scott Atkins, Mike Johnson |
 | baylor@manifoldengineering.ai | Simulate brokers: Jonathan Aceves, Robert McCrary |
 
 ---

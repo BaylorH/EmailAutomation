@@ -193,6 +193,7 @@ Happy to help! Here's the info on 699 Industrial Park Dr:
 - Drive-ins: 1 grade-level door
 - Power: 400 amps, 3-phase
 - Ops Ex: $2.50/SF NNN
+- Asking Rent: $7.50/SF/yr
 
 The space is available immediately. I can send over the flyer if you'd like.
 
@@ -201,6 +202,8 @@ Jeff Wilson
 ```
 
 4. Send the email
+
+**NOTE:** Broker voluntarily provides rent - AI should capture it but NEVER request rent in any response.
 
 ⏸️ **CHECKPOINT:** Tell Claude "Scenario A reply sent"
 
@@ -214,6 +217,7 @@ Jeff Wilson
 ```
 - [ ] Message matched to correct thread
 - [ ] AI extracted: Total SF=15000, Ceiling Ht=24, Docks=2, Drive Ins=1, Power=400 amps 3-phase, Ops Ex=2.50
+- [ ] AI extracted: Rent/SF /Yr=7.50 (voluntarily provided)
 - [ ] Response type: closing (all fields complete)
 - [ ] Closing email sent
 ```
@@ -234,6 +238,15 @@ Row 3 should have:
 - [ ] Drive Ins: 1
 - [ ] Power: 400 amps, 3-phase
 - [ ] Ops Ex /SF: 2.50
+- [ ] Rent/SF /Yr: 7.50 (captured voluntarily)
+- [ ] Gross Rent: AUTO-CALCULATED (formula, NOT written by AI)
+```
+
+🤖 **CRITICAL VERIFICATION (Forbidden Fields):**
+```
+- [ ] Check AI response email - does NOT ask for rent
+- [ ] Gross Rent column is formula: =(H+I)*G/12
+- [ ] AI never wrote to Gross Rent column
 ```
 
 🤖 **CLAUDE AUDIT (Outlook):**
@@ -463,7 +476,56 @@ Sheet:
 - [ ] Thread created and indexed
 ```
 
-⏸️ **CHECKPOINT:** Claude confirms "Scenario C PASSED - new property email sent"
+⏸️ **CHECKPOINT:** Claude confirms "New property email sent, wait for Mike's reply"
+
+### Step C.5 - Mike Replies with Tour Offer
+
+🧑 **USER ACTION:**
+1. Open bp21harrison@gmail.com (simulating Mike)
+2. Find thread "500 Bobby Jones Expressway, Augusta"
+3. Reply with:
+
+```
+Hi,
+
+Thanks for reaching out about 500 Bobby Jones Expressway. Here's what I have:
+
+- Total SF: 22,000
+- Ceiling: 20' clear
+- Docks: 3 dock-high
+- Drive-ins: 1
+- Power: 600 amps, 3-phase
+- OpEx: $2.25/SF
+
+I'd love to show this space to your client. I have availability this Thursday or Friday afternoon. Would either of those work for a tour?
+
+Mike Johnson
+Augusta Commercial Realty
+```
+
+4. Send, trigger workflow, paste logs
+
+🤖 **CLAUDE AUDIT:**
+```
+Logs:
+- [ ] Fields extracted: Total SF=22000, Ceiling Ht=20, Docks=3, Drive Ins=1, Power=600 amps 3-phase, Ops Ex=2.25
+- [ ] `tour_requested` event detected
+- [ ] AI did NOT auto-reply (paused for tour approval)
+
+Firestore:
+- [ ] action_needed notification with reason=tour_requested
+- [ ] Suggested response email in notification meta
+
+Sheet Row 7:
+- [ ] Total SF: 22000
+- [ ] Ceiling Ht: 20
+- [ ] Docks: 3
+- [ ] Drive Ins: 1
+- [ ] Power: 600 amps, 3-phase
+- [ ] Ops Ex /SF: 2.25
+```
+
+⏸️ **CHECKPOINT:** Claude confirms "Scenario C Turn 2 complete - tour offer detected, proceed to Scenario F for tour handling"
 
 ---
 
@@ -629,9 +691,9 @@ Firestore:
 
 ⏸️ **CHECKPOINT:** Claude confirms "Escalation detected, check Dashboard"
 
-### Step E.2 - Respond to Escalation via Modal
+### Step E.2 - Respond to Escalation via ChatWithAI Modal
 
-🖥️ **MODAL TEST: Escalation Response Modal**
+🖥️ **MODAL TEST: Escalation Response with ChatWithAI**
 
 🧑 **USER ACTION:**
 1. Go to Dashboard
@@ -639,19 +701,26 @@ Firestore:
 3. Find the 1 Randolph Ct escalation notification
 4. Click to open
 
-- [ ] Modal shows the broker's question
-- [ ] Shows context about the conversation
-- [ ] Has text input for user response
-- [ ] May have AI suggestions or chat interface
+**ChatWithAI Interface Verification:**
+- [ ] Modal shows the broker's question clearly
+- [ ] Shows full conversation context (thread history)
+- [ ] Chat interface visible (not just text input)
+- [ ] Proactive message from AI asking user what to respond
+- [ ] Can type message to AI and get suggestions
+- [ ] Email preview shows what will be sent
 
 🧑 **USER ACTION:**
-5. Type response: "I represent a confidential industrial tenant looking for 15,000+ SF in the Augusta area."
-6. Click Send
+5. In chat, type: "Tell them we represent a confidential tenant looking for warehouse space"
+6. AI should generate a professional response
+7. Review the generated email in preview
+8. Click Send (or edit and send)
 
-- [ ] Modal closes (immediately, not waiting)
+**UX Verification:**
+- [ ] Modal closes IMMEDIATELY after clicking Send (not waiting for async)
 - [ ] Outbox entry created
+- [ ] Toast/notification confirms "Email queued"
 
-⏸️ **CHECKPOINT:** Tell Claude "Escalation response sent via modal"
+⏸️ **CHECKPOINT:** Tell Claude "Escalation response sent via ChatWithAI modal"
 
 ### Step E.3 - Process User Response
 
@@ -721,6 +790,113 @@ Sheet Row 7:
 
 ---
 
+## Scenario F: Tour Requested (500 Bobby Jones)
+**Property:** 500 Bobby Jones Expressway (created in Scenario C)
+
+### Step F.1 - Process Tour Offer
+
+This continues from Scenario C - Mike's reply included a tour offer.
+
+🤖 **CLAUDE AUDIT (from Scenario C Turn 2 logs):**
+```
+- [ ] `tour_requested` event detected
+- [ ] `action_needed` notification created with reason=tour_requested
+- [ ] Suggested response email generated
+- [ ] AI did NOT auto-reply (waiting for user)
+```
+
+### Step F.2 - Respond to Tour Request via Modal
+
+🖥️ **MODAL TEST: Tour Request Response Modal**
+
+🧑 **USER ACTION:**
+1. Go to Dashboard notification sidebar
+2. Find the `tour_requested` notification for 500 Bobby Jones
+3. Click to open
+
+**Tour Modal Verification:**
+- [ ] Modal shows tour context ("Thursday or Friday afternoon")
+- [ ] Pre-filled suggested response visible
+- [ ] Can edit the suggested response
+- [ ] Shows "from Mike Johnson" context
+
+🧑 **USER ACTION:**
+4. Review or edit the suggested response
+5. Click Send/Approve
+
+**UX Verification:**
+- [ ] Modal closes immediately
+- [ ] Outbox entry created for response
+
+🧑 **USER ACTION:**
+6. Trigger workflow
+7. Paste logs
+
+🤖 **CLAUDE AUDIT:**
+```
+- [ ] Response sent as threaded reply
+- [ ] Message indexed in thread
+- [ ] action_needed notification resolved/deleted
+```
+
+⏸️ **CHECKPOINT:** Claude confirms "Scenario F PASSED - tour request handled"
+
+---
+
+## Scenario G: Contact Optout (Edge Case)
+**Property:** 699 Industrial Park Dr (already completed)
+**Purpose:** Test what happens when broker says "remove me" after conversation
+
+### Step G.1 - Send Optout Reply
+
+🧑 **USER ACTION:**
+1. Open bp21harrison@gmail.com
+2. Find the CLOSED thread "699 Industrial Park Dr, Evans"
+3. Reply with:
+
+```
+Please remove me from your mailing list. We don't work with tenant reps.
+
+Jeff Wilson
+```
+
+4. Send, trigger workflow, paste logs
+
+🤖 **CLAUDE AUDIT:**
+```
+Logs:
+- [ ] `contact_optout` event detected
+- [ ] Subreason: `no_tenant_reps`
+- [ ] Contact added to opt-out list
+- [ ] action_needed notification created
+
+Firestore:
+- [ ] Opt-out entry created (check optouts collection or user settings)
+- [ ] Notification has reason=contact_optout:no_tenant_reps
+```
+
+⏸️ **CHECKPOINT:** Claude confirms "Scenario G PASSED - optout handled"
+
+---
+
+## Real-Time Notification Test
+
+🖥️ **NOTIFICATION REAL-TIME TEST**
+
+🧑 **USER ACTION:**
+1. Open Dashboard in browser (keep it open)
+2. Send a broker reply from another device/browser
+3. Trigger workflow
+
+**Verification:**
+- [ ] Notification appears in sidebar WITHOUT page refresh
+- [ ] Notification count updates in real-time
+- [ ] Bell icon shows indicator
+
+⏸️ **CHECKPOINT:** Confirm real-time notifications working
+
+---
+
 # PHASE 3: Final Verification
 
 ## Step 3.1 - Full State Audit
@@ -729,13 +905,13 @@ Sheet Row 7:
 
 ### Firestore
 ```
-Threads:
-- [ ] 699 Industrial Park: Complete, 3+ messages
+Threads (6 total):
+- [ ] 699 Industrial Park: Complete, 3+ messages, optout received
 - [ ] 135 Trade Center: Complete, 5+ messages
 - [ ] 2058 Gordon Hwy: Closed (non-viable), 2+ messages
-- [ ] 1 Kuhlke Dr: Complete, 11+ messages
-- [ ] 1 Randolph Ct: Complete, 5+ messages
-- [ ] 500 Bobby Jones: Active or complete
+- [ ] 1 Kuhlke Dr: Complete, 11+ messages (5+ turns)
+- [ ] 1 Randolph Ct: Complete, 5+ messages (escalation handled)
+- [ ] 500 Bobby Jones: Complete or active, tour handled
 
 All rowNumbers:
 - [ ] No duplicates
@@ -746,30 +922,49 @@ All rowNumbers:
 ### Google Sheet
 ```
 Final Row Layout:
-- Row 3: 699 Industrial Park Dr ✓ COMPLETE
+- Row 3: 699 Industrial Park Dr ✓ COMPLETE (with rent captured)
 - Row 4: 135 Trade Center Court ✓ COMPLETE
 - Row 5: 1 Kuhlke Dr ✓ COMPLETE
-- Row 6: 1 Randolph Ct ✓ COMPLETE
-- Row 7: 500 Bobby Jones Expressway ✓ (new property)
-- Row 8: NON-VIABLE
-- Row 9: 2058 Gordon Hwy (moved below)
+- Row 6: 1 Randolph Ct ✓ COMPLETE (Leasing Contact unchanged)
+- Row 7: 500 Bobby Jones Expressway ✓ (new property, tour handled)
+- Row 8: NON-VIABLE DIVIDER
+- Row 9: 2058 Gordon Hwy (moved below divider)
+
+Column Verification:
+- [ ] Gross Rent column has FORMULA (=(H+I)*G/12), not AI-written values
+- [ ] Rent/SF /Yr has value for row 3 (voluntarily provided)
+- [ ] Leasing Contact unchanged for all rows
 ```
 
 ### Outlook
 ```
 Sent Items contain:
-- [ ] Initial outreach to all 5 properties
+- [ ] Initial outreach to all 5 properties (5 emails)
 - [ ] Follow-up/closing emails for completed properties
 - [ ] Outreach to new property contact (Mike)
-- [ ] User's escalation response (threaded)
+- [ ] User's escalation response (threaded, RE: 1 Randolph Ct)
+- [ ] Tour response (threaded, RE: 500 Bobby Jones)
+- [ ] Total sent count matches expected
 ```
 
-### Notifications
+### Notifications Summary
 ```
-- [ ] Multiple sheet_update notifications created
-- [ ] row_completed for each completed property
-- [ ] property_unavailable for 2058 Gordon Hwy
-- [ ] action_needed was created and resolved
+Types created:
+- [ ] sheet_update - for each field extraction
+- [ ] row_completed - for each completed property (4-5)
+- [ ] property_unavailable - for 2058 Gordon Hwy
+- [ ] action_needed (new_property) - created and resolved
+- [ ] action_needed (needs_user_input) - created and resolved
+- [ ] action_needed (tour_requested) - created and resolved
+- [ ] action_needed (contact_optout) - for Jeff Wilson optout
+```
+
+### Campaign Completion Check
+```
+- [ ] All viable properties resolved (complete OR closed)
+- [ ] Non-viable properties below divider
+- [ ] No pending action_needed notifications
+- [ ] Client status reflects completion percentage
 ```
 
 ## Step 3.2 - UI Final Check
@@ -796,44 +991,88 @@ Sent Items contain:
 
 ## Summary
 - Properties Tested: 6 (5 original + 1 new)
-- Scenarios Completed: 5/5
+- Scenarios Completed: 7/7
+- Edge Cases Tested: 2
+- Modals Tested: 6
 - Issues Found: X
 
 ## Results by Scenario
 
 | Scenario | Status | Turns | Key Verifications |
 |----------|--------|-------|-------------------|
-| A: Complete Info | ✅/❌ | 1 | Fields extracted, closing sent |
-| B: Partial→Complete | ✅/❌ | 2 | Multi-turn extraction worked |
-| C: Unavailable+New | ✅/❌ | 2+ | Row moved, new property created |
-| D: Long Conversation | ✅/❌ | 5 | Thread integrity maintained |
-| E: Escalation | ✅/❌ | 2+ | Pause/resume worked, contact preserved |
+| A: Complete Info + Rent | ✅/❌ | 1 | All fields + voluntary rent captured, closing sent |
+| B: Partial→Complete | ✅/❌ | 2 | Multi-turn extraction, follow-up sent |
+| C: Unavailable+New | ✅/❌ | 2+ | Row moved, new property approval flow |
+| D: Long Conversation | ✅/❌ | 5 | 5+ turn thread integrity maintained |
+| E: Escalation | ✅/❌ | 3+ | Pause/resume, ChatWithAI modal, contact preserved |
+| F: Tour Requested | ✅/❌ | 2 | Tour modal, suggested response, approval flow |
+| G: Contact Optout | ✅/❌ | 1 | Optout detection, contact added to blocklist |
 
 ## Feature Verification
 
-| Feature | Status |
-|---------|--------|
-| Campaign launch | ✅/❌ |
-| Outbox processing | ✅/❌ |
-| Thread creation & indexing | ✅/❌ |
-| AI field extraction | ✅/❌ |
-| Multi-turn conversations | ✅/❌ |
-| Property completion detection | ✅/❌ |
-| NON-VIABLE row handling | ✅/❌ |
-| Row number synchronization | ✅/❌ |
-| New property approval flow | ✅/❌ |
-| Escalation detection | ✅/❌ |
-| Escalation response (threaded) | ✅/❌ |
-| Leasing Contact preservation | ✅/❌ |
-| Notification accuracy | ✅/❌ |
-| Modal UX (closes immediately) | ✅/❌ |
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Campaign launch (client + sheet + outbox) | ✅/❌ | |
+| Outbox processing & email sending | ✅/❌ | |
+| Thread creation & indexing | ✅/❌ | |
+| AI field extraction | ✅/❌ | |
+| Multi-turn conversations (2 turn) | ✅/❌ | |
+| Multi-turn conversations (5+ turn) | ✅/❌ | |
+| Property completion detection | ✅/❌ | |
+| NON-VIABLE row handling | ✅/❌ | |
+| Row number synchronization | ✅/❌ | |
+| New property approval flow | ✅/❌ | |
+| Escalation detection (needs_user_input) | ✅/❌ | |
+| Escalation response (threaded reply) | ✅/❌ | |
+| Tour requested detection | ✅/❌ | |
+| Tour suggested response | ✅/❌ | |
+| Contact optout detection | ✅/❌ | |
+| Leasing Contact preservation | ✅/❌ | Different person signed email |
+| Voluntary rent capture (not requested) | ✅/❌ | |
+| Forbidden field protection (Gross Rent) | ✅/❌ | |
+| Notification accuracy | ✅/❌ | |
+| Real-time notification updates | ✅/❌ | |
+
+## Modal UX Verification
+
+| Modal | Tested | Closes Immediately | Notes |
+|-------|--------|-------------------|-------|
+| AddClientModal | ✅/❌ | ✅/❌ | |
+| ColumnMappingStep | ✅/❌ | N/A | |
+| StartProjectModal | ✅/❌ | ✅/❌ | |
+| NewPropertyRequestModal | ✅/❌ | ✅/❌ | |
+| ChatWithAI (Escalation) | ✅/❌ | ✅/❌ | |
+| Tour Request Modal | ✅/❌ | ✅/❌ | |
+| ConversationsModal | ✅/❌ | N/A | |
+| NotificationsSidebar | ✅/❌ | N/A | |
+
+## Event Types Tested
+
+| Event | Detected | Handled | Notes |
+|-------|----------|---------|-------|
+| property_unavailable | ✅/❌ | ✅/❌ | |
+| new_property | ✅/❌ | ✅/❌ | |
+| needs_user_input:confidential | ✅/❌ | ✅/❌ | |
+| tour_requested | ✅/❌ | ✅/❌ | |
+| contact_optout:no_tenant_reps | ✅/❌ | ✅/❌ | |
+| row_completed | ✅/❌ | ✅/❌ | |
 
 ## Issues Found
-[List any issues discovered]
+[List any issues discovered during testing]
 
-## Production Readiness
-[ ] READY - All tests passed
-[ ] NOT READY - Issues listed above must be addressed
+## Production Readiness Assessment
+
+### Critical Checks
+- [ ] All scenarios passed
+- [ ] No data corruption
+- [ ] All modals close immediately (UX)
+- [ ] Threading maintained throughout
+- [ ] Forbidden fields protected
+
+### Recommendation
+[ ] ✅ READY FOR PRODUCTION - All tests passed
+[ ] ⚠️ READY WITH CAVEATS - Minor issues (list)
+[ ] ❌ NOT READY - Critical issues must be addressed first
 ```
 
 ---
