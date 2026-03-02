@@ -246,7 +246,7 @@ def _extract_requirements_from_primary(primary_script: str) -> str:
 
 
 def _select_script_for_recipient(user_id: str, recipient_email: str,
-                                  scripts: List[str]) -> str:
+                                  scripts: List[str], contact_name: str = None) -> str:
     """
     Select appropriate script based on contact history.
 
@@ -304,9 +304,15 @@ def _select_script_for_recipient(user_id: str, recipient_email: str,
     print(f"  → Using GENERATED fallback (contact #{email_count + 1})")
     requirements = _extract_requirements_from_primary(primary_script)
 
+    # Extract first name from contact_name for greeting
+    first_name = None
+    if contact_name:
+        first_name = contact_name.split()[0] if contact_name.strip() else None
+    greeting = f"Hi {first_name}," if first_name else "Hi,"
+
     if email_count == 1:
         if requirements:
-            return f"""Hi,
+            return f"""{greeting}
 
 I just emailed you about another one of your listings, but I was wondering if you think there might be a fit at the above address as well.
 
@@ -314,7 +320,7 @@ As a reminder, {requirements}
 
 Thanks!"""
         else:
-            return f"""Hi,
+            return f"""{greeting}
 
 I just emailed you about another one of your listings, but I was wondering if you think there might be a fit at the above address as well.
 
@@ -324,7 +330,7 @@ Thanks!"""
     else:
         organized_note = "\n\nI want to keep things organized for both of us, so I'm sending separate emails for each of your properties I'm inquiring about."
         if requirements:
-            return f"""Hi,
+            return f"""{greeting}
 
 I've reached out about a couple of your other listings. I'm also interested in the property at the above address.
 
@@ -333,7 +339,7 @@ As a reminder, {requirements}
 
 Thanks!"""
         else:
-            return f"""Hi,
+            return f"""{greeting}
 
 I've reached out about a couple of your other listings. I'm also interested in the property at the above address.
 
@@ -1010,7 +1016,7 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
         # For each recipient, select the appropriate script based on contact history
         for recipient_email in emails:
             selected_script = _select_script_for_recipient(
-                user_id, recipient_email, email_scripts
+                user_id, recipient_email, email_scripts, contact_name=contact_name
             )
 
             try:
