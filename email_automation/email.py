@@ -951,6 +951,19 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
             # Use pre-computed subject from property data
             subject_override = prop.get('subject') or None
             followup_config = data.get("followUpConfig")
+
+            # Fallback: fetch followUpConfig from client if not on outbox item
+            if not followup_config and clientId:
+                try:
+                    client_doc = _fs.collection("users").document(user_id).collection("clients").document(clientId).get()
+                    if client_doc.exists:
+                        client_data = client_doc.to_dict()
+                        followup_config = client_data.get("followUpConfig")
+                        if followup_config:
+                            print(f"   📋 Fetched followUpConfig from client (enabled={followup_config.get('enabled')})")
+                except Exception as e:
+                    print(f"   ⚠️ Could not fetch followUpConfig from client: {e}")
+
             contact_name = data.get("contactName") or data.get("firstName")
             res = send_and_index_email(user_id, headers, script, [recipient_email],
                                        client_id_or_none=clientId, row_number=row_number,
@@ -1066,6 +1079,19 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
 
     # Get follow-up config if present
     followup_config = data.get("followUpConfig")
+
+    # Fallback: fetch followUpConfig from client if not on outbox item
+    if not followup_config and clientId:
+        try:
+            client_doc = _fs.collection("users").document(user_id).collection("clients").document(clientId).get()
+            if client_doc.exists:
+                client_data = client_doc.to_dict()
+                followup_config = client_data.get("followUpConfig")
+                if followup_config:
+                    print(f"   📋 Fetched followUpConfig from client (enabled={followup_config.get('enabled')})")
+        except Exception as e:
+            print(f"   ⚠️ Could not fetch followUpConfig from client: {e}")
+
     contact_name = data.get("contactName") or data.get("firstName")
 
     # If this is a reply to an existing thread, use _send_outbox_as_reply
