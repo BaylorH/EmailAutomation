@@ -679,6 +679,10 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             if row_number:
                 thread_meta["rowNumber"] = row_number
 
+            # Store contact name for follow-up personalization
+            if contact_name:
+                thread_meta["contactName"] = contact_name
+
             # Save thread root with retry
             thread_saved = False
             for attempt in range(MAX_INDEX_RETRIES):

@@ -2172,6 +2172,92 @@ def api_firestore_cleanup():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/clear-outlook-emails", methods=["POST"])
+def api_clear_outlook_emails():
+    """
+    Clear campaign-related emails from Outlook (SentItems and optionally Inbox).
+    Accepts JSON body with options:
+    - user_id: str - User ID to clear emails for
+    - keywords: list[str] - Subject keywords to match (e.g., ["Commerce", "Industrial"])
+    - clear_inbox: bool - Also clear from Inbox (default False)
+    - clear_sent: bool - Clear from SentItems (default True)
+    """
+    if not SCHEDULER_AVAILABLE:
+        return jsonify({"success": False, "error": "Scheduler not available"}), 503
+
+    try:
+        import requests
+        from firebase_helpers import download_token
+        from msal import ConfidentialClientApplication, SerializableTokenCache
+
+        data = request.get_json() or {}
+        user_id = data.get("user_id")
+        keywords = data.get("keywords", ["Logistics", "Commerce", "Industrial", "Warehouse", "Distribution", "Storage"])
+        clear_inbox = data.get("clear_inbox", False)
+        clear_sent = data.get("clear_sent", True)
+
+        if not user_id:
+            return jsonify({"success": False, "error": "user_id required"}), 400
+
+        # Download and setup token
+        download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
+        cache = SerializableTokenCache()
+        with open(TOKEN_CACHE, "r") as f:
+            cache.deserialize(f.read())
+
+        app_obj = ConfidentialClientApplication(
+            CLIENT_ID,
+            client_credential=CLIENT_SECRET,
+            authority=AUTHORITY,
+            token_cache=cache
+        )
+
+        accounts = app_obj.get_accounts()
+        if not accounts:
+            return jsonify({"success": False, "error": "No account found in token cache"}), 404
+
+        result = app_obj.acquire_token_silent(SCOPES, account=accounts[0])
+        if not result or "access_token" not in result:
+            return jsonify({"success": False, "error": "Failed to acquire token"}), 401
+
+        headers = {"Authorization": f"Bearer {result['access_token']}"}
+        base = "https://graph.microsoft.com/v1.0"
+        deleted = {"sent": 0, "inbox": 0}
+
+        def delete_matching_emails(folder):
+            nonlocal deleted
+            folder_key = "inbox" if folder == "Inbox" else "sent"
+            resp = requests.get(
+                f"{base}/me/mailFolders/{folder}/messages",
+                headers=headers,
+                params={"$top": 100, "$select": "id,subject"}
+            )
+            if resp.status_code != 200:
+                return
+
+            for msg in resp.json().get("value", []):
+                subj = msg.get("subject", "")
+                if any(kw in subj for kw in keywords):
+                    del_resp = requests.delete(f"{base}/me/messages/{msg['id']}", headers=headers)
+                    if del_resp.status_code in [200, 204]:
+                        deleted[folder_key] += 1
+                        print(f"Deleted from {folder}: {subj[:50]}")
+
+        if clear_sent:
+            delete_matching_emails("SentItems")
+        if clear_inbox:
+            delete_matching_emails("Inbox")
+
+        return jsonify({
+            "success": True,
+            "deleted": deleted,
+            "keywords_matched": keywords
+        })
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
