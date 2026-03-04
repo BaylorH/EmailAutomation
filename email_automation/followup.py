@@ -215,6 +215,28 @@ def _send_followup_email(
 
         # Personalize the message with contact name if available
         contact_name = thread_data.get("contactName", "")
+
+        # Fallback: fetch contact name from sheet if not on thread
+        if not contact_name and "[NAME]" in followup_message:
+            try:
+                from .clients import _get_sheet_id_or_fail, _sheets_client
+                client_id = thread_data.get("clientId")
+                row_number = thread_data.get("rowNumber")
+                if client_id and row_number:
+                    sheet_id = _get_sheet_id_or_fail(user_id, client_id)
+                    sheets = _sheets_client()
+                    # Fetch the row to get Leasing Contact (column E = index 4)
+                    result = sheets.spreadsheets().values().get(
+                        spreadsheetId=sheet_id,
+                        range=f"A{row_number}:F{row_number}"
+                    ).execute()
+                    row_values = result.get("values", [[]])[0]
+                    if len(row_values) >= 5:
+                        contact_name = row_values[4]  # Leasing Contact column (E)
+                        print(f"   Fetched contact name from sheet: {contact_name}")
+            except Exception as e:
+                print(f"   Could not fetch contact name from sheet: {e}")
+
         if contact_name and "[NAME]" in followup_message:
             first_name = contact_name.split()[0] if contact_name else ""
             followup_message = followup_message.replace("[NAME]", first_name)
