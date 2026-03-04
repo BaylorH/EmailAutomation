@@ -22,6 +22,83 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs
 from .utils import exponential_backoff_request, format_email_body_with_footer, get_signature_attachments, needs_signature_attachments
 
+# Claim timeout for follow-up processing (prevent duplicate sends)
+FOLLOWUP_CLAIM_TIMEOUT_SECONDS = 60
+
+
+def _claim_followup(user_id: str, thread_id: str, current_index: int) -> bool:
+    """
+    Atomically claim a follow-up for processing to prevent duplicate sends.
+
+    Uses a transaction to check that:
+    1. No other process is currently sending this follow-up
+    2. The current index hasn't changed since we read it
+
+    Returns True if successfully claimed, False if already being processed.
+    """
+    from google.cloud.firestore import transactional
+
+    thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+
+    @transactional
+    def claim_transaction(transaction, thread_ref, expected_index):
+        snapshot = thread_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return False
+
+        data = snapshot.to_dict() or {}
+        followup_config = data.get("followUpConfig", {})
+
+        # Check if index has changed (another process already sent)
+        actual_index = followup_config.get("currentFollowUpIndex", 0)
+        if actual_index != expected_index:
+            print(f"   ⏭️ Follow-up index changed ({expected_index} → {actual_index}), skipping")
+            return False
+
+        # Check if already being processed
+        processing_by = followup_config.get("processingBy")
+        processing_at = followup_config.get("processingAt")
+
+        now = datetime.now(timezone.utc)
+
+        if processing_by and processing_at:
+            if hasattr(processing_at, 'timestamp'):
+                claim_age = (now - processing_at.replace(tzinfo=timezone.utc)).total_seconds()
+            else:
+                claim_age = (now - processing_at).total_seconds()
+
+            if claim_age < FOLLOWUP_CLAIM_TIMEOUT_SECONDS:
+                print(f"   ⏭️ Follow-up already being processed by {processing_by} ({int(claim_age)}s ago)")
+                return False
+
+        # Claim the follow-up
+        import socket
+        worker_id = f"followup-{socket.gethostname()[:20]}"
+        transaction.update(thread_ref, {
+            "followUpConfig.processingBy": worker_id,
+            "followUpConfig.processingAt": now
+        })
+        return True
+
+    try:
+        transaction = _fs.transaction()
+        return claim_transaction(transaction, thread_ref, current_index)
+    except Exception as e:
+        print(f"   ⚠️ Failed to claim follow-up for {thread_id[:20]}...: {e}")
+        return False
+
+
+def _release_followup_claim(user_id: str, thread_id: str):
+    """Release claim on a follow-up (called on failure to allow retry)."""
+    try:
+        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+        thread_ref.update({
+            "followUpConfig.processingBy": None,
+            "followUpConfig.processingAt": None
+        })
+    except Exception as e:
+        print(f"   ⚠️ Failed to release follow-up claim: {e}")
+
 
 def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
     """
@@ -99,6 +176,10 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
             _mark_followup_complete(user_id, thread_id, "max_reached")
             continue
 
+        # Claim the follow-up to prevent duplicate sends
+        if not _claim_followup(user_id, thread_id, current_index):
+            continue
+
         # Send the follow-up
         success = _send_followup_email(
             user_id=user_id,
@@ -119,6 +200,9 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
                 followup_config=followup_config,
                 just_sent_index=current_index
             )
+        else:
+            # Release the claim so it can be retried
+            _release_followup_claim(user_id, thread_id)
 
     print(f"\n   Sent {followups_sent} follow-up email(s)")
     return followups_sent
@@ -365,6 +449,8 @@ def _schedule_next_followup(
     _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
         "followUpConfig.currentFollowUpIndex": next_index,
         "followUpConfig.nextFollowUpAt": next_followup_at,
+        "followUpConfig.processingBy": None,
+        "followUpConfig.processingAt": None,
         "followUpStatus": "waiting",
         "updatedAt": SERVER_TIMESTAMP
     })

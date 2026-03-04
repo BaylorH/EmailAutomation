@@ -189,11 +189,185 @@ def workflow_status():
     print(result.stdout)
 
 
+def fetch_outlook_conversations():
+    """
+    Fetch full email conversations from Outlook using the same method as main.py.
+    Downloads token from Firebase, uses MSAL to get access token, calls Graph API.
+    """
+    from msal import ConfidentialClientApplication, SerializableTokenCache
+    from firebase_helpers import download_token
+    from email_automation.app_config import CLIENT_ID, CLIENT_SECRET, AUTHORITY, SCOPES, TOKEN_CACHE, FIREBASE_API_KEY
+    import requests
+    import re
+
+    # Map Firebase UID to MSAL cache user ID
+    # The token cache is stored under the MSAL user ID, not Firebase UID
+    MSAL_USER_ID = "5gUMpneceaOWOeY7HNOlYHNyaD53"  # Jill's MSAL user ID
+
+    print("📥 Downloading token from Firebase...")
+    download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=MSAL_USER_ID)
+
+    cache = SerializableTokenCache()
+    with open(TOKEN_CACHE, "r") as f:
+        cache.deserialize(f.read())
+
+    app = ConfidentialClientApplication(
+        CLIENT_ID,
+        client_credential=CLIENT_SECRET,
+        authority=AUTHORITY,
+        token_cache=cache
+    )
+
+    accounts = app.get_accounts()
+    if not accounts:
+        print("❌ No account found in token cache")
+        return
+
+    result = app.acquire_token_silent(SCOPES, account=accounts[0])
+    if not result or "access_token" not in result:
+        print("❌ Failed to acquire token")
+        return
+
+    access_token = result["access_token"]
+    print(f"✅ Got access token: {access_token[:40]}...")
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    # Keywords for our test campaign
+    keywords = ["Commerce", "Industrial", "Warehouse", "Distribution", "Logistics", "Storage", "Tech Park"]
+
+    print("\n" + "=" * 70)
+    print("OUTLOOK SENT ITEMS - JILL'S OUTBOUND EMAILS")
+    print("=" * 70)
+
+    # Fetch sent items with body
+    resp = requests.get(
+        "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages",
+        headers=headers,
+        params={
+            "$top": "50",
+            "$orderby": "sentDateTime desc",
+            "$select": "subject,sentDateTime,toRecipients,body,conversationId"
+        }
+    )
+
+    if resp.status_code != 200:
+        print(f"❌ Failed to fetch sent items: {resp.status_code}")
+        print(resp.text[:500])
+        return
+
+    sent_messages = resp.json().get("value", [])
+
+    # Group by conversation
+    conversations = {}
+    for msg in sent_messages:
+        subject = msg.get("subject", "")
+        if any(kw in subject for kw in keywords):
+            conv_id = msg.get("conversationId", "unknown")
+            if conv_id not in conversations:
+                conversations[conv_id] = {"subject": subject, "messages": []}
+            conversations[conv_id]["messages"].append({
+                "direction": "SENT",
+                "time": msg.get("sentDateTime", "")[:19],
+                "to": [r["emailAddress"]["address"] for r in msg.get("toRecipients", [])],
+                "body": _clean_html(msg.get("body", {}).get("content", ""))
+            })
+
+    # Also fetch inbox for broker replies
+    print("\n" + "=" * 70)
+    print("OUTLOOK INBOX - BROKER REPLIES")
+    print("=" * 70)
+
+    resp = requests.get(
+        "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages",
+        headers=headers,
+        params={
+            "$top": "50",
+            "$orderby": "receivedDateTime desc",
+            "$select": "subject,receivedDateTime,from,body,conversationId"
+        }
+    )
+
+    if resp.status_code == 200:
+        inbox_messages = resp.json().get("value", [])
+        for msg in inbox_messages:
+            subject = msg.get("subject", "")
+            if any(kw in subject for kw in keywords):
+                conv_id = msg.get("conversationId", "unknown")
+                if conv_id not in conversations:
+                    conversations[conv_id] = {"subject": subject, "messages": []}
+                conversations[conv_id]["messages"].append({
+                    "direction": "RECEIVED",
+                    "time": msg.get("receivedDateTime", "")[:19],
+                    "from": msg.get("from", {}).get("emailAddress", {}).get("address", ""),
+                    "body": _clean_html(msg.get("body", {}).get("content", ""))
+                })
+
+    # Print conversations
+    print("\n" + "=" * 70)
+    print("FULL CONVERSATIONS BY PROPERTY")
+    print("=" * 70)
+
+    for conv_id, conv in conversations.items():
+        # Sort messages by time
+        conv["messages"].sort(key=lambda m: m.get("time", ""))
+
+        # Extract property name from subject
+        subject = conv["subject"].replace("RE: ", "").replace("Re: ", "")
+
+        print(f"\n{'='*70}")
+        print(f"📧 {subject}")
+        print(f"   Conversation ID: {conv_id[:40]}...")
+        print(f"   Messages: {len(conv['messages'])}")
+        print("-" * 70)
+
+        for i, msg in enumerate(conv["messages"], 1):
+            direction = msg["direction"]
+            time = msg["time"]
+            body = msg["body"][:800]  # Truncate for readability
+
+            if direction == "SENT":
+                print(f"\n  [{i}] 📤 SENT at {time}")
+                to = msg.get("to", [])
+                if to:
+                    print(f"      To: {', '.join(to)}")
+            else:
+                print(f"\n  [{i}] 📥 RECEIVED at {time}")
+                print(f"      From: {msg.get('from', 'unknown')}")
+
+            print(f"      ---")
+            # Indent the body
+            for line in body.split('\n')[:20]:  # Max 20 lines
+                if line.strip():
+                    print(f"      {line.strip()}")
+        print()
+
+
+def _clean_html(html_content):
+    """Strip HTML tags and clean up content"""
+    import re
+    # Remove style tags
+    text = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL)
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', '\n', text)
+    # Clean up entities
+    text = re.sub(r'&nbsp;', ' ', text)
+    text = re.sub(r'&amp;', '&', text)
+    text = re.sub(r'&lt;', '<', text)
+    text = re.sub(r'&gt;', '>', text)
+    # Clean up whitespace
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    return text.strip()
+
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='E2E Test Helpers')
     parser.add_argument('command', choices=['status', 'threads', 'outbox', 'notifications',
-                                            'clear', 'trigger', 'workflow', 'client'],
+                                            'clear', 'trigger', 'workflow', 'client', 'outlook'],
                         help='Command to run')
     args = parser.parse_args()
 
@@ -213,3 +387,5 @@ if __name__ == '__main__':
         workflow_status()
     elif args.command == 'client':
         get_client()
+    elif args.command == 'outlook':
+        fetch_outlook_conversations()

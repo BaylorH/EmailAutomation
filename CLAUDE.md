@@ -469,6 +469,59 @@ OPENAI_ASSISTANT_MODEL=gpt-4o
 
 ---
 
+## Testing & Debugging Commands
+
+### Accessing Outlook Emails (CRITICAL - DO NOT FORGET)
+
+> **⚠️ This is the ONLY correct way to access Outlook. Do NOT try other methods.**
+
+The backend uses MSAL tokens stored in Firebase Storage. To fetch Outlook conversations:
+
+```bash
+cd /Users/baylorharrison/Documents/GitHub/EmailAutomation
+export $(cat .env | grep -v '^#' | xargs)
+python3 tests/e2e_helpers.py outlook
+```
+
+**How it works (same as main.py):**
+1. Downloads token cache from Firebase Storage via `firebase_helpers.download_token()`
+2. Creates MSAL `ConfidentialClientApplication` with the cache
+3. Calls `acquire_token_silent()` to get access token
+4. Uses Microsoft Graph API to fetch SentItems and Inbox
+
+**Key files:**
+- `tests/e2e_helpers.py` → `fetch_outlook_conversations()` - Fetches and displays all conversations
+- `firebase_helpers.py` → `download_token()` - Downloads MSAL cache from Firebase Storage
+- `main.py` (lines 50-120) - Reference implementation
+
+**DO NOT:**
+- Try to use local cache files directly (they may be stale)
+- Use `requests` with hardcoded tokens
+- Use the Flask app's `/api/status` endpoint for this
+
+### E2E Test Helper Commands
+
+```bash
+# Check Firestore status (threads, outbox, notifications)
+python3 tests/e2e_helpers.py status
+
+# Check specific collections
+python3 tests/e2e_helpers.py threads
+python3 tests/e2e_helpers.py outbox
+python3 tests/e2e_helpers.py notifications
+
+# Trigger GitHub Actions workflow
+python3 tests/e2e_helpers.py trigger
+
+# Check workflow status
+python3 tests/e2e_helpers.py workflow
+
+# Clear all test data (DESTRUCTIVE)
+python3 tests/e2e_helpers.py clear
+```
+
+---
+
 ## Key Learnings from E2E Testing
 
 1. **Thread grouping matters:** Users expect one conversation per property, not per email thread. Frontend groups by property address.
@@ -482,3 +535,33 @@ OPENAI_ASSISTANT_MODEL=gpt-4o
 5. **Escalation pauses auto-reply:** When `needs_user_input` is detected, the system waits for the user to compose a reply—no auto-reply is sent.
 
 6. **Multi-turn conversations work:** The system correctly accumulates data across multiple broker replies until all required fields are gathered.
+
+---
+
+## E2E Test Results (2026-03-04)
+
+### Conversation Quality Scores
+
+| Property | Score | Notes |
+|----------|-------|-------|
+| 100 Commerce Way | A (5/5) | Clean conversation, proper flow |
+| 200 Industrial Blvd | A (5/5) | Multi-turn handled correctly |
+| 300 Warehouse Dr | C (3/5) | ⚠️ Double greeting bug in initial email |
+| 400 Distribution Ave | A (5/5) | Correctly escalated identity question |
+| 500 Logistics Ln | A (5/5) | Correctly escalated tour request |
+| 600 Storage Ct | D (2/5) | ⚠️ Double greeting + duplicate follow-ups |
+
+**Overall: 25/30 (83%)**
+
+### Bugs Found & Fixed
+
+**Bug 1: Duplicate Follow-ups (FIXED)**
+- **Symptom:** 600 Storage Ct received two follow-up emails
+- **Cause:** Race condition - multiple workflow runs could send same follow-up
+- **Fix:** Added claim mechanism in `followup.py` using transactions
+
+**Bug 2: Double Greeting in Multi-Property Emails (TODO)**
+- **Symptom:** Emails show "Hi," followed by "Hi [Name],"
+- **Affected:** 300 Warehouse Dr, 600 Storage Ct (both 2nd-contact emails)
+- **Likely cause:** Frontend generates scripts with "Hi," that don't account for name insertion
+- **Location to fix:** Frontend LLM prompt for multi-property email generation
