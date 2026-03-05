@@ -561,6 +561,26 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         print(f"   Auto-reply emails are not processed to prevent data corruption")
         return
 
+    # SAFETY: Skip emails from ourselves (e.g., forwarded back via auto-forward rules)
+    # This prevents our own outbound emails from being processed as broker replies
+    try:
+        my_email_resp = requests.get(
+            "https://graph.microsoft.com/v1.0/me",
+            headers=headers,
+            params={"$select": "mail,userPrincipalName"},
+            timeout=10
+        )
+        if my_email_resp.status_code == 200:
+            my_data = my_email_resp.json()
+            my_email = (my_data.get("mail") or my_data.get("userPrincipalName") or "").lower()
+            if my_email and from_addr.lower() == my_email:
+                print(f"⏭️ Skipping self-email (forwarded back): {subject}")
+                print(f"   Sender {from_addr} matches our own address - likely auto-forwarded")
+                return
+    except Exception as e:
+        # Don't fail the whole process if this check fails
+        print(f"⚠️ Could not check for self-email: {e}")
+
     print(f"📧 Processing: {subject} from {from_addr}")
     print(f"   In-Reply-To: {in_reply_to}")
     print(f"   References: {references}")
