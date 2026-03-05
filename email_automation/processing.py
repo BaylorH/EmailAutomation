@@ -564,6 +564,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     # SAFETY: Skip emails from ourselves (e.g., forwarded back via auto-forward rules)
     # This prevents our own outbound emails from being processed as broker replies
     try:
+        my_email = None
+
+        # Try /me endpoint first
         my_email_resp = requests.get(
             "https://graph.microsoft.com/v1.0/me",
             headers=headers,
@@ -573,10 +576,24 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         if my_email_resp.status_code == 200:
             my_data = my_email_resp.json()
             my_email = (my_data.get("mail") or my_data.get("userPrincipalName") or "").lower()
-            if my_email and from_addr.lower() == my_email:
-                print(f"⏭️ Skipping self-email (forwarded back): {subject}")
-                print(f"   Sender {from_addr} matches our own address - likely auto-forwarded")
-                return
+
+        # Fallback: get our email from a sent message (works for personal accounts)
+        if not my_email:
+            sent_resp = requests.get(
+                "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages",
+                headers=headers,
+                params={"$top": "1", "$select": "from"},
+                timeout=10
+            )
+            if sent_resp.status_code == 200:
+                sent_data = sent_resp.json()
+                if sent_data.get("value"):
+                    my_email = (sent_data["value"][0].get("from", {}).get("emailAddress", {}).get("address") or "").lower()
+
+        if my_email and from_addr.lower() == my_email:
+            print(f"⏭️ Skipping self-email (forwarded back): {subject}")
+            print(f"   Sender {from_addr} matches our own address - likely auto-forwarded")
+            return
     except Exception as e:
         # Don't fail the whole process if this check fails
         print(f"⚠️ Could not check for self-email: {e}")
