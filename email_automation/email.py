@@ -1083,6 +1083,7 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     # Fallback: fetch followUpConfig from client if not on outbox item
     if not followup_config and clientId:
         try:
+            from .clients import _fs
             client_doc = _fs.collection("users").document(user_id).collection("clients").document(clientId).get()
             if client_doc.exists:
                 client_data = client_doc.to_dict()
