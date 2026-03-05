@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Optional
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
-from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, _header_index_map, _find_row_by_email, clear_row_highlight
+from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, append_links_to_floorplan_column, is_floorplan_filename, _header_index_map, _find_row_by_email, clear_row_highlight
 from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move
 from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
                        dump_thread_from_firestore, has_processed, mark_processed, set_last_scan_iso,
@@ -811,15 +811,35 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         pdf_manifest = fetch_and_process_pdfs(headers, msg_id)
 
         if pdf_manifest:
-            # Collect drive links for sheet
-            drive_links = [p['drive_link'] for p in pdf_manifest if p.get('drive_link')]
+            # Categorize PDFs into flyers vs floorplans based on filename
+            flyer_links = []
+            floorplan_links = []
 
-            # Append Drive links to Flyer / Link column on the current row
-            if drive_links:
-                try:
-                    sheets = _sheets_client()
-                    append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, drive_links)
-                    # Re-read header in case we just created "Flyer / Link"
+            for pdf in pdf_manifest:
+                link = pdf.get('drive_link')
+                if not link:
+                    continue
+
+                filename = pdf.get('name', '')
+                if is_floorplan_filename(filename):
+                    floorplan_links.append(link)
+                    print(f"   📐 Categorized as floorplan: {filename}")
+                else:
+                    flyer_links.append(link)
+                    print(f"   📄 Categorized as flyer: {filename}")
+
+            # Write to appropriate columns
+            try:
+                sheets = _sheets_client()
+
+                if flyer_links:
+                    append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
+
+                if floorplan_links:
+                    append_links_to_floorplan_column(sheets, sheet_id, header, rownum, floorplan_links)
+
+                # Re-read header in case we just created columns
+                if flyer_links or floorplan_links:
                     try:
                         tab_title = _get_first_tab_title(sheets, sheet_id)
                         header = _read_header_row2(sheets, sheet_id, tab_title)
@@ -827,8 +847,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     except Exception as _e:
                         print(f"ℹ️ Skipped re-format after link append: {_e}")
 
-                except Exception as e:
-                    print(f"❌ Failed to append links to sheet: {e}")
+            except Exception as e:
+                print(f"❌ Failed to append links to sheet: {e}")
         
         # URL exploration - find URLs in message and fetch content for AI processing only
         url_texts = []

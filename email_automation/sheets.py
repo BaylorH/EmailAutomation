@@ -406,6 +406,124 @@ def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[
         print(f"❌ Failed to append links to Flyer / Link column: {e}")
 
 
+def append_links_to_floorplan_column(sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]):
+    """Find/create Floorplan column and append unique links (no duplicates)."""
+    try:
+        tab_title = _get_first_tab_title(sheets, spreadsheet_id)
+        idx_map = _header_index_map(header)
+
+        # Find 'Floorplan' (case-insensitive, trimmed)
+        target_key = "floorplan"
+        col_idx = None
+        for key, idx in idx_map.items():
+            if key == target_key or key == "floor plan":
+                col_idx = idx
+                break
+
+        # Create column if missing (insert after Flyer / Link if possible)
+        if col_idx is None:
+            flyer_idx = None
+            for key, idx in idx_map.items():
+                if key == "flyer / link":
+                    flyer_idx = idx
+                    break
+
+            if flyer_idx is not None:
+                col_idx = flyer_idx + 1  # Right after Flyer / Link
+            else:
+                col_idx = len(header) + 1  # Add at end
+
+            col_letter = _col_letter(col_idx)
+            _execute_with_retry(
+                sheets.spreadsheets().values().update(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"{tab_title}!{col_letter}2",
+                    valueInputOption="RAW",
+                    body={"values": [["Floorplan"]]}
+                ),
+                "append_floorplan_create_column"
+            )
+            print(f"📋 Created 'Floorplan' column at {col_letter}")
+
+        # Cell range for this row/column
+        col_letter = _col_letter(col_idx)
+        cell_range = f"{tab_title}!{col_letter}{rownum}"
+
+        # Current cell value
+        resp = _execute_with_retry(
+            sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=cell_range
+            ),
+            "append_floorplan_get_current"
+        )
+        current_value = ""
+        values = resp.get("values", [])
+        if values and values[0]:
+            current_value = values[0][0]
+
+        # Existing links (normalized by stripping whitespace)
+        existing_lines = [l.strip() for l in (current_value.splitlines() if current_value else []) if l.strip()]
+        existing = set(existing_lines)
+
+        # Clean + dedupe incoming links
+        additions = []
+        for raw in links or []:
+            if not raw:
+                continue
+            clean = raw.strip()
+            if not clean:
+                continue
+            if clean not in existing:
+                additions.append(clean)
+                existing.add(clean)
+
+        if not additions:
+            print("ℹ️ All links already present in Floorplan")
+            return
+
+        # Build updated cell content (preserve prior order, append new)
+        updated_lines = existing_lines + additions
+        updated_value = "\n".join(updated_lines)
+
+        _execute_with_retry(
+            sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=cell_range,
+                valueInputOption="RAW",
+                body={"values": [[updated_value]]}
+            ),
+            "append_floorplan_update"
+        )
+
+        print(f"📐 Appended {len(additions)} new link(s) to Floorplan")
+
+    except Exception as e:
+        print(f"❌ Failed to append links to Floorplan column: {e}")
+
+
+def is_floorplan_filename(filename: str) -> bool:
+    """
+    Detect if a PDF filename indicates it's a floorplan.
+
+    Returns True for filenames containing:
+    - floor plan, floorplan, floor-plan
+    - layout
+    - site plan, siteplan
+    """
+    if not filename:
+        return False
+
+    name_lower = filename.lower()
+    floorplan_patterns = [
+        "floor plan", "floorplan", "floor-plan",
+        "layout", "floor_plan",
+        "site plan", "siteplan", "site-plan", "site_plan"
+    ]
+
+    return any(pattern in name_lower for pattern in floorplan_patterns)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Row Highlighting - Visual indicator of row status in sheet
 # ─────────────────────────────────────────────────────────────────────────────

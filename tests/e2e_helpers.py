@@ -363,12 +363,218 @@ def _clean_html(html_content):
     return text.strip()
 
 
+# ============================================================================
+# Firebase Snapshot System - Track document lifecycle during E2E testing
+# ============================================================================
+from pathlib import Path
+
+SNAPSHOT_FILE = Path("/tmp/firebase_snapshots.json")
+
+
+def get_collection_counts() -> dict:
+    """Get document counts for all relevant collections."""
+    collections = {}
+    user_ref = db.collection("users").document(USER_ID)
+
+    # Core collections
+    for coll_name in ["clients", "outbox", "threads", "msgIndex", "convIndex", "notifications", "sheetChangeLog"]:
+        try:
+            docs = list(user_ref.collection(coll_name).stream())
+            collections[coll_name] = {
+                "count": len(docs),
+                "ids": [d.id[:30] + "..." if len(d.id) > 30 else d.id for d in docs]
+            }
+        except Exception as e:
+            collections[coll_name] = {"count": 0, "error": str(e)}
+
+    # Client-level notifications
+    client_notifications = 0
+    notif_details = []
+    for client_doc in user_ref.collection("clients").stream():
+        try:
+            notifs = list(user_ref.collection("clients").document(client_doc.id).collection("notifications").stream())
+            client_notifications += len(notifs)
+            for n in notifs:
+                data = n.to_dict()
+                notif_details.append({
+                    "kind": data.get("kind", "?"),
+                    "property": data.get("rowAnchor", "?")[:25],
+                })
+        except:
+            pass
+    collections["client_notifications"] = {"count": client_notifications, "details": notif_details}
+
+    return collections
+
+
+def get_thread_details() -> list:
+    """Get detailed thread information."""
+    threads = []
+    user_ref = db.collection("users").document(USER_ID)
+
+    for doc in user_ref.collection("threads").stream():
+        data = doc.to_dict()
+        threads.append({
+            "id": doc.id[:30] + "...",
+            "propertyAddress": data.get("propertyAddress", "?"),
+            "status": data.get("status", "?"),
+            "followUpStatus": data.get("followUpStatus", "?"),
+            "followUpCount": data.get("followUpCount", 0),
+            "messageCount": len(data.get("messages", [])),
+        })
+
+    return threads
+
+
+def get_outbox_details() -> list:
+    """Get outbox item details."""
+    items = []
+    user_ref = db.collection("users").document(USER_ID)
+
+    for doc in user_ref.collection("outbox").stream():
+        data = doc.to_dict()
+        to_addr = data.get("to", data.get("assignedEmails", ["?"])[0] if data.get("assignedEmails") else "?")
+        items.append({
+            "id": doc.id[:20] + "...",
+            "propertyAddress": data.get("propertyAddress", "?"),
+            "to": to_addr,
+            "attempts": data.get("attempts", 0),
+        })
+
+    return items
+
+
+def take_snapshot(label: str = None):
+    """Take a snapshot of current Firebase state."""
+    if not label:
+        label = f"Snapshot at {datetime.utcnow().isoformat()}"
+
+    print(f"\n📸 Taking snapshot: {label}")
+
+    snapshot = {
+        "label": label,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "user_id": USER_ID,
+        "collections": get_collection_counts(),
+        "threads": get_thread_details(),
+        "outbox": get_outbox_details(),
+    }
+
+    # Load existing snapshots
+    snapshots = []
+    if SNAPSHOT_FILE.exists():
+        try:
+            snapshots = json.loads(SNAPSHOT_FILE.read_text())
+        except:
+            snapshots = []
+
+    snapshots.append(snapshot)
+    SNAPSHOT_FILE.write_text(json.dumps(snapshots, indent=2))
+
+    # Print summary
+    colls = snapshot["collections"]
+    print(f"   Clients: {colls['clients']['count']}")
+    print(f"   Outbox: {colls['outbox']['count']}")
+    print(f"   Threads: {colls['threads']['count']}")
+    print(f"   MsgIndex: {colls['msgIndex']['count']}")
+    print(f"   ConvIndex: {colls['convIndex']['count']}")
+    print(f"   Notifications: {colls['notifications']['count']}")
+    print(f"   Client Notifications: {colls['client_notifications']['count']}")
+    print(f"   SheetChangeLog: {colls['sheetChangeLog']['count']}")
+
+    if snapshot["threads"]:
+        print(f"\n   Threads:")
+        for t in snapshot["threads"]:
+            print(f"     - {t['propertyAddress']}: status={t['status']}, followUp={t['followUpStatus']}, count={t['followUpCount']}")
+
+    if snapshot["outbox"]:
+        print(f"\n   Outbox:")
+        for o in snapshot["outbox"]:
+            print(f"     - {o['propertyAddress']} -> {o['to']}")
+
+    print(f"\n   Saved to {SNAPSHOT_FILE}")
+
+
+def snapshot_report():
+    """Generate a comparison report of all snapshots."""
+    if not SNAPSHOT_FILE.exists():
+        print("No snapshots found!")
+        return
+
+    snapshots = json.loads(SNAPSHOT_FILE.read_text())
+
+    print("\n" + "=" * 70)
+    print("FIREBASE LIFECYCLE REPORT")
+    print("=" * 70)
+
+    for i, snap in enumerate(snapshots):
+        print(f"\n📸 [{i+1}] {snap['label']}")
+        print(f"   Time: {snap['timestamp']}")
+
+        colls = snap['collections']
+        print(f"   Collections: outbox={colls['outbox']['count']}, threads={colls['threads']['count']}, msgIndex={colls['msgIndex']['count']}, convIndex={colls['convIndex']['count']}")
+        print(f"   Notifications: user={colls['notifications']['count']}, client={colls['client_notifications']['count']}")
+        print(f"   SheetChangeLog: {colls['sheetChangeLog']['count']}")
+
+        if snap.get('threads'):
+            for t in snap['threads']:
+                print(f"     • {t['propertyAddress']}: {t['status']} / {t['followUpStatus']} (msgs={t['messageCount']})")
+
+    # Compare first and last
+    if len(snapshots) >= 2:
+        first = snapshots[0]
+        last = snapshots[-1]
+
+        print("\n" + "-" * 70)
+        print("DELTA: First → Last")
+        print("-" * 70)
+
+        for coll in ["outbox", "threads", "msgIndex", "convIndex", "notifications", "sheetChangeLog"]:
+            f_count = first['collections'][coll]['count']
+            l_count = last['collections'][coll]['count']
+            delta = l_count - f_count
+            sign = "+" if delta > 0 else ""
+            print(f"   {coll}: {f_count} → {l_count} ({sign}{delta})")
+
+    # Check for lingering items
+    print("\n" + "-" * 70)
+    print("CLEANUP CHECK (last snapshot)")
+    print("-" * 70)
+
+    last = snapshots[-1]
+    issues = []
+
+    if last['collections']['outbox']['count'] > 0:
+        issues.append(f"⚠️ Outbox not empty: {last['collections']['outbox']['count']} items remaining")
+
+    # Check thread statuses
+    incomplete_threads = [t for t in last.get('threads', []) if t['status'] not in ['completed', 'stopped']]
+    if incomplete_threads:
+        for t in incomplete_threads:
+            issues.append(f"⚠️ Thread not complete: {t['propertyAddress']} (status={t['status']})")
+
+    if issues:
+        for issue in issues:
+            print(f"   {issue}")
+    else:
+        print("   ✅ All clean - no lingering items detected")
+
+
+def clear_snapshots():
+    """Clear all snapshots."""
+    if SNAPSHOT_FILE.exists():
+        SNAPSHOT_FILE.unlink()
+    print("🗑️ Cleared all snapshots")
+
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='E2E Test Helpers')
     parser.add_argument('command', choices=['status', 'threads', 'outbox', 'notifications',
-                                            'clear', 'trigger', 'workflow', 'client', 'outlook'],
+                                            'clear', 'trigger', 'workflow', 'client', 'outlook',
+                                            'snapshot', 'snapshot-report', 'snapshot-clear'],
                         help='Command to run')
+    parser.add_argument('label', nargs='?', default=None, help='Label for snapshot')
     args = parser.parse_args()
 
     if args.command == 'status':
@@ -389,3 +595,9 @@ if __name__ == '__main__':
         get_client()
     elif args.command == 'outlook':
         fetch_outlook_conversations()
+    elif args.command == 'snapshot':
+        take_snapshot(args.label)
+    elif args.command == 'snapshot-report':
+        snapshot_report()
+    elif args.command == 'snapshot-clear':
+        clear_snapshots()
