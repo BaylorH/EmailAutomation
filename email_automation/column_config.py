@@ -210,8 +210,8 @@ CANONICAL_FIELDS = {
     },
 }
 
-# Fields required for conversation to be considered "complete"
-REQUIRED_FOR_CLOSE = [k for k, v in CANONICAL_FIELDS.items() if v.get("required_for_close")]
+# Fields required for conversation to be considered "complete" (default)
+DEFAULT_REQUIRED_FOR_CLOSE = [k for k, v in CANONICAL_FIELDS.items() if v.get("required_for_close")]
 
 # Fields that AI can extract from conversations
 EXTRACTABLE_FIELDS = [k for k, v in CANONICAL_FIELDS.items() if v.get("extractable")]
@@ -221,6 +221,45 @@ FORMULA_FIELDS = [k for k, v in CANONICAL_FIELDS.items() if v.get("is_formula")]
 
 # Fields we accept but never request
 NEVER_REQUEST_FIELDS = [k for k, v in CANONICAL_FIELDS.items() if v.get("never_request")]
+
+# Legacy alias for backward compatibility
+REQUIRED_FOR_CLOSE = DEFAULT_REQUIRED_FOR_CLOSE
+
+# ============================================================================
+# COLUMN MODES - Used by frontend dropdown
+# ============================================================================
+COLUMN_MODES = {
+    "ask_required": {
+        "label": "Ask (Required)",
+        "description": "AI will request if missing. Required for row completion.",
+        "extractable": True,
+        "required": True,
+    },
+    "ask_optional": {
+        "label": "Ask (Optional)",
+        "description": "AI will request if missing. Not required for completion.",
+        "extractable": True,
+        "required": False,
+    },
+    "accept_only": {
+        "label": "Accept Only",
+        "description": "AI extracts if provided but never asks for it.",
+        "extractable": True,
+        "required": False,
+        "never_request": True,
+    },
+    "note": {
+        "label": "Note",
+        "description": "AI appends contextual information. Never requests.",
+        "extractable": False,
+        "append_mode": True,
+    },
+    "skip": {
+        "label": "Skip",
+        "description": "Column is ignored by the system.",
+        "extractable": False,
+    },
+}
 
 
 def get_default_column_config() -> Dict[str, Any]:
@@ -233,10 +272,34 @@ def get_default_column_config() -> Dict[str, Any]:
             canonical: field["default_aliases"][0]  # Use first alias as default
             for canonical, field in CANONICAL_FIELDS.items()
         },
-        "requiredFields": REQUIRED_FOR_CLOSE,
+        "requiredFields": DEFAULT_REQUIRED_FOR_CLOSE.copy(),
         "formulaFields": FORMULA_FIELDS,
         "neverRequest": NEVER_REQUEST_FIELDS,
+        "customFields": {},  # {columnHeader: {mode, description}}
     }
+
+
+def get_default_mode_for_canonical(canonical: str) -> str:
+    """
+    Get the default column mode for a canonical field.
+    """
+    if canonical not in CANONICAL_FIELDS:
+        return "skip"
+
+    field = CANONICAL_FIELDS[canonical]
+
+    if field.get("is_formula"):
+        return "skip"  # Formula fields should be skipped
+    elif field.get("never_request"):
+        return "accept_only"
+    elif field.get("required_for_close"):
+        return "ask_required"
+    elif field.get("extractable"):
+        return "ask_optional"
+    elif field.get("append_mode"):
+        return "note"
+    else:
+        return "skip"
 
 
 def detect_column_mapping(headers: List[str], use_ai: bool = True) -> Dict[str, Any]:
@@ -351,33 +414,58 @@ def build_column_rules_prompt(column_config: Dict[str, Any]) -> str:
     """
     Build the COLUMN_RULES section of the AI prompt dynamically
     based on the client's column configuration.
+
+    Supports both canonical fields and custom fields.
     """
     mappings = column_config.get("mappings", {})
+    custom_fields = column_config.get("customFields", {})
+    required_fields = column_config.get("requiredFields", DEFAULT_REQUIRED_FOR_CLOSE)
+    never_request = column_config.get("neverRequest", NEVER_REQUEST_FIELDS)
 
     lines = ["COLUMN SEMANTICS & MAPPING (use EXACT header names from this sheet):"]
 
+    # Process canonical fields
     for canonical, actual_col in mappings.items():
         if canonical not in CANONICAL_FIELDS:
             continue
 
         field = CANONICAL_FIELDS[canonical]
 
-        # Skip non-extractable fields
+        # Skip non-extractable fields (unless they have a formula warning)
         if not field.get("extractable") and not field.get("is_formula"):
             continue
 
         # Build the rule line
         if field.get("is_formula"):
             lines.append(f'- "{actual_col}": DO NOT WRITE TO THIS COLUMN. It contains a formula.')
-        elif field.get("never_request"):
+        elif canonical in never_request:
             lines.append(f'- "{actual_col}": {field["description"]}. Accept if provided but NEVER request.')
         else:
             hints = field.get("extraction_hints", field["description"])
             synonyms = field.get("ai_synonyms", [])
+            required_marker = " [REQUIRED]" if canonical in required_fields else ""
             if synonyms:
-                lines.append(f'- "{actual_col}": {hints} Synonyms: {", ".join(synonyms)}.')
+                lines.append(f'- "{actual_col}"{required_marker}: {hints} Synonyms: {", ".join(synonyms)}.')
             else:
-                lines.append(f'- "{actual_col}": {hints}')
+                lines.append(f'- "{actual_col}"{required_marker}: {hints}')
+
+    # Process custom fields (user-defined columns)
+    if custom_fields:
+        lines.append("")
+        lines.append("CUSTOM FIELDS (client-specific):")
+        for col_header, config in custom_fields.items():
+            mode = config.get("mode", "skip")
+            description = config.get("description", "Extract any relevant value for this field")
+
+            if mode == "skip":
+                continue  # Don't include skipped fields
+            elif mode == "accept_only":
+                lines.append(f'- "{col_header}": {description}. Accept if provided but NEVER request.')
+            elif mode in ("ask_required", "ask_optional"):
+                required_marker = " [REQUIRED]" if mode == "ask_required" else ""
+                lines.append(f'- "{col_header}"{required_marker}: {description}')
+            elif mode == "note":
+                lines.append(f'- "{col_header}": Append any relevant contextual notes about {description}.')
 
     # Add formatting rules
     lines.append("")
@@ -389,7 +477,7 @@ def build_column_rules_prompt(column_config: Dict[str, Any]) -> str:
     lines.append('- For power, output the electrical specification as provided: "200A", "480V", "100A 3-phase".')
     lines.append("")
     lines.append("CRITICAL - ALLOWED COLUMNS ONLY:")
-    lines.append("- You may ONLY propose updates to columns listed above in COLUMN SEMANTICS.")
+    lines.append("- You may ONLY propose updates to columns listed above in COLUMN SEMANTICS (including CUSTOM FIELDS if present).")
     lines.append("- DO NOT update: Property Address, City, Property Name, Leasing Company, Leasing Contact, Email, or any other column not listed above.")
     lines.append("- These fields contain pre-existing client data that should NEVER be changed based on email content.")
     lines.append("- Even if someone signs their email differently than the Leasing Contact field, DO NOT change it.")
@@ -401,11 +489,48 @@ def get_required_fields_for_close(column_config: Dict[str, Any]) -> List[str]:
     """
     Get the list of required fields for closing a conversation,
     translated to actual column names.
+
+    Includes both canonical required fields and custom required fields.
     """
     mappings = column_config.get("mappings", {})
-    required_canonicals = column_config.get("requiredFields", REQUIRED_FOR_CLOSE)
+    custom_fields = column_config.get("customFields", {})
+    required_canonicals = column_config.get("requiredFields", DEFAULT_REQUIRED_FOR_CLOSE)
 
-    return [mappings[c] for c in required_canonicals if c in mappings]
+    # Canonical fields translated to actual column names
+    required = [mappings[c] for c in required_canonicals if c in mappings]
+
+    # Custom fields with mode "ask_required"
+    for col_header, config in custom_fields.items():
+        if config.get("mode") == "ask_required":
+            required.append(col_header)
+
+    return required
+
+
+def get_all_extractable_columns(column_config: Dict[str, Any]) -> List[str]:
+    """
+    Get all columns that the AI can extract values for.
+
+    Includes canonical extractable fields + custom ask/accept fields.
+    """
+    mappings = column_config.get("mappings", {})
+    custom_fields = column_config.get("customFields", {})
+
+    # Canonical extractable fields
+    extractable = []
+    for canonical, actual_col in mappings.items():
+        if canonical in CANONICAL_FIELDS:
+            field = CANONICAL_FIELDS[canonical]
+            if field.get("extractable") and not field.get("is_formula"):
+                extractable.append(actual_col)
+
+    # Custom fields that are extractable
+    for col_header, config in custom_fields.items():
+        mode = config.get("mode", "skip")
+        if mode in ("ask_required", "ask_optional", "accept_only"):
+            extractable.append(col_header)
+
+    return extractable
 
 
 def translate_canonical_to_actual(canonical_name: str, column_config: Dict[str, Any]) -> Optional[str]:
