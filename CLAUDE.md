@@ -571,6 +571,18 @@ python3 tests/e2e_helpers.py clear
 
 ## E2E Test Cleanup Procedures
 
+### What Claude Does (Automated)
+- Clear `baylor.freelance@outlook.com` inbox/sent (via Graph API)
+- Delete campaign from Firebase (client, threads, indexes, notifications)
+
+### What User Does (Manual)
+- **Clear `bp21harrison@gmail.com`** - Delete test campaign emails from inbox/sent
+- **Clear `baylor@manifoldengineering.ai`** - Delete test campaign emails from inbox/sent
+
+**ALWAYS remind the user to clear their broker test accounts before starting a new E2E test.**
+
+---
+
 ### 1. Clear Outlook Mailbox (baylor.freelance@outlook.com)
 
 ```python
