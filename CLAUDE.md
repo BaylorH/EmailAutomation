@@ -569,6 +569,24 @@ python3 tests/e2e_helpers.py clear
 
 ---
 
+## ⚠️ E2E Testing Philosophy (CRITICAL - READ THIS)
+
+**The purpose of E2E tests is to verify NEW features work correctly, not just re-test existing functionality.**
+
+### When Setting Up E2E Tests:
+1. **Always include at least one NEW/untested variable** - If we just added support for "Parking Spaces", the E2E test MUST include Parking Spaces as a required or asked field
+2. **Test the feature you just built** - The whole point is verification. Don't test the same 6 standard fields every time.
+3. **Set new fields to "Ask" or "Required"** - This forces the AI to actually gather and populate the new field
+
+### Example:
+- We add support for a new column type "Parking Spaces"
+- E2E test MUST: Set Parking Spaces to "Ask" or "Required" in column config
+- E2E test verifies: AI recognizes the field, asks for it, extracts it from replies, populates the sheet
+
+**DO NOT just run the same test with the same standard fields over and over. E2E tests exist to verify NEW code paths.**
+
+---
+
 ## E2E Test Cleanup Procedures
 
 ### What Claude Does (Automated)
