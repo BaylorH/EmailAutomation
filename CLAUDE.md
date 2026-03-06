@@ -4,6 +4,22 @@
 
 ---
 
+## ⚠️ CRITICAL: Testing Account Information
+
+**DO NOT FORGET THIS. EVER.**
+
+| Role | Account | Notes |
+|------|---------|-------|
+| **Sending Account (Outbox)** | `baylor.freelance@outlook.com` | This is the ONLY account used for sending emails during development/testing |
+| **Test Broker 1** | `bp21harrison@gmail.com` | Simulates broker replies |
+| **Test Broker 2** | `baylor@manifoldengineering.ai` | Simulates broker replies |
+
+**The product is being built FOR Jill Ames (jill@mohrpartners.com), but ALL testing and development uses baylor.freelance@outlook.com as the sending account.**
+
+**NEVER reference jill@mohrpartners.com when discussing test setup, mailbox clearing, MSAL caches, or any hands-on testing activities.**
+
+---
+
 ## Project Overview
 
 **What is this?** An AI-powered commercial real estate email automation system that:
@@ -47,6 +63,37 @@
 ├── app.py                      # Flask server for OAuth & debug APIs
 └── Scrub Augusta GA.xlsx       # Test data file
 ```
+
+---
+
+## Accessing Outlook Inbox (IMPORTANT - READ THIS)
+
+**DO NOT reinvent Outlook access. Use the helper script:**
+
+```bash
+# List inbox messages
+python tests/outlook_helper.py inbox
+
+# List inbox for specific user
+python tests/outlook_helper.py inbox xG7jAeu8ceYVBhXQwDFRfvLmvpH2
+
+# Download attachments from a message
+python tests/outlook_helper.py attachments <msg_id>
+
+# List available user IDs
+python tests/outlook_helper.py users
+```
+
+**Default user:** `xG7jAeu8ceYVBhXQwDFRfvLmvpH2` (baylor.freelance@outlook.com)
+
+**How it works internally:**
+1. `download_token()` from `firebase_helpers.py` downloads MSAL token from Firebase Storage
+2. Token is stored at path: `msal_caches/{user_id}/msal_token_cache.bin`
+3. MSAL `ConfidentialClientApplication` uses the cached token
+4. `acquire_token_silent()` gets the access token
+5. Microsoft Graph API calls use the access token
+
+**NEVER do this manually. Always use `tests/outlook_helper.py`.**
 
 ---
 
@@ -518,6 +565,117 @@ python3 tests/e2e_helpers.py workflow
 
 # Clear all test data (DESTRUCTIVE)
 python3 tests/e2e_helpers.py clear
+```
+
+---
+
+## E2E Test Cleanup Procedures
+
+### 1. Clear Outlook Mailbox (baylor.freelance@outlook.com)
+
+```python
+# Run from EmailAutomation directory
+export $(cat .env | grep -v '^#' | xargs) && export GOOGLE_APPLICATION_CREDENTIALS=service-account.json && python3 << 'EOF'
+import requests
+from tests.outlook_helper import get_access_token
+
+token = get_access_token()
+headers = {"Authorization": f"Bearer {token}"}
+
+# Keywords to match campaign emails
+campaign_keywords = [
+    "industrial", "trade center", "st. josephs", "lottsford",
+    "randolph", "broad st", "center west", "commerce way",
+    "warehouse", "distribution", "logistics", "storage",
+    "augusta", "evans", "kuhlke", "gordon hwy"
+]
+
+folders = ['Inbox', 'SentItems']
+total_deleted = 0
+
+for _ in range(5):  # Multiple passes to clear all
+    for folder in folders:
+        resp = requests.get(
+            f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder}/messages",
+            headers=headers,
+            params={"$top": "100", "$select": "id,subject,from"}
+        )
+        for msg in resp.json().get("value", []):
+            subject = msg.get("subject", "").lower()
+            if any(kw in subject for kw in campaign_keywords):
+                requests.delete(f"https://graph.microsoft.com/v1.0/me/messages/{msg['id']}", headers=headers)
+                total_deleted += 1
+
+print(f"✅ Deleted {total_deleted} campaign emails")
+EOF
+```
+
+### 2. Delete Campaign from Firebase
+
+```python
+export $(cat .env | grep -v '^#' | xargs) && export GOOGLE_APPLICATION_CREDENTIALS=service-account.json && python3 << 'EOF'
+from google.cloud import firestore
+
+db = firestore.Client()
+user_id = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"  # baylor.freelance@outlook.com
+
+# Find and delete campaign
+clients = list(db.collection('users').document(user_id).collection('clients').stream())
+for client in clients:
+    client_id = client.id
+    name = client.to_dict().get('name', 'Unknown')
+    print(f"Deleting campaign: {name}")
+
+    # Delete threads
+    threads = db.collection('users').document(user_id).collection('threads').where('clientId', '==', client_id).stream()
+    for t in threads:
+        # Delete messages subcollection
+        msgs = db.collection('users').document(user_id).collection('threads').document(t.id).collection('messages').stream()
+        for m in msgs:
+            m.reference.delete()
+        t.reference.delete()
+
+    # Delete notifications
+    notifs = db.collection('users').document(user_id).collection('clients').document(client_id).collection('notifications').stream()
+    for n in notifs:
+        n.reference.delete()
+
+    # Delete outbox items
+    outbox = db.collection('users').document(user_id).collection('outbox').where('clientId', '==', client_id).stream()
+    for o in outbox:
+        o.reference.delete()
+
+    # Delete msgIndex entries
+    msg_index = db.collection('users').document(user_id).collection('msgIndex').stream()
+    for m in msg_index:
+        m.reference.delete()
+
+    # Delete convIndex entries
+    conv_index = db.collection('users').document(user_id).collection('convIndex').stream()
+    for c in conv_index:
+        c.reference.delete()
+
+    # Delete the client
+    client.reference.delete()
+    print(f"✅ Deleted campaign and all related data")
+EOF
+```
+
+### 3. Verify Clean State
+
+```bash
+# Check inbox is clean
+python3 tests/outlook_helper.py inbox
+
+# Check Firebase has no test data
+export $(cat .env | grep -v '^#' | xargs) && export GOOGLE_APPLICATION_CREDENTIALS=service-account.json && python3 -c "
+from google.cloud import firestore
+db = firestore.Client()
+user_id = 'NO7lVYVp6BaplKYEfMlWCgBnpdh2'
+clients = list(db.collection('users').document(user_id).collection('clients').stream())
+threads = list(db.collection('users').document(user_id).collection('threads').stream())
+print(f'Clients: {len(clients)}, Threads: {len(threads)}')
+"
 ```
 
 ---

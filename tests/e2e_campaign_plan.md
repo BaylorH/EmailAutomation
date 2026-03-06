@@ -18,6 +18,7 @@ This test simulates a complete campaign lifecycle from file upload to campaign c
 - [ ] Verify signature loads correctly (not "no signature configured")
 - [ ] Verify all 7 personalized emails generated
 - [ ] Verify [NAME] placeholder replaced with first names
+- [ ] **Configure follow-ups:** 3 follow-ups at 1 hour, 2 hours, 3 hours
 - [ ] Click "Start Campaign" - all 7 emails queued to outbox
 
 ### 1.3 Email Sending (Backend Workflow)
@@ -34,13 +35,15 @@ This test simulates a complete campaign lifecycle from file upload to campaign c
 
 | # | Property | Contact | Scenario | Turns | Tests |
 |---|----------|---------|----------|-------|-------|
-| 1 | 699 Industrial Park Dr | Jeff Wilson | Complete Info | 1 | Field extraction, row completion, closing email |
-| 2 | 135 Trade Center Court | Luke Coffey | Multi-Turn Complete | 2 | Partial → complete, multi-turn accumulation |
-| 3 | 2058 Gordon Hwy | Jonathan Aceves | Unavailable + Alt | 1 | property_unavailable event, new_property suggestion |
-| 4 | 1 Kuhlke Dr | Robert McCrary | Escalation → Resume | 2 | needs_user_input, user reply, completion |
+| 1 | 699 Industrial Park Dr | Jeff Wilson | Complete Info + Custom Field | 1 | Field extraction, **Parking Spaces custom column**, row completion, closing email |
+| 2 | 135 Trade Center Court, Augusta GA | Luke Coffey | **REAL** Complete + Call Offer | 1 | Real PDFs, floorplan detection, call_requested escalation |
+| 3 | 2017 St. Josephs Drive, Bowie MD | Brian Greene | **REAL** Unavailable + Alt | 1 | property_unavailable, new_property with URL |
+| 4 | 9300 Lottsford Rd, Largo MD | Craig Cheney | **REAL** Confidentiality Question | 2 | needs_user_input:confidential escalation |
 | 5 | 1 Randolph Ct | Scott Atkins | Wrong Contact | 1 | wrong_contact event, redirect handling |
 | 6 | 1800 Broad St | Marcus Thompson | Property Issue | 1 | property_issue event, severity detection |
 | 7 | 2525 Center West Pkwy | Lisa Anderson | Close Conversation | 1 | close_conversation event, exclusive scenario |
+
+**Note:** Scenarios 2, 3, 4 use REAL broker responses forwarded by Jill Ames from production emails.
 
 ---
 
@@ -73,155 +76,175 @@ Jeff Wilson
 
 **Expected Results:**
 - [ ] Sheet updates: Total SF=45000, Rent/SF=6.75, Ops Ex=1.85, Docks=4, Drive Ins=2, Ceiling Ht=28, Power=1200 amps 480V 3-phase
+- [ ] **Custom field: Parking Spaces=85** (tests dynamic column extraction)
 - [ ] Notification: `row_completed`
 - [ ] AI sends closing/thank you email
 - [ ] Row marked complete
 
 ---
 
-### Scenario 2: Multi-Turn Complete (135 Trade Center Court)
-**Goal:** Test partial info → follow-up → completion across 2 turns
+### Scenario 2: REAL - Complete Info + Call Offer (135 Trade Center Court, Augusta GA)
+**Goal:** Test real broker response with PDFs and call offer detection
+**Source:** Jill Ames forwarded email from Luke Coffey, May 2025
 
-**Turn 1 - Broker Reply:**
+**Turn 1 - REAL Broker Reply:**
 ```
-From: bp21harrison@gmail.com
-Subject: Re: 135 Trade Center Court - Space Availability
+From: Luke.Coffey@southeastern.company
+Subject: Re: 135 Trade Center Court, Augusta, GA
 
-Hi Jill,
+Good Morning Jill,
 
-Yes, 135 Trade Center Court is available. It's 32,500 SF total with 6 dock doors and 2 drive-ins.
+This would certainly be a great fit here. Please see attached Building C & D plans.
+We are asking $15/SF/NNN and we anticipate a delivery of July 1, 2025; building A is almost complete.
 
-I need to check on the other specs - will get back to you.
+More than happy to jump on a call to discuss at your convenience. Just let me know what works best for you.
 
-Luke
-```
-
-**Expected Results (Turn 1):**
-- [ ] Sheet updates: Total SF=32500, Docks=6, Drive Ins=2
-- [ ] Notification: `sheet_update` (multiple)
-- [ ] AI sends follow-up requesting: Ops Ex, Ceiling Ht, Power
-- [ ] Row NOT complete (missing fields)
-
-**Turn 2 - Broker Reply:**
-```
-From: bp21harrison@gmail.com
-Subject: Re: 135 Trade Center Court - Space Availability
-
-Hey Jill,
-
-Here's the rest of the info:
-- NNN/CAM is $2.10/SF
-- Clear height is 24 feet
-- 800 amp 3-phase service
-
-Let me know if you need anything else!
-
-Luke
+Luke Coffey
+Sales Associate
+Southeastern
+p: (706)-854-6731
+c: (651)-271-8098
 ```
 
-**Expected Results (Turn 2):**
-- [ ] Sheet updates: Ops Ex=2.10, Ceiling Ht=24, Power=800 amps 3-phase
-- [ ] Notification: `row_completed`
-- [ ] AI sends closing email
-- [ ] Row marked complete
+**Attachments (REAL PDFs in test_pdfs/real_world/):**
+- `Sealed Bldg C 10-24-23.pdf` (2.8MB) → Floorplan column
+- `Sealed Bldg D 10-24-23.pdf` (2.9MB) → Floorplan column
+- `135 Trade Center Court - Brochure.pdf` (804KB) → Flyer/Link column
+
+**Expected Results:**
+- [ ] Sheet updates: Rent/SF=15, Ops Ex=NNN
+- [ ] PDF categorization: 2 files to Floorplan, 1 to Flyer/Link
+- [ ] Event: `call_requested` (broker offered to "jump on a call")
+- [ ] Notification: `action_needed` with call request
+- [ ] NO auto-reply (paused for user to schedule call)
+- [ ] Row NOT complete yet (missing SF, docks, ceiling, power)
 
 ---
 
-### Scenario 3: Unavailable + New Property (2058 Gordon Hwy)
-**Goal:** Test property_unavailable event AND new_property suggestion flow
+### Scenario 3: REAL - Unavailable + New Property (2017 St. Josephs Drive, Bowie MD)
+**Goal:** Test real property_unavailable + new_property suggestion with website URL
+**Source:** Jill Ames forwarded email from Brian Greene, August 2025
+**Property Name:** Woodmore Commons
 
-**Turn 1 - Broker Reply:**
+**Turn 1 - REAL Broker Reply (initial):**
 ```
-From: baylor@manifoldengineering.ai
-Subject: Re: 2058 Gordon Hwy - Industrial Space
+From: bg@hp-llc.com
+Subject: Re: Woodmore Commons - 2017 St. Josephs Drive, Bowie, MD
 
-Hi Jill,
+Hi Jill. I'm sorry but we are already at lease for this space, and it's our last one.
+We also have an anchor restriction on fitness concepts.
 
-Unfortunately 2058 Gordon Hwy just went under contract last week - sorry about that!
+Thank you,
+Brian Greene
+EVP
+```
 
-However, I have another property that might work for your client - 3100 Peach Orchard Rd. It's a similar size warehouse, about 38,000 SF with good dock access. My colleague Sarah Chen handles that listing - you can reach her at sarah@meybohm.com.
+**Turn 2 - Follow-up (Jill asked for alternatives):**
+```
+From: bg@hp-llc.com
+Subject: Re: Woodmore Commons - 2017 St. Josephs Drive, Bowie, MD
 
-Let me know if you'd like an introduction.
+Hi Jill. Below is the only current space we have and is about 10 miles from Woodmore.
 
-Jonathan
+https://www.hp-llc.com/the-centre-at-forestville
+
+Brian Greene
+EVP OF LEASING
+703-725-1351
+www.hp-llc.com
 ```
 
 **Expected Results:**
-- [ ] Event: `property_unavailable`
-- [ ] Event: `new_property` with address="3100 Peach Orchard Rd", contactName="Sarah Chen", contactEmail="sarah@meybohm.com"
+- [ ] Event: `property_unavailable` (already at lease + anchor restriction)
+- [ ] Event: `new_property` with URL: https://www.hp-llc.com/the-centre-at-forestville
+- [ ] New property name: "The Centre at Forestville" (~10 miles from original)
 - [ ] Notification: `property_unavailable`
 - [ ] Notification: `action_needed` (new_property_pending_approval)
 - [ ] Row moved below NON-VIABLE divider
-- [ ] **UI Test:** NewPropertyRequestModal appears with pre-filled data
-- [ ] **UI Test:** User can approve/reject the new property suggestion
+- [ ] **UI Test:** NewPropertyRequestModal with property URL
+- [ ] **Future:** Web scraping to extract property data from URL
 
 ---
 
-### Scenario 4: Escalation → User Reply → Complete (1 Kuhlke Dr)
-**Goal:** Test needs_user_input escalation, thread pause, user intervention, and resume
+### Scenario 4: REAL - Confidentiality Question (9300 Lottsford Rd, Largo MD)
+**Goal:** Test needs_user_input:confidential escalation - AI must NOT reveal client identity
+**Source:** Jill Ames forwarded email from Craig Cheney, August 2025
+**Property Name:** The Tapestry
 
-**Turn 1 - Broker Reply:**
+**Turn 1 - REAL Broker Reply:**
 ```
-From: baylor@manifoldengineering.ai
-Subject: Re: 1 Kuhlke Dr - Warehouse Space
+From: ccheney@KLNB.com
+Cc: awillner@klnb.com
+Subject: RE: The Tapestry - 9300 Lottsford Rd, Largo MD
 
 Hi Jill,
 
-I'd be happy to provide details on 1 Kuhlke Dr. Before I do, can you tell me a bit about your client's business? What type of operation are they running and what's their timeline for moving in?
+There is plenty of free retail parking on the first level of the garage.
+Attached is a JPG where I highlighted the floor plan of the 1,400 SF space.
+This was taken from page 4 of the attached PDF.
+Please let us know what else you need.
 
-Also, what's their budget range for the space?
+By the way, what franchise is it that you are working with?
 
 Thanks,
-Robert McCrary
+Craig S. Cheney
+O: 703-268-2705 | C: 703-399-1041
+KLNB Commercial Real Estate Services
 ```
+
+**Attachments (REAL PDFs in test_pdfs/real_world/):**
+- `Tapestry Largo Station Retail Floor Plan.pdf` (5.1MB) → Floorplan column
+- `1400 SF Floor Plan-Highlighted.jpg` (image)
+
+**CRITICAL:** Jill asked "Can the A.I. Auto respond to that?" - Answer is **NO**.
+The question "what franchise is it?" is asking about client identity = CONFIDENTIAL.
 
 **Expected Results (Turn 1):**
-- [ ] Event: `needs_user_input` with reason `client_question`
-- [ ] Notification: `action_needed` with meta showing the questions
-- [ ] NO auto-reply sent (thread paused)
-- [ ] **UI Test:** Notification sidebar shows action needed
-- [ ] **UI Test:** Clicking notification opens chat interface
-- [ ] **UI Test:** User composes reply via AI chat or manual edit
+- [ ] Sheet updates: Total SF=1400, Notes="free retail parking on first level"
+- [ ] PDF: Floor Plan → Floorplan column
+- [ ] Event: `needs_user_input` with reason `confidential`
+- [ ] Notification: `action_needed` with subreason "confidential"
+- [ ] **NO auto-reply sent** (thread paused)
+- [ ] **UI Test:** Notification shows "Broker asked about client identity"
+- [ ] **UI Test:** User must compose reply manually
 
 **Turn 2 - User Reply (via Frontend):**
-User composes reply through the UI:
+User composes reply (deciding how much to disclose):
 ```
-Hi Robert,
+Hi Craig,
 
-My client is in the distribution business and looking to move within the next 3-4 months. They're flexible on budget - mainly focused on finding the right space with good loading access.
+Thanks for the floor plan! The parking situation sounds perfect.
 
-Could you share the property specs when you get a chance?
+My client is in the quick-service restaurant space. Could you provide the remaining specs like ceiling height, power, and any NNN/CAM costs?
 
 Thanks,
 Jill
 ```
 
-- [ ] **UI Test:** User clicks "Send Email" in modal
-- [ ] Outbox entry created
-- [ ] Workflow sends the email
-- [ ] Thread resumes
+- [ ] Outbox entry created by user
+- [ ] Thread resumes after user sends
 
-**Turn 3 - Broker Reply:**
+**Turn 3 - Broker completes info:**
 ```
-From: baylor@manifoldengineering.ai
-Subject: Re: 1 Kuhlke Dr - Warehouse Space
+From: ccheney@KLNB.com
+Subject: RE: The Tapestry - 9300 Lottsford Rd, Largo MD
 
-Perfect, that helps! Here's the info on 1 Kuhlke Dr:
+Great! QSR tenants do well here with the foot traffic.
 
-- 28,000 SF
-- $5.50/SF NNN
-- $1.75 CAM
-- 3 dock doors, 1 drive-in
-- 22' clear
-- 400 amps
+Here are the specs:
+- NNN: $12.50/SF
+- Clear height: 14'
+- 200 amp service
+- No dock doors (retail)
+- 1 rear entrance (drive-in equivalent)
 
-Great loading access - perfect for distribution. Available in 60 days.
+Let me know if you'd like to schedule a tour.
 
-Robert
+Craig
 ```
 
 **Expected Results (Turn 3):**
-- [ ] Sheet updates: All fields populated
+- [ ] Sheet updates: Ops Ex=12.50, Ceiling Ht=14, Power=200 amps, Drive Ins=1, Docks=0
 - [ ] Notification: `row_completed`
 - [ ] AI sends closing email
 - [ ] Row complete
@@ -326,9 +349,9 @@ After all turns complete:
 | Property | Status | Expected State |
 |----------|--------|----------------|
 | 699 Industrial Park Dr | Complete | All fields filled, row complete |
-| 135 Trade Center Court | Complete | All fields filled (after 2 turns) |
-| 2058 Gordon Hwy | Non-Viable | Moved below divider |
-| 1 Kuhlke Dr | Complete | All fields filled (after escalation) |
+| 135 Trade Center Court, Augusta GA | Action Needed | Call offer - awaiting user to schedule |
+| 2017 St. Josephs Drive, Bowie MD | Non-Viable | Moved below divider, new property suggested |
+| 9300 Lottsford Rd, Largo MD | Complete | All fields filled (after confidential escalation) |
 | 1 Randolph Ct | Action Needed | Wrong contact, pending user action |
 | 1800 Broad St | Action Needed | Property issue flagged |
 | 2525 Center West Pkwy | Closed | Conversation ended (exclusive) |
@@ -338,15 +361,16 @@ Expected notifications by end of test:
 
 | Type | Count | Properties |
 |------|-------|------------|
-| `row_completed` | 3 | 699 Industrial, 135 Trade Center, 1 Kuhlke |
+| `row_completed` | 2 | 699 Industrial, 9300 Lottsford (The Tapestry) |
 | `sheet_update` | Multiple | Various field updates |
-| `property_unavailable` | 1 | 2058 Gordon Hwy |
-| `action_needed` | 4 | New property, escalation, wrong contact, property issue |
+| `property_unavailable` | 1 | 2017 St. Josephs (Woodmore Commons) |
+| `action_needed` | 4 | Call offer (135 Trade), new property, confidential question, wrong contact, property issue |
 | `conversation_closed` | 1 | 2525 Center West |
 
 ### 3.3 Campaign Completion
-- [ ] 3 rows complete (required fields filled)
+- [ ] 2 rows complete (required fields filled)
 - [ ] 1 row non-viable
+- [ ] 3 rows action needed (call, confidential, wrong contact, issue)
 - [ ] 3 rows requiring user attention
 - [ ] Campaign NOT auto-marked complete (pending items exist)
 
