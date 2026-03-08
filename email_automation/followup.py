@@ -346,12 +346,16 @@ def _send_followup_email(
             reply_draft = create_reply_resp.json()
             reply_draft_id = reply_draft.get("id")
 
-            # Update draft body
+            # Update draft body AND set correct recipient
+            # (createReply on sent messages doesn't auto-populate toRecipients correctly)
             exponential_backoff_request(
                 lambda: requests.patch(
                     f"{base}/me/messages/{reply_draft_id}",
                     headers=headers,
-                    json={"body": {"contentType": "HTML", "content": html_content}},
+                    json={
+                        "body": {"contentType": "HTML", "content": html_content},
+                        "toRecipients": [{"emailAddress": {"address": recipient}}]
+                    },
                     timeout=30
                 )
             )
@@ -379,8 +383,10 @@ def _send_followup_email(
             )
         else:
             # No attachments - use simple reply endpoint
+            # Must explicitly set toRecipients since we're replying to our own sent message
             reply_body = {
                 "message": {
+                    "toRecipients": [{"emailAddress": {"address": recipient}}],
                     "body": {
                         "contentType": "HTML",
                         "content": html_content
