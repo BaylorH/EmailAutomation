@@ -1116,10 +1116,14 @@ Thanks!"""
                     # Move row below divider and create notification
                     message_content = _full_text.lower()
                     unavailable_keywords = [
-                        "no longer available", "not available", "off the market", 
+                        "no longer available", "not available", "off the market",
                         "has been leased", "space is leased", "property is unavailable",
-                        "building unavailable", "no longer considering", "isnt available", 
-                        "isn't available", "unavailable", "off market"
+                        "building unavailable", "no longer considering", "isnt available",
+                        "isn't available", "unavailable", "off market",
+                        # Contract/lease status keywords
+                        "under contract", "went under contract", "already leased",
+                        "just leased", "pending lease", "contract pending",
+                        "accepted an offer", "lease signed", "taken off market"
                     ]
                     
                     # Only proceed if we find explicit unavailability language
