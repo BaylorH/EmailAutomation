@@ -1148,14 +1148,25 @@ Thanks!"""
                             # Sync thread rowNumbers after row movement to prevent stale anchors
                             sync_thread_row_numbers_after_move(user_id, rownum, divider_row, new_rownum)
 
-                            # Add comment to "Jill and Clients comments" column explaining why it was marked unviable
+                            # Add comment to comments column explaining why it was marked unviable
+                            # Prefer "Listing Brokers Comments", fallback to "Jill and Clients Comments"
                             try:
                                 # Find the comments column index
                                 comments_col_idx = None
                                 for i, col_name in enumerate(header):
-                                    if col_name and "jill and clients comments" in col_name.lower():
+                                    col_lower = (col_name or "").lower().strip()
+                                    # First priority: Listing Brokers Comments
+                                    if "listing brokers comments" in col_lower or "listing broker comments" in col_lower:
                                         comments_col_idx = i + 1  # 1-based for Sheets API
                                         break
+
+                                # Fallback: Jill and Clients Comments
+                                if comments_col_idx is None:
+                                    for i, col_name in enumerate(header):
+                                        col_lower = (col_name or "").lower().strip()
+                                        if "jill and clients comments" in col_lower:
+                                            comments_col_idx = i + 1
+                                            break
                                 
                                 if comments_col_idx:
                                     # Get current date for the comment
@@ -1190,7 +1201,7 @@ Thanks!"""
                                     
                                     print(f"💬 Added unavailability comment: {unavailable_comment}")
                                 else:
-                                    print(f"⚠️ Could not find 'Jill and Clients comments' column to add unavailability reason")
+                                    print(f"⚠️ Could not find comments column (Listing Brokers Comments or Jill and Clients Comments) to add unavailability reason")
                             except Exception as comment_error:
                                 print(f"⚠️ Failed to add unavailability comment: {comment_error}")
                             
@@ -1333,8 +1344,10 @@ Thanks!"""
                         # Use the specific contact email if AI provided one, otherwise use the current sender
 
                         # Build personalized greeting and intro
+                        # Extract first name only for email greeting (full name is stored in sheet)
                         if new_contact_name:
-                            greeting = f"Hi {new_contact_name},"
+                            first_name = new_contact_name.split()[0]
+                            greeting = f"Hi {first_name},"
                         else:
                             greeting = "Hi,"
 
@@ -1382,7 +1395,7 @@ Thanks!""",
                                 "leasingCompany": leasing_company,
                                 "leasingContact": leasing_contact,
                                 "brokerEmail": new_property_email,  # Email for the new property contact
-                                "contactName": new_contact_name,  # Extracted name (e.g., "Joe" from "email Joe at...")
+                                "contactName": new_contact_name,  # Extracted full name (e.g., "Joe Smith" from "email Joe Smith at...")
                                 "referrerName": referrer_name if is_different_contact else "",  # Who suggested this contact
                                 "isDifferentContact": is_different_contact,  # Flag for frontend to know context
                                 "sheetId": sheet_id,

@@ -514,20 +514,22 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • If mentioning "forestville", "centre", "woodmore" or other location names different from TARGET, this likely indicates new_property
   • Extract the property identifier (address, name, or URL) as the "address" field
   • Try to infer city/location from context or URL
-  • IMPORTANT: If a DIFFERENT contact person is mentioned (e.g., "email Joe at joe@email.com", "contact Sarah", "reach out to Mike"):
-    - Extract the contact NAME as "contactName" (e.g., "Joe", "Sarah", "Mike")
+  • IMPORTANT: If a DIFFERENT contact person is mentioned (e.g., "email Joe Smith at joe@email.com", "contact Sarah Jones", "reach out to Mike Brown"):
+    - Extract the contact FULL NAME as "contactName" (e.g., "Joe Smith", "Sarah Jones", "Mike Brown")
+    - If only first name is available, use just the first name
     - Extract their email as "email" field
-  • The contactName is CRITICAL for personalized outreach - extract first name when available
+  • The contactName is CRITICAL for personalized outreach - extract the full name when available, first name if that's all you have
 
 - "call_requested": Only when someone explicitly asks for a call/phone conversation. Use this event (NOT needs_user_input) for phone call requests.
 
-- "close_conversation": When the broker ends the conversation but the property isn't truly unavailable. Use this instead of property_unavailable when:
-  • "Going exclusive" with another party/tenant rep
-  • Already have a deal/tenant lined up ("likely signing next week", "in negotiations with someone")
-  • Broker declines to continue without making property unavailable ("can't help right now", "not a good fit")
-  • Natural conversation ending ("thanks for reaching out", "good luck with your search")
-  IMPORTANT: Do NOT emit response_email for close_conversation - the conversation is OVER.
-  Use "notes" to capture reason: "exclusive_with_another", "deal_pending", "not_a_fit", "natural_end"
+- "close_conversation": Emit when the conversation should end. Use in these situations:
+  • ALL REQUIRED FIELDS ARE COMPLETE (MISSING REQUIRED FIELDS is empty) - emit with notes "all_info_gathered"
+  • "Going exclusive" with another party/tenant rep - notes "exclusive_with_another"
+  • Already have a deal/tenant lined up ("likely signing next week", "in negotiations with someone") - notes "deal_pending"
+  • Broker declines to continue without making property unavailable ("can't help right now", "not a good fit") - notes "not_a_fit"
+  • Natural conversation ending ("thanks for reaching out", "good luck with your search") - notes "natural_end"
+  IMPORTANT: When emitting close_conversation with "all_info_gathered", you SHOULD include a brief closing response_email thanking them.
+  For other close_conversation reasons, do NOT emit response_email - the conversation is OVER.
 
 - "tour_requested": Emit when broker offers or requests a property tour/showing. This is DIFFERENT from needs_user_input.
   • Look for: "schedule a tour", "would you like to see it", "happy to show you", "can arrange a tour",
@@ -695,12 +697,18 @@ SCENARIOS:
    Thanks."
 
    IMPORTANT:
+   - ONLY request fields that are in the MISSING REQUIRED FIELDS list provided above
+   - NEVER request fields that are NOT in the missing required fields list
    - NEVER request "Rent/SF /Yr" - this field should never be asked for
    - NEVER request "Gross Rent" - this is a formula column that calculates automatically
    - Keep it short and concise
    - End with a simple "Thanks" - do NOT use "Looking forward to your response" or similar phrases
-   
-2. All fields complete: Thank them and indicate you have everything needed
+
+2. All required fields complete (MISSING REQUIRED FIELDS is empty):
+   - Send a brief closing email thanking them for the information
+   - Indicate you have everything you need and will review with your client
+   - DO NOT ask for any additional information - the conversation is complete
+   - EXAMPLE: "Thanks for all the details on [property]. I have everything I need and will go over this with my client. I'll be in touch if we have any questions."
 3. Property unavailable + new property suggested: Thank them for both pieces of information
 4. Property unavailable (no alternative): Thank them and ask if they have other properties
 5. Call requested:
@@ -804,7 +812,7 @@ OUTPUT ONLY valid JSON in this exact format:
       "address": "<for new_property: extract property name, address, or identifier>",
       "city": "<for new_property: infer city/location if possible>",
       "email": "<for new_property if different email/contact needed>",
-      "contactName": "<for new_property: first name of the new contact if mentioned, e.g., 'Joe' from 'email Joe at joe@email.com'>",
+      "contactName": "<for new_property: full name of the new contact if mentioned, e.g., 'Joe Smith' from 'email Joe Smith at joe@email.com'. Use first name only if that's all available>",
       "link": "<for new_property: include URL if mentioned>",
       "notes": "<for new_property: additional context about the property>",
       "reason": "<for needs_user_input: client_question | scheduling | negotiation | confidential | legal_contract | unclear> OR <for contact_optout: not_interested | unsubscribe | do_not_contact | no_tenant_reps | direct_only | hostile> OR <for wrong_contact: no_longer_handles | wrong_person | forwarded | left_company>",
