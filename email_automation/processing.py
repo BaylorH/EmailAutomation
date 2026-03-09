@@ -835,6 +835,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 if flyer_links:
                     append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
 
+                # Delay between writes to avoid Google Sheets API rate limits
+                if flyer_links and floorplan_links:
+                    print("   ⏳ Waiting 30s before next sheet write to avoid rate limits...")
+                    time.sleep(30)
+
                 if floorplan_links:
                     append_links_to_floorplan_column(sheets, sheet_id, header, rownum, floorplan_links)
 
