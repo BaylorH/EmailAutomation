@@ -1,380 +1,350 @@
-# E2E Test Plan - Production Readiness Evaluation
+# E2E Test Plan - March 2026 (Updated)
 
-**Date:** March 2026
-**Test File:** `test_pdfs/E2E_Test_Augusta.xlsx`
-**Follow-up Config:** 3 follow-ups (2 min, 3 min, 2 min)
+**Date:** March 9, 2026
+**Test File:** Create new Excel with 5 properties
+**Follow-up Config:** 2 follow-ups, 2 minutes each (for quick testing)
+
+---
+
+## Recent Bug Fixes to Verify
+
+| Fix | What to Test |
+|-----|--------------|
+| **AI closes when required fields complete** | Should send closing email, NOT ask for optional fields |
+| **Pending reply shows right side + signature** | Reply queued should appear right-aligned with signature |
+| **Status column first with chevron** | Table layout: Status → Name → Last Updated → Open |
+| **Action count badge** | Shows action_needed count only, not total notifications |
+| **Completed Campaigns header stat** | Shows count of clients with row_completed |
+| **Full name to sheet, first name in email** | New property: sheet gets "Joe Smith", email says "Hi Joe," |
+| **Unavailable reason to comments column** | Writes to "Listing Brokers Comments" column |
+
+---
+
+## Test Configuration
+
+### Create Excel File with These Rows:
+
+| Row | Property Address | City | Leasing Contact | Email |
+|-----|------------------|------|-----------------|-------|
+| 3 | 100 Complete Info Dr | Augusta | Tom Wilson | bp21harrison@gmail.com |
+| 4 | 200 Partial Info Ln | Augusta | Sarah Miller | bp21harrison@gmail.com |
+| 5 | 300 Unavailable Way | Augusta | Mike Chen | bp21harrison@gmail.com |
+| 6 | 400 New Property Ct | Augusta | Brian Greene | bp21harrison@gmail.com |
+| 7 | 500 Confidential Blvd | Augusta | James Roberts | bp21harrison@gmail.com |
+
+### Campaign Settings:
+- **Follow-ups:** Enabled
+- **Count:** 2 follow-ups
+- **Timing:** 2 minutes each
+
+---
+
+## Phase 1: Campaign Launch
+
+### Actions:
+1. Create new client with above Excel
+2. Start campaign with follow-up settings
+
+### Check Immediately:
+- [ ] **UI:** Status column is FIRST column (chevron + button)
+- [ ] **UI:** 5 pending emails in conversation panel
+- [ ] **UI:** Can expand pending email to see content
+- [ ] **UI:** Expanded pending shows email signature
+- [ ] **UI:** "Completed Campaigns" stat in header
+- [ ] **UI:** "Actions Needed" stat next to "Your Clients"
+
+---
+
+## Phase 2: Broker Replies
+
+**Wait for emails to send, then send these replies from bp21harrison@gmail.com:**
+
+---
+
+### Reply 1: Complete Info (100 Complete Info Dr)
+
+**Subject:** Re: 100 Complete Info Dr, Augusta
+
+**Email Body:**
+```
+Hi Jill,
+
+Happy to help with 100 Complete Info Dr. Here are the details:
+
+- Total SF: 45,000
+- Ops Ex/SF: $2.50 NNN
+- Drive-ins: 2
+- Docks: 4
+- Ceiling Height: 28' clear
+- Power: 2000 amps, 480V
+
+Let me know if you need anything else.
+
+Best,
+Tom
+```
+
+**Expected AI Behavior:**
+- Extracts all 6 required fields to sheet
+- Sends closing email like: "Thanks for all the details... I have everything I need..."
+- Emits `close_conversation` event with notes `all_info_gathered`
+- **CRITICAL:** Does NOT ask for Rent, Flyer, or any other optional fields
+
+**Check in UI:**
+- [ ] Thread marked as "Completed" (green badge)
+- [ ] `row_completed` notification appears inline
+- [ ] No "Stop" button (conversation complete)
+- [ ] Completed Campaigns stat increments
+
+**Check in Sheet:**
+- [ ] All 6 fields populated
+- [ ] Row NOT moved (still viable)
+
+---
+
+### Reply 2: Partial Info (200 Partial Info Ln)
+
+**Subject:** Re: 200 Partial Info Ln, Augusta
+
+**Email Body:**
+```
+Hi Jill,
+
+For 200 Partial Info Ln:
+- Total SF: 32,000
+- Docks: 3
+- Ceiling: 24'
+
+I'll get you the rest soon.
+
+Thanks,
+Sarah
+```
+
+**Expected AI Behavior:**
+- Extracts Total SF, Docks, Ceiling Ht to sheet
+- Sends reply asking ONLY for: Ops Ex/SF, Drive-ins, Power
+- **CRITICAL:** Does NOT ask for Rent/SF, Gross Rent, or Flyer
+
+**Check in UI:**
+- [ ] Thread shows "Active" (yellow badge)
+- [ ] "Awaiting Response" badge visible
+- [ ] sheet_update notifications appear inline
+- [ ] Pending AI reply visible (right-aligned with signature)
+
+**Check in Sheet:**
+- [ ] Total SF, Docks, Ceiling Ht populated
+- [ ] Other required fields still empty
+
+---
+
+### Reply 2b: Complete Remaining (200 Partial Info Ln)
+
+**Subject:** Re: 200 Partial Info Ln, Augusta
+
+**Email Body:**
+```
+Hi Jill,
+
+Here's the rest for 200 Partial Info Ln:
+- Ops Ex: $1.85/SF
+- Drive-ins: 1
+- Power: 1200 amps
+
+Sarah
+```
+
+**Expected AI Behavior:**
+- Extracts remaining 3 fields
+- Sends closing email
+- Emits `close_conversation` with `all_info_gathered`
+
+**Check in UI:**
+- [ ] Thread now "Completed"
+- [ ] `row_completed` notification appears
+
+---
+
+### Reply 3: Unavailable (300 Unavailable Way)
+
+**Subject:** Re: 300 Unavailable Way, Augusta
+
+**Email Body:**
+```
+Hi Jill,
+
+Unfortunately 300 Unavailable Way just went under contract last week. We're expecting to close by end of month.
+
+Do you want me to send you info on some other properties we have available?
+
+Thanks,
+Mike
+```
+
+**Expected AI Behavior:**
+- Emits `property_unavailable` event
+- Writes reason to "Listing Brokers Comments" column
+- Row moves below NON-VIABLE divider
+- May send reply asking about alternatives
+
+**Check in UI:**
+- [ ] `property_unavailable` notification appears inline
+
+**Check in Sheet:**
+- [ ] Row moved below NON-VIABLE divider
+- [ ] "Listing Brokers Comments" column contains reason (e.g., "under contract")
+
+---
+
+### Reply 4: New Property (400 New Property Ct)
+
+**Subject:** Re: 400 New Property Ct, Augusta
+
+**Email Body:**
+```
+Hi Jill,
+
+400 New Property Ct is no longer available, but I have a great alternative for you:
+
+550 Better Option Dr in Augusta - 50,000 SF warehouse with 6 docks.
+Contact Joe Smith at joe.smith@realestate.com for details.
+
+Let me know if you'd like me to make an introduction.
+
+Brian
+```
+
+**Expected AI Behavior:**
+- Emits `property_unavailable` for 400 New Property Ct
+- Emits `new_property` event with:
+  - address: "550 Better Option Dr"
+  - city: "Augusta"
+  - email: "joe.smith@realestate.com"
+  - contactName: "Joe Smith" (FULL NAME)
+
+**Check in UI:**
+- [ ] InlineNewPropertyCard appears in conversation
+- [ ] Card shows property details
+- [ ] "Approve & Send" and "Dismiss" buttons visible
+- [ ] Status column shows "New Property" button
+
+**Action:** Click "Approve & Send"
+
+**Check After Approval:**
+- [ ] New row in sheet for 550 Better Option Dr
+- [ ] Leasing Contact column: "Joe Smith" (FULL NAME)
+- [ ] Email greeting: "Hi Joe," (FIRST NAME ONLY)
+- [ ] Pending email appears in conversation (right side, with signature)
+
+---
+
+### Reply 5: Confidential Question (500 Confidential Blvd)
+
+**Subject:** Re: 500 Confidential Blvd, Augusta
+
+**Email Body:**
+```
+Hi Jill,
+
+Before I send over the details on 500 Confidential Blvd, can you tell me who your client is and what size they're looking for?
+
+Thanks,
+James
+```
+
+**Expected AI Behavior:**
+- Emits `needs_user_input` with subreason `confidential`
+- Does NOT send auto-reply
+- Thread paused
+
+**Check in UI:**
+- [ ] Thread shows "Paused" (orange badge)
+- [ ] InlineReplyComposer appears at bottom of thread
+- [ ] Status column shows "Input Needed" button
+- [ ] Action count badge shows count (not total notifications)
+
+**Action:** Click "Input Needed" status button
+
+**Check:**
+- [ ] Conversation panel expands
+- [ ] Auto-scrolls to InlineReplyComposer
+- [ ] Can type and send reply
+
+**Action:** Send a reply
+
+**Check After Send:**
+- [ ] Panel stays open (doesn't collapse)
+- [ ] Pending reply appears in thread (right side)
+- [ ] Pending reply shows signature
+
+---
+
+## Phase 3: UI Verification Summary
+
+### Table Layout:
+- [ ] Columns in order: Status (with chevron) | Name | Last Updated | Open
+
+### Status Column:
+- [ ] Chevron icon to left of status button
+- [ ] Notification count badge is subtle (not button-styled)
+- [ ] Badge shows action_needed count only
+
+### Header Stats:
+- [ ] First card: "Completed Campaigns" (count of clients with row_completed)
+- [ ] Second card: "Properties Completed"
+- [ ] Third card: "Sheet Updates"
+
+### Your Clients Stats:
+- [ ] First card: "Active Clients"
+- [ ] Second card: "Actions Needed"
+
+### Pending Messages:
+- [ ] Display on RIGHT side (outbound style)
+- [ ] Show email signature
+- [ ] Have dashed purple border
+
+---
+
+## Success Criteria
+
+### Backend (AI Processing):
+- [ ] Only asks for REQUIRED fields (Total SF, Ops Ex, Drive-ins, Docks, Ceiling, Power)
+- [ ] Sends closing email when required fields complete
+- [ ] Emits `close_conversation` with "all_info_gathered"
+- [ ] Does NOT ask for optional fields (Rent, Flyer, etc.)
+- [ ] Writes unavailable reason to Listing Brokers Comments
+- [ ] New property: full name to sheet, first name in email
+
+### Frontend (UI):
+- [ ] Status column is first with chevron
+- [ ] Pending replies right-aligned with signature
+- [ ] Action count shows action_needed only
+- [ ] Completed Campaigns stat works
+- [ ] Inline composers work in conversation panel
+- [ ] Click action → expand + scroll to action
+- [ ] Panel stays open after send
+
+---
+
+## Test Accounts
+
+| Role | Email |
+|------|-------|
+| Outbound (Jill) | jill@mohrpartners.com |
+| Broker replies | bp21harrison@gmail.com |
+| Alt broker | baylor@manifoldengineering.ai |
 
 ---
 
 ## Quick Commands
 
 ```bash
-# Status check
+# Check status
 python tests/e2e_helpers.py status
 
-# Trigger workflow
-python tests/e2e_helpers.py trigger
+# Trigger scheduler manually
+python main.py
 
-# Check workflow status
-python tests/e2e_helpers.py workflow
-
-# Clear all data
-python tests/e2e_helpers.py clear
-```
-
----
-
-## Test Data Matrix
-
-### Properties & Contacts
-
-| # | Property | Contact | Email | Test Scenario |
-|---|----------|---------|-------|---------------|
-| 1 | 100 Commerce Way | Tom Wilson | bp21harrison@gmail.com | Complete with PDFs |
-| 2 | 200 Industrial Blvd | Sarah Miller | bp21harrison@gmail.com | Multi-turn (partial → complete) |
-| 3 | 300 Warehouse Dr | Mike Chen | bp21harrison@gmail.com | Unavailable + New Property |
-| 4 | 400 Distribution Ave | James Roberts | baylor@manifoldengineering.ai | Identity Question (pause) |
-| 5 | 500 Logistics Ln | Karen Davis | baylor@manifoldengineering.ai | Tour Offer (pause) |
-| 6 | 600 Storage Ct | Bob Thompson | baylor@manifoldengineering.ai | STOP CONVERSATION TEST |
-
-### PDF Data Reference
-
-| Property | SF | Rent | OpEx | Height | Docks | Drive-ins | Power |
-|----------|-----|------|------|--------|-------|-----------|-------|
-| 100 Commerce Way | 25,000 | $5.50 | $1.75 | 24 ft | 4 | 2 | 800 amps |
-| 200 Industrial Blvd | 18,000 | $6.25 | $2.00 | 22 ft | 3 | 1 | 600 amps |
-| 350 Tech Park Dr* | 22,000 | $5.75 | $1.85 | 20 ft | 3 | 2 | 500 amps |
-| 400 Distribution Ave | 30,000 | $5.95 | $1.90 | 26 ft | 6 | 2 | 1000 amps |
-
-*350 Tech Park Dr is the NEW PROPERTY suggested when 300 Warehouse Dr is unavailable
-
----
-
-## Phase 1: Campaign Setup
-
-### Actions
-1. [ ] Clear existing data: `python tests/e2e_helpers.py clear`
-2. [ ] Upload `test_pdfs/E2E_Test_Augusta.xlsx`
-3. [ ] Set follow-up: **3 follow-ups** (2 min, 3 min, 2 min)
-4. [ ] Start campaign
-
-### Verify
-```bash
-python tests/e2e_helpers.py status
-```
-
-**Expected:**
-- [ ] 6 emails in outbox
-- [ ] Client has `followUpConfig.enabled: true`
-- [ ] 3 follow-ups configured
-
-### 📝 Document
-- Screenshot: Campaign start modal with follow-up settings
-
----
-
-## Phase 2: Initial Email Send
-
-### Actions
-1. [ ] Trigger workflow: `python tests/e2e_helpers.py trigger`
-2. [ ] Wait for completion: `python tests/e2e_helpers.py workflow`
-
-### Verify
-```bash
-python tests/e2e_helpers.py status
-```
-
-**Expected:**
-- [ ] 6 threads created
-- [ ] All threads `status: active`
-- [ ] All threads `followUpStatus: waiting`
-- [ ] Outbox empty
-
-### 📝 Document
-- Screenshot: Outlook sent folder (6 emails from jill@mohrpartners.com)
-- Screenshot: Firestore threads collection
-
----
-
-## Phase 3: Broker Replies (Batch 1 - All at once)
-
-**Send ALL these replies simultaneously, then trigger ONE workflow run.**
-
-### Reply 1: 100 Commerce Way - COMPLETE INFO + PDFs
-**From:** bp21harrison@gmail.com
-**To:** jill@mohrpartners.com
-**Subject:** Re: 100 Commerce Way, Augusta
-**Attach:** `100 Commerce Way - Property Flyer.pdf`, `100 Commerce Way - Floor Plan.pdf`
-
-```
-Hi Jill,
-
-Happy to help! Here's everything on 100 Commerce Way:
-
-- Total Size: 25,000 SF
-- Asking Rate: $5.50/SF NNN
-- Operating Expenses: $1.75/SF
-- Loading: 4 dock doors, 2 drive-ins
-- Clear Height: 24 ft
-- Power: 800 amps, 3-phase
-
-Available immediately. See attached flyer and floor plan.
-
-Tom Wilson
-```
-
-**Expected:** `status: completed`, closing email sent, `row_completed` notification
-
----
-
-### Reply 2: 200 Industrial Blvd - PARTIAL INFO
-**From:** bp21harrison@gmail.com
-**To:** jill@mohrpartners.com
-**Subject:** Re: 200 Industrial Blvd, Evans
-
-```
-Hi Jill,
-
-Thanks for reaching out. Here's what I have on 200 Industrial Blvd:
-
-- Total Size: 18,000 SF
-- Clear Height: 22 ft
-- 3 dock doors, 1 drive-in
-
-I need to check on the rate and power specs - will get back to you.
-
-Sarah
-```
-
-**Expected:** Partial extraction, AI requests remaining, `status: active`
-
----
-
-### Reply 3: 300 Warehouse Dr - UNAVAILABLE + NEW PROPERTY
-**From:** bp21harrison@gmail.com
-**To:** jill@mohrpartners.com
-**Subject:** Re: 300 Warehouse Dr, Augusta
-
-```
-Hi Jill,
-
-Unfortunately, 300 Warehouse Dr just went under contract last week.
-
-However, I have another property that might work - 350 Tech Park Dr. It's 22,000 SF with similar specs. Let me know if you want details.
-
-Mike Chen
-```
-
-**Expected:** `property_unavailable`, row moved to NON-VIABLE, `new_property` notification
-
----
-
-### Reply 4: 400 Distribution Ave - IDENTITY QUESTION
-**From:** baylor@manifoldengineering.ai
-**To:** jill@mohrpartners.com
-**Subject:** Re: 400 Distribution Ave, Augusta
-
-```
-Hi Jill,
-
-Thanks for your interest in 400 Distribution Ave. Before I send details, can you tell me who your client is? We like to know who we're working with.
-
-James Roberts
-```
-
-**Expected:** `status: paused`, `action_needed` notification (reason: `needs_user_input:confidential`)
-
----
-
-### Reply 5: 500 Logistics Ln - TOUR OFFER
-**From:** baylor@manifoldengineering.ai
-**To:** jill@mohrpartners.com
-**Subject:** Re: 500 Logistics Ln, Evans
-
-```
-Hi Jill,
-
-500 Logistics Ln sounds like a great fit for your client. I'd love to show them the space - are you available for a tour this Thursday or Friday?
-
-Karen Davis
-```
-
-**Expected:** `status: paused`, `action_needed` notification (reason: `tour_requested`)
-
----
-
-### Reply 6: 600 Storage Ct - DO NOT REPLY (Stop Test)
-**Do NOT send a reply for this property. We will use it to test the STOP button.**
-
----
-
-### Post-Batch Actions
-1. [ ] Send all 5 replies above
-2. [ ] Trigger workflow: `python tests/e2e_helpers.py trigger`
-3. [ ] Wait for completion
-
-### Verify
-```bash
-python tests/e2e_helpers.py status
-```
-
-**Expected Results:**
-
-| Property | Status | FollowUp | Notification |
-|----------|--------|----------|--------------|
-| 100 Commerce Way | `completed` | N/A | `row_completed` |
-| 200 Industrial Blvd | `active` | waiting | `sheet_update` |
-| 300 Warehouse Dr | `active` | - | `property_unavailable`, `action_needed` (new property) |
-| 400 Distribution Ave | `paused` | paused | `action_needed` |
-| 500 Logistics Ln | `paused` | paused | `action_needed` |
-| 600 Storage Ct | `active` | waiting | None |
-
-### 📝 Document
-- Screenshot: Google Sheet with extracted data
-- Screenshot: Notifications sidebar (priority sorted)
-- Screenshot: Outlook inbox (AI auto-replies)
-- Screenshot: Outlook sent folder (closing email for 100 Commerce Way)
-
----
-
-## Phase 4: Test STOP Conversation
-
-### Actions
-1. [ ] Open Conversations modal for the client
-2. [ ] Find "600 Storage Ct" thread (should be active)
-3. [ ] Click "Stop" button
-4. [ ] Confirm in dialog
-
-### Verify
-```bash
+# Check threads
 python tests/e2e_helpers.py threads
-```
-
-**Expected:**
-- [ ] 600 Storage Ct: `status: stopped`
-- [ ] 600 Storage Ct: `followUpStatus: paused`
-- [ ] Badge shows "Stopped" (gray)
-
-### 📝 Document
-- Screenshot: Conversations modal showing status badges
-- Screenshot: Stop confirmation dialog
-- Screenshot: Thread after stopping (gray badge)
-
----
-
-## Phase 5: Test Follow-up Emails
-
-### Wait for Follow-up Timing
-- 200 Industrial Blvd (active, waiting) should get follow-up after 2 minutes
-
-### Actions
-1. [ ] Wait 2+ minutes
-2. [ ] Trigger workflow: `python tests/e2e_helpers.py trigger`
-
-### Verify
-```bash
-python tests/e2e_helpers.py threads
-```
-
-**Expected:**
-- [ ] 200 Industrial Blvd: `followUpConfig.currentFollowUpIndex: 1`
-- [ ] Follow-up email sent in Outlook
-- [ ] 600 Storage Ct: NO follow-up (stopped)
-
-### 📝 Document
-- Screenshot: Outlook sent folder (follow-up email)
-- Screenshot: Firestore thread showing updated followUpConfig
-
----
-
-## Phase 6: Batch 2 - Complete Remaining
-
-### Reply 2b: 200 Industrial Blvd - COMPLETE REMAINING
-**From:** bp21harrison@gmail.com
-**To:** jill@mohrpartners.com
-**Subject:** Re: 200 Industrial Blvd, Evans
-**Attach:** `200 Industrial Blvd - Property Flyer.pdf`, `200 Industrial Blvd - Floor Plan.pdf`
-
-```
-Hi Jill,
-
-Here's the rest of the info on 200 Industrial Blvd:
-
-- Rate: $6.25/SF NNN
-- Operating Expenses: $2.00/SF
-- Power: 600 amps, 3-phase
-
-See attached flyer and floor plan.
-
-Sarah
-```
-
-**Expected:** Remaining fields extracted, `status: completed`, closing email
-
----
-
-### Actions
-1. [ ] Send reply above
-2. [ ] Trigger workflow
-
-### Verify
-- [ ] 200 Industrial Blvd: `status: completed`
-- [ ] Closing email sent
-- [ ] `row_completed` notification
-
----
-
-## Phase 7: Test Additional Follow-ups (Optional)
-
-If time permits, wait for follow-up #2 and #3 to verify the chain works.
-
----
-
-## Phase 8: Final Verification
-
-### Campaign Summary
-
-| Property | Final Status | Data Complete | Notes |
-|----------|-------------|---------------|-------|
-| 100 Commerce Way | `completed` | ✅ | PDF extraction worked |
-| 200 Industrial Blvd | `completed` | ✅ | Multi-turn completed |
-| 300 Warehouse Dr | `active` | ❌ | NON-VIABLE, new property pending |
-| 400 Distribution Ave | `paused` | ❌ | Waiting for user (identity) |
-| 500 Logistics Ln | `paused` | ❌ | Waiting for user (tour) |
-| 600 Storage Ct | `stopped` | ❌ | Manually stopped |
-
-### 📝 Final Documentation
-- Screenshot: Final Google Sheet state
-- Screenshot: All notifications
-- Screenshot: Conversations modal with all statuses
-- Export: Firestore data snapshot
-
----
-
-## Production Readiness Rubric
-
-| Category | Test | Pass | Fail | Notes |
-|----------|------|------|------|-------|
-| **Email Delivery** | All 6 initial emails sent | | | |
-| **Thread Matching** | Replies matched to correct threads | | | |
-| **PDF Extraction** | Data extracted from attachments | | | |
-| **Sheet Updates** | Correct fields populated | | | |
-| **Status Tracking** | Threads show correct status | | | |
-| **Pausing** | Escalations pause auto-reply | | | |
-| **Stopping** | Manual stop works | | | |
-| **Follow-ups** | Sent after 2 min delay | | | |
-| **Multiple Follow-ups** | All 3 configured work | | | |
-| **Notifications** | Correct types, priority sorted | | | |
-| **Closing Emails** | Sent when row complete | | | |
-| **NON-VIABLE** | Unavailable properties moved | | | |
-| **New Property** | Suggestion creates notification | | | |
-
-**Score:** ___/13
-
----
-
-## Cleanup
-
-```bash
-python tests/e2e_helpers.py clear
 ```
