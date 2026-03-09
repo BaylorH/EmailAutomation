@@ -504,21 +504,28 @@ def append_links_to_floorplan_column(sheets, spreadsheet_id: str, header: list[s
 
 def is_floorplan_filename(filename: str) -> bool:
     """
-    Detect if a PDF filename indicates it's a floorplan.
+    Detect if a PDF filename indicates it's a floorplan/building plan.
 
     Returns True for filenames containing:
     - floor plan, floorplan, floor-plan
     - layout
     - site plan, siteplan
+    - sealed (sealed architectural drawings)
+    - blueprint
+    - bldg (building abbreviation, often used for building plans)
     """
     if not filename:
         return False
 
     name_lower = filename.lower()
     floorplan_patterns = [
-        "floor plan", "floorplan", "floor-plan",
-        "layout", "floor_plan",
-        "site plan", "siteplan", "site-plan", "site_plan"
+        "floor plan", "floorplan", "floor-plan", "floor_plan",
+        "layout",
+        "site plan", "siteplan", "site-plan", "site_plan",
+        "sealed",      # Sealed architectural drawings
+        "blueprint",
+        "bldg",        # Building abbreviation (e.g., "Sealed Bldg C")
+        "building plan"
     ]
 
     return any(pattern in name_lower for pattern in floorplan_patterns)
@@ -530,8 +537,10 @@ def is_floorplan_filename(filename: str) -> bool:
 # Yellow = system is actively managing (conversation in progress)
 # No highlight = needs user attention, complete, or non-viable
 
-# Light yellow RGB values (0-1 scale for Sheets API)
-ROW_HIGHLIGHT_COLOR = {"red": 1.0, "green": 0.95, "blue": 0.6}  # Soft yellow
+# Row highlight colors (RGB values 0-1 scale for Sheets API)
+ROW_HIGHLIGHT_YELLOW = {"red": 1.0, "green": 0.95, "blue": 0.6}  # Active - system monitoring
+ROW_HIGHLIGHT_BLUE = {"red": 0.7, "green": 0.85, "blue": 1.0}    # Paused - awaiting user action
+ROW_HIGHLIGHT_COLOR = ROW_HIGHLIGHT_YELLOW  # Default for backwards compatibility
 
 
 def highlight_row(spreadsheet_id: str, rownum: int, color: dict = None) -> bool:
@@ -584,7 +593,11 @@ def highlight_row(spreadsheet_id: str, rownum: int, color: dict = None) -> bool:
             "highlight_row_update"
         )
 
-        print(f"🟡 Highlighted row {rownum}")
+        # Use appropriate emoji based on color
+        if color == ROW_HIGHLIGHT_BLUE:
+            print(f"🔵 Highlighted row {rownum} (paused/awaiting user)")
+        else:
+            print(f"🟡 Highlighted row {rownum} (active)")
         return True
 
     except Exception as e:
