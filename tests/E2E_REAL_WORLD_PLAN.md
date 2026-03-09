@@ -1,172 +1,108 @@
 # E2E Real World Test Plan
 
-**Date:** March 2026
+**Date:** March 9, 2026
 **Test File:** `test_pdfs/E2E_Real_World_Test.xlsx`
-**Follow-up Config:** 3 follow-ups at **1 hour, 2 hours, 3 hours**
+**Follow-up Config:** 2 follow-ups at **2 minutes** each (for quick testing)
+
+---
+
+## BUG FIXES TO VERIFY (March 9, 2026)
+
+| Fix | How to Verify |
+|-----|---------------|
+| **AI closes when required fields complete** | Reply 1, 6, 8: Should send closing email, NOT ask for optional fields |
+| **Pending reply: right side + signature** | After any AI reply queued, check conversation panel |
+| **Status column first with chevron** | Check table layout immediately after campaign start |
+| **Action count badge (not total)** | Badge should show action_needed count only |
+| **Completed Campaigns header stat** | Should increment when row_completed fires |
+| **Full name to sheet, first name in email** | Reply 2 new property: sheet gets full name, email says "Hi [FirstName]," |
+| **Unavailable reason to comments** | Reply 2: Check "Listing Brokers Comments" column |
+| **InlineReplyComposer works** | Reply 5: Click "Input Needed" → composer appears in panel |
+| **InlineNewPropertyCard works** | Reply 2: Card appears in conversation, can approve |
+
+---
+
+## CUSTOM FIELD MODES TEST
+
+This E2E tests all 3 custom field configuration modes:
+
+| Column | Mode | Behavior |
+|--------|------|----------|
+| **Parking Spaces** | `ask_required` | Must have value before closing, AI will ask if missing |
+| **Yard Space** | `ask_optional` | AI will ask if missing but not required for closing |
+| **Environmental Notes** | `note` | Append any mentions, never ask for it |
+
+### Excel File Setup
+Add these 3 columns after the standard fields:
+- Column S: `Parking Spaces`
+- Column T: `Yard Space`
+- Column U: `Environmental Notes`
+
+### Column Mapping Configuration
+During campaign setup, configure:
+1. **Parking Spaces** → "Ask (Required)"
+2. **Yard Space** → "Ask (Optional)"
+3. **Environmental Notes** → "Note"
 
 ---
 
 ## MONITORING TOOLS
 
-Use these commands throughout the E2E test to track what's happening:
-
 ```bash
 # Take snapshots before/after each phase
 python3 tests/e2e_monitor.py snapshot before
 python3 tests/e2e_monitor.py snapshot after_initial
-python3 tests/e2e_monitor.py snapshot after_replies
-python3 tests/e2e_monitor.py diff    # Compare snapshots
+python3 tests/e2e_monitor.py diff
 
 # Check current state
-python3 tests/e2e_monitor.py firebase   # Show threads, notifications, outbox
-python3 tests/e2e_monitor.py outlook    # Show sent/received emails
-python3 tests/e2e_monitor.py sheet      # Show sheet with highlights + flyer/floorplan status
-
-# Watch in real-time (run in separate terminal)
-python3 tests/e2e_monitor.py watch
+python3 tests/e2e_monitor.py firebase
+python3 tests/e2e_monitor.py outlook
 ```
-
----
-
-## Test Structure
-
-### Part 1: Follow-Up Verification (3+ hours)
-- Start campaign
-- **Do NOT reply to any emails**
-- Wait for all 3 follow-ups to send on all 7 properties
-- Verify follow-ups went to BROKERS (not to self) - **BUG FIX TEST**
-
-### Part 2: Complete Campaign
-- Send broker replies for all 7 properties
-- Test PDF extraction, escalations, Parking Spaces
-- Verify all scenarios work correctly
 
 ---
 
 ## Properties Overview
 
-| Row | Property | Contact | Email | Phase 2 Scenario |
-|-----|----------|---------|-------|------------------|
-| 3 | 699 Industrial Park Dr | Jeff Wilson | bp21harrison | Complete + PDF |
+| Row | Property | Contact | Email | Scenario |
+|-----|----------|---------|-------|----------|
+| 3 | 699 Industrial Park Dr | Jeff Wilson | bp21harrison | Complete + All Custom Fields |
 | 4 | 135 Trade Center Court | Luke Coffey | bp21harrison | Unavailable + New Property |
 | 5 | 2017 St. Josephs Drive | Brian Greene | manifold | Tour Request |
-| 6 | 9300 Lottsford Rd | Craig Cheney | manifold | Complete + Parking |
+| 6 | 9300 Lottsford Rd | Craig Cheney | manifold | Complete + Parking + Env Notes |
 | 7 | 1 Randolph Ct | Scott Atkins | bp21harrison | Identity Question |
-| 8 | 1800 Broad St | Marcus Thompson | bp21harrison | Complete + PDF + Parking |
-| 9 | 2525 Center West Pkwy | Lisa Anderson | manifold | Partial → Ask Parking → Complete |
+| 8 | 1800 Broad St | Marcus Thompson | bp21harrison | Complete + PDF + All Custom |
+| 9 | 2525 Center West Pkwy | Lisa Anderson | manifold | Partial → Multi-turn |
 
 ---
 
-## Pre-Test Checklist
-
-- [ ] Clear `bp21harrison@gmail.com` inbox
-- [ ] Clear `baylor@manifoldengineering.ai` inbox
-- [ ] Firebase cleaned (Claude did this)
-- [ ] Outlook cleaned (Claude did this)
-
----
-
-# PART 1: FOLLOW-UP VERIFICATION
-
-## Phase 1.1: Campaign Setup
+## Phase 1: Campaign Setup
 
 ### User Actions
-1. Go to dashboard, click "New Campaign"
-2. Upload `test_pdfs/E2E_Real_World_Test.xlsx`
-3. Map columns:
+1. Create new client, upload `test_pdfs/E2E_Real_World_Test.xlsx`
+2. **Column Mapping:**
    - Standard fields (Total SF, Docks, etc.) → "Ask"
-   - **Parking Spaces → "Ask"** (NEW FIELD TEST)
-4. Configure follow-ups:
-   - **3 follow-ups**
-   - **1 hour, 2 hours, 3 hours**
-5. Start campaign
-6. **Tell Claude "campaign started"**
+   - **Parking Spaces** → "Ask (Required)"
+   - **Yard Space** → "Ask (Optional)"
+   - **Environmental Notes** → "Note"
+3. Configure: **2 follow-ups** at **2 minutes** each
+4. Start campaign
+5. Tell Claude "campaign started"
+
+### VERIFY UI IMMEDIATELY:
+- [ ] **Status column is FIRST** (chevron + status button together)
+- [ ] **Header stats:** "Completed Campaigns" | "Properties Completed" | "Sheet Updates"
+- [ ] **Your Clients stats:** "Active Clients" | "Actions Needed"
+- [ ] **Pending section** in conversation panel shows 7 emails
+- [ ] **Expand a pending email** → signature visible at bottom
+- [ ] **Notification badge** next to chevron is subtle label style (not button)
 
 ---
 
-## Phase 1.2: Initial Send
+## Phase 2: Send Broker Replies
 
-### Claude Actions
-```bash
-python main.py 2>&1 | tee /tmp/e2e_initial_send.log
-```
-
-### Expected
-- 7 emails sent (grouped by broker)
-- bp21harrison@gmail.com: 4 emails (rows 3, 4, 7, 8)
-- baylor@manifoldengineering.ai: 3 emails (rows 5, 6, 9)
-- All rows highlighted yellow
-- Follow-up #1 scheduled for T+1 hour
-
-### Verify
-```bash
-# Check threads created
-python tests/e2e_helpers.py status
-```
-
----
-
-## Phase 1.3: Wait for Follow-ups
-
-### Timeline
-
-| Time | Event | Claude Action |
-|------|-------|---------------|
-| T+0 | Initial emails sent | Log and verify |
-| T+1h | Follow-up #1 due | Run `main.py`, verify sent |
-| T+2h | Follow-up #2 due | Run `main.py`, verify sent |
-| T+3h | Follow-up #3 due | Run `main.py`, verify sent |
-
-**User Action:** Check back in ~3 hours and tell Claude "check follow-ups"
-
-### Claude Verification (at T+3h)
-```bash
-# Check Outlook SentItems - follow-ups should go to brokers, NOT self
-python3 << 'EOF'
-from tests.outlook_helper import get_access_token
-import requests
-
-token = get_access_token("NO7lVYVp6BaplKYEfMlWCgBnpdh2")
-headers = {"Authorization": f"Bearer {token}"}
-
-resp = requests.get(
-    "https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages",
-    headers=headers,
-    params={"$top": "50", "$select": "subject,sentDateTime,toRecipients", "$orderby": "sentDateTime desc"}
-)
-
-print("📤 SENT ITEMS (checking follow-up recipients):\n")
-for msg in resp.json().get("value", []):
-    to_list = msg.get("toRecipients", [])
-    to = to_list[0]["emailAddress"]["address"] if to_list else "unknown"
-    subj = msg.get("subject", "")[:40]
-    print(f"  To: {to:<35} | {subj}")
-EOF
-```
-
-### Success Criteria for Part 1
-- [ ] 7 initial emails sent to correct brokers
-- [ ] 7 × 3 = **21 follow-up emails** sent total
-- [ ] All follow-ups sent to `bp21harrison@gmail.com` or `baylor@manifoldengineering.ai`
-- [ ] **ZERO follow-ups sent to `baylor.freelance@outlook.com`** (bug fix verified!)
-- [ ] All threads show `followUpStatus: max_reached`
-
----
-
-# PART 2: COMPLETE CAMPAIGN
-
-## Phase 2.1: Send All Broker Replies
-
-**After verifying follow-ups work, send these replies:**
-
----
-
-### Reply 1: 699 Industrial Park Dr → COMPLETE INFO + FLYER + FLOORPLAN
+### Reply 1: 699 Industrial Park Dr → COMPLETE + ALL CUSTOM FIELDS
 **From:** bp21harrison@gmail.com
-**Reply to:** Most recent follow-up for this property
-**Attach BOTH:**
-- `test_pdfs/pdfs/699 Industrial Park Drive - Property Flyer.pdf`
-- `test_pdfs/pdfs/699 Industrial Park Drive - Floor Plan.pdf`
+**Attach:** `699 Industrial Park Drive - Property Flyer.pdf` + `699 Industrial Park Drive - Floor Plan.pdf`
 
 ```
 Hi Jill,
@@ -180,6 +116,8 @@ Thanks for following up! Here are the details on 699 Industrial Park Dr:
 - 28' clear height
 - 1200 amps, 3-phase
 - 75 parking spaces
+- Fenced yard area approximately 15,000 SF
+- Phase 1 environmental completed, no issues found
 
 See attached flyer and floor plan.
 
@@ -187,17 +125,25 @@ Jeff Wilson
 ```
 
 **Expected:**
-- All fields extracted (including parking)
-- **Flyer / Link** column gets flyer PDF link
-- **Floorplan** column gets floor plan PDF link (TESTING THIS!)
+- All fields extracted
+- **Parking Spaces:** 75 ✅
+- **Yard Space:** 15000 (or "15,000 SF") ✅
+- **Environmental Notes:** "Phase 1 completed, no issues found" ✅
 - Closing email sent
-- `row_completed` notification
+
+**VERIFY BUG FIXES:**
+- [ ] **Closing email says:** "Thanks for all the details... I have everything I need..."
+- [ ] **AI does NOT ask for:** Rent, Flyer, or any optional fields not in required list
+- [ ] **Thread status:** "Completed" (green badge)
+- [ ] **row_completed notification** appears inline in conversation
+- [ ] **Completed Campaigns stat** increments in header
+- [ ] **Pending reply** (if visible before send) shows on RIGHT side with signature
 
 ---
 
 ### Reply 2: 135 Trade Center Court → UNAVAILABLE + NEW PROPERTY
 **From:** bp21harrison@gmail.com
-**Attach:** `test_pdfs/real_world/135 Trade Center Court - Brochure.pdf`
+**Attach:** `135 Trade Center Court - Brochure.pdf`
 
 ```
 Hi Jill,
@@ -212,9 +158,19 @@ Luke Coffey
 ```
 
 **Expected:**
-- `property_unavailable` → Row moves to NON-VIABLE
-- `action_needed` notification for new property approval
-- AI extracts from PDF: 7,500 SF, $15/SF NNN
+- `property_unavailable` → Moved to NON-VIABLE
+- `action_needed` for new property approval
+
+**VERIFY BUG FIXES:**
+- [ ] **Listing Brokers Comments column:** Contains "under contract" or similar reason
+- [ ] **InlineNewPropertyCard** appears in conversation panel (not a modal!)
+- [ ] **Card shows:** 150 Trade Center Court details
+- [ ] **Status column:** Shows "New Property" button
+- [ ] **Click "Approve & Send":**
+  - [ ] New row created in sheet
+  - [ ] Leasing Contact column: Full name (e.g., "Luke Coffey")
+  - [ ] Email greeting: First name only ("Hi Luke,")
+  - [ ] Pending email appears in conversation (right side + signature)
 
 ---
 
@@ -231,11 +187,11 @@ Are you available Thursday or Friday afternoon for a tour?
 Brian Greene
 ```
 
-**Expected:** `tour_requested`, thread paused, `action_needed` notification
+**Expected:** `tour_requested`, thread paused, blue highlight
 
 ---
 
-### Reply 4: 9300 Lottsford Rd → COMPLETE INFO + PARKING
+### Reply 4: 9300 Lottsford Rd → COMPLETE + PARKING + ENV NOTES (NO YARD)
 **From:** baylor@manifoldengineering.ai
 
 ```
@@ -251,10 +207,16 @@ Here are the details on 9300 Lottsford:
 - 800 amps
 - 45 parking spaces
 
+Note: Previous tenant was a dry cleaner but all environmental remediation was completed in 2024.
+
 Craig Cheney
 ```
 
-**Expected:** All fields extracted (including parking), closing email, `row_completed`
+**Expected:**
+- **Parking Spaces:** 45 ✅
+- **Yard Space:** (empty - not mentioned, AI should ask since it's ask_optional)
+- **Environmental Notes:** "Previous tenant dry cleaner, remediation completed 2024" ✅
+- Thread stays `active` (AI asks about yard space)
 
 ---
 
@@ -271,15 +233,25 @@ Who are you representing?
 Scott Atkins
 ```
 
-**Expected:** `needs_user_input:confidential`, thread paused, `action_needed`
+**Expected:** `needs_user_input:confidential`, thread paused, blue highlight
+
+**VERIFY BUG FIXES:**
+- [ ] **Thread status:** "Paused" (orange badge)
+- [ ] **InlineReplyComposer** appears at bottom of thread (not a modal!)
+- [ ] **Status column:** Shows "Input Needed" button
+- [ ] **Action count badge:** Shows count (should be at least 1)
+- [ ] **Click "Input Needed" button:**
+  - [ ] Conversation panel expands
+  - [ ] Auto-scrolls to InlineReplyComposer
+- [ ] **Compose and send reply:**
+  - [ ] Panel stays open (doesn't collapse)
+  - [ ] Pending reply appears in thread (right side + signature)
 
 ---
 
-### Reply 6: 1800 Broad St → COMPLETE + PARKING + FLOORPLAN TEST
+### Reply 6: 1800 Broad St → COMPLETE + ALL CUSTOM FIELDS
 **From:** bp21harrison@gmail.com
-**Attach BOTH:**
-- `test_pdfs/pdfs/1800 Broad Street - Property Flyer.pdf`
-- `test_pdfs/pdfs/1800 Broad Street - Floor Plan.pdf`
+**Attach:** `1800 Broad Street - Property Flyer.pdf` + `1800 Broad Street - Floor Plan.pdf`
 
 ```
 Hi Jill,
@@ -293,6 +265,8 @@ Here's everything on 1800 Broad St:
 - 32' clear
 - 2000 amps
 - Parking: 95 spaces
+- Large secured yard: 20,000 SF
+- Clean environmental history
 
 Flyer and floor plan attached.
 
@@ -300,15 +274,15 @@ Marcus Thompson
 ```
 
 **Expected:**
-- All fields extracted INCLUDING **Parking = 95**
-- **Flyer / Link** column gets flyer PDF link
-- **Floorplan** column gets floor plan PDF link
+- All fields extracted
+- **Parking Spaces:** 95 ✅
+- **Yard Space:** 20000 ✅
+- **Environmental Notes:** "Clean environmental history" ✅
 - Closing email sent
-- `row_completed` notification
 
 ---
 
-### Reply 7: 2525 Center West Pkwy → PARTIAL (Missing Parking)
+### Reply 7: 2525 Center West Pkwy → PARTIAL (Test Multi-turn)
 **From:** baylor@manifoldengineering.ai
 
 ```
@@ -329,293 +303,79 @@ Lisa Anderson
 ```
 
 **Expected:**
-- Partial extraction (no parking)
-- AI auto-reply **asks for parking spaces** (testing new field!)
+- Standard fields extracted
+- **Parking missing** (ask_required) → AI MUST ask
+- **Yard missing** (ask_optional) → AI may ask
 - Thread stays `active`
 
 ---
 
-## Phase 2.2: Process Replies
+## Phase 3: Multi-turn Completion (2525 Center West)
 
-### Claude Actions
-```bash
-python main.py 2>&1 | tee /tmp/e2e_replies.log
-```
-
-### Expected Results After Processing
-
-| Row | Property | Status | Parking Extracted? | Notification |
-|-----|----------|--------|-------------------|--------------|
-| 3 | 699 Industrial Park | `completed` | ✅ 75 | `row_completed` |
-| 4 | 135 Trade Center | NON-VIABLE | N/A | `property_unavailable`, `action_needed` |
-| 5 | 2017 St. Josephs | `paused` | N/A | `action_needed` (tour) |
-| 6 | 9300 Lottsford | `completed` | ✅ 45 | `row_completed` |
-| 7 | 1 Randolph Ct | `paused` | N/A | `action_needed` (identity) |
-| 8 | 1800 Broad St | `completed` | ✅ 95 | `row_completed` |
-| 9 | 2525 Center West | `active` | ❌ (AI asking) | `sheet_update` |
-
----
-
-## Phase 2.3: Complete Multi-Turn (2525 Center West)
-
-### Reply 8: 2525 Center West → ADD PARKING
+### Reply 8: Add Parking + Yard
 **From:** baylor@manifoldengineering.ai
-**Reply to:** AI's follow-up asking for parking
+**Reply to:** AI's follow-up
 
 ```
 Hi Jill,
 
-Parking is 60 spaces.
+Parking is 60 spaces. No designated yard area at this property.
 
 Lisa
 ```
 
-### Claude Actions
-```bash
-python main.py 2>&1 | tee /tmp/e2e_final.log
-```
-
 **Expected:**
-- Parking = 60 extracted
-- All fields complete
-- Closing email sent
-- `row_completed`
+- **Parking Spaces:** 60 ✅
+- **Yard Space:** "None" or similar ✅
+- All required fields complete → Closing email sent
 
 ---
 
-## Phase 2.4: Handle Escalations (Dashboard)
+## Expected Final Results
 
-### User Actions on Dashboard
-
-1. **New Property (135 Trade Center)**
-   - Click notification
-   - Review and approve outreach to 150 Trade Center Court
-
-2. **Tour Request (2017 St. Josephs)**
-   - Click notification
-   - Send suggested response or custom reply
-
-3. **Identity Question (1 Randolph Ct)**
-   - Click notification
-   - Compose reply explaining confidential client
+| Row | Property | Status | Parking | Yard | Env Notes |
+|-----|----------|--------|---------|------|-----------|
+| 3 | 699 Industrial Park | completed | 75 | 15000 | Phase 1 completed |
+| 4 | 135 Trade Center | NON-VIABLE | - | - | - |
+| 5 | 2017 St. Josephs | paused | - | - | - |
+| 6 | 9300 Lottsford | active→completed | 45 | (asked) | Remediation 2024 |
+| 7 | 1 Randolph Ct | paused | - | - | - |
+| 8 | 1800 Broad St | completed | 95 | 20000 | Clean history |
+| 9 | 2525 Center West | completed | 60 | None | - |
 
 ---
-
-# FINAL VERIFICATION
 
 ## Success Checklist
 
-### Part 1: Follow-Up Fix
-- [ ] 21 follow-ups sent total (7 properties × 3 each)
-- [ ] All follow-ups sent to brokers (`bp21harrison`, `manifold`)
-- [ ] Zero follow-ups sent to self (`baylor.freelance`)
+### Bug Fixes (March 9, 2026)
+- [ ] **AI closes when complete:** Sends closing email, does NOT ask for optional fields
+- [ ] **Pending reply positioning:** Right side, shows signature
+- [ ] **Status column first:** Chevron + button in first column
+- [ ] **Action count badge:** Shows action_needed count only (subtle label style)
+- [ ] **Completed Campaigns stat:** Increments correctly in header
+- [ ] **Full name to sheet:** New property gets full contact name in sheet
+- [ ] **First name in email:** Greeting uses first name only
+- [ ] **Unavailable reason:** Written to Listing Brokers Comments column
+- [ ] **InlineReplyComposer:** Works in conversation panel (not modal)
+- [ ] **InlineNewPropertyCard:** Works in conversation panel (not modal)
+- [ ] **Panel stays open:** After sending, doesn't collapse
 
-### Part 2: Core Functionality
-- [ ] PDF data extracted (699 Industrial, 1800 Broad)
-- [ ] Real PDF extracted (135 Trade Center brochure)
-- [ ] Parking Spaces extracted (rows 3, 6, 8)
-- [ ] AI asked for Parking when missing (row 9)
-- [ ] Multi-turn conversation completed (row 9)
+### Custom Field Modes
+- [ ] **ask_required (Parking):** AI asks when missing, blocks closing until provided
+- [ ] **ask_optional (Yard):** AI asks when missing, does NOT block closing
+- [ ] **note (Environmental):** AI appends mentions, never asks for it
 
-### Part 2: Escalations
-- [ ] Identity question paused thread
-- [ ] Tour request created notification
-- [ ] Property unavailable moved to NON-VIABLE
-- [ ] New property suggestion created approval flow
-
-### Dashboard
-- [ ] Notifications sorted by priority
-- [ ] Stats cards show correct counts
-- [ ] Conversations modal shows all threads
-
----
-
-## Quick Reference: Broker Inbox Assignments
-
-**bp21harrison@gmail.com (4 properties):**
-- Row 3: 699 Industrial Park Dr
-- Row 4: 135 Trade Center Court
-- Row 7: 1 Randolph Ct
-- Row 8: 1800 Broad St
-
-**baylor@manifoldengineering.ai (3 properties):**
-- Row 5: 2017 St. Josephs Drive
-- Row 6: 9300 Lottsford Rd
-- Row 9: 2525 Center West Pkwy
+### Core Features
+- [ ] PDF extraction (flyer vs floorplan separation)
+- [ ] NON-VIABLE detection ("under contract")
+- [ ] Escalations (tour, identity question)
+- [ ] Multi-turn conversations
+- [ ] Blue highlighting for paused rows
+- [ ] Row completion notifications
 
 ---
 
-# BUG FIXES TO VERIFY (Next E2E)
+## Quick Reference: Broker Inboxes
 
-## Fixed in Previous E2E (2026-03-08):
-- [x] **Follow-up emails sent to self** - Fixed by adding explicit `toRecipients` in followup.py
-
-## Fixed After Previous E2E (2026-03-09):
-- [ ] **"Under contract" not triggering NON-VIABLE move** - Added missing keywords to processing.py:
-  - `"under contract"`, `"went under contract"`, `"already leased"`
-  - `"just leased"`, `"pending lease"`, `"contract pending"`
-  - `"accepted an offer"`, `"lease signed"`, `"taken off market"`
-
-## Configuration Reminder:
-- [ ] **Set Parking Spaces to "Ask"** during column mapping (was set to "Skip" in previous test)
-
----
-
-# FIRESTORE LIFECYCLE TRACKING
-
-## Snapshot Commands (Run Before/During/After Campaign)
-
-### Before Campaign Start
-```bash
-# Save Firestore state BEFORE campaign
-python3 << 'EOF'
-import json
-from datetime import datetime
-from google.cloud import firestore
-import os
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "service-account.json"
-
-db = firestore.Client()
-uid = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
-
-snapshot = {
-    "timestamp": datetime.utcnow().isoformat(),
-    "phase": "BEFORE_CAMPAIGN",
-    "threads": [],
-    "notifications": {},
-    "outbox": []
-}
-
-# Get threads
-for t in db.collection(f"users/{uid}/threads").stream():
-    data = t.to_dict()
-    data["_id"] = t.id
-    snapshot["threads"].append(data)
-
-# Get outbox
-for o in db.collection(f"users/{uid}/outbox").stream():
-    data = o.to_dict()
-    data["_id"] = o.id
-    snapshot["outbox"].append(data)
-
-# Get notifications per client
-clients = list(db.collection(f"users/{uid}/clients").stream())
-for c in clients:
-    notifs = list(db.collection(f"users/{uid}/clients/{c.id}/notifications").stream())
-    snapshot["notifications"][c.id] = len(notifs)
-
-with open("/tmp/e2e_firestore_before.json", "w") as f:
-    json.dump(snapshot, f, indent=2, default=str)
-
-print(f"Saved snapshot: {len(snapshot['threads'])} threads, {len(snapshot['outbox'])} outbox items")
-EOF
-```
-
-### After Each Phase
-```bash
-# Save Firestore state AFTER processing
-python3 << 'EOF'
-import json
-from datetime import datetime
-from google.cloud import firestore
-import os
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "service-account.json"
-
-db = firestore.Client()
-uid = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
-client_id = "<INSERT_CLIENT_ID>"  # Update with actual client ID
-
-snapshot = {
-    "timestamp": datetime.utcnow().isoformat(),
-    "phase": "AFTER_REPLIES",  # Update phase name
-    "threads": [],
-    "notifications": [],
-    "msgIndex_count": 0,
-    "convIndex_count": 0
-}
-
-# Get threads for this client
-for t in db.collection(f"users/{uid}/threads").stream():
-    data = t.to_dict()
-    if data.get("clientId") == client_id:
-        snapshot["threads"].append({
-            "id": t.id,
-            "status": data.get("status"),
-            "followUpStatus": data.get("followUpStatus"),
-            "sheetRow": data.get("sheetRow"),
-            "broker": data.get("broker")
-        })
-
-# Get notifications
-for n in db.collection(f"users/{uid}/clients/{client_id}/notifications").stream():
-    data = n.to_dict()
-    snapshot["notifications"].append({
-        "id": n.id,
-        "kind": data.get("kind"),
-        "rowAnchor": data.get("rowAnchor"),
-        "priority": data.get("priority"),
-        "reason": data.get("meta", {}).get("reason", "")
-    })
-
-# Count indexes
-snapshot["msgIndex_count"] = len(list(db.collection(f"users/{uid}/msgIndex").stream()))
-snapshot["convIndex_count"] = len(list(db.collection(f"users/{uid}/convIndex").stream()))
-
-with open(f"/tmp/e2e_firestore_{snapshot['phase'].lower()}.json", "w") as f:
-    json.dump(snapshot, f, indent=2, default=str)
-
-print(f"Saved: {len(snapshot['threads'])} threads, {len(snapshot['notifications'])} notifications")
-print(f"Indexes: {snapshot['msgIndex_count']} msgIndex, {snapshot['convIndex_count']} convIndex")
-EOF
-```
-
----
-
-# POST-E2E ANALYSIS CHECKLIST
-
-## 1. Log Analysis
-```bash
-# All backend logs saved to /tmp/e2e_*.log
-ls -la /tmp/e2e_*.log
-
-# Key things to grep for:
-grep -c "✅ Sent" /tmp/e2e_*.log           # Emails sent
-grep -c "📥 Scanned" /tmp/e2e_*.log        # Inbox scans
-grep -c "❌" /tmp/e2e_*.log                 # Errors
-grep -c "⚠️" /tmp/e2e_*.log                 # Warnings
-grep "property_unavailable" /tmp/e2e_*.log  # NON-VIABLE triggers
-```
-
-## 2. Firestore Document Lifecycle
-Compare snapshots:
-- `e2e_firestore_before.json` - Before campaign
-- `e2e_firestore_after_initial.json` - After initial send
-- `e2e_firestore_after_followups.json` - After follow-ups
-- `e2e_firestore_after_replies.json` - After broker replies
-
-Check:
-- [ ] Threads created at correct times
-- [ ] Outbox items deleted after send
-- [ ] Notifications created for each event
-- [ ] msgIndex/convIndex growing as expected
-- [ ] Thread statuses changing correctly (active → completed/paused)
-
-## 3. Google Sheet State
-- [ ] All expected rows highlighted yellow initially
-- [ ] Completed rows un-highlighted
-- [ ] NON-VIABLE divider exists
-- [ ] Unavailable properties moved below divider
-- [ ] All extracted data in correct columns
-- [ ] Parking Spaces column populated (if configured)
-
-## 4. Email Verification
-- [ ] All initial emails in Outlook SentItems
-- [ ] All follow-ups in SentItems with correct recipients
-- [ ] AI replies in SentItems
-- [ ] Closing emails sent for completed rows
-
-## 5. Dashboard Verification
-- [ ] Notifications appear in sidebar
-- [ ] Priority ordering correct (action_needed first)
-- [ ] Stats cards accurate
-- [ ] Conversations modal shows all threads grouped by property
+**bp21harrison@gmail.com (4):** Rows 3, 4, 7, 8
+**baylor@manifoldengineering.ai (3):** Rows 5, 6, 9
