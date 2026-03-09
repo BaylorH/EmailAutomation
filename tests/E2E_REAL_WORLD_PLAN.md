@@ -6,6 +6,28 @@
 
 ---
 
+## MONITORING TOOLS
+
+Use these commands throughout the E2E test to track what's happening:
+
+```bash
+# Take snapshots before/after each phase
+python3 tests/e2e_monitor.py snapshot before
+python3 tests/e2e_monitor.py snapshot after_initial
+python3 tests/e2e_monitor.py snapshot after_replies
+python3 tests/e2e_monitor.py diff    # Compare snapshots
+
+# Check current state
+python3 tests/e2e_monitor.py firebase   # Show threads, notifications, outbox
+python3 tests/e2e_monitor.py outlook    # Show sent/received emails
+python3 tests/e2e_monitor.py sheet      # Show sheet with highlights + flyer/floorplan status
+
+# Watch in real-time (run in separate terminal)
+python3 tests/e2e_monitor.py watch
+```
+
+---
+
 ## Test Structure
 
 ### Part 1: Follow-Up Verification (3+ hours)
@@ -139,10 +161,12 @@ EOF
 
 ---
 
-### Reply 1: 699 Industrial Park Dr → COMPLETE INFO + PDF
+### Reply 1: 699 Industrial Park Dr → COMPLETE INFO + FLYER + FLOORPLAN
 **From:** bp21harrison@gmail.com
 **Reply to:** Most recent follow-up for this property
-**Attach:** `test_pdfs/pdfs/699 Industrial Park Drive - Property Flyer.pdf`
+**Attach BOTH:**
+- `test_pdfs/pdfs/699 Industrial Park Drive - Property Flyer.pdf`
+- `test_pdfs/pdfs/699 Industrial Park Drive - Floor Plan.pdf`
 
 ```
 Hi Jill,
@@ -157,12 +181,17 @@ Thanks for following up! Here are the details on 699 Industrial Park Dr:
 - 1200 amps, 3-phase
 - 75 parking spaces
 
-See attached flyer.
+See attached flyer and floor plan.
 
 Jeff Wilson
 ```
 
-**Expected:** All fields extracted (including parking), closing email, `row_completed`
+**Expected:**
+- All fields extracted (including parking)
+- **Flyer / Link** column gets flyer PDF link
+- **Floorplan** column gets floor plan PDF link (TESTING THIS!)
+- Closing email sent
+- `row_completed` notification
 
 ---
 
@@ -246,9 +275,11 @@ Scott Atkins
 
 ---
 
-### Reply 6: 1800 Broad St → COMPLETE + PARKING (NEW FIELD TEST)
+### Reply 6: 1800 Broad St → COMPLETE + PARKING + FLOORPLAN TEST
 **From:** bp21harrison@gmail.com
-**Attach:** `test_pdfs/pdfs/1800 Broad Street - Property Flyer.pdf`
+**Attach BOTH:**
+- `test_pdfs/pdfs/1800 Broad Street - Property Flyer.pdf`
+- `test_pdfs/pdfs/1800 Broad Street - Floor Plan.pdf`
 
 ```
 Hi Jill,
@@ -263,12 +294,17 @@ Here's everything on 1800 Broad St:
 - 2000 amps
 - Parking: 95 spaces
 
-Flyer attached.
+Flyer and floor plan attached.
 
 Marcus Thompson
 ```
 
-**Expected:** All fields extracted INCLUDING **Parking = 95**, closing email, `row_completed`
+**Expected:**
+- All fields extracted INCLUDING **Parking = 95**
+- **Flyer / Link** column gets flyer PDF link
+- **Floorplan** column gets floor plan PDF link
+- Closing email sent
+- `row_completed` notification
 
 ---
 
