@@ -38,6 +38,7 @@ def _filter_config_by_extraction_fields(column_config: dict, extraction_fields: 
         "requiredFields": column_config.get("requiredFields", []),
         "formulaFields": column_config.get("formulaFields", []),
         "neverRequest": column_config.get("neverRequest", []),
+        "customFields": column_config.get("customFields", {}),  # Include custom fields
     }
 
     extraction_set = set(extraction_fields)

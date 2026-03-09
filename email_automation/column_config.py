@@ -354,10 +354,17 @@ def detect_column_mapping(headers: List[str], use_ai: bool = True) -> Dict[str, 
     # Identify unmapped headers
     unmapped = [h for h in headers if h and h not in mapped_headers]
 
+    # Build extractionFields - all extractable canonical fields that were mapped
+    extraction_fields = [
+        f for f in EXTRACTABLE_FIELDS
+        if f in mappings and f not in FORMULA_FIELDS
+    ]
+
     return {
         "mappings": mappings,
         "confidence": confidence,
         "unmapped": unmapped,
+        "extractionFields": extraction_fields,
         "requiredFields": [f for f in REQUIRED_FOR_CLOSE if f in mappings],
         "formulaFields": [f for f in FORMULA_FIELDS if f in mappings],
         "neverRequest": [f for f in NEVER_REQUEST_FIELDS if f in mappings],
