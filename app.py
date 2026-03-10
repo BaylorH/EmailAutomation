@@ -758,6 +758,7 @@ def api_accept_new_property():
         sheet_id = property_data.get("sheetId")
         tab_title = property_data.get("tabTitle")
         pdf_links = property_data.get("pdfLinks", [])
+        pdf_manifest = property_data.get("pdfManifest", [])  # Full PDF data for extraction
 
         if not sheet_id:
             return jsonify({"success": False, "error": "Missing sheetId in propertyData"}), 400
@@ -810,6 +811,65 @@ def api_accept_new_property():
                 print(f"🔗 Applied {len(pdf_links)} PDF link(s) to new property row")
             except Exception as e:
                 print(f"⚠️ Could not apply PDF links to new row: {e}")
+
+        # If we have PDF manifest with extracted text, run AI extraction to pre-fill columns
+        extracted_updates = []
+        if pdf_manifest and new_rownum:
+            try:
+                from email_automation.ai_processing import propose_sheet_updates, apply_proposal_to_sheet
+                from email_automation.sheets import _read_row
+                from email_automation.column_config import get_default_column_config
+
+                # Read the current row values (just created, mostly empty)
+                rowvals = _read_row(sheets, sheet_id, tab_title, new_rownum) or []
+
+                # Get client's column config if available
+                from email_automation.clients import _fs
+                client_doc = _fs.collection("users").document(uid).collection("clients").document(client_id).get()
+                column_config = None
+                if client_doc.exists:
+                    client_data = client_doc.to_dict() or {}
+                    column_config = client_data.get("columnConfig") or get_default_column_config()
+
+                # Build a minimal conversation for context
+                conversation = [{
+                    "direction": "inbound",
+                    "from": broker_email,
+                    "subject": f"Property Info: {address}",
+                    "content": f"Here is information about {address}" + (f", {city}" if city else "") + ".",
+                    "timestamp": "now"
+                }]
+
+                # Call AI to extract data from PDFs
+                proposal = propose_sheet_updates(
+                    uid=uid,
+                    client_id=client_id,
+                    email=broker_email,
+                    sheet_id=sheet_id,
+                    header=header,
+                    rownum=new_rownum,
+                    rowvals=rowvals,
+                    thread_id=f"new_property_{notification_id}",  # Synthetic thread ID
+                    pdf_manifest=pdf_manifest,
+                    conversation=conversation,
+                    column_config=column_config,
+                    dry_run=True  # Don't log to Firestore
+                )
+
+                if proposal and proposal.get("updates"):
+                    # Apply the extracted updates to the sheet
+                    result = apply_proposal_to_sheet(
+                        uid, client_id, sheet_id, header, new_rownum, rowvals, proposal
+                    )
+                    extracted_updates = result.get("applied", [])
+                    print(f"🤖 AI extracted {len(extracted_updates)} field(s) from PDF for new property")
+                    for upd in extracted_updates:
+                        print(f"   • {upd.get('column')}: {upd.get('newValue')}")
+
+            except Exception as e:
+                print(f"⚠️ Could not run AI extraction on PDFs: {e}")
+                import traceback
+                traceback.print_exc()
 
         print(f"✅ Created new property row {new_rownum} for '{address}' in sheet {sheet_id}")
 

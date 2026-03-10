@@ -1410,7 +1410,18 @@ Thanks!""",
                                 # Client criteria for AI email generation on frontend
                                 "clientCriteria": client_criteria,
                                 # PDF links to be applied to new row when created
-                                "pdfLinks": [p.get('drive_link') for p in (pdf_manifest or []) if p.get('drive_link')]
+                                "pdfLinks": [p.get('drive_link') for p in (pdf_manifest or []) if p.get('drive_link')],
+                                # Full PDF manifest for AI extraction when new property row is created
+                                # Includes extracted text so we can pre-fill columns
+                                "pdfManifest": [
+                                    {
+                                        "name": p.get("name"),
+                                        "text": p.get("text", "")[:5000],  # Limit text to 5KB per PDF
+                                        "drive_link": p.get("drive_link"),
+                                        "id": p.get("id")  # OpenAI file ID for re-processing if needed
+                                    }
+                                    for p in (pdf_manifest or [])
+                                ]
                             },
                             dedupe_key=f"new_property_pending:{thread_id}:{address}:{city}:{new_property_email}"
                         )
