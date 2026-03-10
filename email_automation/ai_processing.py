@@ -716,7 +716,12 @@ SCENARIOS:
    - Indicate you have everything you need and will review with your client
    - DO NOT ask for any additional information - the conversation is complete
    - EXAMPLE: "Thanks for all the details on [property]. I have everything I need and will go over this with my client. I'll be in touch if we have any questions."
-3. Property unavailable + new property suggested: Thank them for both pieces of information
+3. Property unavailable + new property suggested:
+   - Thank them for the update on the original property being unavailable
+   - Acknowledge the new property they suggested
+   - Mention you'll send a separate email about the new property to keep things organized
+   - Keep it brief and natural
+   - EXAMPLE: "Thanks for the update—understood on [original property] being unavailable. Appreciate you sending over the info on [new property]. I'll send a separate email to keep things organized and follow up if it looks like a fit."
 4. Property unavailable (no alternative): Thank them and ask if they have other properties
 5. Call requested:
    - If phone number is provided in the message: DO NOT generate a response_email (system will handle notification only)

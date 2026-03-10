@@ -1417,20 +1417,13 @@ Thanks!""",
                         mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                         print(f"🏢 Created new property pending approval notification (no row created yet)")
 
-                        # Send thank-you reply in the CURRENT thread to acknowledge the new property suggestion
-                        # This closes out the conversation about the unavailable property
-                        new_property_full_address = f"{address}, {city}" if city else address
-                        send_thankyou_closing_with_new_property(
-                            user_id, client_id, headers,
-                            from_addr_lower, msg_id,  # Reply to the broker's message
-                            row_num, row_anchor,
-                            new_property_address=new_property_full_address
-                        )
-                        print(f"   📧 Sent thank-you reply for new property suggestion")
-
-                        # Skip any AI-generated response - we just sent the thank-you
-                        proposal["skip_response"] = True
-                        print(f"   ℹ️ Skipping AI response (thank-you already sent)")
+                        # Let the AI-generated response_email flow through normally
+                        # The AI prompt instructs it to generate a contextual thank-you + "I'll follow up separately" message
+                        # when both property_unavailable and new_property events are detected
+                        if proposal.get("response_email"):
+                            print(f"   📧 AI generated contextual response for new property scenario")
+                        else:
+                            print(f"   ℹ️ No AI response generated (user will handle via notification)")
 
                     except Exception as e:
                         print(f"❌ Failed to handle new_property: {e}")
