@@ -187,6 +187,7 @@ CANONICAL_FIELDS = {
         "extraction_hints": "URLs to property flyers or listings",
         "format": "url",
         "extractable": True,
+        "required_for_close": True,
         "append_mode": True,
     },
     "floorplan": {

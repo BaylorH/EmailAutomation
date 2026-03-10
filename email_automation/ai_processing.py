@@ -743,6 +743,7 @@ SCENARIOS:
    - NEVER request fields that are NOT in the missing required fields list
    - NEVER request "Rent/SF /Yr" - this field should never be asked for
    - NEVER request "Gross Rent" - this is a formula column that calculates automatically
+   - For "Flyer / Link", phrase it naturally: "flyer", "brochure", "marketing materials", or "property flyer"
    - Keep it short and concise
    - End with a simple "Thanks" - do NOT use "Looking forward to your response" or similar phrases
 

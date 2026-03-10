@@ -33,7 +33,8 @@ THANK_YOU_BODY = "Thanks for your response."
 # NOTE: "Gross Rent" is NOT included - it's a formula on the sheet (H+I+G/12), not a value we collect
 REQUIRED_FIELDS_FOR_CLOSE = [
     "Total SF", "Ops Ex /SF",
-    "Drive Ins", "Docks", "Ceiling Ht", "Power"
+    "Drive Ins", "Docks", "Ceiling Ht", "Power",
+    "Flyer / Link"
 ]
 
 # Email scanning configuration
