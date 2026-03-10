@@ -168,9 +168,11 @@ Luke Coffey
 
 **Expected:**
 - `property_unavailable` → 150 Trade Center moved to NON-VIABLE
+- **Thank-you reply sent automatically** in current thread: "Thanks for the update—understood on 150 Trade Center being unavailable..."
 - `action_needed` for new property approval (135 Trade Center)
 
-**VERIFY BUG FIXES:**
+**VERIFY NEW PROPERTY FLOW:**
+- [ ] **Thank-you reply sent** in 150 Trade Center conversation: "I'll send a separate email to keep things organized"
 - [ ] **Listing Brokers Comments column:** Contains "under contract" or similar reason
 - [ ] **InlineNewPropertyCard** appears in conversation panel (not a modal!)
 - [ ] **Card shows:** 135 Trade Center Court details (extracted from PDF)
@@ -184,7 +186,8 @@ Luke Coffey
   - [ ] **PDF link appears in Flyer/Link column of NEW row** (not the non-viable row)
   - [ ] Leasing Contact column: Full name (e.g., "Luke Coffey")
   - [ ] Email greeting: First name only ("Hi Luke,")
-  - [ ] Pending email appears in conversation (right side + signature)
+  - [ ] **NEW conversation thread created** with subject "135 Trade Center Court, Augusta, GA" (NOT a reply to 150)
+  - [ ] Pending email appears in conversation panel
 
 ---
 
