@@ -1015,6 +1015,7 @@ Thanks!"""
                             "originalMessage": _full_text[:500],
                             "status": "pending_response",  # Not pending_approval - no row creation needed
                             "replyToMessageId": msg_id,  # Graph API message ID for sending reply
+                            "contactName": contact_name,  # For [NAME] replacement in frontend
                             "suggestedEmail": {
                                 "to": [from_addr_lower],
                                 "subject": f"RE: {row_anchor}" if row_anchor else "RE: Property Tour",
@@ -1071,7 +1072,8 @@ Thanks!"""
                             "details": reason_labels.get(reason, reason_labels["unclear"]),
                             "question": question,
                             "originalMessage": _full_text[:500],  # Include message context
-                            "replyToMessageId": msg_id  # Graph API message ID for sending reply
+                            "replyToMessageId": msg_id,  # Graph API message ID for sending reply
+                            "contactName": contact_name  # For [NAME] replacement in frontend
                         }
 
                         notif_id = write_notification(
@@ -1406,7 +1408,9 @@ Thanks!""",
                                     "originalMessage": _full_text[:500] if _full_text else ""  # First 500 chars of original message
                                 },
                                 # Client criteria for AI email generation on frontend
-                                "clientCriteria": client_criteria
+                                "clientCriteria": client_criteria,
+                                # PDF links to be applied to new row when created
+                                "pdfLinks": [p.get('drive_link') for p in (pdf_manifest or []) if p.get('drive_link')]
                             },
                             dedupe_key=f"new_property_pending:{thread_id}:{address}:{city}:{new_property_email}"
                         )
@@ -1806,7 +1810,7 @@ Could you please provide your phone number so I can give you a call?"""
                         if len(current_row) < len(header):
                             current_row.extend([""] * (len(header) - len(current_row)))
                         
-                        missing_fields = check_missing_required_fields(current_row, header)
+                        missing_fields = check_missing_required_fields(current_row, header, column_config)
                         
                         # CRITICAL: Filter out "Rent/SF /Yr" - it should NEVER be requested
                         missing_fields = [f for f in missing_fields if f != "Rent/SF /Yr"]

@@ -757,6 +757,7 @@ def api_accept_new_property():
         broker_email = property_data.get("brokerEmail", "")
         sheet_id = property_data.get("sheetId")
         tab_title = property_data.get("tabTitle")
+        pdf_links = property_data.get("pdfLinks", [])
 
         if not sheet_id:
             return jsonify({"success": False, "error": "Missing sheetId in propertyData"}), 400
@@ -766,7 +767,7 @@ def api_accept_new_property():
 
         # Import required modules
         from email_automation.clients import _sheets_client
-        from email_automation.sheets import _get_first_tab_title, _read_header_row2, format_sheet_columns_autosize_with_exceptions
+        from email_automation.sheets import _get_first_tab_title, _read_header_row2, format_sheet_columns_autosize_with_exceptions, append_links_to_flyer_link_column
         from email_automation.sheet_operations import insert_property_row_above_divider
 
         sheets = _sheets_client()
@@ -801,6 +802,14 @@ def api_accept_new_property():
         # Read header and format sheet
         header = _read_header_row2(sheets, sheet_id, tab_title)
         format_sheet_columns_autosize_with_exceptions(sheet_id, header)
+
+        # Apply PDF links if provided (from original message that suggested this property)
+        if pdf_links and new_rownum:
+            try:
+                append_links_to_flyer_link_column(sheets, sheet_id, header, new_rownum, pdf_links)
+                print(f"🔗 Applied {len(pdf_links)} PDF link(s) to new property row")
+            except Exception as e:
+                print(f"⚠️ Could not apply PDF links to new row: {e}")
 
         print(f"✅ Created new property row {new_rownum} for '{address}' in sheet {sheet_id}")
 

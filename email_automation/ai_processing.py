@@ -536,7 +536,7 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
     "want to come by", "stop by and take a look", "walk through the property", "showing available"
   • The user needs to decide whether to schedule the tour, so DO NOT auto-respond
   • Instead, GENERATE a suggested response email in the "suggestedEmail" field that the user can approve/edit
-  • Example suggestedEmail: "Hi [broker], Thank you for the offer! I'd like to schedule a tour. Are you available [suggest a few time options]? Looking forward to seeing the space."
+  • Example suggestedEmail: "Hi [NAME], Thank you for the offer! I'd like to schedule a tour. Are you available [suggest a few time options]? Looking forward to seeing the space."
   • Include "question" field with the specific tour offer/request
   • Set response_email to null (user will send the approved email)
 

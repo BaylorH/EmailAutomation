@@ -10,6 +10,9 @@
 
 | Fix | How to Verify |
 |-----|---------------|
+| **Custom required fields checked** | Reply 7 (2525 partial): AI should ask for Parking, NOT close conversation |
+| **[NAME] replaced in tour request** | Reply 3 (tour): AI suggested email should say "Hi Brian," not "Hi [NAME]," |
+| **PDF links to new property row** | Reply 2: After approving 135 Trade Center, PDF link should appear in new row |
 | **AI closes when required fields complete** | Reply 1, 6, 8: Should send closing email, NOT ask for optional fields |
 | **Pending reply: right side + signature** | After any AI reply queued, check conversation panel |
 | **Status column first with chevron** | Check table layout immediately after campaign start |
@@ -66,12 +69,12 @@ python3 tests/e2e_monitor.py outlook
 | Row | Property | Contact | Email | Scenario |
 |-----|----------|---------|-------|----------|
 | 3 | 699 Industrial Park Dr | Jeff Wilson | bp21harrison | Complete + All Custom Fields |
-| 4 | 135 Trade Center Court | Luke Coffey | bp21harrison | Unavailable + New Property |
+| 4 | 150 Trade Center Court | Luke Coffey | bp21harrison | Unavailable + New Property (→ 135 Trade Center) |
 | 5 | 2017 St. Josephs Drive | Brian Greene | manifold | Tour Request |
 | 6 | 9300 Lottsford Rd | Craig Cheney | manifold | Complete + Parking + Env Notes |
 | 7 | 1 Randolph Ct | Scott Atkins | bp21harrison | Identity Question |
 | 8 | 1800 Broad St | Marcus Thompson | bp21harrison | Complete + PDF + All Custom |
-| 9 | 2525 Center West Pkwy | Lisa Anderson | manifold | Partial → Multi-turn |
+| 9 | 2525 Center West Pkwy | Lisa Anderson | manifold | Partial → Multi-turn (test custom required fields) |
 
 ---
 
@@ -141,16 +144,16 @@ Jeff Wilson
 
 ---
 
-### Reply 2: 135 Trade Center Court → UNAVAILABLE + NEW PROPERTY
+### Reply 2: 150 Trade Center Court → UNAVAILABLE + NEW PROPERTY
 **From:** bp21harrison@gmail.com
-**Attach:** `135 Trade Center Court - Brochure.pdf`
+**Attach:** `135 Trade Center Court - Brochure.pdf` (this PDF is for the NEW property 135 Trade Center)
 
 ```
 Hi Jill,
 
-Sorry for the delay - 135 Trade Center Court just went under contract last week.
+Sorry for the delay - 150 Trade Center Court just went under contract last week.
 
-However, I have another property at Gun Club Industrial Park - 150 Trade Center Court. It's 7,500 SF at $15/SF NNN with ample parking. Attached is the brochure.
+However, I have another property at Gun Club Industrial Park - 135 Trade Center Court. It's 7,500 SF at $15/SF NNN with ample parking. Attached is the brochure.
 
 Let me know if interested.
 
@@ -158,16 +161,21 @@ Luke Coffey
 ```
 
 **Expected:**
-- `property_unavailable` → Moved to NON-VIABLE
-- `action_needed` for new property approval
+- `property_unavailable` → 150 Trade Center moved to NON-VIABLE
+- `action_needed` for new property approval (135 Trade Center)
 
 **VERIFY BUG FIXES:**
 - [ ] **Listing Brokers Comments column:** Contains "under contract" or similar reason
 - [ ] **InlineNewPropertyCard** appears in conversation panel (not a modal!)
-- [ ] **Card shows:** 150 Trade Center Court details
+- [ ] **Card shows:** 135 Trade Center Court details (extracted from PDF)
+- [ ] **PDF extraction from brochure should show:**
+  - Building D: 7,500 SF available
+  - Rate: $15.00/SF/YR NNN
+  - Contact: Luke Coffey
 - [ ] **Status column:** Shows "New Property" button
 - [ ] **Click "Approve & Send":**
-  - [ ] New row created in sheet
+  - [ ] New row created in sheet for 135 Trade Center
+  - [ ] **PDF link appears in Flyer/Link column of NEW row** (not the non-viable row)
   - [ ] Leasing Contact column: Full name (e.g., "Luke Coffey")
   - [ ] Email greeting: First name only ("Hi Luke,")
   - [ ] Pending email appears in conversation (right side + signature)
@@ -188,6 +196,11 @@ Brian Greene
 ```
 
 **Expected:** `tour_requested`, thread paused, blue highlight
+
+**VERIFY BUG FIXES:**
+- [ ] **[NAME] replaced:** AI suggested reply says "Hi Brian," (NOT "Hi [NAME],")
+- [ ] **InlineReplyComposer** appears at bottom of conversation
+- [ ] **Placeholder text** in empty input should NOT show [NAME]
 
 ---
 
@@ -282,7 +295,7 @@ Marcus Thompson
 
 ---
 
-### Reply 7: 2525 Center West Pkwy → PARTIAL (Test Multi-turn)
+### Reply 7: 2525 Center West Pkwy → PARTIAL (Test Custom Required Fields)
 **From:** baylor@manifoldengineering.ai
 
 ```
@@ -303,10 +316,16 @@ Lisa Anderson
 ```
 
 **Expected:**
-- Standard fields extracted
-- **Parking missing** (ask_required) → AI MUST ask
+- Standard fields extracted (6 fields)
+- **Parking missing** (ask_required) → AI MUST ask for parking
 - **Yard missing** (ask_optional) → AI may ask
-- Thread stays `active`
+- Thread stays `active` (NOT completed)
+
+**VERIFY BUG FIX (Custom Required Fields):**
+- [ ] **AI does NOT send closing email** - parking is required but missing
+- [ ] **AI reply asks for parking count**
+- [ ] **Thread status:** Active (yellow badge), NOT Completed
+- [ ] **Row NOT marked as completed** in sheet
 
 ---
 
@@ -336,7 +355,8 @@ Lisa
 | Row | Property | Status | Parking | Yard | Env Notes |
 |-----|----------|--------|---------|------|-----------|
 | 3 | 699 Industrial Park | completed | 75 | 15000 | Phase 1 completed |
-| 4 | 135 Trade Center | NON-VIABLE | - | - | - |
+| 4 | 150 Trade Center | NON-VIABLE | - | - | - |
+| NEW | 135 Trade Center | active (new) | - | - | - |
 | 5 | 2017 St. Josephs | paused | - | - | - |
 | 6 | 9300 Lottsford | active→completed | 45 | (asked) | Remediation 2024 |
 | 7 | 1 Randolph Ct | paused | - | - | - |
@@ -347,7 +367,10 @@ Lisa
 
 ## Success Checklist
 
-### Bug Fixes (March 9, 2026)
+### Bug Fixes (March 10, 2026)
+- [ ] **Custom required fields:** Parking (ask_required) blocks closing - Reply 7 should NOT close
+- [ ] **[NAME] replaced:** Tour request email shows "Hi Brian," not "Hi [NAME],"
+- [ ] **PDF links to new row:** 135 Trade Center row gets PDF link, NOT the 150 row
 - [ ] **AI closes when complete:** Sends closing email, does NOT ask for optional fields
 - [ ] **Pending reply positioning:** Right side, shows signature
 - [ ] **Status column first:** Chevron + button in first column
