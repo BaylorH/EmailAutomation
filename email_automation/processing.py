@@ -812,6 +812,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
         if pdf_manifest:
             # Categorize PDFs into flyers vs floorplans based on filename
+            # Categorize PDF links (but don't write yet - wait until after event detection)
             flyer_links = []
             floorplan_links = []
 
@@ -828,32 +829,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     flyer_links.append(link)
                     print(f"   📄 Categorized as flyer: {filename}")
 
-            # Write to appropriate columns
-            try:
-                sheets = _sheets_client()
-
-                if flyer_links:
-                    append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
-
-                # Delay between writes to avoid Google Sheets API rate limits
-                if flyer_links and floorplan_links:
-                    print("   ⏳ Waiting 30s before next sheet write to avoid rate limits...")
-                    time.sleep(30)
-
-                if floorplan_links:
-                    append_links_to_floorplan_column(sheets, sheet_id, header, rownum, floorplan_links)
-
-                # Re-read header in case we just created columns
-                if flyer_links or floorplan_links:
-                    try:
-                        tab_title = _get_first_tab_title(sheets, sheet_id)
-                        header = _read_header_row2(sheets, sheet_id, tab_title)
-                        format_sheet_columns_autosize_with_exceptions(sheet_id, header)
-                    except Exception as _e:
-                        print(f"ℹ️ Skipped re-format after link append: {_e}")
-
-            except Exception as e:
-                print(f"❌ Failed to append links to sheet: {e}")
+            # NOTE: PDF links will be written AFTER event detection
+            # If new_property event is detected, links go to the new row, not this one
+            # See deferred PDF link writing after event processing
         
         # URL exploration - find URLs in message and fetch content for AI processing only
         url_texts = []
@@ -1709,6 +1687,38 @@ Thanks!""",
 
                     except Exception as e:
                         print(f"❌ Failed to handle property_issue: {e}")
+
+            # DEFERRED PDF LINK WRITING: Only write to current row if NOT a new_property scenario
+            # If new_property was detected, the PDFs belong to the new property, not this row
+            if pdf_manifest and not new_row_created:
+                try:
+                    sheets = _sheets_client()
+
+                    if flyer_links:
+                        append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
+                        print(f"   🔗 Applied {len(flyer_links)} flyer link(s) to current row")
+
+                    # Delay between writes to avoid Google Sheets API rate limits
+                    if flyer_links and floorplan_links:
+                        print("   ⏳ Waiting 30s before next sheet write to avoid rate limits...")
+                        time.sleep(30)
+
+                    if floorplan_links:
+                        append_links_to_floorplan_column(sheets, sheet_id, header, rownum, floorplan_links)
+                        print(f"   📐 Applied {len(floorplan_links)} floorplan link(s) to current row")
+
+                    # Re-read header in case we just created columns
+                    if flyer_links or floorplan_links:
+                        try:
+                            tab_title = _get_first_tab_title(sheets, sheet_id)
+                            header = _read_header_row2(sheets, sheet_id, tab_title)
+                            format_sheet_columns_autosize_with_exceptions(sheet_id, header)
+                        except Exception as _e:
+                            print(f"ℹ️ Skipped re-format after link append: {_e}")
+                except Exception as e:
+                    print(f"⚠️ Failed to write PDF links to sheet: {e}")
+            elif pdf_manifest and new_row_created:
+                print(f"   ℹ️ Skipping PDF link write to old row - PDFs belong to new property")
 
             # Required fields check and remaining questions flow
             # Automatic response logic based on property state
