@@ -389,16 +389,23 @@ Could you please provide the following details for this property:
         print(f"❌ Failed to send new property email: {e}")
         return None
     
-def send_thankyou_closing_with_new_property(uid: str, client_id: str, headers: dict, 
-                                           recipient: str, thread_id: str, 
-                                           row_number: int, row_anchor: str) -> bool:
-    """Send thank you when property is unavailable but they suggested a new one."""
+def send_thankyou_closing_with_new_property(uid: str, client_id: str, headers: dict,
+                                           recipient: str, thread_id: str,
+                                           row_number: int, row_anchor: str,
+                                           new_property_address: str = "") -> bool:
+    """Send thank you when property is unavailable but they suggested a new one.
+
+    This closes out the current thread and informs the broker we'll follow up
+    separately about the new property.
+    """
     try:
-        body = """Hi,
+        body = f"""Hi,
 
-Thank you for letting me know that property is no longer available, and thanks for suggesting the alternative property.
+Thanks for the update—understood on {row_anchor} being unavailable.
 
-I'll review the new property details and get back to you if I have any questions."""
+Appreciate you sending over the info on {new_property_address or 'the other property'}. I'll send a separate email to keep things organized and follow up if it looks like a fit for my client.
+
+Thanks,"""
 
         # Format as HTML with footer using user's signature settings
         user_signature, signature_mode = _get_user_signature_settings(uid)

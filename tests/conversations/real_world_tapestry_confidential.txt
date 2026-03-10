@@ -1,0 +1,49 @@
+Subject: RE: The Tapestry - 9300 Lottsford Rd, Largo MD
+From: Craig Cheney <ccheney@KLNB.com>
+To: Jill Ames <jill.ames@mohrpartners.com>
+Cc: Alex Willner <awillner@klnb.com>
+Date: Thursday, August 21, 2025 8:32 AM
+
+Hi Jill,
+
+There is plenty of free retail parking on the first level of the garage. Attached is a JPG where I highlighted the floor plan of the 1,400 SF space. This was taken from page 4 of the attached PDF. Please let us know what else you need. By the way, what franchise is it that you are working with?
+
+Thanks,
+
+Craig S. Cheney
+O: 703-268-2705 | C: 703-399-1041
+KLNB Commercial Real Estate Services
+
+---
+
+TEST METADATA:
+scenario: real_world_confidential_question
+source: Jill Ames forwarded email (August 2025)
+property_address: 9300 Lottsford Rd, Largo MD
+property_name: The Tapestry
+broker_name: Craig Cheney
+broker_email: ccheney@KLNB.com
+broker_company: KLNB
+
+ATTACHMENTS:
+- 1400 SF Floor Plan-Highlighted.jpg
+- Tapestry Largo Station Retail Floor Plan.pdf (floorplan - 5.1MB)
+
+JILL'S NOTES:
+"The broker asked a question. They asked which franchise/business this is for. Can the A.I. Auto respond to that?"
+ANSWER: NO - This is a confidentiality question. AI must escalate to user.
+
+EXPECTED EXTRACTION:
+- total_sf: 1400 (mentioned in context)
+- parking: "free retail parking on first level of garage"
+- floorplan: PDF attachment
+
+EXPECTED EVENTS:
+- needs_user_input:confidential (broker asked "what franchise is it?")
+
+EXPECTED AI BEHAVIOR:
+1. Extract available info (SF, parking situation)
+2. Categorize "Floor Plan" PDF → Floorplan column
+3. CRITICAL: Detect confidentiality question ("what franchise is it?")
+4. Escalate to user with needs_user_input:confidential
+5. DO NOT auto-reply - pause and wait for user input

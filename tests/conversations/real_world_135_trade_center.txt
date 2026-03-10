@@ -1,0 +1,52 @@
+Subject: Re: 135 Trade Center Court, Augusta, GA
+From: Luke Coffey <Luke.Coffey@southeastern.company>
+To: Jill Ames <jill.ames@mohrpartners.com>
+Date: Monday, May 12, 2025 7:08 AM
+
+Good Morning Jill,
+
+This would certainly be a great fit here. Please see attached Building C & D plans. We are asking $15/SF/NNN and we anticipate a delivery of July 1, 2025; building A is almost complete.
+
+More than happy to jump on a call to discuss at your convenience. Just let me know what works best for you.
+
+
+Luke Coffey
+Sales Associate
+Southeastern
+2743 Perimeter Parkway, Bldg. 100, Suite 370
+Augusta, GA 30909
+luke.coffey@southeastern.company
+p: (706)-854-6731
+c: (651)-271-8098
+
+---
+
+TEST METADATA:
+scenario: real_world_complete_info_with_call_offer
+source: Jill Ames forwarded email (May 2025)
+property_address: 135 Trade Center Court, Augusta, GA
+broker_name: Luke Coffey
+broker_email: Luke.Coffey@southeastern.company
+broker_company: Southeastern
+
+ATTACHMENTS:
+- Sealed Bldg C 10-24-23.pdf (floorplan - 2.8MB)
+- Sealed Bldg D 10-24-23.pdf (floorplan - 2.9MB)
+- 135 Trade Center Court - Brochure.pdf (flyer - 804KB)
+
+EXPECTED EXTRACTION:
+- rent_sf_yr: 15 (accept but don't request)
+- ops_ex_sf: NNN (operating expenses)
+- call_requested: true (offered call, escalate to user)
+- PDF categorization: "Sealed Bldg" files → Floorplan column, "Brochure" → Flyer column
+
+EXPECTED EVENTS:
+- call_requested (broker offered to discuss on a call)
+
+EXPECTED AI BEHAVIOR:
+1. Extract rent ($15/SF/NNN)
+2. Detect call offer - escalate with needs_user_input or call_requested event
+3. Categorize PDFs correctly:
+   - "Sealed Bldg C" → Floorplan column
+   - "Sealed Bldg D" → Floorplan column
+   - "Brochure" → Flyer/Link column

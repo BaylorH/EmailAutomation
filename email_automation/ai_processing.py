@@ -549,8 +549,15 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • Messages requiring decisions the AI shouldn't make on behalf of the user
   • NOTE: Tour/meeting requests should use "tour_requested" event instead
 
+  IMPORTANT - NOT a client_question:
+  • "Let me know if you need anything else" = This is the broker OFFERING to provide more info, NOT asking a question
+  • "Happy to help with anything else" = Same - broker offering help
+  • "What else do you need?" = Same - broker asking what PROPERTY info is missing
+  • For these phrases: Check if required fields are missing and generate a response_email asking for them
+  • Do NOT emit needs_user_input for these - they are invitations to continue the conversation
+
   Include "reason" field explaining WHY user input is needed:
-  • "client_question" - broker asking about client's requirements
+  • "client_question" - broker asking about client's requirements (e.g., "what size does your client need?", "what's your budget?")
   • "negotiation" - price or term negotiation
   • "confidential" - asking for client identity/info
   • "legal_contract" - contract/LOI/lease questions

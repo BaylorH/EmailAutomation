@@ -2,7 +2,7 @@
 
 **Date:** March 9, 2026
 **Test File:** `test_pdfs/E2E_Real_World_Test.xlsx`
-**Follow-up Config:** 2 follow-ups at **2 minutes** each (for quick testing)
+**Follow-up Config:** 3 follow-ups at **1 hour**, **2 hours**, **3 hours**
 
 ---
 
@@ -47,6 +47,12 @@ During campaign setup, configure:
 2. **Yard Space** → "Ask (Optional)"
 3. **Environmental Notes** → "Note"
 
+### Initial Outreach Script
+The Excel file (`E2E_Real_World_Test.xlsx`) now includes a **Script** sheet with the outreach template.
+The script asks for parking upfront: `> How many parking spaces are available?`
+
+**IMPORTANT:** The Script sheet is included in the Excel file - no manual script entry needed.
+
 ---
 
 ## MONITORING TOOLS
@@ -69,7 +75,7 @@ python3 tests/e2e_monitor.py outlook
 | Row | Property | Contact | Email | Scenario |
 |-----|----------|---------|-------|----------|
 | 3 | 699 Industrial Park Dr | Jeff Wilson | bp21harrison | Complete + All Custom Fields |
-| 4 | 150 Trade Center Court | Luke Coffey | bp21harrison | Unavailable + New Property (→ 135 Trade Center) |
+| 4 | 150 Trade Center Court | Luke Coffey | bp21harrison | Unavailable + New Property (→ 135 Trade Center, matches PDF) |
 | 5 | 2017 St. Josephs Drive | Brian Greene | manifold | Tour Request |
 | 6 | 9300 Lottsford Rd | Craig Cheney | manifold | Complete + Parking + Env Notes |
 | 7 | 1 Randolph Ct | Scott Atkins | bp21harrison | Identity Question |
@@ -87,7 +93,7 @@ python3 tests/e2e_monitor.py outlook
    - **Parking Spaces** → "Ask (Required)"
    - **Yard Space** → "Ask (Optional)"
    - **Environmental Notes** → "Note"
-3. Configure: **2 follow-ups** at **2 minutes** each
+3. Configure: **3 follow-ups** at **1 hour**, **2 hours**, **3 hours**
 4. Start campaign
 5. Tell Claude "campaign started"
 

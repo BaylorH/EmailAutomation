@@ -1,0 +1,66 @@
+Subject: Re: Woodmore Commons - 2017 St. Josephs Drive, Bowie, MD
+From: Brian Greene <bg@hp-llc.com>
+To: Jill Ames <jill.ames@mohrpartners.com>
+Date: Monday, August 25, 2025 8:22 AM
+
+Hi Jill. Below is the only current space we have and is about 10 miles from Woodmore.
+
+https://www.hp-llc.com/the-centre-at-forestville
+
+BRIAN GREENE
+EVP OF LEASING
+2568A Riva Rd, Suite 200
+Annapolis, MD 21401
+703-725-1351
+www.hp-llc.com
+bg@hp-llc.com
+
+---
+PREVIOUS MESSAGE (Jill's follow-up):
+Subject: Re: Woodmore Commons - 2017 St. Josephs Drive, Bowie, MD
+Date: Thursday, August 21, 2025 4:08 PM
+
+Ok, thanks for letting me know. Do you have or know of any other spaces that might be a fit for us?
+
+---
+ORIGINAL BROKER REPLY:
+Subject: Re: Woodmore Commons - 2017 St. Josephs Drive, Bowie, MD
+Date: Thursday, August 21, 2025 1:43 PM
+
+Hi Jill. I'm sorry but we are already at lease for this space, and it's our last one. We also have an anchor restriction on fitness concepts.
+
+Thank you,
+BRIAN GREENE
+EVP
+
+---
+
+TEST METADATA:
+scenario: real_world_unavailable_with_alternative
+source: Jill Ames forwarded email (August 2025)
+property_address: 2017 St. Josephs Drive, Bowie, MD
+property_name: Woodmore Commons
+broker_name: Brian Greene
+broker_email: bg@hp-llc.com
+broker_company: HP LLC
+
+JILL'S NOTES:
+"The space is no longer available. They are recommending another property. They sent a website link with more info."
+"Can A.I. Look at the website and scan for any of the data it can find to fill into the spreadsheet?"
+ANSWER: Future feature - web scraping for property data
+
+NEW PROPERTY SUGGESTED:
+- Name: The Centre at Forestville
+- URL: https://www.hp-llc.com/the-centre-at-forestville
+- Distance: ~10 miles from Woodmore
+
+EXPECTED EVENTS:
+1. property_unavailable (already at lease + anchor restriction)
+2. new_property_suggestion (suggested The Centre at Forestville with link)
+
+EXPECTED AI BEHAVIOR:
+1. Detect property is unavailable ("already at lease", "our last one")
+2. Move row below NON-VIABLE divider
+3. Detect new property suggestion with URL
+4. Create notification for user approval of new property
+5. If approved, create new row with property from link
