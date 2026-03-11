@@ -1,4 +1,12 @@
-# E2E Real World Test Plan
+# ⚠️ DEPRECATED - Use E2E_TEST_RUN_SHEET.md Instead
+
+**This file is outdated.** The current E2E test plan is at:
+- `/E2E_TEST_RUN_SHEET.md` - Run sheet with expected vs actual
+- `/tests/E2E_REPLY_CHEATSHEET.md` - Copy-paste broker replies
+
+---
+
+# E2E Real World Test Plan (OLD - March 9, 2026)
 
 **Date:** March 9, 2026
 **Test File:** `test_pdfs/E2E_Real_World_Test.xlsx`

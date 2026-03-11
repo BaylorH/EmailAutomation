@@ -1,4 +1,12 @@
-# E2E Campaign Test Plan - Full Production Simulation
+# ⚠️ DEPRECATED - Use E2E_TEST_RUN_SHEET.md Instead
+
+**This file is outdated.** The current E2E test plan is at:
+- `/E2E_TEST_RUN_SHEET.md` - Run sheet with expected vs actual
+- `/tests/E2E_REPLY_CHEATSHEET.md` - Copy-paste broker replies
+
+---
+
+# E2E Campaign Test Plan - Full Production Simulation (OLD)
 
 ## Overview
 
