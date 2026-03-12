@@ -9,7 +9,7 @@ Usage:
     python tests/outlook_helper.py attachments <msg_id> [user_id]  # Download attachments
     python tests/outlook_helper.py users               # List available user IDs
 
-Default user_id: xG7jAeu8ceYVBhXQwDFRfvLmvpH2 (baylor.freelance@outlook.com)
+Default user_id: NO7lVYVp6BaplKYEfMlWCgBnpdh2 (baylor.freelance@outlook.com)
 
 IMPORTANT: This is THE canonical way to access Outlook. Do not reinvent this.
 """
@@ -55,7 +55,7 @@ def list_user_ids():
     return list(user_ids)
 
 # Default user ID for baylor.freelance@outlook.com
-DEFAULT_USER_ID = "xG7jAeu8ceYVBhXQwDFRfvLmvpH2"
+DEFAULT_USER_ID = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
 
 
 def get_access_token(user_id: str = None) -> str:

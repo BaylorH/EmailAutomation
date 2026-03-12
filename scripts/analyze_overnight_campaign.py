@@ -34,7 +34,7 @@ CLIENT_ID = os.getenv("AZURE_API_APP_ID")
 CLIENT_SECRET = os.getenv("AZURE_API_CLIENT_SECRET")
 AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["https://graph.microsoft.com/Mail.ReadWrite"]
-USER_ID = "ERQ9Zda9D4Vh8OPPNg98DWWi5em1"  # baylor.freelance
+USER_ID = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"  # baylor.freelance@outlook.com
 
 def get_access_token():
     """Download token from Firebase and get access token."""

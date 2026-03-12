@@ -1450,8 +1450,13 @@ Thanks!""",
                         )
                         mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
 
-                        # Skip auto-response - conversation is done
-                        proposal["skip_response"] = True
+                        # Only skip response if AI didn't generate a closing email
+                        # If AI generated a response (e.g., thanking broker), send it before closing
+                        if not proposal.get("response_email"):
+                            proposal["skip_response"] = True
+                            print(f"   ℹ️ No closing email generated, skipping response")
+                        else:
+                            print(f"   📧 Will send AI-generated closing email")
                         # Clear highlight - row is complete
                         try:
                             clear_row_highlight(sheet_id, rownum)

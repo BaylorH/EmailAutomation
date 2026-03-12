@@ -20,6 +20,28 @@
 
 ---
 
+## ⚠️ E2E Test File (ALWAYS USE THIS)
+
+**Standard test file:** `test_pdfs/E2E_Real_World_Test.xlsx`
+
+This file is pre-configured with:
+- 7 test properties (699 Industrial, 150 Trade Center, 2017 St. Josephs, 9300 Lottsford, 1 Randolph, 1800 Broad, 2525 Center West)
+- Custom columns for testing: `Rail Access`, `Office %`, `Sprinkler Type`, `Building Condition Notes`
+- Script sheet with outreach template (asks about parking)
+- Broker emails split between `bp21harrison@gmail.com` and `baylor@manifoldengineering.ai`
+
+**Column configuration during setup:**
+| Column | Mode | Tests |
+|--------|------|-------|
+| Rail Access | Ask (Required) | Blocks closing if missing |
+| Office % | Ask (Optional) | AI asks but doesn't block |
+| Sprinkler Type | Accept Only | Extract if mentioned, never ask |
+| Building Condition Notes | Note | Auto-append, never ask |
+
+**DO NOT create new test Excel files. Always use this one.**
+
+---
+
 ## Project Overview
 
 **What is this?** An AI-powered commercial real estate email automation system that:
@@ -75,7 +97,7 @@
 python tests/outlook_helper.py inbox
 
 # List inbox for specific user
-python tests/outlook_helper.py inbox xG7jAeu8ceYVBhXQwDFRfvLmvpH2
+python tests/outlook_helper.py inbox NO7lVYVp6BaplKYEfMlWCgBnpdh2
 
 # Download attachments from a message
 python tests/outlook_helper.py attachments <msg_id>
@@ -84,7 +106,7 @@ python tests/outlook_helper.py attachments <msg_id>
 python tests/outlook_helper.py users
 ```
 
-**Default user:** `xG7jAeu8ceYVBhXQwDFRfvLmvpH2` (baylor.freelance@outlook.com)
+**Default user:** `NO7lVYVp6BaplKYEfMlWCgBnpdh2` (baylor.freelance@outlook.com)
 
 **How it works internally:**
 1. `download_token()` from `firebase_helpers.py` downloads MSAL token from Firebase Storage
@@ -574,14 +596,14 @@ python3 tests/e2e_helpers.py clear
 **The purpose of E2E tests is to verify NEW features work correctly, not just re-test existing functionality.**
 
 ### When Setting Up E2E Tests:
-1. **Always include at least one NEW/untested variable** - If we just added support for "Parking Spaces", the E2E test MUST include Parking Spaces as a required or asked field
+1. **Always include at least one NEW/untested variable** - If we just added support for a new custom field mode, the E2E test MUST include that mode
 2. **Test the feature you just built** - The whole point is verification. Don't test the same 6 standard fields every time.
-3. **Set new fields to "Ask" or "Required"** - This forces the AI to actually gather and populate the new field
+3. **Test ALL custom field modes** - ask_required, ask_optional, accept_only, note
 
 ### Example:
-- We add support for a new column type "Parking Spaces"
-- E2E test MUST: Set Parking Spaces to "Ask" or "Required" in column config
-- E2E test verifies: AI recognizes the field, asks for it, extracts it from replies, populates the sheet
+- We add support for "accept_only" mode (extract but never ask)
+- E2E test MUST: Include a custom field set to "Accept Only"
+- E2E test verifies: AI extracts the value when mentioned, never asks for it, doesn't block closing
 
 **DO NOT just run the same test with the same standard fields over and over. E2E tests exist to verify NEW code paths.**
 
