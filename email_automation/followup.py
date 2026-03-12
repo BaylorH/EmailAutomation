@@ -132,8 +132,9 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
         return 0
 
     print(f"   Found {len(waiting_threads)} threads with follow-up tracking")
+    total_threads = len(waiting_threads)
 
-    for thread_doc in waiting_threads:
+    for idx, thread_doc in enumerate(waiting_threads):
         thread_data = thread_doc.to_dict()
         thread_id = thread_doc.id
 
@@ -200,6 +201,13 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
                 followup_config=followup_config,
                 just_sent_index=current_index
             )
+
+            # Stagger follow-up sends by 2 minutes to avoid spam detection
+            # Only sleep if there are more threads to process
+            remaining_threads = total_threads - (idx + 1)
+            if remaining_threads > 0:
+                print(f"   ⏳ Waiting 2 minutes before next follow-up ({remaining_threads} remaining)...")
+                time.sleep(120)  # 2 minutes
         else:
             # Release the claim so it can be retried
             _release_followup_claim(user_id, thread_id)
