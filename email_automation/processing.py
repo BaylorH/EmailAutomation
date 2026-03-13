@@ -1742,6 +1742,26 @@ Thanks!""",
             elif pdf_manifest and new_row_created:
                 print(f"   ℹ️ Skipping PDF link write to old row - PDFs belong to new property")
 
+            # Update the message record with attachment info so frontend can display links
+            if pdf_manifest and internet_message_id:
+                try:
+                    attachments = []
+                    for pdf in pdf_manifest:
+                        if pdf.get('drive_link'):
+                            attachments.append({
+                                "name": pdf.get('name', 'attachment.pdf'),
+                                "driveLink": pdf.get('drive_link'),
+                                "type": "pdf"
+                            })
+                    if attachments:
+                        msg_ref = (_fs.collection("users").document(user_id)
+                                   .collection("threads").document(thread_id)
+                                   .collection("messages").document(internet_message_id))
+                        msg_ref.update({"attachments": attachments})
+                        print(f"   📎 Added {len(attachments)} attachment link(s) to message record")
+                except Exception as e:
+                    print(f"⚠️ Failed to update message with attachments: {e}")
+
             # Required fields check and remaining questions flow
             # Automatic response logic based on property state
             try:
