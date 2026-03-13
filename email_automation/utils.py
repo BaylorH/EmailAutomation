@@ -17,6 +17,66 @@ def _body_kind(script: str):
 def _normalize_email(s: str) -> str:
     return (s or "").strip().lower()
 
+
+def strip_email_quotes(text: str) -> str:
+    """
+    Strip quoted content from email replies to get just the new message content.
+
+    Handles common quote patterns:
+    - "On [date] [name] wrote:" followed by quoted text
+    - Lines starting with ">"
+    - "-------- Original Message --------"
+    - "From: ... Sent: ... To: ..." headers
+    - Gmail-style "On ... wrote:" blocks
+
+    Returns the text before any quoted content.
+    If no new content exists (e.g., reply is just a PDF attachment with quoted original),
+    returns "[No text content - see attachments]" to signal the AI to focus on PDFs.
+    """
+    if not text:
+        return ""
+
+    lines = text.split('\n')
+    result_lines = []
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Stop at common quote indicators
+        # Gmail/most clients: "On [date] [name] wrote:"
+        if re.match(r'^On\s+.+wrote:\s*$', stripped, re.IGNORECASE):
+            break
+
+        # Outlook: "From: ... Sent: ... To: ..."
+        if stripped.startswith('From:') and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if next_line.startswith('Sent:') or next_line.startswith('To:'):
+                break
+
+        # Common dividers
+        if stripped in ['-------- Original Message --------',
+                        '________________________________',
+                        '-----Original Message-----']:
+            break
+
+        # Lines that are just ">" or start with "> " are quoted
+        if stripped == '>' or stripped.startswith('> '):
+            # Skip quoted lines but continue looking for more content after
+            continue
+
+        result_lines.append(line)
+
+    # Clean up result
+    result = '\n'.join(result_lines).strip()
+
+    # If we stripped everything (reply was just quoted content + attachments),
+    # return a signal for the AI to focus on attachments
+    if not result:
+        return "[No new text content in reply - check PDF attachments for property information]"
+
+    return result
+
+
 # Email validation regex - RFC 5322 simplified
 _EMAIL_REGEX = re.compile(
     r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"

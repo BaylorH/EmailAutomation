@@ -2,7 +2,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs
-from .utils import b64url_id, clean_email_content
+from .utils import b64url_id, clean_email_content, strip_email_quotes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -378,8 +378,15 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, header
             full_text = clean_email_content(raw_content)[:CUT]
             preview = clean_email_content(body.get("preview") or "")[:200]
 
+            # Strip quoted content from inbound messages for AI processing
+            # This prevents the AI from misinterpreting quoted text (our original questions)
+            # as being the broker's message
+            direction = data.get("direction", "unknown")
+            if direction == "inbound":
+                full_text = strip_email_quotes(full_text)
+
             payload.append({
-                "direction": data.get("direction", "unknown"),
+                "direction": direction,
                 "from": data.get("from", ""),
                 "to": data.get("to", []),
                 "subject": data.get("subject", ""),

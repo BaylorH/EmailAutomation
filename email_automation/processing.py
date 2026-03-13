@@ -19,9 +19,9 @@ from .logging import write_message_order_test
 from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_row_anchor, check_missing_required_fields
 from .file_handling import fetch_and_process_pdfs, upload_pdf_to_drive
 from .notifications import write_notification, add_client_notifications
-from .utils import (exponential_backoff_request, strip_html_tags, safe_preview, 
+from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
-                   format_email_body_with_footer)
+                   format_email_body_with_footer, strip_email_quotes)
 from .email_operations import (
     send_remaining_questions_email,
     send_closing_email,
@@ -503,6 +503,10 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     except Exception as e:
         print(f"⚠️ Could not fetch full body for {msg_id}: {e}")
         _full_text = body_preview or ""
+
+    # Strip quoted content for AI processing (keep full text for storage)
+    # This prevents the AI from misinterpreting quoted content as the broker's message
+    _text_for_ai = strip_email_quotes(_full_text)
 
     to_recipients = [r.get("emailAddress", {}).get("address", "") for r in msg.get("toRecipients", [])]
     
