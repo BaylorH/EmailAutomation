@@ -1607,15 +1607,23 @@ Thanks!""",
                             dedupe_key=f"wrong_contact:{thread_id}:{suggested_email or suggested_contact or from_addr_lower}"
                         )
                         mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
-                        print(f"👤 Wrong contact detected - redirect to: {suggested_contact or 'unknown'} ({suggested_email or 'no email'})")
+                        print(f"👤 Wrong contact detected ({reason}) - redirect to: {suggested_contact or 'unknown'} ({suggested_email or 'no email'})")
 
-                        # Skip auto-response - don't reply to wrong person
-                        proposal["skip_response"] = True
-                        # Highlight blue - row needs user attention (paused)
-                        try:
-                            highlight_row(sheet_id, rownum, ROW_HIGHLIGHT_BLUE)
-                        except Exception as e:
-                            print(f"⚠️ Could not highlight row: {e}")
+                        # For "forwarded" (someone covering), don't block - just notify as FYI
+                        # For other cases (wrong_person, left_company, no_longer_handles), block and pause
+                        if reason == "forwarded":
+                            # Just an FYI - person is covering temporarily, conversation continues normally
+                            print(f"   ℹ️ Forwarded case - continuing conversation (someone covering)")
+                        else:
+                            # Skip auto-response - don't reply to wrong person
+                            proposal["skip_response"] = True
+                            # Update thread status to paused
+                            update_thread_status(user_id, thread_id, THREAD_STATUS["paused"], f"wrong_contact:{reason}")
+                            # Highlight blue - row needs user attention (paused)
+                            try:
+                                highlight_row(sheet_id, rownum, ROW_HIGHLIGHT_BLUE)
+                            except Exception as e:
+                                print(f"⚠️ Could not highlight row: {e}")
 
                     except Exception as e:
                         print(f"❌ Failed to handle wrong_contact: {e}")
