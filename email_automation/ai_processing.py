@@ -512,7 +512,13 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • Look for URLs pointing to different properties/listings
   • Look for property names, addresses, or locations mentioned that are NOT the TARGET PROPERTY
   • If mentioning "forestville", "centre", "woodmore" or other location names different from TARGET, this likely indicates new_property
-  • Extract the property identifier (address, name, or URL) as the "address" field
+  • ADDRESS EXTRACTION RULES:
+    - If a SPECIFIC street address is mentioned (e.g., "123 Main St", "500 Industrial Pkwy"), use that as the "address"
+    - If only a building/property NAME is mentioned (e.g., "The Commerce Center", "Woodmore Plaza"), use that as the "address"
+    - If only a VAGUE DESCRIPTION is given (e.g., "new development", "another property nearby", "similar building on X street"):
+      * Prefix the address with "[TBD]" to indicate it needs user clarification
+      * Example: "[TBD] new development on Trade Center Court"
+      * This signals to the user they should get the real address before sending
   • Try to infer city/location from context or URL
   • IMPORTANT: If a DIFFERENT contact person is mentioned (e.g., "email Joe Smith at joe@email.com", "contact Sarah Jones", "reach out to Mike Brown"):
     - Extract the contact FULL NAME as "contactName" (e.g., "Joe Smith", "Sarah Jones", "Mike Brown")
@@ -866,7 +872,7 @@ OUTPUT ONLY valid JSON in this exact format:
   "events": [
     {
       "type": "call_requested | property_unavailable | new_property | close_conversation | needs_user_input | contact_optout | wrong_contact | property_issue | tour_requested",
-      "address": "<for new_property: extract property name, address, or identifier>",
+      "address": "<for new_property: extract street address or building name. If only vague description available, prefix with [TBD] e.g. '[TBD] new development on Main St'>",
       "city": "<for new_property: infer city/location if possible>",
       "email": "<for new_property if different email/contact needed>",
       "contactName": "<for new_property: full name of the new contact if mentioned, e.g., 'Joe Smith' from 'email Joe Smith at joe@email.com'. Use first name only if that's all available>",
