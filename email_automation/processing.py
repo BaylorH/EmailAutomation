@@ -1549,6 +1549,7 @@ Thanks!""",
                                 "reason": f"contact_optout:{reason}",
                                 "details": reason_labels.get(reason, reason),
                                 "contact": from_addr_lower,
+                                "contactName": contact_name,  # For [NAME] replacement in frontend
                                 "originalMessage": _full_text[:500]
                             },
                             dedupe_key=f"contact_optout:{thread_id}:{from_addr_lower}"
@@ -1599,6 +1600,7 @@ Thanks!""",
                                 "reason": f"wrong_contact:{reason}",
                                 "details": details,
                                 "originalContact": from_addr_lower,
+                                "contactName": contact_name,  # For [NAME] replacement in frontend
                                 "suggestedContact": suggested_contact,
                                 "suggestedEmail": suggested_email,
                                 "suggestedPhone": suggested_phone,
@@ -1691,7 +1693,10 @@ Thanks!""",
                                 "severity": severity,
                                 "severityLabel": severity_labels.get(severity, severity),
                                 "contact": from_addr_lower,
-                                "originalMessage": _full_text[:500]
+                                "contactName": contact_name,  # For [NAME] replacement in frontend
+                                "originalMessage": _full_text[:500],
+                                "question": f"Property has an issue: {issue}",  # For AI chat context
+                                "replyToMessageId": msg_id  # For sending reply
                             },
                             dedupe_key=f"property_issue:{thread_id}:{issue[:50]}"
                         )
