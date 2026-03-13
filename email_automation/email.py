@@ -683,6 +683,16 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             if contact_name:
                 thread_meta["contactName"] = contact_name
 
+            # Store property address for PDF/data matching
+            # Extract from subject (format: "Property Address, City")
+            if subject:
+                # Remove common prefixes like "Re:", "RE:", "Fwd:", etc.
+                clean_subject = subject.strip()
+                for prefix in ["Re:", "RE:", "Fwd:", "FWD:", "Fw:"]:
+                    if clean_subject.startswith(prefix):
+                        clean_subject = clean_subject[len(prefix):].strip()
+                thread_meta["propertyAddress"] = clean_subject
+
             # Save thread root with retry
             thread_saved = False
             for attempt in range(MAX_INDEX_RETRIES):
