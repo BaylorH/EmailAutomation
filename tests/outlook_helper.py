@@ -8,6 +8,7 @@ Usage:
     python tests/outlook_helper.py inbox [user_id]     # List inbox messages
     python tests/outlook_helper.py attachments <msg_id> [user_id]  # Download attachments
     python tests/outlook_helper.py users               # List available user IDs
+    python tests/outlook_helper.py clear [user_id]     # Clear inbox & sent items (E2E setup)
 
 Default user_id: NO7lVYVp6BaplKYEfMlWCgBnpdh2 (baylor.freelance@outlook.com)
 
@@ -181,6 +182,53 @@ def show_users():
     print()
 
 
+def clear_mailbox(user_id: str = None, folders: list = None):
+    """
+    Clear all messages from specified folders.
+    Used for E2E test setup to start with a clean mailbox.
+
+    Usage: python tests/outlook_helper.py clear [user_id]
+    """
+    folders = folders or ["Inbox", "SentItems"]
+    token = get_access_token(user_id)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    total_deleted = 0
+
+    for folder in folders:
+        print(f"\n🗑️  Clearing {folder}...")
+
+        # Get all messages (paginate if needed)
+        while True:
+            resp = requests.get(
+                f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder}/messages",
+                headers=headers,
+                params={"$top": "50", "$select": "id,subject"}
+            )
+
+            if resp.status_code != 200:
+                print(f"Error listing {folder}: {resp.status_code}")
+                break
+
+            messages = resp.json().get("value", [])
+            if not messages:
+                break
+
+            for msg in messages:
+                subj = msg.get("subject", "(no subject)")[:40]
+                del_resp = requests.delete(
+                    f"https://graph.microsoft.com/v1.0/me/messages/{msg['id']}",
+                    headers=headers
+                )
+                if del_resp.status_code == 204:
+                    print(f"  ✓ Deleted: {subj}")
+                    total_deleted += 1
+                else:
+                    print(f"  ✗ Failed: {subj} ({del_resp.status_code})")
+
+    print(f"\n✅ Cleared {total_deleted} messages total")
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
@@ -202,6 +250,10 @@ if __name__ == "__main__":
 
     elif cmd == "users":
         show_users()
+
+    elif cmd == "clear":
+        user_id = sys.argv[2] if len(sys.argv) > 2 else None
+        clear_mailbox(user_id)
 
     else:
         print(f"Unknown command: {cmd}")
