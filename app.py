@@ -886,6 +886,97 @@ def api_accept_new_property():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/resume-conversation", methods=["POST"])
+def api_resume_conversation():
+    """
+    Resume monitoring a paused conversation thread.
+    Called when user sends a reply from the frontend.
+    - Sets thread status to 'active'
+    - Highlights row yellow in Google Sheet
+    - Resets follow-up status to 'waiting'
+
+    Expects JSON body: { uid, threadId, clientId? }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        uid = data.get("uid")
+        thread_id = data.get("threadId")
+        client_id = data.get("clientId")  # Optional, used to find sheet
+
+        if not uid or not thread_id:
+            return jsonify({"success": False, "error": "Missing required fields: uid, threadId"}), 400
+
+        from email_automation.clients import _fs, _get_client_config
+        from email_automation.messaging import update_thread_status, THREAD_STATUS
+        from email_automation.sheets import highlight_row, ROW_HIGHLIGHT_YELLOW
+        from google.cloud.firestore import SERVER_TIMESTAMP
+
+        # Get thread data
+        thread_ref = _fs.collection("users").document(uid).collection("threads").document(thread_id)
+        thread_doc = thread_ref.get()
+
+        if not thread_doc.exists:
+            return jsonify({"success": False, "error": "Thread not found"}), 404
+
+        thread_data = thread_doc.to_dict()
+        current_status = thread_data.get("status", "")
+
+        # Only resume if currently paused
+        if current_status != "paused":
+            print(f"ℹ️ Thread already {current_status}, not paused - skipping resume", flush=True)
+            return jsonify({
+                "success": True,
+                "message": f"Thread already {current_status}",
+                "threadId": thread_id,
+                "newStatus": current_status
+            })
+
+        # Update thread status to active
+        if not update_thread_status(uid, thread_id, THREAD_STATUS["active"], "user_replied"):
+            return jsonify({"success": False, "error": "Failed to update thread status"}), 500
+
+        # Reset follow-up status to waiting
+        try:
+            thread_ref.update({
+                "followUpStatus": "waiting",
+                "updatedAt": SERVER_TIMESTAMP
+            })
+            print(f"▶️ Reset follow-up status for thread {thread_id[:20]}...", flush=True)
+        except Exception as e:
+            print(f"⚠️ Could not reset follow-up status: {e}", flush=True)
+
+        # Highlight row yellow in Google Sheet
+        client_id = client_id or thread_data.get("clientId")
+        row_number = thread_data.get("rowNumber")
+
+        if client_id and row_number:
+            try:
+                sheet_id, _, _ = _get_client_config(uid, client_id)
+                if sheet_id:
+                    highlight_row(sheet_id, row_number, ROW_HIGHLIGHT_YELLOW)
+                    print(f"🟡 Highlighted row {row_number} yellow (resumed)", flush=True)
+            except Exception as e:
+                print(f"⚠️ Could not highlight row: {e}", flush=True)
+
+        print(f"▶️ Resumed monitoring thread {thread_id[:20]}...", flush=True)
+
+        return jsonify({
+            "success": True,
+            "message": "Conversation monitoring resumed",
+            "threadId": thread_id,
+            "newStatus": "active"
+        })
+
+    except Exception as e:
+        print(f"❌ Failed to resume conversation: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/stop-conversation", methods=["POST"])
 def api_stop_conversation():
     """
