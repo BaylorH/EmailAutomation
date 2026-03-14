@@ -739,16 +739,27 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             # Retry fetching sheet
             client_id, sheet_id, header, rownum, rowvals, column_config, extraction_fields = fetch_and_log_sheet_for_thread(user_id, thread_id, counterparty_email=from_addr)
     
-    # Extract contact name: try email name first, then sheet row
+    # Extract contact name - PRIORITY ORDER:
+    # 1. Thread's stored contactName (authoritative - set at campaign start)
+    # 2. Sheet row "Leasing Contact" column (original campaign data)
+    # 3. Email sender's display name (fallback only)
     contact_name = None
-    if from_name:
-        contact_name = from_name.strip()
-        print(f"📝 Extracted name from email: {contact_name}")
-    
-    # Try to get name from sheet row (common column names)
+
+    # Priority 1: Check thread's stored contactName (set when initial outreach was sent)
+    try:
+        thread_doc = _fs.collection("users").document(user_id).collection("threads").document(thread_id).get()
+        thread_data = thread_doc.to_dict() or {}
+        stored_contact = thread_data.get("contactName", "").strip()
+        if stored_contact:
+            contact_name = stored_contact
+            print(f"📝 Using stored contact name from thread: {contact_name}")
+    except Exception as e:
+        print(f"⚠️ Could not fetch thread contactName: {e}")
+
+    # Priority 2: Try to get name from sheet row (common column names)
     if not contact_name and rowvals and header:
         idx_map = _header_index_map(header)
-        name_keys = ["name", "contact name", "leasing contact", "contact", "broker name", "broker"]
+        name_keys = ["leasing contact", "contact name", "name", "contact", "broker name", "broker"]
         for key in name_keys:
             idx = idx_map.get(key)
             if idx and (idx - 1) < len(rowvals):
@@ -757,6 +768,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     contact_name = name_val
                     print(f"📝 Extracted name from sheet column '{key}': {contact_name}")
                     break
+
+    # Priority 3: Fallback to email sender's display name (least reliable)
+    if not contact_name and from_name:
+        contact_name = from_name.strip()
+        print(f"📝 Fallback: using email sender name: {contact_name}")
     
     # Only proceed if we successfully matched a sheet row
     if sheet_id and rownum is not None:
