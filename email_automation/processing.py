@@ -84,6 +84,14 @@ def is_contact_opted_out(user_id: str, email: str) -> Optional[Dict]:
         return None
 
 
+def _build_greeting(contact_name: Optional[str]) -> str:
+    """Build a personalized greeting using the contact's first name, or generic 'Hi,' if no name."""
+    if contact_name:
+        first_name = contact_name.split()[0]
+        return f"Hi {first_name},"
+    return "Hi,"
+
+
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     try:
@@ -1809,7 +1817,8 @@ Thanks!""",
                         response_body = llm_response_email
                         print(f"🤖 Using LLM-generated response for non-viable + new property scenario")
                     else:
-                        response_body = """Hi,
+                        greeting = _build_greeting(contact_name)
+                        response_body = f"""{greeting}
 
 Thank you for letting me know that property is no longer available, and thanks for suggesting the alternative property.
 
@@ -1830,7 +1839,8 @@ I'll review the new property details and get back to you if I have any questions
                         response_body = llm_response_email
                         print(f"🤖 Using LLM-generated response for non-viable scenario")
                     else:
-                        response_body = """Hi,
+                        greeting = _build_greeting(contact_name)
+                        response_body = f"""{greeting}
 
 Thank you for letting me know that property is no longer available.
 
@@ -1846,7 +1856,8 @@ Do you have any other properties that might be a good fit for our requirements?"
                 
                 # Handle call request without phone number - send brief response asking for number
                 if call_requested_no_phone and not response_sent:
-                    response_body = """Hi,
+                    greeting = _build_greeting(contact_name)
+                    response_body = f"""{greeting}
 
 Could you please provide your phone number so I can give you a call?"""
                     sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
@@ -1916,8 +1927,9 @@ Could you please provide your phone number so I can give you a call?"""
                                         response_body = response_body.strip() + "\n\nThanks."
                                 print(f"🤖 Using LLM-generated response for missing fields scenario")
                             else:
+                                greeting = _build_greeting(contact_name)
                                 field_list = "\n".join(f"- {field}" for field in missing_fields)
-                                response_body = f"""Hi,
+                                response_body = f"""{greeting}
 
 Thank you for the information!
 
@@ -1938,7 +1950,8 @@ To complete the property details, could you please provide:
                                 response_body = llm_response_email
                                 print(f"🤖 Using LLM-generated response for all fields complete scenario")
                             else:
-                                response_body = """Hi,
+                                greeting = _build_greeting(contact_name)
+                                response_body = f"""{greeting}
 
 Thank you for providing all the requested information! We now have everything we need for your property details.
 

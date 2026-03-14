@@ -683,9 +683,9 @@ GUIDELINES:
 PHRASE VARIATION RULES (MANDATORY - rotate through these options):
 
 GREETINGS (pick one based on context and vary across messages):
-- With name (for longer messages, first contact, or acknowledging specific info):
-  * "Hi [Name]," | "Thanks [Name]," | "[Name]," | "Hi [Name] -"
-- Without name (for brief requests or quick follow-ups):
+- With name (use the FIRST NAME FOR GREETINGS provided above):
+  * "Hi {FirstName}," | "Thanks {FirstName}," | "{FirstName}," | "Hi {FirstName} -"
+- Without name (for brief requests, quick follow-ups, or if no contact name provided):
   * "Hi," | "Thanks," | "Thank you,"
 
 THANKING FOR INFORMATION (rotate - never use same phrase twice in a row):
@@ -800,10 +800,11 @@ IMPORTANT: The response should feel natural and conversational, not robotic or t
         # Check missing required fields to inform response email generation
         missing_fields = check_missing_required_fields(rowvals, header, effective_config)
         
-        # Build contact name context (provided as info for optional use, not required)
+        # Build contact name context with explicit first name for AI to use in greetings
         contact_context = ""
         if contact_name:
-            contact_context = f"\nCONTACT NAME (optional - use contextually, not in every message): {contact_name}"
+            first_name = contact_name.split()[0] if contact_name else None
+            contact_context = f"\nCONTACT NAME: {contact_name}\nFIRST NAME FOR GREETINGS: {first_name} (use this in greetings like 'Hi {first_name},')"
         
         prompt_parts = [f"""
 You are analyzing a conversation thread to suggest updates to ONE Google Sheet row, detect key events, and generate an appropriate response email.
