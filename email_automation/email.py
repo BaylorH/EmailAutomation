@@ -1053,6 +1053,20 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     clientId = (data.get("clientId") or "").strip()
     attempts = int(data.get("attempts") or 0)
     row_number = data.get("rowNumber")
+
+    # If row_number is missing (e.g., user reply from UI), look it up by email
+    if not row_number and emails and clientId:
+        try:
+            sheet_id = _get_sheet_id_or_fail(user_id, clientId)
+            tab_title = _get_first_tab_title(sheet_id)
+            headers = _read_header_row2(sheet_id, tab_title)
+            header_map = _header_index_map(headers)
+            row_number = _find_row_by_email(sheet_id, tab_title, emails[0], header_map)
+            if row_number:
+                print(f"   📍 Looked up row number: {row_number} for {emails[0]}")
+        except Exception as e:
+            print(f"   ⚠️ Could not look up row number: {e}")
+
     # Get pre-computed subject from outbox data (property-specific)
     subject_override = data.get("subject")
 
