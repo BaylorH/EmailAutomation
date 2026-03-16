@@ -1132,6 +1132,7 @@ Thanks!"""
                         # Continue processing if we can't determine position
                     
                     # Move row below divider and create notification
+                    # Trust AI detection - GPT-5.2 already analyzed the message context
                     message_content = _full_text.lower()
                     unavailable_keywords = [
                         "no longer available", "not available", "off the market",
@@ -1143,12 +1144,12 @@ Thanks!"""
                         "just leased", "pending lease", "contract pending",
                         "accepted an offer", "lease signed", "taken off market"
                     ]
-                    
-                    # Only proceed if we find explicit unavailability language
-                    if any(keyword in message_content for keyword in unavailable_keywords):
-                        try:
-                            # Find which keyword triggered the unavailability detection
-                            found_keyword = next(keyword for keyword in unavailable_keywords if keyword in message_content)
+
+                    # Find keyword for logging purposes (optional - AI already detected unavailability)
+                    found_keyword = next((kw for kw in unavailable_keywords if kw in message_content), "AI-detected unavailability")
+                    print(f"🔍 Processing property_unavailable event (trigger: '{found_keyword}')")
+
+                    try:
                             
                             divider_row = ensure_nonviable_divider(sheets, sheet_id, tab_title)
                             new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
@@ -1240,10 +1241,10 @@ Thanks!"""
                             )
                             mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                             print(f"🚫 Moved property to non-viable and created notification")
-                        except Exception as e:
-                            print(f"❌ Failed to handle property_unavailable: {e}")
-                    else:
-                        print(f"⚠️ Property unavailable event detected but no explicit unavailability keywords found")
+                    except Exception as e:
+                        print(f"❌ Failed to handle property_unavailable: {e}")
+                        import traceback
+                        traceback.print_exc()
 
                 elif event_type == "new_property":
                     try:
