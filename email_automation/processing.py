@@ -930,19 +930,31 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             # Process events from the proposal
             sheets = _sheets_client()
             row_anchor = get_row_anchor(rowvals, header)
-            
+
             events = proposal.get("events", [])
-            for event in events:
+            print(f"\n{'='*60}")
+            print(f"📋 EVENT PROCESSING: {len(events)} event(s) detected by AI")
+            print(f"{'='*60}")
+
+            if not events:
+                print(f"   ℹ️ No events to process")
+
+            for i, event in enumerate(events):
                 event_type = event.get("type")
+                print(f"\n🔄 Event {i+1}/{len(events)}: {event_type}")
+                print(f"   Event data: {event}")
 
                 # Build event key for deduplication
                 event_key = build_event_key(event_type, event, thread_id)
+                print(f"   Event key: {event_key}")
 
                 # Check if this event was already handled - prevents duplicate notifications
                 # when AI re-detects the same event from conversation history
                 if is_event_handled(user_id, thread_id, event_key):
-                    print(f"✅ Event already handled, skipping: {event_key}")
+                    print(f"   ✅ Already handled, skipping")
                     continue
+
+                print(f"   ➡️ Processing event...")
 
                 if event_type == "call_requested":
                     # Check if phone number is mentioned in the message
@@ -1789,15 +1801,22 @@ Thanks!""",
 
             # Required fields check and remaining questions flow
             # Automatic response logic based on property state
+            print(f"\n{'='*60}")
+            print(f"📧 RESPONSE SCENARIO SELECTION")
+            print(f"{'='*60}")
+            print(f"   old_row_became_nonviable: {old_row_became_nonviable}")
+            print(f"   new_row_created: {new_row_created}")
+            print(f"   LLM response available: {bool(proposal.get('response_email'))}")
+
             try:
                 response_sent = False
-                
+
                 # Check if we should skip response (e.g., phone number provided in call request)
                 skip_response = proposal.get("skip_response", False)
                 if skip_response:
                     print(f"⏭️ Skipping email response (notification only)")
                     return  # Exit early, notification already created
-                
+
                 # Check if call was requested but no phone number provided
                 call_requested_no_phone = False
                 for event in events:
@@ -1807,12 +1826,13 @@ Thanks!""",
                         if not phone_match:
                             call_requested_no_phone = True
                             break
-                
+
                 # Check if LLM generated a response email
                 llm_response_email = proposal.get("response_email")
-                
+
                 # Scenario 1: Property became non-viable AND new property was suggested
                 if old_row_became_nonviable and new_row_created:
+                    print(f"   📍 SCENARIO 1: Non-viable + new property suggested")
                     # Use LLM-generated response if available, otherwise use template
                     if llm_response_email:
                         response_body = llm_response_email
@@ -1835,6 +1855,7 @@ I'll review the new property details and get back to you if I have any questions
                 
                 # Scenario 2: Property became non-viable but NO new property suggested
                 elif old_row_became_nonviable and not new_row_created:
+                    print(f"   📍 SCENARIO 2: Non-viable, no new property")
                     # Use LLM-generated response if available, otherwise use template
                     if llm_response_email:
                         response_body = llm_response_email
@@ -1871,6 +1892,7 @@ Could you please provide your phone number so I can give you a call?"""
                 
                 # Scenario 3 & 4: Property is still viable - check missing fields
                 if not response_sent and not old_row_became_nonviable:
+                    print(f"   📍 SCENARIO 3/4: Property viable, checking missing fields")
                     sheets = _sheets_client()
                     tab_title = _get_first_tab_title(sheets, sheet_id)
                     
