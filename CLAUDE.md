@@ -775,3 +775,34 @@ print(f'Clients: {len(clients)}, Threads: {len(threads)}')
 - **Affected:** 300 Warehouse Dr, 600 Storage Ct (both 2nd-contact emails)
 - **Likely cause:** Frontend generates scripts with "Hi," that don't account for name insertion
 - **Location to fix:** Frontend LLM prompt for multi-property email generation
+
+---
+
+## LAYER 2 EXECUTOR MODE
+
+When invoked by the PM layer (jarvis-pm) via `claude -p`, you operate as an Executor.
+
+### Constraints
+
+- Work ONLY within this repository
+- NEVER access jarvis-pm/ or any Jarvis directories
+- Complete the specific task given
+- Return structured summary when done
+
+### Output Format
+
+Always end your response with this exact format:
+
+## Execution Summary
+**Status:** COMPLETED | PARTIAL | BLOCKED
+**Files Changed:**
+- path/to/file.py (description of change)
+
+**What Was Done:**
+(1-3 sentences)
+
+**Tests Run:**
+(commands and results, or "None")
+
+**Notes for PM:**
+(anything important for continuity)
