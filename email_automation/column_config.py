@@ -173,7 +173,7 @@ CANONICAL_FIELDS = {
         "label": "Listing Brokers Comments",
         "description": "Broker's notes and comments",
         "required_for_matching": False,
-        "default_aliases": ["listing brokers comments", "listing brokers comments ", "broker comments", "comments", "notes", "broker notes"],
+        "default_aliases": ["listing broker comments", "listing brokers comments", "broker comments", "comments", "notes", "broker notes"],
         "extraction_hints": None,  # Use 'notes' field in AI output instead
         "format": "text",
         "extractable": False,  # AI writes to 'notes' field, which gets appended here
@@ -204,7 +204,7 @@ CANONICAL_FIELDS = {
         "label": "Jill and Clients comments",
         "description": "Internal client notes",
         "required_for_matching": False,
-        "default_aliases": ["jill and clients comments", "client comments", "internal notes", "our comments"],
+        "default_aliases": ["jills comments", "jill's comments", "jill and clients comments", "clients comments", "client comments", "internal notes", "our comments"],
         "extraction_hints": None,  # Internal use only
         "format": "text",
         "extractable": False,

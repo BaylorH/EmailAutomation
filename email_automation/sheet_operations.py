@@ -1,10 +1,16 @@
 from typing import Optional, List, Dict, Any
 from .clients import _fs, _sheets_client
-from .sheets import _get_first_tab_title, _read_header_row2, _header_index_map, _first_sheet_props, _find_row_by_address_city, _find_row_by_email, _execute_with_retry
+from .sheets import _get_first_tab_title, _read_header_row2, _header_index_map, _first_sheet_props, _find_row_by_address_city, _find_row_by_email, _execute_with_retry, _col_letter
 from .utils import _subject_to_address_city
 
 
-def sync_thread_row_numbers_after_move(user_id: str, src_row: int, divider_row: int, new_row: int) -> int:
+def sync_thread_row_numbers_after_move(
+    user_id: str,
+    src_row: int,
+    divider_row: int,
+    new_row: int,
+    client_id: Optional[str] = None,
+) -> int:
     """
     Update thread rowNumbers after a row is moved below the NON-VIABLE divider.
 
@@ -21,6 +27,9 @@ def sync_thread_row_numbers_after_move(user_id: str, src_row: int, divider_row: 
 
         for thread in threads:
             data = thread.to_dict()
+            if client_id and data.get("clientId") != client_id:
+                continue
+
             current_row = data.get("rowNumber")
 
             if current_row is None:
@@ -45,6 +54,88 @@ def sync_thread_row_numbers_after_move(user_id: str, src_row: int, divider_row: 
     except Exception as e:
         print(f"⚠️ Failed to sync thread row numbers: {e}")
         return 0
+
+
+def sync_thread_row_numbers_after_insert(user_id: str, insert_row: int, client_id: Optional[str] = None) -> int:
+    """
+    Update thread rowNumbers after a new sheet row is inserted.
+
+    Every existing tracked thread at or below insert_row shifts down by one.
+    Optional client_id narrows the update to a single campaign.
+    """
+    try:
+        updated_count = 0
+        threads_ref = _fs.collection("users").document(user_id).collection("threads")
+        threads = list(threads_ref.stream())
+
+        for thread in threads:
+            data = thread.to_dict() or {}
+            if client_id and data.get("clientId") != client_id:
+                continue
+
+            current_row = data.get("rowNumber")
+            if current_row is None or current_row < insert_row:
+                continue
+
+            new_row_num = current_row + 1
+            threads_ref.document(thread.id).update({"rowNumber": new_row_num})
+            print(f"   📍 Updated thread rowNumber: {current_row} -> {new_row_num} (insert shifted down)")
+            updated_count += 1
+
+        if updated_count > 0:
+            print(f"✅ Synchronized {updated_count} thread rowNumbers after row insert")
+        return updated_count
+
+    except Exception as e:
+        print(f"⚠️ Failed to sync thread row numbers after insert: {e}")
+        return 0
+
+
+def _find_header_position(header: List[str], aliases: List[str]) -> Optional[int]:
+    normalized_aliases = {alias.strip().lower() for alias in aliases}
+    for idx, column in enumerate(header, start=1):
+        if (column or "").strip().lower() in normalized_aliases:
+            return idx
+    return None
+
+
+def _build_gross_rent_formula_for_row(header: List[str], rownum: int) -> Optional[tuple[str, str]]:
+    total_sf_col = _find_header_position(header, ["total sf", "sf", "square footage", "size"])
+    rent_col = _find_header_position(header, ["rent/sf /yr", "rent/sf/yr", "rent /sf /yr", "asking rent"])
+    ops_col = _find_header_position(header, ["ops ex /sf", "ops ex/sf", "nnn", "cam", "operating expenses"])
+    gross_rent_col = _find_header_position(header, ["gross rent", "monthly gross rent"])
+
+    if not (total_sf_col and rent_col and ops_col and gross_rent_col):
+        return None
+
+    total_sf_letter = _col_letter(total_sf_col)
+    rent_letter = _col_letter(rent_col)
+    ops_letter = _col_letter(ops_col)
+    gross_rent_letter = _col_letter(gross_rent_col)
+    formula = (
+        f'=IF(OR({total_sf_letter}{rownum}="",{rent_letter}{rownum}="",{ops_letter}{rownum}=""),'
+        f'"",({rent_letter}{rownum}+{ops_letter}{rownum})*{total_sf_letter}{rownum}/12)'
+    )
+    return gross_rent_letter, formula
+
+
+def _apply_gross_rent_formula_for_row(sheets, sheet_id: str, tab_title: str, header: List[str], rownum: int) -> bool:
+    formula_target = _build_gross_rent_formula_for_row(header, rownum)
+    if not formula_target:
+        return False
+
+    gross_rent_letter, formula = formula_target
+    _execute_with_retry(
+        sheets.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=f"{tab_title}!{gross_rent_letter}{rownum}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[formula]]}
+        ),
+        "insert_row_fill_gross_rent_formula"
+    )
+    return True
+
 
 def _find_nonviable_divider_row(sheets, spreadsheet_id: str, tab_title: str) -> Optional[int]:
     """Return the divider row index if it exists, else None (no creation)."""
@@ -326,6 +417,9 @@ def insert_property_row_above_divider(sheets, sheet_id: str, tab_title: str, val
                 ),
                 "insert_row_fill_values"
             )
+
+        if _apply_gross_rent_formula_for_row(sheets, sheet_id, tab_title, header, insert_row):
+            print(f"✅ Added Gross Rent formula to inserted property row {insert_row}")
 
         print(f"✨ Inserted new property row {insert_row} above divider")
         return insert_row

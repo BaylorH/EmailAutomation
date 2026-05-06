@@ -320,8 +320,8 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
             "format_columns_batch_update"
         )
 
-def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]):
-    """Find/create Flyer / Link column and append unique links (no duplicates)."""
+def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]) -> list[str]:
+    """Find/create Flyer / Link column and append unique links. Returns newly added links."""
     try:
         tab_title = _get_first_tab_title(sheets, spreadsheet_id)
         idx_map = _header_index_map(header)
@@ -384,7 +384,7 @@ def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[
 
         if not additions:
             print("ℹ️ All links already present in Flyer / Link")
-            return
+            return []
 
         # Build updated cell content (preserve prior order, append new)
         updated_lines = existing_lines + additions
@@ -401,13 +401,15 @@ def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[
         )
 
         print(f"🔗 Appended {len(additions)} new link(s) to Flyer / Link")
+        return additions
 
     except Exception as e:
         print(f"❌ Failed to append links to Flyer / Link column: {e}")
+        return []
 
 
-def append_links_to_floorplan_column(sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]):
-    """Find/create Floorplan column and append unique links (no duplicates)."""
+def append_links_to_floorplan_column(sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]) -> list[str]:
+    """Find/create Floorplan column and append unique links. Returns newly added links."""
     try:
         tab_title = _get_first_tab_title(sheets, spreadsheet_id)
         idx_map = _header_index_map(header)
@@ -480,7 +482,7 @@ def append_links_to_floorplan_column(sheets, spreadsheet_id: str, header: list[s
 
         if not additions:
             print("ℹ️ All links already present in Floorplan")
-            return
+            return []
 
         # Build updated cell content (preserve prior order, append new)
         updated_lines = existing_lines + additions
@@ -497,9 +499,11 @@ def append_links_to_floorplan_column(sheets, spreadsheet_id: str, header: list[s
         )
 
         print(f"📐 Appended {len(additions)} new link(s) to Floorplan")
+        return additions
 
     except Exception as e:
         print(f"❌ Failed to append links to Floorplan column: {e}")
+        return []
 
 
 def is_floorplan_filename(filename: str) -> bool:

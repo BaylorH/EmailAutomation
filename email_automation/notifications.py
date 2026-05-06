@@ -1,8 +1,11 @@
 import hashlib
+import logging
 from typing import Optional, List, Dict, Any
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 from .clients import _fs
 from google.cloud import firestore
+
+logger = logging.getLogger(__name__)
 
 def write_notification(uid: str, client_id: str, *, kind: str, priority: str, email: str, 
                       thread_id: str, row_number: int = None, row_anchor: str = None, 
@@ -17,6 +20,20 @@ def write_notification(uid: str, client_id: str, *, kind: str, priority: str, em
             doc_id = hashlib.sha1(dedupe_key.encode('utf-8')).hexdigest()
         else:
             doc_id = None  # Let Firestore auto-generate
+        logger.debug(
+            "notification.dedupe_key",
+            extra={
+                "uid": uid,
+                "client_id": client_id,
+                "kind": kind,
+                "priority": priority,
+                "email": email,
+                "thread_id": thread_id,
+                "row_number": row_number,
+                "dedupe_key": dedupe_key,
+                "doc_id": doc_id,
+            },
+        )
         
         client_ref = _fs.collection("users").document(uid).collection("clients").document(client_id)
         # If doc_id is fixed (dedupe), we can safely create a stable ref now
@@ -95,6 +112,20 @@ def add_client_notifications(
         # Write one notification per applied update
         for update in applied_updates:
             dedupe_key = f"{thread_id}:{update.get('range', '')}:{update.get('column', '')}:{update.get('newValue', '')}"
+            logger.debug(
+                "notification.dedupe_key",
+                extra={
+                    "uid": uid,
+                    "client_id": client_id,
+                    "kind": "sheet_update",
+                    "email": email,
+                    "thread_id": thread_id,
+                    "range": update.get("range", ""),
+                    "column": update.get("column", ""),
+                    "new_value": update.get("newValue", ""),
+                    "dedupe_key": dedupe_key,
+                },
+            )
 
             write_notification(
                 uid, client_id,

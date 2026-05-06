@@ -1,5 +1,6 @@
 import json
 import hashlib
+import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
@@ -14,6 +15,8 @@ from .column_config import (
     get_required_fields_for_close,
     REQUIRED_FOR_CLOSE,
 )
+
+logger = logging.getLogger(__name__)
 
 def _filter_config_by_extraction_fields(column_config: dict, extraction_fields: List[str]) -> dict:
     """
@@ -213,6 +216,17 @@ def _append_ai_meta(sheets, spreadsheet_id: str, rownum: int, column: str, value
         now_iso = datetime.now(timezone.utc).isoformat()
 
         row_data = [rownum, column, value, now_iso, override]
+        logger.debug(
+            "sheet.ai_meta_append",
+            extra={
+                "spreadsheet_id": spreadsheet_id,
+                "rownum": rownum,
+                "column": column,
+                "value": value,
+                "override": override,
+                "timestamp": now_iso,
+            },
+        )
 
         _execute_with_retry(
             sheets.spreadsheets().values().append(
@@ -236,26 +250,39 @@ def _append_notes_to_comments(sheets, spreadsheet_id: str, tab_title: str, heade
     try:
         idx_map = _header_index_map(header)
         
-        # Try to find comments column (prefer Listing Brokers Comments, fallback to Jill and Clients Comments)
+        # Try to find comments column (prefer broker comments, fallback to user/client notes)
         comments_col_idx = None
         comments_col_name = None
-        
-        # First try "Listing Brokers Comments"
-        for key in ["listing brokers comments", "listing brokers comments "]:
+
+        # First try broker comments. The live MOHR sheet uses singular "Listing Broker Comments".
+        for key in [
+            "listing broker comments",
+            "listing brokers comments",
+            "listing broker comment",
+            "broker comments",
+            "broker notes",
+        ]:
             if key in idx_map:
                 comments_col_idx = idx_map[key]
                 comments_col_name = key
                 break
-        
-        # Fallback to "Jill and Clients Comments"
-        if not comments_col_idx:
-            for key in ["jill and clients comments", "jill and clients comments "]:
+
+        # Fallback to Jill/client comment columns.
+        if comments_col_idx is None:
+            for key in [
+                "jills comments",
+                "jill's comments",
+                "jill and clients comments",
+                "jill/client comments",
+                "clients comments",
+                "client comments",
+            ]:
                 if key in idx_map:
                     comments_col_idx = idx_map[key]
                     comments_col_name = key
                     break
-        
-        if not comments_col_idx:
+
+        if comments_col_idx is None:
             print(f"⚠️ Could not find comments column to append notes")
             return
         
@@ -406,6 +433,17 @@ def apply_proposal_to_sheet(
 
         # Update AI_META for each applied change
         for a in applied:
+            logger.debug(
+                "sheet.ai_meta_append",
+                extra={
+                    "spreadsheet_id": sheet_id,
+                    "rownum": rownum,
+                    "column": a["column"],
+                    "value": a["newValue"],
+                    "override": False,
+                    "source": "apply_proposal_to_sheet",
+                },
+            )
             _append_ai_meta(sheets, sheet_id, rownum, a["column"], a["newValue"], override=False)
 
         # Write notes to comments field if provided
@@ -648,6 +686,7 @@ ALWAYS CAPTURE IN NOTES (context not in columns):
 - Landlord motivation: "owner motivated", "firm on price", "willing to negotiate"
 - TI/buildout: "TI allowance available", "$10/SF TI", "as-is condition"
 - Special features: "fenced yard", "rail spur", "sprinklered", "ESFR", "food grade"
+- Parking/trailer context: parking count, ample parking, truck/trailer parking, fenced trailer parking, trailer storage
 - Zoning/use: "zoned M-1", "heavy industrial allowed", "no outdoor storage"
 - Location context: "near I-20", "airport adjacent", "in industrial park"
 - Divisibility: "can subdivide", "must take full space"
@@ -889,7 +928,7 @@ OUTPUT ONLY valid JSON in this exact format:
     }
   ],
   "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation, reference specific details when possible, and vary wording to avoid repetition. SET TO NULL when: (1) call_requested with phone number provided, (2) needs_user_input event detected, (3) contact_optout event detected, (4) wrong_contact event detected. The system will notify the user instead of auto-responding.>",
-  "notes": "<IMPORTANT: Capture contextual details NOT already in columns. NEVER repeat values being written to columns (rent amounts, SF, ops ex, docks, power, etc.). DO capture: lease type (NNN/gross), availability timing, landlord motivation (motivated/firm), building features (fenced yard, rail spur, sprinklered), zoning, location context, divisibility, TI allowance, sublease terms. Format: terse fragments separated by ' • '. Example: 'NNN • available immediately • owner motivated • fenced yard • near I-20'. Leave empty if no additional context beyond column data.>"
+  "notes": "<IMPORTANT: Capture contextual details NOT already in columns. NEVER repeat values being written to columns (rent amounts, SF, ops ex, docks, power, etc.). DO capture: lease type (NNN/gross), availability timing, landlord motivation (motivated/firm), building features (fenced yard, rail spur, sprinklered), parking/trailer context such as parking count or trailer parking, zoning, location context, divisibility, TI allowance, sublease terms. Format: terse fragments separated by ' • '. Example: 'NNN • available immediately • owner motivated • fenced yard • 30 parking spaces • near I-20'. Leave empty if no additional context beyond column data.>"
 }
 """)
 
@@ -912,9 +951,10 @@ OUTPUT ONLY valid JSON in this exact format:
                     })
                     print(f"📷 Added page {i+1} image from {name} for vision analysis")
 
-                # Add file_id as fallback if we have it and extraction was poor
-                if pdf.get("id") and pdf.get("method") in ("openai_upload", "openai_upload+images", "failed"):
-                    input_content.append({"type": "input_file", "file_id": pdf["id"]})
+                # Add file_id as fallback if we have it and extraction was poor.
+                file_id = pdf.get("file_id") or pdf.get("id")
+                if file_id and pdf.get("method") in ("openai_upload", "openai_upload+images", "failed"):
+                    input_content.append({"type": "input_file", "file_id": file_id})
 
         input_content.append({"type": "input_text", "text": prompt})
 

@@ -2,7 +2,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs
-from .utils import b64url_id, clean_email_content, strip_email_quotes
+from .utils import b64url_id, clean_email_content, normalize_message_id, strip_email_quotes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -98,13 +98,30 @@ def save_message(user_id: str, thread_id: str, message_id: str, payload: Dict[st
         print(f"❌ Failed to save message {message_id}: {e}")
         return False
 
+
+def _message_index_candidates(message_id: str) -> List[str]:
+    """Return normalized msgIndex keys, with legacy raw-key fallback."""
+    normalized_message_id = normalize_message_id(message_id)
+    legacy_raw_message_id = (message_id or "").strip()
+    lookup_candidates = []
+    for candidate in (normalized_message_id, legacy_raw_message_id):
+        if candidate and candidate not in lookup_candidates:
+            lookup_candidates.append(candidate)
+    return lookup_candidates
+
+
 def index_message_id(user_id: str, message_id: str, thread_id: str) -> bool:
     """Index message ID for O(1) lookup. Returns True on success, False on failure."""
     try:
-        encoded_id = b64url_id(message_id)
+        lookup_candidates = _message_index_candidates(message_id)
+        if not lookup_candidates:
+            print("⚠️ Empty message_id provided, skipping msgIndex write")
+            return False
+        canonical_message_id = lookup_candidates[0]
+        encoded_id = b64url_id(canonical_message_id)
         index_ref = _fs.collection("users").document(user_id).collection("msgIndex").document(encoded_id)
         index_ref.set({"threadId": thread_id}, merge=True)
-        print(f"🔍 Indexed message ID: {message_id[:50]}... -> {thread_id}")
+        print(f"🔍 Indexed message ID: {canonical_message_id[:50]}... -> {thread_id}")
         return True
     except Exception as e:
         print(f"❌ Failed to index message {message_id}: {e}")
@@ -113,10 +130,12 @@ def index_message_id(user_id: str, message_id: str, thread_id: str) -> bool:
 def lookup_thread_by_message_id(user_id: str, message_id: str) -> Optional[str]:
     """Look up thread ID by message ID."""
     try:
-        encoded_id = b64url_id(message_id)
-        doc = _fs.collection("users").document(user_id).collection("msgIndex").document(encoded_id).get()
-        if doc.exists:
-            return doc.to_dict().get("threadId")
+        lookup_candidates = _message_index_candidates(message_id)
+        for candidate in lookup_candidates:
+            encoded_id = b64url_id(candidate)
+            doc = _fs.collection("users").document(user_id).collection("msgIndex").document(encoded_id).get()
+            if doc.exists:
+                return doc.to_dict().get("threadId")
         return None
     except Exception as e:
         print(f"❌ Failed to lookup message {message_id}: {e}")

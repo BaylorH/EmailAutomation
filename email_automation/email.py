@@ -2,13 +2,16 @@ import json
 import requests
 import time
 import uuid
-from typing import Dict, List, Optional
+import logging
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 from .utils import exponential_backoff_request, safe_preview, _body_kind, validate_recipient_emails, is_valid_email
 from .messaging import save_thread_root, save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
 from .clients import _get_sheet_id_or_fail, _sheets_client
 from .sheets import _find_row_by_email, _get_first_tab_title, _read_header_row2, _header_index_map, highlight_row
 from .utils import normalize_message_id
+
+logger = logging.getLogger(__name__)
 
 # Maximum retry attempts before moving to dead-letter queue
 MAX_OUTBOX_ATTEMPTS = 5
@@ -134,6 +137,45 @@ def _release_claim(doc_ref):
         print(f"   ⚠️ Failed to release claim on {doc_ref.id}: {e}")
 
 
+def _normalize_email(value: str) -> str:
+    return (value or "").strip().lower()
+
+
+def _get_reply_message_sender(headers: dict, reply_to_msg_id: str) -> Optional[str]:
+    """Fetch the sender address of the message a dashboard reply targets."""
+    if not reply_to_msg_id:
+        return None
+
+    try:
+        resp = exponential_backoff_request(
+            lambda: requests.get(
+                f"https://graph.microsoft.com/v1.0/me/messages/{reply_to_msg_id}",
+                headers=headers,
+                params={"$select": "from"},
+                timeout=30,
+            )
+        )
+        if not resp or resp.status_code != 200:
+            print(f"   ⚠️ Could not resolve reply recipient source: {resp.status_code if resp else 'no response'}")
+            return None
+        return _normalize_email(
+            ((resp.json() or {}).get("from") or {})
+            .get("emailAddress", {})
+            .get("address", "")
+        )
+    except Exception as e:
+        print(f"   ⚠️ Could not resolve reply recipient source: {e}")
+        return None
+
+
+def _assigned_emails_match_reply_sender(assigned_emails: List[str], reply_sender: Optional[str]) -> bool:
+    """True when Graph /reply would send to the same single recipient shown in the UI."""
+    normalized = [_normalize_email(email) for email in (assigned_emails or []) if _normalize_email(email)]
+    if len(normalized) != 1 or not reply_sender:
+        return False
+    return normalized[0] == _normalize_email(reply_sender)
+
+
 def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_id: str,
                           thread_id: str, user_signature: str = None, signature_mode: str = None) -> dict:
     """
@@ -150,6 +192,16 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
 
     # Format body as HTML with footer
     html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+    logger.debug(
+        "outbox.reply_recipient_resolution",
+        extra={
+            "user_id": user_id,
+            "thread_id": thread_id,
+            "reply_to_msg_id": reply_to_msg_id,
+            "recipient_source": "microsoft_graph_reply_endpoint",
+            "assigned_emails_honored": False,
+        },
+    )
 
     try:
         # Check if we need signature attachments (professional mode)
@@ -393,6 +445,11 @@ Please let me know if you have any information on this property, or if it's no l
 {organized_note}
 
 Thanks!"""
+
+
+def _should_use_exact_outbox_script(data: Dict[str, Any]) -> bool:
+    """True when the outbox item contains approved copy that must not be re-selected."""
+    return data.get("scriptSelectionMode") == "exact" or data.get("forceScript") is True
 
 def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> Optional[str]:
     """
@@ -1058,10 +1115,10 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     if not row_number and emails and clientId:
         try:
             sheet_id = _get_sheet_id_or_fail(user_id, clientId)
-            tab_title = _get_first_tab_title(sheet_id)
-            headers = _read_header_row2(sheet_id, tab_title)
-            header_map = _header_index_map(headers)
-            row_number = _find_row_by_email(sheet_id, tab_title, emails[0], header_map)
+            sheets = _sheets_client()
+            tab_title = _get_first_tab_title(sheets, sheet_id)
+            sheet_headers = _read_header_row2(sheets, sheet_id, tab_title)
+            row_number, _row_values = _find_row_by_email(sheets, sheet_id, tab_title, sheet_headers, emails[0])
             if row_number:
                 print(f"   📍 Looked up row number: {row_number} for {emails[0]}")
         except Exception as e:
@@ -1125,27 +1182,57 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     if is_thread_reply:
         # For replies, use the script directly (already personalized by frontend)
         script_content = email_scripts[0] if email_scripts else ""
+        reply_sender = _get_reply_message_sender(headers, reply_to_msg_id)
+        use_graph_reply = _assigned_emails_match_reply_sender(emails, reply_sender)
 
-        try:
-            res = _send_outbox_as_reply(
-                user_id, headers, script_content, reply_to_msg_id,
-                thread_id, user_signature=user_signature, signature_mode=signature_mode
-            )
+        if use_graph_reply:
+            try:
+                res = _send_outbox_as_reply(
+                    user_id, headers, script_content, reply_to_msg_id,
+                    thread_id, user_signature=user_signature, signature_mode=signature_mode
+                )
 
-            if res.get("sent"):
-                all_sent.append(emails[0] if emails else "unknown")
+                if res.get("sent"):
+                    all_sent.append(emails[0] if emails else "unknown")
+                else:
+                    all_errors[emails[0] if emails else "unknown"] = res.get("error", "Unknown error")
+
+            except Exception as e:
+                all_errors[emails[0] if emails else "unknown"] = str(e)
+                print(f"💥 Error sending reply: {e}")
+        else:
+            if emails and reply_sender:
+                print(f"   ↪️ Dashboard recipient differs from reply sender ({reply_sender}); sending new indexed message")
+            elif emails:
+                print("   ↪️ Could not verify Graph reply recipient; sending new indexed message to dashboard recipient")
             else:
-                all_errors[emails[0] if emails else "unknown"] = res.get("error", "Unknown error")
+                all_errors["_all"] = "Thread reply has no assigned recipient"
 
-        except Exception as e:
-            all_errors[emails[0] if emails else "unknown"] = str(e)
-            print(f"💥 Error sending reply: {e}")
+            for recipient_email in emails:
+                try:
+                    res = send_and_index_email(
+                        user_id, headers, script_content, [recipient_email],
+                        client_id_or_none=clientId, row_number=row_number,
+                        user_signature=user_signature, subject_override=subject_override,
+                        signature_mode=signature_mode, followup_config=followup_config,
+                        contact_name=contact_name
+                    )
+                    all_sent.extend(res.get("sent", []))
+                    all_errors.update(res.get("errors", {}))
+                except Exception as e:
+                    all_errors[recipient_email] = str(e)
+                    print(f"💥 Error sending redirected thread reply to {recipient_email}: {e}")
     else:
         # For each recipient, select the appropriate script based on contact history
+        use_exact_script = _should_use_exact_outbox_script(data)
         for recipient_email in emails:
-            selected_script = _select_script_for_recipient(
-                user_id, recipient_email, email_scripts, contact_name=contact_name
-            )
+            if use_exact_script:
+                selected_script = email_scripts[0] if email_scripts else ""
+                print(f"  → Using exact outbox script for {recipient_email}")
+            else:
+                selected_script = _select_script_for_recipient(
+                    user_id, recipient_email, email_scripts, contact_name=contact_name
+                )
 
             try:
                 res = send_and_index_email(user_id, headers, selected_script, [recipient_email],

@@ -161,6 +161,7 @@ def process_pdf_for_ai(content: bytes, filename: str = "document.pdf") -> Dict[s
         'images': [],
         'method': 'none',
         'file_id': None,
+        'id': None,
         'filename': filename
     }
 
@@ -184,6 +185,7 @@ def process_pdf_for_ai(content: bytes, filename: str = "document.pdf") -> Dict[s
     try:
         file_id = upload_pdf_user_data(filename, content)
         result['file_id'] = file_id
+        result['id'] = file_id
         result['method'] = 'openai_upload'
 
         # Still include images if we have them

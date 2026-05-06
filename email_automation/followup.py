@@ -486,6 +486,8 @@ def _mark_followup_complete(user_id: str, thread_id: str, reason: str):
     """Mark follow-up sequence as complete."""
     _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
         "followUpStatus": reason,
+        "followUpConfig.processingBy": None,
+        "followUpConfig.processingAt": None,
         "updatedAt": SERVER_TIMESTAMP
     })
     print(f"   Follow-up sequence complete for thread {thread_id[:20]}... ({reason})")

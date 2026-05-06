@@ -3,6 +3,7 @@ import requests
 import hashlib
 import json
 import time
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
@@ -16,9 +17,10 @@ from .messaging import (save_message, save_thread_root, index_message_id, index_
                        is_event_handled, mark_event_handled, build_event_key,
                        update_thread_status, get_thread_status, THREAD_STATUS)
 from .logging import write_message_order_test
-from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_row_anchor, check_missing_required_fields
+from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_row_anchor, check_missing_required_fields, _append_ai_meta
 from .file_handling import fetch_and_process_pdfs, upload_pdf_to_drive
 from .notifications import write_notification, add_client_notifications
+from .notification_payloads import build_wrong_contact_suggested_email
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
                    format_email_body_with_footer, strip_email_quotes)
@@ -30,6 +32,37 @@ from .email_operations import (
 )
 from .pending_responses import queue_pending_response
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE, INBOX_SCAN_WINDOW_HOURS
+
+logger = logging.getLogger(__name__)
+
+
+def _format_event_property(event: Dict[str, Any]) -> str:
+    address = (event.get("address") or "").strip()
+    city = (event.get("city") or "").strip()
+    if address and city:
+        return f"{address}, {city}"
+    return address or city
+
+
+def _build_property_unavailable_comment(current_date: str, found_keyword: str, events: List[Dict[str, Any]]) -> str:
+    base = f"[{current_date}] Property marked unavailable - contact said: '{found_keyword}'"
+    new_property_events = [event for event in (events or []) if event.get("type") == "new_property"]
+
+    alternates = []
+    for event in new_property_events:
+        alternate = _format_event_property(event)
+        notes = (event.get("notes") or "").strip()
+
+        if alternate:
+            alternates.append(f"Suggested alternate: {alternate}")
+        if notes:
+            alternates.append(f"Alternate context: {notes}")
+
+    if not alternates:
+        return base
+
+    return f"{base} ({'; '.join(alternates)})"
+
 
 def _store_contact_optout(user_id: str, email: str, reason: str, thread_id: str) -> bool:
     """
@@ -814,7 +847,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 external_email = thread_emails[0].lower()
 
             # Final fallback: use current sender (with warning)
-            recipient_email = external_email or (from_addr or "").lower()
+            sender_addr_lower = (from_addr or "").strip().lower()
+            recipient_email = external_email or sender_addr_lower
             if not external_email:
                 print(f"⚠️ Could not find email in sheet row, falling back to sender")
 
@@ -825,10 +859,24 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             
         except Exception as e:
             print(f"⚠️ Could not determine thread recipient, using current sender: {e}")
-            recipient_email = (from_addr or "").lower()
+            sender_addr_lower = (from_addr or "").strip().lower()
+            recipient_email = sender_addr_lower
         
-        # Keep the original variable name for compatibility but use correct recipient
-        from_addr_lower = recipient_email
+        # This is the outbound recipient for automated replies, not necessarily the inbound sender.
+        to_addr_lower = recipient_email
+        logger.debug(
+            "identity.recipient_resolved",
+            extra={
+                "user_id": user_id,
+                "client_id": client_id,
+                "thread_id": thread_id,
+                "message_id": msg_id,
+                "sender_addr_lower": sender_addr_lower,
+                "to_addr_lower": to_addr_lower,
+                "thread_emails": thread_emails,
+                "external_email_found": bool(external_email),
+            },
+        )
 
         # --- flags for gating later ---
         old_row_became_nonviable = False   # set true when we move the row below divider
@@ -878,7 +926,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         # Step 3: get proposal using Responses API with URL content and PDF data
         # Pass column_config and extraction_fields for per-client AI configuration
         proposal = propose_sheet_updates(
-            user_id, client_id, from_addr_lower, sheet_id, header, rownum, rowvals,
+            user_id, client_id, to_addr_lower, sheet_id, header, rownum, rowvals,
             thread_id, pdf_manifest=pdf_manifest, url_texts=url_texts, contact_name=contact_name,
             headers=headers, column_config=column_config, extraction_fields=extraction_fields
         )
@@ -899,11 +947,15 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     from datetime import datetime as dt, timezone as tz
                     now_id = dt.now(tz.utc).isoformat().replace(":", "-").replace(".", "-").replace("+00:00", "Z")
                     # Extract file IDs from PDF manifest if available
-                    file_ids = [p.get('id') for p in (pdf_manifest or []) if p.get('id')]
+                    file_ids = [
+                        p.get('file_id') or p.get('id')
+                        for p in (pdf_manifest or [])
+                        if p.get('file_id') or p.get('id')
+                    ]
 
                     _fs.collection("users").document(user_id).collection("sheetChangeLog").document(f"{thread_id}__applied__{now_id}").set({
                         "clientId": client_id,
-                        "email": from_addr_lower,
+                        "email": to_addr_lower,
                         "sheetId": sheet_id,
                         "rowNumber": rownum,
                         "applied": apply_result,
@@ -921,7 +973,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
                 # Write client notifications (one per field)
                 add_client_notifications(
-                    user_id, client_id, from_addr_lower, thread_id,
+                    user_id, client_id, to_addr_lower, thread_id,
                     applied_updates=apply_result.get("applied", []),
                     notes=proposal.get("notes"),
                     address=property_address
@@ -977,7 +1029,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
-                            email=from_addr_lower,
+                            email=to_addr_lower,
                             thread_id=thread_id,
                             row_number=rownum,
                             row_anchor=row_anchor,
@@ -1012,7 +1064,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
                         # If AI didn't generate a suggested email, create a default one
                         if not suggested_email:
-                            broker_name = from_addr_lower.split('@')[0].split('.')[0].title()
+                            broker_name = to_addr_lower.split('@')[0].split('.')[0].title()
                             suggested_email = f"""Hi {broker_name},
 
 Thank you for offering to show me the property! I'd love to schedule a tour.
@@ -1035,7 +1087,7 @@ Thanks!"""
                             "replyToMessageId": msg_id,  # Graph API message ID for sending reply
                             "contactName": contact_name,  # For [NAME] replacement in frontend
                             "suggestedEmail": {
-                                "to": [from_addr_lower],
+                                "to": [to_addr_lower],
                                 "subject": f"RE: {row_anchor}" if row_anchor else "RE: Property Tour",
                                 "body": suggested_email
                             }
@@ -1045,7 +1097,7 @@ Thanks!"""
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
-                            email=from_addr_lower,
+                            email=to_addr_lower,
                             thread_id=thread_id,
                             row_number=rownum,
                             row_anchor=row_anchor,
@@ -1098,7 +1150,7 @@ Thanks!"""
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
-                            email=from_addr_lower,
+                            email=to_addr_lower,
                             thread_id=thread_id,
                             row_number=rownum,
                             row_anchor=row_anchor,
@@ -1167,7 +1219,17 @@ Thanks!"""
                             new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
 
                             # Sync thread rowNumbers after row movement to prevent stale anchors
-                            sync_thread_row_numbers_after_move(user_id, rownum, divider_row, new_rownum)
+                            sync_thread_row_numbers_after_move(user_id, rownum, divider_row, new_rownum, client_id=client_id)
+
+                            update_thread_status(user_id, thread_id, THREAD_STATUS["stopped"], "property_unavailable")
+                            unavailable_thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+                            unavailable_thread_ref.set({
+                                "rowNumber": new_rownum,
+                                "nonViableAt": SERVER_TIMESTAMP,
+                                "nonViableReason": found_keyword,
+                                "followUpStatus": "stopped",
+                                "updatedAt": SERVER_TIMESTAMP,
+                            }, merge=True)
 
                             # Add comment to comments column explaining why it was marked unviable
                             # Prefer "Listing Brokers Comments", fallback to "Jill and Clients Comments"
@@ -1194,8 +1256,12 @@ Thanks!"""
                                     from datetime import datetime
                                     current_date = datetime.now().strftime("%m/%d/%Y")
                                     
-                                    # Create comment explaining why property was marked unviable
-                                    unavailable_comment = f"[{current_date}] Property marked unavailable - contact said: '{found_keyword}'"
+                                    # Create comment explaining why property was marked unviable.
+                                    unavailable_comment = _build_property_unavailable_comment(
+                                        current_date,
+                                        found_keyword,
+                                        events,
+                                    )
                                     
                                     # Get existing comments to append to them
                                     existing_resp = sheets.spreadsheets().values().get(
@@ -1244,7 +1310,7 @@ Thanks!"""
                                 user_id, client_id,
                                 kind="property_unavailable",
                                 priority="important",
-                                email=from_addr_lower,
+                                email=to_addr_lower,
                                 thread_id=thread_id,
                                 row_number=new_rownum,
                                 row_anchor=row_anchor,
@@ -1263,12 +1329,12 @@ Thanks!"""
                         address = event.get("address", "")
                         city = event.get("city", "")
                         # AI can provide specific email for new property contact (different from current sender)
-                        new_property_email = event.get("email", "").strip().lower() or from_addr_lower
+                        new_property_email = event.get("email", "").strip().lower() or to_addr_lower
                         # Extract contact name if AI provided one (e.g., "Joe" from "email Joe at joe@email.com")
                         new_contact_name = event.get("contactName", "").strip()
 
                         # Determine if this is a different contact than the original sender
-                        is_different_contact = new_property_email != from_addr_lower
+                        is_different_contact = new_property_email != to_addr_lower
 
                         # Get the referrer name (the person who suggested this new contact)
                         # Use the leasing contact from the current row, or extract from sender email
@@ -1281,12 +1347,12 @@ Thanks!"""
                                 referrer_name = (rowvals[leasing_contact_idx_temp - 1] or "").strip()
                             # Fallback: extract first name from sender email (before @ and first part)
                             if not referrer_name:
-                                email_name = from_addr_lower.split('@')[0]
+                                email_name = sender_addr_lower.split('@')[0]
                                 # Handle formats like "john.doe" or "jdoe"
                                 referrer_name = email_name.split('.')[0].title()
 
                         if is_different_contact:
-                            print(f"📧 New property has different contact: {new_property_email} (referred by: {referrer_name or from_addr_lower})")
+                            print(f"📧 New property has different contact: {new_property_email} (referred by: {referrer_name or sender_addr_lower})")
                             if new_contact_name:
                                 print(f"   👤 Contact name extracted: {new_contact_name}")
 
@@ -1437,7 +1503,7 @@ Thanks!""",
                                         "name": p.get("name"),
                                         "text": p.get("text", "")[:5000],  # Limit text to 5KB per PDF
                                         "drive_link": p.get("drive_link"),
-                                        "id": p.get("id")  # OpenAI file ID for re-processing if needed
+                                        "id": p.get("file_id") or p.get("id")  # OpenAI file ID for re-processing if needed
                                     }
                                     for p in (pdf_manifest or [])
                                 ]
@@ -1469,7 +1535,10 @@ Thanks!""",
                         if thread_ref:
                             thread_ref.update({
                                 "closedAt": datetime.now().isoformat(),
-                                "closeReason": "natural_end"
+                                "closeReason": "natural_end",
+                                "followUpStatus": "stopped",
+                                "followUpConfig.processingBy": None,
+                                "followUpConfig.processingAt": None,
                             })
                             print(f"💬 Thread marked as completed")
 
@@ -1478,7 +1547,7 @@ Thanks!""",
                             user_id, client_id,
                             kind="conversation_closed",
                             priority="normal",
-                            email=from_addr_lower,
+                            email=to_addr_lower,
                             thread_id=thread_id,
                             row_number=rownum,
                             row_anchor=row_anchor,
@@ -1522,7 +1591,7 @@ Thanks!""",
                         }
 
                         # Store opt-out in Firestore for future reference
-                        _store_contact_optout(user_id, from_addr_lower, reason, thread_id)
+                        _store_contact_optout(user_id, sender_addr_lower, reason, thread_id)
 
                         # Move row to NON-VIABLE with reason
                         try:
@@ -1532,7 +1601,7 @@ Thanks!""",
                                 new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
 
                                 # Sync thread rowNumbers after row movement
-                                sync_thread_row_numbers_after_move(user_id, rownum, divider_row, new_rownum)
+                                sync_thread_row_numbers_after_move(user_id, rownum, divider_row, new_rownum, client_id=client_id)
 
                                 # Add comment explaining why
                                 from datetime import datetime
@@ -1542,7 +1611,15 @@ Thanks!""",
                                 # Find comments column
                                 comments_col_idx = None
                                 for i, col_name in enumerate(header):
-                                    if col_name and "jill and clients comments" in col_name.lower():
+                                    col_lower = (col_name or "").lower().strip()
+                                    if col_lower in {
+                                        "jills comments",
+                                        "jill comments",
+                                        "client comments",
+                                        "clients comments",
+                                        "jill and client comments",
+                                        "jill and clients comments",
+                                    }:
                                         comments_col_idx = i + 1
                                         break
 
@@ -1577,26 +1654,38 @@ Thanks!""",
                         except Exception as move_err:
                             print(f"⚠️ Could not move row to NON-VIABLE: {move_err}")
 
+                        update_thread_status(user_id, thread_id, THREAD_STATUS["stopped"], f"contact_optout:{reason}")
+                        optout_thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+                        optout_thread_ref.set({
+                            "rowNumber": rownum,
+                            "optedOutAt": SERVER_TIMESTAMP,
+                            "optOutReason": reason,
+                            "followUpStatus": "stopped",
+                            "followUpConfig.processingBy": None,
+                            "followUpConfig.processingAt": None,
+                            "updatedAt": SERVER_TIMESTAMP,
+                        }, merge=True)
+
                         # Create notification for user awareness
                         notif_id = write_notification(
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
-                            email=from_addr_lower,
+                            email=sender_addr_lower,
                             thread_id=thread_id,
                             row_number=rownum,
                             row_anchor=row_anchor,
                             meta={
                                 "reason": f"contact_optout:{reason}",
                                 "details": reason_labels.get(reason, reason),
-                                "contact": from_addr_lower,
+                                "contact": sender_addr_lower,
                                 "contactName": contact_name,  # For [NAME] replacement in frontend
                                 "originalMessage": _full_text[:500]
                             },
-                            dedupe_key=f"contact_optout:{thread_id}:{from_addr_lower}"
+                            dedupe_key=f"contact_optout:{thread_id}:{sender_addr_lower}"
                         )
                         mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
-                        print(f"🚫 Contact opted out ({reason}): {from_addr_lower}")
+                        print(f"🚫 Contact opted out ({reason}): {sender_addr_lower}")
 
                         # Skip auto-response - don't email someone who asked not to be contacted
                         proposal["skip_response"] = True
@@ -1628,26 +1717,48 @@ Thanks!""",
                         if suggested_phone:
                             details += f" - {suggested_phone}"
 
+                        suggested_email_payload = build_wrong_contact_suggested_email(
+                            original_contact=sender_addr_lower,
+                            suggested_contact=suggested_contact,
+                            suggested_email=suggested_email,
+                            row_anchor=row_anchor,
+                            referrer_name=contact_name,
+                        )
+                        logger.debug(
+                            "notification.wrong_contact",
+                            extra={
+                                "user_id": user_id,
+                                "client_id": client_id,
+                                "thread_id": thread_id,
+                                "message_id": msg_id,
+                                "reason": reason,
+                                "original_contact": sender_addr_lower,
+                                "suggested_contact": suggested_contact,
+                                "suggested_email": suggested_email,
+                                "payload_to": suggested_email_payload.get("to", []),
+                            },
+                        )
+
                         # Create actionable notification
                         notif_id = write_notification(
                             user_id, client_id,
                             kind="action_needed",
                             priority="important",
-                            email=from_addr_lower,
+                            email=sender_addr_lower,
                             thread_id=thread_id,
                             row_number=rownum,
                             row_anchor=row_anchor,
                             meta={
                                 "reason": f"wrong_contact:{reason}",
                                 "details": details,
-                                "originalContact": from_addr_lower,
+                                "originalContact": sender_addr_lower,
                                 "contactName": contact_name,  # For [NAME] replacement in frontend
                                 "suggestedContact": suggested_contact,
-                                "suggestedEmail": suggested_email,
+                                "suggestedEmail": suggested_email_payload,
                                 "suggestedPhone": suggested_phone,
                                 "originalMessage": _full_text[:500]
                             },
-                            dedupe_key=f"wrong_contact:{thread_id}:{suggested_email or suggested_contact or from_addr_lower}"
+                            dedupe_key=f"wrong_contact:{thread_id}:{suggested_email or suggested_contact or sender_addr_lower}"
                         )
                         mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                         print(f"👤 Wrong contact detected ({reason}) - redirect to: {suggested_contact or 'unknown'} ({suggested_email or 'no email'})")
@@ -1724,7 +1835,7 @@ Thanks!""",
                             user_id, client_id,
                             kind="action_needed",
                             priority=priority,
-                            email=from_addr_lower,
+                            email=sender_addr_lower,
                             thread_id=thread_id,
                             row_number=rownum,
                             row_anchor=row_anchor,
@@ -1733,7 +1844,7 @@ Thanks!""",
                                 "issue": issue,
                                 "severity": severity,
                                 "severityLabel": severity_labels.get(severity, severity),
-                                "contact": from_addr_lower,
+                                "contact": sender_addr_lower,
                                 "contactName": contact_name,  # For [NAME] replacement in frontend
                                 "originalMessage": _full_text[:500],
                                 "question": f"Property has an issue: {issue}",  # For AI chat context
@@ -1754,7 +1865,20 @@ Thanks!""",
                     sheets = _sheets_client()
 
                     if flyer_links:
-                        append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
+                        added_flyer_links = append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
+                        if added_flyer_links:
+                            logger.debug(
+                                "sheet.ai_meta_append",
+                                extra={
+                                    "spreadsheet_id": sheet_id,
+                                    "rownum": rownum,
+                                    "column": "Flyer / Link",
+                                    "value": "\n".join(added_flyer_links),
+                                    "override": False,
+                                    "source": "pdf_link_write",
+                                },
+                            )
+                            _append_ai_meta(sheets, sheet_id, rownum, "Flyer / Link", "\n".join(added_flyer_links), override=False)
                         print(f"   🔗 Applied {len(flyer_links)} flyer link(s) to current row")
 
                     # Delay between writes to avoid Google Sheets API rate limits
@@ -1763,7 +1887,20 @@ Thanks!""",
                         time.sleep(30)
 
                     if floorplan_links:
-                        append_links_to_floorplan_column(sheets, sheet_id, header, rownum, floorplan_links)
+                        added_floorplan_links = append_links_to_floorplan_column(sheets, sheet_id, header, rownum, floorplan_links)
+                        if added_floorplan_links:
+                            logger.debug(
+                                "sheet.ai_meta_append",
+                                extra={
+                                    "spreadsheet_id": sheet_id,
+                                    "rownum": rownum,
+                                    "column": "Floorplan",
+                                    "value": "\n".join(added_floorplan_links),
+                                    "override": False,
+                                    "source": "pdf_link_write",
+                                },
+                            )
+                            _append_ai_meta(sheets, sheet_id, rownum, "Floorplan", "\n".join(added_floorplan_links), override=False)
                         print(f"   📐 Applied {len(floorplan_links)} floorplan link(s) to current row")
 
                     # Re-read header in case we just created columns
@@ -1845,13 +1982,13 @@ Thank you for letting me know that property is no longer available, and thanks f
 
 I'll review the new property details and get back to you if I have any questions."""
                     
-                    sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
+                    sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                     if sent:
-                        print(f"📧 Sent thank you + closing (new property suggested) to: {from_addr_lower}")
+                        print(f"📧 Sent thank you + closing (new property suggested) to: {to_addr_lower}")
                         response_sent = True
                     else:
                         print(f"❌ Failed to send thank you email")
-                        queue_pending_response(user_id, thread_id, msg_id, from_addr_lower, response_body, client_id)
+                        queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
                 
                 # Scenario 2: Property became non-viable but NO new property suggested
                 elif old_row_became_nonviable and not new_row_created:
@@ -1868,13 +2005,13 @@ Thank you for letting me know that property is no longer available.
 
 Do you have any other properties that might be a good fit for our requirements?"""
                     
-                    sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
+                    sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                     if sent:
-                        print(f"📧 Sent thank you + ask for alternatives to: {from_addr_lower}")
+                        print(f"📧 Sent thank you + ask for alternatives to: {to_addr_lower}")
                         response_sent = True
                     else:
                         print(f"❌ Failed to send alternatives request")
-                        queue_pending_response(user_id, thread_id, msg_id, from_addr_lower, response_body, client_id)
+                        queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
                 
                 # Handle call request without phone number - send brief response asking for number
                 if call_requested_no_phone and not response_sent:
@@ -1882,13 +2019,13 @@ Do you have any other properties that might be a good fit for our requirements?"
                     response_body = f"""{greeting}
 
 Could you please provide your phone number so I can give you a call?"""
-                    sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
+                    sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                     if sent:
-                        print(f"📞 Sent request for phone number to: {from_addr_lower}")
+                        print(f"📞 Sent request for phone number to: {to_addr_lower}")
                         response_sent = True
                     else:
                         print(f"❌ Failed to send phone number request")
-                        queue_pending_response(user_id, thread_id, msg_id, from_addr_lower, response_body, client_id)
+                        queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
                 
                 # Scenario 3 & 4: Property is still viable - check missing fields
                 if not response_sent and not old_row_became_nonviable:
@@ -1960,12 +2097,12 @@ To complete the property details, could you please provide:
 
 {field_list}"""
                             
-                            sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
+                            sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                             if sent:
-                                print(f"📧 Sent thank you + missing fields request to: {from_addr_lower}")
+                                print(f"📧 Sent thank you + missing fields request to: {to_addr_lower}")
                             else:
                                 print(f"❌ Failed to send missing fields request")
-                                queue_pending_response(user_id, thread_id, msg_id, from_addr_lower, response_body, client_id)
+                                queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
                         else:
                             # Scenario 4: All fields complete - send closing
                             # Use LLM-generated response if available, otherwise use template
@@ -1980,16 +2117,16 @@ Thank you for providing all the requested information! We now have everything we
 
 We'll be in touch if we need any additional information."""
 
-                            sent = send_reply_in_thread(user_id, headers, response_body, msg_id, from_addr_lower, thread_id)
+                            sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                             if sent:
-                                print(f"📧 Sent closing email - all fields complete to: {from_addr_lower}")
+                                print(f"📧 Sent closing email - all fields complete to: {to_addr_lower}")
                                 # Create row_completed notification for dashboard stats
                                 try:
                                     write_notification(
                                         user_id, client_id,
                                         kind="row_completed",
                                         priority="important",
-                                        email=from_addr_lower,
+                                        email=to_addr_lower,
                                         thread_id=thread_id,
                                         row_number=rownum,
                                         row_anchor=row_anchor,
@@ -2004,6 +2141,12 @@ We'll be in touch if we need any additional information."""
                                     print(f"⚠️ Could not create row_completed notification: {e}")
                                 # Update thread status to completed
                                 update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], "all_fields_gathered")
+                                if thread_ref:
+                                    thread_ref.update({
+                                        "followUpStatus": "stopped",
+                                        "followUpConfig.processingBy": None,
+                                        "followUpConfig.processingAt": None,
+                                    })
                                 # Clear highlight - row is complete, no longer under system control
                                 try:
                                     clear_row_highlight(sheet_id, rownum)
@@ -2011,7 +2154,7 @@ We'll be in touch if we need any additional information."""
                                     print(f"⚠️ Could not clear row highlight: {e}")
                             else:
                                 print(f"❌ Failed to send closing email")
-                                queue_pending_response(user_id, thread_id, msg_id, from_addr_lower, response_body, client_id)
+                                queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
                         
             except Exception as e:
                 print(f"❌ Failed to send automatic response: {e}")

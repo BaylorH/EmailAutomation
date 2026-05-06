@@ -3,8 +3,11 @@ import base64
 import time
 import requests
 import os
+import logging
 from bs4 import BeautifulSoup
 from typing import Optional, List
+
+logger = logging.getLogger(__name__)
 
 # Helper: detect HTML vs text
 _html_rx = re.compile(r"<[a-zA-Z/][^>]*>")
@@ -119,7 +122,15 @@ def _norm_txt(x: str) -> str:
 
 def b64url_id(message_id: str) -> str:
     """Encode message ID for safe use as Firestore document key."""
-    return base64.urlsafe_b64encode(message_id.encode('utf-8')).decode('ascii').rstrip('=')
+    encoded = base64.urlsafe_b64encode(message_id.encode('utf-8')).decode('ascii').rstrip('=')
+    logger.debug(
+        "message_id.b64url",
+        extra={
+            "input": message_id,
+            "encoded": encoded,
+        },
+    )
+    return encoded
 
 def normalize_message_id(msg_id: str) -> str:
     """Normalize message ID - strip whitespace and angle brackets."""
@@ -127,6 +138,13 @@ def normalize_message_id(msg_id: str) -> str:
         return ""
     # Remove angle brackets if present (email headers often wrap IDs in < >)
     normalized = msg_id.strip().strip('<>')
+    logger.debug(
+        "message_id.normalize",
+        extra={
+            "input": msg_id,
+            "normalized": normalized,
+        },
+    )
     return normalized
 
 def parse_references_header(references: str) -> List[str]:
