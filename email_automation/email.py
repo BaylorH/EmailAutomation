@@ -176,6 +176,61 @@ def _assigned_emails_match_reply_sender(assigned_emails: List[str], reply_sender
     return normalized[0] == _normalize_email(reply_sender)
 
 
+def _get_thread_row_number(user_id: str, thread_id: str) -> Optional[int]:
+    """Return the stored Sheet row number for a known thread, if present."""
+    if not thread_id:
+        return None
+
+    try:
+        from .clients import _fs
+        thread_doc = (
+            _fs.collection("users").document(user_id)
+            .collection("threads").document(thread_id).get()
+        )
+        if not thread_doc.exists:
+            return None
+        row_number = (thread_doc.to_dict() or {}).get("rowNumber")
+        return int(row_number) if row_number else None
+    except Exception as e:
+        print(f"   ⚠️ Could not resolve row number from thread {thread_id[:20]}...: {e}")
+        return None
+
+
+def _save_outbox_reply_message(
+    user_id: str,
+    thread_id: str,
+    assigned_emails: List[str],
+    subject: str,
+    body: str,
+    user_signature: str = None,
+    signature_mode: str = None,
+) -> bool:
+    """Persist a dashboard-approved Graph /reply send into the conversation history."""
+    if not thread_id:
+        return False
+
+    try:
+        from .utils import format_email_body_with_footer
+
+        synthetic_id = f"dashboard-reply-{int(time.time() * 1000)}"
+        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+        payload = {
+            "direction": "outbound",
+            "from": "me",
+            "to": assigned_emails or [],
+            "subject": subject,
+            "body": html_body,
+            "bodyPreview": safe_preview(body, 300),
+            "sentDateTime": datetime.now(timezone.utc).isoformat(),
+            "headers": {"internetMessageId": synthetic_id},
+            "source": "dashboard_outbox_reply",
+        }
+        return save_message(user_id, thread_id, synthetic_id, payload)
+    except Exception as e:
+        print(f"   ⚠️ Could not save dashboard reply message for {thread_id[:20]}...: {e}")
+        return False
+
+
 def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_id: str,
                           thread_id: str, user_signature: str = None, signature_mode: str = None) -> dict:
     """
@@ -1110,8 +1165,17 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     clientId = (data.get("clientId") or "").strip()
     attempts = int(data.get("attempts") or 0)
     row_number = data.get("rowNumber")
+    thread_id = data.get("threadId")
+    reply_to_msg_id = data.get("replyToMessageId")
+    is_thread_reply = bool(thread_id and reply_to_msg_id)
 
-    # If row_number is missing (e.g., user reply from UI), look it up by email
+    # If row_number is missing, prefer the known thread anchor before falling back to email.
+    if not row_number and thread_id:
+        row_number = _get_thread_row_number(user_id, thread_id)
+        if row_number:
+            print(f"   📍 Resolved row number from thread: {row_number}")
+
+    # User replies may share broker emails across rows; email lookup is a last resort.
     if not row_number and emails and clientId:
         try:
             sheet_id = _get_sheet_id_or_fail(user_id, clientId)
@@ -1126,11 +1190,6 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
 
     # Get pre-computed subject from outbox data (property-specific)
     subject_override = data.get("subject")
-
-    # Threading support: check if this is a reply to an existing thread
-    thread_id = data.get("threadId")
-    reply_to_msg_id = data.get("replyToMessageId")
-    is_thread_reply = bool(thread_id and reply_to_msg_id)
 
     # Get scripts array (new format) or build from legacy fields
     email_scripts = data.get("emailScripts")
@@ -1194,6 +1253,10 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
 
                 if res.get("sent"):
                     all_sent.append(emails[0] if emails else "unknown")
+                    _save_outbox_reply_message(
+                        user_id, thread_id, emails, subject_override,
+                        script_content, user_signature, signature_mode
+                    )
                 else:
                     all_errors[emails[0] if emails else "unknown"] = res.get("error", "Unknown error")
 

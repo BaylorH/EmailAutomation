@@ -35,6 +35,52 @@ from .app_config import REQUIRED_FIELDS_FOR_CLOSE, INBOX_SCAN_WINDOW_HOURS
 
 logger = logging.getLogger(__name__)
 
+TERMINAL_CLOSE_REASONS_WITHOUT_COMPLETE_FIELDS = {
+    "exclusive_with_another",
+    "deal_pending",
+    "not_a_fit",
+    "natural_end",
+}
+
+
+def _close_reason_from_event(event: Dict[str, Any]) -> str:
+    return (
+        event.get("notes")
+        or event.get("reason")
+        or event.get("closeReason")
+        or "all_info_gathered"
+    )
+
+
+def _close_event_can_bypass_missing_fields(event: Dict[str, Any]) -> bool:
+    return _close_reason_from_event(event) in TERMINAL_CLOSE_REASONS_WITHOUT_COMPLETE_FIELDS
+
+
+def _response_mentions_missing_fields(response_body: str, missing_fields: List[str]) -> bool:
+    """Detect whether an LLM response is actually asking for the missing fields."""
+    body = (response_body or "").lower()
+    if not body or not missing_fields:
+        return False
+
+    aliases = {
+        "rail access": ["rail"],
+        "docks": ["dock"],
+        "drive ins": ["drive", "grade"],
+        "drive-ins": ["drive", "grade"],
+        "ceiling ht": ["ceiling", "clear height"],
+        "power": ["power", "electrical", "amps", "voltage"],
+        "ops ex /sf": ["ops", "nnn", "cam", "operating"],
+        "flyer / link": ["flyer", "brochure", "marketing"],
+        "total sf": ["sf", "square footage", "size"],
+    }
+
+    for field in missing_fields:
+        key = (field or "").strip().lower()
+        candidates = aliases.get(key, [part for part in re.split(r"[^a-z0-9]+", key) if len(part) > 2])
+        if any(candidate in body for candidate in candidates):
+            return True
+    return False
+
 
 def _format_event_property(event: Dict[str, Any]) -> str:
     address = (event.get("address") or "").strip()
@@ -1529,13 +1575,31 @@ Thanks!""",
                     try:
                         from datetime import datetime
 
+                        close_reason = _close_reason_from_event(event)
+                        if not _close_event_can_bypass_missing_fields(event):
+                            tab_title = _get_first_tab_title(sheets, sheet_id)
+                            current_resp = sheets.spreadsheets().values().get(
+                                spreadsheetId=sheet_id,
+                                range=f"{tab_title}!{rownum}:{rownum}"
+                            ).execute()
+                            current_row = current_resp.get("values", [[]])[0] if current_resp.get("values") else []
+                            if len(current_row) < len(header):
+                                current_row.extend([""] * (len(header) - len(current_row)))
+                            missing_for_close = check_missing_required_fields(current_row, header, column_config)
+                            missing_for_close = [f for f in missing_for_close if f != "Rent/SF /Yr"]
+                            if missing_for_close:
+                                print(
+                                    f"⚠️ Ignoring close_conversation ({close_reason}) because required fields are still missing: {missing_for_close}"
+                                )
+                                continue
+
                         # Update thread status to completed using the status system
-                        update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], "natural_end")
+                        update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], close_reason)
                         # Also update legacy fields for backwards compatibility
                         if thread_ref:
                             thread_ref.update({
                                 "closedAt": datetime.now().isoformat(),
-                                "closeReason": "natural_end",
+                                "closeReason": close_reason,
                                 "followUpStatus": "stopped",
                                 "followUpConfig.processingBy": None,
                                 "followUpConfig.processingAt": None,
@@ -1552,7 +1616,7 @@ Thanks!""",
                             row_number=rownum,
                             row_anchor=row_anchor,
                             meta={
-                                "reason": "natural_end",
+                                "reason": close_reason,
                                 "details": "Broker indicated conversation is complete",
                                 "lastMessage": _full_text[:300] if _full_text else ""
                             },
@@ -2068,7 +2132,7 @@ Could you please provide your phone number so I can give you a call?"""
                         if missing_fields:
                             # Scenario 3: Thank you + request missing fields
                             # Use LLM-generated response if available, otherwise use template
-                            if llm_response_email:
+                            if llm_response_email and _response_mentions_missing_fields(llm_response_email, missing_fields):
                                 response_body = llm_response_email
                                 # Safety check: Remove any mention of "Rent/SF /Yr" from LLM response
                                 if "Rent/SF /Yr" in response_body or "Rent/SF/Yr" in response_body:
@@ -2087,6 +2151,8 @@ Could you please provide your phone number so I can give you a call?"""
                                         response_body = response_body.strip() + "\n\nThanks."
                                 print(f"🤖 Using LLM-generated response for missing fields scenario")
                             else:
+                                if llm_response_email:
+                                    print("⚠️ Ignoring LLM response because it did not ask for the missing fields")
                                 greeting = _build_greeting(contact_name)
                                 field_list = "\n".join(f"- {field}" for field in missing_fields)
                                 response_body = f"""{greeting}

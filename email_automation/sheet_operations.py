@@ -112,9 +112,14 @@ def _build_gross_rent_formula_for_row(header: List[str], rownum: int) -> Optiona
     rent_letter = _col_letter(rent_col)
     ops_letter = _col_letter(ops_col)
     gross_rent_letter = _col_letter(gross_rent_col)
+    rent_value = (
+        f'IFERROR(VALUE({rent_letter}{rownum}),'
+        f'AVERAGE(VALUE(INDEX(SPLIT({rent_letter}{rownum},"-"),1)),'
+        f'VALUE(INDEX(SPLIT({rent_letter}{rownum},"-"),2))))'
+    )
     formula = (
         f'=IF(OR({total_sf_letter}{rownum}="",{rent_letter}{rownum}="",{ops_letter}{rownum}=""),'
-        f'"",({rent_letter}{rownum}+{ops_letter}{rownum})*{total_sf_letter}{rownum}/12)'
+        f'"",({rent_value}+{ops_letter}{rownum})*{total_sf_letter}{rownum}/12)'
     )
     return gross_rent_letter, formula
 
@@ -431,10 +436,36 @@ def insert_property_row_above_divider(sheets, sheet_id: str, tab_title: str, val
 def _find_row_by_anchor(uid: str, thread_id: str, sheets, spreadsheet_id: str, tab_title: str, 
                        header: List[str], fallback_email: str):
     try:
+        def _norm(value: str) -> str:
+            return " ".join((value or "").lower().replace(",", " ").split())
+
+        def _stored_row_matches_subject(row_values: List[str], addr: str, city: str) -> bool:
+            if not addr:
+                return True
+            idx_map = _header_index_map(header)
+            row_addr = ""
+            row_city = ""
+            for key in ("property address", "address", "street address", "property"):
+                if key in idx_map and idx_map[key] - 1 < len(row_values):
+                    row_addr = row_values[idx_map[key] - 1]
+                    break
+            for key in ("city", "town", "municipality"):
+                if key in idx_map and idx_map[key] - 1 < len(row_values):
+                    row_city = row_values[idx_map[key] - 1]
+                    break
+
+            if _norm(addr) and _norm(addr) not in _norm(row_addr):
+                return False
+            if city and row_city and _norm(city) != _norm(row_city):
+                return False
+            return True
+
         # 1) Prefer explicit stored rowNumber (unchanged)
         thread_doc = _fs.collection("users").document(uid).collection("threads").document(thread_id).get()
         if thread_doc.exists:
             thread_data = thread_doc.to_dict() or {}
+            subj = thread_data.get("subject") or ""
+            addr, city = _subject_to_address_city(subj)
             stored_row_num = thread_data.get("rowNumber")
             if stored_row_num:
                 resp = _execute_with_retry(
@@ -447,12 +478,12 @@ def _find_row_by_anchor(uid: str, thread_id: str, sheets, spreadsheet_id: str, t
                 rows = resp.get("values", [])
                 if rows and rows[0]:
                     padded = rows[0] + [""] * (max(0, len(header) - len(rows[0])))
-                    print(f"📍 Using thread-anchored row {stored_row_num}")
-                    return stored_row_num, padded
+                    if _stored_row_matches_subject(padded, addr, city):
+                        print(f"📍 Using thread-anchored row {stored_row_num}")
+                        return stored_row_num, padded
+                    print(f"⚠️ Stored row {stored_row_num} no longer matches thread subject; falling back to subject anchor")
 
             # 2) NEW: subject → (address, city) → row
-            subj = thread_data.get("subject") or ""
-            addr, city = _subject_to_address_city(subj)
             if addr:
                 rn, rv = _find_row_by_address_city(sheets, spreadsheet_id, tab_title, header, addr, city)
                 if rn is not None:

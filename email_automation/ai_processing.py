@@ -1,6 +1,7 @@
 import json
 import hashlib
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
@@ -17,6 +18,101 @@ from .column_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _find_header_name(header: List[str], target: str) -> Optional[str]:
+    target_key = (target or "").strip().lower()
+    for column in header:
+        if (column or "").strip().lower() == target_key:
+            return column
+    return None
+
+
+def _proposal_updates_column(proposal: dict, column_name: str) -> bool:
+    target_key = (column_name or "").strip().lower()
+    for update in (proposal or {}).get("updates", []) or []:
+        if (update.get("column") or "").strip().lower() == target_key:
+            return True
+    return False
+
+
+def _row_value_for_column(rowvals: List[str], header: List[str], column_name: str) -> str:
+    idx_map = _header_index_map(header)
+    key = (column_name or "").strip().lower()
+    if key not in idx_map:
+        return ""
+    idx = idx_map[key] - 1
+    return rowvals[idx] if idx < len(rowvals) else ""
+
+
+def _latest_inbound_text(conversation: List[dict]) -> str:
+    for message in reversed(conversation or []):
+        if (message.get("direction") or "").lower() == "inbound":
+            return message.get("content") or message.get("body") or message.get("preview") or ""
+    return ""
+
+
+def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
+    """Best-effort deterministic fallback for common asking-rent phrases."""
+    if not text:
+        return None
+
+    rent_context = re.compile(
+        r"(?:asking|base\s+rent|rent|rate)[^\d$]{0,24}\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
+        r"(?:/|\s+per\s+)?\s*(?:sf|sq\.?\s*ft|square\s*foot)(?:\s*/?\s*(?:yr|year|annum))?",
+        re.IGNORECASE,
+    )
+    dollar_per_sf = re.compile(
+        r"\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*(?:/|\s+per\s+)\s*"
+        r"(?:sf|sq\.?\s*ft|square\s*foot)(?:\s*/?\s*(?:yr|year|annum))?",
+        re.IGNORECASE,
+    )
+
+    for pattern in (rent_context, dollar_per_sf):
+        for match in pattern.finditer(text):
+            value = float(match.group(1))
+            if value < 1:
+                continue
+            context = text[max(0, match.start() - 30): match.start()].lower()
+            if any(marker in context for marker in ("nnn", "cam", "ops", "opex", "operating expense")):
+                continue
+            return f"{value:.2f}"
+
+    return None
+
+
+def _augment_proposal_with_deterministic_extractions(
+    proposal: dict,
+    rowvals: List[str],
+    header: List[str],
+    effective_config: dict,
+    conversation: List[dict],
+) -> dict:
+    """Add high-confidence values from simple broker text patterns the LLM missed."""
+    if not proposal:
+        return proposal
+
+    mappings = (effective_config or {}).get("mappings", {})
+    rent_col = mappings.get("rent_sf_yr") or _find_header_name(header, "Rent/SF /Yr")
+    if not rent_col or not _find_header_name(header, rent_col):
+        return proposal
+
+    if (_row_value_for_column(rowvals, header, rent_col) or "").strip():
+        return proposal
+    if _proposal_updates_column(proposal, rent_col):
+        return proposal
+
+    rent_value = _extract_rent_sf_yr_from_text(_latest_inbound_text(conversation))
+    if not rent_value:
+        return proposal
+
+    proposal.setdefault("updates", []).append({
+        "column": rent_col,
+        "value": rent_value,
+        "confidence": 0.92,
+        "reason": "Deterministic fallback parsed asking rent per SF per year from the latest broker message.",
+    })
+    return proposal
 
 def _filter_config_by_extraction_fields(column_config: dict, extraction_fields: List[str]) -> dict:
     """
@@ -445,6 +541,13 @@ def apply_proposal_to_sheet(
                 },
             )
             _append_ai_meta(sheets, sheet_id, rownum, a["column"], a["newValue"], override=False)
+
+        try:
+            from .sheet_operations import _apply_gross_rent_formula_for_row
+            if _apply_gross_rent_formula_for_row(sheets, sheet_id, tab_title, header, rownum):
+                print(f"✅ Refreshed Gross Rent formula for row {rownum}")
+        except Exception as formula_err:
+            print(f"⚠️ Could not refresh Gross Rent formula for row {rownum}: {formula_err}")
 
         # Write notes to comments field if provided
         notes = proposal.get("notes")
@@ -995,6 +1098,9 @@ OUTPUT ONLY valid JSON in this exact format:
         proposal.setdefault("updates", [])
         proposal.setdefault("events", [])
         proposal.setdefault("response_email", None)  # LLM-generated response email
+        proposal = _augment_proposal_with_deterministic_extractions(
+            proposal, rowvals, header, effective_config, conversation
+        )
 
         # ---- Log + store in sheetChangeLog -----------------------------------
         print(f"\n🤖 OpenAI Proposal for {client_id}__{email}:")

@@ -83,6 +83,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
     @patch.object(email_module, "_claim_outbox_item", return_value=True)
     @patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com")
     @patch.object(email_module, "_send_outbox_as_reply", return_value={"sent": True, "error": None})
+    @patch.object(email_module, "_save_outbox_reply_message", create=True)
     @patch.object(email_module, "send_and_index_email")
     @patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1")
     @patch.object(email_module, "highlight_row")
@@ -91,6 +92,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
         _highlight_row,
         _get_sheet_id_or_fail,
         send_and_index_email,
+        save_outbox_reply_message,
         send_outbox_as_reply,
         _get_reply_message_sender,
         _claim_outbox_item,
@@ -105,7 +107,44 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
 
         send_and_index_email.assert_not_called()
         send_outbox_as_reply.assert_called_once()
+        save_outbox_reply_message.assert_called_once()
         self.assertTrue(doc.reference.deleted)
+
+    @patch.object(email_module, "_claim_outbox_item", return_value=True)
+    @patch.object(email_module, "_get_thread_row_number", return_value=9, create=True)
+    @patch.object(email_module, "_find_row_by_email", return_value=(3, []))
+    @patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com")
+    @patch.object(email_module, "_send_outbox_as_reply", return_value={"sent": True, "error": None})
+    @patch.object(email_module, "_save_outbox_reply_message", create=True)
+    @patch.object(email_module, "send_and_index_email")
+    @patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1")
+    @patch.object(email_module, "highlight_row")
+    def test_thread_reply_without_row_number_uses_thread_row_before_email_lookup(
+        self,
+        highlight_row,
+        _get_sheet_id_or_fail,
+        send_and_index_email,
+        _save_outbox_reply_message,
+        _send_outbox_as_reply,
+        _get_reply_message_sender,
+        _find_row_by_email,
+        _get_thread_row_number,
+        _claim_outbox_item,
+    ):
+        doc = self._thread_reply_outbox("bp21harrison@gmail.com")
+        data = doc.to_dict()
+        data.pop("rowNumber")
+
+        email_module._send_single_outbox_item(
+            "uid-1",
+            {"Authorization": "Bearer token"},
+            {"doc": doc, "data": data},
+        )
+
+        _get_thread_row_number.assert_called_once_with("uid-1", "thread-1")
+        _find_row_by_email.assert_not_called()
+        highlight_row.assert_called_once_with("sheet-1", 9)
+        send_and_index_email.assert_not_called()
 
 
 if __name__ == "__main__":

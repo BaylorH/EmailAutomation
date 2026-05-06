@@ -20,10 +20,12 @@ from typing import Dict, List, Optional, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
 
 from .clients import _fs
-from .utils import exponential_backoff_request, format_email_body_with_footer, get_signature_attachments, needs_signature_attachments
+from .utils import exponential_backoff_request, format_email_body_with_footer, get_signature_attachments, needs_signature_attachments, safe_preview
+from .messaging import save_message
 
 # Claim timeout for follow-up processing (prevent duplicate sends)
 FOLLOWUP_CLAIM_TIMEOUT_SECONDS = 60
+SYNTHETIC_OUTBOUND_SOURCES = {"dashboard_outbox_reply", "followup_scheduler"}
 
 
 def _claim_followup(user_id: str, thread_id: str, current_index: int) -> bool:
@@ -98,6 +100,83 @@ def _release_followup_claim(user_id: str, thread_id: str):
         })
     except Exception as e:
         print(f"   ⚠️ Failed to release follow-up claim: {e}")
+
+
+def _save_followup_message(
+    user_id: str,
+    thread_id: str,
+    recipient: str,
+    subject: str,
+    body: str,
+    user_signature: str = None,
+    signature_mode: str = None,
+) -> bool:
+    """Persist a sent follow-up into thread history for dashboard reconciliation."""
+    try:
+        synthetic_id = f"followup-{thread_id}-{int(time.time() * 1000)}"
+        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+        return save_message(
+            user_id,
+            thread_id,
+            synthetic_id,
+            {
+                "direction": "outbound",
+                "from": "me",
+                "to": [recipient] if recipient else [],
+                "subject": subject,
+                "body": html_body,
+                "bodyPreview": safe_preview(body, 300),
+                "sentDateTime": datetime.now(timezone.utc).isoformat(),
+                "headers": {"internetMessageId": synthetic_id},
+                "source": "followup_scheduler",
+            },
+        )
+    except Exception as e:
+        print(f"   ⚠️ Could not save follow-up message for {thread_id[:20]}...: {e}")
+        return False
+
+
+def _clear_followup_row_highlight(user_id: str, thread_id: str) -> bool:
+    """Clear Sheet highlight when a follow-up sequence reaches a terminal state."""
+    try:
+        from .clients import _get_sheet_id_or_fail
+        from .sheets import clear_row_highlight
+
+        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+        thread_doc = thread_ref.get()
+        if not thread_doc.exists:
+            return False
+        thread_data = thread_doc.to_dict() or {}
+        client_id = thread_data.get("clientId")
+        row_number = thread_data.get("rowNumber")
+        if not client_id or not row_number:
+            return False
+        sheet_id = _get_sheet_id_or_fail(user_id, client_id)
+        return clear_row_highlight(sheet_id, row_number)
+    except Exception as e:
+        print(f"   ⚠️ Could not clear terminal follow-up row highlight for {thread_id[:20]}...: {e}")
+        return False
+
+
+def _is_graph_backed_outbound_message(message_data: Dict[str, Any]) -> bool:
+    """True when an outbound history entry can be found again through Microsoft Graph."""
+    if (message_data or {}).get("source") in SYNTHETIC_OUTBOUND_SOURCES:
+        return False
+
+    internet_msg_id = ((message_data or {}).get("headers") or {}).get("internetMessageId")
+    if not internet_msg_id:
+        return False
+
+    return not str(internet_msg_id).startswith(("dashboard-reply-", "followup-"))
+
+
+def _select_reply_anchor_message(outbound_message_docs: List[Any]) -> Optional[Dict[str, Any]]:
+    """Pick the newest outbound message that has a real Graph internetMessageId."""
+    for doc in outbound_message_docs:
+        data = doc.to_dict() or {}
+        if _is_graph_backed_outbound_message(data):
+            return data
+    return None
 
 
 def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
@@ -254,7 +333,7 @@ def _send_followup_email(
             outbound_messages = list(
                 messages_ref.where("direction", "==", "outbound")
                 .order_by("sentDateTime", direction="DESCENDING")
-                .limit(1)
+                .limit(10)
                 .stream()
             )
         except Exception as e:
@@ -264,13 +343,20 @@ def _send_followup_email(
                 if doc.to_dict().get("direction") == "outbound"
             ]
             if outbound_messages:
-                outbound_messages = [outbound_messages[-1]]
+                outbound_messages.sort(
+                    key=lambda doc: (doc.to_dict() or {}).get("sentDateTime", ""),
+                    reverse=True
+                )
 
         if not outbound_messages:
             print(f"   No outbound messages found in thread {thread_id[:20]}...")
             return False
 
-        last_outbound = outbound_messages[0].to_dict()
+        last_outbound = _select_reply_anchor_message(outbound_messages)
+        if not last_outbound:
+            print(f"   No Graph-backed outbound message found in thread {thread_id[:20]}...")
+            return False
+
         internet_msg_id = last_outbound.get("headers", {}).get("internetMessageId")
 
         # Find the Graph message ID
@@ -413,6 +499,10 @@ def _send_followup_email(
 
         if reply_resp.status_code in [200, 201, 202]:
             print(f"   Sent follow-up #{followup_index + 1} for thread {thread_id[:20]}...")
+            _save_followup_message(
+                user_id, thread_id, recipient, subject,
+                followup_message, user_signature, signature_mode
+            )
 
             # Update thread
             _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
@@ -484,12 +574,20 @@ def _pause_followup(user_id: str, thread_id: str):
 
 def _mark_followup_complete(user_id: str, thread_id: str, reason: str):
     """Mark follow-up sequence as complete."""
-    _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
+    update_data = {
         "followUpStatus": reason,
         "followUpConfig.processingBy": None,
         "followUpConfig.processingAt": None,
         "updatedAt": SERVER_TIMESTAMP
-    })
+    }
+    if reason == "max_reached":
+        update_data.update({
+            "status": "stopped",
+            "statusReason": "max_followups_reached",
+        })
+        _clear_followup_row_highlight(user_id, thread_id)
+
+    _fs.collection("users").document(user_id).collection("threads").document(thread_id).update(update_data)
     print(f"   Follow-up sequence complete for thread {thread_id[:20]}... ({reason})")
 
 
