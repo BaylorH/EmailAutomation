@@ -33,6 +33,61 @@ class FakeDoc:
         return self._data
 
 
+class FakeThreadDoc:
+    def __init__(self, data):
+        self._data = data
+
+    def to_dict(self):
+        return self._data
+
+
+class FakeThreadQuery:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def stream(self):
+        return [FakeThreadDoc(data) for data in self.docs]
+
+
+class FakeThreadsCollection:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def where(self, *_args):
+        return FakeThreadQuery(self.docs)
+
+
+class FakeUserDoc:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def collection(self, name):
+        self.assert_threads_collection(name)
+        return FakeThreadsCollection(self.docs)
+
+    def assert_threads_collection(self, name):
+        if name != "threads":
+            raise AssertionError(f"Unexpected collection: {name}")
+
+
+class FakeUsersCollection:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def document(self, _uid):
+        return FakeUserDoc(self.docs)
+
+
+class FakeFirestoreForThreads:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def collection(self, name):
+        if name != "users":
+            raise AssertionError(f"Unexpected collection: {name}")
+        return FakeUsersCollection(self.docs)
+
+
 class OutboxReplyRecipientRoutingTests(unittest.TestCase):
     def _thread_reply_outbox(self, assigned_email):
         return FakeDoc({
@@ -79,6 +134,49 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
         self.assertEqual(kwargs["subject_override"], "RE: 920 Wrong Contact Drive, Henderson")
         self.assertEqual(kwargs["contact_name"], "Casey Broker")
         self.assertTrue(doc.reference.deleted)
+
+    def test_new_outreach_duplicate_check_is_scoped_to_client(self):
+        existing_threads = [
+            {
+                "clientId": "older-client",
+                "email": ["bp21harrison@gmail.com"],
+                "subject": "2629 E Craig Rd, North Las Vegas",
+            },
+            {
+                "clientId": "current-client",
+                "email": ["bp21harrison@gmail.com"],
+                "subject": "730 W Cheyenne Ave, North Las Vegas",
+            },
+        ]
+
+        with patch("email_automation.clients._fs", FakeFirestoreForThreads(existing_threads)):
+            blocked = email_module._has_existing_thread_for_property(
+                "uid-1",
+                "bp21harrison@gmail.com",
+                "2629 E Craig Rd, North Las Vegas",
+                client_id="current-client",
+            )
+
+        self.assertFalse(blocked)
+
+    def test_new_outreach_duplicate_check_blocks_same_client_match(self):
+        existing_threads = [
+            {
+                "clientId": "current-client",
+                "email": ["bp21harrison@gmail.com"],
+                "subject": "2629 E Craig Rd, North Las Vegas",
+            },
+        ]
+
+        with patch("email_automation.clients._fs", FakeFirestoreForThreads(existing_threads)):
+            blocked = email_module._has_existing_thread_for_property(
+                "uid-1",
+                "bp21harrison@gmail.com",
+                "2629 E Craig Rd, North Las Vegas",
+                client_id="current-client",
+            )
+
+        self.assertTrue(blocked)
 
     @patch.object(email_module, "_claim_outbox_item", return_value=True)
     @patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com")

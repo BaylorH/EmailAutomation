@@ -24,12 +24,21 @@ CLAIM_TIMEOUT_SECONDS = 300  # 5 minutes
 WORKER_ID = str(uuid.uuid4())[:8]
 
 
-def _has_existing_thread_for_property(user_id: str, recipient_email: str, property_address: str) -> bool:
+def _has_existing_thread_for_property(
+    user_id: str,
+    recipient_email: str,
+    property_address: str,
+    *,
+    client_id: Optional[str] = None,
+) -> bool:
     """
     Check if we've already sent an email to this recipient about this property.
 
     This is a defense-in-depth check to prevent duplicate outreach emails
-    even if duplicate outbox entries are somehow created.
+    even if duplicate outbox entries are somehow created. When a client id is
+    known, only threads from that client can block the send; otherwise old test
+    or archived campaigns with the same real property address can suppress a
+    valid new campaign outreach.
 
     Returns True if a matching thread already exists, False otherwise.
     """
@@ -55,6 +64,8 @@ def _has_existing_thread_for_property(user_id: str, recipient_email: str, proper
 
         for thread in results:
             data = thread.to_dict() or {}
+            if client_id and data.get("clientId") != client_id:
+                continue
             subject = (data.get("subject") or "").lower()
 
             # Check if subject contains the property address
@@ -1059,7 +1070,7 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
 
         # DUPLICATE CHECK: Skip if we've already sent to this recipient about this property
         property_address = prop.get('subject') or prop.get('name') or ''
-        if _has_existing_thread_for_property(user_id, recipient_email, property_address):
+        if _has_existing_thread_for_property(user_id, recipient_email, property_address, client_id=clientId):
             print(f"   🚫 DUPLICATE DETECTED: Already sent to {recipient_email} about '{property_address}'")
             print(f"   🗑️ Deleting duplicate outbox entry")
             item['doc'].reference.delete()
@@ -1209,7 +1220,7 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
         # DUPLICATE CHECK: For new outreach (not replies), check if thread already exists
         # Only check if we have a subject (property address)
         if subject_override and len(emails) == 1:
-            if _has_existing_thread_for_property(user_id, emails[0], subject_override):
+            if _has_existing_thread_for_property(user_id, emails[0], subject_override, client_id=clientId):
                 print(f"   🚫 DUPLICATE DETECTED: Already sent to {emails[0]} about '{subject_override}'")
                 print(f"   🗑️ Deleting duplicate outbox entry")
                 d.reference.delete()
