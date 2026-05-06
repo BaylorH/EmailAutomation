@@ -230,7 +230,10 @@ def _save_outbox_reply_message(
             "from": "me",
             "to": assigned_emails or [],
             "subject": subject,
-            "body": html_body,
+            "body": {
+                "content": html_body,
+                "preview": safe_preview(body, 300),
+            },
             "bodyPreview": safe_preview(body, 300),
             "sentDateTime": datetime.now(timezone.utc).isoformat(),
             "headers": {"internetMessageId": synthetic_id},

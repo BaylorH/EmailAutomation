@@ -898,13 +898,13 @@ def api_resume_conversation():
     Expects JSON body: { uid, threadId, clientId? }
     """
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or request.form.to_dict() or request.args.to_dict()
         if not data:
             return jsonify({"success": False, "error": "No JSON data provided"}), 400
 
-        uid = data.get("uid")
-        thread_id = data.get("threadId")
-        client_id = data.get("clientId")  # Optional, used to find sheet
+        uid = data.get("uid") or data.get("userId") or data.get("user_id")
+        thread_id = data.get("threadId") or data.get("thread_id")
+        client_id = data.get("clientId") or data.get("client_id")  # Optional, used to find sheet
 
         if not uid or not thread_id:
             return jsonify({"success": False, "error": "Missing required fields: uid, threadId"}), 400
@@ -1017,16 +1017,16 @@ def api_stop_conversation():
         if not update_thread_status(uid, thread_id, THREAD_STATUS["stopped"], "user_requested"):
             return jsonify({"success": False, "error": "Failed to update thread status"}), 500
 
-        # Pause follow-ups
+        # Stop follow-ups
         try:
             thread_ref.update({
-                "followUpStatus": "paused",
-                "followUpConfig.pausedAt": SERVER_TIMESTAMP,
+                "followUpStatus": "stopped",
+                "followUpConfig.stoppedAt": SERVER_TIMESTAMP,
                 "updatedAt": SERVER_TIMESTAMP
             })
-            print(f"⏹️ Paused follow-ups for thread {thread_id[:20]}...", flush=True)
+            print(f"⏹️ Stopped follow-ups for thread {thread_id[:20]}...", flush=True)
         except Exception as e:
-            print(f"⚠️ Could not pause follow-ups: {e}", flush=True)
+            print(f"⚠️ Could not stop follow-ups: {e}", flush=True)
 
         # Clear row highlight in Google Sheet
         client_id = client_id or thread_data.get("clientId")
@@ -1041,13 +1041,30 @@ def api_stop_conversation():
             except Exception as e:
                 print(f"⚠️ Could not clear row highlight: {e}", flush=True)
 
+        deleted_notifications = 0
+        if client_id:
+            try:
+                notifications_ref = (
+                    _fs.collection("users").document(uid)
+                    .collection("clients").document(client_id)
+                    .collection("notifications")
+                )
+                for notif in notifications_ref.where("threadId", "==", thread_id).stream():
+                    notif.reference.delete()
+                    deleted_notifications += 1
+                if deleted_notifications:
+                    print(f"🧹 Deleted {deleted_notifications} notification(s) for stopped thread", flush=True)
+            except Exception as e:
+                print(f"⚠️ Could not delete stop notifications: {e}", flush=True)
+
         print(f"⏹️ Stopped monitoring thread {thread_id[:20]}...", flush=True)
 
         return jsonify({
             "success": True,
             "message": "Conversation monitoring stopped",
             "threadId": thread_id,
-            "newStatus": "stopped"
+            "newStatus": "stopped",
+            "deletedNotifications": deleted_notifications
         })
 
     except Exception as e:

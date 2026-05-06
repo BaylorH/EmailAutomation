@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from .clients import _sheets_client, _fs
 from .sheets import _get_first_tab_title
-from .messaging import _get_thread_messages_chronological
+from .messaging import _get_thread_messages_chronological, _message_body_content_and_preview
 
 def _ensure_log_tab_exists(sheets, spreadsheet_id: str) -> str:
     """Ensure 'Log' tab exists and return its title."""
@@ -138,7 +138,8 @@ def write_message_order_test(uid: str, thread_id: str, sheet_id: str):
             to_addrs = data.get("to", [])
             joined_to = ", ".join(to_addrs) if to_addrs else ""
             subject = data.get("subject", "")
-            preview = data.get("body", {}).get("preview", "")[:100]  # Limit preview length
+            _, preview = _message_body_content_and_preview(data)
+            preview = preview[:100]  # Limit preview length
             
             rows_to_append.append([
                 "",  # Empty timestamp for message rows

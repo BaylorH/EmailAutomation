@@ -238,6 +238,17 @@ def _get_thread_messages_chronological(uid: str, thread_id: str) -> List[dict]:
         print(f"❌ Failed to get thread messages: {e}")
         return []
 
+
+def _message_body_content_and_preview(data: dict) -> tuple[str, str]:
+    """Normalize legacy string-body docs and current dict-body docs."""
+    body = data.get("body", {}) or {}
+    if isinstance(body, dict):
+        return body.get("content") or "", body.get("preview") or data.get("bodyPreview") or ""
+    if isinstance(body, str):
+        return body, data.get("bodyPreview") or body[:200]
+    return "", data.get("bodyPreview") or ""
+
+
 def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, headers: dict = None) -> List[dict]:
     """
     Return last N messages in chronological order. Each item includes:
@@ -392,10 +403,9 @@ def build_conversation_payload(uid: str, thread_id: str, limit: int = 10, header
             elif not isinstance(ts, str):
                 ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-            body = data.get("body", {}) or {}
-            raw_content = body.get("content") or ""
+            raw_content, raw_preview = _message_body_content_and_preview(data)
             full_text = clean_email_content(raw_content)[:CUT]
-            preview = clean_email_content(body.get("preview") or "")[:200]
+            preview = clean_email_content(raw_preview or "")[:200]
 
             # Strip quoted content from inbound messages for AI processing
             # This prevents the AI from misinterpreting quoted text (our original questions)
@@ -452,7 +462,7 @@ def dump_thread_from_firestore(user_id: str, thread_id: str):
             subject = data.get("subject", "")
             from_addr = data.get("from", "")
             to_addrs = data.get("to", [])
-            preview = data.get("body", {}).get("preview", "")
+            _, preview = _message_body_content_and_preview(data)
             
             if direction == "outbound":
                 arrow = "ME → " + ", ".join(to_addrs)
