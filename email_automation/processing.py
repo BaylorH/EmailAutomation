@@ -43,6 +43,10 @@ TERMINAL_CLOSE_REASONS_WITHOUT_COMPLETE_FIELDS = {
 }
 
 
+def _should_skip_processing_for_terminal_thread(thread_status: Optional[str]) -> bool:
+    return thread_status in {THREAD_STATUS["stopped"], THREAD_STATUS["completed"]}
+
+
 def _close_reason_from_event(event: Dict[str, Any]) -> str:
     return (
         event.get("notes")
@@ -729,15 +733,15 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     
     print(f"🎯 Matched via {matched_header} -> thread {thread_id}")
 
-    # Check if thread is stopped - if so, skip processing but still save the message for record
+    # Terminal threads keep late replies for history but must not generate new AI work or auto-replies.
     thread_status = get_thread_status(user_id, thread_id)
-    if thread_status == THREAD_STATUS["stopped"]:
-        print(f"⏹️ Thread {thread_id[:20]}... is stopped - saving message but skipping processing")
+    if _should_skip_processing_for_terminal_thread(thread_status):
+        print(f"⏹️ Thread {thread_id[:20]}... is {thread_status} - saving message but skipping processing")
         # Still save the message for conversation history, but don't process or auto-reply
         # Fall through to message saving, but set a flag to skip processing
-        skip_processing_for_stopped = True
+        skip_processing_for_terminal = True
     else:
-        skip_processing_for_stopped = False
+        skip_processing_for_terminal = False
 
     # Create message record
     message_record = {
@@ -805,9 +809,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     # Dump the conversation
     dump_thread_from_firestore(user_id, thread_id)
 
-    # If thread is stopped, skip further processing (AI, sheet updates, auto-replies)
-    if skip_processing_for_stopped:
-        print(f"⏹️ Skipping processing for stopped thread - message saved for history only")
+    # If thread is terminal, skip further processing (AI, sheet updates, auto-replies)
+    if skip_processing_for_terminal:
+        print(f"⏹️ Skipping processing for terminal thread - message saved for history only")
         return
 
     # Step 1: fetch Google Sheet (required) and log header + counterparty email

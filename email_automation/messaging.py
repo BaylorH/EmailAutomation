@@ -1,3 +1,4 @@
+import re
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from google.cloud.firestore import SERVER_TIMESTAMP
@@ -15,6 +16,104 @@ THREAD_STATUS = {
     "stopped": "stopped",         # Manually stopped by user
     "completed": "completed"      # All info gathered, closing email sent
 }
+
+SYNTHETIC_OUTBOUND_SOURCES = {"dashboard_outbox_reply", "followup_scheduler"}
+
+
+def _normalize_history_text(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip().lower()
+
+
+def _message_preview(payload: Dict[str, Any]) -> str:
+    body = payload.get("body")
+    if isinstance(body, dict):
+        text = body.get("preview") or body.get("content") or payload.get("bodyPreview") or ""
+    else:
+        text = payload.get("bodyPreview") or body or ""
+    return _normalize_history_text(text)
+
+
+def _message_recipients(payload: Dict[str, Any]) -> set:
+    recipients = payload.get("to") or []
+    if isinstance(recipients, str):
+        recipients = [recipients]
+    return {str(item).strip().lower() for item in recipients if str(item).strip()}
+
+
+def _message_ts_seconds(payload: Dict[str, Any]) -> Optional[float]:
+    raw = payload.get("sentDateTime") or payload.get("receivedDateTime")
+    if hasattr(raw, "timestamp"):
+        return raw.timestamp()
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _is_synthetic_outbound(message_id: str, payload: Dict[str, Any]) -> bool:
+    if payload.get("direction") != "outbound":
+        return False
+    source = payload.get("source")
+    header_id = ((payload.get("headers") or {}).get("internetMessageId") or "")
+    candidates = [message_id or "", header_id]
+    return (
+        source in SYNTHETIC_OUTBOUND_SOURCES
+        or any(str(candidate).startswith(("dashboard-reply-", "followup-")) for candidate in candidates)
+    )
+
+
+def _is_real_graph_outbound(message_id: str, payload: Dict[str, Any]) -> bool:
+    return payload.get("direction") == "outbound" and not _is_synthetic_outbound(message_id, payload)
+
+
+def _outbound_history_match(real_payload: Dict[str, Any], synthetic_payload: Dict[str, Any]) -> bool:
+    real_preview = _message_preview(real_payload)
+    synthetic_preview = _message_preview(synthetic_payload)
+    if len(real_preview) < 16 or len(synthetic_preview) < 16:
+        return False
+    if real_preview != synthetic_preview and real_preview not in synthetic_preview and synthetic_preview not in real_preview:
+        return False
+
+    real_subject = _normalize_history_text(real_payload.get("subject"))
+    synthetic_subject = _normalize_history_text(synthetic_payload.get("subject"))
+    if real_subject and synthetic_subject and real_subject != synthetic_subject:
+        return False
+
+    real_to = _message_recipients(real_payload)
+    synthetic_to = _message_recipients(synthetic_payload)
+    if real_to and synthetic_to and real_to.isdisjoint(synthetic_to):
+        return False
+
+    real_ts = _message_ts_seconds(real_payload)
+    synthetic_ts = _message_ts_seconds(synthetic_payload)
+    if real_ts is not None and synthetic_ts is not None and abs(real_ts - synthetic_ts) > 3600:
+        return False
+
+    return True
+
+
+def _delete_synthetic_outbound_duplicates(user_id: str, thread_id: str, message_id: str, payload: Dict[str, Any]) -> None:
+    if not _is_real_graph_outbound(message_id, payload):
+        return
+
+    try:
+        messages_ref = (_fs.collection("users").document(user_id)
+                        .collection("threads").document(thread_id)
+                        .collection("messages"))
+        for doc in messages_ref.stream():
+            if doc.id == message_id:
+                continue
+            data = doc.to_dict() or {}
+            if _is_synthetic_outbound(doc.id, data) and _outbound_history_match(payload, data):
+                doc.reference.delete()
+                print(f"🧹 Removed synthetic duplicate message {doc.id} from thread {thread_id}")
+    except Exception as e:
+        print(f"⚠️ Could not remove synthetic duplicate messages for {thread_id}: {e}")
 
 
 def update_thread_status(user_id: str, thread_id: str, status: str, reason: str = None) -> bool:
@@ -90,6 +189,7 @@ def save_message(user_id: str, thread_id: str, message_id: str, payload: Dict[st
         msg_ref = (_fs.collection("users").document(user_id)
                    .collection("threads").document(thread_id)
                    .collection("messages").document(message_id))
+        _delete_synthetic_outbound_duplicates(user_id, thread_id, message_id, payload)
         payload["createdAt"] = SERVER_TIMESTAMP
         msg_ref.set(payload, merge=True)
         print(f"💾 Saved message {message_id} to thread {thread_id}")
