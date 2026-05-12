@@ -9,8 +9,46 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
 
+try:
+    import sentry_sdk
+except ImportError:  # pragma: no cover - exercised by production packaging
+    sentry_sdk = None
+
 # Maximum retry attempts before giving up
 MAX_RESPONSE_ATTEMPTS = 5
+
+
+def _capture_pending_response_abandoned(user_id: str, doc_id: str, data: Dict[str, Any]):
+    if sentry_sdk is None:
+        print("⚠️ Sentry SDK unavailable; pending response abandonment was not captured")
+        return None
+
+    client_id = data.get("clientId")
+    context = {
+        "uid": user_id,
+        "thread_id": data.get("threadId") or doc_id,
+        "message_id": data.get("msgId"),
+        "doc_id": doc_id,
+        "attempts": data.get("attempts", 0),
+        "max_attempts": MAX_RESPONSE_ATTEMPTS,
+        "last_error": data.get("lastError"),
+        "recipient": data.get("recipient"),
+        "client_id": client_id,
+    }
+
+    try:
+        with sentry_sdk.new_scope() as scope:
+            scope.set_tag("worker", "pending_responses")
+            if client_id:
+                scope.set_tag("client_id", str(client_id))
+            scope.set_context("pending_response", context)
+            return sentry_sdk.capture_message(
+                f"Pending response abandoned after {MAX_RESPONSE_ATTEMPTS} retries",
+                level="warning",
+            )
+    except Exception as exc:
+        print(f"⚠️ Failed to capture pending response abandonment in Sentry: {exc}")
+        return None
 
 
 def queue_pending_response(
@@ -78,6 +116,7 @@ def get_pending_responses(user_id: str) -> list:
 
         if attempts >= MAX_RESPONSE_ATTEMPTS:
             # Move to dead letter or just delete
+            _capture_pending_response_abandoned(user_id, doc.id, data)
             print(f"☠️ Pending response exceeded max attempts ({MAX_RESPONSE_ATTEMPTS}): {doc.id[:30]}...")
             doc.reference.delete()
             continue

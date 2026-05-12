@@ -7,6 +7,7 @@ from email_automation.email import send_outboxes
 from email_automation.processing import scan_inbox_against_index, scan_sent_items_for_manual_replies
 from email_automation.followup import check_and_send_followups
 from email_automation.pending_responses import process_pending_responses
+from email_automation.observability import init_sentry
 from email_automation.app_config import CLIENT_ID, CLIENT_SECRET, AUTHORITY, SCOPES, TOKEN_CACHE, FIREBASE_API_KEY
 
 # Thresholds for auto-cleanup (to stay within Firebase free tier)
@@ -130,6 +131,7 @@ def refresh_and_process_user(user_id: str):
 
 
 if __name__ == "__main__":
+    init_sentry()
     all_users = list_user_ids()
     print(f"📦 Found {len(all_users)} token cache users: {all_users}")
 
