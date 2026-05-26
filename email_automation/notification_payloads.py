@@ -80,3 +80,35 @@ def should_skip_original_reply_for_new_property_referral(
     original = (original_contact_email or "").strip().lower()
     replacement = (new_property_email or "").strip().lower()
     return bool(original and replacement and original != replacement)
+
+
+def sanitize_new_property_referral_response(
+    proposal: dict,
+    *,
+    original_contact_email: str,
+) -> dict:
+    """Clear reply-back drafts when a new-property referral includes a different direct email."""
+    if not isinstance(proposal, dict):
+        return proposal
+
+    sanitized = {
+        **proposal,
+        "events": [
+            dict(event) if isinstance(event, dict) else event
+            for event in (proposal.get("events") or [])
+        ],
+    }
+
+    for event in sanitized["events"]:
+        if not isinstance(event, dict) or event.get("type") != "new_property":
+            continue
+
+        if should_skip_original_reply_for_new_property_referral(
+            original_contact_email=original_contact_email,
+            new_property_email=event.get("email", ""),
+        ):
+            sanitized["response_email"] = None
+            sanitized["skip_response"] = True
+            break
+
+    return sanitized

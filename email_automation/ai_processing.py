@@ -16,6 +16,7 @@ from .column_config import (
     get_required_fields_for_close,
     REQUIRED_FOR_CLOSE,
 )
+from .notification_payloads import sanitize_new_property_referral_response
 
 logger = logging.getLogger(__name__)
 
@@ -1100,6 +1101,10 @@ OUTPUT ONLY valid JSON in this exact format:
         proposal.setdefault("response_email", None)  # LLM-generated response email
         proposal = _augment_proposal_with_deterministic_extractions(
             proposal, rowvals, header, effective_config, conversation
+        )
+        proposal = sanitize_new_property_referral_response(
+            proposal,
+            original_contact_email=email,
         )
 
         # ---- Log + store in sheetChangeLog -----------------------------------

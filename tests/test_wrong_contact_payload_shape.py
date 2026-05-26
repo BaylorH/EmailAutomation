@@ -3,6 +3,7 @@ import unittest
 from email_automation.notification_payloads import (
     build_new_property_suggested_email,
     build_wrong_contact_suggested_email,
+    sanitize_new_property_referral_response,
     should_skip_original_reply_for_new_property_referral,
 )
 
@@ -69,6 +70,53 @@ class WrongContactPayloadShapeTests(unittest.TestCase):
                 new_property_email="monica@example.com",
             )
         )
+
+    def test_new_property_referral_to_different_contact_suppresses_reply_draft(self):
+        proposal = {
+            "events": [
+                {
+                    "type": "property_unavailable",
+                    "address": "2860 N Commerce St",
+                },
+                {
+                    "type": "new_property",
+                    "address": "2629 E Craig Rd",
+                    "city": "North Las Vegas",
+                    "email": "avery@example.com",
+                    "contactName": "Avery Brooks",
+                },
+            ],
+            "response_email": "Hi Monica,\n\nPlease connect me with Avery.",
+        }
+
+        sanitized = sanitize_new_property_referral_response(
+            proposal,
+            original_contact_email="monica@example.com",
+        )
+
+        self.assertIsNone(sanitized["response_email"])
+        self.assertTrue(sanitized["skip_response"])
+
+    def test_new_property_same_contact_preserves_reply_draft(self):
+        proposal = {
+            "events": [
+                {
+                    "type": "new_property",
+                    "address": "2629 E Craig Rd",
+                    "city": "North Las Vegas",
+                    "email": "monica@example.com",
+                },
+            ],
+            "response_email": "Hi Monica,\n\nPlease send the details.",
+        }
+
+        sanitized = sanitize_new_property_referral_response(
+            proposal,
+            original_contact_email="monica@example.com",
+        )
+
+        self.assertEqual(sanitized["response_email"], proposal["response_email"])
+        self.assertNotIn("skip_response", sanitized)
 
 
 if __name__ == "__main__":
