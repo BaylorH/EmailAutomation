@@ -20,7 +20,11 @@ from .logging import write_message_order_test
 from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_row_anchor, check_missing_required_fields, _append_ai_meta
 from .file_handling import fetch_and_process_pdfs, upload_pdf_to_drive
 from .notifications import write_notification, add_client_notifications
-from .notification_payloads import build_wrong_contact_suggested_email
+from .notification_payloads import (
+    build_new_property_suggested_email,
+    build_wrong_contact_suggested_email,
+    should_skip_original_reply_for_new_property_referral,
+)
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
                    format_email_body_with_footer, strip_email_quotes)
@@ -1480,38 +1484,20 @@ Thanks!"""
                         # Build suggested (not sent) email payload
                         # Use the specific contact email if AI provided one, otherwise use the current sender
 
-                        # Build personalized greeting and intro
-                        # Extract first name only for email greeting (full name is stored in sheet)
-                        if new_contact_name:
-                            first_name = new_contact_name.split()[0]
-                            greeting = f"Hi {first_name},"
-                        else:
-                            greeting = "Hi,"
+                        email_payload = build_new_property_suggested_email(
+                            address=address,
+                            city=city,
+                            to_email=new_property_email,
+                            contact_name=new_contact_name,
+                            referrer_name=referrer_name if is_different_contact else "",
+                            client_id=client_id,
+                        )
 
-                        # Build intro with referral context if this is a different contact
-                        if is_different_contact and referrer_name:
-                            intro = f"{referrer_name} mentioned you might be able to help with a property: {address}{', ' + city if city else ''}."
-                        else:
-                            intro = f"You mentioned a new property: {address}{', ' + city if city else ''}."
-
-                        email_payload = {
-                            "to": [new_property_email],
-                            "subject": f"{address}, {city}" if city else address,
-                            "body": f"""{greeting}
-
-{intro}
-
-If you think this might be a good fit:
-> Can you please verify the current asking rent rates and NNN's?
-> Provide any floor plans or flyers you may have.
-> When will the space be available?
-
-Just like before — if this one's no longer available or not a fit, feel free to let me know so I can cross it off and stop bugging you. And of course, if you know of any others that might be a good fit, I'd love to hear about them.
-
-Thanks!""",
-                            "clientId": client_id,
-                            "rowNumber": None  # No row yet - created on accept
-                        }
+                        if should_skip_original_reply_for_new_property_referral(
+                            original_contact_email=to_addr_lower,
+                            new_property_email=new_property_email,
+                        ):
+                            proposal["skip_response"] = True
 
                         # Create ACTION_NEEDED notification for approval (no row created yet)
                         notif_id = write_notification(
