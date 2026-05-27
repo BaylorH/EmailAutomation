@@ -17,6 +17,7 @@ from .column_config import (
     REQUIRED_FOR_CLOSE,
 )
 from .notification_payloads import sanitize_new_property_referral_response
+from .openai_usage import track_openai_usage_safely
 
 logger = logging.getLogger(__name__)
 
@@ -1068,6 +1069,28 @@ OUTPUT ONLY valid JSON in this exact format:
             input=[{"role": "user", "content": input_content}],
             temperature=0.1
         )
+        if not dry_run:
+            track_openai_usage_safely(
+                db=_fs,
+                user_id=uid,
+                client_id=client_id,
+                thread_id=thread_id,
+                operation="ai.extract_sheet_updates",
+                model="gpt-5.2",
+                usage=getattr(response, "usage", None),
+                request_id=getattr(response, "id", None),
+                endpoint="responses",
+                metadata={
+                    "sheetId": sheet_id,
+                    "rowNumber": rownum,
+                    "headerCount": len(header or []),
+                    "conversationMessageCount": len(conversation or []),
+                    "hasPdfManifest": bool(pdf_manifest),
+                    "pdfCount": len(pdf_manifest or []),
+                    "urlTextCount": len(url_texts or []),
+                    "configuredExtractionFieldCount": len(extraction_fields or []),
+                },
+            )
 
         raw_response = (response.output_text or "").strip()
 
