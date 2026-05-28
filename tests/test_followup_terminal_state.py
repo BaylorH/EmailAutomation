@@ -5,11 +5,24 @@ from email_automation import followup
 
 
 class FakeThreadRef:
-    def __init__(self):
+    def __init__(self, data=None):
         self.updates = []
+        self._data = data or {}
 
     def update(self, data):
         self.updates.append(data)
+
+    def get(self):
+        return FakeThreadSnapshot(self._data)
+
+
+class FakeThreadSnapshot:
+    def __init__(self, data):
+        self.exists = True
+        self._data = data
+
+    def to_dict(self):
+        return self._data
 
 
 class FakeFirestore:
@@ -24,6 +37,9 @@ class FakeFirestore:
 
     def update(self, data):
         self.thread_ref.update(data)
+
+    def get(self):
+        return self.thread_ref.get()
 
 
 class FakeMessageDoc:
@@ -74,6 +90,31 @@ class FollowupTerminalStateTests(unittest.TestCase):
         ])
 
         self.assertIsNone(selected)
+
+    def test_auto_response_reschedules_paused_active_thread(self):
+        thread_ref = FakeThreadRef({
+            "status": "active",
+            "followUpStatus": "paused",
+            "hasInboundReply": True,
+            "followUpConfig": {
+                "enabled": True,
+                "currentFollowUpIndex": 1,
+                "followUps": [
+                    {"waitTime": 1, "waitUnit": "hours", "message": "First"},
+                    {"waitTime": 2, "waitUnit": "hours", "message": "Second"},
+                ],
+            },
+        })
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)):
+            result = followup.schedule_followup_after_auto_response("uid-1", "thread-1")
+
+        self.assertTrue(result)
+        update = thread_ref.updates[-1]
+        self.assertEqual(update["followUpStatus"], "waiting")
+        self.assertFalse(update["hasInboundReply"])
+        self.assertIsNone(update["followUpConfig.pausedAt"])
+        self.assertIn("followUpConfig.nextFollowUpAt", update)
 
 
 if __name__ == "__main__":

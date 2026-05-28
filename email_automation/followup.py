@@ -562,6 +562,57 @@ def _schedule_next_followup(
     print(f"   Next follow-up scheduled for {next_followup_at.strftime('%Y-%m-%d %H:%M')} UTC")
 
 
+def schedule_followup_after_auto_response(user_id: str, thread_id: str) -> bool:
+    """Resume follow-up tracking after the system sends an automatic mid-thread reply."""
+    try:
+        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+        thread_doc = thread_ref.get()
+
+        if not thread_doc.exists:
+            return False
+
+        thread_data = thread_doc.to_dict() or {}
+        if thread_data.get("status") in {"completed", "stopped"}:
+            return False
+
+        followup_config = thread_data.get("followUpConfig", {})
+        if not followup_config.get("enabled", False):
+            return False
+
+        followups = followup_config.get("followUps", [])
+        current_index = followup_config.get("currentFollowUpIndex", 0)
+        if current_index >= len(followups):
+            return False
+
+        next_followup = followups[current_index]
+        wait_time = next_followup.get("waitTime", 3)
+        wait_unit = next_followup.get("waitUnit", "days")
+
+        if wait_unit == "minutes":
+            delta = timedelta(minutes=wait_time)
+        elif wait_unit == "hours":
+            delta = timedelta(hours=wait_time)
+        else:
+            delta = timedelta(days=wait_time)
+
+        next_followup_at = datetime.now(timezone.utc) + delta
+        thread_ref.update({
+            "followUpStatus": "waiting",
+            "followUpConfig.nextFollowUpAt": next_followup_at,
+            "followUpConfig.pausedAt": None,
+            "hasInboundReply": False,
+            "lastOutboundAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+        })
+
+        print(f"   Follow-up rescheduled after auto-response for thread {thread_id[:20]}...")
+        return True
+
+    except Exception as e:
+        print(f"   Error rescheduling follow-up after auto-response: {e}")
+        return False
+
+
 def _pause_followup(user_id: str, thread_id: str):
     """Pause follow-up sequence when broker responds."""
     _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({

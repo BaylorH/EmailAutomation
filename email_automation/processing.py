@@ -2156,6 +2156,11 @@ To complete the property details, could you please provide:
                             sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                             if sent:
                                 print(f"📧 Sent thank you + missing fields request to: {to_addr_lower}")
+                                try:
+                                    from .followup import schedule_followup_after_auto_response
+                                    schedule_followup_after_auto_response(user_id, thread_id)
+                                except Exception as e:
+                                    print(f"⚠️ Failed to reschedule follow-up after missing-fields response: {e}")
                             else:
                                 print(f"❌ Failed to send missing fields request")
                                 queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
