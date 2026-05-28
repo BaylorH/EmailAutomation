@@ -122,6 +122,38 @@ class MessageHistoryDedupeTests(unittest.TestCase):
 
         self.assertEqual([], messages.deleted)
 
+    def test_real_graph_followup_replaces_synthetic_when_only_reply_prefix_differs(self):
+        messages = FakeMessagesCollection({
+            "followup-thread-123": {
+                "direction": "outbound",
+                "source": "followup_scheduler",
+                "subject": "3670 N 5th St, North Las Vegas",
+                "to": ["baylor@manifoldengineering.ai"],
+                "bodyPreview": "Hi Marcus, I wanted to follow up on my previous email regarding the property above.",
+                "sentDateTime": "2026-05-26T09:06:31.200738+00:00",
+            }
+        })
+        payload = {
+            "direction": "outbound",
+            "subject": "RE: 3670 N 5th St, North Las Vegas",
+            "to": ["baylor@manifoldengineering.ai"],
+            "body": {
+                "preview": "Hi Marcus, I wanted to follow up on my previous email regarding the property above.",
+            },
+            "sentDateTime": "2026-05-26T09:06:31Z",
+            "headers": {"internetMessageId": "<real-followup@example.com>"},
+        }
+
+        original_fs = messaging._fs
+        messaging._fs = FakeChain(messages)
+        try:
+            self.assertTrue(messaging.save_message("uid-1", "thread-1", "real-message", payload))
+        finally:
+            messaging._fs = original_fs
+
+        self.assertIn("followup-thread-123", messages.deleted)
+        self.assertIn("real-message", messages.saved)
+
 
 if __name__ == "__main__":
     unittest.main()

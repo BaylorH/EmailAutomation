@@ -27,6 +27,11 @@ def _normalize_history_text(value: Any) -> str:
     return text.strip().lower()
 
 
+def _normalize_history_subject(value: Any) -> str:
+    subject = _normalize_history_text(value)
+    return re.sub(r"^(?:(?:re|fw|fwd)\s*:\s*)+", "", subject).strip()
+
+
 def _message_preview(payload: Dict[str, Any]) -> str:
     body = payload.get("body")
     if isinstance(body, dict):
@@ -79,8 +84,8 @@ def _outbound_history_match(real_payload: Dict[str, Any], synthetic_payload: Dic
     if real_preview != synthetic_preview and real_preview not in synthetic_preview and synthetic_preview not in real_preview:
         return False
 
-    real_subject = _normalize_history_text(real_payload.get("subject"))
-    synthetic_subject = _normalize_history_text(synthetic_payload.get("subject"))
+    real_subject = _normalize_history_subject(real_payload.get("subject"))
+    synthetic_subject = _normalize_history_subject(synthetic_payload.get("subject"))
     if real_subject and synthetic_subject and real_subject != synthetic_subject:
         return False
 
