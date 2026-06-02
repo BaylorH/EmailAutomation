@@ -100,6 +100,11 @@ def _claim_outbox_item(doc_ref, data: dict) -> bool:
             return False
 
         current_data = snapshot.to_dict() or {}
+        if _is_cancelled_outbox_item(current_data):
+            transaction.delete(doc_ref)
+            print(f"   🗑️ Deleted canceled outbox item {doc_ref.id}")
+            return False
+
         processing_by = current_data.get("processingBy")
         processing_at = current_data.get("processingAt")
 
@@ -519,6 +524,102 @@ Thanks!"""
 def _should_use_exact_outbox_script(data: Dict[str, Any]) -> bool:
     """True when the outbox item contains approved copy that must not be re-selected."""
     return data.get("scriptSelectionMode") == "exact" or data.get("forceScript") is True
+
+
+def _is_cancelled_outbox_item(data: Dict[str, Any]) -> bool:
+    """True when the dashboard has requested cancellation before the worker sends."""
+    status = (data.get("status") or "").strip().lower()
+    return data.get("cancelRequested") is True or status in {"cancel_requested", "cancelled", "canceled"}
+
+
+def _delete_cancelled_outbox_item_if_needed(doc_ref, data: Dict[str, Any]) -> bool:
+    if not _is_cancelled_outbox_item(data):
+        return False
+    doc_id = getattr(doc_ref, "id", "unknown")
+    try:
+        doc_ref.delete()
+        print(f"   🗑️ Deleted canceled outbox item {doc_id}")
+    except Exception as e:
+        print(f"   ⚠️ Could not delete canceled outbox item {doc_id}: {e}")
+    return True
+
+
+def _must_process_outbox_item_individually(data: Dict[str, Any]) -> bool:
+    """Dashboard-approved replies/exact-copy items must not be bundled into campaign outreach."""
+    return bool(
+        data.get("threadId")
+        or data.get("replyToMessageId")
+        or data.get("notificationId")
+        or _should_use_exact_outbox_script(data)
+    )
+
+
+def _get_current_outbox_data(doc_ref) -> Optional[Dict[str, Any]]:
+    if not hasattr(doc_ref, "get"):
+        return {}
+    try:
+        snapshot = doc_ref.get()
+        if not snapshot.exists:
+            return None
+        return snapshot.to_dict() or {}
+    except Exception as e:
+        print(f"   ⚠️ Could not refresh outbox item {getattr(doc_ref, 'id', 'unknown')}: {e}")
+        return None
+
+
+def _finalize_successful_outbox_item(
+    user_id: str,
+    doc_ref,
+    data: Dict[str, Any],
+    row_number: Optional[int] = None,
+    client_id: Optional[str] = None,
+):
+    """Delete sent outbox and apply post-send dashboard state only after send success."""
+    from .clients import _fs
+    from google.cloud.firestore import SERVER_TIMESTAMP
+
+    client_id = client_id or (data.get("clientId") or "").strip()
+
+    doc_ref.delete()
+
+    if row_number and client_id:
+        try:
+            sheet_id = _get_sheet_id_or_fail(user_id, client_id)
+            highlight_row(sheet_id, row_number)
+        except Exception as e:
+            print(f"  ⚠️ Could not highlight row {row_number}: {e}")
+
+    notification_id = data.get("notificationId")
+    notification_client_id = data.get("notificationClientId") or client_id
+    if data.get("deleteNotificationOnSend") and notification_id and notification_client_id:
+        try:
+            (
+                _fs.collection("users").document(user_id)
+                .collection("clients").document(notification_client_id)
+                .collection("notifications").document(notification_id)
+                .delete()
+            )
+            print(f"   🗑️ Deleted action notification {notification_id} after send")
+        except Exception as e:
+            print(f"   ⚠️ Could not delete action notification {notification_id}: {e}")
+
+    thread_id = data.get("threadId")
+    if data.get("resumeThreadOnSend") and thread_id:
+        try:
+            (
+                _fs.collection("users").document(user_id)
+                .collection("threads").document(thread_id)
+                .set({
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "lastOperatorReplySentAt": SERVER_TIMESTAMP,
+                    "updatedAt": SERVER_TIMESTAMP,
+                }, merge=True)
+            )
+            print(f"   ▶️ Resumed thread {thread_id[:20]}... after dashboard send")
+        except Exception as e:
+            print(f"   ⚠️ Could not resume thread {thread_id[:20]}... after send: {e}")
+
 
 def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> Optional[str]:
     """
@@ -978,7 +1079,19 @@ def send_outboxes(user_id: str, headers):
     email_groups = defaultdict(list)
     for d in docs:
         data = d.to_dict() or {}
+        if _delete_cancelled_outbox_item_if_needed(d.reference, data):
+            continue
         emails = data.get("assignedEmails") or []
+
+        if _must_process_outbox_item_individually(data):
+            email_lower = emails[0].lower().strip() if emails else f"__no_recipient__:{d.id}"
+            email_groups[f"__single__:{d.id}"].append({
+                'doc': d,
+                'data': data,
+                'email': email_lower
+            })
+            continue
+
         for email in emails:
             email_lower = email.lower().strip()
             email_groups[email_lower].append({
@@ -1042,6 +1155,8 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
     properties = []
     for item in items:
         data = item['data']
+        if _delete_cancelled_outbox_item_if_needed(item['doc'].reference, data):
+            continue
         subject = data.get("subject", "")
         # Try to extract property address from subject or script
         property_name = subject or _extract_property_from_script(data.get("script", ""))
@@ -1062,14 +1177,26 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
         item = prop['item']
         data = item['data']
 
+        if _delete_cancelled_outbox_item_if_needed(item['doc'].reference, data):
+            continue
+
         # CRITICAL: Claim the item before processing to prevent duplicate sends
         if not _claim_outbox_item(item['doc'].reference, data):
             print(f"   ⏭️ Skipping property {idx + 1} - already being processed by another worker")
             continue
 
+        fresh_data = _get_current_outbox_data(item['doc'].reference)
+        if fresh_data is None:
+            continue
+        if fresh_data:
+            data = fresh_data
+
+        if _delete_cancelled_outbox_item_if_needed(item['doc'].reference, data):
+            continue
+
         clientId = (data.get("clientId") or "").strip()
         attempts = int(data.get("attempts") or 0)
-        row_number = prop.get('rowNumber')
+        row_number = data.get("rowNumber") or prop.get('rowNumber')
 
         # DUPLICATE CHECK: Skip if we've already sent to this recipient about this property
         property_address = prop.get('subject') or prop.get('name') or ''
@@ -1080,7 +1207,7 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
             continue
 
         # Use the original approved script without modification
-        script = prop['script']
+        script = data.get("script", prop['script'])
 
         print(f"  → Property {idx + 1}/{len(properties)}: {prop['name'] or 'Unknown'} (attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
 
@@ -1111,15 +1238,11 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
             any_errors = bool([e for e in res.get("errors", {}) if "opted out" not in str(res["errors"].get(e, ""))])
 
             if not any_errors and res["sent"]:
-                item['doc'].reference.delete()
+                _finalize_successful_outbox_item(
+                    user_id, item['doc'].reference, data,
+                    row_number=row_number, client_id=clientId
+                )
                 print(f"  ✅ Sent and deleted outbox item for {prop['name']}")
-                # Highlight row yellow to show system is managing this conversation
-                if row_number and clientId:
-                    try:
-                        sheet_id = _get_sheet_id_or_fail(user_id, clientId)
-                        highlight_row(sheet_id, row_number)
-                    except Exception as e:
-                        print(f"  ⚠️ Could not highlight row {row_number}: {e}")
             else:
                 new_attempts = attempts + 1
                 error_msg = json.dumps(res["errors"])[:1500]
@@ -1170,9 +1293,21 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     d = item['doc']
     data = item['data']
 
+    if _delete_cancelled_outbox_item_if_needed(d.reference, data):
+        return
+
     # CRITICAL: Claim the item before processing to prevent duplicate sends
     if not _claim_outbox_item(d.reference, data):
         print(f"   ⏭️ Skipping {d.id} - already being processed by another worker")
+        return
+
+    fresh_data = _get_current_outbox_data(d.reference)
+    if fresh_data is None:
+        return
+    if fresh_data:
+        data = fresh_data
+
+    if _delete_cancelled_outbox_item_if_needed(d.reference, data):
         return
 
     emails = data.get("assignedEmails") or []
@@ -1181,15 +1316,14 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     row_number = data.get("rowNumber")
     thread_id = data.get("threadId")
     reply_to_msg_id = data.get("replyToMessageId")
-    is_thread_reply = bool(thread_id and reply_to_msg_id)
 
-    # If row_number is missing, prefer the known thread anchor before falling back to email.
+    # If row_number is missing (e.g., user reply from UI), prefer the known thread anchor.
+    # Broker email can appear on several rows in a campaign; email fallback is only safe for new outreach.
     if not row_number and thread_id:
         row_number = _get_thread_row_number(user_id, thread_id)
         if row_number:
-            print(f"   📍 Resolved row number from thread: {row_number}")
+            print(f"   📍 Resolved row number from thread {thread_id[:20]}...: {row_number}")
 
-    # User replies may share broker emails across rows; email lookup is a last resort.
     if not row_number and emails and clientId:
         try:
             sheet_id = _get_sheet_id_or_fail(user_id, clientId)
@@ -1204,6 +1338,9 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
 
     # Get pre-computed subject from outbox data (property-specific)
     subject_override = data.get("subject")
+
+    # Threading support: check if this is a reply to an existing thread
+    is_thread_reply = bool(thread_id and reply_to_msg_id)
 
     # Get scripts array (new format) or build from legacy fields
     email_scripts = data.get("emailScripts")
@@ -1329,15 +1466,11 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     any_errors = bool(all_errors)
 
     if not any_errors and all_sent:
-        d.reference.delete()
+        _finalize_successful_outbox_item(
+            user_id, d.reference, data,
+            row_number=row_number, client_id=clientId
+        )
         print(f"🗑️ Deleted outbox item {d.id}")
-        # Highlight row yellow to show system is managing this conversation
-        if row_number and clientId:
-            try:
-                sheet_id = _get_sheet_id_or_fail(user_id, clientId)
-                highlight_row(sheet_id, row_number)
-            except Exception as e:
-                print(f"⚠️ Could not highlight row {row_number}: {e}")
     else:
         new_attempts = attempts + 1
         error_msg = json.dumps(all_errors)[:1500]

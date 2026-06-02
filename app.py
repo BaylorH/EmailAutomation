@@ -999,7 +999,7 @@ def api_stop_conversation():
         if not uid or not thread_id:
             return jsonify({"success": False, "error": "Missing required fields: uid, threadId"}), 400
 
-        from email_automation.clients import _fs, _get_client_config, _sheets_client
+        from email_automation.clients import _fs, _get_client_config
         from email_automation.messaging import update_thread_status, THREAD_STATUS
         from email_automation.sheets import clear_row_highlight
         from google.cloud.firestore import SERVER_TIMESTAMP
@@ -1022,6 +1022,9 @@ def api_stop_conversation():
             thread_ref.update({
                 "followUpStatus": "stopped",
                 "followUpConfig.stoppedAt": SERVER_TIMESTAMP,
+                "followUpConfig.processingBy": None,
+                "followUpConfig.processingAt": None,
+                "nextFollowUpAt": None,
                 "updatedAt": SERVER_TIMESTAMP
             })
             print(f"⏹️ Stopped follow-ups for thread {thread_id[:20]}...", flush=True)
@@ -1041,30 +1044,13 @@ def api_stop_conversation():
             except Exception as e:
                 print(f"⚠️ Could not clear row highlight: {e}", flush=True)
 
-        deleted_notifications = 0
-        if client_id:
-            try:
-                notifications_ref = (
-                    _fs.collection("users").document(uid)
-                    .collection("clients").document(client_id)
-                    .collection("notifications")
-                )
-                for notif in notifications_ref.where("threadId", "==", thread_id).stream():
-                    notif.reference.delete()
-                    deleted_notifications += 1
-                if deleted_notifications:
-                    print(f"🧹 Deleted {deleted_notifications} notification(s) for stopped thread", flush=True)
-            except Exception as e:
-                print(f"⚠️ Could not delete stop notifications: {e}", flush=True)
-
         print(f"⏹️ Stopped monitoring thread {thread_id[:20]}...", flush=True)
 
         return jsonify({
             "success": True,
             "message": "Conversation monitoring stopped",
             "threadId": thread_id,
-            "newStatus": "stopped",
-            "deletedNotifications": deleted_notifications
+            "newStatus": "stopped"
         })
 
     except Exception as e:

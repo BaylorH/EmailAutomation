@@ -84,6 +84,7 @@ def strip_email_quotes(text: str) -> str:
 _EMAIL_REGEX = re.compile(
     r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
 )
+_RESERVED_EMAIL_TLDS = {"invalid", "test", "example", "localhost"}
 
 def is_valid_email(email: str) -> bool:
     """
@@ -94,6 +95,12 @@ def is_valid_email(email: str) -> bool:
         return False
     email = email.strip()
     if not _EMAIL_REGEX.match(email):
+        return False
+    domain = email.rsplit('@', 1)[1].lower()
+    labels = domain.split('.')
+    if labels[-1] in _RESERVED_EMAIL_TLDS:
+        return False
+    if domain == "localhost":
         return False
     # Additional safety checks
     if len(email) > 254:  # Max email length per RFC 5321

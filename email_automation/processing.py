@@ -39,6 +39,31 @@ from .app_config import REQUIRED_FIELDS_FOR_CLOSE, INBOX_SCAN_WINDOW_HOURS
 
 logger = logging.getLogger(__name__)
 
+
+class RetryableProcessingError(Exception):
+    """Raised when a message should remain unprocessed so the next scan can retry it."""
+
+
+def _should_mark_processed_after_error(error: Optional[Exception]) -> bool:
+    return not isinstance(error, RetryableProcessingError)
+
+
+def _record_ai_processing_failure(user_id: str, client_id: str, thread_id: str, message_id: str, reason: str):
+    try:
+        doc_id = f"{thread_id}__{message_id or int(time.time())}"
+        _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).set({
+            "clientId": client_id,
+            "threadId": thread_id,
+            "messageId": message_id,
+            "reason": reason,
+            "retryable": True,
+            "createdAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+        }, merge=True)
+    except Exception as e:
+        print(f"⚠️ Could not record AI processing failure: {e}")
+
+
 TERMINAL_CLOSE_REASONS_WITHOUT_COMPLETE_FIELDS = {
     "exclusive_with_another",
     "deal_pending",
@@ -2222,6 +2247,11 @@ We'll be in touch if we need any additional information."""
         
         else:
             print("ℹ️ No proposal generated; nothing to apply.")
+            _record_ai_processing_failure(
+                user_id, client_id, thread_id, msg_id,
+                "OpenAI proposal was unavailable or invalid JSON"
+            )
+            raise RetryableProcessingError("OpenAI proposal was unavailable or invalid JSON")
 
 def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread: bool = True, top: int = 50):
     """
@@ -2346,25 +2376,35 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
 
             # Process the last message (which will see all previous in conversation)
             last_msg = messages[-1]
+            processing_error = None
             try:
                 process_inbox_message(user_id, headers, last_msg)
                 processed_count += 1
             except Exception as e:
+                processing_error = e
                 print(f"❌ Failed to process batched message: {e}")
             finally:
                 processed_key = last_msg.get("internetMessageId") or last_msg.get("id")
-                mark_processed(user_id, processed_key)
+                if _should_mark_processed_after_error(processing_error):
+                    mark_processed(user_id, processed_key)
+                else:
+                    print(f"🔁 Leaving batched message retryable: {processed_key}")
         else:
             # Single message - process normally
             msg = messages[0]
+            processing_error = None
             try:
                 process_inbox_message(user_id, headers, msg)
                 processed_count += 1
             except Exception as e:
+                processing_error = e
                 print(f"❌ Failed to process message {msg.get('id', 'unknown')}: {e}")
             finally:
                 processed_key = msg.get("internetMessageId") or msg.get("id")
-                mark_processed(user_id, processed_key)
+                if _should_mark_processed_after_error(processing_error):
+                    mark_processed(user_id, processed_key)
+                else:
+                    print(f"🔁 Leaving message retryable: {processed_key}")
 
         # Rate limit delay between threads (skip delay after last one)
         if idx < len(thread_list) - 1:
@@ -2372,13 +2412,18 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
 
     # Process orphan messages (couldn't match to thread - will be ignored by process_inbox_message)
     for idx, msg in enumerate(orphan_messages):
+        processing_error = None
         try:
             process_inbox_message(user_id, headers, msg)
         except Exception as e:
+            processing_error = e
             print(f"❌ Failed to process orphan message: {e}")
         finally:
             processed_key = msg.get("internetMessageId") or msg.get("id")
-            mark_processed(user_id, processed_key)
+            if _should_mark_processed_after_error(processing_error):
+                mark_processed(user_id, processed_key)
+            else:
+                print(f"🔁 Leaving orphan message retryable: {processed_key}")
 
         # Rate limit delay between orphan messages (skip delay after last one)
         if idx < len(orphan_messages) - 1:
