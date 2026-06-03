@@ -8,6 +8,8 @@ from email_automation.processing import scan_inbox_against_index, scan_sent_item
 from email_automation.followup import check_and_send_followups
 from email_automation.pending_responses import process_pending_responses
 from email_automation.app_config import CLIENT_ID, CLIENT_SECRET, AUTHORITY, SCOPES, TOKEN_CACHE, FIREBASE_API_KEY
+from email_automation.scheduler_lease import run_with_scheduler_lease
+from email_automation.system_health import record_user_health
 
 # Thresholds for auto-cleanup (to stay within Firebase free tier)
 PROCESSED_MESSAGES_THRESHOLD = 500
@@ -76,6 +78,11 @@ def refresh_and_process_user(user_id: str):
     accounts = app.get_accounts()
     if not accounts:
         print(f"⚠️ No account found for {user_id}")
+        record_user_health(
+            user_id,
+            token_state={"status": "error", "error": "no_account_found"},
+            graph_state={"status": "unknown"},
+        )
         return
 
     # --- KEY CHANGE: do NOT force refresh; let MSAL use cached AT first ---
@@ -85,6 +92,11 @@ def refresh_and_process_user(user_id: str):
 
     if not result or "access_token" not in result:
         print(f"❌ Silent auth failed for {user_id}")
+        record_user_health(
+            user_id,
+            token_state={"status": "error", "error": "silent_auth_failed"},
+            graph_state={"status": "unknown"},
+        )
         return
 
     access_token = result["access_token"]
@@ -128,8 +140,18 @@ def refresh_and_process_user(user_id: str):
     # Auto-cleanup Firestore if collections are getting large (stay within free tier)
     auto_cleanup_firestore(user_id)
 
+    record_user_health(
+        user_id,
+        token_state={
+            "status": "healthy",
+            "source": token_source,
+            "expiresIn": exp_secs,
+        },
+        graph_state={"status": "healthy"},
+    )
 
-if __name__ == "__main__":
+
+def run_all_users():
     all_users = list_user_ids()
     print(f"📦 Found {len(all_users)} token cache users: {all_users}")
 
@@ -138,3 +160,12 @@ if __name__ == "__main__":
             refresh_and_process_user(uid)
         except Exception as e:
             print(f"💥 Error for user {uid}:", str(e))
+            record_user_health(
+                uid,
+                token_state={"status": "unknown"},
+                graph_state={"status": "error", "error": str(e)},
+            )
+
+
+if __name__ == "__main__":
+    run_with_scheduler_lease(run_all_users)

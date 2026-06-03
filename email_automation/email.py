@@ -5,6 +5,7 @@ import uuid
 import logging
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
+from google.cloud.firestore import SERVER_TIMESTAMP
 from .utils import exponential_backoff_request, safe_preview, _body_kind, validate_recipient_emails, is_valid_email
 from .messaging import save_thread_root, save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
 from .clients import _get_sheet_id_or_fail, _sheets_client
@@ -22,6 +23,20 @@ CLAIM_TIMEOUT_SECONDS = 300  # 5 minutes
 
 # Unique worker ID for this process
 WORKER_ID = str(uuid.uuid4())[:8]
+
+
+def _update_action_audit(user_id: str, action_audit_id: Optional[str], payload: Dict[str, Any]) -> None:
+    if not action_audit_id:
+        return
+    try:
+        from .clients import _fs
+        (
+            _fs.collection("users").document(user_id)
+            .collection("actionAudit").document(action_audit_id)
+            .set(payload, merge=True)
+        )
+    except Exception as e:
+        print(f"   ⚠️ Could not update action audit {action_audit_id}: {e}")
 
 
 def _has_existing_thread_for_property(
@@ -576,11 +591,20 @@ def _finalize_successful_outbox_item(
 ):
     """Delete sent outbox and apply post-send dashboard state only after send success."""
     from .clients import _fs
-    from google.cloud.firestore import SERVER_TIMESTAMP
 
     client_id = client_id or (data.get("clientId") or "").strip()
 
     doc_ref.delete()
+
+    _update_action_audit(user_id, data.get("actionAuditId"), {
+        "status": "sent",
+        "outboxId": getattr(doc_ref, "id", None),
+        "clientId": client_id or None,
+        "notificationId": data.get("notificationId"),
+        "threadId": data.get("threadId"),
+        "sentAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+    })
 
     if row_number and client_id:
         try:
@@ -1032,6 +1056,16 @@ def _move_to_dead_letter(user_id: str, doc_ref, data: dict, reason: str):
     }
 
     dead_letter_ref.add(dead_letter_data)
+    _update_action_audit(user_id, data.get("actionAuditId"), {
+        "status": "failed",
+        "outboxId": getattr(doc_ref, "id", None),
+        "clientId": data.get("clientId"),
+        "notificationId": data.get("notificationId"),
+        "threadId": data.get("threadId"),
+        "failureReason": reason,
+        "failedAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+    })
     doc_ref.delete()
     print(f"☠️ Moved item {doc_ref.id} to dead-letter queue: {reason}")
 
