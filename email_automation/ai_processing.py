@@ -69,16 +69,21 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
         r"(?:sf|sq\.?\s*ft|square\s*foot)(?:\s*/?\s*(?:yr|year|annum))?",
         re.IGNORECASE,
     )
+    monthly_unit = re.compile(r"(?:/|\bper\s+)(?:mo|mos|month|monthly)\b", re.IGNORECASE)
+    annual_unit = re.compile(r"(?:/|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
 
     for pattern in (rent_context, dollar_per_sf):
         for match in pattern.finditer(text):
             value = float(match.group(1))
-            if value < 1:
+            unit_context = text[max(0, match.start() - 40): min(len(text), match.end() + 50)]
+            is_monthly = bool(monthly_unit.search(unit_context)) and not bool(annual_unit.search(unit_context))
+            annual_value = value * 12 if is_monthly else value
+            if annual_value < 1:
                 continue
             context = text[max(0, match.start() - 30): match.start()].lower()
             if any(marker in context for marker in ("nnn", "cam", "ops", "opex", "operating expense")):
                 continue
-            return f"{value:.2f}"
+            return f"{annual_value:.2f}"
 
     return None
 

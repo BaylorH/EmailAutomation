@@ -31,6 +31,20 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
         self.assertEqual(value, "9.00")
 
+    def test_deterministic_rent_fallback_annualizes_monthly_asking_rent(self):
+        value = ai_processing._extract_rent_sf_yr_from_text(
+            "Asking rate: $1.25/SF/month NNN."
+        )
+
+        self.assertEqual(value, "15.00")
+
+    def test_deterministic_rent_fallback_annualizes_per_square_foot_per_month(self):
+        value = ai_processing._extract_rent_sf_yr_from_text(
+            "Base rent is $0.95 per square foot per month plus operating expenses."
+        )
+
+        self.assertEqual(value, "11.40")
+
     def test_deterministic_rent_fallback_augments_blank_rent_cell(self):
         header = ["Property Address", "Rent/SF /Yr", "Ops Ex /SF"]
         proposal = {"updates": [{"column": "Ops Ex /SF", "value": "0.39"}]}
