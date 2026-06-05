@@ -1,5 +1,6 @@
 import atexit
 import json
+from datetime import datetime
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token
 from email_automation.clients import list_user_ids, decode_token_payload, _fs
@@ -16,6 +17,37 @@ PROCESSED_MESSAGES_THRESHOLD = 500
 SHEET_CHANGELOG_THRESHOLD = 100
 
 
+def _timestamp_sort_value(doc, fields):
+    data = doc.to_dict() or {}
+    for field in fields:
+        value = data.get(field)
+        if value is None:
+            continue
+        if hasattr(value, "timestamp"):
+            return value.timestamp()
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return 0
+        return 0
+    return 0
+
+
+def _delete_oldest_excess_docs(collection_ref, threshold: int, timestamp_fields) -> int:
+    docs = list(collection_ref.stream())
+    excess_count = max(0, len(docs) - threshold)
+    if excess_count <= 0:
+        return 0
+
+    docs.sort(key=lambda doc: _timestamp_sort_value(doc, timestamp_fields))
+    for doc in docs[:excess_count]:
+        doc.reference.delete()
+    return excess_count
+
+
 def auto_cleanup_firestore(user_id: str):
     """
     Automatically clean up Firestore collections if they exceed thresholds.
@@ -28,11 +60,12 @@ def auto_cleanup_firestore(user_id: str):
 
         if len(pm_docs) > PROCESSED_MESSAGES_THRESHOLD:
             print(f"🧹 Auto-cleanup: processedMessages ({len(pm_docs)}+) exceeds threshold ({PROCESSED_MESSAGES_THRESHOLD})")
-            # Delete all - safe to clear, just prevents duplicate processing temporarily
-            all_pm = list(pm_ref.stream())
-            for doc in all_pm:
-                doc.reference.delete()
-            print(f"   ✅ Deleted {len(all_pm)} processedMessages docs")
+            deleted = _delete_oldest_excess_docs(
+                pm_ref,
+                PROCESSED_MESSAGES_THRESHOLD,
+                ["processedAt", "timestamp", "createdAt"],
+            )
+            print(f"   ✅ Deleted {deleted} oldest processedMessages docs")
 
         # Check sheetChangeLog count
         cl_ref = _fs.collection("users").document(user_id).collection("sheetChangeLog")
@@ -40,11 +73,12 @@ def auto_cleanup_firestore(user_id: str):
 
         if len(cl_docs) > SHEET_CHANGELOG_THRESHOLD:
             print(f"🧹 Auto-cleanup: sheetChangeLog ({len(cl_docs)}+) exceeds threshold ({SHEET_CHANGELOG_THRESHOLD})")
-            # Delete all - just audit logs
-            all_cl = list(cl_ref.stream())
-            for doc in all_cl:
-                doc.reference.delete()
-            print(f"   ✅ Deleted {len(all_cl)} sheetChangeLog docs")
+            deleted = _delete_oldest_excess_docs(
+                cl_ref,
+                SHEET_CHANGELOG_THRESHOLD,
+                ["timestamp", "createdAt", "updatedAt"],
+            )
+            print(f"   ✅ Deleted {deleted} oldest sheetChangeLog docs")
 
     except Exception as e:
         print(f"⚠️ Auto-cleanup error for {user_id}: {e}")

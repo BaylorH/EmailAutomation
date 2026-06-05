@@ -1,11 +1,37 @@
 import hashlib
 import logging
+import re
 from typing import Optional, List, Dict, Any
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 from .clients import _fs
 from google.cloud import firestore
 
 logger = logging.getLogger(__name__)
+
+
+def extract_row_number_from_update(update: Dict[str, Any]) -> Optional[int]:
+    """Extract a Sheet row number from explicit metadata or an A1 notation range."""
+    row_number = update.get("rowNumber")
+    if row_number:
+        try:
+            return int(row_number)
+        except (TypeError, ValueError):
+            pass
+
+    range_value = str(update.get("range") or "")
+    if not range_value:
+        return None
+
+    range_part = range_value.split("!")[-1]
+    match = re.search(r"\$?[A-Z]+\$?(\d+)", range_part)
+    if not match:
+        return None
+
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
 
 def write_notification(uid: str, client_id: str, *, kind: str, priority: str, email: str, 
                       thread_id: str, row_number: int = None, row_anchor: str = None, 
@@ -111,6 +137,7 @@ def add_client_notifications(
     try:
         # Write one notification per applied update
         for update in applied_updates:
+            row_number = extract_row_number_from_update(update)
             dedupe_key = f"{thread_id}:{update.get('range', '')}:{update.get('column', '')}:{update.get('newValue', '')}"
             logger.debug(
                 "notification.dedupe_key",
@@ -133,7 +160,7 @@ def add_client_notifications(
                 priority="normal",
                 email=email,
                 thread_id=thread_id,
-                row_number=None,  # Could extract from range if needed
+                row_number=row_number,
                 row_anchor=address,
                 meta={
                     "column": update.get("column", ""),
@@ -141,7 +168,8 @@ def add_client_notifications(
                     "newValue": update.get("newValue", ""),
                     "reason": update.get("reason", ""),
                     "confidence": update.get("confidence", 0.0),
-                    "address": address or ""
+                    "address": address or "",
+                    "rowNumber": row_number,
                 },
                 dedupe_key=dedupe_key
             )

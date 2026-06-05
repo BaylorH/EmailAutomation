@@ -39,6 +39,84 @@ def _update_action_audit(user_id: str, action_audit_id: Optional[str], payload: 
         print(f"   ⚠️ Could not update action audit {action_audit_id}: {e}")
 
 
+def _terminalize_outbox_action_audit(
+    user_id: Optional[str],
+    doc_ref,
+    data: Dict[str, Any],
+    status: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Write the final dashboard action-audit state for a no-send/send outcome."""
+    if not user_id:
+        return
+
+    payload = {
+        "status": status,
+        "outboxId": getattr(doc_ref, "id", None),
+        "clientId": data.get("clientId"),
+        "notificationId": data.get("notificationId"),
+        "threadId": data.get("threadId"),
+        "updatedAt": SERVER_TIMESTAMP,
+    }
+    if extra:
+        payload.update({k: v for k, v in extra.items() if v is not None})
+    _update_action_audit(user_id, data.get("actionAuditId"), payload)
+
+
+def _first_result_value(mapping: Any, preferred_keys: Optional[List[str]] = None) -> Optional[Any]:
+    if not mapping:
+        return None
+    if isinstance(mapping, dict):
+        for key in preferred_keys or []:
+            if mapping.get(key):
+                return mapping[key]
+        for value in mapping.values():
+            if value:
+                return value
+        return None
+    if isinstance(mapping, list):
+        return next((value for value in mapping if value), None)
+    return mapping
+
+
+def _send_identity_payload(send_result: Optional[Dict[str, Any]], recipients: Optional[List[str]] = None) -> Dict[str, Any]:
+    if not send_result:
+        return {}
+
+    recipients = recipients or []
+    sent_message_ids = send_result.get("sentMessageIds") or {}
+    internet_message_ids = send_result.get("internetMessageIds") or {}
+    thread_ids = send_result.get("threadIds") or {}
+    conversation_ids = send_result.get("conversationIds") or {}
+
+    payload = {
+        "sentMessageId": _first_result_value(sent_message_ids, recipients),
+        "internetMessageId": _first_result_value(internet_message_ids, recipients),
+        "sentThreadId": _first_result_value(thread_ids, recipients),
+        "conversationId": _first_result_value(conversation_ids, recipients),
+        "sentRecipients": send_result.get("sent"),
+        "sentMessageIds": sent_message_ids or None,
+        "internetMessageIds": internet_message_ids or None,
+        "sentThreadIds": thread_ids or None,
+        "conversationIds": conversation_ids or None,
+    }
+    return {k: v for k, v in payload.items() if v}
+
+
+def _merge_send_identity(accumulator: Dict[str, Any], send_result: Dict[str, Any]) -> None:
+    for key in ("sentMessageIds", "internetMessageIds", "threadIds", "conversationIds"):
+        accumulator.setdefault(key, {})
+        values = send_result.get(key) or {}
+        if isinstance(values, dict):
+            accumulator[key].update(values)
+
+
+def _all_send_errors_are_opt_out(errors: Dict[str, Any]) -> bool:
+    if not errors:
+        return False
+    return all("opted out" in str(message).lower() for message in errors.values())
+
+
 def _has_existing_thread_for_property(
     user_id: str,
     recipient_email: str,
@@ -96,7 +174,7 @@ def _has_existing_thread_for_property(
         return False
 
 
-def _claim_outbox_item(doc_ref, data: dict) -> bool:
+def _claim_outbox_item(doc_ref, data: dict, user_id: Optional[str] = None) -> bool:
     """
     Attempt to claim an outbox item for processing using a transaction.
     Prevents duplicate sends when multiple processes run concurrently.
@@ -105,6 +183,8 @@ def _claim_outbox_item(doc_ref, data: dict) -> bool:
     """
     from .clients import _fs
     from google.cloud.firestore import transactional
+
+    cancelled_seen = {}
 
     @transactional
     def claim_transaction(transaction, doc_ref):
@@ -117,6 +197,7 @@ def _claim_outbox_item(doc_ref, data: dict) -> bool:
         current_data = snapshot.to_dict() or {}
         if _is_cancelled_outbox_item(current_data):
             transaction.delete(doc_ref)
+            cancelled_seen["data"] = current_data
             print(f"   🗑️ Deleted canceled outbox item {doc_ref.id}")
             return False
 
@@ -151,7 +232,16 @@ def _claim_outbox_item(doc_ref, data: dict) -> bool:
 
     try:
         transaction = _fs.transaction()
-        return claim_transaction(transaction, doc_ref)
+        claimed = claim_transaction(transaction, doc_ref)
+        if not claimed and cancelled_seen:
+            _terminalize_outbox_action_audit(
+                user_id,
+                doc_ref,
+                cancelled_seen.get("data") or data,
+                "cancelled",
+                {"cancelledAt": SERVER_TIMESTAMP},
+            )
+        return claimed
     except Exception as e:
         print(f"   ⚠️ Failed to claim {doc_ref.id}: {e}")
         return False
@@ -547,12 +637,23 @@ def _is_cancelled_outbox_item(data: Dict[str, Any]) -> bool:
     return data.get("cancelRequested") is True or status in {"cancel_requested", "cancelled", "canceled"}
 
 
-def _delete_cancelled_outbox_item_if_needed(doc_ref, data: Dict[str, Any]) -> bool:
+def _delete_cancelled_outbox_item_if_needed(
+    doc_ref,
+    data: Dict[str, Any],
+    user_id: Optional[str] = None,
+) -> bool:
     if not _is_cancelled_outbox_item(data):
         return False
     doc_id = getattr(doc_ref, "id", "unknown")
     try:
         doc_ref.delete()
+        _terminalize_outbox_action_audit(
+            user_id,
+            doc_ref,
+            data,
+            "cancelled",
+            {"cancelledAt": SERVER_TIMESTAMP},
+        )
         print(f"   🗑️ Deleted canceled outbox item {doc_id}")
     except Exception as e:
         print(f"   ⚠️ Could not delete canceled outbox item {doc_id}: {e}")
@@ -588,6 +689,7 @@ def _finalize_successful_outbox_item(
     data: Dict[str, Any],
     row_number: Optional[int] = None,
     client_id: Optional[str] = None,
+    send_result: Optional[Dict[str, Any]] = None,
 ):
     """Delete sent outbox and apply post-send dashboard state only after send success."""
     from .clients import _fs
@@ -596,7 +698,7 @@ def _finalize_successful_outbox_item(
 
     doc_ref.delete()
 
-    _update_action_audit(user_id, data.get("actionAuditId"), {
+    audit_payload = {
         "status": "sent",
         "outboxId": getattr(doc_ref, "id", None),
         "clientId": client_id or None,
@@ -604,7 +706,9 @@ def _finalize_successful_outbox_item(
         "threadId": data.get("threadId"),
         "sentAt": SERVER_TIMESTAMP,
         "updatedAt": SERVER_TIMESTAMP,
-    })
+    }
+    audit_payload.update(_send_identity_payload(send_result, data.get("assignedEmails") or []))
+    _update_action_audit(user_id, data.get("actionAuditId"), audit_payload)
 
     if row_number and client_id:
         try:
@@ -766,7 +870,15 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
     content_type, content = _body_kind(script)
 
     # Initialize results with opted_out info
-    results = {"sent": [], "errors": {}, "opted_out": opted_out_recipients}
+    results = {
+        "sent": [],
+        "errors": {},
+        "opted_out": opted_out_recipients,
+        "sentMessageIds": {},
+        "internetMessageIds": {},
+        "threadIds": {},
+        "conversationIds": {},
+    }
 
     # Add opted-out recipients to errors for visibility
     for optout in opted_out_recipients:
@@ -916,6 +1028,10 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             # CRITICAL: Email is already sent at this point. We MUST index it successfully
             # or future replies will be orphaned (unable to match to this thread).
             root_id = normalize_message_id(internet_message_id)
+            results["sentMessageIds"][addr] = draft_id
+            results["internetMessageIds"][addr] = internet_message_id
+            results["threadIds"][addr] = root_id
+            results["conversationIds"][addr] = conversation_id
 
             # Thread root
             thread_meta = {
@@ -1057,12 +1173,13 @@ def _move_to_dead_letter(user_id: str, doc_ref, data: dict, reason: str):
 
     dead_letter_ref.add(dead_letter_data)
     _update_action_audit(user_id, data.get("actionAuditId"), {
-        "status": "failed",
+        "status": "dead_lettered",
         "outboxId": getattr(doc_ref, "id", None),
         "clientId": data.get("clientId"),
         "notificationId": data.get("notificationId"),
         "threadId": data.get("threadId"),
         "failureReason": reason,
+        "deadLetteredAt": SERVER_TIMESTAMP,
         "failedAt": SERVER_TIMESTAMP,
         "updatedAt": SERVER_TIMESTAMP,
     })
@@ -1113,7 +1230,7 @@ def send_outboxes(user_id: str, headers):
     email_groups = defaultdict(list)
     for d in docs:
         data = d.to_dict() or {}
-        if _delete_cancelled_outbox_item_if_needed(d.reference, data):
+        if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id):
             continue
         emails = data.get("assignedEmails") or []
 
@@ -1181,6 +1298,16 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
         print(f"🚫 Skipping multi-property emails to opted-out contact: {recipient_email}")
         # Delete all outbox items for this recipient
         for item in items:
+            _terminalize_outbox_action_audit(
+                user_id,
+                item['doc'].reference,
+                item['data'],
+                "opt_out_skipped",
+                {
+                    "skippedAt": SERVER_TIMESTAMP,
+                    "skipReason": optout_record.get("reason", "contact_opted_out"),
+                },
+            )
             item['doc'].reference.delete()
         print(f"🗑️ Deleted {len(items)} outbox items (recipient opted out)")
         return
@@ -1189,7 +1316,7 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
     properties = []
     for item in items:
         data = item['data']
-        if _delete_cancelled_outbox_item_if_needed(item['doc'].reference, data):
+        if _delete_cancelled_outbox_item_if_needed(item['doc'].reference, data, user_id=user_id):
             continue
         subject = data.get("subject", "")
         # Try to extract property address from subject or script
@@ -1211,11 +1338,11 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
         item = prop['item']
         data = item['data']
 
-        if _delete_cancelled_outbox_item_if_needed(item['doc'].reference, data):
+        if _delete_cancelled_outbox_item_if_needed(item['doc'].reference, data, user_id=user_id):
             continue
 
         # CRITICAL: Claim the item before processing to prevent duplicate sends
-        if not _claim_outbox_item(item['doc'].reference, data):
+        if not _claim_outbox_item(item['doc'].reference, data, user_id=user_id):
             print(f"   ⏭️ Skipping property {idx + 1} - already being processed by another worker")
             continue
 
@@ -1225,7 +1352,7 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
         if fresh_data:
             data = fresh_data
 
-        if _delete_cancelled_outbox_item_if_needed(item['doc'].reference, data):
+        if _delete_cancelled_outbox_item_if_needed(item['doc'].reference, data, user_id=user_id):
             continue
 
         clientId = (data.get("clientId") or "").strip()
@@ -1237,6 +1364,13 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
         if _has_existing_thread_for_property(user_id, recipient_email, property_address, client_id=clientId):
             print(f"   🚫 DUPLICATE DETECTED: Already sent to {recipient_email} about '{property_address}'")
             print(f"   🗑️ Deleting duplicate outbox entry")
+            _terminalize_outbox_action_audit(
+                user_id,
+                item['doc'].reference,
+                data,
+                "duplicate_skipped",
+                {"skippedAt": SERVER_TIMESTAMP, "skipReason": "existing_thread_for_property"},
+            )
             item['doc'].reference.delete()
             continue
 
@@ -1274,9 +1408,20 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
             if not any_errors and res["sent"]:
                 _finalize_successful_outbox_item(
                     user_id, item['doc'].reference, data,
-                    row_number=row_number, client_id=clientId
+                    row_number=row_number, client_id=clientId,
+                    send_result=res,
                 )
                 print(f"  ✅ Sent and deleted outbox item for {prop['name']}")
+            elif not res.get("sent") and res.get("opted_out") and _all_send_errors_are_opt_out(res.get("errors", {})):
+                _terminalize_outbox_action_audit(
+                    user_id,
+                    item['doc'].reference,
+                    data,
+                    "opt_out_skipped",
+                    {"skippedAt": SERVER_TIMESTAMP, "skipReason": "contact_opted_out"},
+                )
+                item['doc'].reference.delete()
+                print(f"  🚫 Deleted outbox item for opted-out recipient {recipient_email}")
             else:
                 new_attempts = attempts + 1
                 error_msg = json.dumps(res["errors"])[:1500]
@@ -1327,11 +1472,11 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     d = item['doc']
     data = item['data']
 
-    if _delete_cancelled_outbox_item_if_needed(d.reference, data):
+    if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id):
         return
 
     # CRITICAL: Claim the item before processing to prevent duplicate sends
-    if not _claim_outbox_item(d.reference, data):
+    if not _claim_outbox_item(d.reference, data, user_id=user_id):
         print(f"   ⏭️ Skipping {d.id} - already being processed by another worker")
         return
 
@@ -1341,7 +1486,7 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     if fresh_data:
         data = fresh_data
 
-    if _delete_cancelled_outbox_item_if_needed(d.reference, data):
+    if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id):
         return
 
     emails = data.get("assignedEmails") or []
@@ -1397,12 +1542,25 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
             if _has_existing_thread_for_property(user_id, emails[0], subject_override, client_id=clientId):
                 print(f"   🚫 DUPLICATE DETECTED: Already sent to {emails[0]} about '{subject_override}'")
                 print(f"   🗑️ Deleting duplicate outbox entry")
+                _terminalize_outbox_action_audit(
+                    user_id,
+                    d.reference,
+                    data,
+                    "duplicate_skipped",
+                    {"skippedAt": SERVER_TIMESTAMP, "skipReason": "existing_thread_for_property"},
+                )
                 d.reference.delete()
                 return
 
     # Track results for all recipients
     all_sent = []
     all_errors = {}
+    send_identity = {
+        "sentMessageIds": {},
+        "internetMessageIds": {},
+        "threadIds": {},
+        "conversationIds": {},
+    }
 
     # Get follow-up config if present
     followup_config = data.get("followUpConfig")
@@ -1467,6 +1625,7 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
                     )
                     all_sent.extend(res.get("sent", []))
                     all_errors.update(res.get("errors", {}))
+                    _merge_send_identity(send_identity, res)
                 except Exception as e:
                     all_errors[recipient_email] = str(e)
                     print(f"💥 Error sending redirected thread reply to {recipient_email}: {e}")
@@ -1491,6 +1650,7 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
 
                 all_sent.extend(res.get("sent", []))
                 all_errors.update(res.get("errors", {}))
+                _merge_send_identity(send_identity, res)
 
             except Exception as e:
                 all_errors[recipient_email] = str(e)
@@ -1502,9 +1662,20 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
     if not any_errors and all_sent:
         _finalize_successful_outbox_item(
             user_id, d.reference, data,
-            row_number=row_number, client_id=clientId
+            row_number=row_number, client_id=clientId,
+            send_result={**send_identity, "sent": all_sent},
         )
         print(f"🗑️ Deleted outbox item {d.id}")
+    elif not all_sent and _all_send_errors_are_opt_out(all_errors):
+        _terminalize_outbox_action_audit(
+            user_id,
+            d.reference,
+            data,
+            "opt_out_skipped",
+            {"skippedAt": SERVER_TIMESTAMP, "skipReason": "contact_opted_out"},
+        )
+        d.reference.delete()
+        print(f"🚫 Deleted outbox item {d.id}; all recipients opted out")
     else:
         new_attempts = attempts + 1
         error_msg = json.dumps(all_errors)[:1500]

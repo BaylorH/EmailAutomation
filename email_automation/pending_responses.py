@@ -13,6 +13,21 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 MAX_RESPONSE_ATTEMPTS = 5
 
 
+def _move_pending_response_to_dead_letter(user_id: str, doc, data: Dict[str, Any], reason: str) -> None:
+    from .clients import _fs
+
+    dead_letter_ref = _fs.collection("users").document(user_id).collection("deadLetterQueue")
+    dead_letter_ref.add({
+        **data,
+        "source": "pendingResponses",
+        "originalDocId": doc.id,
+        "failureReason": reason,
+        "deadLetteredAt": SERVER_TIMESTAMP,
+        "movedAt": SERVER_TIMESTAMP,
+    })
+    doc.reference.delete()
+
+
 def queue_pending_response(
     user_id: str,
     thread_id: str,
@@ -77,9 +92,9 @@ def get_pending_responses(user_id: str) -> list:
         attempts = data.get("attempts", 0)
 
         if attempts >= MAX_RESPONSE_ATTEMPTS:
-            # Move to dead letter or just delete
+            reason = data.get("lastError") or f"Exceeded max attempts ({MAX_RESPONSE_ATTEMPTS})"
             print(f"☠️ Pending response exceeded max attempts ({MAX_RESPONSE_ATTEMPTS}): {doc.id[:30]}...")
-            doc.reference.delete()
+            _move_pending_response_to_dead_letter(user_id, doc, data, reason)
             continue
 
         valid.append({

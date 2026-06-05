@@ -98,8 +98,37 @@ if not SCHEDULER_AVAILABLE:
 
 app = Flask(__name__)
 
-# Enable CORS for all routes and origins
-CORS(app, origins=["http://localhost:3000", "https://your-frontend-domain.com", "*"])
+
+def _split_csv_env(name, fallback=None):
+    raw = os.getenv(name)
+    values = raw.split(",") if raw else (fallback or [])
+    return [value.strip() for value in values if value and value.strip() and value.strip() != "*"]
+
+
+def _is_production_env():
+    env = (
+        os.getenv("FLASK_ENV")
+        or os.getenv("APP_ENV")
+        or os.getenv("ENV")
+        or ""
+    ).strip().lower()
+    return env in {"prod", "production"}
+
+
+def _destructive_admin_routes_enabled():
+    if _is_production_env():
+        return False
+    return os.getenv("ENABLE_DESTRUCTIVE_ADMIN_ROUTES", "").strip().lower() == "true"
+
+
+# Explicit origins only; production must not allow wildcard CORS.
+CORS(app, origins=_split_csv_env("ALLOWED_CORS_ORIGINS", [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://email-automation-cache.web.app",
+    "https://sitesift.ai",
+    "https://www.sitesift.ai",
+]))
 
 app.secret_key = os.getenv("SECRET_KEY", "some-default-secret")
 
@@ -2232,6 +2261,9 @@ def api_firestore_cleanup():
     - clear_old_threads: int - Clear threads older than N days (0 = don't clear)
     - user_id: str - Specific user ID (optional, defaults to all users)
     """
+    if not _destructive_admin_routes_enabled():
+        return jsonify({"success": False, "error": "Destructive admin route disabled"}), 403
+
     if not SCHEDULER_AVAILABLE:
         return jsonify({"success": False, "error": "Scheduler not available"}), 503
 
@@ -2345,6 +2377,9 @@ def api_clear_outlook_emails():
     - clear_inbox: bool - Also clear from Inbox (default False)
     - clear_sent: bool - Clear from SentItems (default True)
     """
+    if not _destructive_admin_routes_enabled():
+        return jsonify({"success": False, "error": "Destructive admin route disabled"}), 403
+
     if not SCHEDULER_AVAILABLE:
         return jsonify({"success": False, "error": "Scheduler not available"}), 503
 

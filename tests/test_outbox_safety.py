@@ -12,7 +12,8 @@ from email_automation import email as email_module
 
 
 class FakeDocRef:
-    def __init__(self):
+    def __init__(self, doc_id="outbox-1"):
+        self.id = doc_id
         self.deleted = False
         self.set_calls = []
         self.update_calls = []
@@ -30,7 +31,7 @@ class FakeDocRef:
 class FakeDoc:
     def __init__(self, data, doc_id="outbox-1"):
         self.id = doc_id
-        self.reference = FakeDocRef()
+        self.reference = FakeDocRef(doc_id)
         self._data = data
 
     def to_dict(self):
@@ -54,11 +55,16 @@ class FakeFirestoreNode:
     def set(self, data, merge=False):
         self.root.set_calls.append((tuple(self.path), data, merge))
 
+    def add(self, data):
+        self.root.add_calls.append((tuple(self.path), data))
+        return FakeFirestoreNode(self.root, self.path + ["document", "auto-id"])
+
 
 class FakeFirestore:
     def __init__(self):
         self.deleted_paths = []
         self.set_calls = []
+        self.add_calls = []
 
     def collection(self, name):
         return FakeFirestoreNode(self, ["collection", name])
@@ -138,6 +144,60 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(thread_set[1]["status"], "active")
         self.assertEqual(thread_set[1]["followUpStatus"], "waiting")
         self.assertTrue(thread_set[2])
+
+    def test_duplicate_suppression_terminalizes_action_audit(self):
+        doc = FakeDoc({
+            "assignedEmails": ["bp21harrison@gmail.com"],
+            "script": "Hi,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "123 Duplicate St, Testville",
+            "rowNumber": 12,
+            "actionAuditId": "audit-duplicate",
+        }, doc_id="outbox-duplicate")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=True), \
+             patch.object(email_module, "send_and_index_email") as send_and_index_email:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual(audit_payload["status"], "duplicate_skipped")
+        self.assertEqual(audit_payload["outboxId"], "outbox-duplicate")
+
+    def test_contact_opt_out_terminalizes_action_audit_for_grouped_item(self):
+        doc = FakeDoc({
+            "assignedEmails": ["bp21harrison@gmail.com"],
+            "script": "Hi,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "123 Opt Out St, Testville",
+            "rowNumber": 12,
+            "actionAuditId": "audit-opt-out",
+        }, doc_id="outbox-opt-out")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch("email_automation.processing.is_contact_opted_out", return_value={"reason": "unsubscribe"}), \
+             patch.object(email_module, "send_and_index_email") as send_and_index_email:
+            email_module._send_multi_property_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "bp21harrison@gmail.com",
+                [{"doc": doc, "data": doc.to_dict()}],
+            )
+
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual(audit_payload["status"], "opt_out_skipped")
+        self.assertEqual(audit_payload["outboxId"], "outbox-opt-out")
 
 
 if __name__ == "__main__":
