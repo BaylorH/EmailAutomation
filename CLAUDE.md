@@ -287,7 +287,7 @@ All numeric values must be written as plain decimals:
 # Backend (this repo)
 pip install -r requirements.txt
 python main.py                  # Run email processing
-python app.py                   # Run Flask server for OAuth
+python app.py                   # Optional local Flask admin/API server; email access uses Firebase Functions
 
 # Frontend (email-admin-ui)
 cd ~/Documents/GitHub/email-admin-ui
@@ -314,7 +314,7 @@ python3 -m py_compile email_automation/<file>.py   # Syntax check
 python tests/standalone_test.py                     # MUST pass (25/25)
 python tests/e2e_test.py                           # MUST pass
 git add -A && git commit -m "description" && git push
-# Render auto-deploys on push
+# GitHub Actions uses main.py for the scheduled production worker
 ```
 
 ### Testing Requirements
@@ -456,9 +456,9 @@ A row is "complete" when these fields have values:
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/auth/login` | GET | Initiate Microsoft OAuth |
-| `/auth/callback` | GET | OAuth callback handler |
-| `/api/status` | GET | Check token validity |
+| `/auth/login` | GET | Legacy route; redirects to Firebase email-access setup by default |
+| `/auth/callback` | GET | Legacy route; redirects to Firebase email-access setup by default |
+| `/api/status` | GET | Local/legacy token status helper |
 | `/api/trigger-scheduler` | POST | Manual processing trigger |
 | `/api/accept-new-property` | POST | Create row for suggested property |
 | `/api/decline-property` | POST | Remove suggested property row |
@@ -473,6 +473,9 @@ A row is "complete" when these fields have values:
 | `deleteSheet` | Delete Google Sheet when client removed |
 | `analyzeSheetColumns` | AI maps Excel columns to canonical fields |
 | `chatWithPropertyContext` | AI chat for composing replies |
+| `initiateMsalAuth` | Start Microsoft email-access OAuth |
+| `msalCallback` | Store Microsoft token after OAuth redirect |
+| `stopConversation` | Stop a conversation, write audit, remove action notifications, and clear row highlight |
 
 ---
 
@@ -506,8 +509,8 @@ OPENAI_ASSISTANT_MODEL=gpt-4o
 |-----------|----------|----------------|
 | Frontend | Firebase Hosting | Push to main → GitHub Actions |
 | Functions | Firebase Functions | Push to main → GitHub Actions |
-| Backend | Render.com | Push to main → Auto-deploy |
-| Scheduler | GitHub Actions | Cron every 30 minutes |
+| Email worker | GitHub Actions | Cron every 30 minutes runs `python main.py` |
+| Local Flask API | Local only | Run `python app.py` when explicitly needed |
 
 ---
 
@@ -516,12 +519,12 @@ OPENAI_ASSISTANT_MODEL=gpt-4o
 ### Common Issues
 
 **"Token expired" errors:**
-- Run `python app.py` and re-authenticate via `/auth/login`
-- Token cache is in `msal_caches/*.bin`
+- Use the dashboard Email Access flow to reconnect Microsoft email
+- Token cache is stored in Firebase Storage under `msal_caches/{uid}/`
 
 **Emails not sending:**
 - Check `users/{uid}/outbox/` in Firestore console
-- Verify Microsoft Graph token is valid: `GET /api/status`
+- Check dashboard mailbox/API health and reconnect Microsoft email if needed
 
 **AI not extracting data:**
 - Check OpenAI API key is valid

@@ -313,7 +313,7 @@ python3 tests/e2e_helpers.py status
 python3 tests/e2e_helpers.py workflow
 
 # Firestore inspection
-curl -s "https://email-token-manager.onrender.com/api/firestore-inspect"
+python3 tests/e2e_helpers.py firestore
 
 # Fetch Outlook conversations (I'll write custom queries)
 # - SentItems for Jill's outbound

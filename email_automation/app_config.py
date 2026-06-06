@@ -13,6 +13,10 @@ TOKEN_CACHE = "msal_token_cache.bin"
 # Firebase Config
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY") or ("mock-firebase-key" if E2E_TEST_MODE else None)
 FIREBASE_BUCKET = "email-automation-cache.firebasestorage.app"
+FRONTEND_EMAIL_ACCESS_URL = os.getenv(
+    "FRONTEND_EMAIL_ACCESS_URL",
+    "https://email-automation-cache.web.app/email-access",
+)
 
 # OpenAI Config
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ("mock-openai-key" if E2E_TEST_MODE else None)
@@ -79,6 +83,18 @@ def destructive_admin_routes_enabled():
     if is_production_env():
         return False
     return os.getenv("ENABLE_DESTRUCTIVE_ADMIN_ROUTES", "").strip().lower() == "true"
+
+
+def legacy_flask_oauth_enabled():
+    if is_production_env():
+        return False
+    return os.getenv("ENABLE_LEGACY_FLASK_OAUTH", "").strip().lower() == "true"
+
+
+def legacy_flask_oauth_redirect_uri():
+    if not legacy_flask_oauth_enabled():
+        return None
+    return os.getenv("LEGACY_FLASK_OAUTH_REDIRECT_URI")
 
 
 # Validation (skip in E2E test mode - mock values are used)

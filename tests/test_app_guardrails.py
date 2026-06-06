@@ -1,6 +1,7 @@
 import os
 import importlib.util
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
@@ -18,6 +19,22 @@ else:
 
 
 class AppGuardrailTests(unittest.TestCase):
+    def test_render_blueprint_is_removed_from_backend_repo(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        self.assertFalse((repo_root / "render.yaml").exists())
+
+    def test_legacy_flask_oauth_is_disabled_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(app_config.legacy_flask_oauth_enabled())
+
+    @unittest.skipIf(app is None, "flask is not installed")
+    def test_legacy_flask_oauth_login_redirects_to_firebase_email_access_by_default(self):
+        with app.app.test_client() as client:
+            response = client.get("/auth/login")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/email-access", response.headers["Location"])
+
     def test_cors_origin_parser_never_returns_wildcard(self):
         with patch.dict(os.environ, {"ALLOWED_CORS_ORIGINS": "http://localhost:3000,*,https://sitesift.ai"}):
             self.assertEqual(

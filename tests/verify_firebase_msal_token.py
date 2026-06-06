@@ -236,7 +236,7 @@ def main():
     print("✅ ALL TESTS PASSED!")
     print("=" * 60)
     print("\nFirebase Functions MSAL tokens are fully compatible with Python backend.")
-    print("The Render server can be safely replaced with Firebase Functions.")
+    print("The legacy Flask MSAL flow can be safely retired in favor of Firebase Functions.")
 
 
 if __name__ == "__main__":

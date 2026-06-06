@@ -10,6 +10,9 @@ from firebase_helpers import upload_token
 from email_automation.app_config import (
     cors_origins as _cors_origins,
     destructive_admin_routes_enabled as _destructive_admin_routes_enabled,
+    FRONTEND_EMAIL_ACCESS_URL,
+    legacy_flask_oauth_enabled as _legacy_flask_oauth_enabled,
+    legacy_flask_oauth_redirect_uri as _legacy_flask_oauth_redirect_uri,
 )
 import threading
 import time
@@ -121,10 +124,7 @@ CACHE_FILE       = "msal_token_cache.bin"
 
 # Get the base URL for redirect URI
 def get_base_url():
-    if "https://email-token-manager.onrender.com" == request.url_root.rstrip('/'):
-        return "https://email-token-manager.onrender.com"
-    else:
-        return "NOT SAME"
+    return FRONTEND_EMAIL_ACCESS_URL
 
 def check_token_status():
     """Check if we have a valid token"""
@@ -504,12 +504,12 @@ def index():
 
             <script>
                 function connectEmail() {
-                    window.location.href = '/auth/login';
+                    window.location.href = {{ email_access_url|tojson }};
                 }
             </script>
         </body>
     </html>
-    """, status=status, base_url=base_url, uid=uid, upload_result=upload_result)
+    """, status=status, base_url=base_url, uid=uid, upload_result=upload_result, email_access_url=FRONTEND_EMAIL_ACCESS_URL)
 
 @app.route("/api/status")
 def api_status():
@@ -1614,6 +1614,10 @@ def api_console_logs_clear():
 # Web-based authentication routes
 @app.route("/auth/login")
 def auth_login():
+    redirect_uri = _legacy_flask_oauth_redirect_uri()
+    if not _legacy_flask_oauth_enabled() or not redirect_uri:
+        return redirect(FRONTEND_EMAIL_ACCESS_URL)
+
     # Get UID from session, set during initial page load
     uid = session.get("uid", "web_user")
     print(f"[LOGIN] Using UID from session: {uid}")
@@ -1636,7 +1640,7 @@ def auth_login():
     # CRITICAL: Pass UID as state parameter to preserve it through OAuth redirect
     auth_url = app_obj.get_authorization_request_url(
         SCOPES,
-        redirect_uri="https://email-token-manager.onrender.com/auth/callback",
+        redirect_uri=redirect_uri,
         state=uid  # This preserves the UID through the OAuth flow
     )
     
@@ -1645,6 +1649,10 @@ def auth_login():
 
 @app.route("/auth/callback")
 def auth_callback():
+    redirect_uri = _legacy_flask_oauth_redirect_uri()
+    if not _legacy_flask_oauth_enabled() or not redirect_uri:
+        return redirect(FRONTEND_EMAIL_ACCESS_URL)
+
     try:
         # CRITICAL: Get UID from state parameter (this is how it survives the redirect)
         uid = request.args.get("state", "web_user")
@@ -1787,7 +1795,7 @@ def auth_callback():
         result = app_obj.acquire_token_by_authorization_code(
             code,
             scopes=SCOPES,
-            redirect_uri="https://email-token-manager.onrender.com/auth/callback"
+            redirect_uri=redirect_uri
         )
         
         if "access_token" in result:
