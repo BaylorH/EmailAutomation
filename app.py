@@ -8,9 +8,8 @@ from flask_cors import CORS
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
 from email_automation.app_config import (
-    DEFAULT_CORS_ORIGINS,
+    cors_origins as _cors_origins,
     destructive_admin_routes_enabled as _destructive_admin_routes_enabled,
-    split_csv_env as _split_csv_env,
 )
 import threading
 import time
@@ -104,7 +103,7 @@ if not SCHEDULER_AVAILABLE:
 app = Flask(__name__)
 
 # Explicit origins only; production must not allow wildcard CORS.
-CORS(app, origins=_split_csv_env("ALLOWED_CORS_ORIGINS", DEFAULT_CORS_ORIGINS))
+CORS(app, origins=_cors_origins())
 
 app.secret_key = os.getenv("SECRET_KEY", "some-default-secret")
 

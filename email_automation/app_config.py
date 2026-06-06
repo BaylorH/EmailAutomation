@@ -60,6 +60,11 @@ def split_csv_env(name, fallback=None):
     return [value.strip() for value in values if value and value.strip() and value.strip() != "*"]
 
 
+def cors_origins(name="ALLOWED_CORS_ORIGINS"):
+    origins = [*DEFAULT_CORS_ORIGINS, *split_csv_env(name, [])]
+    return list(dict.fromkeys(origins))
+
+
 def is_production_env():
     env = (
         os.getenv("FLASK_ENV")

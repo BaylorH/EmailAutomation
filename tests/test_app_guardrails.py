@@ -30,6 +30,13 @@ class AppGuardrailTests(unittest.TestCase):
         self.assertIn("https://www.sitesiftai.com", app_config.DEFAULT_CORS_ORIGINS)
         self.assertNotIn("*", app_config.DEFAULT_CORS_ORIGINS)
 
+    def test_cors_origins_merge_safe_defaults_with_env_overrides(self):
+        with patch.dict(os.environ, {"ALLOWED_CORS_ORIGINS": "*,https://custom.example"}):
+            origins = app_config.cors_origins()
+        self.assertIn("https://sitesiftai.com", origins)
+        self.assertIn("https://custom.example", origins)
+        self.assertNotIn("*", origins)
+
     def test_destructive_routes_are_disabled_in_production_even_when_flagged(self):
         with patch.dict(os.environ, {
             "APP_ENV": "production",
