@@ -515,7 +515,13 @@ def convert_plain_text_signature_to_html(plain_text_signature: str) -> str:
 </div>"""
 
 
-def get_email_footer(custom_signature: str = None, signature_mode: str = None) -> str:
+def _is_legacy_mohr_signature_user(user_email: str = None) -> bool:
+    """Only MOHR-owned sender profiles may use the legacy hardcoded MOHR footer."""
+    email = (user_email or "").strip().lower()
+    return email.endswith("@mohrpartners.com")
+
+
+def get_email_footer(custom_signature: str = None, signature_mode: str = None, user_email: str = None) -> str:
     """
     Returns HTML formatted email footer.
 
@@ -524,9 +530,11 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None) -
         signature_mode: Signature mode - "none", "custom", or "professional".
                        - "none": No signature at all
                        - "custom": Use the custom_signature text (converted to HTML)
-                       - "professional": Use custom_signature when present; otherwise use
-                         the legacy Jill Ames signature with logo/images
+                       - "professional": Use custom_signature when present. Empty
+                         professional profiles only use the legacy MOHR/Jill footer for
+                         MOHR-owned sender emails.
                        - None/empty: Defaults to "none" (user must explicitly configure)
+        user_email: Sender profile email used to gate the legacy MOHR footer.
     """
     # Default to "none" when mode is not set - user must explicitly configure signature in settings
     if not signature_mode:
@@ -545,8 +553,8 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None) -
     if signature_mode == "professional":
         if custom_signature and custom_signature.strip():
             return convert_plain_text_signature_to_html(custom_signature)
-        # No saved signature: keep the legacy Jill/Mohr professional template.
-        pass  # Fall through to professional signature below
+        if not _is_legacy_mohr_signature_user(user_email):
+            return ""
     else:
         # Unknown mode - treat as none
         return ""
@@ -598,14 +606,21 @@ T +1 206 510 5575<br>
     return footer
 
 
-def needs_signature_attachments(signature_mode: str, custom_signature: str = None) -> bool:
+def needs_signature_attachments(signature_mode: str, custom_signature: str = None, user_email: str = None) -> bool:
     """Check if the signature mode requires inline image attachments."""
-    return signature_mode == "professional" and not (
-        custom_signature and custom_signature.strip()
+    return (
+        signature_mode == "professional"
+        and not (custom_signature and custom_signature.strip())
+        and _is_legacy_mohr_signature_user(user_email)
     )
 
 
-def format_email_body_with_footer(body: str, custom_signature: str = None, signature_mode: str = None) -> str:
+def format_email_body_with_footer(
+    body: str,
+    custom_signature: str = None,
+    signature_mode: str = None,
+    user_email: str = None,
+) -> str:
     """
     Converts plain text email body to HTML and appends footer.
     Preserves line breaks and formatting.
@@ -615,6 +630,7 @@ def format_email_body_with_footer(body: str, custom_signature: str = None, signa
         body: The email body text
         custom_signature: Optional plain text signature from user settings
         signature_mode: Signature mode - "none", "custom", or "professional"
+        user_email: Sender profile email used to gate the legacy MOHR footer
     """
     # Strip trailing whitespace/newlines from body before converting
     body = body.rstrip()
@@ -624,7 +640,7 @@ def format_email_body_with_footer(body: str, custom_signature: str = None, signa
     html_body = body.replace('\n\n', '<br><br>').replace('\n', '<br>')
 
     # Get the footer (custom or default based on mode)
-    footer_html = get_email_footer(custom_signature, signature_mode)
+    footer_html = get_email_footer(custom_signature, signature_mode, user_email=user_email)
 
     # If no signature at all, just return the body without footer section
     if not footer_html:

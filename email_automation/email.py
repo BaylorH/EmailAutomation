@@ -325,6 +325,7 @@ def _save_outbox_reply_message(
     body: str,
     user_signature: str = None,
     signature_mode: str = None,
+    user_email: str = None,
 ) -> bool:
     """Persist a dashboard-approved Graph /reply send into the conversation history."""
     if not thread_id:
@@ -334,7 +335,12 @@ def _save_outbox_reply_message(
         from .utils import format_email_body_with_footer
 
         synthetic_id = f"dashboard-reply-{int(time.time() * 1000)}"
-        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+        html_body = format_email_body_with_footer(
+            body,
+            user_signature,
+            signature_mode,
+            user_email=user_email,
+        )
         payload = {
             "direction": "outbound",
             "from": "me",
@@ -356,7 +362,8 @@ def _save_outbox_reply_message(
 
 
 def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_id: str,
-                          thread_id: str, user_signature: str = None, signature_mode: str = None) -> dict:
+                          thread_id: str, user_signature: str = None,
+                          signature_mode: str = None, user_email: str = None) -> dict:
     """
     Send an outbox item as a reply to an existing message in a thread.
 
@@ -370,7 +377,12 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
     base = "https://graph.microsoft.com/v1.0"
 
     # Format body as HTML with footer
-    html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+    html_body = format_email_body_with_footer(
+        body,
+        user_signature,
+        signature_mode,
+        user_email=user_email,
+    )
     logger.debug(
         "outbox.reply_recipient_resolution",
         extra={
@@ -384,7 +396,7 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
 
     try:
         # Check if we need signature attachments (professional mode)
-        if needs_signature_attachments(signature_mode, user_signature):
+        if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
             # Use createReply to get a draft, add attachments, then send
             create_reply_resp = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{reply_to_msg_id}/createReply", headers=headers, timeout=30)
@@ -806,7 +818,7 @@ def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> Op
 def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, recipients: List[str],
                         client_id_or_none: Optional[str] = None, row_number: int = None, user_signature: str = None,
                         subject_override: str = None, signature_mode: str = None, followup_config: Dict = None,
-                        contact_name: str = None):
+                        contact_name: str = None, user_email: str = None):
     """
     Send email and immediately index it in Firestore for reply tracking.
 
@@ -826,6 +838,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         signature_mode: Signature mode - "none", "custom", or "professional"
         followup_config: Optional follow-up configuration from outbox
         contact_name: Optional contact name for follow-up personalization
+        user_email: Sender profile email used to gate the legacy MOHR footer
 
     SAFETY: All recipient emails are validated before sending to prevent sending to malformed addresses.
     SAFETY: Opted-out contacts are filtered out before sending.
@@ -889,14 +902,14 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
 
     # Check if we need to attach signature images (for professional mode)
     signature_attachments = []
-    if needs_signature_attachments(signature_mode, user_signature):
+    if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
         signature_attachments = get_signature_attachments()
         print(f"📎 Will attach {len(signature_attachments)} signature image(s)")
 
     if content_type == "HTML":
         # If already HTML, wrap it properly and append footer
         # Check if content is already wrapped in HTML structure
-        footer_html = get_email_footer(user_signature, signature_mode)
+        footer_html = get_email_footer(user_signature, signature_mode, user_email=user_email)
         if not content.strip().startswith("<!DOCTYPE") and not content.strip().startswith("<html"):
             # Wrap existing HTML content and add footer (only if footer exists)
             if footer_html:
@@ -942,7 +955,12 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             # If no footer, leave content as-is
     else:
         # Convert to HTML and add footer (this function now wraps in proper HTML structure)
-        content = format_email_body_with_footer(content, user_signature, signature_mode)
+        content = format_email_body_with_footer(
+            content,
+            user_signature,
+            signature_mode,
+            user_email=user_email,
+        )
         content_type = "HTML"
     base = "https://graph.microsoft.com/v1.0"
 
@@ -1207,10 +1225,12 @@ def send_outboxes(user_id: str, headers):
     user_doc = _fs.collection("users").document(user_id).get()
     user_signature = None
     signature_mode = None
+    user_email = None
     if user_doc.exists:
         user_data = user_doc.to_dict() or {}
         user_signature = user_data.get("emailSignature")
         signature_mode = user_data.get("signatureMode")  # "none", "custom", or "professional"
+        user_email = user_data.get("email")
         if signature_mode:
             print(f"📝 Signature mode: {signature_mode}")
         elif user_signature:
@@ -1273,11 +1293,26 @@ def send_outboxes(user_id: str, headers):
         # Check if multiple properties for same broker
         if len(valid_items) > 1:
             print(f"🔗 Detected {len(valid_items)} properties for same broker: {recipient_email}")
-            _send_multi_property_email(user_id, headers, recipient_email, valid_items, user_signature, signature_mode)
+            _send_multi_property_email(
+                user_id,
+                headers,
+                recipient_email,
+                valid_items,
+                user_signature,
+                signature_mode,
+                user_email,
+            )
         else:
             # Single property - send normally
             item = valid_items[0]
-            _send_single_outbox_item(user_id, headers, item, user_signature, signature_mode)
+            _send_single_outbox_item(
+                user_id,
+                headers,
+                item,
+                user_signature,
+                signature_mode,
+                user_email,
+            )
 
         # 2-minute delay between ALL emails to avoid spam detection
         if idx < len(recipients_list) - 1:
@@ -1285,7 +1320,15 @@ def send_outboxes(user_id: str, headers):
             time.sleep(120)
 
 
-def _send_multi_property_email(user_id: str, headers, recipient_email: str, items: list, user_signature: str = None, signature_mode: str = None):
+def _send_multi_property_email(
+    user_id: str,
+    headers,
+    recipient_email: str,
+    items: list,
+    user_signature: str = None,
+    signature_mode: str = None,
+    user_email: str = None,
+):
     """
     Send SEPARATE emails for multiple properties to the same broker.
     Each property gets its own thread for clean tracking.
@@ -1402,7 +1445,7 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
                                        client_id_or_none=clientId, row_number=row_number,
                                        user_signature=user_signature, subject_override=subject_override,
                                        signature_mode=signature_mode, followup_config=followup_config,
-                                       contact_name=contact_name)
+                                       contact_name=contact_name, user_email=user_email)
             any_errors = bool([e for e in res.get("errors", {}) if "opted out" not in str(res["errors"].get(e, ""))])
 
             if not any_errors and res["sent"]:
@@ -1458,7 +1501,14 @@ def _send_multi_property_email(user_id: str, headers, recipient_email: str, item
             time.sleep(120)
 
 
-def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: str = None, signature_mode: str = None):
+def _send_single_outbox_item(
+    user_id: str,
+    headers,
+    item: dict,
+    user_signature: str = None,
+    signature_mode: str = None,
+    user_email: str = None,
+):
     """
     Send a single outbox item with smart script selection based on contact history.
 
@@ -1591,14 +1641,15 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
             try:
                 res = _send_outbox_as_reply(
                     user_id, headers, script_content, reply_to_msg_id,
-                    thread_id, user_signature=user_signature, signature_mode=signature_mode
+                    thread_id, user_signature=user_signature,
+                    signature_mode=signature_mode, user_email=user_email
                 )
 
                 if res.get("sent"):
                     all_sent.append(emails[0] if emails else "unknown")
                     _save_outbox_reply_message(
                         user_id, thread_id, emails, subject_override,
-                        script_content, user_signature, signature_mode
+                        script_content, user_signature, signature_mode, user_email
                     )
                 else:
                     all_errors[emails[0] if emails else "unknown"] = res.get("error", "Unknown error")
@@ -1621,7 +1672,7 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
                         client_id_or_none=clientId, row_number=row_number,
                         user_signature=user_signature, subject_override=subject_override,
                         signature_mode=signature_mode, followup_config=followup_config,
-                        contact_name=contact_name
+                        contact_name=contact_name, user_email=user_email
                     )
                     all_sent.extend(res.get("sent", []))
                     all_errors.update(res.get("errors", {}))
@@ -1646,7 +1697,7 @@ def _send_single_outbox_item(user_id: str, headers, item: dict, user_signature: 
                                            client_id_or_none=clientId, row_number=row_number,
                                            user_signature=user_signature, subject_override=subject_override,
                                            signature_mode=signature_mode, followup_config=followup_config,
-                                           contact_name=contact_name)
+                                           contact_name=contact_name, user_email=user_email)
 
                 all_sent.extend(res.get("sent", []))
                 all_errors.update(res.get("errors", {}))

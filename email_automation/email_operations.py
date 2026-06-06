@@ -8,19 +8,23 @@ from .utils import exponential_backoff_request, format_email_body_with_footer, g
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 
 
-def _get_user_signature_settings(uid: str) -> Tuple[Optional[str], Optional[str]]:
+def _get_user_signature_settings(uid: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Fetch user's signature settings from Firestore.
-    Returns (email_signature, signature_mode) tuple.
+    Returns (email_signature, signature_mode, user_email) tuple.
     """
     try:
         user_doc = _fs.collection("users").document(uid).get()
         if user_doc.exists:
             user_data = user_doc.to_dict() or {}
-            return user_data.get("emailSignature"), user_data.get("signatureMode")
+            return (
+                user_data.get("emailSignature"),
+                user_data.get("signatureMode"),
+                user_data.get("email"),
+            )
     except Exception as e:
         print(f"⚠️ Failed to fetch user signature settings: {e}")
-    return None, None
+    return None, None, None
 
 
 def _add_signature_attachments_to_draft(
@@ -28,12 +32,13 @@ def _add_signature_attachments_to_draft(
     draft_id: str,
     signature_mode: str,
     user_signature: Optional[str] = None,
+    user_email: Optional[str] = None,
 ) -> None:
     """
     Add signature image attachments to a draft message.
     Only adds attachments if signature_mode is 'professional'.
     """
-    if not needs_signature_attachments(signature_mode, user_signature):
+    if not needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
         return
 
     base = "https://graph.microsoft.com/v1.0"
@@ -98,8 +103,13 @@ We still need the following information to complete your property details:
 Could you please provide these details when you have a moment?"""
 
         # Format as HTML with footer using user's signature settings
-        user_signature, signature_mode = _get_user_signature_settings(uid)
-        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+        user_signature, signature_mode, user_email = _get_user_signature_settings(uid)
+        html_body = format_email_body_with_footer(
+            body,
+            user_signature,
+            signature_mode,
+            user_email=user_email,
+        )
         
         base = "https://graph.microsoft.com/v1.0"
         # 1) Find Graph message id by our stored internetMessageId (thread_id)
@@ -112,7 +122,7 @@ Could you please provide these details when you have a moment?"""
             graph_id = vals[0]["id"]
 
             # Check if we need signature attachments (professional mode)
-            if needs_signature_attachments(signature_mode, user_signature):
+            if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
                 # Use createReply to get a draft, add attachments, then send
                 create_reply_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{graph_id}/createReply", headers=headers, timeout=30)
@@ -131,7 +141,13 @@ Could you please provide these details when you have a moment?"""
                 )
 
                 # Add signature attachments
-                _add_signature_attachments_to_draft(headers, reply_draft_id, signature_mode, user_signature)
+                _add_signature_attachments_to_draft(
+                    headers,
+                    reply_draft_id,
+                    signature_mode,
+                    user_signature,
+                    user_email,
+                )
 
                 # Send the reply
                 resp = exponential_backoff_request(
@@ -161,13 +177,19 @@ Could you please provide these details when you have a moment?"""
                 "toRecipients": [{"emailAddress": {"address": recipient}}],
             }
 
-            if needs_signature_attachments(signature_mode, user_signature):
+            if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
                 # Create draft, add attachments, send
                 create_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
                 )
                 draft_id = create_resp.json()["id"]
-                _add_signature_attachments_to_draft(headers, draft_id, signature_mode, user_signature)
+                _add_signature_attachments_to_draft(
+                    headers,
+                    draft_id,
+                    signature_mode,
+                    user_signature,
+                    user_email,
+                )
                 resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
                 )
@@ -215,8 +237,13 @@ Thank you for providing all the requested information! We now have everything we
 We'll be in touch if we need any additional information."""
 
         # Format as HTML with footer using user's signature settings
-        user_signature, signature_mode = _get_user_signature_settings(uid)
-        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+        user_signature, signature_mode, user_email = _get_user_signature_settings(uid)
+        html_body = format_email_body_with_footer(
+            body,
+            user_signature,
+            signature_mode,
+            user_email=user_email,
+        )
 
         # Send email using draft + send to support signature attachments
         base = "https://graph.microsoft.com/v1.0"
@@ -230,13 +257,19 @@ We'll be in touch if we need any additional information."""
             ]
         }
 
-        if needs_signature_attachments(signature_mode, user_signature):
+        if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
             # Create draft, add attachments, send
             create_resp = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
             )
             draft_id = create_resp.json()["id"]
-            _add_signature_attachments_to_draft(headers, draft_id, signature_mode, user_signature)
+            _add_signature_attachments_to_draft(
+                headers,
+                draft_id,
+                signature_mode,
+                user_signature,
+                user_email,
+            )
             response = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
             )
@@ -297,8 +330,13 @@ Could you please provide the following details for this property:
 - Power specifications"""
 
         # Format as HTML with footer using user's signature settings
-        user_signature, signature_mode = _get_user_signature_settings(uid)
-        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+        user_signature, signature_mode, user_email = _get_user_signature_settings(uid)
+        html_body = format_email_body_with_footer(
+            body,
+            user_signature,
+            signature_mode,
+            user_email=user_email,
+        )
 
         # Send as new email (not a reply)
         base = "https://graph.microsoft.com/v1.0"
@@ -319,7 +357,13 @@ Could you please provide the following details for this property:
         draft_id = create_response.json()["id"]
 
         # Add signature attachments if needed
-        _add_signature_attachments_to_draft(headers, draft_id, signature_mode, user_signature)
+        _add_signature_attachments_to_draft(
+            headers,
+            draft_id,
+            signature_mode,
+            user_signature,
+            user_email,
+        )
 
         # Get message identifiers
         get_response = exponential_backoff_request(
@@ -413,8 +457,13 @@ Appreciate you sending over the info on {new_property_address or 'the other prop
 Thanks,"""
 
         # Format as HTML with footer using user's signature settings
-        user_signature, signature_mode = _get_user_signature_settings(uid)
-        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+        user_signature, signature_mode, user_email = _get_user_signature_settings(uid)
+        html_body = format_email_body_with_footer(
+            body,
+            user_signature,
+            signature_mode,
+            user_email=user_email,
+        )
 
         base = "https://graph.microsoft.com/v1.0"
 
@@ -428,7 +477,7 @@ Thanks,"""
         if vals:
             graph_id = vals[0]["id"]
 
-            if needs_signature_attachments(signature_mode, user_signature):
+            if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
                 # Use createReply to get a draft, add attachments, then send
                 create_reply_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{graph_id}/createReply", headers=headers, timeout=30)
@@ -447,7 +496,13 @@ Thanks,"""
                 )
 
                 # Add signature attachments
-                _add_signature_attachments_to_draft(headers, reply_draft_id, signature_mode, user_signature)
+                _add_signature_attachments_to_draft(
+                    headers,
+                    reply_draft_id,
+                    signature_mode,
+                    user_signature,
+                    user_email,
+                )
 
                 # Send the reply
                 resp = exponential_backoff_request(
@@ -485,13 +540,19 @@ Thanks,"""
                 ]
             }
 
-            if needs_signature_attachments(signature_mode, user_signature):
+            if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
                 # Create draft, add attachments, send
                 create_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
                 )
                 draft_id = create_resp.json()["id"]
-                _add_signature_attachments_to_draft(headers, draft_id, signature_mode, user_signature)
+                _add_signature_attachments_to_draft(
+                    headers,
+                    draft_id,
+                    signature_mode,
+                    user_signature,
+                    user_email,
+                )
                 resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
                 )
@@ -531,8 +592,13 @@ Thank you for letting me know that property is no longer available.
 Do you have any other properties that might be a good fit for our requirements?"""
 
         # Format as HTML with footer using user's signature settings
-        user_signature, signature_mode = _get_user_signature_settings(uid)
-        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+        user_signature, signature_mode, user_email = _get_user_signature_settings(uid)
+        html_body = format_email_body_with_footer(
+            body,
+            user_signature,
+            signature_mode,
+            user_email=user_email,
+        )
 
         base = "https://graph.microsoft.com/v1.0"
 
@@ -546,7 +612,7 @@ Do you have any other properties that might be a good fit for our requirements?"
         if vals:
             graph_id = vals[0]["id"]
 
-            if needs_signature_attachments(signature_mode, user_signature):
+            if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
                 # Use createReply to get a draft, add attachments, then send
                 create_reply_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{graph_id}/createReply", headers=headers, timeout=30)
@@ -565,7 +631,13 @@ Do you have any other properties that might be a good fit for our requirements?"
                 )
 
                 # Add signature attachments
-                _add_signature_attachments_to_draft(headers, reply_draft_id, signature_mode, user_signature)
+                _add_signature_attachments_to_draft(
+                    headers,
+                    reply_draft_id,
+                    signature_mode,
+                    user_signature,
+                    user_email,
+                )
 
                 # Send the reply
                 resp = exponential_backoff_request(
@@ -603,13 +675,19 @@ Do you have any other properties that might be a good fit for our requirements?"
                 ]
             }
 
-            if needs_signature_attachments(signature_mode, user_signature):
+            if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
                 # Create draft, add attachments, send
                 create_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
                 )
                 draft_id = create_resp.json()["id"]
-                _add_signature_attachments_to_draft(headers, draft_id, signature_mode, user_signature)
+                _add_signature_attachments_to_draft(
+                    headers,
+                    draft_id,
+                    signature_mode,
+                    user_signature,
+                    user_email,
+                )
                 resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
                 )

@@ -110,11 +110,17 @@ def _save_followup_message(
     body: str,
     user_signature: str = None,
     signature_mode: str = None,
+    user_email: str = None,
 ) -> bool:
     """Persist a sent follow-up into thread history for dashboard reconciliation."""
     try:
         synthetic_id = f"followup-{thread_id}-{int(time.time() * 1000)}"
-        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+        html_body = format_email_body_with_footer(
+            body,
+            user_signature,
+            signature_mode,
+            user_email=user_email,
+        )
         return save_message(
             user_id,
             thread_id,
@@ -423,16 +429,23 @@ def _send_followup_email(
         user_doc = _fs.collection("users").document(user_id).get()
         user_signature = None
         signature_mode = None
+        user_email = None
         if user_doc.exists:
             user_data = user_doc.to_dict() or {}
             user_signature = user_data.get("emailSignature")
             signature_mode = user_data.get("signatureMode")
+            user_email = user_data.get("email")
 
         # Format as HTML with signature
-        html_content = format_email_body_with_footer(followup_message, user_signature, signature_mode)
+        html_content = format_email_body_with_footer(
+            followup_message,
+            user_signature,
+            signature_mode,
+            user_email=user_email,
+        )
 
         # Send as reply with signature attachments
-        if needs_signature_attachments(signature_mode, user_signature):
+        if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
             # Use createReply to get a draft, add attachments, then send
             create_reply_resp = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{graph_msg_id}/createReply", headers=headers, timeout=30)
@@ -501,7 +514,7 @@ def _send_followup_email(
             print(f"   Sent follow-up #{followup_index + 1} for thread {thread_id[:20]}...")
             _save_followup_message(
                 user_id, thread_id, recipient, subject,
-                followup_message, user_signature, signature_mode
+                followup_message, user_signature, signature_mode, user_email
             )
 
             # Update thread

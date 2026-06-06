@@ -219,24 +219,31 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         # Fetch user's signature settings to use the same signature as outbox emails
         user_signature = None
         signature_mode = None
+        user_email = None
         try:
             user_doc = _fs.collection("users").document(user_id).get()
             if user_doc.exists:
                 user_data = user_doc.to_dict() or {}
                 user_signature = user_data.get("emailSignature")
                 signature_mode = user_data.get("signatureMode")
+                user_email = user_data.get("email")
         except Exception as e:
             print(f"   ⚠️ Failed to fetch user signature settings: {e}")
 
         # Format body as HTML with footer (uses user's signature settings)
-        html_body = format_email_body_with_footer(body, user_signature, signature_mode)
+        html_body = format_email_body_with_footer(
+            body,
+            user_signature,
+            signature_mode,
+            user_email=user_email,
+        )
 
         # Track if reply was sent successfully
         reply_sent_successfully = False
 
         # Check if we need to attach signature images (for professional mode)
         # CID attachments require using createReply + draft + send pattern
-        if needs_signature_attachments(signature_mode, user_signature):
+        if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
             # Use createReply to get a draft, add attachments, then send
             create_reply_resp = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{current_msg_id}/createReply", headers=headers, timeout=30)
@@ -318,7 +325,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                 ]
             }
 
-            if needs_signature_attachments(signature_mode, user_signature):
+            if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
                 # Create draft, add attachments, send
                 create_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
