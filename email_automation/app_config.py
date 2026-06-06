@@ -43,6 +43,39 @@ REQUIRED_FIELDS_FOR_CLOSE = [
 # Default: 24 hours to handle overnight and weekend delays
 INBOX_SCAN_WINDOW_HOURS = int(os.getenv("INBOX_SCAN_WINDOW_HOURS", "24"))
 
+DEFAULT_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://email-automation-cache.web.app",
+    "https://sitesiftai.com",
+    "https://www.sitesiftai.com",
+    "https://sitesift.ai",
+    "https://www.sitesift.ai",
+]
+
+
+def split_csv_env(name, fallback=None):
+    raw = os.getenv(name)
+    values = raw.split(",") if raw else (fallback or [])
+    return [value.strip() for value in values if value and value.strip() and value.strip() != "*"]
+
+
+def is_production_env():
+    env = (
+        os.getenv("FLASK_ENV")
+        or os.getenv("APP_ENV")
+        or os.getenv("ENV")
+        or ""
+    ).strip().lower()
+    return env in {"prod", "production"}
+
+
+def destructive_admin_routes_enabled():
+    if is_production_env():
+        return False
+    return os.getenv("ENABLE_DESTRUCTIVE_ADMIN_ROUTES", "").strip().lower() == "true"
+
+
 # Validation (skip in E2E test mode - mock values are used)
 if not E2E_TEST_MODE:
     if not CLIENT_ID or not CLIENT_SECRET or not FIREBASE_API_KEY:

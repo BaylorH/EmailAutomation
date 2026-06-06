@@ -9,34 +9,40 @@ os.environ.setdefault(
     "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
 )
 
+from email_automation import app_config
+
 if importlib.util.find_spec("flask"):
     import app
 else:
     app = None
 
 
-@unittest.skipUnless(app, "Flask is not installed in this test runtime")
 class AppGuardrailTests(unittest.TestCase):
     def test_cors_origin_parser_never_returns_wildcard(self):
         with patch.dict(os.environ, {"ALLOWED_CORS_ORIGINS": "http://localhost:3000,*,https://sitesift.ai"}):
             self.assertEqual(
-                app._split_csv_env("ALLOWED_CORS_ORIGINS"),
+                app_config.split_csv_env("ALLOWED_CORS_ORIGINS"),
                 ["http://localhost:3000", "https://sitesift.ai"],
             )
+
+    def test_default_cors_origins_include_current_production_domains(self):
+        self.assertIn("https://sitesiftai.com", app_config.DEFAULT_CORS_ORIGINS)
+        self.assertIn("https://www.sitesiftai.com", app_config.DEFAULT_CORS_ORIGINS)
+        self.assertNotIn("*", app_config.DEFAULT_CORS_ORIGINS)
 
     def test_destructive_routes_are_disabled_in_production_even_when_flagged(self):
         with patch.dict(os.environ, {
             "APP_ENV": "production",
             "ENABLE_DESTRUCTIVE_ADMIN_ROUTES": "true",
         }):
-            self.assertFalse(app._destructive_admin_routes_enabled())
+            self.assertFalse(app_config.destructive_admin_routes_enabled())
 
     def test_destructive_routes_require_explicit_non_production_flag(self):
         with patch.dict(os.environ, {
             "APP_ENV": "local",
             "ENABLE_DESTRUCTIVE_ADMIN_ROUTES": "true",
         }):
-            self.assertTrue(app._destructive_admin_routes_enabled())
+            self.assertTrue(app_config.destructive_admin_routes_enabled())
 
 
 if __name__ == "__main__":

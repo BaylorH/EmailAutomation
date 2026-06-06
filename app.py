@@ -7,6 +7,11 @@ from flask import Flask, request, jsonify, render_template_string, redirect, url
 from flask_cors import CORS
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
+from email_automation.app_config import (
+    DEFAULT_CORS_ORIGINS,
+    destructive_admin_routes_enabled as _destructive_admin_routes_enabled,
+    split_csv_env as _split_csv_env,
+)
 import threading
 import time
 
@@ -98,37 +103,8 @@ if not SCHEDULER_AVAILABLE:
 
 app = Flask(__name__)
 
-
-def _split_csv_env(name, fallback=None):
-    raw = os.getenv(name)
-    values = raw.split(",") if raw else (fallback or [])
-    return [value.strip() for value in values if value and value.strip() and value.strip() != "*"]
-
-
-def _is_production_env():
-    env = (
-        os.getenv("FLASK_ENV")
-        or os.getenv("APP_ENV")
-        or os.getenv("ENV")
-        or ""
-    ).strip().lower()
-    return env in {"prod", "production"}
-
-
-def _destructive_admin_routes_enabled():
-    if _is_production_env():
-        return False
-    return os.getenv("ENABLE_DESTRUCTIVE_ADMIN_ROUTES", "").strip().lower() == "true"
-
-
 # Explicit origins only; production must not allow wildcard CORS.
-CORS(app, origins=_split_csv_env("ALLOWED_CORS_ORIGINS", [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://email-automation-cache.web.app",
-    "https://sitesift.ai",
-    "https://www.sitesift.ai",
-]))
+CORS(app, origins=_split_csv_env("ALLOWED_CORS_ORIGINS", DEFAULT_CORS_ORIGINS))
 
 app.secret_key = os.getenv("SECRET_KEY", "some-default-secret")
 
