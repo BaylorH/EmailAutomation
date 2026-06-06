@@ -236,7 +236,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
 
         # Check if we need to attach signature images (for professional mode)
         # CID attachments require using createReply + draft + send pattern
-        if needs_signature_attachments(signature_mode):
+        if needs_signature_attachments(signature_mode, user_signature):
             # Use createReply to get a draft, add attachments, then send
             create_reply_resp = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{current_msg_id}/createReply", headers=headers, timeout=30)
@@ -318,7 +318,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                 ]
             }
 
-            if needs_signature_attachments(signature_mode):
+            if needs_signature_attachments(signature_mode, user_signature):
                 # Create draft, add attachments, send
                 create_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)

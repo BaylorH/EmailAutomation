@@ -432,7 +432,7 @@ def _send_followup_email(
         html_content = format_email_body_with_footer(followup_message, user_signature, signature_mode)
 
         # Send as reply with signature attachments
-        if needs_signature_attachments(signature_mode):
+        if needs_signature_attachments(signature_mode, user_signature):
             # Use createReply to get a draft, add attachments, then send
             create_reply_resp = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{graph_msg_id}/createReply", headers=headers, timeout=30)

@@ -524,7 +524,8 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None) -
         signature_mode: Signature mode - "none", "custom", or "professional".
                        - "none": No signature at all
                        - "custom": Use the custom_signature text (converted to HTML)
-                       - "professional": Use the default Jill Ames signature with logo/images
+                       - "professional": Use custom_signature when present; otherwise use
+                         the legacy Jill Ames signature with logo/images
                        - None/empty: Defaults to "none" (user must explicitly configure)
     """
     # Default to "none" when mode is not set - user must explicitly configure signature in settings
@@ -542,7 +543,9 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None) -
         return ""
 
     if signature_mode == "professional":
-        # Use professional signature with logo
+        if custom_signature and custom_signature.strip():
+            return convert_plain_text_signature_to_html(custom_signature)
+        # No saved signature: keep the legacy Jill/Mohr professional template.
         pass  # Fall through to professional signature below
     else:
         # Unknown mode - treat as none
@@ -595,9 +598,11 @@ T +1 206 510 5575<br>
     return footer
 
 
-def needs_signature_attachments(signature_mode: str) -> bool:
+def needs_signature_attachments(signature_mode: str, custom_signature: str = None) -> bool:
     """Check if the signature mode requires inline image attachments."""
-    return signature_mode == "professional"
+    return signature_mode == "professional" and not (
+        custom_signature and custom_signature.strip()
+    )
 
 
 def format_email_body_with_footer(body: str, custom_signature: str = None, signature_mode: str = None) -> str:

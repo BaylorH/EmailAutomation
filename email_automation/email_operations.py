@@ -23,12 +23,17 @@ def _get_user_signature_settings(uid: str) -> Tuple[Optional[str], Optional[str]
     return None, None
 
 
-def _add_signature_attachments_to_draft(headers: dict, draft_id: str, signature_mode: str) -> None:
+def _add_signature_attachments_to_draft(
+    headers: dict,
+    draft_id: str,
+    signature_mode: str,
+    user_signature: Optional[str] = None,
+) -> None:
     """
     Add signature image attachments to a draft message.
     Only adds attachments if signature_mode is 'professional'.
     """
-    if not needs_signature_attachments(signature_mode):
+    if not needs_signature_attachments(signature_mode, user_signature):
         return
 
     base = "https://graph.microsoft.com/v1.0"
@@ -107,7 +112,7 @@ Could you please provide these details when you have a moment?"""
             graph_id = vals[0]["id"]
 
             # Check if we need signature attachments (professional mode)
-            if needs_signature_attachments(signature_mode):
+            if needs_signature_attachments(signature_mode, user_signature):
                 # Use createReply to get a draft, add attachments, then send
                 create_reply_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{graph_id}/createReply", headers=headers, timeout=30)
@@ -126,7 +131,7 @@ Could you please provide these details when you have a moment?"""
                 )
 
                 # Add signature attachments
-                _add_signature_attachments_to_draft(headers, reply_draft_id, signature_mode)
+                _add_signature_attachments_to_draft(headers, reply_draft_id, signature_mode, user_signature)
 
                 # Send the reply
                 resp = exponential_backoff_request(
@@ -156,13 +161,13 @@ Could you please provide these details when you have a moment?"""
                 "toRecipients": [{"emailAddress": {"address": recipient}}],
             }
 
-            if needs_signature_attachments(signature_mode):
+            if needs_signature_attachments(signature_mode, user_signature):
                 # Create draft, add attachments, send
                 create_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
                 )
                 draft_id = create_resp.json()["id"]
-                _add_signature_attachments_to_draft(headers, draft_id, signature_mode)
+                _add_signature_attachments_to_draft(headers, draft_id, signature_mode, user_signature)
                 resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
                 )
@@ -225,13 +230,13 @@ We'll be in touch if we need any additional information."""
             ]
         }
 
-        if needs_signature_attachments(signature_mode):
+        if needs_signature_attachments(signature_mode, user_signature):
             # Create draft, add attachments, send
             create_resp = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
             )
             draft_id = create_resp.json()["id"]
-            _add_signature_attachments_to_draft(headers, draft_id, signature_mode)
+            _add_signature_attachments_to_draft(headers, draft_id, signature_mode, user_signature)
             response = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
             )
@@ -314,7 +319,7 @@ Could you please provide the following details for this property:
         draft_id = create_response.json()["id"]
 
         # Add signature attachments if needed
-        _add_signature_attachments_to_draft(headers, draft_id, signature_mode)
+        _add_signature_attachments_to_draft(headers, draft_id, signature_mode, user_signature)
 
         # Get message identifiers
         get_response = exponential_backoff_request(
@@ -423,7 +428,7 @@ Thanks,"""
         if vals:
             graph_id = vals[0]["id"]
 
-            if needs_signature_attachments(signature_mode):
+            if needs_signature_attachments(signature_mode, user_signature):
                 # Use createReply to get a draft, add attachments, then send
                 create_reply_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{graph_id}/createReply", headers=headers, timeout=30)
@@ -442,7 +447,7 @@ Thanks,"""
                 )
 
                 # Add signature attachments
-                _add_signature_attachments_to_draft(headers, reply_draft_id, signature_mode)
+                _add_signature_attachments_to_draft(headers, reply_draft_id, signature_mode, user_signature)
 
                 # Send the reply
                 resp = exponential_backoff_request(
@@ -480,13 +485,13 @@ Thanks,"""
                 ]
             }
 
-            if needs_signature_attachments(signature_mode):
+            if needs_signature_attachments(signature_mode, user_signature):
                 # Create draft, add attachments, send
                 create_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
                 )
                 draft_id = create_resp.json()["id"]
-                _add_signature_attachments_to_draft(headers, draft_id, signature_mode)
+                _add_signature_attachments_to_draft(headers, draft_id, signature_mode, user_signature)
                 resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
                 )
@@ -541,7 +546,7 @@ Do you have any other properties that might be a good fit for our requirements?"
         if vals:
             graph_id = vals[0]["id"]
 
-            if needs_signature_attachments(signature_mode):
+            if needs_signature_attachments(signature_mode, user_signature):
                 # Use createReply to get a draft, add attachments, then send
                 create_reply_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{graph_id}/createReply", headers=headers, timeout=30)
@@ -560,7 +565,7 @@ Do you have any other properties that might be a good fit for our requirements?"
                 )
 
                 # Add signature attachments
-                _add_signature_attachments_to_draft(headers, reply_draft_id, signature_mode)
+                _add_signature_attachments_to_draft(headers, reply_draft_id, signature_mode, user_signature)
 
                 # Send the reply
                 resp = exponential_backoff_request(
@@ -598,13 +603,13 @@ Do you have any other properties that might be a good fit for our requirements?"
                 ]
             }
 
-            if needs_signature_attachments(signature_mode):
+            if needs_signature_attachments(signature_mode, user_signature):
                 # Create draft, add attachments, send
                 create_resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
                 )
                 draft_id = create_resp.json()["id"]
-                _add_signature_attachments_to_draft(headers, draft_id, signature_mode)
+                _add_signature_attachments_to_draft(headers, draft_id, signature_mode, user_signature)
                 resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
                 )
