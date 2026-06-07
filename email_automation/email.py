@@ -4,7 +4,7 @@ import time
 import uuid
 import logging
 from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .utils import exponential_backoff_request, safe_preview, _body_kind, validate_recipient_emails, is_valid_email
 from .messaging import save_thread_root, save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
@@ -101,6 +101,72 @@ def _send_identity_payload(send_result: Optional[Dict[str, Any]], recipients: Op
         "conversationIds": conversation_ids or None,
     }
     return {k: v for k, v in payload.items() if v}
+
+
+def _fetch_graph_message_metadata(headers: dict, message_id: str, base: str) -> Dict[str, Any]:
+    if not message_id:
+        return {}
+    try:
+        response = exponential_backoff_request(
+            lambda: requests.get(
+                f"{base}/me/messages/{message_id}",
+                headers=headers,
+                params={"$select": "conversationId,subject"},
+                timeout=30,
+            )
+        )
+        return response.json() if response else {}
+    except Exception as e:
+        print(f"   ⚠️ Could not fetch reply source metadata: {e}")
+        return {}
+
+
+def _find_recent_sent_reply_identity(
+    headers: dict,
+    base: str,
+    conversation_id: Optional[str],
+    sent_after: datetime,
+    *,
+    attempts: int = 4,
+) -> Dict[str, Any]:
+    """Resolve Graph identity for /reply sends, whose API response has no body."""
+    if not conversation_id:
+        return {}
+
+    sent_after_iso = sent_after.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    params = {
+        "$top": "25",
+        "$orderby": "sentDateTime desc",
+        "$select": "id,internetMessageId,conversationId,subject,sentDateTime",
+        "$filter": f"sentDateTime ge {sent_after_iso}",
+    }
+
+    for attempt in range(attempts):
+        try:
+            response = exponential_backoff_request(
+                lambda: requests.get(
+                    f"{base}/me/mailFolders/SentItems/messages",
+                    headers=headers,
+                    params=params,
+                    timeout=30,
+                )
+            )
+            for msg in (response.json() if response else {}).get("value", []):
+                if msg.get("conversationId") != conversation_id:
+                    continue
+                return {
+                    "sentMessageId": msg.get("id"),
+                    "internetMessageId": msg.get("internetMessageId"),
+                    "conversationId": msg.get("conversationId"),
+                }
+        except Exception as e:
+            print(f"   ⚠️ Could not resolve sent reply identity: {e}")
+
+        if attempt < attempts - 1:
+            time.sleep(0.75 * (attempt + 1))
+
+    print("   ⚠️ Sent reply identity not found in SentItems yet")
+    return {}
 
 
 def _merge_send_identity(accumulator: Dict[str, Any], send_result: Dict[str, Any]) -> None:
@@ -375,6 +441,7 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
     from .utils import get_signature_attachments, needs_signature_attachments, format_email_body_with_footer
 
     base = "https://graph.microsoft.com/v1.0"
+    source_metadata = _fetch_graph_message_metadata(headers, reply_to_msg_id, base)
 
     # Format body as HTML with footer
     html_body = format_email_body_with_footer(
@@ -434,13 +501,20 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
                         print(f"   ⚠️ Error attaching {attachment['name']}: {e}")
 
                 # Send the reply
+                sent_after = datetime.now(timezone.utc) - timedelta(seconds=10)
                 resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30)
                 )
 
                 if resp and resp.status_code in [200, 202]:
                     print(f"   ✅ Sent reply (with attachments) to thread {thread_id}")
-                    return {"sent": True, "error": None}
+                    identity = _find_recent_sent_reply_identity(
+                        headers,
+                        base,
+                        source_metadata.get("conversationId"),
+                        sent_after,
+                    )
+                    return {"sent": True, "error": None, **identity}
                 else:
                     error_msg = f"Send draft failed: {resp.status_code if resp else 'None'}"
                     print(f"   ❌ {error_msg}")
@@ -457,6 +531,7 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
                 }
             }
         }
+        sent_after = datetime.now(timezone.utc) - timedelta(seconds=10)
         resp = exponential_backoff_request(
             lambda: requests.post(f"{base}/me/messages/{reply_to_msg_id}/reply",
                                  headers=headers, json=reply_payload, timeout=30)
@@ -464,7 +539,13 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
 
         if resp and resp.status_code in [200, 201, 202]:
             print(f"   ✅ Sent reply to thread {thread_id}")
-            return {"sent": True, "error": None}
+            identity = _find_recent_sent_reply_identity(
+                headers,
+                base,
+                source_metadata.get("conversationId"),
+                sent_after,
+            )
+            return {"sent": True, "error": None, **identity}
         else:
             error_msg = f"Reply failed: {resp.status_code if resp else 'None'}"
             print(f"   ❌ {error_msg}")
@@ -1646,7 +1727,14 @@ def _send_single_outbox_item(
                 )
 
                 if res.get("sent"):
-                    all_sent.append(emails[0] if emails else "unknown")
+                    recipient = emails[0] if emails else "unknown"
+                    all_sent.append(recipient)
+                    if res.get("sentMessageId"):
+                        send_identity["sentMessageIds"][recipient] = res.get("sentMessageId")
+                    if res.get("internetMessageId"):
+                        send_identity["internetMessageIds"][recipient] = res.get("internetMessageId")
+                    if res.get("conversationId"):
+                        send_identity["conversationIds"][recipient] = res.get("conversationId")
                     _save_outbox_reply_message(
                         user_id, thread_id, emails, subject_override,
                         script_content, user_signature, signature_mode, user_email

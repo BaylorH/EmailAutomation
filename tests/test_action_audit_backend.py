@@ -52,6 +52,19 @@ class FakeFirestore:
         return FakeFirestoreNode(self, ["collection", name])
 
 
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise AssertionError(f"Unexpected HTTP status {self.status_code}")
+
+
 class BackendActionAuditTests(unittest.TestCase):
     def test_successful_dashboard_send_marks_action_audit_sent(self):
         outbox_ref = FakeOutboxRef()
@@ -167,6 +180,43 @@ class BackendActionAuditTests(unittest.TestCase):
         audit_payload = fake_fs.set_calls[-1][1]
         self.assertEqual(audit_payload["status"], "dead_lettered")
         self.assertEqual(audit_payload["failureReason"], "Graph returned 500")
+
+    @patch.object(email_module.time, "sleep", return_value=None)
+    @patch.object(email_module.requests, "post")
+    @patch.object(email_module.requests, "get")
+    def test_graph_reply_send_returns_sent_item_identity(self, requests_get, requests_post, _sleep):
+        requests_get.side_effect = [
+            FakeResponse(200, {
+                "conversationId": "conversation-1",
+                "subject": "RE: 910 Confidential Ct",
+            }),
+            FakeResponse(200, {
+                "value": [{
+                    "id": "graph-message-1",
+                    "internetMessageId": "<internet-message-1@example.com>",
+                    "conversationId": "conversation-1",
+                    "subject": "RE: 910 Confidential Ct",
+                    "sentDateTime": "2026-06-06T23:57:12Z",
+                }]
+            }),
+        ]
+        requests_post.return_value = FakeResponse(202)
+
+        result = email_module._send_outbox_as_reply(
+            "uid-1",
+            {"Authorization": "Bearer token"},
+            "Hi Morgan,\n\nThanks.",
+            "reply-message-1",
+            "thread-1",
+            user_signature="Baylor Harrison\nbaylor.freelance@outlook.com",
+            signature_mode="professional",
+            user_email="baylor.freelance@outlook.com",
+        )
+
+        self.assertTrue(result["sent"])
+        self.assertEqual(result["sentMessageId"], "graph-message-1")
+        self.assertEqual(result["internetMessageId"], "<internet-message-1@example.com>")
+        self.assertEqual(result["conversationId"], "conversation-1")
 
 
 if __name__ == "__main__":
