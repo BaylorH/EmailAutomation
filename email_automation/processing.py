@@ -2408,7 +2408,11 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
 
     except Exception as e:
         print(f"❌ Failed to scan inbox: {e}")
-        return
+        return {
+            "status": "error",
+            "operation": "inbox_scan",
+            "error": str(e),
+        }
 
     # PHASE 2: Process messages - batched by thread
     processed_count = 0
@@ -2499,6 +2503,16 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
         print(f"📥 Scanned {scanned_count}; processed {processed_count}; batched {batched_count} extra messages; skipped {skipped_count}")
     else:
         print(f"📥 Scanned {scanned_count}; processed {processed_count}; skipped {skipped_count}")
+
+    return {
+        "status": "healthy",
+        "operation": "inbox_scan",
+        "scanned": scanned_count,
+        "processed": processed_count,
+        "batched": batched_count,
+        "skipped": skipped_count,
+        "orphaned": len(orphan_messages),
+    }
 
 
 def _match_message_to_thread(user_id: str, msg: dict, headers: dict) -> Optional[str]:
@@ -2666,7 +2680,14 @@ def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], to
         
         if not tracked_conversation_ids:
             print("📭 No tracked conversations found, skipping SentItems scan")
-            return
+            return {
+                "status": "healthy",
+                "operation": "sent_items_scan",
+                "scanned": 0,
+                "processed": 0,
+                "skipped": 0,
+                "noTrackedConversations": True,
+            }
         
         print(f"📤 Scanning SentItems for manual replies in {len(tracked_conversation_ids)} tracked conversations...")
         
@@ -2810,9 +2831,26 @@ def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], to
                 print(f"📤 Indexed {processed_count} manual reply(s) from SentItems")
             else:
                 print(f"📤 No new manual replies found in SentItems")
+
+            return {
+                "status": "healthy",
+                "operation": "sent_items_scan",
+                "scanned": scanned_count,
+                "processed": processed_count,
+            }
                 
         except Exception as e:
             print(f"❌ Failed to scan SentItems: {e}")
+            return {
+                "status": "error",
+                "operation": "sent_items_scan",
+                "error": str(e),
+            }
             
     except Exception as e:
         print(f"❌ Failed to scan SentItems for manual replies: {e}")
+        return {
+            "status": "error",
+            "operation": "sent_items_scan",
+            "error": str(e),
+        }

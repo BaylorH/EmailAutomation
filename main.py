@@ -83,6 +83,32 @@ def auto_cleanup_firestore(user_id: str):
     except Exception as e:
         print(f"⚠️ Auto-cleanup error for {user_id}: {e}")
 
+
+def _combine_graph_operation_states(operation_states):
+    states = [
+        state for state in operation_states
+        if isinstance(state, dict) and state.get("status")
+    ]
+    failed_states = [state for state in states if state.get("status") == "error"]
+    unknown_states = [state for state in states if state.get("status") == "unknown"]
+
+    if failed_states:
+        return {
+            "status": "error",
+            "failedOperations": failed_states,
+            "operations": states,
+        }
+    if unknown_states:
+        return {
+            "status": "unknown",
+            "operations": states,
+        }
+    return {
+        "status": "healthy",
+        "operations": states,
+    }
+
+
 def refresh_and_process_user(user_id: str):
     print(f"\n🔄 Processing user: {user_id}")
 
@@ -156,14 +182,20 @@ def refresh_and_process_user(user_id: str):
 
     # Process outbound emails (now with indexing)
     send_outboxes(user_id, headers)
+
+    graph_operation_states = []
     
     # Scan for client replies (inbox - catch all replies, not just unread)
     print(f"\n🔍 Scanning inbox for client replies...")
-    scan_inbox_against_index(user_id, headers, only_unread=False, top=50)
+    graph_operation_states.append(
+        scan_inbox_against_index(user_id, headers, only_unread=False, top=50)
+    )
     
     # Scan for Jill's manual replies (SentItems - catch manual replies we didn't index)
     print(f"\n📤 Scanning SentItems for manual replies...")
-    scan_sent_items_for_manual_replies(user_id, headers, top=50)
+    graph_operation_states.append(
+        scan_sent_items_for_manual_replies(user_id, headers, top=50)
+    )
 
     # Retry any pending responses that failed to send previously
     process_pending_responses(user_id, headers)
@@ -181,7 +213,7 @@ def refresh_and_process_user(user_id: str):
             "source": token_source,
             "expiresIn": exp_secs,
         },
-        graph_state={"status": "healthy"},
+        graph_state=_combine_graph_operation_states(graph_operation_states),
     )
 
 
