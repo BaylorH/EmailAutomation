@@ -260,11 +260,11 @@ def _ensure_ai_meta_tab(sheets, spreadsheet_id: str) -> None:
         )
 
         # Add headers
-        headers = ["rowNumber", "columnName", "last_ai_value", "last_ai_write_iso", "human_override"]
+        headers = ["rowNumber", "columnName", "last_ai_value", "last_ai_write_iso", "human_override", "rowAnchor"]
         _execute_with_retry(
             sheets.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
-                range="AI_META!A1:E1",
+                range="AI_META!A1:F1",
                 valueInputOption="RAW",
                 body={"values": [headers]}
             ),
@@ -276,7 +276,17 @@ def _ensure_ai_meta_tab(sheets, spreadsheet_id: str) -> None:
     except Exception as e:
         print(f"⚠️ Could not create AI_META tab: {e}")
 
-def _read_ai_meta_row(sheets, spreadsheet_id: str, rownum: int, column: str) -> Optional[Dict]:
+def _normalize_ai_meta_anchor(anchor: str) -> str:
+    return " ".join((anchor or "").strip().lower().replace(",", " ").split())
+
+
+def _read_ai_meta_row(
+    sheets,
+    spreadsheet_id: str,
+    rownum: int,
+    column: str,
+    row_anchor: str = None,
+) -> Optional[Dict]:
     """Read AI_META record for specific row/column."""
     try:
         _ensure_ai_meta_tab(sheets, spreadsheet_id)
@@ -285,7 +295,7 @@ def _read_ai_meta_row(sheets, spreadsheet_id: str, rownum: int, column: str) -> 
         resp = _execute_with_retry(
             sheets.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
-                range="AI_META!A:E"
+                range="AI_META!A:F"
             ),
             "read_ai_meta"
         )
@@ -297,12 +307,21 @@ def _read_ai_meta_row(sheets, spreadsheet_id: str, rownum: int, column: str) -> 
         # Find matching row
         for row in rows[1:]:  # Skip header
             if len(row) >= 2 and str(row[0]) == str(rownum) and row[1].lower() == column.lower():
+                stored_anchor = row[5] if len(row) > 5 else ""
+                if stored_anchor and row_anchor:
+                    if _normalize_ai_meta_anchor(stored_anchor) != _normalize_ai_meta_anchor(row_anchor):
+                        print(
+                            f"⚠️ Ignoring AI_META row {rownum}/{column}: "
+                            f"anchor changed from '{stored_anchor}' to '{row_anchor}'"
+                        )
+                        continue
                 return {
                     "rowNumber": row[0],
                     "columnName": row[1],
                     "last_ai_value": row[2] if len(row) > 2 else None,
                     "last_ai_write_iso": row[3] if len(row) > 3 else None,
-                    "human_override": row[4] if len(row) > 4 else False
+                    "human_override": row[4] if len(row) > 4 else False,
+                    "rowAnchor": stored_anchor,
                 }
         
         return None
@@ -311,14 +330,22 @@ def _read_ai_meta_row(sheets, spreadsheet_id: str, rownum: int, column: str) -> 
         print(f"⚠️ Failed to read AI_META for row {rownum}, column {column}: {e}")
         return None
 
-def _append_ai_meta(sheets, spreadsheet_id: str, rownum: int, column: str, value: str, override: bool = False):
+def _append_ai_meta(
+    sheets,
+    spreadsheet_id: str,
+    rownum: int,
+    column: str,
+    value: str,
+    override: bool = False,
+    row_anchor: str = None,
+):
     """Append new AI_META record."""
     try:
         _ensure_ai_meta_tab(sheets, spreadsheet_id)
 
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        row_data = [rownum, column, value, now_iso, override]
+        row_data = [rownum, column, value, now_iso, override, row_anchor or ""]
         logger.debug(
             "sheet.ai_meta_append",
             extra={
@@ -327,6 +354,7 @@ def _append_ai_meta(sheets, spreadsheet_id: str, rownum: int, column: str, value
                 "column": column,
                 "value": value,
                 "override": override,
+                "row_anchor": row_anchor,
                 "timestamp": now_iso,
             },
         )
@@ -334,7 +362,7 @@ def _append_ai_meta(sheets, spreadsheet_id: str, rownum: int, column: str, value
         _execute_with_retry(
             sheets.spreadsheets().values().append(
                 spreadsheetId=spreadsheet_id,
-                range="AI_META!A:E",
+                range="AI_META!A:F",
                 valueInputOption="RAW",
                 body={"values": [row_data]}
             ),
@@ -449,6 +477,7 @@ def apply_proposal_to_sheet(
             return {"applied": [], "skipped": [{"reason":"no-updates"}]}
 
         idx_map = _header_index_map(header)
+        row_anchor = get_row_anchor(current_rowvals, header)
 
         data_payload = []
         applied, skipped = [], []
@@ -487,7 +516,7 @@ def apply_proposal_to_sheet(
                 continue
 
             # Check AI_META for write guards
-            meta = _read_ai_meta_row(sheets, sheet_id, rownum, col_name)
+            meta = _read_ai_meta_row(sheets, sheet_id, rownum, col_name, row_anchor=row_anchor)
 
             # 2) prior AI write and human changed it
             if meta and meta.get("last_ai_value") is not None and str(old_val) != str(meta["last_ai_value"]):
@@ -544,10 +573,19 @@ def apply_proposal_to_sheet(
                     "column": a["column"],
                     "value": a["newValue"],
                     "override": False,
+                    "row_anchor": row_anchor,
                     "source": "apply_proposal_to_sheet",
                 },
             )
-            _append_ai_meta(sheets, sheet_id, rownum, a["column"], a["newValue"], override=False)
+            _append_ai_meta(
+                sheets,
+                sheet_id,
+                rownum,
+                a["column"],
+                a["newValue"],
+                override=False,
+                row_anchor=row_anchor,
+            )
 
         try:
             from .sheet_operations import _apply_gross_rent_formula_for_row
