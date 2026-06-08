@@ -10,7 +10,7 @@ from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
 from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, append_links_to_floorplan_column, is_floorplan_filename, _header_index_map, _find_row_by_email, clear_row_highlight, highlight_row, ROW_HIGHLIGHT_BLUE
-from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move
+from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move, stop_threads_for_row
 from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
                        dump_thread_from_firestore, has_processed, mark_processed, set_last_scan_iso,
                        lookup_thread_by_message_id, lookup_thread_by_conversation_id,
@@ -1307,7 +1307,14 @@ Thanks!"""
                             # Sync thread rowNumbers after row movement to prevent stale anchors
                             sync_thread_row_numbers_after_move(user_id, rownum, divider_row, new_rownum, client_id=client_id)
 
-                            update_thread_status(user_id, thread_id, THREAD_STATUS["stopped"], "property_unavailable")
+                            stopped_thread_count = stop_threads_for_row(
+                                user_id,
+                                new_rownum,
+                                client_id=client_id,
+                                reason="property_unavailable",
+                            )
+                            if stopped_thread_count == 0:
+                                update_thread_status(user_id, thread_id, THREAD_STATUS["stopped"], "property_unavailable")
                             unavailable_thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
                             unavailable_thread_ref.set({
                                 "rowNumber": new_rownum,

@@ -1,4 +1,5 @@
 from typing import Optional, List, Dict, Any
+from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs, _sheets_client
 from .sheets import _get_first_tab_title, _read_header_row2, _header_index_map, _first_sheet_props, _find_row_by_address_city, _find_row_by_email, _execute_with_retry, _col_letter
 from .utils import _subject_to_address_city
@@ -53,6 +54,55 @@ def sync_thread_row_numbers_after_move(
 
     except Exception as e:
         print(f"⚠️ Failed to sync thread row numbers: {e}")
+        return 0
+
+
+def stop_threads_for_row(
+    user_id: str,
+    row_number: int,
+    client_id: Optional[str] = None,
+    reason: str = "property_unavailable",
+) -> int:
+    """
+    Stop every thread anchored to a campaign row.
+
+    Graph can split one property conversation into multiple Firestore thread roots.
+    When the property becomes non-viable, every root on that row must stop so
+    follow-ups cannot continue from a stale sibling thread.
+    """
+    if row_number is None:
+        return 0
+
+    try:
+        updated_count = 0
+        threads_ref = _fs.collection("users").document(user_id).collection("threads")
+        threads = list(threads_ref.stream())
+
+        for thread in threads:
+            data = thread.to_dict() or {}
+            if client_id and data.get("clientId") != client_id:
+                continue
+            if data.get("rowNumber") != row_number:
+                continue
+
+            threads_ref.document(thread.id).update({
+                "status": "stopped",
+                "statusReason": reason,
+                "statusUpdatedAt": SERVER_TIMESTAMP,
+                "followUpStatus": "stopped",
+                "followUpConfig.processingBy": None,
+                "followUpConfig.processingAt": None,
+                "updatedAt": SERVER_TIMESTAMP,
+            })
+            print(f"   🛑 Stopped thread {thread.id[:20]}... for row {row_number}")
+            updated_count += 1
+
+        if updated_count > 0:
+            print(f"✅ Stopped {updated_count} thread(s) anchored to row {row_number}")
+        return updated_count
+
+    except Exception as e:
+        print(f"⚠️ Failed to stop threads for row {row_number}: {e}")
         return 0
 
 
