@@ -11,6 +11,11 @@ logger = logging.getLogger(__name__)
 
 # Helper: detect HTML vs text
 _html_rx = re.compile(r"<[a-zA-Z/][^>]*>")
+_GLUED_DOCUMENT_SIGNOFF_RX = re.compile(
+    r"(?i)(\.(?:pdf|docx?|xlsx?|pptx?|csv|zip))"
+    r"(?:thank(?:s|you|\s+you)?|regards|best|sincerely|cheers|sent|from|on)"
+    r"[\w,.;:!?\- ]*$"
+)
 
 def _body_kind(script: str):
     if script and _html_rx.search(script):
@@ -275,8 +280,12 @@ def fetch_url_as_text(url: str) -> Optional[str]:
 def _sanitize_url(u: str) -> str:
     if not u:
         return u
+    u = u.strip()
     # Trim common trailing junk (punctuation, stray words glued to the URL)
     u = re.sub(r'[\)\]\}\.,;:!?]+$', '', u)
+    glued_signoff = _GLUED_DOCUMENT_SIGNOFF_RX.search(u)
+    if glued_signoff:
+        u = u[:glued_signoff.end(1)]
     # If a trailing capitalized token got glued on (e.g., 'Thank'/'Thanks'), drop it
     u = re.sub(r'(?i)(thank(?:s| you)?)$', '', u)
     u = re.sub(r'On$', '', u)
