@@ -204,6 +204,100 @@ def _build_greeting(contact_name: Optional[str]) -> str:
     return "Hi,"
 
 
+def _normalize_email(value: Optional[str]) -> Optional[str]:
+    value = (value or "").strip().lower()
+    return value if "@" in value else None
+
+
+def _row_value_by_header(rowvals: Optional[List[str]], header: Optional[List[str]], names: List[str]) -> Optional[str]:
+    if not rowvals or not header:
+        return None
+    idx_map = _header_index_map(header)
+    for name in names:
+        idx = idx_map.get(name)
+        if idx and (idx - 1) < len(rowvals):
+            value = (rowvals[idx - 1] or "").strip()
+            if value:
+                return value
+    return None
+
+
+def _resolve_reply_identity(
+    *,
+    thread_data: Dict[str, Any],
+    rowvals: Optional[List[str]],
+    header: Optional[List[str]],
+    from_addr: Optional[str],
+    from_name: Optional[str],
+) -> Dict[str, Optional[str]]:
+    """
+    Resolve the identity used for automatic replies.
+
+    Graph reply endpoints reply to the current inbound message, so forwarded or
+    delegated threads must use the current sender's identity instead of stale
+    campaign-start contact metadata.
+    """
+    sender_email = _normalize_email(from_addr)
+    sender_name = (from_name or "").strip() or None
+
+    thread_emails = [
+        email for email in (
+            _normalize_email(email)
+            for email in (thread_data.get("email") or [])
+        )
+        if email
+    ]
+    sheet_email = _normalize_email(_row_value_by_header(
+        rowvals,
+        header,
+        ["email", "email address", "contact email", "leasing email"],
+    ))
+    original_email = sheet_email or (thread_emails[0] if thread_emails else None)
+
+    stored_contact = (thread_data.get("contactName") or "").strip() or None
+    sheet_contact = _row_value_by_header(
+        rowvals,
+        header,
+        ["leasing contact", "contact name", "name", "contact", "broker name", "broker"],
+    )
+
+    if sender_email and (not original_email or sender_email != original_email):
+        return {
+            "recipient_email": sender_email,
+            "contact_name": sender_name,
+            "source": "current_sender",
+            "original_email": original_email,
+        }
+
+    contact_name = stored_contact or sheet_contact or sender_name
+    source = (
+        "stored_contact" if stored_contact
+        else "sheet_contact" if sheet_contact
+        else "current_sender" if sender_name
+        else "unknown"
+    )
+    return {
+        "recipient_email": original_email or sender_email,
+        "contact_name": contact_name,
+        "source": source,
+        "original_email": original_email,
+    }
+
+
+def _align_response_greeting(response_body: Optional[str], contact_name: Optional[str]) -> Optional[str]:
+    """Replace a stale named greeting with the resolved reply identity greeting."""
+    if not response_body:
+        return response_body
+
+    expected = _build_greeting(contact_name)
+    greeting_re = re.compile(
+        r"^(\s*)(?:hi|hello|hey|thanks|thank you)\s+"
+        r"[a-z][a-z'’.-]*(?:\s+[a-z][a-z'’.-]*)?\s*(?:,|[-–—])",
+        re.IGNORECASE,
+    )
+    return greeting_re.sub(lambda match: f"{match.group(1)}{expected}", response_body, count=1)
+
+
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     try:
@@ -866,87 +960,38 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             # Retry fetching sheet
             client_id, sheet_id, header, rownum, rowvals, column_config, extraction_fields = fetch_and_log_sheet_for_thread(user_id, thread_id, counterparty_email=from_addr)
     
-    # Extract contact name - PRIORITY ORDER:
-    # 1. Thread's stored contactName (authoritative - set at campaign start)
-    # 2. Sheet row "Leasing Contact" column (original campaign data)
-    # 3. Email sender's display name (fallback only)
-    contact_name = None
-
-    # Priority 1: Check thread's stored contactName (set when initial outreach was sent)
+    # Resolve reply identity from the current inbound message. For normal threads,
+    # this preserves the campaign contact; for forwarded/delegated threads, it
+    # switches automated replies to the current sender so Graph reply behavior
+    # and email copy stay aligned.
+    thread_data = {}
     try:
         thread_doc = _fs.collection("users").document(user_id).collection("threads").document(thread_id).get()
         thread_data = thread_doc.to_dict() or {}
-        stored_contact = thread_data.get("contactName", "").strip()
-        if stored_contact:
-            contact_name = stored_contact
-            print(f"📝 Using stored contact name from thread: {contact_name}")
     except Exception as e:
-        print(f"⚠️ Could not fetch thread contactName: {e}")
-
-    # Priority 2: Try to get name from sheet row (common column names)
-    if not contact_name and rowvals and header:
-        idx_map = _header_index_map(header)
-        name_keys = ["leasing contact", "contact name", "name", "contact", "broker name", "broker"]
-        for key in name_keys:
-            idx = idx_map.get(key)
-            if idx and (idx - 1) < len(rowvals):
-                name_val = (rowvals[idx - 1] or "").strip()
-                if name_val:
-                    contact_name = name_val
-                    print(f"📝 Extracted name from sheet column '{key}': {contact_name}")
-                    break
-
-    # Priority 3: Fallback to email sender's display name (least reliable)
-    if not contact_name and from_name:
-        contact_name = from_name.strip()
-        print(f"📝 Fallback: using email sender name: {contact_name}")
+        print(f"⚠️ Could not fetch thread identity data: {e}")
     
     # Only proceed if we successfully matched a sheet row
     if sheet_id and rownum is not None:
-        # Get the correct recipient email from the thread metadata (original external contact)
-        # The send_and_index_email function will handle threading properly
-        try:
-            # Get thread participants to find the external contact
-            thread_doc = _fs.collection("users").document(user_id).collection("threads").document(thread_id).get()
-            thread_data = thread_doc.to_dict() or {}
-            thread_emails = thread_data.get("email", [])
+        sender_addr_lower = (from_addr or "").strip().lower()
+        identity = _resolve_reply_identity(
+            thread_data=thread_data,
+            rowvals=rowvals,
+            header=header,
+            from_addr=from_addr,
+            from_name=from_name,
+        )
+        recipient_email = identity.get("recipient_email") or sender_addr_lower
+        contact_name = identity.get("contact_name")
+        thread_emails = thread_data.get("email", [])
+        external_email = identity.get("original_email")
 
-            # Find the external contact email using header mapping (NOT hardcoded index)
-            # SAFETY: Use column header lookup instead of hardcoded position
-            external_email = None
-            if rowvals and header:
-                # Build header index map for reliable column lookup
-                idx_map = _header_index_map(header)
-                # Try common email column names
-                email_col_names = ["email", "email address", "contact email", "leasing email"]
-                for col_name in email_col_names:
-                    if col_name in idx_map:
-                        email_idx = idx_map[col_name] - 1  # Convert to 0-based
-                        if 0 <= email_idx < len(rowvals):
-                            sheet_email = (rowvals[email_idx] or "").strip().lower()
-                            if sheet_email and "@" in sheet_email:
-                                external_email = sheet_email
-                                break
-
-            # Fallback: use thread participants if sheet email not found
-            if not external_email and thread_emails:
-                external_email = thread_emails[0].lower()
-
-            # Final fallback: use current sender (with warning)
-            sender_addr_lower = (from_addr or "").strip().lower()
-            recipient_email = external_email or sender_addr_lower
-            if not external_email:
-                print(f"⚠️ Could not find email in sheet row, falling back to sender")
-
-            print(f"📧 Reply recipient determined: {recipient_email}")
-            print(f"   Thread participants: {thread_emails}")
-            print(f"   Sheet email column found: {'Yes' if external_email else 'No'}")
-            print(f"   Will reply to: {recipient_email}")
-            
-        except Exception as e:
-            print(f"⚠️ Could not determine thread recipient, using current sender: {e}")
-            sender_addr_lower = (from_addr or "").strip().lower()
-            recipient_email = sender_addr_lower
+        print(f"📧 Reply recipient determined: {recipient_email}")
+        print(f"   Thread participants: {thread_emails}")
+        print(f"   Original sheet/thread email: {external_email or 'None'}")
+        print(f"   Current sender: {sender_addr_lower or 'None'}")
+        print(f"   Contact identity source: {identity.get('source')}")
+        print(f"   Greeting contact: {contact_name or 'generic'}")
         
         # This is the outbound recipient for automated replies, not necessarily the inbound sender.
         to_addr_lower = recipient_email
@@ -2058,7 +2103,10 @@ Thanks!"""
                             break
 
                 # Check if LLM generated a response email
-                llm_response_email = proposal.get("response_email")
+                llm_response_email = _align_response_greeting(
+                    proposal.get("response_email"),
+                    contact_name,
+                )
 
                 # Scenario 1: Property became non-viable AND new property was suggested
                 if old_row_became_nonviable and new_row_created:
