@@ -52,8 +52,25 @@ def build_new_property_suggested_email(
     normalized_to = (to_email or "").strip().lower()
     property_label = f"{address}, {city}" if city else address
     recipient_name = _first_name(contact_name or normalized_to)
-    referrer = (referrer_name or "").strip() or "A broker"
+    referrer = (referrer_name or "").strip()
     greeting = f"Hi {recipient_name}," if recipient_name else "Hi,"
+
+    if not referrer:
+        body = f"""{greeting}
+
+Thanks for sending over {property_label}.
+
+Could you send any flyer or floor plans you have, and confirm any remaining property details such as total SF, asking rent, NNN/opex, loading, clear height, and power?
+
+Thanks!"""
+    else:
+        body = f"""{greeting}
+
+{referrer} mentioned you might be the right contact for {property_label}.
+
+I'm helping a client review industrial/warehouse options in the area. Could you confirm availability and send the current property details, including total SF, asking rent, NNN/opex, loading, clear height, power, and any flyer or floor plans?
+
+Thanks!"""
 
     return {
         "to": [normalized_to] if normalized_to else [],
@@ -61,13 +78,7 @@ def build_new_property_suggested_email(
         "contactName": (contact_name or "").strip() or recipient_name,
         "clientId": client_id,
         "rowNumber": None,
-        "body": f"""{greeting}
-
-{referrer} mentioned you might be the right contact for {property_label}.
-
-I'm helping a client review industrial/warehouse options in the area. Could you confirm availability and send the current property details, including total SF, asking rent, NNN/opex, loading, clear height, power, and any flyer or floor plans?
-
-Thanks!""",
+        "body": body,
     }
 
 

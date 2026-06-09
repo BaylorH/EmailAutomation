@@ -57,6 +57,22 @@ class WrongContactPayloadShapeTests(unittest.TestCase):
         self.assertEqual(payload["contactName"], "Avery Brooks")
         self.assertEqual(payload["clientId"], "client-123")
 
+    def test_new_property_suggested_email_same_contact_does_not_claim_broker_mentioned_them(self):
+        payload = build_new_property_suggested_email(
+            address="414 Alternate Signal Pkwy",
+            city="North Las Vegas",
+            to_email="devin@example.com",
+            contact_name="Devin Replacement",
+            referrer_name="",
+            client_id="client-123",
+        )
+
+        self.assertIn("Hi Devin,", payload["body"])
+        self.assertIn("Thanks for sending over 414 Alternate Signal Pkwy, North Las Vegas", payload["body"])
+        self.assertIn("flyer or floor plans", payload["body"])
+        self.assertNotIn("A broker mentioned", payload["body"])
+        self.assertNotIn("you might be the right contact", payload["body"])
+
     def test_new_property_referral_to_different_contact_skips_original_auto_reply(self):
         self.assertTrue(
             should_skip_original_reply_for_new_property_referral(
