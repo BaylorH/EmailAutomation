@@ -43,6 +43,26 @@ class ProcessingReplyIdentityTests(unittest.TestCase):
         self.assertEqual(identity["contact_name"], "Jeff Beard")
         self.assertEqual(identity["source"], "stored_contact")
 
+    def test_plus_address_reply_uses_actual_sender_but_keeps_sheet_contact_name(self):
+        identity = processing._resolve_reply_identity(
+            thread_data={
+                "email": ["bp21harrison+sig-direct-20260609@gmail.com"],
+                "contactName": "Jordan Direct",
+            },
+            rowvals=[
+                "505 Signature Direct Reply Ave",
+                "Jordan Direct",
+                "bp21harrison+sig-direct-20260609@gmail.com",
+            ],
+            header=["Address", "Leasing Contact", "Email"],
+            from_addr="bp21harrison@gmail.com",
+            from_name="Baylor Harrison",
+        )
+
+        self.assertEqual(identity["recipient_email"], "bp21harrison@gmail.com")
+        self.assertEqual(identity["contact_name"], "Jordan Direct")
+        self.assertEqual(identity["source"], "same_mailbox_contact")
+
     def test_llm_greeting_is_aligned_to_current_sender_name(self):
         body = "Hi Jeff,\n\nPerfect, thank you. This covers everything."
 

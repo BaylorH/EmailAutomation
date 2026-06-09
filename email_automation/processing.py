@@ -209,6 +209,20 @@ def _normalize_email(value: Optional[str]) -> Optional[str]:
     return value if "@" in value else None
 
 
+def _mailbox_identity_without_plus(email: Optional[str]) -> Optional[str]:
+    normalized = _normalize_email(email)
+    if not normalized:
+        return None
+    local, domain = normalized.rsplit("@", 1)
+    return f"{local.split('+', 1)[0]}@{domain}"
+
+
+def _same_mailbox_alias(first_email: Optional[str], second_email: Optional[str]) -> bool:
+    first_identity = _mailbox_identity_without_plus(first_email)
+    second_identity = _mailbox_identity_without_plus(second_email)
+    return bool(first_identity and second_identity and first_identity == second_identity)
+
+
 def _row_value_by_header(rowvals: Optional[List[str]], header: Optional[List[str]], names: List[str]) -> Optional[str]:
     if not rowvals or not header:
         return None
@@ -262,6 +276,15 @@ def _resolve_reply_identity(
     )
 
     if sender_email and (not original_email or sender_email != original_email):
+        if original_email and _same_mailbox_alias(sender_email, original_email):
+            contact_name = stored_contact or sheet_contact or sender_name
+            return {
+                "recipient_email": sender_email,
+                "contact_name": contact_name,
+                "source": "same_mailbox_contact" if (stored_contact or sheet_contact) else "current_sender",
+                "original_email": original_email,
+            }
+
         return {
             "recipient_email": sender_email,
             "contact_name": sender_name,
