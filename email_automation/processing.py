@@ -72,8 +72,60 @@ TERMINAL_CLOSE_REASONS_WITHOUT_COMPLETE_FIELDS = {
 }
 
 
-def _should_skip_processing_for_terminal_thread(thread_status: Optional[str]) -> bool:
-    return thread_status in {THREAD_STATUS["stopped"], THREAD_STATUS["completed"]}
+def _normalize_replacement_match_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _active_replacement_context(thread_data: Optional[Dict[str, Any]], message_text: str = "") -> Optional[Dict[str, Any]]:
+    if not isinstance(thread_data, dict):
+        return None
+
+    replacement = (
+        thread_data.get("activeReplacementProperty")
+        or thread_data.get("replacementProperty")
+        or thread_data.get("activeReplacement")
+    )
+    if not isinstance(replacement, dict):
+        return None
+
+    address = (
+        replacement.get("address")
+        or replacement.get("propertyAddress")
+        or replacement.get("rowAnchor")
+        or ""
+    ).strip()
+    if not address:
+        return None
+
+    row_number = replacement.get("rowNumber")
+    try:
+        row_number = int(row_number)
+    except (TypeError, ValueError):
+        return None
+
+    normalized_message = _normalize_replacement_match_text(message_text)
+    normalized_address = _normalize_replacement_match_text(address)
+    if normalized_message and normalized_address not in normalized_message:
+        return None
+
+    return {
+        **replacement,
+        "address": address,
+        "city": (replacement.get("city") or "").strip(),
+        "rowNumber": row_number,
+    }
+
+
+def _should_skip_processing_for_terminal_thread(
+    thread_status: Optional[str],
+    thread_data: Optional[Dict[str, Any]] = None,
+    message_text: str = "",
+) -> bool:
+    if thread_status == THREAD_STATUS["completed"]:
+        return True
+    if thread_status == THREAD_STATUS["stopped"]:
+        return _active_replacement_context(thread_data, message_text) is None
+    return False
 
 
 def _close_reason_from_event(event: Dict[str, Any]) -> str:
@@ -886,9 +938,40 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     
     print(f"🎯 Matched via {matched_header} -> thread {thread_id}")
 
-    # Terminal threads keep late replies for history but must not generate new AI work or auto-replies.
-    thread_status = get_thread_status(user_id, thread_id)
-    if _should_skip_processing_for_terminal_thread(thread_status):
+    thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+    thread_data = {}
+    try:
+        thread_doc = thread_ref.get()
+        if thread_doc.exists:
+            thread_data = thread_doc.to_dict() or {}
+    except Exception as e:
+        print(f"⚠️ Could not fetch thread status data: {e}")
+
+    # Terminal threads keep late replies for history but must not generate new AI work or auto-replies,
+    # except when the user approved a same-contact replacement property in this email thread.
+    thread_status = thread_data.get("status") or get_thread_status(user_id, thread_id)
+    replacement_context = _active_replacement_context(thread_data, _full_text)
+    if replacement_context and thread_status == THREAD_STATUS["stopped"]:
+        replacement_subject = replacement_context["address"]
+        if replacement_context.get("city"):
+            replacement_subject = f"{replacement_subject}, {replacement_context['city']}"
+        thread_patch = {
+            "rowNumber": replacement_context["rowNumber"],
+            "subject": replacement_subject,
+            "status": THREAD_STATUS["active"],
+            "followUpStatus": "waiting",
+            "statusReason": "same_contact_replacement_reply",
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+        thread_ref.set(thread_patch, merge=True)
+        thread_data.update(thread_patch)
+        thread_status = THREAD_STATUS["active"]
+        print(
+            f"🔁 Reactivated stopped thread for replacement property "
+            f"{replacement_subject} row {replacement_context['rowNumber']}"
+        )
+
+    if _should_skip_processing_for_terminal_thread(thread_status, thread_data, _full_text):
         print(f"⏹️ Thread {thread_id[:20]}... is {thread_status} - saving message but skipping processing")
         # Still save the message for conversation history, but don't process or auto-reply
         # Fall through to message saving, but set a flag to skip processing
@@ -947,7 +1030,6 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     
     # Update thread timestamp
     try:
-        thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
         thread_ref.set({"updatedAt": SERVER_TIMESTAMP}, merge=True)
     except Exception as e:
         print(f"⚠️ Failed to update thread timestamp: {e}")
@@ -987,10 +1069,10 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     # this preserves the campaign contact; for forwarded/delegated threads, it
     # switches automated replies to the current sender so Graph reply behavior
     # and email copy stay aligned.
-    thread_data = {}
     try:
         thread_doc = _fs.collection("users").document(user_id).collection("threads").document(thread_id).get()
-        thread_data = thread_doc.to_dict() or {}
+        latest_thread_data = thread_doc.to_dict() or {}
+        thread_data = {**thread_data, **latest_thread_data}
     except Exception as e:
         print(f"⚠️ Could not fetch thread identity data: {e}")
     
