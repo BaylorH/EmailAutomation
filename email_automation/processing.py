@@ -64,6 +64,41 @@ def _record_ai_processing_failure(user_id: str, client_id: str, thread_id: str, 
         print(f"⚠️ Could not record AI processing failure: {e}")
 
 
+def _clear_thread_action_notifications(
+    user_id: str,
+    client_id: str,
+    thread_id: str,
+    *,
+    notifications_ref=None,
+) -> int:
+    if not client_id or not thread_id:
+        return 0
+
+    try:
+        if notifications_ref is None:
+            notifications_ref = (
+                _fs.collection("users").document(user_id)
+                .collection("clients").document(client_id)
+                .collection("notifications")
+            )
+
+        query = (
+            notifications_ref
+            .where(filter=FieldFilter("threadId", "==", thread_id))
+            .where(filter=FieldFilter("kind", "==", "action_needed"))
+        )
+        deleted = 0
+        for doc in query.stream():
+            doc.reference.delete()
+            deleted += 1
+        if deleted:
+            print(f"🧹 Cleared {deleted} stale action notification(s) for completed thread")
+        return deleted
+    except Exception as e:
+        print(f"⚠️ Could not clear stale action notifications for completed thread: {e}")
+        return 0
+
+
 TERMINAL_CLOSE_REASONS_WITHOUT_COMPLETE_FIELDS = {
     "exclusive_with_another",
     "deal_pending",
@@ -2462,6 +2497,7 @@ We'll be in touch if we need any additional information."""
                                     print(f"✅ Created row_completed notification")
                                 except Exception as e:
                                     print(f"⚠️ Could not create row_completed notification: {e}")
+                                _clear_thread_action_notifications(user_id, client_id, thread_id)
                                 # Update thread status to completed
                                 update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], "all_fields_gathered")
                                 if thread_ref:

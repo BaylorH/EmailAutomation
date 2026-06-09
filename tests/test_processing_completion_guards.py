@@ -63,6 +63,44 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
         self.assertTrue(processing._tour_event_needs_operator_action(event))
 
+    def test_completion_cleanup_deletes_thread_action_notifications(self):
+        class FakeReference:
+            def __init__(self):
+                self.deleted = False
+
+            def delete(self):
+                self.deleted = True
+
+        class FakeDoc:
+            def __init__(self):
+                self.reference = FakeReference()
+
+        class FakeNotificationsRef:
+            def __init__(self, docs):
+                self.docs = docs
+                self.filters = []
+
+            def where(self, *, filter):
+                self.filters.append(filter)
+                return self
+
+            def stream(self):
+                return self.docs
+
+        stale_action = FakeDoc()
+        notifications_ref = FakeNotificationsRef([stale_action])
+
+        deleted = processing._clear_thread_action_notifications(
+            "uid-1",
+            "client-1",
+            "thread-1",
+            notifications_ref=notifications_ref,
+        )
+
+        self.assertEqual(1, deleted)
+        self.assertTrue(stale_action.reference.deleted)
+        self.assertEqual(2, len(notifications_ref.filters))
+
     def test_deterministic_rent_fallback_extracts_asking_rent_not_nnn(self):
         value = ai_processing._extract_rent_sf_yr_from_text(
             "Asking $9.00/SF/year, NNN $0.39/SF, power is 200 amps."
