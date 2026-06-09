@@ -1,7 +1,12 @@
 import unittest
 import base64
+import io
+import random
+
+from PIL import Image
 
 from email_automation.utils import (
+    SIGNATURE_INLINE_IMAGE_MAX_BYTES,
     format_email_body_with_footer,
     get_signature_attachments,
     get_email_footer,
@@ -119,6 +124,35 @@ Best,<br>
 
         self.assertIn("Jill Ames Custom", footer)
         self.assertNotIn("License Nos. 127384", footer)
+
+    def test_oversized_custom_logo_attachment_is_resized_before_send(self):
+        width = height = 420
+        rng = random.Random(42)
+        image = Image.new("RGB", (width, height))
+        image.putdata([
+            (rng.randrange(256), rng.randrange(256), rng.randrange(256))
+            for _ in range(width * height)
+        ])
+
+        raw = io.BytesIO()
+        image.save(raw, format="PNG")
+        original_bytes = raw.getvalue()
+        self.assertGreater(len(original_bytes), SIGNATURE_INLINE_IMAGE_MAX_BYTES)
+
+        logo_b64 = base64.b64encode(original_bytes).decode("ascii")
+        signature = f"""<!-- sitesift:professional-signature:v1 -->
+<div data-sitesift-professional-signature="v1">
+Best,<br>
+<table><tr><td><img src="data:image/png;base64,{logo_b64}" alt="Huge logo"></td><td><strong>Logo User</strong></td></tr></table>
+</div>"""
+
+        attachments = get_signature_attachments(signature, "professional", user_email="logo.user@example.com")
+
+        self.assertEqual(1, len(attachments))
+        resized_bytes = base64.b64decode(attachments[0]["contentBytes"])
+        self.assertLessEqual(len(resized_bytes), SIGNATURE_INLINE_IMAGE_MAX_BYTES)
+        resized = Image.open(io.BytesIO(resized_bytes))
+        self.assertLessEqual(max(resized.size), 240)
 
 
 if __name__ == "__main__":

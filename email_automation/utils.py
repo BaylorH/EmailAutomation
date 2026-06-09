@@ -1,5 +1,6 @@
 import re
 import base64
+import io
 import time
 import requests
 import os
@@ -8,6 +9,8 @@ from bs4 import BeautifulSoup
 from typing import Optional, List
 
 logger = logging.getLogger(__name__)
+SIGNATURE_INLINE_IMAGE_MAX_BYTES = 48 * 1024
+SIGNATURE_INLINE_IMAGE_MAX_DIMENSION = 240
 
 # Helper: detect HTML vs text
 _html_rx = re.compile(r"<[a-zA-Z/][^>]*>")
@@ -460,6 +463,58 @@ _SIGNATURE_DATA_IMAGE_RX = re.compile(
 )
 
 
+def _compress_signature_image(content_type: str, content_bytes_b64: str) -> tuple[str, str]:
+    """Keep inline signature logos below Gmail clipping-prone MIME sizes."""
+    normalized_b64 = re.sub(r"\s+", "", content_bytes_b64 or "")
+    try:
+        raw_bytes = base64.b64decode(normalized_b64)
+    except Exception:
+        return content_type, normalized_b64
+
+    if len(raw_bytes) <= SIGNATURE_INLINE_IMAGE_MAX_BYTES:
+        return content_type, normalized_b64
+
+    try:
+        from PIL import Image, ImageOps
+    except Exception as exc:
+        print(f"⚠️ Pillow unavailable for signature logo resize: {exc}")
+        return content_type, normalized_b64
+
+    try:
+        source = Image.open(io.BytesIO(raw_bytes))
+        source = ImageOps.exif_transpose(source)
+    except Exception as exc:
+        print(f"⚠️ Could not resize signature logo: {exc}")
+        return content_type, normalized_b64
+
+    has_alpha = source.mode in {"RGBA", "LA"} or (
+        source.mode == "P" and "transparency" in source.info
+    )
+    best = (content_type, raw_bytes)
+
+    for dimension in (SIGNATURE_INLINE_IMAGE_MAX_DIMENSION, 200, 160, 120, 96):
+        image = source.copy()
+        image.thumbnail((dimension, dimension), Image.Resampling.LANCZOS)
+
+        output = io.BytesIO()
+        if has_alpha:
+            image = image.convert("RGBA")
+            image.save(output, format="PNG", optimize=True)
+            candidate_type = "image/png"
+        else:
+            image = image.convert("RGB")
+            image.save(output, format="JPEG", quality=82, optimize=True)
+            candidate_type = "image/jpeg"
+
+        candidate_bytes = output.getvalue()
+        if len(candidate_bytes) < len(best[1]):
+            best = (candidate_type, candidate_bytes)
+        if len(candidate_bytes) <= SIGNATURE_INLINE_IMAGE_MAX_BYTES:
+            return candidate_type, base64.b64encode(candidate_bytes).decode("ascii")
+
+    return best[0], base64.b64encode(best[1]).decode("ascii")
+
+
 def _has_html_signature(custom_signature: str = None) -> bool:
     signature = (custom_signature or "").strip()
     return bool(signature and ("data-sitesift-professional-signature" in signature or _html_rx.search(signature)))
@@ -503,7 +558,7 @@ def _custom_signature_attachment_entries(custom_signature: str = None) -> List[d
             continue
 
         content_type = match.group(1).lower().replace("jpg", "jpeg")
-        content_bytes = re.sub(r"\s+", "", match.group(2))
+        content_type, content_bytes = _compress_signature_image(content_type, match.group(2))
         content_id = f"signature-custom-logo-{image_index}"
         attachments.append({
             "@odata.type": "#microsoft.graph.fileAttachment",
