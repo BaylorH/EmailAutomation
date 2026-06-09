@@ -1,7 +1,7 @@
 from typing import Optional, List, Dict, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs, _sheets_client
-from .sheets import _get_first_tab_title, _read_header_row2, _header_index_map, _first_sheet_props, _find_row_by_address_city, _find_row_by_email, _execute_with_retry, _col_letter
+from .sheets import _get_first_tab_title, _read_header_row2, _header_index_map, _first_sheet_props, _execute_with_retry, _col_letter
 from .utils import _subject_to_address_city
 
 
@@ -483,32 +483,129 @@ def insert_property_row_above_divider(sheets, sheet_id: str, tab_title: str, val
         print(f"❌ Failed to insert property row: {e}")
         raise
 
+
+def _norm_row_anchor_text(value: str) -> str:
+    return " ".join((value or "").lower().replace(",", " ").split())
+
+
+def _row_address_city(header: List[str], row_values: List[str]) -> tuple[str, str]:
+    idx_map = _header_index_map(header)
+    row_addr = ""
+    row_city = ""
+    for key in ("property address", "address", "street address", "property"):
+        if key in idx_map and idx_map[key] - 1 < len(row_values):
+            row_addr = row_values[idx_map[key] - 1]
+            break
+    for key in ("city", "town", "municipality"):
+        if key in idx_map and idx_map[key] - 1 < len(row_values):
+            row_city = row_values[idx_map[key] - 1]
+            break
+    return row_addr, row_city
+
+
+def _row_matches_subject_anchor(header: List[str], row_values: List[str], addr: str, city: str) -> bool:
+    if not addr:
+        return True
+
+    row_addr, row_city = _row_address_city(header, row_values)
+    want_addr = _norm_row_anchor_text(addr)
+    got_addr = _norm_row_anchor_text(row_addr)
+    if not got_addr:
+        return False
+
+    # Test/proof subjects can append run tags after the address. Accept either
+    # containment direction so the real sheet address still wins over email.
+    if want_addr != got_addr and want_addr not in got_addr and got_addr not in want_addr:
+        return False
+
+    want_city = _norm_row_anchor_text(city)
+    got_city = _norm_row_anchor_text(row_city)
+    if want_city and got_city and want_city != got_city:
+        return False
+
+    return True
+
+
+def _find_row_by_subject_anchor(
+    sheets,
+    spreadsheet_id: str,
+    tab_title: str,
+    header: List[str],
+    addr: str,
+    city: str,
+):
+    if not addr:
+        return None, None
+
+    resp = _execute_with_retry(
+        sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!A2:ZZZ"
+        ),
+        "find_row_by_subject_anchor"
+    )
+    rows = resp.get("values", [])
+    data_rows = rows[1:] if rows else []
+
+    for sheet_rownum, row in enumerate(data_rows, start=3):
+        padded = row + [""] * (max(0, len(header) - len(row)))
+        if _row_matches_subject_anchor(header, padded, addr, city):
+            return sheet_rownum, padded
+
+    return None, None
+
+
+def _find_unique_row_by_email(sheets, spreadsheet_id: str, tab_title: str, header: List[str], email: str):
+    if not email:
+        return None, None
+
+    resp = _execute_with_retry(
+        sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!A2:ZZZ"
+        ),
+        "find_unique_row_by_email"
+    )
+    rows = resp.get("values", [])
+    if not rows:
+        return None, None
+
+    idx_map = _header_index_map(header)
+    email_idx = (
+        idx_map.get("email")
+        or idx_map.get("email address")
+        or idx_map.get("contact email")
+        or idx_map.get("e-mail")
+        or idx_map.get("e mail")
+        or 0
+    )
+    needle = (email or "").strip().lower()
+    matches = []
+
+    for sheet_rownum, row in enumerate(rows[1:], start=3):
+        padded = row + [""] * (max(0, len(header) - len(row)))
+        if email_idx:
+            candidate = padded[email_idx - 1] if email_idx - 1 < len(padded) else ""
+            if (candidate or "").strip().lower() == needle:
+                matches.append((sheet_rownum, padded))
+        else:
+            for cell in padded:
+                if (cell or "").strip().lower() == needle:
+                    matches.append((sheet_rownum, padded))
+                    break
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print(f"⚠️ Email fallback for {email} matched {len(matches)} rows; refusing ambiguous row mutation")
+    return None, None
+
+
 def _find_row_by_anchor(uid: str, thread_id: str, sheets, spreadsheet_id: str, tab_title: str, 
                        header: List[str], fallback_email: str):
     try:
-        def _norm(value: str) -> str:
-            return " ".join((value or "").lower().replace(",", " ").split())
-
         def _stored_row_matches_subject(row_values: List[str], addr: str, city: str) -> bool:
-            if not addr:
-                return True
-            idx_map = _header_index_map(header)
-            row_addr = ""
-            row_city = ""
-            for key in ("property address", "address", "street address", "property"):
-                if key in idx_map and idx_map[key] - 1 < len(row_values):
-                    row_addr = row_values[idx_map[key] - 1]
-                    break
-            for key in ("city", "town", "municipality"):
-                if key in idx_map and idx_map[key] - 1 < len(row_values):
-                    row_city = row_values[idx_map[key] - 1]
-                    break
-
-            if _norm(addr) and _norm(addr) not in _norm(row_addr):
-                return False
-            if city and row_city and _norm(city) != _norm(row_city):
-                return False
-            return True
+            return _row_matches_subject_anchor(header, row_values, addr, city)
 
         # 1) Prefer explicit stored rowNumber (unchanged)
         thread_doc = _fs.collection("users").document(uid).collection("threads").document(thread_id).get()
@@ -533,17 +630,18 @@ def _find_row_by_anchor(uid: str, thread_id: str, sheets, spreadsheet_id: str, t
                         return stored_row_num, padded
                     print(f"⚠️ Stored row {stored_row_num} no longer matches thread subject; falling back to subject anchor")
 
-            # 2) NEW: subject → (address, city) → row
+            # 2) Subject → (address, city) → row. This is safer than email
+            # fallback when several rows share one broker inbox.
             if addr:
-                rn, rv = _find_row_by_address_city(sheets, spreadsheet_id, tab_title, header, addr, city)
+                rn, rv = _find_row_by_subject_anchor(sheets, spreadsheet_id, tab_title, header, addr, city)
                 if rn is not None:
                     print(f"📍 Using subject-anchored row {rn} for '{addr}{', '+city if city else ''}'")
                     return rn, rv
 
-        # 3) Fallback: email matching (unchanged)
+        # 3) Fallback: email matching only when it uniquely identifies one row.
         print(f"📧 Falling back to email matching for {fallback_email}")
-        return _find_row_by_email(sheets, spreadsheet_id, tab_title, header, fallback_email)
+        return _find_unique_row_by_email(sheets, spreadsheet_id, tab_title, header, fallback_email)
 
     except Exception as e:
         print(f"⚠️ Row anchor lookup failed: {e}")
-        return _find_row_by_email(sheets, spreadsheet_id, tab_title, header, fallback_email)
+        return _find_unique_row_by_email(sheets, spreadsheet_id, tab_title, header, fallback_email)
