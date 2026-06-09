@@ -128,6 +128,58 @@ def _should_skip_processing_for_terminal_thread(
     return False
 
 
+def _extract_tour_time_options(question: str) -> List[str]:
+    text = str(question or "").strip()
+    if not text or text.lower() == "tour requested":
+        return []
+
+    text = re.sub(r"^tour availability offered\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = text.strip(" .")
+    if not text:
+        return []
+
+    has_time_signal = re.search(
+        r"\b(mon|tue|wed|thu|fri|sat|sun|morning|afternoon|noon|am|pm|\d{1,2}:\d{2})\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not has_time_signal:
+        return []
+
+    parts = [
+        part.strip(" .")
+        for part in re.split(r"\s+(?:or|/)\s+|;\s*", text)
+        if part.strip(" .")
+    ]
+    return parts[:3] if parts else [text]
+
+
+def _build_default_tour_suggested_email(broker_name: str, question: str = "") -> str:
+    greeting_name = (broker_name or "there").strip()
+    time_options = _extract_tour_time_options(question)
+
+    if time_options:
+        primary = time_options[0]
+        alternate = time_options[1] if len(time_options) > 1 else None
+        timing_sentence = f"{primary} would work on my end."
+        if alternate:
+            timing_sentence += f" If that time is no longer available, {alternate} could also work."
+        follow_up = "Could you please confirm what works best?"
+    else:
+        timing_sentence = "Could you let me know what tour windows are available?"
+        follow_up = "Once I have a few options, I can confirm the best fit."
+
+    return f"""Hi {greeting_name},
+
+Thank you for offering to show me the property. I'd like to schedule a tour.
+
+{timing_sentence}
+
+{follow_up}
+
+Thanks!"""
+
+
 def _close_reason_from_event(event: Dict[str, Any]) -> str:
     return (
         event.get("notes")
@@ -1301,18 +1353,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         # If AI didn't generate a suggested email, create a default one
                         if not suggested_email:
                             broker_name = to_addr_lower.split('@')[0].split('.')[0].title()
-                            suggested_email = f"""Hi {broker_name},
-
-Thank you for offering to show me the property! I'd love to schedule a tour.
-
-Would any of the following times work for you?
-- [Day/Time option 1]
-- [Day/Time option 2]
-- [Day/Time option 3]
-
-Please let me know what works best, and I'll confirm.
-
-Thanks!"""
+                            suggested_email = _build_default_tour_suggested_email(broker_name, question)
 
                         meta = {
                             "reason": "tour_requested",

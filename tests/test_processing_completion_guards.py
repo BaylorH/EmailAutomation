@@ -24,6 +24,22 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
         self.assertTrue(processing._close_event_can_bypass_missing_fields(event))
 
+    def test_default_tour_suggested_email_uses_offered_times_without_placeholders(self):
+        body = processing._build_default_tour_suggested_email(
+            "Devin",
+            "Tour availability offered: Monday at 2:00 PM or Wednesday at 10:00 AM.",
+        )
+
+        self.assertIn("Monday at 2:00 PM", body)
+        self.assertIn("Wednesday at 10:00 AM", body)
+        self.assertNotIn("[Day/Time option", body)
+
+    def test_default_tour_suggested_email_without_times_asks_for_windows(self):
+        body = processing._build_default_tour_suggested_email("Devin", "Tour requested")
+
+        self.assertIn("what tour windows are available", body)
+        self.assertNotIn("[Day/Time option", body)
+
     def test_deterministic_rent_fallback_extracts_asking_rent_not_nnn(self):
         value = ai_processing._extract_rent_sf_yr_from_text(
             "Asking $9.00/SF/year, NNN $0.39/SF, power is 200 amps."
