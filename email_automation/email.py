@@ -484,7 +484,7 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
                 )
 
                 # Add signature attachments
-                signature_attachments = get_signature_attachments()
+                signature_attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
                 for attachment in signature_attachments:
                     try:
                         att_resp = exponential_backoff_request(
@@ -984,7 +984,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
     # Check if we need to attach signature images (for professional mode)
     signature_attachments = []
     if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
-        signature_attachments = get_signature_attachments()
+        signature_attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
         print(f"📎 Will attach {len(signature_attachments)} signature image(s)")
 
     if content_type == "HTML":

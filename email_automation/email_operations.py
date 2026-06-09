@@ -42,7 +42,7 @@ def _add_signature_attachments_to_draft(
         return
 
     base = "https://graph.microsoft.com/v1.0"
-    attachments = get_signature_attachments()
+    attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
 
     for attachment in attachments:
         try:

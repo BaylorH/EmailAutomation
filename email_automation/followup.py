@@ -468,7 +468,7 @@ def _send_followup_email(
             )
 
             # Add signature attachments
-            signature_attachments = get_signature_attachments()
+            signature_attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
             for attachment in signature_attachments:
                 try:
                     att_resp = exponential_backoff_request(

@@ -454,7 +454,87 @@ def _image_to_base64(image_path: str) -> str:
         return ""
 
 
-def get_signature_attachments() -> List[dict]:
+_SIGNATURE_DATA_IMAGE_RX = re.compile(
+    r"^data:(image/(?:png|jpe?g|gif|webp));base64,([A-Za-z0-9+/=\s]+)$",
+    re.IGNORECASE,
+)
+
+
+def _has_html_signature(custom_signature: str = None) -> bool:
+    signature = (custom_signature or "").strip()
+    return bool(signature and ("data-sitesift-professional-signature" in signature or _html_rx.search(signature)))
+
+
+def _sanitize_custom_signature_html(custom_signature: str) -> str:
+    """Keep generated signature HTML email-safe before embedding it in Graph messages."""
+    soup = BeautifulSoup(custom_signature or "", "html.parser")
+    for unsafe in soup.find_all(["script", "style", "iframe", "object", "embed"]):
+        unsafe.decompose()
+
+    for tag in soup.find_all(True):
+        for attr in list(tag.attrs):
+            attr_lower = attr.lower()
+            value = tag.get(attr)
+            if attr_lower.startswith("on"):
+                del tag.attrs[attr]
+                continue
+            if attr_lower in {"href", "src"} and isinstance(value, str) and value.strip().lower().startswith("javascript:"):
+                del tag.attrs[attr]
+                continue
+            if attr_lower == "src" and tag.name == "img" and isinstance(value, str):
+                allowed = re.match(r"^(data:image/(?:png|jpe?g|gif|webp);base64,|cid:|https?://)", value.strip(), re.IGNORECASE)
+                if not allowed:
+                    del tag.attrs[attr]
+
+    return str(soup)
+
+
+def _custom_signature_attachment_entries(custom_signature: str = None) -> List[dict]:
+    if not custom_signature or not _has_html_signature(custom_signature):
+        return []
+
+    soup = BeautifulSoup(_sanitize_custom_signature_html(custom_signature), "html.parser")
+    attachments = []
+    image_index = 1
+    for img in soup.find_all("img"):
+        src = (img.get("src") or "").strip()
+        match = _SIGNATURE_DATA_IMAGE_RX.match(src)
+        if not match:
+            continue
+
+        content_type = match.group(1).lower().replace("jpg", "jpeg")
+        content_bytes = re.sub(r"\s+", "", match.group(2))
+        content_id = f"signature-custom-logo-{image_index}"
+        attachments.append({
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": f"{content_id}.{content_type.split('/')[-1]}",
+            "contentType": content_type,
+            "contentBytes": content_bytes,
+            "contentId": content_id,
+            "isInline": True
+        })
+        image_index += 1
+
+    return attachments
+
+
+def _custom_signature_html_with_cids(custom_signature: str = None) -> str:
+    if not custom_signature:
+        return ""
+
+    soup = BeautifulSoup(_sanitize_custom_signature_html(custom_signature), "html.parser")
+    image_index = 1
+    for img in soup.find_all("img"):
+        src = (img.get("src") or "").strip()
+        if not _SIGNATURE_DATA_IMAGE_RX.match(src):
+            continue
+        img["src"] = f"cid:signature-custom-logo-{image_index}"
+        image_index += 1
+
+    return str(soup)
+
+
+def _legacy_mohr_signature_attachments() -> List[dict]:
     """
     Get signature images as inline attachments for Microsoft Graph API.
     Returns list of attachment objects with contentId for CID references.
@@ -507,6 +587,32 @@ def get_signature_attachments() -> List[dict]:
 
     return attachments
 
+
+def get_signature_attachments(custom_signature: str = None, signature_mode: str = None, user_email: str = None) -> List[dict]:
+    """
+    Get signature images as inline attachments for Microsoft Graph API.
+
+    User-created professional signatures can include uploaded logo data URLs.
+    Those are converted to CID attachments. Empty legacy MOHR professional mode
+    keeps using the bundled MOHR logo and LinkedIn image.
+    """
+    custom_attachments = _custom_signature_attachment_entries(custom_signature)
+    if custom_attachments:
+        return custom_attachments
+
+    if (
+        signature_mode is None
+        and custom_signature is None
+        and user_email is None
+    ) or (
+        signature_mode == "professional"
+        and not (custom_signature and custom_signature.strip())
+        and _is_legacy_mohr_signature_user(user_email)
+    ):
+        return _legacy_mohr_signature_attachments()
+
+    return []
+
 def convert_plain_text_signature_to_html(plain_text_signature: str) -> str:
     """
     Converts a plain text email signature to HTML format.
@@ -514,6 +620,9 @@ def convert_plain_text_signature_to_html(plain_text_signature: str) -> str:
     """
     if not plain_text_signature or not plain_text_signature.strip():
         return ""
+
+    if _has_html_signature(plain_text_signature):
+        return _custom_signature_html_with_cids(plain_text_signature)
 
     # Convert line breaks to HTML
     html_signature = plain_text_signature.replace('\n', '<br>')
@@ -617,6 +726,9 @@ T +1 206 510 5575<br>
 
 def needs_signature_attachments(signature_mode: str, custom_signature: str = None, user_email: str = None) -> bool:
     """Check if the signature mode requires inline image attachments."""
+    if _custom_signature_attachment_entries(custom_signature):
+        return True
+
     return (
         signature_mode == "professional"
         and not (custom_signature and custom_signature.strip())
