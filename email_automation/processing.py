@@ -99,6 +99,104 @@ def _clear_thread_action_notifications(
         return 0
 
 
+TERMINAL_THREAD_STATUSES = {THREAD_STATUS["completed"], THREAD_STATUS["stopped"]}
+NON_PENDING_OUTBOX_STATUSES = {
+    "cancel_requested",
+    "cancelled",
+    "canceled",
+    "sent",
+    "duplicate_skipped",
+    "opt_out_skipped",
+    "dead_lettered",
+}
+
+
+def _maybe_mark_client_completed(
+    user_id: str,
+    client_id: str,
+    *,
+    client_ref=None,
+    threads_ref=None,
+    notifications_ref=None,
+    outbox_ref=None,
+) -> bool:
+    """Mark a campaign completed once every thread is terminal and no current work remains."""
+    if not client_id:
+        return False
+
+    try:
+        user_ref = _fs.collection("users").document(user_id)
+        if client_ref is None:
+            client_ref = user_ref.collection("clients").document(client_id)
+        if threads_ref is None:
+            threads_ref = user_ref.collection("threads")
+        if notifications_ref is None:
+            notifications_ref = client_ref.collection("notifications")
+        if outbox_ref is None:
+            outbox_ref = user_ref.collection("outbox")
+
+        client_snapshot = client_ref.get()
+        client_data = client_snapshot.to_dict() if getattr(client_snapshot, "exists", False) else {}
+        status = str((client_data or {}).get("status") or "").strip().lower()
+        if status in {"archived", "deleted"}:
+            return False
+
+        thread_docs = list(
+            threads_ref
+            .where(filter=FieldFilter("clientId", "==", client_id))
+            .stream()
+        )
+        if not thread_docs:
+            return False
+
+        active_threads = []
+        terminal_threads = []
+        for doc in thread_docs:
+            data = doc.to_dict() or {}
+            thread_status = str(data.get("status") or THREAD_STATUS["active"]).strip().lower()
+            if thread_status in TERMINAL_THREAD_STATUSES:
+                terminal_threads.append(doc)
+            else:
+                active_threads.append(doc)
+
+        action_docs = list(
+            notifications_ref
+            .where(filter=FieldFilter("kind", "==", "action_needed"))
+            .stream()
+        )
+        outbox_docs = []
+        for doc in (
+            outbox_ref
+            .where(filter=FieldFilter("clientId", "==", client_id))
+            .stream()
+        ):
+            data = doc.to_dict() or {}
+            outbox_status = str(data.get("status") or "").strip().lower()
+            if outbox_status not in NON_PENDING_OUTBOX_STATUSES:
+                outbox_docs.append(doc)
+
+        if active_threads or action_docs or outbox_docs:
+            return False
+
+        client_ref.set({
+            "status": "completed",
+            "completedAt": SERVER_TIMESTAMP,
+            "statusUpdatedAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+            "completionSummary": {
+                "terminalThreads": len(terminal_threads),
+                "activeThreads": len(active_threads),
+                "pendingOutbox": len(outbox_docs),
+                "currentActions": len(action_docs),
+            },
+        }, merge=True)
+        print(f"✅ Marked client {client_id} completed after {len(terminal_threads)} terminal threads")
+        return True
+    except Exception as e:
+        print(f"⚠️ Could not evaluate client completion for {client_id}: {e}")
+        return False
+
+
 TERMINAL_CLOSE_REASONS_WITHOUT_COMPLETE_FIELDS = {
     "exclusive_with_another",
     "deal_pending",
@@ -1667,6 +1765,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             )
                             mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                             print(f"🚫 Moved property to non-viable and created notification")
+                            if not any((evt or {}).get("type") == "new_property" for evt in events):
+                                _maybe_mark_client_completed(user_id, client_id)
                     except Exception as e:
                         print(f"❌ Failed to handle property_unavailable: {e}")
                         import traceback
@@ -1920,6 +2020,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             clear_row_highlight(sheet_id, rownum)
                         except Exception as e:
                             print(f"⚠️ Could not clear row highlight: {e}")
+                        _maybe_mark_client_completed(user_id, client_id)
 
                     except Exception as e:
                         print(f"❌ Failed to handle close_conversation: {e}")
@@ -2511,6 +2612,7 @@ We'll be in touch if we need any additional information."""
                                     clear_row_highlight(sheet_id, rownum)
                                 except Exception as e:
                                     print(f"⚠️ Could not clear row highlight: {e}")
+                                _maybe_mark_client_completed(user_id, client_id)
                             else:
                                 print(f"❌ Failed to send closing email")
                                 queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
