@@ -45,6 +45,20 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
         self.assertEqual(value, "11.40")
 
+    def test_deterministic_rent_fallback_annualizes_nnn_monthly_suffix(self):
+        value = ai_processing._extract_rent_sf_yr_from_text(
+            "Asking rent: $1.12/SF NNN monthly."
+        )
+
+        self.assertEqual(value, "13.44")
+
+    def test_deterministic_rent_fallback_does_not_treat_next_month_as_monthly_rent(self):
+        value = ai_processing._extract_rent_sf_yr_from_text(
+            "Asking rent: $9.00/SF NNN, available next month."
+        )
+
+        self.assertEqual(value, "9.00")
+
     def test_deterministic_rent_fallback_augments_blank_rent_cell(self):
         header = ["Property Address", "Rent/SF /Yr", "Ops Ex /SF"]
         proposal = {"updates": [{"column": "Ops Ex /SF", "value": "0.39"}]}
@@ -61,6 +75,31 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
         self.assertIn(
             {"column": "Rent/SF /Yr", "value": "9.00", "confidence": 0.92,
+             "reason": "Deterministic fallback parsed asking rent per SF per year from the latest broker message."},
+            augmented["updates"],
+        )
+
+    def test_deterministic_rent_fallback_corrects_existing_monthly_llm_update(self):
+        header = ["Property Address", "Rent/SF /Yr", "Ops Ex /SF"]
+        proposal = {
+            "updates": [
+                {"column": "Rent/SF /Yr", "value": "1.12", "confidence": 0.92, "reason": "LLM copied monthly rent"},
+                {"column": "Ops Ex /SF", "value": "3.24"},
+            ]
+        }
+        rowvals = ["414 Alternate Signal Pkwy", "", ""]
+        config = {"mappings": {"rent_sf_yr": "Rent/SF /Yr"}}
+        conversation = [{
+            "direction": "inbound",
+            "content": "Asking rent: $1.12/SF NNN monthly. Ops Ex / NNN: $0.27/SF monthly.",
+        }]
+
+        augmented = ai_processing._augment_proposal_with_deterministic_extractions(
+            proposal, rowvals, header, config, conversation
+        )
+
+        self.assertIn(
+            {"column": "Rent/SF /Yr", "value": "13.44", "confidence": 0.92,
              "reason": "Deterministic fallback parsed asking rent per SF per year from the latest broker message."},
             augmented["updates"],
         )

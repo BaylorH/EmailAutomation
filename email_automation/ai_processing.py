@@ -38,6 +38,14 @@ def _proposal_updates_column(proposal: dict, column_name: str) -> bool:
     return False
 
 
+def _proposal_update_for_column(proposal: dict, column_name: str) -> Optional[dict]:
+    target_key = (column_name or "").strip().lower()
+    for update in (proposal or {}).get("updates", []) or []:
+        if (update.get("column") or "").strip().lower() == target_key:
+            return update
+    return None
+
+
 def _row_value_for_column(rowvals: List[str], header: List[str], column_name: str) -> str:
     idx_map = _header_index_map(header)
     key = (column_name or "").strip().lower()
@@ -69,7 +77,7 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
         r"(?:sf|sq\.?\s*ft|square\s*foot)(?:\s*/?\s*(?:yr|year|annum))?",
         re.IGNORECASE,
     )
-    monthly_unit = re.compile(r"(?:/|\bper\s+)(?:mo|mos|month|monthly)\b", re.IGNORECASE)
+    monthly_unit = re.compile(r"(?:/|\bper\s+)(?:mo|mos|month|monthly)\b|\bmonthly\b", re.IGNORECASE)
     annual_unit = re.compile(r"(?:/|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
 
     for pattern in (rent_context, dollar_per_sf):
@@ -106,19 +114,25 @@ def _augment_proposal_with_deterministic_extractions(
 
     if (_row_value_for_column(rowvals, header, rent_col) or "").strip():
         return proposal
-    if _proposal_updates_column(proposal, rent_col):
-        return proposal
 
     rent_value = _extract_rent_sf_yr_from_text(_latest_inbound_text(conversation))
     if not rent_value:
         return proposal
 
-    proposal.setdefault("updates", []).append({
+    deterministic_update = {
         "column": rent_col,
         "value": rent_value,
         "confidence": 0.92,
         "reason": "Deterministic fallback parsed asking rent per SF per year from the latest broker message.",
-    })
+    }
+    existing_update = _proposal_update_for_column(proposal, rent_col)
+    if existing_update:
+        if str(existing_update.get("value") or "").strip() != rent_value:
+            existing_update.clear()
+            existing_update.update(deterministic_update)
+        return proposal
+
+    proposal.setdefault("updates", []).append(deterministic_update)
     return proposal
 
 def _filter_config_by_extraction_fields(column_config: dict, extraction_fields: List[str]) -> dict:
