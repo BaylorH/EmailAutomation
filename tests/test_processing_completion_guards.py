@@ -40,6 +40,29 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertIn("what tour windows are available", body)
         self.assertNotIn("[Day/Time option", body)
 
+    def test_confirmed_tour_without_suggested_email_is_not_actionable(self):
+        event = {
+            "type": "tour_requested",
+            "question": (
+                "Monday at 2:00 PM is confirmed. Park at the main office entrance; "
+                "I will meet you in the lobby. No additional access instructions."
+            ),
+            "suggestedEmail": "",
+        }
+
+        self.assertFalse(processing._tour_event_needs_operator_action(event))
+
+    def test_follow_up_tour_choice_still_needs_operator_action(self):
+        event = {
+            "type": "tour_requested",
+            "question": "Jordan offered tour times: Tuesday at 11:00 AM or Wednesday at 1:30 PM for a follow-up tour.",
+            "suggestedEmail": {
+                "body": "Can you pencil us in for Tuesday at 11:00 AM?",
+            },
+        }
+
+        self.assertTrue(processing._tour_event_needs_operator_action(event))
+
     def test_deterministic_rent_fallback_extracts_asking_rent_not_nnn(self):
         value = ai_processing._extract_rent_sf_yr_from_text(
             "Asking $9.00/SF/year, NNN $0.39/SF, power is 200 amps."

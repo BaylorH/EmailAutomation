@@ -180,6 +180,30 @@ Thank you for offering to show me the property. I'd like to schedule a tour.
 Thanks!"""
 
 
+def _tour_event_needs_operator_action(event: Dict[str, Any]) -> bool:
+    suggested = event.get("suggestedEmail")
+    if isinstance(suggested, dict):
+        suggested_body = suggested.get("body") or ""
+    else:
+        suggested_body = suggested or ""
+    if str(suggested_body).strip():
+        return True
+
+    question = str(event.get("question") or "").strip().lower()
+    if not question:
+        return True
+
+    confirmation_pattern = (
+        r"\b(?:is|are|for)\s+confirmed\b|"
+        r"\bconfirmed\s+(?:for|at|on)\b|"
+        r"\b(?:tour|showing|appointment)\s+(?:is|has been)\s+confirmed\b"
+    )
+    if re.search(confirmation_pattern, question):
+        return False
+
+    return True
+
+
 def _close_reason_from_event(event: Dict[str, Any]) -> str:
     return (
         event.get("notes")
@@ -1347,6 +1371,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 elif event_type == "tour_requested":
                     # Broker offered a tour - create notification with suggested response
                     try:
+                        if not _tour_event_needs_operator_action(event):
+                            mark_event_handled(user_id, thread_id, event_key, msg_id, None)
+                            print("🏠 Tour confirmation detected - no operator action needed")
+                            continue
+
                         question = event.get("question", "Tour requested")
                         suggested_email = event.get("suggestedEmail", "")
 
