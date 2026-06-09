@@ -19,6 +19,33 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         )
         self.assertTrue(processing._should_mark_processed_after_error(ValueError("non-retryable bug")))
 
+    def test_new_property_duplicate_check_fails_open_on_sheet_read_error(self):
+        class FailingSheets:
+            def spreadsheets(self):
+                return self
+
+            def values(self):
+                return self
+
+            def get(self, **_kwargs):
+                return self
+
+            def execute(self):
+                raise RuntimeError("sheets quota")
+
+        header = ["Property Address", "City"]
+
+        self.assertFalse(
+            processing._property_exists_in_sheet(
+                FailingSheets(),
+                "sheet-1",
+                "Properties",
+                header,
+                "777 Replacement Signal Ave",
+                "Las Vegas",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -473,6 +473,57 @@ def _build_property_unavailable_comment(current_date: str, found_keyword: str, e
     return f"{base} ({'; '.join(alternates)})"
 
 
+def _property_exists_in_sheet(
+    sheets,
+    sheet_id: str,
+    tab_title: str,
+    header: List[str],
+    address: str,
+    city: str,
+) -> bool:
+    """
+    Best-effort duplicate check for replacement-property approvals.
+
+    If Sheets is temporarily rate limited, fail open so the dashboard still
+    surfaces the pending replacement. A duplicate action is recoverable; a
+    dropped action can hide unresolved user work.
+    """
+    try:
+        resp = sheets.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{tab_title}!3:1000",
+        ).execute()
+    except Exception as e:
+        print(f"⚠️ Could not check for existing replacement property, creating approval action anyway: {e}")
+        return False
+
+    existing_rows = resp.get("values", [])
+    idx_map = _header_index_map(header)
+    addr_col = idx_map.get("property address") or idx_map.get("address")
+    city_col = idx_map.get("city")
+
+    if addr_col is None:
+        return False
+
+    address_normalized = (address or "").strip().lower()
+    city_normalized = (city or "").strip().lower()
+
+    for row_idx, row in enumerate(existing_rows, start=3):
+        if len(row) <= (addr_col - 1):
+            continue
+        existing_addr = (row[addr_col - 1] or "").strip().lower()
+        existing_city = ""
+
+        if city_col is not None and len(row) > (city_col - 1):
+            existing_city = (row[city_col - 1] or "").strip().lower()
+
+        if existing_addr == address_normalized and existing_city == city_normalized:
+            print(f"ℹ️ Property '{address}, {city}' already exists in row {row_idx}, skipping")
+            return True
+
+    return False
+
+
 def _store_contact_optout(user_id: str, email: str, reason: str, thread_id: str) -> bool:
     """
     Store a contact's opt-out status in Firestore.
@@ -1829,6 +1880,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         print(f"❌ Failed to handle property_unavailable: {e}")
                         import traceback
                         traceback.print_exc()
+                        _record_ai_processing_failure(
+                            user_id,
+                            client_id,
+                            thread_id,
+                            msg_id,
+                            f"property_unavailable_event_failed:{e}",
+                        )
+                        raise RetryableProcessingError(f"property_unavailable event failed: {e}")
 
                 elif event_type == "new_property":
                     try:
@@ -1872,35 +1931,17 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
                         # Check if property already exists in sheet
                         tab_title = _get_first_tab_title(sheets, sheet_id)
-                        resp = sheets.spreadsheets().values().get(
-                            spreadsheetId=sheet_id,
-                            range=f"{tab_title}!3:1000"  # Skip header rows, read data rows
-                        ).execute()
-
-                        existing_rows = resp.get("values", [])
-                        property_exists = False
 
                         # Build header index map to find address/city columns
                         idx_map = _header_index_map(header)
-                        addr_col = idx_map.get("property address") or idx_map.get("address")
-                        city_col = idx_map.get("city")
-
-                        if addr_col is not None:
-                            # Check each row for existing property
-                            for row_idx, row in enumerate(existing_rows, start=3):
-                                if len(row) > (addr_col - 1):  # -1 because idx_map is 1-based
-                                    existing_addr = (row[addr_col - 1] or "").strip().lower()
-                                    existing_city = ""
-
-                                    if city_col is not None and len(row) > (city_col - 1):
-                                        existing_city = (row[city_col - 1] or "").strip().lower()
-
-                                    # Match both address and city
-                                    if (existing_addr == address.lower() and
-                                        existing_city == city.lower()):
-                                        property_exists = True
-                                        print(f"ℹ️ Property '{address}, {city}' already exists in row {row_idx}, skipping")
-                                        break
+                        property_exists = _property_exists_in_sheet(
+                            sheets,
+                            sheet_id,
+                            tab_title,
+                            header,
+                            address,
+                            city,
+                        )
 
                         if property_exists:
                             continue  # Skip this event - property already exists
@@ -2011,6 +2052,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
                     except Exception as e:
                         print(f"❌ Failed to handle new_property: {e}")
+                        _record_ai_processing_failure(
+                            user_id,
+                            client_id,
+                            thread_id,
+                            msg_id,
+                            f"new_property_event_failed:{e}",
+                        )
+                        raise RetryableProcessingError(f"new_property event failed: {e}")
                 
                 elif event_type == "close_conversation":
                     # Mark thread as closed and notify user
