@@ -9,6 +9,7 @@ os.environ.setdefault(
 )
 
 from email_automation import email as email_module
+from email_automation import notifications as notifications_module
 
 
 class FakeDocRef:
@@ -113,7 +114,8 @@ class OutboxSafetyTests(unittest.TestCase):
         outbox_ref = FakeDocRef()
         fake_fs = FakeFirestore()
 
-        with patch("email_automation.clients._fs", fake_fs):
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "delete_notification_and_decrement_counters") as delete_notification:
             email_module._finalize_successful_outbox_item(
                 "uid-1",
                 outbox_ref,
@@ -128,14 +130,7 @@ class OutboxSafetyTests(unittest.TestCase):
             )
 
         self.assertTrue(outbox_ref.deleted)
-        self.assertIn(
-            (
-                "collection", "users", "document", "uid-1",
-                "collection", "clients", "document", "client-1",
-                "collection", "notifications", "document", "notification-1",
-            ),
-            fake_fs.deleted_paths,
-        )
+        delete_notification.assert_called_once_with("uid-1", "client-1", "notification-1")
         thread_set = fake_fs.set_calls[0]
         self.assertEqual(
             thread_set[0],
@@ -144,6 +139,34 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(thread_set[1]["status"], "active")
         self.assertEqual(thread_set[1]["followUpStatus"], "waiting")
         self.assertTrue(thread_set[2])
+
+    def test_decrement_notification_rollups_clamps_counts(self):
+        updated = notifications_module._decrement_notification_rollups(
+            {
+                "notificationsUnread": 1,
+                "newUpdateCount": 0,
+                "notifCounts": {"action_needed": 1, "sheet_update": 3},
+            },
+            "action_needed",
+        )
+
+        self.assertEqual(updated["notificationsUnread"], 0)
+        self.assertEqual(updated["newUpdateCount"], 0)
+        self.assertEqual(updated["notifCounts"], {"sheet_update": 3})
+
+    def test_decrement_notification_rollups_handles_sheet_update_count(self):
+        updated = notifications_module._decrement_notification_rollups(
+            {
+                "notificationsUnread": 4,
+                "newUpdateCount": 2,
+                "notifCounts": {"sheet_update": 2},
+            },
+            "sheet_update",
+        )
+
+        self.assertEqual(updated["notificationsUnread"], 3)
+        self.assertEqual(updated["newUpdateCount"], 1)
+        self.assertEqual(updated["notifCounts"], {"sheet_update": 1})
 
     def test_duplicate_suppression_terminalizes_action_audit(self):
         doc = FakeDoc({

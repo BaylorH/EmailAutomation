@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from email_automation import ai_processing, processing
 
@@ -73,6 +74,7 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
         class FakeDoc:
             def __init__(self):
+                self.id = "notification-1"
                 self.reference = FakeReference()
 
         class FakeNotificationsRef:
@@ -90,15 +92,17 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         stale_action = FakeDoc()
         notifications_ref = FakeNotificationsRef([stale_action])
 
-        deleted = processing._clear_thread_action_notifications(
-            "uid-1",
-            "client-1",
-            "thread-1",
-            notifications_ref=notifications_ref,
-        )
+        with patch.object(processing, "delete_notification_and_decrement_counters") as delete_notification:
+            deleted = processing._clear_thread_action_notifications(
+                "uid-1",
+                "client-1",
+                "thread-1",
+                notifications_ref=notifications_ref,
+            )
 
         self.assertEqual(1, deleted)
-        self.assertTrue(stale_action.reference.deleted)
+        delete_notification.assert_called_once_with("uid-1", "client-1", "notification-1")
+        self.assertFalse(stale_action.reference.deleted)
         self.assertEqual(2, len(notifications_ref.filters))
 
     def test_marks_client_completed_when_all_threads_terminal_and_no_current_work(self):

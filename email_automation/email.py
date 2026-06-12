@@ -10,6 +10,7 @@ from .utils import exponential_backoff_request, safe_preview, _body_kind, valida
 from .messaging import save_thread_root, save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
 from .clients import _get_sheet_id_or_fail, _sheets_client
 from .sheets import _find_row_by_email, _get_first_tab_title, _read_header_row2, _header_index_map, highlight_row
+from .notifications import delete_notification_and_decrement_counters
 from .utils import normalize_message_id
 
 logger = logging.getLogger(__name__)
@@ -814,12 +815,7 @@ def _finalize_successful_outbox_item(
     notification_client_id = data.get("notificationClientId") or client_id
     if data.get("deleteNotificationOnSend") and notification_id and notification_client_id:
         try:
-            (
-                _fs.collection("users").document(user_id)
-                .collection("clients").document(notification_client_id)
-                .collection("notifications").document(notification_id)
-                .delete()
-            )
+            delete_notification_and_decrement_counters(user_id, notification_client_id, notification_id)
             print(f"   🗑️ Deleted action notification {notification_id} after send")
         except Exception as e:
             print(f"   ⚠️ Could not delete action notification {notification_id}: {e}")

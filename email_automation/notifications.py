@@ -9,6 +9,53 @@ from google.cloud import firestore
 logger = logging.getLogger(__name__)
 
 
+def _decrement_notification_rollups(client_data: Dict[str, Any], kind: Optional[str]) -> Dict[str, Any]:
+    """Return client notification rollups after one notification of kind is resolved."""
+    current_data = client_data or {}
+    unread_count = max(0, int(current_data.get("notificationsUnread") or 0) - 1)
+    new_update_count = int(current_data.get("newUpdateCount") or 0)
+    if kind == "sheet_update":
+        new_update_count = max(0, new_update_count - 1)
+
+    notif_counts = dict(current_data.get("notifCounts") or {})
+    if kind and kind in notif_counts:
+        next_count = max(0, int(notif_counts.get(kind) or 0) - 1)
+        if next_count:
+            notif_counts[kind] = next_count
+        else:
+            notif_counts.pop(kind, None)
+
+    return {
+        "notificationsUnread": unread_count,
+        "newUpdateCount": new_update_count,
+        "notifCounts": notif_counts,
+    }
+
+
+def delete_notification_and_decrement_counters(uid: str, client_id: str, notification_id: str) -> bool:
+    """Delete a notification and keep the parent client rollup counters in sync."""
+    client_ref = _fs.collection("users").document(uid).collection("clients").document(client_id)
+    notif_ref = client_ref.collection("notifications").document(notification_id)
+
+    @firestore.transactional
+    def delete_with_counters(transaction):
+        notif_snapshot = notif_ref.get(transaction=transaction)
+        if not notif_snapshot.exists:
+            return False
+
+        client_snapshot = client_ref.get(transaction=transaction)
+        notif_data = notif_snapshot.to_dict() or {}
+        client_data = client_snapshot.to_dict() if client_snapshot.exists else {}
+        kind = notif_data.get("kind") or notif_data.get("type")
+
+        transaction.delete(notif_ref)
+        transaction.set(client_ref, _decrement_notification_rollups(client_data, kind), merge=True)
+        return True
+
+    transaction = _fs.transaction()
+    return bool(delete_with_counters(transaction))
+
+
 def extract_row_number_from_update(update: Dict[str, Any]) -> Optional[int]:
     """Extract a Sheet row number from explicit metadata or an A1 notation range."""
     row_number = update.get("rowNumber")

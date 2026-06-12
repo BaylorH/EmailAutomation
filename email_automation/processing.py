@@ -19,7 +19,11 @@ from .messaging import (save_message, save_thread_root, index_message_id, index_
 from .logging import write_message_order_test
 from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_row_anchor, check_missing_required_fields, _append_ai_meta
 from .file_handling import fetch_and_process_pdfs, upload_pdf_to_drive
-from .notifications import write_notification, add_client_notifications
+from .notifications import (
+    write_notification,
+    add_client_notifications,
+    delete_notification_and_decrement_counters,
+)
 from .notification_payloads import (
     build_new_property_suggested_email,
     build_wrong_contact_suggested_email,
@@ -159,7 +163,11 @@ def _clear_thread_action_notifications(
         )
         deleted = 0
         for doc in query.stream():
-            doc.reference.delete()
+            notification_id = getattr(doc, "id", None)
+            if notification_id:
+                delete_notification_and_decrement_counters(user_id, client_id, notification_id)
+            else:
+                doc.reference.delete()
             deleted += 1
         if deleted:
             print(f"🧹 Cleared {deleted} stale action notification(s) for completed thread")
