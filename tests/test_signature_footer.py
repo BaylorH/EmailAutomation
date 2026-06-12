@@ -105,6 +105,20 @@ class SignatureFooterTests(unittest.TestCase):
         self.assertNotIn("Jill Ames", html)
         self.assertNotIn("jill.ames@mohrpartners.com", html)
 
+    def test_format_body_normalizes_smart_punctuation_before_graph_send(self):
+        html = format_email_body_with_footer(
+            "Hi Casey,\n\nI\u2019ll send the tour packet\u2014please review \u201cSuite B\u201d \u2022 NNN.",
+            "",
+            "none",
+        )
+
+        self.assertIn("I'll send the tour packet-please review \"Suite B\" - NNN.", html)
+        self.assertNotIn("\u2019", html)
+        self.assertNotIn("\u2014", html)
+        self.assertNotIn("\u201c", html)
+        self.assertNotIn("\u201d", html)
+        self.assertNotIn("\u2022", html)
+
     def test_professional_html_signature_uses_custom_inline_logo_attachment(self):
         logo_bytes = base64.b64encode(b"fake-logo").decode("ascii")
         signature = f"""<!-- sitesift:professional-signature:v1 -->

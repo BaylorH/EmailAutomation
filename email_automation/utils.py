@@ -19,6 +19,23 @@ _GLUED_DOCUMENT_SIGNOFF_RX = re.compile(
     r"(?:thank(?:s|you|\s+you)?|regards|best|sincerely|cheers|sent|from|on)"
     r"[\w,.;:!?\- ]*$"
 )
+_OUTBOUND_TEXT_TRANSLATION = str.maketrans({
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201a": "'",
+    "\u201b": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u201e": '"',
+    "\u201f": '"',
+    "\u2013": "-",
+    "\u2014": "-",
+    "\u2015": "-",
+    "\u2212": "-",
+    "\u2022": "-",
+    "\u2026": "...",
+    "\u00a0": " ",
+})
 
 def _body_kind(script: str):
     if script and _html_rx.search(script):
@@ -27,6 +44,11 @@ def _body_kind(script: str):
 
 def _normalize_email(s: str) -> str:
     return (s or "").strip().lower()
+
+
+def normalize_outbound_message_text(text: str) -> str:
+    """Normalize generated copy before handing HTML to mail transports."""
+    return (text or "").translate(_OUTBOUND_TEXT_TRANSLATION)
 
 
 def strip_email_quotes(text: str) -> str:
@@ -804,8 +826,8 @@ def format_email_body_with_footer(
         signature_mode: Signature mode - "none", "custom", or "professional"
         user_email: Sender profile email used to gate the legacy MOHR footer
     """
-    # Strip trailing whitespace/newlines from body before converting
-    body = body.rstrip()
+    # Strip trailing whitespace/newlines from body before converting.
+    body = normalize_outbound_message_text(body).rstrip()
 
     # Convert plain text to HTML
     # Replace double newlines with <br><br>, single newlines with <br>
