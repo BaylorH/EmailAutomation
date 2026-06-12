@@ -20,6 +20,38 @@ CANONICAL FIELDS:
 import json
 from typing import Dict, List, Optional, Any
 
+
+LISTING_COMMENT_COLUMN_ALIASES = (
+    "listing broker comments",
+    "listing brokers comments",
+    "listing broker comment",
+    "broker comments",
+    "broker notes",
+    "comments",
+    "notes",
+)
+
+CLIENT_COMMENT_COLUMN_ALIASES = (
+    "client / team comments",
+    "client/team comments",
+    "client and team comments",
+    "team and client comments",
+    "team comments",
+    "client comments",
+    "clients comments",
+    "internal notes",
+    "our comments",
+)
+
+LEGACY_CLIENT_COMMENT_COLUMN_ALIASES = (
+    "jills comments",
+    "jill's comments",
+    "jill comments",
+    "jill and client comments",
+    "jill/client comments",
+    "jill and clients comments",
+)
+
 # ============================================================================
 # CANONICAL FIELD DEFINITIONS
 # ============================================================================
@@ -201,10 +233,11 @@ CANONICAL_FIELDS = {
         "append_mode": True,
     },
     "client_comments": {
-        "label": "Jill and Clients comments",
+        "label": "Client / Team Comments",
         "description": "Internal client notes",
         "required_for_matching": False,
-        "default_aliases": ["jills comments", "jill's comments", "jill and clients comments", "clients comments", "client comments", "internal notes", "our comments"],
+        "default_aliases": list(CLIENT_COMMENT_COLUMN_ALIASES),
+        "legacy_aliases": list(LEGACY_CLIENT_COMMENT_COLUMN_ALIASES),
         "extraction_hints": None,  # Internal use only
         "format": "text",
         "extractable": False,
@@ -280,6 +313,49 @@ def get_default_column_config() -> Dict[str, Any]:
     }
 
 
+def get_field_aliases(canonical: str) -> List[str]:
+    """Return current aliases first, then legacy aliases for existing sheets."""
+    field = CANONICAL_FIELDS.get(canonical, {})
+    aliases = list(field.get("default_aliases", []))
+    aliases.extend(field.get("legacy_aliases", []))
+    return aliases
+
+
+def _normalized_column_name(name: str) -> str:
+    return (name or "").strip().lower()
+
+
+def _find_header_index_for_aliases(header: List[str], aliases: List[str]) -> Optional[int]:
+    alias_set = {_normalized_column_name(alias) for alias in aliases}
+    for index, column in enumerate(header, start=1):
+        if _normalized_column_name(column) in alias_set:
+            return index
+    return None
+
+
+def find_listing_comment_column_index(header: List[str]) -> Optional[int]:
+    return _find_header_index_for_aliases(header, list(LISTING_COMMENT_COLUMN_ALIASES))
+
+
+def find_client_comment_column_index(header: List[str]) -> Optional[int]:
+    current_index = _find_header_index_for_aliases(header, list(CLIENT_COMMENT_COLUMN_ALIASES))
+    if current_index:
+        return current_index
+    return _find_header_index_for_aliases(header, list(LEGACY_CLIENT_COMMENT_COLUMN_ALIASES))
+
+
+def find_notes_comment_column_index(header: List[str]) -> Optional[int]:
+    return find_listing_comment_column_index(header) or find_client_comment_column_index(header)
+
+
+def is_wrapped_notes_column(header_name: str) -> bool:
+    normalized = _normalized_column_name(header_name)
+    wrap_aliases = set(LISTING_COMMENT_COLUMN_ALIASES)
+    wrap_aliases.update(CLIENT_COMMENT_COLUMN_ALIASES)
+    wrap_aliases.update(LEGACY_CLIENT_COMMENT_COLUMN_ALIASES)
+    return normalized in wrap_aliases
+
+
 def get_default_mode_for_canonical(canonical: str) -> str:
     """
     Get the default column mode for a canonical field.
@@ -329,7 +405,7 @@ def detect_column_mapping(headers: List[str], use_ai: bool = True) -> Dict[str, 
 
     # First pass: exact alias matching
     for canonical, field in CANONICAL_FIELDS.items():
-        for alias in field.get("default_aliases", []):
+        for alias in get_field_aliases(canonical):
             alias_norm = alias.strip().lower()
             if alias_norm in normalized_headers:
                 actual_header = normalized_headers[alias_norm]

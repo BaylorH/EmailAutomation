@@ -4,6 +4,7 @@ import random
 from typing import Optional, List, Dict, Any
 from googleapiclient.errors import HttpError
 from .clients import _sheets_client
+from .column_config import is_wrapped_notes_column
 from .utils import _norm_txt, _normalize_email
 
 # Rate limit handling configuration
@@ -178,7 +179,7 @@ def _find_row_by_address_city(sheets, spreadsheet_id: str, tab_title: str,
 def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: list[str]) -> None:
     """
     Auto-size all columns to the longest visible value + padding, with exceptions:
-      - 'Listing Brokers Comments ' and 'Jill and Clients Comments' -> WRAP and be reasonably wide
+      - broker and client/team note columns -> WRAP and be reasonably wide
       - 'Flyer / Link' and 'Floorplan' -> CLIP and keep width small (ignore huge URLs)
     Header row (row 2) is NOT wrapped.
     Column A additionally respects the width of cell A1 (client name).
@@ -202,10 +203,6 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
     def _norm(name: str) -> str:
         return (name or "").strip().lower()
 
-    WRAP_KEYS = {
-        "listing brokers comments",   # trailing space in sheet header is normalized out
-        "jill and clients comments",
-    }
     LINK_KEYS = {"flyer / link", "floorplan", "floor plan"}
 
     sheets = _sheets_client()
@@ -273,7 +270,7 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
             width_px = min(width_px, LINK_CAP_PX)
             wrap_mode = "CLIP"
 
-        elif col_key in WRAP_KEYS:
+        elif is_wrapped_notes_column(col):
             width_px = max(MIN_WRAP_PX, min(auto_px, MAX_WRAP_PX))
             wrap_mode = "WRAP"
 

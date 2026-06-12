@@ -648,18 +648,14 @@ def get_signature_attachments(custom_signature: str = None, signature_mode: str 
     Get signature images as inline attachments for Microsoft Graph API.
 
     User-created professional signatures can include uploaded logo data URLs.
-    Those are converted to CID attachments. Empty legacy MOHR professional mode
-    keeps using the bundled MOHR logo and LinkedIn image.
+    Those are converted to CID attachments. The bundled MOHR logo is only for
+    Jill's explicit legacy profile, never a generic company/domain default.
     """
     custom_attachments = _custom_signature_attachment_entries(custom_signature)
     if custom_attachments:
         return custom_attachments
 
     if (
-        signature_mode is None
-        and custom_signature is None
-        and user_email is None
-    ) or (
         signature_mode == "professional"
         and not (custom_signature and custom_signature.strip())
         and _is_legacy_mohr_signature_user(user_email)
@@ -689,9 +685,9 @@ def convert_plain_text_signature_to_html(plain_text_signature: str) -> str:
 
 
 def _is_legacy_mohr_signature_user(user_email: str = None) -> bool:
-    """Only MOHR-owned sender profiles may use the legacy hardcoded MOHR footer."""
+    """Only Jill's explicit legacy sender profile may use the old hardcoded footer."""
     email = (user_email or "").strip().lower()
-    return email.endswith("@mohrpartners.com")
+    return email == "jill.ames@mohrpartners.com"
 
 
 def get_email_footer(custom_signature: str = None, signature_mode: str = None, user_email: str = None) -> str:
@@ -705,9 +701,9 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None, u
                        - "custom": Use the custom_signature text (converted to HTML)
                        - "professional": Use custom_signature when present. Empty
                          professional profiles only use the legacy MOHR/Jill footer for
-                         MOHR-owned sender emails.
+                         Jill's explicit legacy sender profile.
                        - None/empty: Defaults to "none" (user must explicitly configure)
-        user_email: Sender profile email used to gate the legacy MOHR footer.
+        user_email: Sender profile email used to gate the legacy Jill footer.
     """
     # Default to "none" when mode is not set - user must explicitly configure signature in settings
     if not signature_mode:

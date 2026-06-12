@@ -50,7 +50,10 @@ class SignatureFooterTests(unittest.TestCase):
             )
         )
 
-    def test_professional_mode_without_user_signature_keeps_legacy_mohr_for_mohr_users(self):
+    def test_signature_attachments_do_not_default_to_company_logo_without_profile_context(self):
+        self.assertEqual([], get_signature_attachments())
+
+    def test_professional_mode_without_user_signature_keeps_legacy_jill_only_for_jill(self):
         footer = get_email_footer(
             "",
             "professional",
@@ -64,6 +67,30 @@ class SignatureFooterTests(unittest.TestCase):
                 "",
                 user_email="jill.ames@mohrpartners.com",
             )
+        )
+
+    def test_professional_mode_without_user_signature_does_not_use_jill_for_other_mohr_users(self):
+        footer = get_email_footer(
+            "",
+            "professional",
+            user_email="drew.ingram@mohrpartners.com",
+        )
+
+        self.assertEqual("", footer)
+        self.assertFalse(
+            needs_signature_attachments(
+                "professional",
+                "",
+                user_email="drew.ingram@mohrpartners.com",
+            )
+        )
+        self.assertEqual(
+            [],
+            get_signature_attachments(
+                "",
+                "professional",
+                user_email="drew.ingram@mohrpartners.com",
+            ),
         )
 
     def test_format_body_does_not_append_jill_for_empty_non_mohr_professional_signature(self):

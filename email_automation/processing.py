@@ -36,6 +36,7 @@ from .email_operations import (
 )
 from .pending_responses import queue_pending_response
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE, INBOX_SCAN_WINDOW_HOURS
+from .column_config import find_client_comment_column_index, find_notes_comment_column_index
 
 logger = logging.getLogger(__name__)
 
@@ -471,6 +472,16 @@ def _build_property_unavailable_comment(current_date: str, found_keyword: str, e
         return base
 
     return f"{base} ({'; '.join(alternates)})"
+
+
+def _has_new_property_path(
+    events: List[Dict[str, Any]],
+    new_row_created: bool = False,
+    new_property_pending_created: bool = False,
+) -> bool:
+    if new_row_created or new_property_pending_created:
+        return True
+    return any((event or {}).get("type") == "new_property" for event in (events or []))
 
 
 def _property_exists_in_sheet(
@@ -1435,6 +1446,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         # --- flags for gating later ---
         old_row_became_nonviable = False   # set true when we move the row below divider
         new_row_created = False            # set true when we insert a new property row
+        new_property_pending_created = False
         new_row_number = None              # track the newly created row number
 
         # NEW: Handle PDF attachments with enhanced extraction for current message only
@@ -1786,26 +1798,10 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                                 "updatedAt": SERVER_TIMESTAMP,
                             }, merge=True)
 
-                            # Add comment to comments column explaining why it was marked unviable
-                            # Prefer "Listing Brokers Comments", fallback to "Jill and Clients Comments"
+                            # Add comment to the best available notes column explaining why it was marked unviable.
                             try:
-                                # Find the comments column index
-                                comments_col_idx = None
-                                for i, col_name in enumerate(header):
-                                    col_lower = (col_name or "").lower().strip()
-                                    # First priority: Listing Brokers Comments
-                                    if "listing brokers comments" in col_lower or "listing broker comments" in col_lower:
-                                        comments_col_idx = i + 1  # 1-based for Sheets API
-                                        break
+                                comments_col_idx = find_notes_comment_column_index(header)
 
-                                # Fallback: Jill and Clients Comments
-                                if comments_col_idx is None:
-                                    for i, col_name in enumerate(header):
-                                        col_lower = (col_name or "").lower().strip()
-                                        if "jill and clients comments" in col_lower:
-                                            comments_col_idx = i + 1
-                                            break
-                                
                                 if comments_col_idx:
                                     # Get current date for the comment
                                     from datetime import datetime
@@ -1843,7 +1839,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                                     
                                     print(f"💬 Added unavailability comment: {unavailable_comment}")
                                 else:
-                                    print(f"⚠️ Could not find comments column (Listing Brokers Comments or Jill and Clients Comments) to add unavailability reason")
+                                    print(f"⚠️ Could not find notes column to add unavailability reason")
                             except Exception as comment_error:
                                 print(f"⚠️ Failed to add unavailability comment: {comment_error}")
                             
@@ -2040,6 +2036,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             dedupe_key=f"new_property_pending:{thread_id}:{address}:{city}:{new_property_email}"
                         )
                         mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
+                        new_property_pending_created = True
                         print(f"🏢 Created new property pending approval notification (no row created yet)")
 
                         # Let the AI-generated response_email flow through normally
@@ -2164,20 +2161,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                                 current_date = datetime.now().strftime("%m/%d/%Y")
                                 optout_comment = f"[{current_date}] Contact opted out: {reason_labels.get(reason, reason)}"
 
-                                # Find comments column
-                                comments_col_idx = None
-                                for i, col_name in enumerate(header):
-                                    col_lower = (col_name or "").lower().strip()
-                                    if col_lower in {
-                                        "jills comments",
-                                        "jill comments",
-                                        "client comments",
-                                        "clients comments",
-                                        "jill and client comments",
-                                        "jill and clients comments",
-                                    }:
-                                        comments_col_idx = i + 1
-                                        break
+                                comments_col_idx = find_client_comment_column_index(header)
 
                                 if comments_col_idx:
                                     existing_resp = sheets.spreadsheets().values().get(
@@ -2355,11 +2339,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         # Add issue to comments column
                         try:
                             tab_title = _get_first_tab_title(sheets, sheet_id)
-                            comments_col_idx = None
-                            for i, col_name in enumerate(header):
-                                if col_name and "jill and clients comments" in col_name.lower():
-                                    comments_col_idx = i + 1
-                                    break
+                            comments_col_idx = find_client_comment_column_index(header)
 
                             if comments_col_idx:
                                 from datetime import datetime
@@ -2416,7 +2396,12 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
             # DEFERRED PDF LINK WRITING: Only write to current row if NOT a new_property scenario
             # If new_property was detected, the PDFs belong to the new property, not this row
-            if pdf_manifest and not new_row_created:
+            has_new_property_path = _has_new_property_path(
+                events,
+                new_row_created=new_row_created,
+                new_property_pending_created=new_property_pending_created,
+            )
+            if pdf_manifest and not has_new_property_path:
                 try:
                     sheets = _sheets_client()
 
@@ -2469,8 +2454,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             print(f"ℹ️ Skipped re-format after link append: {_e}")
                 except Exception as e:
                     print(f"⚠️ Failed to write PDF links to sheet: {e}")
-            elif pdf_manifest and new_row_created:
-                print(f"   ℹ️ Skipping PDF link write to old row - PDFs belong to new property")
+            elif pdf_manifest and has_new_property_path:
+                print(f"   ℹ️ Skipping PDF link write to old row - PDFs belong to new property path")
 
             # Update the message record with attachment info so frontend can display links
             if pdf_manifest and internet_message_id:
@@ -2499,6 +2484,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             print(f"{'='*60}")
             print(f"   old_row_became_nonviable: {old_row_became_nonviable}")
             print(f"   new_row_created: {new_row_created}")
+            print(f"   new_property_pending_created: {new_property_pending_created}")
             print(f"   LLM response available: {bool(proposal.get('response_email'))}")
 
             try:
@@ -2527,7 +2513,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 )
 
                 # Scenario 1: Property became non-viable AND new property was suggested
-                if old_row_became_nonviable and new_row_created:
+                if old_row_became_nonviable and has_new_property_path:
                     print(f"   📍 SCENARIO 1: Non-viable + new property suggested")
                     # Use LLM-generated response if available, otherwise use template
                     if llm_response_email:
@@ -2550,7 +2536,7 @@ I'll review the new property details and get back to you if I have any questions
                         queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
                 
                 # Scenario 2: Property became non-viable but NO new property suggested
-                elif old_row_became_nonviable and not new_row_created:
+                elif old_row_became_nonviable and not has_new_property_path:
                     print(f"   📍 SCENARIO 2: Non-viable, no new property")
                     # Use LLM-generated response if available, otherwise use template
                     if llm_response_email:

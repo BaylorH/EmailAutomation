@@ -919,7 +919,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         signature_mode: Signature mode - "none", "custom", or "professional"
         followup_config: Optional follow-up configuration from outbox
         contact_name: Optional contact name for follow-up personalization
-        user_email: Sender profile email used to gate the legacy MOHR footer
+        user_email: Sender profile email used to gate Jill's explicit legacy footer
 
     SAFETY: All recipient emails are validated before sending to prevent sending to malformed addresses.
     SAFETY: Opted-out contacts are filtered out before sending.

@@ -14,6 +14,7 @@ from .column_config import (
     get_default_column_config,
     build_column_rules_prompt,
     get_required_fields_for_close,
+    find_notes_comment_column_index,
     REQUIRED_FOR_CLOSE,
 )
 from .notification_payloads import sanitize_new_property_referral_response
@@ -60,6 +61,36 @@ def _latest_inbound_text(conversation: List[dict]) -> str:
         if (message.get("direction") or "").lower() == "inbound":
             return message.get("content") or message.get("body") or message.get("preview") or ""
     return ""
+
+
+def _augment_events_with_deterministic_signals(proposal: dict, conversation: List[dict]) -> dict:
+    """Add high-confidence event signals from broker phrases the model can miss."""
+    if not proposal:
+        return proposal
+
+    events = proposal.setdefault("events", [])
+    if any((event or {}).get("type") == "property_unavailable" for event in events):
+        return proposal
+
+    latest_text = _latest_inbound_text(conversation).lower()
+    if not latest_text:
+        return proposal
+
+    unavailable_patterns = [
+        ("signed_loi", r"\bsigned\s+(?:an?\s+)?(?:loi|letter\s+of\s+intent)\b"),
+        ("signed_lease", r"\bsigned\s+(?:a\s+)?lease\b"),
+        ("no_longer_represented", r"\bno\s+longer\s+represent(?:s|ed|ing)?\s+(?:this\s+|the\s+)?property\b"),
+        ("no_space_available", r"\b(?:no|not\s+any|do(?:es)?\s+not\s+have\s+any)\s+space\s+available\b"),
+        ("no_availability", r"\bno\s+availability\b"),
+        ("fully_leased", r"\bfully\s+leased\b"),
+    ]
+
+    for reason, pattern in unavailable_patterns:
+        if re.search(pattern, latest_text):
+            events.append({"type": "property_unavailable", "reason": reason})
+            return proposal
+
+    return proposal
 
 
 def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
@@ -388,48 +419,18 @@ def _append_ai_meta(
 
 def _append_notes_to_comments(sheets, spreadsheet_id: str, tab_title: str, header: List[str], rownum: int, notes: str):
     """
-    Append notes to the comments field (Listing Brokers Comments or Jill and Clients Comments).
-    Prefers 'Listing Brokers Comments' if available, otherwise uses 'Jill and Clients Comments'.
+    Append notes to the comments field.
+    Prefers listing-broker comments if available, otherwise uses user/client notes.
     Appends to existing comments with a separator.
     """
     try:
-        idx_map = _header_index_map(header)
-        
-        # Try to find comments column (prefer broker comments, fallback to user/client notes)
-        comments_col_idx = None
-        comments_col_name = None
-
-        # First try broker comments. The live MOHR sheet uses singular "Listing Broker Comments".
-        for key in [
-            "listing broker comments",
-            "listing brokers comments",
-            "listing broker comment",
-            "broker comments",
-            "broker notes",
-        ]:
-            if key in idx_map:
-                comments_col_idx = idx_map[key]
-                comments_col_name = key
-                break
-
-        # Fallback to Jill/client comment columns.
-        if comments_col_idx is None:
-            for key in [
-                "jills comments",
-                "jill's comments",
-                "jill and clients comments",
-                "jill/client comments",
-                "clients comments",
-                "client comments",
-            ]:
-                if key in idx_map:
-                    comments_col_idx = idx_map[key]
-                    comments_col_name = key
-                    break
+        comments_col_idx = find_notes_comment_column_index(header)
 
         if comments_col_idx is None:
             print(f"⚠️ Could not find comments column to append notes")
             return
+
+        comments_col_name = header[comments_col_idx - 1]
         
         # Get existing comments
         col_letter = _col_letter(comments_col_idx)
@@ -875,7 +876,7 @@ Therefore, your response email body should:
 - DO NOT include any signature, contact information, or footer content
 
 GUIDELINES:
-- Write in a professional, friendly tone matching Jill Ames' communication style
+- Write in a professional, friendly tone suitable for commercial real estate outreach and the sender's configured profile
 - CRITICAL: Vary your language naturally - NEVER use the same phrases repeatedly across emails
 - Reference specific details from the conversation to show you're paying attention
 - Keep responses concise and to the point - short and direct
@@ -1182,6 +1183,7 @@ OUTPUT ONLY valid JSON in this exact format:
         proposal = _augment_proposal_with_deterministic_extractions(
             proposal, rowvals, header, effective_config, conversation
         )
+        proposal = _augment_events_with_deterministic_signals(proposal, conversation)
         proposal = sanitize_new_property_referral_response(
             proposal,
             original_contact_email=email,
