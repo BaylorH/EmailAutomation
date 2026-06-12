@@ -247,6 +247,18 @@ def get_row_anchor(rowvals: List[str], header: List[str]) -> str:
     except Exception:
         return "Unknown property"
 
+
+def _build_row_snapshot(header: List[str], rowvals: List[str]) -> dict:
+    """Return a header-keyed row snapshot for report and audit readback."""
+    snapshot = {}
+    for idx, column_name in enumerate(header or []):
+        column = (column_name or "").strip()
+        if not column:
+            continue
+        snapshot[column] = rowvals[idx] if idx < len(rowvals or []) else ""
+    return snapshot
+
+
 def check_missing_required_fields(rowvals: List[str], header: List[str], column_config: dict = None) -> List[str]:
     """
     Check which required fields are missing from the row.
@@ -489,10 +501,22 @@ def apply_proposal_to_sheet(
         _ensure_ai_meta_tab(sheets, sheet_id)
 
         if not proposal or not isinstance(proposal.get("updates"), list):
-            return {"applied": [], "skipped": [{"reason":"no-updates"}]}
+            row_anchor = get_row_anchor(current_rowvals, header)
+            return {
+                "applied": [],
+                "skipped": [{"reason": "no-updates"}],
+                "rowNumber": rownum,
+                "targetAnchor": row_anchor,
+                "rowSnapshotBefore": _build_row_snapshot(header, current_rowvals),
+                "rowSnapshotAfter": _build_row_snapshot(header, current_rowvals),
+            }
 
         idx_map = _header_index_map(header)
         row_anchor = get_row_anchor(current_rowvals, header)
+        row_snapshot_before = _build_row_snapshot(header, current_rowvals)
+        row_after = list(current_rowvals or [])
+        if len(row_after) < len(header or []):
+            row_after.extend([""] * (len(header or []) - len(row_after)))
 
         data_payload = []
         applied, skipped = [], []
@@ -554,6 +578,8 @@ def apply_proposal_to_sheet(
 
             # 4) otherwise proceed to write...
             data_payload.append({"range": rng, "values": [[new_val]]})
+            if (col_idx - 1) < len(row_after):
+                row_after[col_idx - 1] = new_val
             applied.append({
                 "column": col_name,
                 "range": rng,
@@ -564,7 +590,14 @@ def apply_proposal_to_sheet(
             })
 
         if not data_payload:
-            return {"applied": [], "skipped": skipped}
+            return {
+                "applied": [],
+                "skipped": skipped,
+                "rowNumber": rownum,
+                "targetAnchor": row_anchor,
+                "rowSnapshotBefore": row_snapshot_before,
+                "rowSnapshotAfter": _build_row_snapshot(header, row_after),
+            }
 
         # Execute batch update
         _execute_with_retry(
@@ -628,7 +661,14 @@ def apply_proposal_to_sheet(
                 conf = s.get('confidence', 'N/A')
                 print(f"     • {s.get('column', 'Unknown')}: '{old_val}' (reason: {reason}, confidence: {conf})")
 
-        return {"applied": applied, "skipped": skipped}
+        return {
+            "applied": applied,
+            "skipped": skipped,
+            "rowNumber": rownum,
+            "targetAnchor": row_anchor,
+            "rowSnapshotBefore": row_snapshot_before,
+            "rowSnapshotAfter": _build_row_snapshot(header, row_after),
+        }
 
     except Exception as e:
         print(f"❌ Failed to apply proposal to sheet: {e}")

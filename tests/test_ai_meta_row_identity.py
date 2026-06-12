@@ -122,6 +122,53 @@ class AiMetaRowIdentityTests(unittest.TestCase):
         appended_row = fake_sheets.values_api.append_calls[0]["body"]["values"][0]
         self.assertEqual("404 New Way, Dallas", appended_row[5])
 
+    def test_applied_result_includes_row_snapshot_evidence_for_reports(self):
+        fake_sheets = FakeSheets()
+        header = ["Property Address", "City", "Total SF", "Power"]
+        current_row = ["777 Alternative Logistics Dr", "Mesa", "", ""]
+        proposal = {
+            "updates": [
+                {
+                    "column": "Total SF",
+                    "value": "18,500",
+                    "confidence": 0.95,
+                    "reason": "Broker confirmed size.",
+                },
+                {
+                    "column": "Power",
+                    "value": "800A 3-phase",
+                    "confidence": 0.9,
+                    "reason": "Broker confirmed service.",
+                },
+            ]
+        }
+
+        with patch("email_automation.ai_processing._sheets_client", return_value=fake_sheets), \
+             patch("email_automation.ai_processing._get_first_tab_title", return_value="Sheet1"), \
+             patch("email_automation.sheet_operations._apply_gross_rent_formula_for_row", return_value=False):
+            result = apply_proposal_to_sheet(
+                "uid-1",
+                "client-1",
+                "sheet-1",
+                header,
+                6,
+                current_row,
+                proposal,
+            )
+
+        self.assertEqual("777 Alternative Logistics Dr, Mesa", result["targetAnchor"])
+        self.assertEqual(
+            {
+                "Property Address": "777 Alternative Logistics Dr",
+                "City": "Mesa",
+                "Total SF": "",
+                "Power": "",
+            },
+            result["rowSnapshotBefore"],
+        )
+        self.assertEqual("18,500", result["rowSnapshotAfter"]["Total SF"])
+        self.assertEqual("800A 3-phase", result["rowSnapshotAfter"]["Power"])
+
 
 if __name__ == "__main__":
     unittest.main()
