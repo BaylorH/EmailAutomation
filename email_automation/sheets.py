@@ -270,7 +270,7 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
             width_px = min(width_px, LINK_CAP_PX)
             wrap_mode = "CLIP"
 
-        elif is_wrapped_notes_column(col):
+        elif is_wrapped_notes_column(header_text):
             width_px = max(MIN_WRAP_PX, min(auto_px, MAX_WRAP_PX))
             wrap_mode = "WRAP"
 
