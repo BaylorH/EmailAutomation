@@ -22,6 +22,11 @@ MAX_INDEX_RETRIES = 3
 # Claim timeout in seconds (if a claim is older than this, it's considered stale)
 CLAIM_TIMEOUT_SECONDS = 300  # 5 minutes
 
+# Outbox items from these dashboard flows already contain operator-reviewed body
+# copy. They must not be replaced by contact-history campaign fallback text.
+EXACT_OUTBOX_SOURCES = {"dashboard_tour_planner"}
+EXACT_OUTBOX_ACTION_TYPES = {"tour_invite"}
+
 # Unique worker ID for this process
 WORKER_ID = str(uuid.uuid4())[:8]
 
@@ -722,7 +727,14 @@ Thanks!"""
 
 def _should_use_exact_outbox_script(data: Dict[str, Any]) -> bool:
     """True when the outbox item contains approved copy that must not be re-selected."""
-    return data.get("scriptSelectionMode") == "exact" or data.get("forceScript") is True
+    source = str(data.get("source") or "").strip().lower()
+    action_type = str(data.get("actionType") or "").strip().lower()
+    return (
+        data.get("scriptSelectionMode") == "exact"
+        or data.get("forceScript") is True
+        or source in EXACT_OUTBOX_SOURCES
+        or action_type in EXACT_OUTBOX_ACTION_TYPES
+    )
 
 
 def _is_cancelled_outbox_item(data: Dict[str, Any]) -> bool:
