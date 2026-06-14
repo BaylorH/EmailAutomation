@@ -138,6 +138,136 @@ def _record_ai_processing_failure(user_id: str, client_id: str, thread_id: str, 
         print(f"⚠️ Could not record AI processing failure: {e}")
 
 
+PDF_LINK_CHANGE_REASON = "Broker PDF attachment uploaded to Drive."
+PDF_LINK_COLUMN_ALIASES = {
+    "Flyer / Link": ("flyer / link", "flyer/link", "flyer"),
+    "Floorplan": ("floorplan", "floor plan"),
+}
+
+
+def _find_header_column_name(header: List[str], canonical_column: str) -> Optional[str]:
+    idx_map = _header_index_map(header or [])
+    aliases = PDF_LINK_COLUMN_ALIASES.get(canonical_column, (canonical_column.strip().lower(),))
+    for alias in aliases:
+        col_idx = idx_map.get(alias)
+        if col_idx and (col_idx - 1) < len(header or []):
+            return (header[col_idx - 1] or canonical_column).strip() or canonical_column
+    return None
+
+
+def _read_row_cell_by_header(header: List[str], rowvals: List[str], column_name: str) -> str:
+    idx_map = _header_index_map(header or [])
+    col_idx = idx_map.get((column_name or "").strip().lower())
+    if not col_idx:
+        return ""
+    value_index = col_idx - 1
+    if value_index >= len(rowvals or []):
+        return ""
+    return str((rowvals or [])[value_index] or "").strip()
+
+
+def _merge_link_lines(existing_value: str, added_links: List[str]) -> str:
+    existing_lines = [
+        line.strip()
+        for line in str(existing_value or "").splitlines()
+        if line.strip()
+    ]
+    seen = set(existing_lines)
+    merged = list(existing_lines)
+    for raw_link in added_links or []:
+        link = str(raw_link or "").strip()
+        if not link or link in seen:
+            continue
+        merged.append(link)
+        seen.add(link)
+    return "\n".join(merged)
+
+
+def _build_pdf_link_sheet_change_applied_record(
+    header: List[str],
+    rowvals: List[str],
+    link_updates_by_column: Dict[str, List[str]],
+    *,
+    row_number: Optional[int] = None,
+) -> Dict[str, Any]:
+    applied = []
+    for canonical_column, added_links in (link_updates_by_column or {}).items():
+        column_name = _find_header_column_name(header, canonical_column)
+        if not column_name:
+            continue
+        old_value = _read_row_cell_by_header(header, rowvals or [], column_name)
+        new_value = _merge_link_lines(old_value, added_links)
+        if not new_value or new_value == old_value:
+            continue
+        applied.append({
+            "column": column_name,
+            "oldValue": old_value,
+            "newValue": new_value,
+            "confidence": 1.0,
+            "reason": PDF_LINK_CHANGE_REASON,
+        })
+
+    return {
+        "applied": applied,
+        "skipped": [],
+        "rowNumber": row_number,
+        "source": "pdf_link_write",
+    }
+
+
+def _store_pdf_link_sheet_change(
+    user_id: str,
+    client_id: str,
+    sheet_id: str,
+    header: List[str],
+    rownum: int,
+    rowvals: List[str],
+    thread_id: str,
+    email: str,
+    pdf_manifest: List[Dict[str, Any]],
+    link_updates_by_column: Dict[str, List[str]],
+) -> Optional[str]:
+    apply_result = _build_pdf_link_sheet_change_applied_record(
+        header,
+        rowvals,
+        link_updates_by_column,
+        row_number=rownum,
+    )
+    if not apply_result.get("applied"):
+        return None
+
+    try:
+        applied_hash = hashlib.sha256(
+            json.dumps(apply_result, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        now_id = datetime.now(timezone.utc).isoformat().replace(":", "-").replace(".", "-").replace("+00:00", "Z")
+        file_ids = [
+            p.get("file_id") or p.get("id")
+            for p in (pdf_manifest or [])
+            if p.get("file_id") or p.get("id")
+        ]
+        doc_id = f"{thread_id}__pdf_links__{now_id}"
+        _fs.collection("users").document(user_id).collection("sheetChangeLog").document(doc_id).set({
+            "clientId": client_id,
+            "email": email,
+            "sheetId": sheet_id,
+            "rowNumber": rownum,
+            "targetAnchor": get_row_anchor(rowvals, header),
+            "applied": apply_result,
+            "status": "applied",
+            "source": "pdf_link_write",
+            "threadId": thread_id,
+            "createdAt": SERVER_TIMESTAMP,
+            "fileIds": file_ids,
+            "proposalHash": applied_hash,
+        })
+        print(f"💾 Stored PDF link sheetChangeLog/{doc_id}")
+        return doc_id
+    except Exception as e:
+        print(f"⚠️ Failed to store PDF link sheetChangeLog record: {e}")
+        return None
+
+
 def _clear_thread_action_notifications(
     user_id: str,
     client_id: str,
@@ -2512,10 +2642,12 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             if pdf_manifest and not has_new_property_path:
                 try:
                     sheets = _sheets_client()
+                    pdf_link_updates_for_results: Dict[str, List[str]] = {}
 
                     if flyer_links:
                         added_flyer_links = append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
                         if added_flyer_links:
+                            pdf_link_updates_for_results["Flyer / Link"] = added_flyer_links
                             logger.debug(
                                 "sheet.ai_meta_append",
                                 extra={
@@ -2538,6 +2670,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     if floorplan_links:
                         added_floorplan_links = append_links_to_floorplan_column(sheets, sheet_id, header, rownum, floorplan_links)
                         if added_floorplan_links:
+                            pdf_link_updates_for_results["Floorplan"] = added_floorplan_links
                             logger.debug(
                                 "sheet.ai_meta_append",
                                 extra={
@@ -2560,6 +2693,20 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             format_sheet_columns_autosize_with_exceptions(sheet_id, header)
                         except Exception as _e:
                             print(f"ℹ️ Skipped re-format after link append: {_e}")
+
+                    if pdf_link_updates_for_results:
+                        _store_pdf_link_sheet_change(
+                            user_id,
+                            client_id,
+                            sheet_id,
+                            header,
+                            rownum,
+                            rowvals,
+                            thread_id,
+                            to_addr_lower,
+                            pdf_manifest,
+                            pdf_link_updates_for_results,
+                        )
                 except Exception as e:
                     print(f"⚠️ Failed to write PDF links to sheet: {e}")
             elif pdf_manifest and has_new_property_path:
