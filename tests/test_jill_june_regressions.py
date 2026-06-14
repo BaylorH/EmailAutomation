@@ -72,6 +72,53 @@ class JillJuneRegressionTests(unittest.TestCase):
 
         self.assertTrue(processing._has_new_property_path(events))
 
+    def test_unavailable_event_without_address_does_not_apply_to_replacement_row(self):
+        event = {"type": "property_unavailable", "reason": "fully_leased"}
+        message_text = (
+            "404 Replacement Signal Ave is fully leased. "
+            "A similar option is 414 Alternate Signal Ave in Las Vegas. "
+            "Following up with the package details for 414 Alternate Signal Ave: "
+            "19,250 SF, asking $1.05/SF/month NNN."
+        )
+
+        self.assertFalse(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="414 Alternate Signal Ave, Las Vegas",
+                message_text=message_text,
+            )
+        )
+
+    def test_unavailable_event_without_address_applies_when_current_row_is_named_unavailable(self):
+        event = {"type": "property_unavailable", "reason": "fully_leased"}
+        message_text = (
+            "404 Replacement Signal Ave is fully leased. "
+            "A similar option is 414 Alternate Signal Ave in Las Vegas."
+        )
+
+        self.assertTrue(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="404 Replacement Signal Ave, Las Vegas",
+                message_text=message_text,
+            )
+        )
+
+    def test_unavailable_event_with_different_address_does_not_apply_to_current_row(self):
+        event = {
+            "type": "property_unavailable",
+            "address": "404 Replacement Signal Ave",
+            "city": "Las Vegas",
+        }
+
+        self.assertFalse(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="414 Alternate Signal Ave, Las Vegas",
+                message_text="404 Replacement Signal Ave is fully leased.",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

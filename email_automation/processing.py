@@ -282,9 +282,106 @@ TERMINAL_CLOSE_REASONS_WITHOUT_COMPLETE_FIELDS = {
     "natural_end",
 }
 
+PROPERTY_UNAVAILABLE_KEYWORDS = [
+    "no longer available", "not available", "off the market",
+    "has been leased", "space is leased", "property is unavailable",
+    "building unavailable", "no longer considering", "isnt available",
+    "isn't available", "unavailable", "off market",
+    "under contract", "went under contract", "already leased",
+    "just leased", "pending lease", "contract pending",
+    "accepted an offer", "lease signed", "taken off market",
+    "fully leased",
+]
+
 
 def _normalize_replacement_match_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _property_unavailable_event_applies_to_row(
+    event: Dict[str, Any],
+    *,
+    row_anchor: str = "",
+    message_text: str = "",
+    unavailable_keywords: Optional[List[str]] = None,
+) -> bool:
+    """
+    Guard row-moving against stale unavailable context in replacement-property threads.
+
+    Brokers often say "A is leased, try B instead" and later send specs for B in
+    the same thread. If the model repeats the old unavailable event while the row
+    is anchored to B, do not move B below the NON-VIABLE divider.
+    """
+    if (event or {}).get("type") != "property_unavailable":
+        return True
+
+    row_norm = _normalize_replacement_match_text(row_anchor)
+    message_norm = _normalize_replacement_match_text(message_text)
+    keywords = [
+        _normalize_replacement_match_text(keyword)
+        for keyword in (unavailable_keywords or PROPERTY_UNAVAILABLE_KEYWORDS)
+        if keyword
+    ]
+
+    event_property = _format_event_property(event)
+    if event_property:
+        event_norm = _normalize_replacement_match_text(event_property)
+        row_primary = row_norm.split(",", 1)[0].strip()
+        event_primary = event_norm.split(",", 1)[0].strip()
+        if not row_norm or not event_norm:
+            return True
+        return bool(
+            event_primary
+            and (
+                event_primary in row_norm
+                or row_primary in event_norm
+            )
+        )
+
+    if not row_norm or not message_norm:
+        return True
+
+    row_candidates = [
+        candidate
+        for candidate in {
+            row_norm,
+            row_norm.split(",", 1)[0].strip(),
+        }
+        if len(candidate) >= 6
+    ]
+    row_positions = [
+        idx
+        for candidate in row_candidates
+        for idx in [message_norm.find(candidate)]
+        if idx >= 0
+    ]
+    if not row_positions:
+        return True
+
+    keyword_positions = [
+        idx
+        for keyword in keywords
+        for idx in [message_norm.find(keyword)]
+        if idx >= 0
+    ]
+    if not keyword_positions:
+        return True
+
+    row_number_match = re.search(r"\b\d{2,6}\b", row_norm)
+    row_number = row_number_match.group(0) if row_number_match else None
+
+    for row_pos in row_positions:
+        for keyword_pos in keyword_positions:
+            if 0 <= keyword_pos - row_pos <= 180:
+                return True
+            if 0 <= row_pos - keyword_pos <= 80:
+                previous_window = message_norm[max(0, keyword_pos - 120):keyword_pos]
+                previous_numbers = set(re.findall(r"\b\d{2,6}\b", previous_window))
+                if previous_numbers and (not row_number or previous_numbers != {row_number}):
+                    continue
+                return True
+
+    return False
 
 
 def _active_replacement_context(thread_data: Optional[Dict[str, Any]], message_text: str = "") -> Optional[Dict[str, Any]]:
@@ -1753,6 +1850,19 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         print(f"❌ Failed to write needs_user_input notification: {e}")
 
                 elif event_type == "property_unavailable":
+                    if not _property_unavailable_event_applies_to_row(
+                        event,
+                        row_anchor=row_anchor,
+                        message_text=_full_text,
+                        unavailable_keywords=PROPERTY_UNAVAILABLE_KEYWORDS,
+                    ):
+                        print(
+                            "ℹ️ Skipping property_unavailable event because it does not match "
+                            f"current row anchor: {row_anchor or 'unknown row'}"
+                        )
+                        mark_event_handled(user_id, thread_id, event_key, msg_id, None)
+                        continue
+
                     # Check if row is already below NON-VIABLE divider - if so, skip processing
                     try:
                         tab_title = _get_first_tab_title(sheets, sheet_id)
@@ -1766,19 +1876,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     # Move row below divider and create notification
                     # Trust AI detection - GPT-5.2 already analyzed the message context
                     message_content = _full_text.lower()
-                    unavailable_keywords = [
-                        "no longer available", "not available", "off the market",
-                        "has been leased", "space is leased", "property is unavailable",
-                        "building unavailable", "no longer considering", "isnt available",
-                        "isn't available", "unavailable", "off market",
-                        # Contract/lease status keywords
-                        "under contract", "went under contract", "already leased",
-                        "just leased", "pending lease", "contract pending",
-                        "accepted an offer", "lease signed", "taken off market"
-                    ]
 
                     # Find keyword for logging purposes (optional - AI already detected unavailability)
-                    found_keyword = next((kw for kw in unavailable_keywords if kw in message_content), "AI-detected unavailability")
+                    found_keyword = next((kw for kw in PROPERTY_UNAVAILABLE_KEYWORDS if kw in message_content), "AI-detected unavailability")
                     print(f"🔍 Processing property_unavailable event (trigger: '{found_keyword}')")
 
                     try:
