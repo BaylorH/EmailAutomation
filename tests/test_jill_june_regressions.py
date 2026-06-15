@@ -67,6 +67,43 @@ class JillJuneRegressionTests(unittest.TestCase):
         self.assertEqual(1, len(augmented["events"]))
         self.assertEqual("model", augmented["events"][0]["reason"])
 
+    def test_requirements_mismatch_adds_nonviable_event(self):
+        proposal = {"updates": [], "events": []}
+        conversation = [
+            {
+                "direction": "inbound",
+                "content": (
+                    "Hi Jill,\n\n"
+                    "This space wouldn’t be a good fit for your client as it is more "
+                    "office heavy as opposed to a true warehouse with drive in space."
+                ),
+            }
+        ]
+
+        augmented = ai_processing._augment_events_with_deterministic_signals(
+            proposal,
+            conversation,
+        )
+
+        self.assertEqual("property_unavailable", augmented["events"][0]["type"])
+        self.assertEqual("requirements_mismatch", augmented["events"][0]["reason"])
+
+    def test_fit_question_does_not_add_nonviable_event(self):
+        proposal = {"updates": [], "events": []}
+        conversation = [
+            {
+                "direction": "inbound",
+                "content": "Can you confirm whether this space would be a good fit for your client?",
+            }
+        ]
+
+        augmented = ai_processing._augment_events_with_deterministic_signals(
+            proposal,
+            conversation,
+        )
+
+        self.assertEqual([], augmented["events"])
+
     def test_new_property_event_defers_pdf_links_from_current_row(self):
         events = [{"type": "new_property", "address": "Elam Business Park"}]
 

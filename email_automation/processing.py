@@ -421,6 +421,9 @@ PROPERTY_UNAVAILABLE_KEYWORDS = [
     "just leased", "pending lease", "contract pending",
     "accepted an offer", "lease signed", "taken off market",
     "fully leased",
+    "not a good fit", "wouldn't be a good fit", "wouldn’t be a good fit",
+    "requirements mismatch", "more office heavy", "office-heavy",
+    "not a true warehouse", "no drive in space", "no drive-in space",
 ]
 
 

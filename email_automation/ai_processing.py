@@ -63,6 +63,38 @@ def _latest_inbound_text(conversation: List[dict]) -> str:
     return ""
 
 
+def _looks_like_requirements_mismatch_nonviable(text: str) -> bool:
+    """Detect broker replies saying the property fails the client's physical requirements."""
+    latest_text = (text or "").lower()
+    if not latest_text:
+        return False
+
+    fit_rejection = bool(
+        re.search(
+            r"\b(?:this\s+)?(?:space|property|building|suite)?\s*"
+            r"(?:wouldn[’']t|would\s+not|won[’']t|will\s+not|isn[’']t|is\s+not|"
+            r"doesn[’']t|does\s+not)\s+(?:be\s+)?(?:a\s+)?(?:good\s+)?fit\b",
+            latest_text,
+        )
+        or re.search(r"\bnot\s+(?:a\s+)?(?:good\s+)?fit\s+for\s+(?:your|the)\s+client\b", latest_text)
+        or re.search(r"\bfails?\s+(?:your\s+|the\s+)?client(?:'s)?\s+requirements\b", latest_text)
+    )
+    property_context = bool(re.search(r"\b(?:space|property|building|suite|warehouse|client)\b", latest_text))
+    physical_mismatches = [
+        re.search(r"\b(?:too|more|mostly|primarily)\s+office[-\s]?heavy\b", latest_text),
+        re.search(r"\boffice[-\s]?heavy\s+as\s+opposed\s+to\s+(?:a\s+)?(?:true\s+)?warehouse\b", latest_text),
+        re.search(r"\bnot\s+(?:a\s+)?true\s+warehouse\b", latest_text),
+        re.search(r"\b(?:no|without|lacks?|doesn[’']t\s+have|does\s+not\s+have)\s+(?:any\s+)?(?:drive[-\s]?in|grade[-\s]?level)\s+(?:doors?|space|access)?\b", latest_text),
+        re.search(r"\bnot\s+(?:enough|sufficient)\s+(?:warehouse|industrial|drive[-\s]?in)\b", latest_text),
+    ]
+    mismatch_count = sum(1 for match in physical_mismatches if match)
+
+    return bool(
+        (fit_rejection and (property_context or mismatch_count > 0))
+        or mismatch_count >= 2
+    )
+
+
 def _augment_events_with_deterministic_signals(proposal: dict, conversation: List[dict]) -> dict:
     """Add high-confidence event signals from broker phrases the model can miss."""
     if not proposal:
@@ -74,6 +106,10 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
 
     latest_text = _latest_inbound_text(conversation).lower()
     if not latest_text:
+        return proposal
+
+    if _looks_like_requirements_mismatch_nonviable(latest_text):
+        events.append({"type": "property_unavailable", "reason": "requirements_mismatch"})
         return proposal
 
     unavailable_patterns = [
@@ -746,7 +782,9 @@ FIELD MINING HINTS:
         EVENT_RULES = """
 EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
 
-- "property_unavailable": ONLY when the CURRENT TARGET PROPERTY is explicitly stated as unavailable/leased/off-market/no longer available.
+- "property_unavailable": Emit when the CURRENT TARGET PROPERTY is explicitly stated as unavailable/leased/off-market/no longer available OR when the broker clearly says the property is non-viable for the client's requirements.
+  • Treat requirements-fit failures as non-viable when the broker says the space/property is not a good fit because it is office-heavy, not a true warehouse, lacks drive-in/grade-level access, lacks required industrial use, or otherwise fails the requested physical requirements.
+  • Do NOT use this for vague relationship refusals like "we are not a fit to work together" unless the property itself is being ruled out.
 
 - "new_property": Emit when the LAST HUMAN message suggests or mentions a DIFFERENT property than the TARGET PROPERTY.
   • Look for phrases like: "we have another", "different location", "alternative property", "other space available"
@@ -773,7 +811,7 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • ALL REQUIRED FIELDS ARE COMPLETE (MISSING REQUIRED FIELDS is empty) - emit with notes "all_info_gathered"
   • "Going exclusive" with another party/tenant rep - notes "exclusive_with_another"
   • Already have a deal/tenant lined up ("likely signing next week", "in negotiations with someone") - notes "deal_pending"
-  • Broker declines to continue without making property unavailable ("can't help right now", "not a good fit") - notes "not_a_fit"
+  • Broker declines to continue without making the property physically non-viable ("can't help right now", "not a fit to work together") - notes "not_a_fit"
   • Natural conversation ending ("thanks for reaching out", "good luck with your search") - notes "natural_end"
   IMPORTANT: When emitting close_conversation with "all_info_gathered", you SHOULD include a brief closing response_email thanking them.
   For other close_conversation reasons, do NOT emit response_email - the conversation is OVER.
@@ -852,6 +890,7 @@ CRITICAL EXAMPLES:
 - "Below is the only current space we have" + URL = new_property event
 - "Here's an alternative location" = new_property event
 - "This property isn't available" = property_unavailable event
+- "This space isn't a good fit because it's more office-heavy than warehouse and has no drive-in space" = property_unavailable event (reason: requirements_mismatch)
 - "Can you call me?" = call_requested event
 - "What size space does your client need?" = needs_user_input (reason: client_question)
 - "Can you tour Tuesday at 2pm?" = tour_requested event (with suggestedEmail)
