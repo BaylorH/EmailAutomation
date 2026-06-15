@@ -71,6 +71,57 @@ class FakeFirestore:
         return FakeFirestoreNode(self, ["collection", name])
 
 
+class FakeSnapshot:
+    def __init__(self, data=None, exists=True):
+        self._data = data or {}
+        self.exists = exists
+
+    def to_dict(self):
+        return self._data
+
+
+class FakeOutboxCollection:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def order_by(self, _field):
+        return self
+
+    def stream(self):
+        return self.docs
+
+
+class FakeUserNode:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def get(self):
+        return FakeSnapshot({"email": "baylor.freelance@outlook.com"})
+
+    def collection(self, name):
+        if name != "outbox":
+            raise AssertionError(f"Unexpected user collection: {name}")
+        return FakeOutboxCollection(self.docs)
+
+
+class FakeUsersCollection:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def document(self, _user_id):
+        return FakeUserNode(self.docs)
+
+
+class FakeFirestoreWithOutbox:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def collection(self, name):
+        if name != "users":
+            raise AssertionError(f"Unexpected root collection: {name}")
+        return FakeUsersCollection(self.docs)
+
+
 class OutboxSafetyTests(unittest.TestCase):
     def test_cancel_requested_item_is_deleted_without_sending(self):
         doc = FakeDoc({
@@ -115,6 +166,49 @@ class OutboxSafetyTests(unittest.TestCase):
             "assignedEmails": ["bp21harrison@gmail.com"],
             "script": "Campaign first touch",
         }))
+
+    def test_send_outboxes_requests_fresh_headers_for_each_throttled_recipient(self):
+        docs = [
+            FakeDoc({
+                "assignedEmails": ["bp21harrison+one@gmail.com"],
+                "script": "Hi Avery",
+                "clientId": "client-1",
+                "subject": "100 Token Way",
+                "rowNumber": 3,
+            }, doc_id="outbox-1"),
+            FakeDoc({
+                "assignedEmails": ["bp21harrison+two@gmail.com"],
+                "script": "Hi Blake",
+                "clientId": "client-1",
+                "subject": "200 Token Way",
+                "rowNumber": 4,
+            }, doc_id="outbox-2"),
+        ]
+        provider_calls = []
+        send_headers = []
+
+        def headers_provider():
+            provider_calls.append(len(provider_calls) + 1)
+            return {
+                "Authorization": f"Bearer fresh-token-{provider_calls[-1]}",
+                "Content-Type": "application/json",
+            }
+
+        def record_single_send(_user_id, headers, _item, *_args, **_kwargs):
+            send_headers.append(headers["Authorization"])
+
+        with patch("email_automation.clients._fs", FakeFirestoreWithOutbox(docs)), \
+             patch.object(email_module, "_send_single_outbox_item", side_effect=record_single_send), \
+             patch.object(email_module.time, "sleep", return_value=None) as sleep:
+            email_module.send_outboxes(
+                "uid-1",
+                {"Authorization": "Bearer stale-token"},
+                headers_provider=headers_provider,
+            )
+
+        self.assertEqual(provider_calls, [1, 2])
+        self.assertEqual(send_headers, ["Bearer fresh-token-1", "Bearer fresh-token-2"])
+        sleep.assert_called_once_with(120)
 
     def test_tour_planner_outbox_uses_reviewed_body_even_for_existing_contact(self):
         reviewed_body = (

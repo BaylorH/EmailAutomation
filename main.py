@@ -15,6 +15,21 @@ from email_automation.system_health import record_user_health
 # Thresholds for auto-cleanup (to stay within Firebase free tier)
 PROCESSED_MESSAGES_THRESHOLD = 500
 SHEET_CHANGELOG_THRESHOLD = 100
+GRAPH_TOKEN_REFRESH_BUFFER_SECONDS = 15 * 60
+
+
+def _headers_from_access_token(access_token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+
+def _expires_in_seconds(token_result) -> int:
+    try:
+        return int((token_result or {}).get("expires_in") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _timestamp_sort_value(doc, fields):
@@ -145,74 +160,99 @@ def refresh_and_process_user(user_id: str):
         )
         return
 
-    # --- KEY CHANGE: do NOT force refresh; let MSAL use cached AT first ---
-    before_state = cache.has_state_changed  # usually False right after deserialize
-    result = app.acquire_token_silent(SCOPES, account=accounts[0])  # <-- no force_refresh
-    after_state = cache.has_state_changed
+    account = accounts[0]
+    latest_token_state = {"status": "unknown"}
 
-    if not result or "access_token" not in result:
-        print(f"❌ Silent auth failed for {user_id}")
+    def get_graph_headers(min_expires_in: int = GRAPH_TOKEN_REFRESH_BUFFER_SECONDS):
+        nonlocal latest_token_state
+
+        # Prefer cached access tokens when they have enough runway, but refresh before
+        # long Graph operations so throttled outbox batches do not expire mid-send.
+        before_state = cache.has_state_changed
+        result = app.acquire_token_silent(SCOPES, account=account)
+        after_state = cache.has_state_changed
+        token_source = "refreshed_via_refresh_token" if (not before_state and after_state) else "cached_access_token"
+
+        if result and "access_token" in result and _expires_in_seconds(result) < min_expires_in:
+            print(
+                f"🔄 Token expires in≈{_expires_in_seconds(result)}s; "
+                f"refreshing before Graph operation"
+            )
+            forced_result = app.acquire_token_silent(
+                SCOPES,
+                account=account,
+                force_refresh=True,
+            )
+            if forced_result and "access_token" in forced_result:
+                result = forced_result
+                token_source = "refreshed_before_graph_operation"
+            else:
+                print("⚠️ Forced Graph token refresh failed; using existing token if available")
+
+        if not result or "access_token" not in result:
+            raise RuntimeError("silent_auth_failed")
+
+        access_token = result["access_token"]
+        exp_secs = result.get("expires_in")
+        latest_token_state = {
+            "status": "healthy",
+            "source": token_source,
+            "expiresIn": exp_secs,
+        }
+
+        print(f"🎯 Using {token_source}; expires_in≈{exp_secs}s – preview: {access_token[:40]}")
+
+        # (Optional) sanity check on JWT-shaped token & appid
+        if access_token.count(".") == 2:
+            decoded = decode_token_payload(access_token)
+            appid = decoded.get("appid", "unknown")
+            if not appid.startswith("54cec"):
+                print(f"⚠️ Unexpected appid: {appid}")
+            else:
+                print("✅ Token appid matches expected prefix")
+
+        return _headers_from_access_token(access_token)
+
+    try:
+        headers = get_graph_headers()
+    except RuntimeError as e:
+        print(f"❌ Silent auth failed for {user_id}: {e}")
         record_user_health(
             user_id,
-            token_state={"status": "error", "error": "silent_auth_failed"},
+            token_state={"status": "error", "error": str(e)},
             graph_state={"status": "unknown"},
         )
         return
 
-    access_token = result["access_token"]
-
-    # Helpful logging: was it cached or refreshed?
-    token_source = "refreshed_via_refresh_token" if (not before_state and after_state) else "cached_access_token"
-    exp_secs = result.get("expires_in")
-    print(f"🎯 Using {token_source}; expires_in≈{exp_secs}s – preview: {access_token[:40]}")
-
-    # (Optional) sanity check on JWT-shaped token & appid
-    if access_token.count(".") == 2:
-        decoded = decode_token_payload(access_token)
-        appid = decoded.get("appid", "unknown")
-        if not appid.startswith("54cec"):
-            print(f"⚠️ Unexpected appid: {appid}")
-        else:
-            print("✅ Token appid matches expected prefix")
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-
     # Process outbound emails (now with indexing)
-    send_outboxes(user_id, headers)
+    send_outboxes(user_id, headers, headers_provider=get_graph_headers)
 
     graph_operation_states = []
     
     # Scan for client replies (inbox - catch all replies, not just unread)
     print(f"\n🔍 Scanning inbox for client replies...")
     graph_operation_states.append(
-        scan_inbox_against_index(user_id, headers, only_unread=False, top=50)
+        scan_inbox_against_index(user_id, get_graph_headers(), only_unread=False, top=50)
     )
     
     # Scan for Jill's manual replies (SentItems - catch manual replies we didn't index)
     print(f"\n📤 Scanning SentItems for manual replies...")
     graph_operation_states.append(
-        scan_sent_items_for_manual_replies(user_id, headers, top=50)
+        scan_sent_items_for_manual_replies(user_id, get_graph_headers(), top=50)
     )
 
     # Retry any pending responses that failed to send previously
-    process_pending_responses(user_id, headers)
+    process_pending_responses(user_id, get_graph_headers())
 
     # Check and send follow-up emails for threads without responses
-    check_and_send_followups(user_id, headers)
+    check_and_send_followups(user_id, get_graph_headers())
 
     # Auto-cleanup Firestore if collections are getting large (stay within free tier)
     auto_cleanup_firestore(user_id)
 
     record_user_health(
         user_id,
-        token_state={
-            "status": "healthy",
-            "source": token_source,
-            "expiresIn": exp_secs,
-        },
+        token_state=latest_token_state,
         graph_state=_combine_graph_operation_states(graph_operation_states),
     )
 
