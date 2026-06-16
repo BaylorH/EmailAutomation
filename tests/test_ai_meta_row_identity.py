@@ -8,7 +8,7 @@ os.environ.setdefault(
     "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
 )
 
-from email_automation.ai_processing import apply_proposal_to_sheet
+from email_automation.ai_processing import _ensure_ai_meta_tab, apply_proposal_to_sheet
 
 
 class FakeRequest:
@@ -63,6 +63,7 @@ class FakeValues:
 class FakeSpreadsheets:
     def __init__(self, values):
         self._values = values
+        self.batch_update_calls = []
 
     def values(self):
         return self._values
@@ -75,6 +76,10 @@ class FakeSpreadsheets:
             ]
         })
 
+    def batchUpdate(self, spreadsheetId=None, body=None, **kwargs):
+        self.batch_update_calls.append(body)
+        return FakeRequest({})
+
 
 class FakeSheets:
     def __init__(self):
@@ -86,6 +91,27 @@ class FakeSheets:
 
 
 class AiMetaRowIdentityTests(unittest.TestCase):
+    def test_existing_ai_meta_tab_is_hidden_when_backend_touches_it(self):
+        fake_sheets = FakeSheets()
+
+        _ensure_ai_meta_tab(fake_sheets, "sheet-1")
+
+        self.assertEqual(1, len(fake_sheets.spreadsheets_api.batch_update_calls))
+        self.assertEqual(
+            {
+                "requests": [{
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": 1,
+                            "hidden": True,
+                        },
+                        "fields": "hidden",
+                    }
+                }]
+            },
+            fake_sheets.spreadsheets_api.batch_update_calls[0],
+        )
+
     def test_stale_ai_meta_for_same_row_number_does_not_block_moved_property_update(self):
         fake_sheets = FakeSheets()
         header = ["Property Address", "City", "Total SF"]

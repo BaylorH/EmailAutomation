@@ -331,9 +331,32 @@ def _ensure_ai_meta_tab(sheets, spreadsheet_id: str) -> None:
             sheets.spreadsheets().get(spreadsheetId=spreadsheet_id),
             "ensure_ai_meta_get"
         )
-        sheet_names = [sheet["properties"]["title"] for sheet in meta["sheets"]]
+        ai_meta_sheet = next(
+            (
+                sheet.get("properties", {})
+                for sheet in meta["sheets"]
+                if sheet.get("properties", {}).get("title") == "AI_META"
+            ),
+            None,
+        )
 
-        if "AI_META" in sheet_names:
+        if ai_meta_sheet:
+            if not ai_meta_sheet.get("hidden") and ai_meta_sheet.get("sheetId") is not None:
+                request = {
+                    "requests": [{
+                        "updateSheetProperties": {
+                            "properties": {
+                                "sheetId": ai_meta_sheet["sheetId"],
+                                "hidden": True,
+                            },
+                            "fields": "hidden",
+                        }
+                    }]
+                }
+                _execute_with_retry(
+                    sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=request),
+                    "ensure_ai_meta_hide_existing"
+                )
             return
 
         # Create AI_META tab
