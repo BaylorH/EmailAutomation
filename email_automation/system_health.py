@@ -75,7 +75,7 @@ def write_user_health(user_id: str, payload: Dict, *, fs_client=None) -> None:
     (
         fs_client.collection("users").document(user_id)
         .collection(HEALTH_COLLECTION).document(HEALTH_DOC_ID)
-        .set(payload, merge=True)
+        .set(payload)
     )
 
 

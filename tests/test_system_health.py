@@ -103,7 +103,7 @@ class SystemHealthTests(unittest.TestCase):
         self.assertEqual("error", payload["status"])
         self.assertEqual("silent_auth_failed", payload["token"]["error"])
 
-    def test_write_user_health_stores_dashboard_document(self):
+    def test_write_user_health_replaces_dashboard_snapshot(self):
         fs = FakeFirestore({
             "outbox": 0,
             "deadLetterQueue": 0,
@@ -119,7 +119,7 @@ class SystemHealthTests(unittest.TestCase):
             ("collection", "users", "document", "uid-1", "collection", "systemHealth", "document", "emailAutomation"),
             fs.set_calls[0][0],
         )
-        self.assertTrue(fs.set_calls[0][2])
+        self.assertFalse(fs.set_calls[0][2])
 
 
 if __name__ == "__main__":
