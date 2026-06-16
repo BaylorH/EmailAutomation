@@ -422,8 +422,11 @@ PROPERTY_UNAVAILABLE_KEYWORDS = [
     "accepted an offer", "lease signed", "taken off market",
     "fully leased",
     "not a good fit", "wouldn't be a good fit", "wouldn’t be a good fit",
-    "requirements mismatch", "more office heavy", "office-heavy",
-    "not a true warehouse", "no drive in space", "no drive-in space",
+    "not the right fit", "does not meet the client's requirements",
+    "doesn't meet the client's requirements", "requirements mismatch",
+    "more office heavy", "mostly office", "office-heavy",
+    "not a true warehouse", "lacks warehouse space", "lacks industrial warehouse",
+    "no drive in space", "no drive-in space", "does not have drive-in access",
 ]
 
 

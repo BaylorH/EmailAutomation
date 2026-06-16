@@ -77,13 +77,18 @@ def _looks_like_requirements_mismatch_nonviable(text: str) -> bool:
             latest_text,
         )
         or re.search(r"\bnot\s+(?:a\s+)?(?:good\s+)?fit\s+for\s+(?:your|the)\s+client\b", latest_text)
+        or re.search(r"\bnot\s+(?:the\s+)?right\s+fit\s+for\s+(?:your|the)\s+client\b", latest_text)
         or re.search(r"\bfails?\s+(?:your\s+|the\s+)?client(?:'s)?\s+requirements\b", latest_text)
+        or re.search(r"\bdoes\s+not\s+(?:meet|satisfy)\s+(?:your\s+|the\s+)?client(?:'s)?\s+requirements\b", latest_text)
+        or re.search(r"\bdoesn[’']t\s+(?:meet|satisfy)\s+(?:your\s+|the\s+)?client(?:'s)?\s+requirements\b", latest_text)
     )
     property_context = bool(re.search(r"\b(?:space|property|building|suite|warehouse|client)\b", latest_text))
     physical_mismatches = [
         re.search(r"\b(?:too|more|mostly|primarily)\s+office[-\s]?heavy\b", latest_text),
+        re.search(r"\b(?:too|more|mostly|primarily)\s+office\b", latest_text),
         re.search(r"\boffice[-\s]?heavy\s+as\s+opposed\s+to\s+(?:a\s+)?(?:true\s+)?warehouse\b", latest_text),
         re.search(r"\bnot\s+(?:a\s+)?true\s+warehouse\b", latest_text),
+        re.search(r"\blacks?\s+(?:enough\s+|sufficient\s+)?(?:warehouse|industrial|industrial\s+warehouse)\s+(?:space|area)?\b", latest_text),
         re.search(r"\b(?:no|without|lacks?|doesn[’']t\s+have|does\s+not\s+have)\s+(?:any\s+)?(?:drive[-\s]?in|grade[-\s]?level)\s+(?:doors?|space|access)?\b", latest_text),
         re.search(r"\bnot\s+(?:enough|sufficient)\s+(?:warehouse|industrial|drive[-\s]?in)\b", latest_text),
     ]

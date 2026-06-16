@@ -2,10 +2,13 @@ import unittest
 import os
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
-os.environ.setdefault(
-    "GOOGLE_APPLICATION_CREDENTIALS",
+for candidate_credentials in [
+    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
     "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
-)
+]:
+    if os.path.exists(candidate_credentials):
+        os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", candidate_credentials)
+        break
 
 from email_automation import ai_processing, processing
 
@@ -87,6 +90,47 @@ class JillJuneRegressionTests(unittest.TestCase):
 
         self.assertEqual("property_unavailable", augmented["events"][0]["type"])
         self.assertEqual("requirements_mismatch", augmented["events"][0]["reason"])
+
+    def test_requirements_mismatch_variants_add_nonviable_event(self):
+        examples = [
+            (
+                "This property is not the right fit for your client because it "
+                "lacks warehouse space and does not have drive-in access."
+            ),
+            (
+                "The suite does not meet the client's requirements. It is mostly "
+                "office and lacks industrial warehouse area."
+            ),
+        ]
+
+        for example in examples:
+            with self.subTest(example=example):
+                proposal = {"updates": [], "events": []}
+                conversation = [{"direction": "inbound", "content": example}]
+
+                augmented = ai_processing._augment_events_with_deterministic_signals(
+                    proposal,
+                    conversation,
+                )
+
+                self.assertEqual("property_unavailable", augmented["events"][0]["type"])
+                self.assertEqual("requirements_mismatch", augmented["events"][0]["reason"])
+
+    def test_requirements_mismatch_downstream_guard_applies_to_current_row(self):
+        event = {"type": "property_unavailable", "reason": "requirements_mismatch"}
+        message_text = (
+            "19241 David Memorial Dr is not the right fit for your client because "
+            "it lacks warehouse space and does not have drive-in access."
+        )
+
+        self.assertTrue(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="19241 David Memorial Dr, The Woodlands",
+                message_text=message_text,
+                unavailable_keywords=processing.PROPERTY_UNAVAILABLE_KEYWORDS,
+            )
+        )
 
     def test_fit_question_does_not_add_nonviable_event(self):
         proposal = {"updates": [], "events": []}
