@@ -1,11 +1,20 @@
-name: Email Automation
-on:
-  schedule:
-    - cron: '*/30 * * * *'  # Every 30 minutes
+name: Email Automation - Dev Scoped
 
-# Prevent concurrent runs - cancel in-progress if new one starts
+on:
+  workflow_dispatch:
+    inputs:
+      target_user:
+        description: Baylor-only development scheduler target
+        required: true
+        type: choice
+        default: baylor
+        options:
+          - baylor
+
+# Keep the dev button from canceling the production cron at the GitHub layer.
+# The Firestore scheduler lease still prevents overlapping worker execution.
 concurrency:
-  group: email-automation
+  group: email-automation-dev-scoped
   cancel-in-progress: true
 
 jobs:
@@ -14,12 +23,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        
+
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.x'
-          
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -35,11 +44,10 @@ jobs:
           CLIENT_ID: ${{ secrets.AZURE_API_APP_ID }}
 
       - name: Write service account key
-        # Expect a repo secret named FIREBASE_SERVICE_ACCOUNT_JSON containing the full JSON
         run: |
           echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}' > $RUNNER_TEMP/sa.json
-          
-      - name: Run email script
+
+      - name: Run Baylor-only email script
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
@@ -48,11 +56,11 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_API_APP_ID: ${{ secrets.AZURE_API_APP_ID }}
           AZURE_API_CLIENT_SECRET: ${{ secrets.AZURE_API_CLIENT_SECRET }}
-          # Google OAuth (helper Gmail account for Drive/Sheets)
           GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        # run: python noPopup_signin_emails_to_excel.py
+          SITESIFT_DEV_SCOPED_SCHEDULER: "1"
+          SITESIFT_SCHEDULER_TARGET_USER_IDS: "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
+          SITESIFT_SCHEDULER_ALLOWED_USER_IDS: "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
         run: python main.py
-        # run: python scheduler_runner.py

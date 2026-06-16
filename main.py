@@ -10,6 +10,7 @@ from email_automation.followup import check_and_send_followups
 from email_automation.pending_responses import process_pending_responses
 from email_automation.app_config import CLIENT_ID, CLIENT_SECRET, AUTHORITY, SCOPES, TOKEN_CACHE, FIREBASE_API_KEY
 from email_automation.scheduler_lease import run_with_scheduler_lease
+from email_automation.scheduler_scope import SchedulerScopeError, resolve_scheduler_user_ids
 from email_automation.system_health import record_user_health
 
 # Thresholds for auto-cleanup (to stay within Firebase free tier)
@@ -261,7 +262,14 @@ def run_all_users():
     all_users = list_user_ids()
     print(f"📦 Found {len(all_users)} token cache users: {all_users}")
 
-    for uid in all_users:
+    try:
+        scope = resolve_scheduler_user_ids(all_users)
+    except SchedulerScopeError as e:
+        raise SystemExit(f"🚫 Scheduler scope blocked: {e}") from e
+
+    print(f"🛡️ Scheduler scope: {scope.mode}; processing users: {scope.user_ids}")
+
+    for uid in scope.user_ids:
         try:
             refresh_and_process_user(uid)
         except Exception as e:
