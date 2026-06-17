@@ -41,6 +41,23 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertIn("what tour windows are available", body)
         self.assertNotIn("[Day/Time option", body)
 
+    def test_tour_fallback_draft_uses_contact_name_not_recipient_local_part(self):
+        body = processing._build_tour_fallback_suggested_email(
+            contact_name="Drew",
+            recipient_email="bp21harrison@gmail.com",
+            question=(
+                "Please confirm whether this tour slot works, would work on my end. "
+                "If that time is no longer available, reply with the closest available alternate. "
+                "(Drew offered 11:30 AM instead, or any time after 2:00 PM.)"
+            ),
+        )
+
+        self.assertIn("Hi Drew,", body)
+        self.assertNotIn("Bp21Harrison", body)
+        self.assertNotIn("Please confirm whether this tour slot works", body)
+        self.assertNotIn("reply with the closest available alternate", body)
+        self.assertIn("11:30 AM", body)
+
     def test_confirmed_tour_without_suggested_email_is_not_actionable(self):
         event = {
             "type": "tour_requested",

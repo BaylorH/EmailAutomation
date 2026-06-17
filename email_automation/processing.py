@@ -577,7 +577,16 @@ def _extract_tour_time_options(question: str) -> List[str]:
     if not text or text.lower() == "tour requested":
         return []
 
+    parenthetical_options = [
+        match.group(1).strip()
+        for match in re.finditer(r"\(([^)]*)\)", text)
+        if re.search(r"\b(?:offered|available|any time|am|pm|\d{1,2}:\d{2})\b", match.group(1), flags=re.IGNORECASE)
+    ]
+    if parenthetical_options:
+        text = parenthetical_options[-1]
+
     text = re.sub(r"^tour availability offered\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^[A-Z][A-Za-z' -]+\s+offered\s+(?:tour\s+times?\s*:\s*)?", "", text, flags=re.IGNORECASE)
     text = text.strip(" .")
     if not text:
         return []
@@ -591,11 +600,28 @@ def _extract_tour_time_options(question: str) -> List[str]:
         return []
 
     parts = [
-        part.strip(" .")
+        re.sub(r"\s+instead\b", "", part.strip(" .,)"), flags=re.IGNORECASE).strip(" .")
         for part in re.split(r"\s+(?:or|/)\s+|;\s*", text)
         if part.strip(" .")
     ]
-    return parts[:3] if parts else [text]
+    return [part for part in parts[:3] if part] if parts else [text]
+
+
+def _safe_tour_greeting_name(contact_name: str = "", recipient_email: str = "") -> str:
+    candidate = str(contact_name or "").strip()
+    recipient_local = str(recipient_email or "").split("@", 1)[0].strip().lower()
+    compact_candidate = re.sub(r"[^a-z0-9]", "", candidate.lower())
+    compact_local = re.sub(r"[^a-z0-9]", "", recipient_local)
+    if not candidate or "@" in candidate or (compact_local and compact_candidate == compact_local):
+        return "there"
+    return candidate
+
+
+def _build_tour_fallback_suggested_email(contact_name: str = "", recipient_email: str = "", question: str = "") -> str:
+    return _build_default_tour_suggested_email(
+        _safe_tour_greeting_name(contact_name, recipient_email),
+        question,
+    )
 
 
 def _build_default_tour_suggested_email(broker_name: str, question: str = "") -> str:
@@ -1876,8 +1902,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
                         # If AI didn't generate a suggested email, create a default one
                         if not suggested_email:
-                            broker_name = to_addr_lower.split('@')[0].split('.')[0].title()
-                            suggested_email = _build_default_tour_suggested_email(broker_name, question)
+                            suggested_email = _build_tour_fallback_suggested_email(
+                                contact_name=contact_name,
+                                recipient_email=to_addr_lower,
+                                question=question,
+                            )
 
                         meta = {
                             "reason": "tour_requested",
