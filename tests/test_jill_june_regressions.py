@@ -175,6 +175,41 @@ class JillJuneRegressionTests(unittest.TestCase):
 
         self.assertTrue(processing._has_new_property_path(events))
 
+    def test_terminalized_original_row_skips_stale_operator_escalations(self):
+        for event_type in [
+            "tour_requested",
+            "call_requested",
+            "needs_user_input",
+            "wrong_contact",
+            "property_issue",
+            "close_conversation",
+        ]:
+            with self.subTest(event_type=event_type):
+                self.assertTrue(
+                    processing._should_skip_event_after_original_row_terminalized(
+                        event_type,
+                        old_row_became_nonviable=True,
+                    )
+                )
+
+    def test_terminalized_original_row_still_allows_replacement_and_optout_events(self):
+        for event_type in ["new_property", "contact_optout"]:
+            with self.subTest(event_type=event_type):
+                self.assertFalse(
+                    processing._should_skip_event_after_original_row_terminalized(
+                        event_type,
+                        old_row_became_nonviable=True,
+                    )
+                )
+
+    def test_viable_original_row_does_not_skip_operator_escalations(self):
+        self.assertFalse(
+            processing._should_skip_event_after_original_row_terminalized(
+                "tour_requested",
+                old_row_became_nonviable=False,
+            )
+        )
+
     def test_unavailable_event_without_address_does_not_apply_to_replacement_row(self):
         event = {"type": "property_unavailable", "reason": "fully_leased"}
         message_text = (

@@ -1,0 +1,212 @@
+{
+  "source": "Sanitized Firestore read-only campaign patterns observed from Jill-owned production campaigns on 2026-06-17. Do not use Jill mailbox data.",
+  "safety": "Real broker names and emails are intentionally replaced with Baylor/BP21-safe identities. These scenarios are for local replay and Baylor/BP21 proof only.",
+  "scenarios": [
+    {
+      "id": "office_heavy_original_nonviable_with_alternate_tour",
+      "clientAlias": "Conroe-style industrial search",
+      "property": {
+        "address": "19241 David Memorial Dr",
+        "city": "The Woodlands",
+        "state": "TX",
+        "rowNumber": 16
+      },
+      "contact": {
+        "name": "Morgan Broker",
+        "email": "bp21harrison+19241@gmail.com"
+      },
+      "conversation": [
+        {
+          "direction": "outbound",
+          "content": "Hi Morgan, checking whether 19241 David Memorial Dr could fit a light-industrial client that needs warehouse area and drive-in access."
+        },
+        {
+          "direction": "inbound",
+          "content": "Hi Baylor,\n\nThis space wouldn't be a good fit for your client as it is more office heavy as opposed to a true warehouse with drive in space.\n\nHowever, we may have 27610 Commerce Oaks Dr available and can send the marketing package. Happy to set up a tour if that alternative looks interesting.\n\nBest,\nMorgan"
+        }
+      ],
+      "proposalEventsBeforeDeterministic": [
+        {
+          "type": "new_property",
+          "address": "27610 Commerce Oaks Dr",
+          "city": "The Woodlands",
+          "email": "bp21harrison+19241@gmail.com",
+          "contactName": "Morgan Broker",
+          "notes": "Broker suggested this as an alternate after ruling out the original property."
+        },
+        {
+          "type": "tour_requested",
+          "reason": "tour_offer",
+          "question": "Happy to set up a tour if that alternative looks interesting.",
+          "suggestedEmail": ""
+        }
+      ],
+      "expectedEvents": [
+        "property_unavailable",
+        "new_property",
+        "tour_requested"
+      ],
+      "expectedUnavailableReason": "requirements_mismatch",
+      "operatorChecks": [
+        "Original row becomes non-viable before replacement handling continues.",
+        "Replacement property remains a separate action and does not inherit the original non-viable status.",
+        "Tour action stays visible for user approval instead of sending automatically."
+      ]
+    },
+    {
+      "id": "las_vegas_pdf_fit_gap_tour",
+      "clientAlias": "Las Vegas industrial search",
+      "property": {
+        "address": "3200 Polaris Ave",
+        "city": "Las Vegas",
+        "state": "NV",
+        "rowNumber": 26
+      },
+      "contact": {
+        "name": "Jordan Broker",
+        "email": "bp21harrison+polaris@gmail.com"
+      },
+      "conversation": [
+        {
+          "direction": "outbound",
+          "content": "Hi Jordan, could you send availability, loading, clear height, and power details for 3200 Polaris Ave?"
+        },
+        {
+          "direction": "inbound",
+          "content": "Hi Baylor,\n\nThe building is available and I attached the updated offering memorandum. It has dual access roll-up doors at 10 feet high and warehouse ceiling height over 14 feet. The gap is power: it does not currently have three-phase power. Let me know if you want to tour it.\n\nBest,\nJordan"
+        }
+      ],
+      "attachments": [
+        {
+          "name": "3200 Polaris OM - Updated.pdf",
+          "fixture": "test_pdfs/pdfs/full_e2e/200 Industrial Blvd - Property Flyer.pdf"
+        }
+      ],
+      "expectedUpdates": [
+        {
+          "column": "Drive Ins",
+          "value": "2"
+        },
+        {
+          "column": "Ceiling Ht",
+          "value": "14"
+        },
+        {
+          "column": "Power",
+          "value": "No three-phase power"
+        }
+      ],
+      "expectedEvents": [
+        "tour_requested"
+      ],
+      "operatorChecks": [
+        "PDF/flyer evidence remains attached to this row.",
+        "Power gap is visible in results and map detail panel.",
+        "Tour offer pauses for user approval."
+      ]
+    },
+    {
+      "id": "las_vegas_multi_turn_missing_power_then_complete",
+      "clientAlias": "Las Vegas industrial search",
+      "property": {
+        "address": "2900 S Highland Dr",
+        "city": "Las Vegas",
+        "state": "NV",
+        "rowNumber": 25
+      },
+      "contact": {
+        "name": "Taylor Broker",
+        "email": "bp21harrison+highland@gmail.com"
+      },
+      "conversation": [
+        {
+          "direction": "outbound",
+          "content": "Hi Taylor, can you share the industrial specs for 2900 S Highland Dr?"
+        },
+        {
+          "direction": "inbound",
+          "content": "Suite 120 is available. It is 5,000 SF with office, reception, restrooms, one 12x12 grade-level door, 24 foot ceilings, and asking rent of $1.70 MG. I can get a floor plan over later."
+        },
+        {
+          "direction": "outbound",
+          "content": "Thanks Taylor. Do you know whether the suite has three-phase power and any notable amperage?"
+        },
+        {
+          "direction": "inbound",
+          "content": "It does and a ton of amps. Highly upgraded power was installed because the whole building used to be a commercial printing company."
+        }
+      ],
+      "expectedUpdates": [
+        {
+          "column": "Total SF",
+          "value": "5000"
+        },
+        {
+          "column": "Drive Ins",
+          "value": "1"
+        },
+        {
+          "column": "Ceiling Ht",
+          "value": "24"
+        },
+        {
+          "column": "Power",
+          "value": "Highly upgraded three-phase power"
+        }
+      ],
+      "expectedEvents": [
+        "close_conversation"
+      ],
+      "operatorChecks": [
+        "AI should ask for missing power instead of prematurely completing.",
+        "Later power reply should complete the row and preserve the context in comments.",
+        "Tour/results outputs should show the property as viable."
+      ]
+    },
+    {
+      "id": "las_vegas_completed_pdf_forwarded_contact",
+      "clientAlias": "Las Vegas industrial search",
+      "property": {
+        "address": "2860 N Commerce St",
+        "city": "North Las Vegas",
+        "state": "NV",
+        "rowNumber": 9
+      },
+      "contact": {
+        "name": "Casey Broker",
+        "email": "bp21harrison+commerce@gmail.com"
+      },
+      "conversation": [
+        {
+          "direction": "outbound",
+          "content": "Hi Casey, could you send specs and any flyer for 2860 N Commerce St?"
+        },
+        {
+          "direction": "inbound",
+          "content": "Looping in my teammate who can help here. The brochure is attached. Power is 400 amps, 208Y/120, 3-phase. The space is still worth reviewing and we can coordinate a showing if your client wants to shortlist it."
+        }
+      ],
+      "attachments": [
+        {
+          "name": "BR_2860 Commerce.pdf",
+          "fixture": "test_pdfs/pdfs/full_e2e/100 Commerce Way - Property Flyer.pdf"
+        }
+      ],
+      "expectedUpdates": [
+        {
+          "column": "Power",
+          "value": "400 amps, 208Y/120, 3-phase"
+        }
+      ],
+      "expectedEvents": [
+        "wrong_contact",
+        "tour_requested"
+      ],
+      "operatorChecks": [
+        "Forwarded-contact context should not break thread identity.",
+        "PDF evidence should flow into the final packet.",
+        "Tour request should stay as an action until approved."
+      ]
+    }
+  ]
+}

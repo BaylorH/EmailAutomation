@@ -887,6 +887,22 @@ def _has_new_property_path(
     return any((event or {}).get("type") == "new_property" for event in (events or []))
 
 
+EVENTS_ALLOWED_AFTER_ORIGINAL_ROW_NONVIABLE = {
+    "new_property",
+    "contact_optout",
+}
+
+
+def _should_skip_event_after_original_row_terminalized(
+    event_type: str,
+    *,
+    old_row_became_nonviable: bool,
+) -> bool:
+    if not old_row_became_nonviable:
+        return False
+    return event_type not in EVENTS_ALLOWED_AFTER_ORIGINAL_ROW_NONVIABLE
+
+
 def _property_exists_in_sheet(
     sheets,
     sheet_id: str,
@@ -1977,6 +1993,17 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 # when AI re-detects the same event from conversation history
                 if is_event_handled(user_id, thread_id, event_key):
                     print(f"   ✅ Already handled, skipping")
+                    continue
+
+                if _should_skip_event_after_original_row_terminalized(
+                    event_type,
+                    old_row_became_nonviable=old_row_became_nonviable,
+                ):
+                    print(
+                        "   ℹ️ Skipping stale original-row event after non-viable move; "
+                        "replacement/opt-out events will continue."
+                    )
+                    mark_event_handled(user_id, thread_id, event_key, msg_id, None)
                     continue
 
                 print(f"   ➡️ Processing event...")

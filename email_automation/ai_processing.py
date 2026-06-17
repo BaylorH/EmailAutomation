@@ -142,7 +142,7 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
         return proposal
 
     if _looks_like_requirements_mismatch_nonviable(latest_text):
-        events.append({"type": "property_unavailable", "reason": "requirements_mismatch"})
+        events.insert(0, {"type": "property_unavailable", "reason": "requirements_mismatch"})
         return proposal
 
     unavailable_patterns = [
@@ -157,7 +157,7 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
 
     for reason, pattern in unavailable_patterns:
         if re.search(pattern, latest_text):
-            events.append({"type": "property_unavailable", "reason": reason})
+            events.insert(0, {"type": "property_unavailable", "reason": reason})
             return proposal
 
     if not any((event or {}).get("type") == "tour_requested" for event in events):
