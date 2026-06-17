@@ -129,6 +129,17 @@ class SignatureFooterTests(unittest.TestCase):
         self.assertNotIn("<img", signature)
         self.assertEqual([], get_signature_attachments(signature, "professional", user_email="avery@example.com"))
 
+    def test_professional_signature_logo_scales_without_forcing_fixed_width(self):
+        signature = build_professional_signature_html({
+            "name": "Avery Broker",
+            "email": "avery@example.com",
+            "company": "Example Realty Advisors",
+            "logoDataUrl": "data:image/png;base64,LOGO",
+        })
+
+        self.assertIn("max-width:120px;max-height:150px;width:auto;height:auto", signature)
+        self.assertNotIn('style="width:120px;max-width:120px;max-height:150px', signature)
+
     def test_professional_mode_without_user_signature_does_not_use_jill_for_other_mohr_users(self):
         footer = get_email_footer(
             "",

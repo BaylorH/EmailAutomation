@@ -666,7 +666,7 @@ def build_professional_signature_html(fields: Dict[str, Any] = None) -> str:
         logo_cell = (
             '<td valign="top" style="padding-right:30px;vertical-align:top;width:120px;">'
             f'<img src="{values["logoDataUrl"]}" alt="{logo_alt}" '
-            'style="width:120px;max-width:120px;max-height:150px;height:auto;object-fit:contain;display:block;border:0;" />'
+            'style="max-width:120px;max-height:150px;width:auto;height:auto;object-fit:contain;display:block;border:0;" />'
             "</td>"
         )
 
