@@ -7,9 +7,11 @@ from PIL import Image
 
 from email_automation.utils import (
     SIGNATURE_INLINE_IMAGE_MAX_BYTES,
+    build_professional_signature_html,
     format_email_body_with_footer,
     get_signature_attachments,
     get_email_footer,
+    resolve_signature_settings,
     needs_signature_attachments,
 )
 
@@ -53,21 +55,79 @@ class SignatureFooterTests(unittest.TestCase):
     def test_signature_attachments_do_not_default_to_company_logo_without_profile_context(self):
         self.assertEqual([], get_signature_attachments())
 
-    def test_professional_mode_without_user_signature_keeps_legacy_jill_only_for_jill(self):
+    def test_professional_mode_without_user_signature_does_not_use_legacy_jill(self):
         footer = get_email_footer(
             "",
             "professional",
             user_email="jill.ames@mohrpartners.com",
         )
 
-        self.assertIn("Jill Ames", footer)
-        self.assertTrue(
+        self.assertEqual("", footer)
+        self.assertFalse(
             needs_signature_attachments(
                 "professional",
                 "",
                 user_email="jill.ames@mohrpartners.com",
             )
         )
+
+    def test_resolved_professional_signature_uses_structured_fields_over_stale_cached_html(self):
+        stale_jill_html = (
+            '<div data-sitesift-professional-signature="v1">'
+            '<strong>Jill Ames</strong><a href="mailto:jill.ames@mohrpartners.com">jill.ames@mohrpartners.com</a>'
+            '</div>'
+        )
+
+        signature, mode, user_email = resolve_signature_settings({
+            "email": "baylor.freelance@outlook.com",
+            "signatureMode": "professional",
+            "emailSignature": stale_jill_html,
+            "professionalSignature": {
+                "name": "John Doe",
+                "title": "Principal",
+                "email": "baylor.freelance@outlook.com",
+                "company": "Example Realty Advisors",
+            },
+        })
+
+        self.assertEqual("professional", mode)
+        self.assertEqual("baylor.freelance@outlook.com", user_email)
+        self.assertIn("John Doe", signature)
+        self.assertIn("Example Realty Advisors", signature)
+        self.assertNotIn("Jill Ames", signature)
+        self.assertNotIn("jill.ames@mohrpartners.com", signature)
+
+    def test_mohr_domain_defaults_fill_company_branding_without_person_impersonation(self):
+        signature, mode, user_email = resolve_signature_settings({
+            "email": "drew.ingram@mohrpartners.com",
+            "displayName": "Drew Ingram",
+            "signatureMode": "professional",
+            "professionalSignature": {
+                "title": "Advisor",
+            },
+        })
+        footer = get_email_footer(signature, mode, user_email=user_email)
+        attachments = get_signature_attachments(signature, mode, user_email=user_email)
+
+        self.assertIn("Drew Ingram", footer)
+        self.assertIn("drew.ingram@mohrpartners.com", footer)
+        self.assertIn("Mohr Partners, Inc.", footer)
+        self.assertIn('src="cid:signature-custom-logo-1"', footer)
+        self.assertNotIn("Jill Ames", footer)
+        self.assertEqual(1, len(attachments))
+
+    def test_professional_signature_without_logo_stays_presentable_and_attachment_free(self):
+        signature = build_professional_signature_html({
+            "name": "Avery Broker",
+            "title": "Industrial Advisor",
+            "email": "avery@example.com",
+            "company": "Example Realty Advisors",
+        })
+
+        self.assertIn("Avery Broker", signature)
+        self.assertIn("Example Realty Advisors", signature)
+        self.assertNotIn("<img", signature)
+        self.assertEqual([], get_signature_attachments(signature, "professional", user_email="avery@example.com"))
 
     def test_professional_mode_without_user_signature_does_not_use_jill_for_other_mohr_users(self):
         footer = get_email_footer(

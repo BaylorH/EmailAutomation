@@ -1,16 +1,20 @@
 import re
 import base64
+import html
 import io
 import time
 import requests
 import os
 import logging
 from bs4 import BeautifulSoup
-from typing import Optional, List
+from functools import lru_cache
+from typing import Any, Dict, Optional, List, Tuple
 
 logger = logging.getLogger(__name__)
 SIGNATURE_INLINE_IMAGE_MAX_BYTES = 48 * 1024
 SIGNATURE_INLINE_IMAGE_MAX_DIMENSION = 240
+PROFESSIONAL_SIGNATURE_MARKER = 'data-sitesift-professional-signature="v1"'
+MOHR_PARTNERS_DOMAIN = "mohrpartners.com"
 
 # Helper: detect HTML vs text
 _html_rx = re.compile(r"<[a-zA-Z/][^>]*>")
@@ -542,6 +546,244 @@ def _has_html_signature(custom_signature: str = None) -> bool:
     return bool(signature and ("data-sitesift-professional-signature" in signature or _html_rx.search(signature)))
 
 
+def _clean_signature_value(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_signature_url(value: Any) -> str:
+    url = _clean_signature_value(value)
+    if not url:
+        return ""
+    if re.match(r"^https?://", url, re.IGNORECASE):
+        return url
+    return f"https://{url}"
+
+
+def _display_signature_website(value: Any) -> str:
+    return re.sub(r"/$", "", re.sub(r"^https?://", "", _clean_signature_value(value), flags=re.IGNORECASE))
+
+
+def _safe_signature_data_url(value: Any) -> str:
+    data_url = _clean_signature_value(value)
+    if re.match(r"^data:image/(?:png|jpe?g|gif|webp);base64,[a-z0-9+/=]+$", data_url, re.IGNORECASE):
+        return data_url
+    return ""
+
+
+@lru_cache(maxsize=8)
+def _signature_asset_data_url(filename: str) -> str:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    full_path = os.path.join(current_dir, "assets", "images", filename)
+    if not os.path.exists(full_path):
+        return ""
+
+    ext = os.path.splitext(filename)[1].lower()
+    content_type = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }.get(ext, "image/png")
+
+    with open(full_path, "rb") as f:
+        return f"data:{content_type};base64,{base64.b64encode(f.read()).decode('ascii')}"
+
+
+def get_signature_domain_defaults(user_email: str = None) -> Dict[str, str]:
+    """Company-wide defaults are allowed for org branding, never for a person's identity."""
+    email = _clean_signature_value(user_email).lower()
+    domain = email.split("@")[-1] if "@" in email else ""
+    if domain != MOHR_PARTNERS_DOMAIN:
+        return {}
+
+    return {
+        "company": "Mohr Partners, Inc.",
+        "website": "mohrpartners.com",
+        "linkedinUrl": "https://www.linkedin.com/company/mohr-partners",
+        "logoDataUrl": _signature_asset_data_url("mohr-partners-logo.png"),
+    }
+
+
+def _professional_fields_from_user_data(user_data: Dict[str, Any]) -> Dict[str, str]:
+    user_data = user_data or {}
+    professional_signature = user_data.get("professionalSignature") or {}
+    if not isinstance(professional_signature, dict):
+        professional_signature = {}
+
+    user_email = _clean_signature_value(user_data.get("email"))
+    defaults = get_signature_domain_defaults(user_email)
+    organization_name = _clean_signature_value(user_data.get("organizationName"))
+
+    fields = {
+        "name": _clean_signature_value(
+            professional_signature.get("name")
+            or user_data.get("preferredDisplayName")
+            or user_data.get("displayName")
+        ),
+        "title": _clean_signature_value(professional_signature.get("title")),
+        "team": _clean_signature_value(professional_signature.get("team")),
+        "licenseLine": _clean_signature_value(professional_signature.get("licenseLine")),
+        "phone": _clean_signature_value(professional_signature.get("phone")),
+        "email": _clean_signature_value(professional_signature.get("email") or user_email),
+        "company": _clean_signature_value(professional_signature.get("company") or defaults.get("company") or organization_name),
+        "website": _clean_signature_value(professional_signature.get("website") or defaults.get("website")),
+        "location": _clean_signature_value(professional_signature.get("location")),
+        "linkedinUrl": _clean_signature_value(professional_signature.get("linkedinUrl") or defaults.get("linkedinUrl")),
+        "logoDataUrl": _safe_signature_data_url(professional_signature.get("logoDataUrl") or defaults.get("logoDataUrl")),
+    }
+    return fields
+
+
+def build_professional_signature_html(fields: Dict[str, Any] = None) -> str:
+    """Render the same structured professional signature the frontend previews."""
+    fields = fields or {}
+    values = {
+        "name": _clean_signature_value(fields.get("name")),
+        "title": _clean_signature_value(fields.get("title")),
+        "team": _clean_signature_value(fields.get("team")),
+        "licenseLine": _clean_signature_value(fields.get("licenseLine")),
+        "phone": _clean_signature_value(fields.get("phone")),
+        "email": _clean_signature_value(fields.get("email")),
+        "company": _clean_signature_value(fields.get("company")),
+        "website": _clean_signature_value(fields.get("website")),
+        "location": _clean_signature_value(fields.get("location")),
+        "linkedinUrl": _clean_signature_value(fields.get("linkedinUrl")),
+        "logoDataUrl": _safe_signature_data_url(fields.get("logoDataUrl")),
+    }
+
+    has_content = any(value for key, value in values.items() if key != "logoDataUrl")
+    if not has_content:
+        return ""
+
+    website_href = _normalize_signature_url(values["website"])
+    website_text = _display_signature_website(values["website"])
+    linkedin_href = _normalize_signature_url(values["linkedinUrl"])
+    logo_alt = html.escape(f"{values['company'] or values['name'] or 'Signature'} logo", quote=True)
+
+    logo_cell = ""
+    if values["logoDataUrl"]:
+        logo_cell = (
+            '<td valign="top" style="padding-right:30px;vertical-align:top;width:120px;">'
+            f'<img src="{values["logoDataUrl"]}" alt="{logo_alt}" '
+            'style="width:120px;max-width:120px;max-height:150px;height:auto;object-fit:contain;display:block;border:0;" />'
+            "</td>"
+        )
+
+    title_lines = "".join(
+        f'<span style="font-size:10pt;color:#000000;">{html.escape(value)}</span><br>'
+        for value in [values["title"], values["team"], values["licenseLine"]]
+        if value
+    )
+    email_line = (
+        f'<a href="mailto:{html.escape(values["email"], quote=True)}" '
+        'style="color:#000000;text-decoration:underline;text-decoration-color:#CC0000;text-underline-offset:2px;">'
+        f'{html.escape(values["email"])}</a><br>'
+        if values["email"]
+        else ""
+    )
+    linkedin_line = (
+        f'<a href="{html.escape(linkedin_href, quote=True)}" target="_blank" rel="noopener noreferrer" '
+        'style="text-decoration:none;display:inline-block;margin-top:4px;">'
+        '<span aria-hidden="true" style="display:inline-block;width:20px;height:20px;line-height:20px;text-align:center;'
+        'border-radius:50%;background:#6b7280;color:#ffffff;font-size:11px;font-weight:bold;'
+        'font-family:Arial,Helvetica,sans-serif;">in</span></a>'
+        if linkedin_href
+        else ""
+    )
+    website_line = (
+        f'<a href="{html.escape(website_href, quote=True)}" target="_blank" rel="noopener noreferrer" '
+        'style="color:#CC0000;text-decoration:underline;text-decoration-color:#CC0000;text-underline-offset:2px;">'
+        f'{html.escape(website_text)}</a><br>'
+        if website_href
+        else ""
+    )
+
+    return f"""<!-- sitesift:professional-signature:v1 -->
+<div data-sitesift-professional-signature="v1" style="font-family:Arial,Helvetica,sans-serif;font-size:10pt;color:#000000;line-height:1.5;">
+Best,<br>
+<br>
+<table cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;margin-top:10px;font-family:Arial,Helvetica,sans-serif;font-size:10pt;color:#000000;">
+<tr>
+{logo_cell}
+<td valign="top" style="vertical-align:top;font-family:Arial,Helvetica,sans-serif;font-size:10pt;color:#000000;width:340px;">
+<table cellpadding="0" cellspacing="0" border="0" width="340" style="border-collapse:collapse;width:340px;max-width:340px;">
+<tr>
+<td colspan="2" style="padding-bottom:8px;">
+{f'<strong style="font-size:12pt;font-weight:bold;color:#000000;">{html.escape(values["name"])}</strong><br>' if values["name"] else ''}
+{title_lines}
+</td>
+</tr>
+<tr>
+<td colspan="2" style="padding:8px 0;">
+<div style="border-top:1px solid #CC0000;width:100%;"></div>
+</td>
+</tr>
+<tr>
+<td valign="top" width="155" style="padding-right:30px;vertical-align:top;font-size:10pt;color:#000000;width:155px;">
+{f'{html.escape(values["phone"])}<br>' if values["phone"] else ''}
+{email_line}
+{linkedin_line}
+</td>
+<td valign="top" width="155" style="vertical-align:top;font-size:10pt;color:#000000;width:155px;">
+{f'<strong style="font-weight:bold;color:#000000;">{html.escape(values["company"])}</strong><br>' if values["company"] else ''}
+{website_line}
+{f'<span style="color:#000000;">{html.escape(values["location"])}</span>' if values["location"] else ''}
+</td>
+</tr>
+</table>
+</td>
+</tr>
+</table>
+</div>"""
+
+
+def _professional_signature_html_belongs_to_sender(signature: str, user_email: str = None) -> bool:
+    signature = signature or ""
+    user_email = _clean_signature_value(user_email).lower()
+    if not signature.strip():
+        return False
+    if user_email and user_email in signature.lower():
+        return True
+    if user_email != "jill.ames@mohrpartners.com" and "jill.ames@mohrpartners.com" in signature.lower():
+        return False
+    return True
+
+
+def resolve_signature_settings(user_data: Dict[str, Any] = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Resolve the active signature from one user profile.
+
+    Structured professional fields are the source of truth for professional
+    signatures. The cached emailSignature HTML is only a fallback for old
+    profiles when it appears to belong to the current sender.
+    """
+    user_data = user_data or {}
+    user_email = _clean_signature_value(user_data.get("email"))
+    signature_mode = user_data.get("signatureMode")
+    email_signature = user_data.get("emailSignature")
+
+    if not signature_mode:
+        signature_mode = "custom" if _clean_signature_value(email_signature) else "none"
+
+    if signature_mode == "professional":
+        structured_signature = build_professional_signature_html(_professional_fields_from_user_data(user_data))
+        if structured_signature:
+            return structured_signature, "professional", user_email
+
+        if (
+            _clean_signature_value(email_signature)
+            and _professional_signature_html_belongs_to_sender(email_signature, user_email)
+        ):
+            return email_signature, "professional", user_email
+        return None, "professional", user_email
+
+    if signature_mode == "custom":
+        return email_signature, "custom", user_email
+
+    return None, "none", user_email
+
+
 def _sanitize_custom_signature_html(custom_signature: str) -> str:
     """Keep generated signature HTML email-safe before embedding it in Graph messages."""
     soup = BeautifulSoup(custom_signature or "", "html.parser")
@@ -670,19 +912,12 @@ def get_signature_attachments(custom_signature: str = None, signature_mode: str 
     Get signature images as inline attachments for Microsoft Graph API.
 
     User-created professional signatures can include uploaded logo data URLs.
-    Those are converted to CID attachments. The bundled MOHR logo is only for
-    Jill's explicit legacy profile, never a generic company/domain default.
+    Those are converted to CID attachments. Company defaults are resolved into
+    the active signature HTML before this helper is called.
     """
     custom_attachments = _custom_signature_attachment_entries(custom_signature)
     if custom_attachments:
         return custom_attachments
-
-    if (
-        signature_mode == "professional"
-        and not (custom_signature and custom_signature.strip())
-        and _is_legacy_mohr_signature_user(user_email)
-    ):
-        return _legacy_mohr_signature_attachments()
 
     return []
 
@@ -707,9 +942,8 @@ def convert_plain_text_signature_to_html(plain_text_signature: str) -> str:
 
 
 def _is_legacy_mohr_signature_user(user_email: str = None) -> bool:
-    """Only Jill's explicit legacy sender profile may use the old hardcoded footer."""
-    email = (user_email or "").strip().lower()
-    return email == "jill.ames@mohrpartners.com"
+    """Deprecated: send paths must use saved structured signature data instead."""
+    return False
 
 
 def get_email_footer(custom_signature: str = None, signature_mode: str = None, user_email: str = None) -> str:
@@ -721,9 +955,9 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None, u
         signature_mode: Signature mode - "none", "custom", or "professional".
                        - "none": No signature at all
                        - "custom": Use the custom_signature text (converted to HTML)
-                       - "professional": Use custom_signature when present. Empty
-                         professional profiles only use the legacy MOHR/Jill footer for
-                         Jill's explicit legacy sender profile.
+                       - "professional": Use the resolved professional signature
+                         HTML passed in custom_signature. Empty professional
+                         profiles stay empty.
                        - None/empty: Defaults to "none" (user must explicitly configure)
         user_email: Sender profile email used to gate the legacy Jill footer.
     """
@@ -744,57 +978,10 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None, u
     if signature_mode == "professional":
         if custom_signature and custom_signature.strip():
             return convert_plain_text_signature_to_html(custom_signature)
-        if not _is_legacy_mohr_signature_user(user_email):
-            return ""
+        return ""
     else:
         # Unknown mode - treat as none
         return ""
-
-    # Build the footer HTML matching the professional signature layout
-    # Uses CID references for images - the actual attachments are added by send_and_index_email()
-    # CID (Content-ID) is the most reliable way to embed images in emails across all clients
-    footer = """Best,<br>
-<br>
-<table cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; margin-top: 10px; font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000;">
-<tr>
-<td valign="top" style="padding-right: 30px; vertical-align: top;">
-<a href="https://mohrpartners.com/" target="_blank" style="text-decoration: none;">
-<img src="cid:signature-logo" alt="Mohr Partners" style="width: 120px; height: auto; display: block; border: 0;" />
-</a>
-</td>
-<td valign="top" style="vertical-align: top; font-family: Arial, Helvetica, sans-serif; font-size: 10pt; color: #000000;">
-<table cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; width: 100%;">
-<tr>
-<td colspan="2" style="padding-bottom: 8px;">
-<strong style="font-size: 12pt; font-weight: bold; color: #000000;">Jill Ames</strong><br>
-<span style="font-size: 10pt; color: #000000;">Senior Associate</span><br>
-<span style="font-size: 10pt; color: #000000;">National Accounts</span><br>
-<span style="font-size: 10pt; color: #000000;">License Nos. 127384 (WA), SP24646 (ID)</span>
-</td>
-</tr>
-<tr>
-<td colspan="2" style="padding: 8px 0;">
-<div style="border-top: 1px solid #CC0000; width: 100%;"></div>
-</td>
-</tr>
-<tr>
-<td valign="top" style="padding-right: 30px; vertical-align: top; font-size: 10pt; color: #000000;">
-T +1 206 510 5575<br>
-<a href="mailto:jill.ames@mohrpartners.com" style="color: #000000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">jill.ames@mohrpartners.com</a><br>
-<a href="https://www.linkedin.com/company/mohr-partners" target="_blank" style="text-decoration: none; display: inline-block; margin-top: 4px;"><img src="cid:signature-linkedin" alt="LinkedIn" style="width: 20px; height: 20px; border: 0; vertical-align: middle;" /></a>
-</td>
-<td valign="top" style="vertical-align: top; font-size: 10pt; color: #000000;">
-<strong style="font-weight: bold; color: #000000;">Mohr Partners, Inc.</strong><br>
-<a href="https://mohrpartners.com/" target="_blank" style="color: #CC0000; text-decoration: underline; text-decoration-color: #CC0000; text-underline-offset: 2px;">mohrpartners.com</a><br>
-<span style="color: #000000;">Seattle, WA</span>
-</td>
-</tr>
-</table>
-</td>
-</tr>
-</table>"""
-
-    return footer
 
 
 def needs_signature_attachments(signature_mode: str, custom_signature: str = None, user_email: str = None) -> bool:
@@ -802,11 +989,7 @@ def needs_signature_attachments(signature_mode: str, custom_signature: str = Non
     if _custom_signature_attachment_entries(custom_signature):
         return True
 
-    return (
-        signature_mode == "professional"
-        and not (custom_signature and custom_signature.strip())
-        and _is_legacy_mohr_signature_user(user_email)
-    )
+    return False
 
 
 def format_email_body_with_footer(

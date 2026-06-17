@@ -4,7 +4,13 @@ from typing import List, Dict, Tuple, Optional
 from google.cloud.firestore import FieldFilter
 from .clients import _fs
 from .notifications import write_notification
-from .utils import exponential_backoff_request, format_email_body_with_footer, get_signature_attachments, needs_signature_attachments
+from .utils import (
+    exponential_backoff_request,
+    format_email_body_with_footer,
+    get_signature_attachments,
+    needs_signature_attachments,
+    resolve_signature_settings,
+)
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 
 
@@ -17,11 +23,7 @@ def _get_user_signature_settings(uid: str) -> Tuple[Optional[str], Optional[str]
         user_doc = _fs.collection("users").document(uid).get()
         if user_doc.exists:
             user_data = user_doc.to_dict() or {}
-            return (
-                user_data.get("emailSignature"),
-                user_data.get("signatureMode"),
-                user_data.get("email"),
-            )
+            return resolve_signature_settings(user_data)
     except Exception as e:
         print(f"⚠️ Failed to fetch user signature settings: {e}")
     return None, None, None

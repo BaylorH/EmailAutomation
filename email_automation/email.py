@@ -6,7 +6,14 @@ import logging
 from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 from google.cloud.firestore import SERVER_TIMESTAMP
-from .utils import exponential_backoff_request, safe_preview, _body_kind, validate_recipient_emails, is_valid_email
+from .utils import (
+    exponential_backoff_request,
+    safe_preview,
+    _body_kind,
+    validate_recipient_emails,
+    is_valid_email,
+    resolve_signature_settings,
+)
 from .messaging import save_thread_root, save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
 from .clients import _get_sheet_id_or_fail, _sheets_client
 from .sheets import _find_row_by_email, _get_first_tab_title, _read_header_row2, _header_index_map, highlight_row
@@ -1332,9 +1339,7 @@ def send_outboxes(
     user_email = None
     if user_doc.exists:
         user_data = user_doc.to_dict() or {}
-        user_signature = user_data.get("emailSignature")
-        signature_mode = user_data.get("signatureMode")  # "none", "custom", or "professional"
-        user_email = user_data.get("email")
+        user_signature, signature_mode, user_email = resolve_signature_settings(user_data)
         if signature_mode:
             print(f"📝 Signature mode: {signature_mode}")
         elif user_signature:

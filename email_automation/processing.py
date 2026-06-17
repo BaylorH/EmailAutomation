@@ -983,7 +983,13 @@ def _align_response_greeting(response_body: Optional[str], contact_name: Optiona
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     try:
-        from .utils import exponential_backoff_request, safe_preview, get_signature_attachments, needs_signature_attachments
+        from .utils import (
+            exponential_backoff_request,
+            safe_preview,
+            get_signature_attachments,
+            needs_signature_attachments,
+            resolve_signature_settings,
+        )
         from .messaging import save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
         from .clients import _fs
         from datetime import datetime, timezone
@@ -1000,9 +1006,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             user_doc = _fs.collection("users").document(user_id).get()
             if user_doc.exists:
                 user_data = user_doc.to_dict() or {}
-                user_signature = user_data.get("emailSignature")
-                signature_mode = user_data.get("signatureMode")
-                user_email = user_data.get("email")
+                user_signature, signature_mode, user_email = resolve_signature_settings(user_data)
         except Exception as e:
             print(f"   ⚠️ Failed to fetch user signature settings: {e}")
 

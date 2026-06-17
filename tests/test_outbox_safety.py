@@ -92,11 +92,12 @@ class FakeOutboxCollection:
 
 
 class FakeUserNode:
-    def __init__(self, docs):
+    def __init__(self, docs, user_data=None):
         self.docs = docs
+        self.user_data = user_data or {"email": "baylor.freelance@outlook.com"}
 
     def get(self):
-        return FakeSnapshot({"email": "baylor.freelance@outlook.com"})
+        return FakeSnapshot(self.user_data)
 
     def collection(self, name):
         if name != "outbox":
@@ -105,21 +106,23 @@ class FakeUserNode:
 
 
 class FakeUsersCollection:
-    def __init__(self, docs):
+    def __init__(self, docs, user_data=None):
         self.docs = docs
+        self.user_data = user_data
 
     def document(self, _user_id):
-        return FakeUserNode(self.docs)
+        return FakeUserNode(self.docs, self.user_data)
 
 
 class FakeFirestoreWithOutbox:
-    def __init__(self, docs):
+    def __init__(self, docs, user_data=None):
         self.docs = docs
+        self.user_data = user_data
 
     def collection(self, name):
         if name != "users":
             raise AssertionError(f"Unexpected root collection: {name}")
-        return FakeUsersCollection(self.docs)
+        return FakeUsersCollection(self.docs, self.user_data)
 
 
 class OutboxSafetyTests(unittest.TestCase):
@@ -209,6 +212,49 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(provider_calls, [1, 2])
         self.assertEqual(send_headers, ["Bearer fresh-token-1", "Bearer fresh-token-2"])
         sleep.assert_called_once_with(120)
+
+    def test_send_outboxes_resolves_structured_professional_signature_before_send(self):
+        docs = [
+            FakeDoc({
+                "assignedEmails": ["bp21harrison@gmail.com"],
+                "script": "Hi Avery",
+                "clientId": "client-1",
+                "subject": "100 Signature Way",
+                "rowNumber": 3,
+            }, doc_id="outbox-1")
+        ]
+        captured_signature = {}
+
+        def record_single_send(_user_id, _headers, _item, user_signature=None, signature_mode=None, user_email=None, **_kwargs):
+            captured_signature["html"] = user_signature
+            captured_signature["mode"] = signature_mode
+            captured_signature["email"] = user_email
+
+        with patch(
+            "email_automation.clients._fs",
+            FakeFirestoreWithOutbox(docs, user_data={
+                "email": "baylor.freelance@outlook.com",
+                "signatureMode": "professional",
+                "emailSignature": '<div data-sitesift-professional-signature="v1">Jill Ames jill.ames@mohrpartners.com</div>',
+                "professionalSignature": {
+                    "name": "John Doe",
+                    "title": "Principal",
+                    "email": "baylor.freelance@outlook.com",
+                    "company": "Example Realty Advisors",
+                },
+            }),
+        ), patch.object(email_module, "_send_single_outbox_item", side_effect=record_single_send):
+            email_module.send_outboxes(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+            )
+
+        self.assertEqual(captured_signature["mode"], "professional")
+        self.assertEqual(captured_signature["email"], "baylor.freelance@outlook.com")
+        self.assertIn("John Doe", captured_signature["html"])
+        self.assertIn("Example Realty Advisors", captured_signature["html"])
+        self.assertNotIn("Jill Ames", captured_signature["html"])
+        self.assertNotIn("jill.ames@mohrpartners.com", captured_signature["html"])
 
     def test_tour_planner_outbox_uses_reviewed_body_even_for_existing_contact(self):
         reviewed_body = (

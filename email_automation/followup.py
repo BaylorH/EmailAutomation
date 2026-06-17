@@ -20,7 +20,14 @@ from typing import Dict, List, Optional, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
 
 from .clients import _fs
-from .utils import exponential_backoff_request, format_email_body_with_footer, get_signature_attachments, needs_signature_attachments, safe_preview
+from .utils import (
+    exponential_backoff_request,
+    format_email_body_with_footer,
+    get_signature_attachments,
+    needs_signature_attachments,
+    safe_preview,
+    resolve_signature_settings,
+)
 from .messaging import save_message
 
 # Claim timeout for follow-up processing (prevent duplicate sends)
@@ -432,9 +439,7 @@ def _send_followup_email(
         user_email = None
         if user_doc.exists:
             user_data = user_doc.to_dict() or {}
-            user_signature = user_data.get("emailSignature")
-            signature_mode = user_data.get("signatureMode")
-            user_email = user_data.get("email")
+            user_signature, signature_mode, user_email = resolve_signature_settings(user_data)
 
         # Format as HTML with signature
         html_content = format_email_body_with_footer(
