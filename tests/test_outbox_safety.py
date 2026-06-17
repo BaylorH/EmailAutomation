@@ -292,6 +292,48 @@ class OutboxSafetyTests(unittest.TestCase):
         send_and_index_email.assert_called_once()
         self.assertEqual(send_and_index_email.call_args.args[2], reviewed_body)
 
+    def test_tour_planner_outbox_preserves_tour_context_on_sent_thread(self):
+        tour_context = {
+            "propertyId": "row-7",
+            "arrivalTime": "10:47 AM",
+            "departureTime": "11:17 AM",
+            "stopMinutes": 30,
+        }
+        doc = FakeDoc({
+            "assignedEmails": ["bp21harrison@gmail.com"],
+            "script": "Hi Avery,\n\nPlease confirm the 10:47 AM tour slot.",
+            "clientId": "client-1",
+            "subject": "Tour slot: 555 Geocoded Map Dr at 10:47 AM",
+            "rowNumber": 7,
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": tour_context,
+            "actionAuditId": "audit-tour",
+        }, doc_id="outbox-tour")
+
+        with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": ["bp21harrison@gmail.com"],
+                 "errors": {},
+             }) as send_and_index_email, \
+             patch.object(email_module, "_finalize_successful_outbox_item"):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        self.assertEqual(
+            {
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "tourInvite": tour_context,
+                "actionAuditId": "audit-tour",
+            },
+            send_and_index_email.call_args.kwargs["thread_context"],
+        )
+
     def test_successful_dashboard_outbox_finalizes_notification_and_thread_after_send(self):
         outbox_ref = FakeDocRef()
         fake_fs = FakeFirestore()

@@ -755,6 +755,19 @@ def _should_use_exact_outbox_script(data: Dict[str, Any]) -> bool:
     )
 
 
+def _thread_context_from_outbox(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Preserve dashboard-flow context on the sent thread for later reply handling."""
+    if not data:
+        return {}
+
+    context = {}
+    for key in ("source", "actionType", "tourInvite", "actionAuditId"):
+        value = data.get(key)
+        if value:
+            context[key] = value
+    return context
+
+
 def _is_cancelled_outbox_item(data: Dict[str, Any]) -> bool:
     """True when the dashboard has requested cancellation before the worker sends."""
     status = (data.get("status") or "").strip().lower()
@@ -925,7 +938,8 @@ def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> Op
 def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, recipients: List[str],
                         client_id_or_none: Optional[str] = None, row_number: int = None, user_signature: str = None,
                         subject_override: str = None, signature_mode: str = None, followup_config: Dict = None,
-                        contact_name: str = None, user_email: str = None):
+                        contact_name: str = None, user_email: str = None,
+                        thread_context: Optional[Dict[str, Any]] = None):
     """
     Send email and immediately index it in Firestore for reply tracking.
 
@@ -946,6 +960,7 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         followup_config: Optional follow-up configuration from outbox
         contact_name: Optional contact name for follow-up personalization
         user_email: Sender profile email used to gate Jill's explicit legacy footer
+        thread_context: Optional dashboard context to store on newly indexed threads
 
     SAFETY: All recipient emails are validated before sending to prevent sending to malformed addresses.
     SAFETY: Opted-out contacts are filtered out before sending.
@@ -1174,6 +1189,12 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             # Store contact name for follow-up personalization
             if contact_name:
                 thread_meta["contactName"] = contact_name
+
+            if isinstance(thread_context, dict):
+                thread_meta.update({
+                    key: value for key, value in thread_context.items()
+                    if key in {"source", "actionType", "tourInvite", "actionAuditId"} and value
+                })
 
             # Store property address for PDF/data matching
             # Extract from subject (format: "Property Address, City")
@@ -1796,7 +1817,8 @@ def _send_single_outbox_item(
                         client_id_or_none=clientId, row_number=row_number,
                         user_signature=user_signature, subject_override=subject_override,
                         signature_mode=signature_mode, followup_config=followup_config,
-                        contact_name=contact_name, user_email=user_email
+                        contact_name=contact_name, user_email=user_email,
+                        thread_context=_thread_context_from_outbox(data),
                     )
                     all_sent.extend(res.get("sent", []))
                     all_errors.update(res.get("errors", {}))
@@ -1822,7 +1844,8 @@ def _send_single_outbox_item(
                                            client_id_or_none=clientId, row_number=row_number,
                                            user_signature=user_signature, subject_override=subject_override,
                                            signature_mode=signature_mode, followup_config=followup_config,
-                                           contact_name=contact_name, user_email=user_email)
+                                           contact_name=contact_name, user_email=user_email,
+                                           thread_context=_thread_context_from_outbox(data))
 
                 all_sent.extend(res.get("sent", []))
                 all_errors.update(res.get("errors", {}))

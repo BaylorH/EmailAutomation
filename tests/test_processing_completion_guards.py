@@ -81,6 +81,38 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
         self.assertTrue(processing._tour_event_needs_operator_action(event))
 
+    def test_tour_invite_confirmation_closes_without_operator_action(self):
+        classification = processing._classify_tour_invite_reply(
+            "That time works. We are confirmed for 10:47 AM.",
+            event={"type": "tour_requested", "question": "Confirmed for the requested tour slot."},
+            thread_data={
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "tourInvite": {"arrivalTime": "10:47 AM", "departureTime": "11:17 AM"},
+            },
+        )
+
+        self.assertEqual("confirmed", classification["outcome"])
+        self.assertFalse(classification["needsOperatorAction"])
+        self.assertTrue(classification["canCloseThread"])
+
+    def test_tour_invite_alternate_time_requires_operator_review_not_auto_shuffle(self):
+        classification = processing._classify_tour_invite_reply(
+            "The 10:47 AM requested time does not work. I can do 1:30 PM instead.",
+            event={"type": "tour_requested", "question": "Broker offered 1:30 PM instead."},
+            thread_data={
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "tourInvite": {"arrivalTime": "10:47 AM", "departureTime": "11:17 AM"},
+            },
+        )
+
+        self.assertEqual("alternate_requested", classification["outcome"])
+        self.assertTrue(classification["needsOperatorAction"])
+        self.assertFalse(classification["canCloseThread"])
+        self.assertIn("1:30 PM", classification["alternateTimes"])
+        self.assertNotIn("move the other tour", classification["suggestedEmail"].lower())
+
     def test_completion_cleanup_deletes_thread_action_notifications(self):
         class FakeReference:
             def __init__(self):

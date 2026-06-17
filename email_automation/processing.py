@@ -650,7 +650,143 @@ Thank you for offering to show me the property. I'd like to schedule a tour.
 Thanks!"""
 
 
-def _tour_event_needs_operator_action(event: Dict[str, Any]) -> bool:
+def _is_tour_invite_thread(thread_data: Optional[Dict[str, Any]] = None) -> bool:
+    if not isinstance(thread_data, dict):
+        return False
+    source = str(thread_data.get("source") or "").strip().lower()
+    action_type = str(thread_data.get("actionType") or "").strip().lower()
+    return bool(
+        source == "dashboard_tour_planner"
+        or action_type == "tour_invite"
+        or isinstance(thread_data.get("tourInvite"), dict)
+    )
+
+
+def _extract_tour_reply_time_mentions(text: str) -> List[str]:
+    seen = set()
+    times = []
+    for match in re.finditer(
+        r"\b(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)|noon|morning|afternoon)\b",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    ):
+        value = re.sub(r"\s+", " ", match.group(0).strip()).upper()
+        normalized = value.replace("AM", "AM").replace("PM", "PM")
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        times.append(normalized)
+    return times[:4]
+
+
+def _build_tour_reply_hold_suggested_email(
+    contact_name: str = "",
+    recipient_email: str = "",
+    alternate_times: Optional[List[str]] = None,
+) -> str:
+    greeting_name = _safe_tour_greeting_name(contact_name, recipient_email)
+    alternate_text = ""
+    if alternate_times:
+        alternate_text = f" I saw the alternate time you suggested ({', '.join(alternate_times)})."
+
+    return f"""Hi {greeting_name},
+
+Thanks for letting me know.{alternate_text}
+
+I'm checking the route and schedule on my end and will circle back once I can confirm a workable time.
+
+Thanks!"""
+
+
+def _classify_tour_invite_reply(
+    message_text: str = "",
+    *,
+    event: Optional[Dict[str, Any]] = None,
+    thread_data: Optional[Dict[str, Any]] = None,
+    contact_name: str = "",
+    recipient_email: str = "",
+) -> Dict[str, Any]:
+    event = event or {}
+    thread_data = thread_data or {}
+    raw_text = " ".join([
+        str(message_text or ""),
+        str(event.get("question") or ""),
+        str(event.get("notes") or ""),
+    ]).strip()
+    text = raw_text.lower()
+    tour_invite_context = _is_tour_invite_thread(thread_data) or event.get("reason") == "tour_slot_reply"
+
+    negative_time_signal = bool(re.search(
+        r"\b(?:does\s+not\s+work|doesn[’']t\s+work|won[’']t\s+work|can't\s+do|cannot\s+do|"
+        r"not\s+available|unavailable|need\s+to\s+reschedule|instead|works\s+better)\b",
+        text,
+    ))
+    declined_signal = bool(re.search(
+        r"\b(?:no\s+longer\s+available|cannot\s+show|can't\s+show|not\s+able\s+to\s+show|"
+        r"no\s+tour|not\s+touring|cancel(?:led)?\s+the\s+tour)\b",
+        text,
+    ))
+    confirmation_signal = bool(re.search(
+        r"\b(?:that\s+(?:time|slot)\s+works?|works\s+for\s+us|confirmed|confirming|"
+        r"see\s+you\s+(?:then|there)|we\s+are\s+confirmed|we're\s+confirmed|sounds\s+good)\b",
+        text,
+    ))
+    alternate_times = _extract_tour_reply_time_mentions(raw_text)
+
+    if tour_invite_context and declined_signal and not alternate_times:
+        return {
+            "outcome": "declined",
+            "needsOperatorAction": True,
+            "canCloseThread": False,
+            "alternateTimes": [],
+            "details": "Broker declined or cancelled the requested tour slot.",
+            "suggestedEmail": _build_tour_reply_hold_suggested_email(contact_name, recipient_email),
+        }
+
+    if tour_invite_context and (negative_time_signal or "instead" in text) and alternate_times:
+        return {
+            "outcome": "alternate_requested",
+            "needsOperatorAction": True,
+            "canCloseThread": False,
+            "alternateTimes": alternate_times,
+            "details": f"Broker said the requested tour slot does not work and offered {', '.join(alternate_times)}.",
+            "suggestedEmail": _build_tour_reply_hold_suggested_email(contact_name, recipient_email, alternate_times),
+        }
+
+    if tour_invite_context and confirmation_signal and not negative_time_signal and not declined_signal:
+        return {
+            "outcome": "confirmed",
+            "needsOperatorAction": False,
+            "canCloseThread": True,
+            "alternateTimes": alternate_times,
+            "details": "Broker confirmed the requested tour slot.",
+            "suggestedEmail": "",
+        }
+
+    return {
+        "outcome": "tour_offer_or_request",
+        "needsOperatorAction": True,
+        "canCloseThread": False,
+        "alternateTimes": alternate_times,
+        "details": "Broker tour/showing message needs operator review.",
+        "suggestedEmail": "",
+    }
+
+
+def _tour_event_needs_operator_action(
+    event: Dict[str, Any],
+    message_text: str = "",
+    thread_data: Optional[Dict[str, Any]] = None,
+) -> bool:
+    classification = _classify_tour_invite_reply(
+        message_text,
+        event=event,
+        thread_data=thread_data,
+    )
+    if classification.get("outcome") == "confirmed":
+        return False
+
     suggested = event.get("suggestedEmail")
     if isinstance(suggested, dict):
         suggested_body = suggested.get("body") or ""
@@ -1896,13 +2032,37 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 elif event_type == "tour_requested":
                     # Broker offered a tour - create notification with suggested response
                     try:
-                        if not _tour_event_needs_operator_action(event):
+                        tour_reply_classification = _classify_tour_invite_reply(
+                            _full_text,
+                            event=event,
+                            thread_data=thread_data,
+                            contact_name=contact_name,
+                            recipient_email=to_addr_lower,
+                        )
+
+                        if not _tour_event_needs_operator_action(event, _full_text, thread_data):
                             mark_event_handled(user_id, thread_id, event_key, msg_id, None)
+                            if tour_reply_classification.get("canCloseThread"):
+                                update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], "tour_confirmed")
+                                _clear_thread_action_notifications(user_id, client_id, thread_id)
+                                _maybe_mark_client_completed(user_id, client_id)
                             print("🏠 Tour confirmation detected - no operator action needed")
                             continue
 
                         question = event.get("question", "Tour requested")
                         suggested_email = event.get("suggestedEmail", "")
+                        reason = "tour_requested"
+                        details = "Tour/showing offered - review and approve response"
+
+                        if tour_reply_classification.get("outcome") in {"alternate_requested", "declined"}:
+                            reason = (
+                                "tour_reschedule_requested"
+                                if tour_reply_classification.get("outcome") == "alternate_requested"
+                                else "tour_slot_declined"
+                            )
+                            details = tour_reply_classification.get("details") or details
+                            question = details
+                            suggested_email = tour_reply_classification.get("suggestedEmail") or suggested_email
 
                         # If AI didn't generate a suggested email, create a default one
                         if not suggested_email:
@@ -1913,13 +2073,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             )
 
                         meta = {
-                            "reason": "tour_requested",
-                            "details": "Tour/showing offered - review and approve response",
+                            "reason": reason,
+                            "details": details,
                             "question": question,
                             "originalMessage": _full_text[:500],
                             "status": "pending_response",  # Not pending_approval - no row creation needed
                             "replyToMessageId": msg_id,  # Graph API message ID for sending reply
                             "contactName": contact_name,  # For [NAME] replacement in frontend
+                            "tourReplyClassification": tour_reply_classification,
                             "suggestedEmail": {
                                 "to": [to_addr_lower],
                                 "subject": f"RE: {row_anchor}" if row_anchor else "RE: Property Tour",
@@ -1936,13 +2097,17 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             row_number=rownum,
                             row_anchor=row_anchor,
                             meta=meta,
-                            dedupe_key=f"tour_requested:{thread_id}"
+                            dedupe_key=(
+                                f"tour_reply:{thread_id}:{msg_id}"
+                                if reason in {"tour_reschedule_requested", "tour_slot_declined"}
+                                else f"tour_requested:{thread_id}"
+                            )
                         )
                         mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
-                        print(f"🏠 Created tour_requested notification with suggested email")
+                        print(f"🏠 Created {reason} notification with suggested email")
 
                         # Update thread status to paused - waiting for user to handle tour
-                        update_thread_status(user_id, thread_id, THREAD_STATUS["paused"], "tour_requested")
+                        update_thread_status(user_id, thread_id, THREAD_STATUS["paused"], reason)
 
                         # Don't auto-respond - user will send the approved email
                         proposal["skip_response"] = True

@@ -100,6 +100,33 @@ def _looks_like_requirements_mismatch_nonviable(text: str) -> bool:
     )
 
 
+def _looks_like_tour_slot_reply(conversation: List[dict], latest_text: str) -> bool:
+    latest = (latest_text or "").lower()
+    if not latest:
+        return False
+
+    recent_thread_text = "\n".join(
+        str((message or {}).get("content") or (message or {}).get("body") or (message or {}).get("preview") or "")
+        for message in (conversation or [])[-4:]
+    ).lower()
+    tour_context = re.search(
+        r"\b(?:tour|showing|walk[-\s]?through|tour\s+slot|requested\s+arrival|expected\s+departure)\b",
+        f"{recent_thread_text}\n{latest}",
+    )
+    if not tour_context:
+        return False
+
+    reply_signal = re.search(
+        r"\b(?:that\s+time|that\s+slot|the\s+slot|requested\s+time|works?|confirmed|"
+        r"does\s+not\s+work|doesn[’']t\s+work|can't\s+do|cannot\s+do|won[’']t\s+work|"
+        r"could\s+do|available\s+(?:at|around|after|before)|instead|works\s+better|"
+        r"see\s+you|no\s+longer\s+available)\b",
+        latest,
+    )
+    time_signal = re.search(r"\b(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)|morning|afternoon|noon)\b", latest)
+    return bool(reply_signal or time_signal)
+
+
 def _augment_events_with_deterministic_signals(proposal: dict, conversation: List[dict]) -> dict:
     """Add high-confidence event signals from broker phrases the model can miss."""
     if not proposal:
@@ -109,7 +136,8 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
     if any((event or {}).get("type") == "property_unavailable" for event in events):
         return proposal
 
-    latest_text = _latest_inbound_text(conversation).lower()
+    latest_text_raw = _latest_inbound_text(conversation)
+    latest_text = latest_text_raw.lower()
     if not latest_text:
         return proposal
 
@@ -118,6 +146,7 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
         return proposal
 
     unavailable_patterns = [
+        ("no_longer_available", r"\bno\s+longer\s+available\b"),
         ("signed_loi", r"\bsigned\s+(?:an?\s+)?(?:loi|letter\s+of\s+intent)\b"),
         ("signed_lease", r"\bsigned\s+(?:a\s+)?lease\b"),
         ("no_longer_represented", r"\bno\s+longer\s+represent(?:s|ed|ing)?\s+(?:this\s+|the\s+)?property\b"),
@@ -129,6 +158,16 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
     for reason, pattern in unavailable_patterns:
         if re.search(pattern, latest_text):
             events.append({"type": "property_unavailable", "reason": reason})
+            return proposal
+
+    if not any((event or {}).get("type") == "tour_requested" for event in events):
+        if _looks_like_tour_slot_reply(conversation, latest_text):
+            events.append({
+                "type": "tour_requested",
+                "reason": "tour_slot_reply",
+                "question": latest_text_raw[:500],
+                "suggestedEmail": "",
+            })
             return proposal
 
     return proposal
