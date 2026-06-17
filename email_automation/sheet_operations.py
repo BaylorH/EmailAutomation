@@ -106,6 +106,60 @@ def stop_threads_for_row(
         return 0
 
 
+def complete_threads_for_row(
+    user_id: str,
+    row_number: int,
+    client_id: Optional[str] = None,
+    reason: str = "row_completed",
+) -> int:
+    """
+    Complete active thread roots anchored to one campaign row.
+
+    Graph can create a separate thread root for later dashboard sends like tour
+    invites. When that later thread confirms the row-level outcome, active
+    sibling roots should stop follow-ups too. Paused/stopped siblings are left
+    visible because they may still represent a real operator decision.
+    """
+    if row_number is None:
+        return 0
+
+    try:
+        updated_count = 0
+        threads_ref = _fs.collection("users").document(user_id).collection("threads")
+        threads = list(threads_ref.stream())
+
+        for thread in threads:
+            data = thread.to_dict() or {}
+            if client_id and data.get("clientId") != client_id:
+                continue
+            if data.get("rowNumber") != row_number:
+                continue
+
+            current_status = str(data.get("status") or "active").strip().lower()
+            if current_status not in {"active", "completed"}:
+                continue
+
+            threads_ref.document(thread.id).update({
+                "status": "completed",
+                "statusReason": reason,
+                "statusUpdatedAt": SERVER_TIMESTAMP,
+                "followUpStatus": "stopped",
+                "followUpConfig.processingBy": None,
+                "followUpConfig.processingAt": None,
+                "updatedAt": SERVER_TIMESTAMP,
+            })
+            print(f"   ✅ Completed thread {thread.id[:20]}... for row {row_number}")
+            updated_count += 1
+
+        if updated_count > 0:
+            print(f"✅ Completed {updated_count} active thread root(s) anchored to row {row_number}")
+        return updated_count
+
+    except Exception as e:
+        print(f"⚠️ Failed to complete threads for row {row_number}: {e}")
+        return 0
+
+
 def sync_thread_row_numbers_after_insert(user_id: str, insert_row: int, client_id: Optional[str] = None) -> int:
     """
     Update thread rowNumbers after a new sheet row is inserted.

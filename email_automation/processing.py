@@ -10,7 +10,7 @@ from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
 from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, append_links_to_floorplan_column, is_floorplan_filename, _header_index_map, _find_row_by_email, clear_row_highlight, highlight_row, ROW_HIGHLIGHT_BLUE
-from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move, stop_threads_for_row
+from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move, stop_threads_for_row, complete_threads_for_row
 from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
                        dump_thread_from_firestore, has_processed, mark_processed, set_last_scan_iso,
                        lookup_thread_by_message_id, lookup_thread_by_conversation_id,
@@ -2071,6 +2071,12 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             mark_event_handled(user_id, thread_id, event_key, msg_id, None)
                             if tour_reply_classification.get("canCloseThread"):
                                 update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], "tour_confirmed")
+                                complete_threads_for_row(
+                                    user_id,
+                                    rownum,
+                                    client_id=client_id,
+                                    reason="tour_confirmed",
+                                )
                                 _clear_thread_action_notifications(user_id, client_id, thread_id)
                                 _maybe_mark_client_completed(user_id, client_id)
                             print("🏠 Tour confirmation detected - no operator action needed")
@@ -2552,6 +2558,12 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
                         # Update thread status to completed using the status system
                         update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], close_reason)
+                        complete_threads_for_row(
+                            user_id,
+                            rownum,
+                            client_id=client_id,
+                            reason=close_reason,
+                        )
                         # Also update legacy fields for backwards compatibility
                         if thread_ref:
                             thread_ref.update({
@@ -3180,6 +3192,12 @@ We'll be in touch if we need any additional information."""
                                 _clear_thread_action_notifications(user_id, client_id, thread_id)
                                 # Update thread status to completed
                                 update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], "all_fields_gathered")
+                                complete_threads_for_row(
+                                    user_id,
+                                    rownum,
+                                    client_id=client_id,
+                                    reason="all_fields_gathered",
+                                )
                                 if thread_ref:
                                     thread_ref.update({
                                         "followUpStatus": "stopped",
