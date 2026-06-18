@@ -96,14 +96,32 @@ def _get_client_config(uid: str, client_id: str) -> tuple:
 
 def list_user_ids():
     url = f"https://firebasestorage.googleapis.com/v0/b/email-automation-cache.firebasestorage.app/o?prefix=msal_caches%2F&key={FIREBASE_API_KEY}"
-    r = requests.get(url)
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
     data = r.json()
     user_ids = set()
     for item in data.get("items", []):
         parts = item["name"].split("/")
         if len(parts) == 3 and parts[0] == "msal_caches" and parts[2] == "msal_token_cache.bin":
-            user_ids.add(parts[1])
-    return list(user_ids)
+            uid = parts[1]
+            if _is_scheduler_mailbox_user(uid):
+                user_ids.add(uid)
+            else:
+                print(f"⚠️ Skipping token cache path without mailbox-enabled user doc: {uid}")
+    return sorted(user_ids)
+
+def _is_scheduler_mailbox_user(uid: str) -> bool:
+    if not uid or uid.startswith("AIza"):
+        return False
+    try:
+        doc = _fs.collection("users").document(uid).get()
+        if not doc.exists:
+            return False
+        data = doc.to_dict() or {}
+        return data.get("hasMsalToken") is True
+    except Exception as exc:
+        print(f"⚠️ Could not validate scheduler user {uid}: {exc}")
+        return False
 
 def decode_token_payload(token):
     payload = token.split(".")[1]
