@@ -886,6 +886,10 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
 - "tour_requested": Emit when broker offers or requests a property tour/showing. This is DIFFERENT from needs_user_input.
   • Look for: "schedule a tour", "would you like to see it", "happy to show you", "can arrange a tour",
     "want to come by", "stop by and take a look", "walk through the property", "showing available"
+  • DO NOT emit when the broker merely sends specs, says a property is available, attaches a flyer, or when quoted
+    history/outbound text mentions "tour availability" as one of the requested fields.
+  • DO NOT infer a tour offer from "available immediately", "available SF", "tourable", or "attached is the flyer"
+    unless the LAST HUMAN message explicitly offers/request a showing or tour.
   • The user needs to decide whether to schedule the tour, so DO NOT auto-respond
   • Instead, GENERATE a suggested response email in the "suggestedEmail" field that the user can approve/edit
   • Example suggestedEmail: "Hi [NAME], Thank you for the offer! I'd like to schedule a tour. Are you available [suggest a few time options]? Looking forward to seeing the space."

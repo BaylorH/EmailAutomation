@@ -7,7 +7,13 @@ os.environ.setdefault(
     "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
 )
 
-from email_automation.utils import _sanitize_url, is_valid_email, validate_recipient_emails
+from email_automation.utils import (
+    _sanitize_url,
+    is_valid_email,
+    strip_email_quotes,
+    strip_html_tags,
+    validate_recipient_emails,
+)
 
 
 class EmailValidationTests(unittest.TestCase):
@@ -38,6 +44,21 @@ class EmailValidationTests(unittest.TestCase):
         signed_url = "https://example.com/flyer.pdf?token=ThanksMorgan&download=1"
 
         self.assertEqual(_sanitize_url(signed_url), signed_url)
+
+    def test_strip_html_tags_preserves_reply_boundaries_for_quote_trimming(self):
+        html = (
+            "<div>Hi John,</div>"
+            "<div>Here are the property details.</div>"
+            "<div>Best,</div>"
+            "<div>BP21 Broker</div>"
+            "<div>On Wed, Jun 17, 2026 at 9:28 PM Baylor wrote:</div>"
+            "<blockquote>Hi Ryan, can you send the specs?</blockquote>"
+        )
+
+        text = strip_html_tags(html)
+
+        self.assertRegex(text, r"BP21 Broker\s+On Wed")
+        self.assertNotIn("can you send the specs", strip_email_quotes(text))
 
 
 if __name__ == "__main__":

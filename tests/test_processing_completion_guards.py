@@ -113,6 +113,32 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertIn("1:30 PM", classification["alternateTimes"])
         self.assertNotIn("move the other tour", classification["suggestedEmail"].lower())
 
+    def test_specs_and_flyer_reply_is_not_treated_as_tour_offer(self):
+        message = (
+            "Hi John,\n"
+            "Gemini Business Park has a few options that could work. The strongest fit is "
+            "4,531 SF total with one drive-in, 17' clear height, asking $10.00/SF/YR NNN "
+            "plus $3.31/SF opex. Attached is a flyer with the broader park information.\n"
+            "Best,\nBP21 Gemini Broker\n"
+            "On Wed, Jun 17, 2026 at 9:28 PM Baylor wrote:\n"
+            "Hi Ryan, please include tour availability if tours are being offered."
+        )
+        event = {
+            "type": "tour_requested",
+            "question": message,
+            "suggestedEmail": "",
+        }
+
+        classification = processing._classify_tour_invite_reply(
+            message,
+            event=event,
+            thread_data={"actionType": "campaign_creation"},
+        )
+
+        self.assertEqual("not_tour", classification["outcome"])
+        self.assertFalse(processing._tour_event_needs_operator_action(event, message))
+        self.assertEqual([], classification["alternateTimes"])
+
     def test_completion_cleanup_deletes_thread_action_notifications(self):
         class FakeReference:
             def __init__(self):

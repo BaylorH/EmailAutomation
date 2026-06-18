@@ -699,6 +699,34 @@ I'm checking the route and schedule on my end and will circle back once I can co
 Thanks!"""
 
 
+def _clean_tour_signal_text(*parts: str) -> str:
+    """Use only the newest broker-authored text when judging tour actions."""
+    joined = "\n".join(str(part or "") for part in parts if str(part or "").strip())
+    return strip_email_quotes(joined).strip()
+
+
+def _looks_like_explicit_tour_offer_or_request(text: str = "") -> bool:
+    latest = (text or "").lower()
+    if not latest:
+        return False
+
+    tour_noun = (
+        r"(?:tour|showing|walk[-\s]?through|walkthrough|"
+        r"show\s+(?:you|your\s+client)|see\s+(?:it|the\s+space|the\s+property)|"
+        r"come\s+by|stop\s+by|take\s+a\s+look)"
+    )
+    patterns = [
+        rf"\b(?:schedule|arrange|set\s+up|book|coordinate)\s+(?:a\s+)?{tour_noun}\b",
+        rf"\b(?:would\s+you\s+like|do\s+you\s+want|want)\s+to\s+(?:schedule\s+)?{tour_noun}\b",
+        r"\b(?:offered|sent|provided|gave)\s+(?:available\s+)?(?:tour\s+)?(?:times|windows|slots|availability)\b",
+        rf"\b(?:happy|glad|able|available)\s+to\s+(?:show|tour|walk)\b",
+        rf"\b(?:can|could)\s+(?:show|tour|walk|meet)\b",
+        rf"\b(?:can|could)\s+(?:you|your\s+client|we)\s+(?:tour|come\s+by|stop\s+by|see)\b",
+        rf"\b(?:tour|showing|walk[-\s]?through|walkthrough)\s+(?:is\s+)?(?:available|offered)\b",
+    ]
+    return any(re.search(pattern, latest) for pattern in patterns)
+
+
 def _classify_tour_invite_reply(
     message_text: str = "",
     *,
@@ -714,8 +742,19 @@ def _classify_tour_invite_reply(
         str(event.get("question") or ""),
         str(event.get("notes") or ""),
     ]).strip()
-    text = raw_text.lower()
+    clean_text = _clean_tour_signal_text(raw_text)
+    text = clean_text.lower()
     tour_invite_context = _is_tour_invite_thread(thread_data) or event.get("reason") == "tour_slot_reply"
+
+    if not tour_invite_context and not _looks_like_explicit_tour_offer_or_request(clean_text):
+        return {
+            "outcome": "not_tour",
+            "needsOperatorAction": False,
+            "canCloseThread": False,
+            "alternateTimes": [],
+            "details": "Broker did not explicitly offer or request a tour.",
+            "suggestedEmail": "",
+        }
 
     negative_time_signal = bool(re.search(
         r"\b(?:does\s+not\s+work|doesn[’']t\s+work|won[’']t\s+work|can't\s+do|cannot\s+do|"
@@ -732,7 +771,7 @@ def _classify_tour_invite_reply(
         r"see\s+you\s+(?:then|there)|we\s+are\s+confirmed|we're\s+confirmed|sounds\s+good)\b",
         text,
     ))
-    alternate_times = _extract_tour_reply_time_mentions(raw_text)
+    alternate_times = _extract_tour_reply_time_mentions(clean_text)
 
     if tour_invite_context and declined_signal and not alternate_times:
         return {
@@ -784,6 +823,8 @@ def _tour_event_needs_operator_action(
         event=event,
         thread_data=thread_data,
     )
+    if classification.get("outcome") == "not_tour":
+        return False
     if classification.get("outcome") == "confirmed":
         return False
 
@@ -2059,15 +2100,20 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 elif event_type == "tour_requested":
                     # Broker offered a tour - create notification with suggested response
                     try:
+                        tour_message_text = _clean_tour_signal_text(_text_for_ai or _full_text)
+                        clean_event = dict(event)
+                        clean_event["question"] = _clean_tour_signal_text(
+                            event.get("question") or tour_message_text
+                        ) or tour_message_text
                         tour_reply_classification = _classify_tour_invite_reply(
-                            _full_text,
-                            event=event,
+                            tour_message_text,
+                            event=clean_event,
                             thread_data=thread_data,
                             contact_name=contact_name,
                             recipient_email=to_addr_lower,
                         )
 
-                        if not _tour_event_needs_operator_action(event, _full_text, thread_data):
+                        if not _tour_event_needs_operator_action(clean_event, tour_message_text, thread_data):
                             mark_event_handled(user_id, thread_id, event_key, msg_id, None)
                             if tour_reply_classification.get("canCloseThread"):
                                 update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], "tour_confirmed")
@@ -2079,11 +2125,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                                 )
                                 _clear_thread_action_notifications(user_id, client_id, thread_id)
                                 _maybe_mark_client_completed(user_id, client_id)
-                            print("🏠 Tour confirmation detected - no operator action needed")
+                            print(f"🏠 Skipped non-actionable tour event: {tour_reply_classification.get('outcome')}")
                             continue
 
-                        question = event.get("question", "Tour requested")
-                        suggested_email = event.get("suggestedEmail", "")
+                        question = clean_event.get("question") or "Tour requested"
+                        suggested_email = clean_event.get("suggestedEmail", "")
                         reason = "tour_requested"
                         details = "Tour/showing offered - review and approve response"
 
@@ -2109,7 +2155,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             "reason": reason,
                             "details": details,
                             "question": question,
-                            "originalMessage": _full_text[:500],
+                            "originalMessage": tour_message_text[:500],
                             "status": "pending_response",  # Not pending_approval - no row creation needed
                             "replyToMessageId": msg_id,  # Graph API message ID for sending reply
                             "contactName": contact_name,  # For [NAME] replacement in frontend

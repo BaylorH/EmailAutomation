@@ -1,6 +1,6 @@
 import re
 import base64
-import html
+import html as html_lib
 import io
 import time
 import requests
@@ -201,14 +201,22 @@ def strip_html_tags(html: str) -> str:
     """Strip HTML tags for preview."""
     if not html:
         return ""
-    # Simple HTML tag removal
-    clean = re.sub(r'<[^>]+>', '', html)
-    # Decode common HTML entities
-    clean = clean.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
-    clean = clean.replace('&quot;', '"').replace('&#39;', "'")
-    clean = clean.replace('&nbsp;', ' ')  # Non-breaking spaces
-    # Collapse multiple spaces into single space
-    clean = re.sub(r' +', ' ', clean)
+    clean = html
+    clean = re.sub(
+        r"(?i)<\s*(?:br|/p|/div|/li|/tr|/h[1-6])\b[^>]*>",
+        "\n",
+        clean,
+    )
+    clean = re.sub(
+        r"(?i)<\s*(?:p|div|li|tr|h[1-6])\b[^>]*>",
+        "\n",
+        clean,
+    )
+    clean = re.sub(r'<[^>]+>', ' ', clean)
+    clean = html_lib.unescape(clean)
+    clean = re.sub(r'[ \t]+', ' ', clean)
+    clean = re.sub(r' *\n *', '\n', clean)
+    clean = re.sub(r'\n{3,}', '\n\n', clean)
     return clean.strip()
 
 
@@ -659,7 +667,7 @@ def build_professional_signature_html(fields: Dict[str, Any] = None) -> str:
     website_href = _normalize_signature_url(values["website"])
     website_text = _display_signature_website(values["website"])
     linkedin_href = _normalize_signature_url(values["linkedinUrl"])
-    logo_alt = html.escape(f"{values['company'] or values['name'] or 'Signature'} logo", quote=True)
+    logo_alt = html_lib.escape(f"{values['company'] or values['name'] or 'Signature'} logo", quote=True)
 
     logo_cell = ""
     if values["logoDataUrl"]:
@@ -671,19 +679,19 @@ def build_professional_signature_html(fields: Dict[str, Any] = None) -> str:
         )
 
     title_lines = "".join(
-        f'<span style="font-size:10pt;color:#000000;">{html.escape(value)}</span><br>'
+        f'<span style="font-size:10pt;color:#000000;">{html_lib.escape(value)}</span><br>'
         for value in [values["title"], values["team"], values["licenseLine"]]
         if value
     )
     email_line = (
-        f'<a href="mailto:{html.escape(values["email"], quote=True)}" '
+        f'<a href="mailto:{html_lib.escape(values["email"], quote=True)}" '
         'style="color:#000000;text-decoration:underline;text-decoration-color:#CC0000;text-underline-offset:2px;">'
-        f'{html.escape(values["email"])}</a><br>'
+        f'{html_lib.escape(values["email"])}</a><br>'
         if values["email"]
         else ""
     )
     linkedin_line = (
-        f'<a href="{html.escape(linkedin_href, quote=True)}" target="_blank" rel="noopener noreferrer" '
+        f'<a href="{html_lib.escape(linkedin_href, quote=True)}" target="_blank" rel="noopener noreferrer" '
         'style="text-decoration:none;display:inline-block;margin-top:4px;">'
         '<span aria-hidden="true" style="display:inline-block;width:20px;height:20px;line-height:20px;text-align:center;'
         'border-radius:50%;background:#6b7280;color:#ffffff;font-size:11px;font-weight:bold;'
@@ -692,9 +700,9 @@ def build_professional_signature_html(fields: Dict[str, Any] = None) -> str:
         else ""
     )
     website_line = (
-        f'<a href="{html.escape(website_href, quote=True)}" target="_blank" rel="noopener noreferrer" '
+        f'<a href="{html_lib.escape(website_href, quote=True)}" target="_blank" rel="noopener noreferrer" '
         'style="color:#CC0000;text-decoration:underline;text-decoration-color:#CC0000;text-underline-offset:2px;">'
-        f'{html.escape(website_text)}</a><br>'
+        f'{html_lib.escape(website_text)}</a><br>'
         if website_href
         else ""
     )
@@ -710,7 +718,7 @@ Best,<br>
 <table cellpadding="0" cellspacing="0" border="0" width="340" style="border-collapse:collapse;width:340px;max-width:340px;">
 <tr>
 <td colspan="2" style="padding-bottom:8px;">
-{f'<strong style="font-size:12pt;font-weight:bold;color:#000000;">{html.escape(values["name"])}</strong><br>' if values["name"] else ''}
+{f'<strong style="font-size:12pt;font-weight:bold;color:#000000;">{html_lib.escape(values["name"])}</strong><br>' if values["name"] else ''}
 {title_lines}
 </td>
 </tr>
@@ -721,14 +729,14 @@ Best,<br>
 </tr>
 <tr>
 <td valign="top" width="155" style="padding-right:30px;vertical-align:top;font-size:10pt;color:#000000;width:155px;">
-{f'{html.escape(values["phone"])}<br>' if values["phone"] else ''}
+{f'{html_lib.escape(values["phone"])}<br>' if values["phone"] else ''}
 {email_line}
 {linkedin_line}
 </td>
 <td valign="top" width="155" style="vertical-align:top;font-size:10pt;color:#000000;width:155px;">
-{f'<strong style="font-weight:bold;color:#000000;">{html.escape(values["company"])}</strong><br>' if values["company"] else ''}
+{f'<strong style="font-weight:bold;color:#000000;">{html_lib.escape(values["company"])}</strong><br>' if values["company"] else ''}
 {website_line}
-{f'<span style="color:#000000;">{html.escape(values["location"])}</span>' if values["location"] else ''}
+{f'<span style="color:#000000;">{html_lib.escape(values["location"])}</span>' if values["location"] else ''}
 </td>
 </tr>
 </table>
