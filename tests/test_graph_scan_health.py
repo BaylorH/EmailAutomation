@@ -3,10 +3,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import requests
+
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
+    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
 )
 
 import main
@@ -60,6 +62,27 @@ class ExpiringMsalApp:
         }
 
 
+class FakeGraphErrorResponse:
+    status_code = 404
+    url = "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages?$top=50&$select=id"
+    text = '{"error":{"code":"MailboxNotEnabledForRESTAPI","message":"The mailbox is either inactive, soft-deleted, or is hosted on-premise."}}'
+
+    def json(self):
+        return {
+            "error": {
+                "code": "MailboxNotEnabledForRESTAPI",
+                "message": "The mailbox is either inactive, soft-deleted, or is hosted on-premise.",
+            }
+        }
+
+
+def mailbox_not_enabled_error():
+    return requests.exceptions.HTTPError(
+        "404 Client Error: Not Found for url: https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages?$top=50&$select=id",
+        response=FakeGraphErrorResponse(),
+    )
+
+
 class GraphScanHealthTests(unittest.TestCase):
     def test_inbox_scan_returns_error_state_when_graph_request_fails(self):
         with patch.object(processing, "exponential_backoff_request", side_effect=Exception("404 mailbox not found")):
@@ -68,6 +91,31 @@ class GraphScanHealthTests(unittest.TestCase):
         self.assertEqual("error", state["status"])
         self.assertEqual("inbox_scan", state["operation"])
         self.assertIn("404 mailbox not found", state["error"])
+
+    def test_inbox_scan_returns_admin_hint_for_mailbox_not_enabled(self):
+        with patch.object(processing, "exponential_backoff_request", side_effect=mailbox_not_enabled_error()):
+            state = processing.scan_inbox_against_index("uid-1", {"Authorization": "Bearer fake"})
+
+        self.assertEqual("error", state["status"])
+        self.assertEqual("inbox_scan", state["operation"])
+        self.assertEqual("MailboxNotEnabledForRESTAPI", state["errorCode"])
+        self.assertIn("mailbox is either inactive", state["errorMessage"])
+        self.assertIn("Exchange Online mailbox", state["recoveryHint"])
+        self.assertNotIn("https://graph.microsoft.com", state["error"])
+
+    def test_sent_items_scan_returns_admin_hint_for_mailbox_not_enabled(self):
+        with patch.object(processing, "_fs") as fs, \
+             patch("email_automation.utils.exponential_backoff_request", side_effect=mailbox_not_enabled_error()):
+            fs.collection.return_value.document.return_value.collection.return_value.stream.return_value = [
+                type("ThreadDoc", (), {"to_dict": lambda self: {"conversationId": "conversation-1"}})()
+            ]
+            state = processing.scan_sent_items_for_manual_replies("uid-1", {"Authorization": "Bearer fake"})
+
+        self.assertEqual("error", state["status"])
+        self.assertEqual("sent_items_scan", state["operation"])
+        self.assertEqual("MailboxNotEnabledForRESTAPI", state["errorCode"])
+        self.assertIn("Graph can authenticate this user", state["recoveryHint"])
+        self.assertNotIn("https://graph.microsoft.com", state["error"])
 
     def test_refresh_records_graph_error_when_inbox_scan_reports_error(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as token_file:

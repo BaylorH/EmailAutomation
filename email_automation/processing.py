@@ -62,6 +62,61 @@ def _parse_graph_datetime(value: str) -> Optional[datetime]:
         return None
 
 
+GRAPH_RECOVERY_HINTS = {
+    "MailboxNotEnabledForRESTAPI": (
+        "Microsoft Graph can authenticate this user, but the mailbox is not available to Graph. "
+        "Ask the Microsoft 365/Exchange admin to verify the user has an active Exchange Online "
+        "mailbox/license and is not on-premises, inactive, or soft-deleted. Admin consent alone "
+        "is not enough until the mailbox is Graph-accessible."
+    ),
+}
+
+
+def _graph_operation_error_state(operation: str, error: Exception) -> Dict[str, Any]:
+    """Return a dashboard-safe health payload for a failed Graph operation."""
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    graph_error = {}
+
+    if response is not None:
+        try:
+            payload = response.json() or {}
+            graph_error = payload.get("error") or {}
+        except Exception:
+            try:
+                payload = json.loads(getattr(response, "text", "") or "{}")
+                graph_error = payload.get("error") or {}
+            except Exception:
+                graph_error = {}
+
+    error_code = graph_error.get("code")
+    error_message = graph_error.get("message")
+
+    state: Dict[str, Any] = {
+        "status": "error",
+        "operation": operation,
+    }
+
+    if status_code is not None:
+        state["httpStatus"] = status_code
+
+    if error_code:
+        state["errorCode"] = error_code
+        if error_message:
+            state["errorMessage"] = error_message
+            state["error"] = f"{error_code}: {error_message}"
+        else:
+            state["error"] = error_code
+    else:
+        state["error"] = str(error)
+
+    recovery_hint = GRAPH_RECOVERY_HINTS.get(error_code)
+    if recovery_hint:
+        state["recoveryHint"] = recovery_hint
+
+    return state
+
+
 def _find_recent_sent_message_for_conversation(
     headers: Dict[str, str],
     base: str,
@@ -3373,12 +3428,9 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
                 params = {}  # nextLink includes all parameters
 
     except Exception as e:
-        print(f"❌ Failed to scan inbox: {e}")
-        return {
-            "status": "error",
-            "operation": "inbox_scan",
-            "error": str(e),
-        }
+        state = _graph_operation_error_state("inbox_scan", e)
+        print(f"❌ Failed to scan inbox: {state.get('error')}")
+        return state
 
     # PHASE 2: Process messages - batched by thread
     processed_count = 0
@@ -3806,17 +3858,11 @@ def scan_sent_items_for_manual_replies(user_id: str, headers: Dict[str, str], to
             }
                 
         except Exception as e:
-            print(f"❌ Failed to scan SentItems: {e}")
-            return {
-                "status": "error",
-                "operation": "sent_items_scan",
-                "error": str(e),
-            }
+            state = _graph_operation_error_state("sent_items_scan", e)
+            print(f"❌ Failed to scan SentItems: {state.get('error')}")
+            return state
             
     except Exception as e:
-        print(f"❌ Failed to scan SentItems for manual replies: {e}")
-        return {
-            "status": "error",
-            "operation": "sent_items_scan",
-            "error": str(e),
-        }
+        state = _graph_operation_error_state("sent_items_scan", e)
+        print(f"❌ Failed to scan SentItems for manual replies: {state.get('error')}")
+        return state
