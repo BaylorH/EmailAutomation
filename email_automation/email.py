@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .utils import (
+    GRAPH_SEND_MAX_RETRIES,
     exponential_backoff_request,
     safe_preview,
     _body_kind,
@@ -512,7 +513,8 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
         if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
             # Use createReply to get a draft, add attachments, then send
             create_reply_resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{reply_to_msg_id}/createReply", headers=headers, timeout=30)
+                lambda: requests.post(f"{base}/me/messages/{reply_to_msg_id}/createReply", headers=headers, timeout=30),
+                max_retries=GRAPH_SEND_MAX_RETRIES,
             )
 
             if create_reply_resp.status_code in [200, 201]:
@@ -526,7 +528,8 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
                         headers=headers,
                         json={"body": {"contentType": "HTML", "content": html_body}},
                         timeout=30
-                    )
+                    ),
+                    max_retries=GRAPH_SEND_MAX_RETRIES,
                 )
 
                 # Add signature attachments
@@ -539,7 +542,8 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
                                 headers=headers,
                                 json=att,
                                 timeout=30
-                            )
+                            ),
+                            max_retries=GRAPH_SEND_MAX_RETRIES,
                         )
                         if att_resp.status_code in [200, 201]:
                             print(f"   📎 Attached {attachment['name']}")
@@ -549,7 +553,8 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
                 # Send the reply
                 sent_after = datetime.now(timezone.utc) - timedelta(seconds=10)
                 resp = exponential_backoff_request(
-                    lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30)
+                    lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
+                    max_retries=GRAPH_SEND_MAX_RETRIES,
                 )
 
                 if resp and resp.status_code in [200, 202]:
@@ -580,7 +585,8 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
         sent_after = datetime.now(timezone.utc) - timedelta(seconds=10)
         resp = exponential_backoff_request(
             lambda: requests.post(f"{base}/me/messages/{reply_to_msg_id}/reply",
-                                 headers=headers, json=reply_payload, timeout=30)
+                                 headers=headers, json=reply_payload, timeout=30),
+            max_retries=GRAPH_SEND_MAX_RETRIES,
         )
 
         if resp and resp.status_code in [200, 201, 202]:
@@ -1141,7 +1147,8 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
         try:
             # 1. Create draft
             create_response = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
+                lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30),
+                max_retries=GRAPH_SEND_MAX_RETRIES,
             )
             draft_id = create_response.json()["id"]
             print(f"📝 Created draft {draft_id} for {addr}")
@@ -1156,7 +1163,8 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                             headers=headers,
                             json=att,
                             timeout=30
-                        )
+                        ),
+                        max_retries=GRAPH_SEND_MAX_RETRIES,
                     )
                     if attach_response.status_code in [200, 201]:
                         print(f"   📎 Attached {attachment['name']}")
@@ -1183,7 +1191,8 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
 
             # 3. Send draft
             exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
+                lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30),
+                max_retries=GRAPH_SEND_MAX_RETRIES,
             )
 
             # 4. Index in Firestore with retry logic

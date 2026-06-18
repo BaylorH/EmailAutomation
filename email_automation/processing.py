@@ -1177,6 +1177,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
     """Send a reply to the current message being processed and index it for future replies"""
     try:
         from .utils import (
+            GRAPH_SEND_MAX_RETRIES,
             exponential_backoff_request,
             safe_preview,
             get_signature_attachments,
@@ -1220,7 +1221,8 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
             # Use createReply to get a draft, add attachments, then send
             create_reply_resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{current_msg_id}/createReply", headers=headers, timeout=30)
+                lambda: requests.post(f"{base}/me/messages/{current_msg_id}/createReply", headers=headers, timeout=30),
+                max_retries=GRAPH_SEND_MAX_RETRIES,
             )
 
             if create_reply_resp.status_code in [200, 201]:
@@ -1234,7 +1236,8 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                         headers=headers,
                         json={"body": {"contentType": "HTML", "content": html_body}},
                         timeout=30
-                    )
+                    ),
+                    max_retries=GRAPH_SEND_MAX_RETRIES,
                 )
 
                 # Add signature attachments
@@ -1247,7 +1250,8 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                                 headers=headers,
                                 json=att,
                                 timeout=30
-                            )
+                            ),
+                            max_retries=GRAPH_SEND_MAX_RETRIES,
                         )
                         if att_resp.status_code in [200, 201]:
                             print(f"   📎 Attached {attachment['name']}")
@@ -1257,7 +1261,8 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                 # Send the reply
                 reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
                 resp = exponential_backoff_request(
-                    lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30)
+                    lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
+                    max_retries=GRAPH_SEND_MAX_RETRIES,
                 )
 
                 if resp and resp.status_code in [200, 202]:
@@ -1281,7 +1286,8 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
             resp = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{current_msg_id}/reply",
-                                     headers=headers, json=reply_payload, timeout=30)
+                                     headers=headers, json=reply_payload, timeout=30),
+                max_retries=GRAPH_SEND_MAX_RETRIES,
             )
             reply_sent_successfully = resp and resp.status_code in [200, 201, 202]
             if reply_sent_successfully:
@@ -1304,7 +1310,8 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
                 # Create draft, add attachments, send
                 create_resp = exponential_backoff_request(
-                    lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30)
+                    lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30),
+                    max_retries=GRAPH_SEND_MAX_RETRIES,
                 )
                 if create_resp.status_code in [200, 201]:
                     draft_id = create_resp.json()["id"]
@@ -1317,13 +1324,15 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                                     headers=headers,
                                     json=att,
                                     timeout=30
-                                )
+                                ),
+                                max_retries=GRAPH_SEND_MAX_RETRIES,
                             )
                         except:
                             pass
                     reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
                     resp = exponential_backoff_request(
-                        lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30)
+                        lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30),
+                        max_retries=GRAPH_SEND_MAX_RETRIES,
                     )
                     if resp and resp.status_code in [200, 202]:
                         print(f"   ✅ Sent reply via sendMail fallback with attachments")
@@ -1333,7 +1342,8 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                 reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
                 resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/sendMail", headers=headers,
-                                         json=send_payload, timeout=30)
+                                         json=send_payload, timeout=30),
+                    max_retries=GRAPH_SEND_MAX_RETRIES,
                 )
                 if resp and resp.status_code in [200, 201, 202]:
                     print(f"   ✅ Sent reply via /sendMail fallback")

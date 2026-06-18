@@ -15,6 +15,7 @@ SIGNATURE_INLINE_IMAGE_MAX_BYTES = 48 * 1024
 SIGNATURE_INLINE_IMAGE_MAX_DIMENSION = 240
 PROFESSIONAL_SIGNATURE_MARKER = 'data-sitesift-professional-signature="v1"'
 MOHR_PARTNERS_DOMAIN = "mohrpartners.com"
+GRAPH_SEND_MAX_RETRIES = int(os.getenv("SITESIFT_GRAPH_SEND_MAX_RETRIES", "8"))
 
 # Helper: detect HTML vs text
 _html_rx = re.compile(r"<[a-zA-Z/][^>]*>")
@@ -255,6 +256,12 @@ def exponential_backoff_request(func, max_retries: int = 3):
             response = func()
             if response.status_code == 429:  # Rate limited
                 retry_after = int(response.headers.get('Retry-After', 2 ** attempt))
+                if attempt >= max_retries - 1:
+                    details = (getattr(response, "text", "") or "").strip()
+                    message = f"HTTP 429 rate limited after {max_retries} attempts"
+                    if details:
+                        message = f"{message}: {details[:500]}"
+                    raise requests.exceptions.HTTPError(message, response=response)
                 print(f"⏳ Rate limited, retrying after {retry_after}s")
                 time.sleep(retry_after)
                 continue
