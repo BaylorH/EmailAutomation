@@ -87,6 +87,28 @@ def _terminalize_outbox_action_audit(
     _update_action_audit(user_id, data.get("actionAuditId"), payload)
 
 
+def _mark_outbox_action_audit_retrying(
+    user_id: Optional[str],
+    doc_ref,
+    data: Dict[str, Any],
+    attempts: int,
+    error_msg: str,
+) -> None:
+    """Expose a retryable send failure without terminalizing the action."""
+    _terminalize_outbox_action_audit(
+        user_id,
+        doc_ref,
+        data,
+        "retrying",
+        {
+            "attempts": attempts,
+            "maxAttempts": MAX_OUTBOX_ATTEMPTS,
+            "lastError": error_msg,
+            "lastFailedAt": SERVER_TIMESTAMP,
+        },
+    )
+
+
 def _first_result_value(mapping: Any, preferred_keys: Optional[List[str]] = None) -> Optional[Any]:
     if not mapping:
         return None
@@ -1609,8 +1631,21 @@ def _send_multi_property_email(
                 else:
                     # Release claim and update attempts so it can be retried
                     item['doc'].reference.set(
-                        {"attempts": new_attempts, "lastError": error_msg, "processingBy": None, "processingAt": None},
+                        {
+                            "attempts": new_attempts,
+                            "lastError": error_msg,
+                            "status": "retrying",
+                            "processingBy": None,
+                            "processingAt": None,
+                        },
                         merge=True,
+                    )
+                    _mark_outbox_action_audit_retrying(
+                        user_id,
+                        item['doc'].reference,
+                        data,
+                        new_attempts,
+                        error_msg,
                     )
                 print(f"  ⚠️ Kept item with error; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
 
@@ -1624,8 +1659,21 @@ def _send_multi_property_email(
             else:
                 # Release claim and update attempts so it can be retried
                 item['doc'].reference.set(
-                    {"attempts": new_attempts, "lastError": error_msg, "processingBy": None, "processingAt": None},
+                    {
+                        "attempts": new_attempts,
+                        "lastError": error_msg,
+                        "status": "retrying",
+                        "processingBy": None,
+                        "processingAt": None,
+                    },
                     merge=True,
+                )
+                _mark_outbox_action_audit_retrying(
+                    user_id,
+                    item['doc'].reference,
+                    data,
+                    new_attempts,
+                    error_msg,
                 )
             print(f"  💥 Error: {e}; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
 
@@ -1884,8 +1932,21 @@ def _send_single_outbox_item(
         else:
             # Release claim and update attempts so it can be retried
             d.reference.set(
-                {"attempts": new_attempts, "lastError": error_msg, "processingBy": None, "processingAt": None},
+                {
+                    "attempts": new_attempts,
+                    "lastError": error_msg,
+                    "status": "retrying",
+                    "processingBy": None,
+                    "processingAt": None,
+                },
                 merge=True,
+            )
+            _mark_outbox_action_audit_retrying(
+                user_id,
+                d.reference,
+                data,
+                new_attempts,
+                error_msg,
             )
             print(f"⚠️ Kept item {d.id} with error; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
 

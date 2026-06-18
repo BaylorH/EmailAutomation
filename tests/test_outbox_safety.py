@@ -364,6 +364,49 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(thread_set[1]["followUpStatus"], "waiting")
         self.assertTrue(thread_set[2])
 
+    def test_retryable_send_failure_updates_action_audit_with_visible_retry_state(self):
+        doc = FakeDoc({
+            "assignedEmails": ["bp21harrison+leaguecity-row20@gmail.com"],
+            "script": "Hi Ron,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "0 Gemini Ave, Houston",
+            "rowNumber": 20,
+            "attempts": 1,
+            "actionAuditId": "audit-retry",
+            "followUpConfig": {"enabled": False},
+        }, doc_id="outbox-retry")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": [],
+                 "errors": {
+                     "bp21harrison+leaguecity-row20@gmail.com": "Request failed after 3 attempts",
+                 },
+             }):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        self.assertFalse(doc.reference.deleted)
+        retry_payload = doc.reference.set_calls[-1][0][0]
+        self.assertEqual(retry_payload["attempts"], 2)
+        self.assertEqual(retry_payload["processingBy"], None)
+        self.assertEqual(retry_payload["processingAt"], None)
+        self.assertIn("Request failed after 3 attempts", retry_payload["lastError"])
+
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual(audit_payload["status"], "retrying")
+        self.assertEqual(audit_payload["outboxId"], "outbox-retry")
+        self.assertEqual(audit_payload["attempts"], 2)
+        self.assertEqual(audit_payload["maxAttempts"], email_module.MAX_OUTBOX_ATTEMPTS)
+        self.assertIn("Request failed after 3 attempts", audit_payload["lastError"])
+
     def test_decrement_notification_rollups_clamps_counts(self):
         updated = notifications_module._decrement_notification_rollups(
             {
