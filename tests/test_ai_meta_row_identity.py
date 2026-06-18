@@ -20,9 +20,19 @@ class FakeRequest:
 
 
 class FakeValues:
-    def __init__(self):
+    def __init__(self, ai_meta_rows=None):
         self.batch_update_calls = []
         self.append_calls = []
+        self.ai_meta_rows = ai_meta_rows or [
+            [
+                "3",
+                "Total SF",
+                "10,000",
+                "2026-06-01T00:00:00Z",
+                "False",
+                "101 Old St, Dallas",
+            ],
+        ]
 
     def get(self, spreadsheetId=None, range=None, **kwargs):
         if range and range.startswith("AI_META!"):
@@ -36,14 +46,7 @@ class FakeValues:
                         "human_override",
                         "rowAnchor",
                     ],
-                    [
-                        "3",
-                        "Total SF",
-                        "10,000",
-                        "2026-06-01T00:00:00Z",
-                        "False",
-                        "101 Old St, Dallas",
-                    ],
+                    *self.ai_meta_rows,
                 ]
             })
         return FakeRequest({"values": []})
@@ -82,8 +85,8 @@ class FakeSpreadsheets:
 
 
 class FakeSheets:
-    def __init__(self):
-        self.values_api = FakeValues()
+    def __init__(self, ai_meta_rows=None):
+        self.values_api = FakeValues(ai_meta_rows=ai_meta_rows)
         self.spreadsheets_api = FakeSpreadsheets(self.values_api)
 
     def spreadsheets(self):
@@ -147,6 +150,47 @@ class AiMetaRowIdentityTests(unittest.TestCase):
         self.assertEqual(1, len(fake_sheets.values_api.append_calls))
         appended_row = fake_sheets.values_api.append_calls[0]["body"]["values"][0]
         self.assertEqual("404 New Way, Dallas", appended_row[5])
+
+    def test_anchorless_ai_meta_does_not_block_blank_current_row_update(self):
+        fake_sheets = FakeSheets(ai_meta_rows=[
+            [
+                "4",
+                "Rent/SF/Yr",
+                "16.20",
+                "2026-06-01T00:00:00Z",
+                "False",
+                "",
+            ],
+        ])
+        header = ["Property Address", "City", "Rent/SF/Yr"]
+        current_row = ["951 E FM 646", "League City", ""]
+        proposal = {
+            "updates": [
+                {
+                    "column": "Rent/SF/Yr",
+                    "value": "16.20",
+                    "confidence": 0.92,
+                    "reason": "Broker confirmed modified gross rent.",
+                }
+            ]
+        }
+
+        with patch("email_automation.ai_processing._sheets_client", return_value=fake_sheets), \
+             patch("email_automation.ai_processing._get_first_tab_title", return_value="Sheet1"), \
+             patch("email_automation.sheet_operations._apply_gross_rent_formula_for_row", return_value=False):
+            result = apply_proposal_to_sheet(
+                "uid-1",
+                "client-1",
+                "sheet-1",
+                header,
+                4,
+                current_row,
+                proposal,
+            )
+
+        self.assertEqual([], result["skipped"])
+        self.assertEqual("Rent/SF/Yr", result["applied"][0]["column"])
+        self.assertEqual("16.20", result["rowSnapshotAfter"]["Rent/SF/Yr"])
 
     def test_applied_result_includes_row_snapshot_evidence_for_reports(self):
         fake_sheets = FakeSheets()

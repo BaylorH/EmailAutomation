@@ -464,8 +464,9 @@ def _read_ai_meta_row(
         if len(rows) <= 1:  # Only header or empty
             return None
         
-        # Find matching row
-        for row in rows[1:]:  # Skip header
+        # Find the newest matching row. AI_META is append-only, so older records
+        # for the same row/column can exist after retries or row moves.
+        for row in reversed(rows[1:]):  # Skip header
             if len(row) >= 2 and str(row[0]) == str(rownum) and row[1].lower() == column.lower():
                 stored_anchor = row[5] if len(row) > 5 else ""
                 if stored_anchor and row_anchor:
@@ -475,6 +476,12 @@ def _read_ai_meta_row(
                             f"anchor changed from '{stored_anchor}' to '{row_anchor}'"
                         )
                         continue
+                elif row_anchor and not stored_anchor:
+                    print(
+                        f"⚠️ Ignoring AI_META row {rownum}/{column}: "
+                        f"missing row anchor for current row '{row_anchor}'"
+                    )
+                    continue
                 return {
                     "rowNumber": row[0],
                     "columnName": row[1],
