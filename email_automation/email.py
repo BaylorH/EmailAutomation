@@ -1329,12 +1329,18 @@ def _move_to_dead_letter(user_id: str, doc_ref, data: dict, reason: str):
     from google.cloud.firestore import SERVER_TIMESTAMP
 
     dead_letter_ref = _fs.collection("users").document(user_id).collection("deadLetterQueue")
+    attempts = max(int(data.get("attempts") or 0), MAX_OUTBOX_ATTEMPTS)
 
     # Copy data to dead-letter queue with failure info
     dead_letter_data = {
         **data,
         "originalDocId": doc_ref.id,
+        "status": "dead_lettered",
+        "attempts": attempts,
+        "maxAttempts": MAX_OUTBOX_ATTEMPTS,
+        "lastError": reason,
         "failureReason": reason,
+        "failedAt": SERVER_TIMESTAMP,
         "movedAt": SERVER_TIMESTAMP,
         "source": "outbox"
     }
@@ -1347,6 +1353,9 @@ def _move_to_dead_letter(user_id: str, doc_ref, data: dict, reason: str):
         "notificationId": data.get("notificationId"),
         "threadId": data.get("threadId"),
         "failureReason": reason,
+        "attempts": attempts,
+        "maxAttempts": MAX_OUTBOX_ATTEMPTS,
+        "lastError": reason,
         "deadLetteredAt": SERVER_TIMESTAMP,
         "failedAt": SERVER_TIMESTAMP,
         "updatedAt": SERVER_TIMESTAMP,

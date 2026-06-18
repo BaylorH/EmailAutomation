@@ -181,6 +181,35 @@ class BackendActionAuditTests(unittest.TestCase):
         self.assertEqual(audit_payload["status"], "dead_lettered")
         self.assertEqual(audit_payload["failureReason"], "Graph returned 500")
 
+    def test_dead_letter_copy_overrides_retry_metadata(self):
+        outbox_ref = FakeOutboxRef("outbox-dead")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs):
+            email_module._move_to_dead_letter(
+                "uid-1",
+                outbox_ref,
+                {
+                    "assignedEmails": ["bp21harrison+leaguecity-row20@gmail.com"],
+                    "clientId": "client-1",
+                    "rowNumber": 20,
+                    "actionAuditId": "audit-dead",
+                    "status": "retrying",
+                    "attempts": 4,
+                    "maxAttempts": email_module.MAX_OUTBOX_ATTEMPTS,
+                    "lastError": "Request failed after 3 attempts",
+                },
+                "Send errors after 5 attempts: Request failed after 3 attempts",
+            )
+
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "dead_lettered")
+        self.assertEqual(dead_letter_payload["attempts"], email_module.MAX_OUTBOX_ATTEMPTS)
+        self.assertEqual(dead_letter_payload["maxAttempts"], email_module.MAX_OUTBOX_ATTEMPTS)
+        self.assertEqual(dead_letter_payload["lastError"], "Send errors after 5 attempts: Request failed after 3 attempts")
+        self.assertEqual(dead_letter_payload["failureReason"], "Send errors after 5 attempts: Request failed after 3 attempts")
+        self.assertEqual(dead_letter_payload["originalDocId"], "outbox-dead")
+
     @patch.object(email_module.time, "sleep", return_value=None)
     @patch.object(email_module.requests, "post")
     @patch.object(email_module.requests, "get")
