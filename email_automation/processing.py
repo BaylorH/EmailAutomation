@@ -2242,6 +2242,13 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             mark_event_handled(user_id, thread_id, event_key, msg_id, None)
                             if tour_reply_classification.get("canCloseThread"):
                                 update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], "tour_confirmed")
+                                if thread_ref:
+                                    thread_ref.update({
+                                        "tourStatus": "confirmed",
+                                        "tourConfirmedAt": SERVER_TIMESTAMP,
+                                        "tourInvite.status": "confirmed",
+                                        "tourInvite.confirmedAt": SERVER_TIMESTAMP,
+                                    })
                                 complete_threads_for_row(
                                     user_id,
                                     rownum,
@@ -2250,6 +2257,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                                 )
                                 _clear_thread_action_notifications(user_id, client_id, thread_id)
                                 _maybe_mark_client_completed(user_id, client_id)
+                                proposal["skip_response"] = True
                             print(f"🏠 Skipped non-actionable tour event: {tour_reply_classification.get('outcome')}")
                             continue
 

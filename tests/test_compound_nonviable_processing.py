@@ -68,6 +68,161 @@ class FakeFirestore:
 
 
 class CompoundNonviableProcessingTests(unittest.TestCase):
+    def test_tour_invite_confirmation_does_not_send_generic_completion_reply(self):
+        user_id = "test-user"
+        client_id = "client-1"
+        thread_id = "thread-tour-confirmed"
+        from_email = "bp21harrison@gmail.com"
+        body = "Hi John,\n\n10:16 AM works for 1561 Live Oak St. Confirmed.\n\nBest,\nBP21"
+        msg = {
+            "id": "msg-tour-confirmed",
+            "subject": "RE: Tour slot: 1561 Live Oak St at 10:16 AM",
+            "from": {"emailAddress": {"address": from_email, "name": "BP21"}},
+            "toRecipients": [{"emailAddress": {"address": "baylor.freelance@outlook.com"}}],
+            "internetMessageId": "<tour-confirmed@mock.test>",
+            "conversationId": "conv-tour-confirmed",
+            "receivedDateTime": "2026-06-19T19:12:39Z",
+            "bodyPreview": body,
+            "hasAttachments": False,
+            "internetMessageHeaders": [
+                {"name": "In-Reply-To", "value": "<tour-invite@mock.test>"},
+            ],
+        }
+        header = [
+            "Property Address",
+            "City",
+            "Leasing Contact",
+            "Email",
+            "Total SF",
+            "Rent/SF/Yr",
+            "Ops Ex / SF",
+            "Drive Ins",
+            "Ceiling Ht",
+            "Power",
+        ]
+        rowvals = [
+            "1561 Live Oak St",
+            "Webster",
+            "Tram Kim",
+            "bp21harrison+leaguecity-row05@gmail.com",
+            "5000",
+            "12.00",
+            "3.84",
+            "2",
+            "20",
+            "480V 3-phase",
+        ]
+        proposal = {
+            "updates": [],
+            "events": [
+                {
+                    "type": "tour_requested",
+                    "question": "10:16 AM works for 1561 Live Oak St. Confirmed.",
+                    "suggestedEmail": "Hi Tram,\n\n10:16 AM works for 1561 Live Oak St. Confirmed.\n\nThanks,",
+                }
+            ],
+            "response_email": None,
+        }
+        thread_ref = FakeDocumentRef(
+            {
+                "clientId": client_id,
+                "email": [from_email],
+                "status": processing.THREAD_STATUS["active"],
+                "rowNumber": 5,
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "tourInvite": {"arrivalTime": "10:16 AM", "departureTime": "10:46 AM"},
+            }
+        )
+        client_ref = FakeDocumentRef({"criteria": "Industrial search"})
+
+        class FakeExecute:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def execute(self):
+                return self.payload
+
+        class FakeValues:
+            def get(self, spreadsheetId=None, range=None):
+                if range and range.endswith("A:A"):
+                    return FakeExecute({"values": [["Property Address"], ["1561 Live Oak St"]]})
+                return FakeExecute({"values": [rowvals]})
+
+        class FakeSpreadsheets:
+            def values(self):
+                return FakeValues()
+
+        class FakeSheets:
+            def spreadsheets(self):
+                return FakeSpreadsheets()
+
+        full_body_response = MagicMock()
+        full_body_response.json.return_value = {
+            "body": {"content": body, "contentType": "Text"},
+            "hasAttachments": False,
+        }
+        me_response = MagicMock(status_code=200)
+        me_response.json.return_value = {"mail": "baylor.freelance@outlook.com"}
+
+        send_reply_patcher = patch.object(processing, "send_reply_in_thread", return_value=True)
+        patches = [
+            patch.object(processing, "_fs", FakeFirestore(thread_ref, client_ref)),
+            patch.object(processing, "exponential_backoff_request", return_value=full_body_response),
+            patch.object(processing.requests, "get", return_value=me_response),
+            patch.object(processing, "lookup_thread_by_message_id", return_value=thread_id),
+            patch.object(processing, "lookup_thread_by_conversation_id", return_value=None),
+            patch.object(processing, "get_thread_status", return_value=processing.THREAD_STATUS["active"]),
+            patch.object(processing, "save_message", return_value=True),
+            patch.object(processing, "index_message_id", return_value=True),
+            patch.object(processing, "dump_thread_from_firestore"),
+            patch("email_automation.followup.cancel_followup_on_response"),
+            patch.object(
+                processing,
+                "fetch_and_log_sheet_for_thread",
+                return_value=(client_id, "sheet-1", header, 5, rowvals, None, []),
+            ),
+            patch.object(
+                processing,
+                "_resolve_reply_identity",
+                return_value={
+                    "recipient_email": from_email,
+                    "contact_name": "Tram",
+                    "original_email": from_email,
+                    "source": "test",
+                },
+            ),
+            patch.object(processing, "fetch_and_process_pdfs", return_value=[]),
+            patch.object(processing, "write_message_order_test"),
+            patch.object(processing, "fetch_url_as_text", return_value=None),
+            patch.object(processing, "propose_sheet_updates", return_value=proposal),
+            patch.object(processing, "_sheets_client", return_value=FakeSheets()),
+            patch.object(processing, "_get_first_tab_title", return_value="Sheet1"),
+            patch.object(processing, "is_event_handled", return_value=False),
+            patch.object(processing, "mark_event_handled"),
+            patch.object(processing, "update_thread_status"),
+            patch.object(processing, "complete_threads_for_row", return_value=1),
+            patch.object(processing, "_clear_thread_action_notifications"),
+            patch.object(processing, "_maybe_mark_client_completed"),
+            patch.object(processing, "check_missing_required_fields", return_value=[]),
+            patch.object(processing, "write_notification"),
+            send_reply_patcher,
+        ]
+
+        started = [patcher.start() for patcher in patches]
+        send_reply = started[-1]
+        try:
+            processing.process_inbox_message(
+                user_id,
+                {"Authorization": "Bearer test-token"},
+                msg,
+            )
+        finally:
+            for patcher in reversed(patches):
+                patcher.stop()
+
+        send_reply.assert_not_called()
+
     def test_quote_only_blank_reply_is_saved_without_ai_or_followup_side_effects(self):
         user_id = "test-user"
         client_id = "client-1"
