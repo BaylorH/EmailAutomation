@@ -778,6 +778,7 @@ def _looks_like_explicit_tour_offer_or_request(text: str = "") -> bool:
         rf"\b(?:can|could)\s+(?:show|tour|walk|meet)\b",
         rf"\b(?:can|could)\s+(?:you|your\s+client|we)\s+(?:tour|come\s+by|stop\s+by|see)\b",
         rf"\b(?:tour|showing|walk[-\s]?through|walkthrough)\s+(?:is\s+)?(?:available|offered)\b",
+        r"\b(?:tours?|showings?|walk[-\s]?throughs?|walkthroughs?)\s+(?:are|is)\s+(?:available|offered)\b",
     ]
     return any(re.search(pattern, latest) for pattern in patterns)
 

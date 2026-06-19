@@ -139,6 +139,28 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertFalse(processing._tour_event_needs_operator_action(event, message))
         self.assertEqual([], classification["alternateTimes"])
 
+    def test_broker_tours_are_available_next_week_requires_operator_action(self):
+        message = (
+            "Hi Baylor,\n\n"
+            "0 Gemini Ave is available as a 6,000 SF industrial/flex space. "
+            "I can share a flyer/floor plan, and tours are available next week.\n\n"
+            "Best,\nBP21"
+        )
+        event = {
+            "type": "tour_requested",
+            "question": "Broker indicated tours are available next week.",
+            "suggestedEmail": "",
+        }
+
+        classification = processing._classify_tour_invite_reply(
+            message,
+            event=event,
+            thread_data={"actionType": "campaign_creation"},
+        )
+
+        self.assertEqual("tour_offer_or_request", classification["outcome"])
+        self.assertTrue(processing._tour_event_needs_operator_action(event, message))
+
     def test_completion_cleanup_deletes_thread_action_notifications(self):
         class FakeReference:
             def __init__(self):
