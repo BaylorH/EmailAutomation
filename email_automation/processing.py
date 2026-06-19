@@ -795,6 +795,14 @@ def _clean_tour_signal_text(*parts: str) -> str:
     return strip_email_quotes(joined).strip()
 
 
+def _is_no_new_reply_text(text: str = "") -> bool:
+    """True when an inbound message has no broker-authored text above quoted history."""
+    normalized = (text or "").strip()
+    if not normalized:
+        return True
+    return normalized.startswith("[No new text content in reply")
+
+
 def _looks_like_explicit_tour_offer_or_request(text: str = "") -> bool:
     latest = (text or "").lower()
     if not latest:
@@ -1681,17 +1689,20 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     received_dt = msg.get("receivedDateTime")
     sent_dt = msg.get("sentDateTime")
     body_preview = msg.get("bodyPreview", "")
+    has_attachments = bool(msg.get("hasAttachments"))
     
     # NEW: fetch full message body and normalize to plain text
     try:
-        full_body_resp = exponential_backoff_request(
+        full_msg = exponential_backoff_request(
             lambda: requests.get(
                 f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}",
                 headers=headers,
-                params={"$select": "body"},
+                params={"$select": "body,hasAttachments"},
                 timeout=30
             )
-        ).json().get("body", {}) or {}
+        ).json() or {}
+        full_body_resp = full_msg.get("body", {}) or {}
+        has_attachments = bool(has_attachments or full_msg.get("hasAttachments"))
         _raw_content = full_body_resp.get("content", "") or ""
         _ctype = (full_body_resp.get("contentType") or "Text").upper()
         _full_text = strip_html_tags(_raw_content) if _ctype == "HTML" else _raw_content
@@ -1895,7 +1906,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             "contentType": "Text",
             "content": _full_text,
             "preview": safe_preview(_full_text)
-        }
+        },
+        "hasAttachments": has_attachments,
     }
     
     # Save to Firestore with retry logic for reliability
@@ -1932,6 +1944,13 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         thread_ref.set({"updatedAt": SERVER_TIMESTAMP}, merge=True)
     except Exception as e:
         print(f"⚠️ Failed to update thread timestamp: {e}")
+
+    if _is_no_new_reply_text(_text_for_ai) and not has_attachments:
+        print(
+            "⏭️ Inbound reply has no new broker-authored text and no attachments; "
+            "saved for history without AI/sheet/follow-up side effects"
+        )
+        return
 
     # Cancel/pause any pending follow-ups since broker responded
     try:
@@ -3403,7 +3422,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     params = {
         "$top": str(top),
         "$orderby": "receivedDateTime asc",  # CHANGED: oldest first for proper batching
-        "$select": "id,subject,from,toRecipients,receivedDateTime,sentDateTime,conversationId,internetMessageId,internetMessageHeaders,bodyPreview",
+        "$select": "id,subject,from,toRecipients,receivedDateTime,sentDateTime,conversationId,internetMessageId,internetMessageHeaders,bodyPreview,hasAttachments",
         "$filter": filter_str
     }
 
@@ -3644,17 +3663,20 @@ def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: di
     sent_dt = msg.get("sentDateTime")
     subject = msg.get("subject", "")
     to_recipients = [r.get("emailAddress", {}).get("address", "") for r in msg.get("toRecipients", [])]
+    has_attachments = bool(msg.get("hasAttachments"))
 
     # Fetch full body
     try:
-        full_body_resp = exponential_backoff_request(
+        full_msg = exponential_backoff_request(
             lambda: requests.get(
                 f"https://graph.microsoft.com/v1.0/me/messages/{msg.get('id')}",
                 headers=headers,
-                params={"$select": "body"},
+                params={"$select": "body,hasAttachments"},
                 timeout=30
             )
-        ).json().get("body", {}) or {}
+        ).json() or {}
+        full_body_resp = full_msg.get("body", {}) or {}
+        has_attachments = bool(has_attachments or full_msg.get("hasAttachments"))
         _raw_content = full_body_resp.get("content", "") or ""
         _ctype = (full_body_resp.get("contentType") or "Text").upper()
         _full_text = strip_html_tags(_raw_content) if _ctype == "HTML" else _raw_content
@@ -3691,7 +3713,8 @@ def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: di
             "contentType": "Text",
             "content": _full_text,
             "preview": safe_preview(_full_text)
-        }
+        },
+        "hasAttachments": has_attachments,
     }
 
     # Save to Firestore

@@ -68,6 +68,78 @@ class FakeFirestore:
 
 
 class CompoundNonviableProcessingTests(unittest.TestCase):
+    def test_quote_only_blank_reply_is_saved_without_ai_or_followup_side_effects(self):
+        user_id = "test-user"
+        client_id = "client-1"
+        thread_id = "thread-tour-invite"
+        from_email = "bp21harrison@gmail.com"
+        quoted_original = (
+            "On Fri, Jun 19, 2026 at 10:58 AM Baylor Harrison "
+            "<baylor.freelance@outlook.com> wrote:\n\n"
+            "Hi Ryan,\n\n"
+            "I am planning a tour for 912-930 Gemini St.\n"
+            "Requested arrival: 9:38 AM\n"
+            "Expected departure: 10:08 AM\n"
+            "Tour length: 30 minutes\n\n"
+            "Please confirm whether this tour slot works, or reply with the closest available alternate."
+        )
+        msg = {
+            "id": "msg-blank-reply",
+            "subject": "RE: Tour slot: 912-930 Gemini St at 9:38 AM",
+            "from": {"emailAddress": {"address": from_email, "name": "BP21"}},
+            "toRecipients": [{"emailAddress": {"address": "baylor.freelance@outlook.com"}}],
+            "internetMessageId": "<blank-reply@mock.test>",
+            "conversationId": "conv-tour",
+            "receivedDateTime": "2026-06-19T18:38:00Z",
+            "bodyPreview": quoted_original[:200],
+            "hasAttachments": False,
+            "internetMessageHeaders": [
+                {"name": "In-Reply-To", "value": "<tour-invite@mock.test>"},
+            ],
+        }
+        thread_ref = FakeDocumentRef(
+            {
+                "clientId": client_id,
+                "email": [from_email],
+                "status": processing.THREAD_STATUS["active"],
+                "rowNumber": 3,
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+            }
+        )
+        client_ref = FakeDocumentRef({"criteria": "Industrial search"})
+        full_body_response = MagicMock()
+        full_body_response.json.return_value = {
+            "body": {"content": quoted_original, "contentType": "Text"},
+            "hasAttachments": False,
+        }
+        me_response = MagicMock(status_code=200)
+        me_response.json.return_value = {"mail": "baylor.freelance@outlook.com"}
+
+        with patch.object(processing, "_fs", FakeFirestore(thread_ref, client_ref)), \
+             patch.object(processing, "exponential_backoff_request", return_value=full_body_response), \
+             patch.object(processing.requests, "get", return_value=me_response), \
+             patch.object(processing, "lookup_thread_by_message_id", return_value=thread_id), \
+             patch.object(processing, "lookup_thread_by_conversation_id", return_value=None), \
+             patch.object(processing, "get_thread_status", return_value=processing.THREAD_STATUS["active"]), \
+             patch.object(processing, "save_message", return_value=True) as save_message, \
+             patch.object(processing, "index_message_id", return_value=True), \
+             patch.object(processing, "dump_thread_from_firestore") as dump_thread, \
+             patch("email_automation.followup.cancel_followup_on_response") as cancel_followup, \
+             patch.object(processing, "fetch_and_log_sheet_for_thread") as fetch_sheet, \
+             patch.object(processing, "propose_sheet_updates") as propose_sheet_updates:
+            processing.process_inbox_message(
+                user_id,
+                {"Authorization": "Bearer test-token"},
+                msg,
+            )
+
+        save_message.assert_called_once()
+        cancel_followup.assert_not_called()
+        dump_thread.assert_not_called()
+        fetch_sheet.assert_not_called()
+        propose_sheet_updates.assert_not_called()
+
     def test_nonviable_with_replacement_and_tour_does_not_pause_old_row_for_tour(self):
         user_id = "test-user"
         client_id = "client-1"
