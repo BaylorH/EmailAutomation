@@ -654,12 +654,44 @@ def _extract_tour_time_options(question: str) -> List[str]:
     if not has_time_signal:
         return []
 
-    parts = [
-        re.sub(r"\s+instead\b", "", part.strip(" .,)"), flags=re.IGNORECASE).strip(" .")
-        for part in re.split(r"\s+(?:or|/)\s+|;\s*", text)
-        if part.strip(" .")
-    ]
+    parts = []
+    for part in re.split(r"\s+(?:or|/)\s+|;\s*", text):
+        if not part.strip(" ."):
+            continue
+        cleaned = re.sub(r"\s+instead\b", "", part.strip(" .,)"), flags=re.IGNORECASE).strip(" .")
+        cleaned = _strip_tour_duration_note(cleaned)
+        if cleaned:
+            parts.append(cleaned)
     return [part for part in parts[:3] if part] if parts else [text]
+
+
+def _strip_tour_duration_note(text: str = "") -> str:
+    cleaned = re.sub(
+        r"\s*\(?\b(?:about|approximately|approx\.?)?\s*\d+\s*(?:minutes?|mins?|hours?|hrs?)"
+        r"\s+(?:on[-\s]?site|onsite|for\s+(?:the\s+)?tour)\b\.?\)?\s*",
+        " ",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", cleaned).strip(" .,)(")
+
+
+def _extract_tour_duration_sentence(text: str = "") -> str:
+    match = re.search(
+        r"\(?\b((?:about|approximately|approx\.?)?\s*\d+\s*(?:minutes?|mins?|hours?|hrs?)"
+        r"\s+(?:on[-\s]?site|onsite|for\s+(?:the\s+)?tour))\b\.?\)?",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+
+    phrase = re.sub(r"\s+", " ", match.group(1)).strip(" .")
+    phrase = re.sub(r"\bmins?\b", "minutes", phrase, flags=re.IGNORECASE)
+    phrase = re.sub(r"\bhrs?\b", "hours", phrase, flags=re.IGNORECASE)
+    phrase = re.sub(r"\bon[-\s]?site\b", "on site", phrase, flags=re.IGNORECASE)
+    phrase = re.sub(r"\bonsite\b", "on site", phrase, flags=re.IGNORECASE)
+    return f"Please plan for {phrase}."
 
 
 def _safe_tour_greeting_name(contact_name: str = "", recipient_email: str = "") -> str:
@@ -682,6 +714,7 @@ def _build_tour_fallback_suggested_email(contact_name: str = "", recipient_email
 def _build_default_tour_suggested_email(broker_name: str, question: str = "") -> str:
     greeting_name = (broker_name or "there").strip()
     time_options = _extract_tour_time_options(question)
+    duration_sentence = _extract_tour_duration_sentence(question)
 
     if time_options:
         primary = time_options[0]
@@ -689,6 +722,8 @@ def _build_default_tour_suggested_email(broker_name: str, question: str = "") ->
         timing_sentence = f"{primary} would work on my end."
         if alternate:
             timing_sentence += f" If that time is no longer available, {alternate} could also work."
+        if duration_sentence:
+            timing_sentence += f"\n\n{duration_sentence}"
         follow_up = "Could you please confirm what works best?"
     else:
         timing_sentence = "Could you let me know what tour windows are available?"

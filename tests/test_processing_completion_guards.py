@@ -58,6 +58,24 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertNotIn("reply with the closest available alternate", body)
         self.assertIn("11:30 AM", body)
 
+    def test_tour_fallback_draft_keeps_duration_out_of_alternate_time_sentence(self):
+        body = processing._build_tour_fallback_suggested_email(
+            contact_name="Ron Allon",
+            recipient_email="bp21harrison@gmail.com",
+            question=(
+                "Broker offered tour times: Tuesday, June 23 at 2:00 PM CT or "
+                "Thursday, June 25 at 11:30 AM CT (about 30 minutes on site)."
+            ),
+        )
+
+        self.assertIn("Tuesday, June 23 at 2:00 PM CT would work on my end.", body)
+        self.assertIn(
+            "If that time is no longer available, Thursday, June 25 at 11:30 AM CT could also work.",
+            body,
+        )
+        self.assertIn("Please plan for about 30 minutes on site.", body)
+        self.assertNotIn("(about 30 minutes on site could also work", body)
+
     def test_confirmed_tour_without_suggested_email_is_not_actionable(self):
         event = {
             "type": "tour_requested",
