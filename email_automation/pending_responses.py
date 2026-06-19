@@ -148,10 +148,14 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> int:
                 doc.reference.delete()
                 success_count += 1
             else:
+                failure_reason = (
+                    getattr(send_reply_in_thread, "last_error", None)
+                    or "send_reply_in_thread returned False"
+                )
                 # Update attempt count
                 doc.reference.update({
                     "attempts": attempts + 1,
-                    "lastError": "send_reply_in_thread returned False",
+                    "lastError": failure_reason,
                     "updatedAt": SERVER_TIMESTAMP,
                 })
                 print(f"    ❌ Still failing, will retry later")

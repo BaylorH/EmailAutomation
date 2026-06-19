@@ -1,4 +1,6 @@
 import os
+import sys
+import types
 import unittest
 from unittest.mock import patch
 
@@ -64,6 +66,12 @@ class FakeFirestore:
 
 
 class PendingResponsesTests(unittest.TestCase):
+    def _mock_clients_module(self, fake_fs):
+        return patch.dict(
+            sys.modules,
+            {"email_automation.clients": types.SimpleNamespace(_fs=fake_fs)},
+        )
+
     def test_max_attempt_pending_response_moves_to_dead_letter_queue(self):
         stale_doc = FakeDoc("thread-stale", {
             "threadId": "thread-stale",
@@ -85,7 +93,7 @@ class PendingResponsesTests(unittest.TestCase):
         })
         fake_fs = FakeFirestore([stale_doc, active_doc])
 
-        with patch("email_automation.clients._fs", fake_fs):
+        with self._mock_clients_module(fake_fs):
             valid = pending_responses.get_pending_responses("uid-1")
 
         self.assertEqual([item["doc"].id for item in valid], ["thread-active"])
@@ -96,6 +104,36 @@ class PendingResponsesTests(unittest.TestCase):
         self.assertEqual(dead_letter["threadId"], "thread-stale")
         self.assertEqual(dead_letter["recipient"], "bp21harrison@gmail.com")
         self.assertEqual(dead_letter["failureReason"], "Graph failed repeatedly")
+
+    def test_failed_retry_preserves_detailed_send_error_when_available(self):
+        active_doc = FakeDoc("thread-active", {
+            "threadId": "thread-active",
+            "msgId": "message-2",
+            "recipient": "bp21harrison@gmail.com",
+            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "clientId": "client-1",
+            "attempts": 1,
+            "lastError": "Temporary failure",
+        })
+        fake_fs = FakeFirestore([active_doc])
+
+        def fake_send_reply_in_thread(**_kwargs):
+            return False
+
+        fake_send_reply_in_thread.last_error = "HTTP 429 rate limited after 3 attempts"
+
+        with patch.dict(sys.modules, {
+            "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
+            "email_automation.processing": types.SimpleNamespace(
+                send_reply_in_thread=fake_send_reply_in_thread,
+            ),
+        }):
+            sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
+
+        self.assertEqual(sent, 0)
+        retry_payload = active_doc.reference.update_calls[-1]
+        self.assertEqual(retry_payload["attempts"], 2)
+        self.assertEqual(retry_payload["lastError"], "HTTP 429 rate limited after 3 attempts")
 
 
 if __name__ == "__main__":

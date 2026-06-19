@@ -1230,6 +1230,7 @@ def _align_response_greeting(response_body: Optional[str], contact_name: Optiona
 
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
+    send_reply_in_thread.last_error = None
     try:
         from .utils import (
             GRAPH_SEND_MAX_RETRIES,
@@ -1405,6 +1406,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                     reply_sent_successfully = True
 
             if not reply_sent_successfully:
+                send_reply_in_thread.last_error = "All reply methods failed"
                 print(f"   ❌ All reply methods failed")
                 return False
 
@@ -1456,7 +1458,9 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                             time.sleep(0.5 * (attempt + 1))
 
                         if not msg_indexed:
-                            print(f"   ⚠️ CRITICAL: Failed to index reply after {MAX_RETRIES} attempts - future replies may be orphaned")
+                            error_msg = f"Failed to index reply after {MAX_RETRIES} attempts"
+                            send_reply_in_thread.last_error = error_msg
+                            print(f"   ⚠️ CRITICAL: {error_msg} - future replies may be orphaned")
                             # SAFETY: Return failure because email was sent but not indexed
                             # Caller should be aware that conversation tracking is broken
                             return False
@@ -1506,6 +1510,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         return True
 
     except Exception as e:
+        send_reply_in_thread.last_error = str(e)
         print(f"   ❌ Failed to send reply: {e}")
         return False
 
