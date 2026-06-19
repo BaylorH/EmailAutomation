@@ -770,6 +770,48 @@ def _extract_tour_reply_time_mentions(text: str) -> List[str]:
     return times[:4]
 
 
+def _tour_time_minutes(value: str = "") -> Optional[int]:
+    text = re.sub(r"[\s.]+", "", str(value or "").strip().lower())
+    if text == "noon":
+        return 12 * 60
+    match = re.fullmatch(r"0?(\d{1,2})(?::?(\d{2}))?(am|pm)", text)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or "0")
+    if minute > 59:
+        return None
+    if match.group(3) == "pm" and hour != 12:
+        hour += 12
+    if match.group(3) == "am" and hour == 12:
+        hour = 0
+    if hour > 23:
+        return None
+    return hour * 60 + minute
+
+
+def _filter_requested_tour_times(
+    times: List[str],
+    thread_data: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    invite = (thread_data or {}).get("tourInvite") or {}
+    requested = {
+        minutes
+        for minutes in (
+            _tour_time_minutes(invite.get("arrivalTime")),
+            _tour_time_minutes(invite.get("departureTime")),
+        )
+        if minutes is not None
+    }
+    if not requested:
+        return times
+    return [
+        time_value
+        for time_value in times
+        if _tour_time_minutes(time_value) not in requested
+    ]
+
+
 def _build_tour_reply_hold_suggested_email(
     contact_name: str = "",
     recipient_email: str = "",
@@ -883,6 +925,7 @@ def _classify_tour_invite_reply(
         }
 
     if tour_invite_context and (negative_time_signal or "instead" in text) and alternate_times:
+        alternate_times = _filter_requested_tour_times(alternate_times, thread_data)
         return {
             "outcome": "alternate_requested",
             "needsOperatorAction": True,

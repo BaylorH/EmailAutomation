@@ -129,6 +129,8 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertTrue(classification["needsOperatorAction"])
         self.assertFalse(classification["canCloseThread"])
         self.assertIn("1:30 PM", classification["alternateTimes"])
+        self.assertNotIn("10:47 AM", classification["alternateTimes"])
+        self.assertNotIn("10:47 AM", classification["suggestedEmail"])
         self.assertNotIn("move the other tour", classification["suggestedEmail"].lower())
 
     def test_specs_and_flyer_reply_is_not_treated_as_tour_offer(self):
