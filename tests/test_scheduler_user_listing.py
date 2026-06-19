@@ -3,12 +3,17 @@ import unittest
 from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
+os.environ.setdefault("AZURE_API_APP_ID", "test-client-id")
+os.environ.setdefault("AZURE_API_CLIENT_SECRET", "test-client-secret")
+os.environ.setdefault("FIREBASE_API_KEY", "test-firebase-api-key")
+os.environ.setdefault("OPENAI_API_KEY", "test-openai-api-key")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
     "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
 )
 
 from email_automation import clients
+import scheduler_runner
 
 
 class FakeResponse:
@@ -85,6 +90,26 @@ class SchedulerUserListingTests(unittest.TestCase):
         with patch.object(clients.requests, "get", return_value=FakeResponse(payload)), \
              patch.object(clients, "_fs", fake_fs):
             self.assertEqual(["real-user-1", "real-user-2"], clients.list_user_ids())
+
+    def test_legacy_scheduler_runner_uses_same_mailbox_filter(self):
+        payload = {
+            "items": [
+                {"name": "msal_caches/real-user-1/msal_token_cache.bin"},
+                {"name": "msal_caches/AIzaSyFakeFirebaseApiKey/msal_token_cache.bin"},
+                {"name": "msal_caches/signup-no-mailbox/msal_token_cache.bin"},
+                {"name": "msal_caches/missing-user-doc/msal_token_cache.bin"},
+                {"name": "msal_caches/real-user-2/msal_token_cache.bin"},
+            ]
+        }
+        fake_fs = FakeFirestore({
+            "real-user-1": {"hasMsalToken": True, "email": "one@example.com"},
+            "real-user-2": {"hasMsalToken": True, "email": "two@example.com"},
+            "signup-no-mailbox": {"hasMsalToken": False, "email": "three@example.com"},
+        })
+
+        with patch.object(scheduler_runner.requests, "get", return_value=FakeResponse(payload)), \
+             patch.object(scheduler_runner, "_fs", fake_fs):
+            self.assertEqual(["real-user-1", "real-user-2"], scheduler_runner.list_user_ids())
 
 
 if __name__ == "__main__":
