@@ -789,11 +789,30 @@ def _thread_context_from_outbox(data: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
     context = {}
-    for key in ("source", "actionType", "tourInvite", "actionAuditId"):
+    for key in ("source", "actionType", "tourInvite", "actionAuditId", "property"):
         value = data.get(key)
         if value:
             context[key] = value
     return context
+
+
+def _property_address_from_thread_context(thread_context: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return the real property address from dashboard context when subject is workflow copy."""
+    if not isinstance(thread_context, dict):
+        return None
+
+    property_data = thread_context.get("property")
+    if not isinstance(property_data, dict):
+        return None
+
+    address = str(property_data.get("address") or "").strip()
+    city = str(property_data.get("city") or "").strip()
+
+    if address and city:
+        return f"{address}, {city}"
+    if address:
+        return address
+    return None
 
 
 def _is_cancelled_outbox_item(data: Dict[str, Any]) -> bool:
@@ -1228,8 +1247,12 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                 })
 
             # Store property address for PDF/data matching
-            # Extract from subject (format: "Property Address, City")
-            if subject:
+            # Prefer explicit dashboard property context for workflow subjects
+            # like "Tour slot: 0 Gemini Ave at 9:00 AM"; fall back to subject.
+            context_property_address = _property_address_from_thread_context(thread_context)
+            if context_property_address:
+                thread_meta["propertyAddress"] = context_property_address
+            elif subject:
                 # Remove common prefixes like "Re:", "RE:", "Fwd:", etc.
                 clean_subject = subject.strip()
                 for prefix in ["Re:", "RE:", "Fwd:", "FWD:", "Fw:"]:

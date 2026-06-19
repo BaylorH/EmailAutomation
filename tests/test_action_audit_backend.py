@@ -210,6 +210,19 @@ class BackendActionAuditTests(unittest.TestCase):
         self.assertEqual(dead_letter_payload["failureReason"], "Send errors after 5 attempts: Request failed after 3 attempts")
         self.assertEqual(dead_letter_payload["originalDocId"], "outbox-dead")
 
+    def test_tour_invite_outbox_context_preserves_property_anchor(self):
+        context = email_module._thread_context_from_outbox({
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": {"arrivalTime": "9:00 AM"},
+            "property": {"address": "0 Gemini Ave", "city": "Houston"},
+        })
+
+        self.assertEqual("dashboard_tour_planner", context["source"])
+        self.assertEqual("tour_invite", context["actionType"])
+        self.assertEqual({"arrivalTime": "9:00 AM"}, context["tourInvite"])
+        self.assertEqual({"address": "0 Gemini Ave", "city": "Houston"}, context["property"])
+
     @patch.object(email_module.time, "sleep", return_value=None)
     @patch.object(email_module.requests, "post")
     @patch.object(email_module.requests, "get")
@@ -246,6 +259,64 @@ class BackendActionAuditTests(unittest.TestCase):
         self.assertEqual(result["sentMessageId"], "graph-message-1")
         self.assertEqual(result["internetMessageId"], "<internet-message-1@example.com>")
         self.assertEqual(result["conversationId"], "conversation-1")
+
+    @patch.object(email_module.time, "sleep", return_value=None)
+    @patch("email_automation.processing.is_contact_opted_out", return_value=None)
+    @patch.object(email_module, "lookup_thread_by_message_id")
+    @patch.object(email_module, "index_conversation_id", return_value=True)
+    @patch.object(email_module, "index_message_id", return_value=True)
+    @patch.object(email_module, "save_message", return_value=True)
+    @patch.object(email_module, "save_thread_root", return_value=True)
+    @patch.object(email_module.requests, "post")
+    @patch.object(email_module.requests, "get")
+    def test_tour_invite_thread_indexes_actual_property_address(
+        self,
+        requests_get,
+        requests_post,
+        save_thread_root,
+        _save_message,
+        _index_message_id,
+        _index_conversation_id,
+        _lookup_thread_by_message_id,
+        _is_contact_opted_out,
+        _sleep,
+    ):
+        normalized_message_id = email_module.normalize_message_id("<normalized-tour-message@example.com>")
+        _lookup_thread_by_message_id.return_value = normalized_message_id
+        requests_post.side_effect = [
+            FakeResponse(201, {"id": "draft-tour-1"}),
+            FakeResponse(202),
+        ]
+        requests_get.return_value = FakeResponse(200, {
+            "internetMessageId": "<normalized-tour-message@example.com>",
+            "conversationId": "conversation-tour-1",
+            "subject": "Tour slot: 0 Gemini Ave at 9:00 AM",
+            "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
+        })
+
+        result = email_module.send_and_index_email(
+            "uid-1",
+            {"Authorization": "Bearer token"},
+            "Hi Ron,\n\nPlease confirm the 9:00 AM tour slot for 0 Gemini Ave.",
+            ["bp21harrison@gmail.com"],
+            client_id_or_none="client-1",
+            row_number=20,
+            subject_override="Tour slot: 0 Gemini Ave at 9:00 AM",
+            thread_context={
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "tourInvite": {"arrivalTime": "9:00 AM", "departureTime": "9:30 AM"},
+                "property": {"address": "0 Gemini Ave", "city": "Houston", "state": "TX"},
+            },
+        )
+
+        self.assertEqual(["bp21harrison@gmail.com"], result["sent"])
+        thread_meta = save_thread_root.call_args[0][2]
+        self.assertEqual("Tour slot: 0 Gemini Ave at 9:00 AM", thread_meta["subject"])
+        self.assertEqual("0 Gemini Ave, Houston", thread_meta["propertyAddress"])
+        self.assertEqual("dashboard_tour_planner", thread_meta["source"])
+        self.assertEqual("tour_invite", thread_meta["actionType"])
+        self.assertEqual({"arrivalTime": "9:00 AM", "departureTime": "9:30 AM"}, thread_meta["tourInvite"])
 
 
 if __name__ == "__main__":
