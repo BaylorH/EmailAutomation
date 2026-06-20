@@ -170,6 +170,28 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertEqual("RE: 4402 Rex Rd", sanitized["subject"])
         self.assertEqual("Hi Drew,\n\nThat time works.", sanitized["body"])
 
+    def test_dashboard_suggested_email_keeps_real_builder_metadata(self):
+        payload = processing.build_new_property_suggested_email(
+            address="4402 Rex Rd",
+            city="Friendswood",
+            to_email="broker@example.com",
+            contact_name="Drew Broker",
+            referrer_name="Lawton",
+            client_id="client-1",
+        )
+
+        sanitized = processing._sanitize_dashboard_suggested_email_payload(payload)
+
+        self.assertEqual(["broker@example.com"], sanitized["to"])
+        self.assertEqual("Drew Broker", sanitized["contactName"])
+        self.assertEqual("client-1", sanitized["clientId"])
+        self.assertIsNone(sanitized["rowNumber"])
+        self.assertIn("4402 Rex Rd", sanitized["body"])
+        self.assertNotRegex(
+            sanitized["body"],
+            r"(?im)^\s*(thanks|best|best regards|regards)[,!]?\s*$",
+        )
+
     def test_tour_invite_alternate_reply_builds_durable_thread_state(self):
         payload = processing._build_tour_invite_reply_state_update({
             "outcome": "alternate_requested",
