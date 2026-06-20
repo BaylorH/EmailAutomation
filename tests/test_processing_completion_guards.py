@@ -137,6 +137,39 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             r"(?im)^\s*(thanks|best|best regards|regards)[,!]?\s*$",
         )
 
+    def test_dashboard_suggested_email_strips_body_signoff_before_user_signature(self):
+        body = (
+            "Hi Lawton,\n\n"
+            "Got it -- 2:15 PM works on our end for 4402 Rex Rd.\n\n"
+            "Can you confirm the date for the 2:15 PM tour, and the best address/entry point "
+            "to meet you on-site?\n\n"
+            "Thanks,\n"
+            "BP21"
+        )
+
+        sanitized = processing._sanitize_dashboard_suggested_email_body(body)
+
+        self.assertIn("Hi Lawton,", sanitized)
+        self.assertIn("best address/entry point", sanitized)
+        self.assertNotRegex(
+            sanitized,
+            r"(?im)^\s*(thanks|best|best regards|regards)[,!]?\s*$",
+        )
+        self.assertNotIn("BP21", sanitized)
+
+    def test_dashboard_suggested_email_payload_keeps_recipients_while_cleaning_body(self):
+        payload = {
+            "to": ["broker@example.com"],
+            "subject": "RE: 4402 Rex Rd",
+            "body": "Hi Drew,\n\nThat time works.\n\nThanks,",
+        }
+
+        sanitized = processing._sanitize_dashboard_suggested_email_payload(payload)
+
+        self.assertEqual(["broker@example.com"], sanitized["to"])
+        self.assertEqual("RE: 4402 Rex Rd", sanitized["subject"])
+        self.assertEqual("Hi Drew,\n\nThat time works.", sanitized["body"])
+
     def test_tour_invite_alternate_reply_builds_durable_thread_state(self):
         payload = processing._build_tour_invite_reply_state_update({
             "outcome": "alternate_requested",

@@ -31,7 +31,7 @@ from .notification_payloads import (
 )
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
-                   format_email_body_with_footer, strip_email_quotes)
+                   format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff)
 from .email_operations import (
     send_remaining_questions_email,
     send_closing_email,
@@ -1029,6 +1029,21 @@ def _tour_event_needs_operator_action(
         return False
 
     return True
+
+
+def _sanitize_dashboard_suggested_email_body(body: Any) -> str:
+    """Strip draft-body closings before the user's configured signature is appended."""
+    return strip_outbound_body_signoff(str(body or "")).strip()
+
+
+def _sanitize_dashboard_suggested_email_payload(payload: Any) -> Any:
+    """Clean suggested-email payload bodies without altering suggested contact addresses."""
+    if not isinstance(payload, dict):
+        return payload
+    clean_payload = dict(payload)
+    if "body" in clean_payload:
+        clean_payload["body"] = _sanitize_dashboard_suggested_email_body(clean_payload.get("body"))
+    return clean_payload
 
 
 def _close_reason_from_event(event: Dict[str, Any]) -> str:
@@ -2365,6 +2380,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                                 recipient_email=to_addr_lower,
                                 question=question,
                             )
+                        suggested_email = _sanitize_dashboard_suggested_email_body(suggested_email)
 
                         meta = {
                             "reason": reason,
@@ -2717,6 +2733,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             referrer_name=referrer_name if is_different_contact else "",
                             client_id=client_id,
                         )
+                        email_payload = _sanitize_dashboard_suggested_email_payload(email_payload)
 
                         if should_skip_original_reply_for_new_property_referral(
                             original_contact_email=to_addr_lower,
@@ -3005,6 +3022,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             suggested_email=suggested_email,
                             row_anchor=row_anchor,
                             referrer_name=contact_name,
+                        )
+                        suggested_email_payload = _sanitize_dashboard_suggested_email_payload(
+                            suggested_email_payload
                         )
                         logger.debug(
                             "notification.wrong_contact",
