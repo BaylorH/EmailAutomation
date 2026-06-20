@@ -132,6 +132,10 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertNotIn("10:47 AM", classification["alternateTimes"])
         self.assertNotIn("10:47 AM", classification["suggestedEmail"])
         self.assertNotIn("move the other tour", classification["suggestedEmail"].lower())
+        self.assertNotRegex(
+            classification["suggestedEmail"],
+            r"(?im)^\s*(thanks|best|best regards|regards)[,!]?\s*$",
+        )
 
     def test_tour_invite_alternate_reply_builds_durable_thread_state(self):
         payload = processing._build_tour_invite_reply_state_update({

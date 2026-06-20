@@ -190,6 +190,28 @@ class SignatureFooterTests(unittest.TestCase):
         self.assertNotIn("\u201d", html)
         self.assertNotIn("\u2022", html)
 
+    def test_format_body_strips_broker_signoff_before_user_signature(self):
+        html = format_email_body_with_footer(
+            "Hi Casey,\n\n2:15 PM is still available for 4402 Rex Rd if that works on your end.\n\nThanks,\nBP21",
+            "John Doe\nExample Realty Advisors",
+            "professional",
+            user_email="baylor.freelance@outlook.com",
+        )
+
+        self.assertIn("2:15 PM is still available", html)
+        self.assertIn("John Doe", html)
+        self.assertIn("Example Realty Advisors", html)
+        self.assertNotIn("BP21", html)
+
+    def test_format_body_preserves_manual_signoff_without_configured_signature(self):
+        html = format_email_body_with_footer(
+            "Hi Casey,\n\n2:15 PM is still available.\n\nThanks,\nBP21",
+            "",
+            "none",
+        )
+
+        self.assertIn("Thanks,<br>BP21", html)
+
     def test_professional_html_signature_uses_custom_inline_logo_attachment(self):
         logo_bytes = base64.b64encode(b"fake-logo").decode("ascii")
         signature = f"""<!-- sitesift:professional-signature:v1 -->

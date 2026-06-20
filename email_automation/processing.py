@@ -826,9 +826,7 @@ def _build_tour_reply_hold_suggested_email(
 
 Thanks for letting me know.{alternate_text}
 
-I'm checking the route and schedule on my end and will circle back once I can confirm a workable time.
-
-Thanks!"""
+I'm checking the route and schedule on my end and will circle back once I can confirm a workable time."""
 
 
 def _clean_tour_signal_text(*parts: str) -> str:

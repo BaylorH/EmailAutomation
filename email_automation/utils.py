@@ -24,6 +24,14 @@ _GLUED_DOCUMENT_SIGNOFF_RX = re.compile(
     r"(?:thank(?:s|you|\s+you)?|regards|best|sincerely|cheers|sent|from|on)"
     r"[\w,.;:!?\- ]*$"
 )
+_OUTBOUND_BODY_SIGNOFF_RX = re.compile(
+    r"\n+\s*"
+    r"(?:best|thanks|thank you|regards|best regards|kind regards|warm regards|sincerely|cheers|"
+    r"all the best|take care|many thanks|with thanks|respectfully|cordially|yours truly|"
+    r"best wishes|talk soon|looking forward)"
+    r"[,!]?(?:\s*\n[\s\S]*)?\s*$",
+    re.IGNORECASE,
+)
 _OUTBOUND_TEXT_TRANSLATION = str.maketrans({
     "\u2018": "'",
     "\u2019": "'",
@@ -54,6 +62,13 @@ def _normalize_email(s: str) -> str:
 def normalize_outbound_message_text(text: str) -> str:
     """Normalize generated copy before handing HTML to mail transports."""
     return (text or "").translate(_OUTBOUND_TEXT_TRANSLATION)
+
+
+def strip_outbound_body_signoff(text: str) -> str:
+    """Remove body-level closings before appending the signed-in user's footer."""
+    if not text:
+        return text or ""
+    return _OUTBOUND_BODY_SIGNOFF_RX.sub("", text).rstrip()
 
 
 def strip_email_quotes(text: str) -> str:
@@ -1024,15 +1039,18 @@ def format_email_body_with_footer(
         signature_mode: Signature mode - "none", "custom", or "professional"
         user_email: Sender profile email used to gate the legacy MOHR footer
     """
-    # Strip trailing whitespace/newlines from body before converting.
+    # Get the footer (custom or default based on mode)
+    footer_html = get_email_footer(custom_signature, signature_mode, user_email=user_email)
+    # Strip trailing whitespace/newlines from body before converting. When a
+    # footer exists, also remove any copied/generated closing so the signed-in
+    # user's configured signature is the only signoff that can be sent.
     body = normalize_outbound_message_text(body).rstrip()
+    if footer_html:
+        body = strip_outbound_body_signoff(body)
 
     # Convert plain text to HTML
     # Replace double newlines with <br><br>, single newlines with <br>
     html_body = body.replace('\n\n', '<br><br>').replace('\n', '<br>')
-
-    # Get the footer (custom or default based on mode)
-    footer_html = get_email_footer(custom_signature, signature_mode, user_email=user_email)
 
     # If no signature at all, just return the body without footer section
     if not footer_html:
