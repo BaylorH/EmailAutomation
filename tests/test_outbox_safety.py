@@ -60,6 +60,9 @@ class FakeFirestoreNode:
         self.root.add_calls.append((tuple(self.path), data))
         return FakeFirestoreNode(self.root, self.path + ["document", "auto-id"])
 
+    def get(self):
+        return FakeSnapshot({}, exists=False)
+
 
 class FakeFirestore:
     def __init__(self):
@@ -276,6 +279,7 @@ class OutboxSafetyTests(unittest.TestCase):
 
         with patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch("email_automation.clients._fs", FakeFirestore()), \
              patch.object(email_module, "_select_script_for_recipient", return_value="Wrong fallback body") as select_script, \
              patch.object(email_module, "send_and_index_email", return_value={
                  "sent": ["bp21harrison@gmail.com"],
@@ -313,6 +317,7 @@ class OutboxSafetyTests(unittest.TestCase):
 
         with patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch("email_automation.clients._fs", FakeFirestore()), \
              patch.object(email_module, "send_and_index_email", return_value={
                  "sent": ["bp21harrison@gmail.com"],
                  "errors": {},

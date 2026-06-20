@@ -133,6 +133,31 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertNotIn("10:47 AM", classification["suggestedEmail"])
         self.assertNotIn("move the other tour", classification["suggestedEmail"].lower())
 
+    def test_tour_invite_alternate_reply_builds_durable_thread_state(self):
+        payload = processing._build_tour_invite_reply_state_update({
+            "outcome": "alternate_requested",
+            "alternateTimes": ["1:30 PM"],
+            "details": "Broker offered an alternate time.",
+        })
+
+        self.assertEqual("alternate_requested", payload["tourStatus"])
+        self.assertEqual("alternate_requested", payload["tourInvite.status"])
+        self.assertEqual(["1:30 PM"], payload["tourInvite.alternateTimes"])
+        self.assertEqual("Broker offered an alternate time.", payload["tourInvite.lastReplyDetails"])
+        self.assertEqual(processing.SERVER_TIMESTAMP, payload["tourInvite.rescheduleRequestedAt"])
+
+    def test_tour_invite_decline_reply_builds_durable_thread_state(self):
+        payload = processing._build_tour_invite_reply_state_update({
+            "outcome": "declined",
+            "alternateTimes": [],
+            "details": "Broker declined the requested tour slot.",
+        })
+
+        self.assertEqual("declined", payload["tourStatus"])
+        self.assertEqual("declined", payload["tourInvite.status"])
+        self.assertEqual([], payload["tourInvite.alternateTimes"])
+        self.assertEqual(processing.SERVER_TIMESTAMP, payload["tourInvite.declinedAt"])
+
     def test_specs_and_flyer_reply_is_not_treated_as_tour_offer(self):
         message = (
             "Hi John,\n"

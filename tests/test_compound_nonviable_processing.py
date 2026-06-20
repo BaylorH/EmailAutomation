@@ -222,6 +222,10 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
                 patcher.stop()
 
         send_reply.assert_not_called()
+        self.assertEqual("confirmed", thread_ref._data["tourStatus"])
+        self.assertEqual("confirmed", thread_ref._data["tourInvite.status"])
+        self.assertEqual(processing.SERVER_TIMESTAMP, thread_ref._data["tourInvite.confirmedAt"])
+        self.assertEqual("Broker confirmed the requested tour slot.", thread_ref._data["tourInvite.lastReplyDetails"])
 
     def test_quote_only_blank_reply_is_saved_without_ai_or_followup_side_effects(self):
         user_id = "test-user"

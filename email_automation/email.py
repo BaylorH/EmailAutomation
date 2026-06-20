@@ -150,6 +150,51 @@ def _send_identity_payload(send_result: Optional[Dict[str, Any]], recipients: Op
     return {k: v for k, v in payload.items() if v}
 
 
+def _is_tour_invite_outbox(data: Optional[Dict[str, Any]] = None) -> bool:
+    data = data or {}
+    return bool(
+        str(data.get("actionType") or "").strip().lower() == "tour_invite"
+        or isinstance(data.get("tourInvite"), dict)
+        or str(data.get("source") or "").strip().lower() == "dashboard_tour_planner"
+    )
+
+
+def _mark_tour_invite_thread_sent(
+    user_id: str,
+    data: Dict[str, Any],
+    outbox_id: Optional[str] = None,
+    send_result: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist the post-send lifecycle state for reviewed tour invites."""
+    thread_id = (data.get("threadId") or "").strip()
+    if not thread_id or not _is_tour_invite_outbox(data):
+        return
+
+    recipients = data.get("assignedEmails") or []
+    identity = _send_identity_payload(send_result, recipients)
+    payload = {
+        "tourStatus": "awaiting_confirmation",
+        "tourInvite.status": "sent",
+        "tourInvite.sentAt": SERVER_TIMESTAMP,
+        "tourInvite.outboxId": outbox_id,
+        "tourInvite.actionAuditId": data.get("actionAuditId"),
+        "tourInvite.sentMessageId": identity.get("sentMessageId"),
+        "tourInvite.internetMessageId": identity.get("internetMessageId"),
+        "tourInvite.sentThreadId": identity.get("sentThreadId"),
+        "tourInvite.conversationId": identity.get("conversationId"),
+    }
+
+    try:
+        from .clients import _fs
+        (
+            _fs.collection("users").document(user_id)
+            .collection("threads").document(thread_id)
+            .set({key: value for key, value in payload.items() if value is not None}, merge=True)
+        )
+    except Exception as e:
+        print(f"   ⚠️ Could not mark tour invite thread {thread_id} sent: {e}")
+
+
 def _fetch_graph_message_metadata(headers: dict, message_id: str, base: str) -> Dict[str, Any]:
     if not message_id:
         return {}
@@ -893,6 +938,12 @@ def _finalize_successful_outbox_item(
     }
     audit_payload.update(_send_identity_payload(send_result, data.get("assignedEmails") or []))
     _update_action_audit(user_id, data.get("actionAuditId"), audit_payload)
+    _mark_tour_invite_thread_sent(
+        user_id,
+        data,
+        outbox_id=getattr(doc_ref, "id", None),
+        send_result=send_result,
+    )
 
     if row_number and client_id:
         try:

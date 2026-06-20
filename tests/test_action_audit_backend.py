@@ -131,6 +131,48 @@ class BackendActionAuditTests(unittest.TestCase):
         self.assertEqual(audit_payload["sentThreadId"], "thread-graph-1")
         self.assertEqual(audit_payload["conversationId"], "conversation-graph-1")
 
+    def test_successful_tour_invite_send_marks_thread_awaiting_confirmation(self):
+        outbox_ref = FakeOutboxRef("outbox-tour")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs):
+            email_module._finalize_successful_outbox_item(
+                "uid-1",
+                outbox_ref,
+                {
+                    "assignedEmails": ["bp21harrison@gmail.com"],
+                    "clientId": "client-1",
+                    "threadId": "thread-tour",
+                    "actionType": "tour_invite",
+                    "actionAuditId": "audit-tour",
+                    "tourInvite": {
+                        "arrivalTime": "10:47 AM",
+                        "departureTime": "11:17 AM",
+                    },
+                },
+                send_result={
+                    "sentMessageIds": {"bp21harrison@gmail.com": "graph-tour-message"},
+                    "internetMessageIds": {"bp21harrison@gmail.com": "<tour-message@example.com>"},
+                    "conversationIds": {"bp21harrison@gmail.com": "conversation-tour"},
+                },
+            )
+
+        thread_updates = [
+            call for call in fake_fs.set_calls
+            if call[0] == (
+                "collection", "users", "document", "uid-1",
+                "collection", "threads", "document", "thread-tour",
+            )
+        ]
+        self.assertEqual(1, len(thread_updates))
+        payload = thread_updates[0][1]
+        self.assertEqual("awaiting_confirmation", payload["tourStatus"])
+        self.assertEqual("sent", payload["tourInvite.status"])
+        self.assertEqual(email_module.SERVER_TIMESTAMP, payload["tourInvite.sentAt"])
+        self.assertEqual("graph-tour-message", payload["tourInvite.sentMessageId"])
+        self.assertEqual("<tour-message@example.com>", payload["tourInvite.internetMessageId"])
+        self.assertEqual("conversation-tour", payload["tourInvite.conversationId"])
+
     def test_cancelled_outbox_terminalizes_action_audit(self):
         outbox_ref = FakeOutboxRef("outbox-cancel")
         fake_fs = FakeFirestore()

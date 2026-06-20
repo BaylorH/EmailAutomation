@@ -955,6 +955,46 @@ def _classify_tour_invite_reply(
     }
 
 
+def _build_tour_invite_reply_state_update(
+    classification: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build durable thread fields for a broker reply to a reviewed tour invite."""
+    classification = classification or {}
+    outcome = str(classification.get("outcome") or "").strip().lower()
+    alternate_times = list(classification.get("alternateTimes") or [])
+
+    payload = {
+        "tourInvite.lastReplyOutcome": outcome or None,
+        "tourInvite.lastReplyAt": SERVER_TIMESTAMP,
+        "tourInvite.lastReplyDetails": classification.get("details") or "",
+    }
+
+    if outcome == "confirmed":
+        payload.update({
+            "tourStatus": "confirmed",
+            "tourConfirmedAt": SERVER_TIMESTAMP,
+            "tourInvite.status": "confirmed",
+            "tourInvite.confirmedAt": SERVER_TIMESTAMP,
+            "tourInvite.alternateTimes": [],
+        })
+    elif outcome == "alternate_requested":
+        payload.update({
+            "tourStatus": "alternate_requested",
+            "tourInvite.status": "alternate_requested",
+            "tourInvite.alternateTimes": alternate_times,
+            "tourInvite.rescheduleRequestedAt": SERVER_TIMESTAMP,
+        })
+    elif outcome == "declined":
+        payload.update({
+            "tourStatus": "declined",
+            "tourInvite.status": "declined",
+            "tourInvite.alternateTimes": alternate_times,
+            "tourInvite.declinedAt": SERVER_TIMESTAMP,
+        })
+
+    return {key: value for key, value in payload.items() if value is not None}
+
+
 def _tour_event_needs_operator_action(
     event: Dict[str, Any],
     message_text: str = "",
@@ -2286,12 +2326,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             if tour_reply_classification.get("canCloseThread"):
                                 update_thread_status(user_id, thread_id, THREAD_STATUS["completed"], "tour_confirmed")
                                 if thread_ref:
-                                    thread_ref.update({
-                                        "tourStatus": "confirmed",
-                                        "tourConfirmedAt": SERVER_TIMESTAMP,
-                                        "tourInvite.status": "confirmed",
-                                        "tourInvite.confirmedAt": SERVER_TIMESTAMP,
-                                    })
+                                    thread_ref.update(
+                                        _build_tour_invite_reply_state_update(tour_reply_classification)
+                                    )
                                 complete_threads_for_row(
                                     user_id,
                                     rownum,
@@ -2318,6 +2355,10 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             details = tour_reply_classification.get("details") or details
                             question = details
                             suggested_email = tour_reply_classification.get("suggestedEmail") or suggested_email
+                            if thread_ref:
+                                thread_ref.update(
+                                    _build_tour_invite_reply_state_update(tour_reply_classification)
+                                )
 
                         # If AI didn't generate a suggested email, create a default one
                         if not suggested_email:
