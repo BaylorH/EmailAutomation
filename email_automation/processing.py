@@ -816,12 +816,14 @@ def _build_tour_reply_hold_suggested_email(
 ) -> str:
     greeting_name = _safe_tour_greeting_name(contact_name, recipient_email)
     alternate_text = ""
+    date_label = format_tour_date_label(tour_date)
     if alternate_times:
-        date_label = format_tour_date_label(tour_date)
         alternate_label = ", ".join(alternate_times)
         if date_label and date_label.lower() not in alternate_label.lower():
             alternate_label = f"{date_label} at {alternate_label}"
         alternate_text = f" I saw the alternate time you suggested ({alternate_label})."
+    elif date_label:
+        alternate_text = f" I saw the update for the {date_label} tour."
 
     return f"""Hi {greeting_name},
 
@@ -944,9 +946,13 @@ def _classify_tour_invite_reply(
         r"see\s+you\s+(?:then|there)|we\s+are\s+confirmed|we're\s+confirmed|sounds\s+good)\b",
         text,
     ))
+    slot_scoped_decline_signal = bool(re.search(
+        r"\b(?:that|requested|scheduled)\s+(?:time|slot)\b|\bat\s+that\s+time\b",
+        text,
+    ))
     alternate_times = _extract_tour_reply_time_mentions(clean_text)
 
-    if tour_invite_context and tour_unavailable_signal and not alternate_times:
+    if tour_invite_context and tour_unavailable_signal and not alternate_times and not slot_scoped_decline_signal:
         suggested_email = build_tour_unavailable_reply(
             contact_name,
             recipient_email,

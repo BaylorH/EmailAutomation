@@ -167,6 +167,35 @@ class JillJuneRegressionTests(unittest.TestCase):
         self.assertEqual("tour_requested", augmented["events"][0]["type"])
         self.assertEqual("tour_unavailable", augmented["events"][0]["reason"])
 
+    def test_tour_unavailable_slash_phrase_stays_tour_specific(self):
+        proposal = {"updates": [], "events": [{"type": "property_unavailable", "reason": "model"}]}
+        conversation = [
+            {
+                "direction": "outbound",
+                "content": (
+                    "Tour date: Tuesday, June 23, 2026\n"
+                    "Requested arrival: 10:47 AM\n"
+                    "Please confirm whether this tour slot works."
+                ),
+            },
+            {
+                "direction": "inbound",
+                "content": "The space is no longer available for tours/showings/walkthroughs.",
+            },
+        ]
+
+        augmented = ai_processing._augment_events_with_deterministic_signals(
+            proposal,
+            conversation,
+        )
+
+        self.assertNotIn(
+            "property_unavailable",
+            [event.get("type") for event in augmented["events"]],
+        )
+        self.assertEqual("tour_requested", augmented["events"][0]["type"])
+        self.assertEqual("tour_unavailable", augmented["events"][0]["reason"])
+
     def test_requirements_mismatch_downstream_guard_applies_to_current_row(self):
         event = {"type": "property_unavailable", "reason": "requirements_mismatch"}
         message_text = (

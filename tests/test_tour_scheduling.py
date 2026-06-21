@@ -143,6 +143,35 @@ class TourSchedulingTests(unittest.TestCase):
         self.assertEqual("conflict", decision["feasibility"])
         self.assertEqual(["1000 Busy St"], [item["address"] for item in decision["conflicts"]])
 
+    def test_evaluate_alternate_tour_time_honors_persisted_zero_travel_buffer(self):
+        decision = evaluate_alternate_tour_time(
+            [
+                {
+                    "id": "current-thread",
+                    "propertyAddress": "4402 Rex Rd",
+                    "tourInvite": {
+                        "arrivalTime": "10:00 AM",
+                        "departureTime": "10:30 AM",
+                        "travelBufferMinutes": 0,
+                    },
+                },
+                {
+                    "id": "other-thread",
+                    "propertyAddress": "1000 Busy St",
+                    "tourInvite": {
+                        "arrivalTime": "11:00 AM",
+                        "departureTime": "11:30 AM",
+                        "travelBufferMinutes": 0,
+                    },
+                },
+            ],
+            "current-thread",
+            "10:30 AM",
+        )
+
+        self.assertEqual("fits", decision["feasibility"])
+        self.assertEqual([], decision["conflicts"])
+
     def test_evaluate_alternate_tour_time_carries_tour_date(self):
         decision = evaluate_alternate_tour_time(
             [

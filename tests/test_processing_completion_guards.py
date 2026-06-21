@@ -223,6 +223,57 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
         self.assertEqual(decision, payload["tourInvite.requestedAlternate"])
 
+    def test_sibling_schedule_load_failure_degrades_alternate_to_needs_review(self):
+        test_case = self
+
+        class BrokenThreadsRef:
+            def where(self, *, filter):
+                raise RuntimeError("emulator unavailable")
+
+        class FakeUserRef:
+            def collection(self, name):
+                test_case.assertEqual("threads", name)
+                return BrokenThreadsRef()
+
+        class FakeUsersCollection:
+            def document(self, user_id):
+                test_case.assertEqual("uid-1", user_id)
+                return FakeUserRef()
+
+        class BrokenFirestore:
+            def collection(self, name):
+                test_case.assertEqual("users", name)
+                return FakeUsersCollection()
+
+        thread_data = {
+            "clientId": "client-1",
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "propertyAddress": "4402 Rex Rd",
+            "tourInvite": {
+                "tourDate": "2026-06-23",
+                "arrivalTime": "10:00 AM",
+                "departureTime": "10:30 AM",
+            },
+        }
+
+        with patch.object(processing, "_fs", BrokenFirestore()):
+            schedule = processing._load_sibling_tour_schedule(
+                "uid-1",
+                "client-1",
+                "thread-current",
+                thread_data,
+            )
+
+        decision = processing.evaluate_alternate_tour_time(
+            schedule,
+            "thread-current",
+            "2:15 PM",
+        )
+
+        self.assertEqual("needs_review", decision["feasibility"])
+        self.assertIn("could not be loaded", decision["reviewReason"].lower())
+
     def test_tour_invite_alternate_reply_uses_schedule_aware_copy_when_decision_exists(self):
         decision = {
             "feasibility": "fits",
@@ -340,6 +391,31 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertEqual("declined", payload["tourInvite.status"])
         self.assertEqual([], payload["tourInvite.alternateTimes"])
         self.assertEqual(processing.SERVER_TIMESTAMP, payload["tourInvite.declinedAt"])
+
+    def test_tour_invite_decline_reply_preserves_tour_date_in_state_and_draft(self):
+        classification = processing._classify_tour_invite_reply(
+            "We cannot show the space at that time anymore.",
+            event={"type": "tour_requested", "question": "Broker declined the requested tour slot."},
+            thread_data={
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "propertyAddress": "4402 Rex Rd",
+                "tourInvite": {
+                    "tourDate": "2026-06-23",
+                    "arrivalTime": "10:47 AM",
+                    "departureTime": "11:17 AM",
+                },
+            },
+            contact_name="Lawton",
+            recipient_email="lawton@example.com",
+        )
+
+        payload = processing._build_tour_invite_reply_state_update(classification)
+
+        self.assertEqual("declined", classification["outcome"])
+        self.assertEqual("2026-06-23", classification["tourDate"])
+        self.assertEqual("2026-06-23", payload["tourInvite.tourDate"])
+        self.assertIn("Tuesday, June 23, 2026", classification["suggestedEmail"])
 
     def test_specs_and_flyer_reply_is_not_treated_as_tour_offer(self):
         message = (

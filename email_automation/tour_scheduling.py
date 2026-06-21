@@ -117,17 +117,31 @@ def _stop_address(stop: Dict[str, Any]) -> str:
     return "the property"
 
 
+def _first_present(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _parse_buffer_minutes(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def _scheduled_stop(stop: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     invite = _tour_invite(stop)
     arrival = parse_tour_time_minutes(invite.get("arrivalTime") or stop.get("arrivalTime"))
     departure = parse_tour_time_minutes(invite.get("departureTime") or stop.get("departureTime"))
     if arrival is None or departure is None or departure <= arrival:
         return None
-    stop_buffer = invite.get("travelBufferMinutes") or stop.get("travelBufferMinutes")
-    try:
-        buffer_minutes = int(stop_buffer)
-    except (TypeError, ValueError):
-        buffer_minutes = DEFAULT_BUFFER_MINUTES
+    buffer_minutes = _parse_buffer_minutes(
+        _first_present(invite.get("travelBufferMinutes"), stop.get("travelBufferMinutes"))
+    )
     return {
         "id": _thread_id(stop),
         "address": _stop_address(stop),
@@ -225,11 +239,12 @@ def evaluate_alternate_tour_time(
     decision["departureTime"] = format_tour_time(departure)
 
     other_stops = [stop for stop in scheduled_stops if stop["id"] != current_id]
-    effective_buffer = max(
-        buffer_minutes,
-        current_stop.get("bufferMinutes") or DEFAULT_BUFFER_MINUTES,
-        *[stop.get("bufferMinutes") or DEFAULT_BUFFER_MINUTES for stop in other_stops],
-    )
+    explicit_buffers = [
+        stop["bufferMinutes"]
+        for stop in [current_stop, *other_stops]
+        if stop.get("bufferMinutes") is not None
+    ]
+    effective_buffer = max(explicit_buffers) if explicit_buffers else buffer_minutes
     previous = [
         stop for stop in other_stops
         if stop["departure"] + effective_buffer <= alternate_minutes
