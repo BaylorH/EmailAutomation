@@ -138,6 +138,35 @@ class JillJuneRegressionTests(unittest.TestCase):
         self.assertEqual("tour_slot_reply", augmented["events"][0]["reason"])
         self.assertIn("1:30 PM", augmented["events"][0]["question"])
 
+    def test_tour_unavailable_reply_does_not_mark_property_unavailable(self):
+        proposal = {"updates": [], "events": [{"type": "property_unavailable", "reason": "model"}]}
+        conversation = [
+            {
+                "direction": "outbound",
+                "content": (
+                    "Tour date: Tuesday, June 23, 2026\n"
+                    "Requested arrival: 10:47 AM\n"
+                    "Please confirm whether this tour slot works."
+                ),
+            },
+            {
+                "direction": "inbound",
+                "content": "The space is no longer available for tours.",
+            },
+        ]
+
+        augmented = ai_processing._augment_events_with_deterministic_signals(
+            proposal,
+            conversation,
+        )
+
+        self.assertNotIn(
+            "property_unavailable",
+            [event.get("type") for event in augmented["events"]],
+        )
+        self.assertEqual("tour_requested", augmented["events"][0]["type"])
+        self.assertEqual("tour_unavailable", augmented["events"][0]["reason"])
+
     def test_requirements_mismatch_downstream_guard_applies_to_current_row(self):
         event = {"type": "property_unavailable", "reason": "requirements_mismatch"}
         message_text = (
@@ -151,6 +180,20 @@ class JillJuneRegressionTests(unittest.TestCase):
                 row_anchor="19241 David Memorial Dr, The Woodlands",
                 message_text=message_text,
                 unavailable_keywords=processing.PROPERTY_UNAVAILABLE_KEYWORDS,
+            )
+        )
+
+    def test_downstream_guard_rejects_tour_only_unavailability_as_nonviable(self):
+        event = {"type": "property_unavailable", "reason": "model"}
+
+        self.assertFalse(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="4402 Rex Rd, Friendswood",
+                message_text=(
+                    "The space is no longer available for tours on Tuesday, "
+                    "but the listing package is still accurate."
+                ),
             )
         )
 

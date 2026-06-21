@@ -19,6 +19,7 @@ from .column_config import (
 )
 from .notification_payloads import sanitize_new_property_referral_response
 from .openai_usage import track_openai_usage_safely
+from .tour_scheduling import looks_like_tour_only_unavailable
 
 logger = logging.getLogger(__name__)
 
@@ -133,12 +134,32 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
         return proposal
 
     events = proposal.setdefault("events", [])
-    if any((event or {}).get("type") == "property_unavailable" for event in events):
-        return proposal
-
     latest_text_raw = _latest_inbound_text(conversation)
     latest_text = latest_text_raw.lower()
     if not latest_text:
+        return proposal
+
+    tour_reply_reason = None
+    if looks_like_tour_only_unavailable(latest_text_raw):
+        tour_reply_reason = "tour_unavailable"
+    elif _looks_like_tour_slot_reply(conversation, latest_text):
+        tour_reply_reason = "tour_slot_reply"
+
+    if tour_reply_reason:
+        proposal["events"] = [
+            event for event in events
+            if (event or {}).get("type") != "property_unavailable"
+        ]
+        if not any((event or {}).get("type") == "tour_requested" for event in proposal["events"]):
+            proposal["events"].append({
+                "type": "tour_requested",
+                "reason": tour_reply_reason,
+                "question": latest_text_raw[:500],
+                "suggestedEmail": "",
+            })
+        return proposal
+
+    if any((event or {}).get("type") == "property_unavailable" for event in events):
         return proposal
 
     if _looks_like_requirements_mismatch_nonviable(latest_text):
@@ -158,16 +179,6 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
     for reason, pattern in unavailable_patterns:
         if re.search(pattern, latest_text):
             events.insert(0, {"type": "property_unavailable", "reason": reason})
-            return proposal
-
-    if not any((event or {}).get("type") == "tour_requested" for event in events):
-        if _looks_like_tour_slot_reply(conversation, latest_text):
-            events.append({
-                "type": "tour_requested",
-                "reason": "tour_slot_reply",
-                "question": latest_text_raw[:500],
-                "suggestedEmail": "",
-            })
             return proposal
 
     return proposal
@@ -858,6 +869,7 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
 
 - "property_unavailable": Emit when the CURRENT TARGET PROPERTY is explicitly stated as unavailable/leased/off-market/no longer available OR when the broker clearly says the property is non-viable for the client's requirements.
   • Treat requirements-fit failures as non-viable when the broker says the space/property is not a good fit because it is office-heavy, not a true warehouse, lacks drive-in/grade-level access, lacks required industrial use, or otherwise fails the requested physical requirements.
+  • DO NOT emit property_unavailable when the broker says only tours/showings are unavailable. "The space is no longer available for tours" means tour scheduling cannot continue, not that the property/listing is unavailable.
   • Do NOT use this for vague relationship refusals like "we are not a fit to work together" unless the property itself is being ruled out.
 
 - "new_property": Emit when the LAST HUMAN message suggests or mentions a DIFFERENT property than the TARGET PROPERTY.
@@ -900,6 +912,7 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • The user needs to decide whether to schedule the tour, so DO NOT auto-respond
   • Instead, GENERATE a suggested response email in the "suggestedEmail" field that the user can approve/edit
   • Example suggestedEmail: "Hi [NAME], Thank you for the offer! I'd like to schedule a tour. Are you available [suggest a few time options]? Looking forward to seeing the space."
+  • If this is a reply to a tour invite and the broker says tours/showings are no longer available, still emit tour_requested with reason "tour_unavailable"; do not emit property_unavailable.
   • Include "question" field with the specific tour offer/request
   • Set response_email to null (user will send the approved email)
 

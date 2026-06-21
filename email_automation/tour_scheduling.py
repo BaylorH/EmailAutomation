@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
@@ -36,6 +37,58 @@ def format_tour_time(minutes) -> str:
     suffix = "AM" if hour_24 < 12 else "PM"
     hour_12 = hour_24 % 12 or 12
     return f"{hour_12}:{minute:02d} {suffix}"
+
+
+def format_tour_date_label(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+            return f"{parsed:%A}, {parsed:%B} {parsed.day}, {parsed.year}"
+        except ValueError:
+            continue
+    return text
+
+
+def looks_like_tour_only_unavailable(text: str = "") -> bool:
+    latest = str(text or "").strip().lower()
+    if not latest:
+        return False
+
+    if re.search(
+        r"\b(?:fully\s+leased|has\s+been\s+leased|already\s+leased|signed\s+(?:an?\s+)?loi|"
+        r"signed\s+(?:a\s+)?lease|off[-\s]?market|under\s+contract|no\s+space\s+available)\b",
+        latest,
+    ):
+        return False
+
+    tour_context = r"(?:tours?|showings?|walk[-\s]?throughs?|walkthroughs?)"
+    return bool(
+        re.search(
+            rf"\b(?:no\s+longer|not|unavailable|cannot|can't|not\s+able|unable)\b"
+            rf".{{0,80}}\b(?:for\s+)?{tour_context}\b",
+            latest,
+        )
+        or re.search(
+            rf"\b{tour_context}\b.{{0,60}}\b(?:no\s+longer\s+available|not\s+available|"
+            r"unavailable|cancelled|canceled|not\s+being\s+offered)\b",
+            latest,
+        )
+    )
+
+
+def tour_date_from_thread_data(thread_data: Dict[str, Any]) -> str:
+    data = thread_data or {}
+    invite = _tour_invite(data)
+    for source in (invite, data):
+        for key in ("tourDate", "tourDay", "scheduledDate", "date"):
+            value = source.get(key)
+            if value:
+                return str(value).strip()
+    return ""
 
 
 def _thread_id(stop: Dict[str, Any]) -> str:
@@ -82,6 +135,7 @@ def _scheduled_stop(stop: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "departure": departure,
         "arrivalTime": format_tour_time(arrival),
         "departureTime": format_tour_time(departure),
+        "tourDate": tour_date_from_thread_data(stop),
         "bufferMinutes": buffer_minutes,
         "scheduleComplete": stop.get("scheduleComplete", True),
     }
@@ -141,6 +195,7 @@ def evaluate_alternate_tour_time(
         "requestedTime": str(alternate_time or "").strip(),
         "arrivalTime": arrival_time,
         "departureTime": None,
+        "tourDate": None,
         "previousSlot": None,
         "conflicts": [],
         "suggestedOpenSlots": [],
@@ -162,6 +217,7 @@ def evaluate_alternate_tour_time(
         return decision
 
     duration = current_stop["departure"] - current_stop["arrival"]
+    decision["tourDate"] = current_stop.get("tourDate") or None
     if duration <= 0:
         duration = DEFAULT_TOUR_DURATION_MINUTES
 
@@ -215,6 +271,38 @@ def _decision_address(thread_data: Dict[str, Any]) -> str:
     return _stop_address(thread_data or {})
 
 
+def _decision_tour_date_label(thread_data: Dict[str, Any], decision: Dict[str, Any]) -> str:
+    return format_tour_date_label(
+        (decision or {}).get("tourDate") or tour_date_from_thread_data(thread_data or {})
+    )
+
+
+def _date_time_phrase(thread_data: Dict[str, Any], decision: Dict[str, Any], arrival: str) -> str:
+    date_label = _decision_tour_date_label(thread_data, decision)
+    arrival_text = str(arrival or "").strip()
+    if date_label and arrival_text and date_label.lower() not in arrival_text.lower():
+        return f"{date_label} at {arrival_text}"
+    return arrival_text or date_label or "that time"
+
+
+def build_tour_unavailable_reply(
+    contact_name: str,
+    recipient_email: str,
+    thread_data: Dict[str, Any],
+    tour_date: str = "",
+) -> str:
+    greeting = _safe_greeting_name(contact_name, recipient_email)
+    address = _decision_address(thread_data)
+    date_label = format_tour_date_label(tour_date or tour_date_from_thread_data(thread_data or {}))
+    date_phrase = f" on {date_label}" if date_label else ""
+
+    return (
+        f"Hi {greeting},\n\n"
+        f"Thanks for letting me know. Understood that tours are unavailable for {address}{date_phrase}.\n\n"
+        "I'll keep the property information in the package and follow up if we need anything else."
+    )
+
+
 def build_schedule_aware_tour_reply(
     contact_name: str,
     recipient_email: str,
@@ -224,12 +312,13 @@ def build_schedule_aware_tour_reply(
     greeting = _safe_greeting_name(contact_name, recipient_email)
     address = _decision_address(thread_data)
     arrival = str((decision or {}).get("arrivalTime") or "").strip() or "that time"
+    arrival_phrase = _date_time_phrase(thread_data, decision, arrival)
     feasibility = str((decision or {}).get("feasibility") or "").strip().lower()
 
     if feasibility == "fits":
         return (
             f"Hi {greeting},\n\n"
-            f"{arrival} works on our end for {address}.\n\n"
+            f"{arrival_phrase} works on our end for {address}.\n\n"
             "Please consider that confirmed."
         )
 
@@ -243,13 +332,13 @@ def build_schedule_aware_tour_reply(
             offer = "Could you send a couple of later windows that might work?"
         return (
             f"Hi {greeting},\n\n"
-            f"Thanks for offering {arrival} for {address}. Another tour is already scheduled "
+            f"Thanks for offering {arrival_phrase} for {address}. Another tour is already scheduled "
             f"around that window.\n\n"
             f"{offer}"
         )
 
     return (
         f"Hi {greeting},\n\n"
-        f"I need to review the tour schedule before confirming {arrival} for {address}.\n\n"
+        f"I need to review the tour schedule before confirming {arrival_phrase} for {address}.\n\n"
         "I'll follow up once I can confirm a workable time."
     )

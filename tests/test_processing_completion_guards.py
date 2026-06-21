@@ -228,6 +228,7 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             "feasibility": "fits",
             "arrivalTime": "2:15 PM",
             "departureTime": "2:45 PM",
+            "tourDate": "2026-06-23",
             "conflicts": [],
             "suggestedOpenSlots": [],
         }
@@ -239,7 +240,11 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
                 "source": "dashboard_tour_planner",
                 "actionType": "tour_invite",
                 "propertyAddress": "4402 Rex Rd",
-                "tourInvite": {"arrivalTime": "10:47 AM", "departureTime": "11:17 AM"},
+                "tourInvite": {
+                    "tourDate": "2026-06-23",
+                    "arrivalTime": "10:47 AM",
+                    "departureTime": "11:17 AM",
+                },
             },
             contact_name="Lawton",
             recipient_email="lawton@example.com",
@@ -247,7 +252,7 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         )
 
         self.assertEqual("alternate_requested", classification["outcome"])
-        self.assertIn("2:15 PM works on our end for 4402 Rex Rd.", classification["suggestedEmail"])
+        self.assertIn("Tuesday, June 23, 2026 at 2:15 PM works on our end for 4402 Rex Rd.", classification["suggestedEmail"])
         self.assertIn("Please consider that confirmed.", classification["suggestedEmail"])
         self.assertNotIn("checking the route", classification["suggestedEmail"].lower())
         self.assertNotRegex(
@@ -284,6 +289,45 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
         self.assertIn("2:15 PM works on our end for 4402 Rex Rd.", classification["suggestedEmail"])
         self.assertNotIn("Tour slot:", classification["suggestedEmail"])
+
+    def test_tour_invite_unavailable_for_tours_stays_tour_specific(self):
+        classification = processing._classify_tour_invite_reply(
+            "The space is no longer available for tours.",
+            event={"type": "tour_requested", "question": "Tours are no longer available."},
+            thread_data={
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "propertyAddress": "4402 Rex Rd",
+                "tourInvite": {
+                    "tourDate": "2026-06-23",
+                    "arrivalTime": "10:47 AM",
+                    "departureTime": "11:17 AM",
+                },
+            },
+            contact_name="Lawton",
+            recipient_email="lawton@example.com",
+        )
+
+        self.assertEqual("tour_unavailable", classification["outcome"])
+        self.assertTrue(classification["needsOperatorAction"])
+        self.assertFalse(classification["canCloseThread"])
+        self.assertEqual("2026-06-23", classification["tourDate"])
+        self.assertIn("Tours are unavailable", classification["details"])
+        self.assertIn("Tuesday, June 23, 2026", classification["suggestedEmail"])
+        self.assertIn("4402 Rex Rd", classification["suggestedEmail"])
+
+    def test_tour_invite_unavailable_reply_builds_durable_thread_state(self):
+        payload = processing._build_tour_invite_reply_state_update({
+            "outcome": "tour_unavailable",
+            "alternateTimes": [],
+            "details": "Tours are unavailable for this property.",
+            "tourDate": "2026-06-23",
+        })
+
+        self.assertEqual("tour_unavailable", payload["tourStatus"])
+        self.assertEqual("tour_unavailable", payload["tourInvite.status"])
+        self.assertEqual("2026-06-23", payload["tourInvite.tourDate"])
+        self.assertEqual(processing.SERVER_TIMESTAMP, payload["tourInvite.tourUnavailableAt"])
 
     def test_tour_invite_decline_reply_builds_durable_thread_state(self):
         payload = processing._build_tour_invite_reply_state_update({

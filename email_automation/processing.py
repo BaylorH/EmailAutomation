@@ -30,9 +30,13 @@ from .notification_payloads import (
     should_skip_original_reply_for_new_property_referral,
 )
 from .tour_scheduling import (
+    build_tour_unavailable_reply,
     build_schedule_aware_tour_reply,
     evaluate_alternate_tour_time,
+    format_tour_date_label,
+    looks_like_tour_only_unavailable,
     parse_tour_time_minutes,
+    tour_date_from_thread_data,
 )
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
@@ -511,6 +515,9 @@ def _property_unavailable_event_applies_to_row(
     if (event or {}).get("type") != "property_unavailable":
         return True
 
+    if looks_like_tour_only_unavailable(message_text):
+        return False
+
     row_norm = _normalize_replacement_match_text(row_anchor)
     message_norm = _normalize_replacement_match_text(message_text)
     keywords = [
@@ -805,11 +812,16 @@ def _build_tour_reply_hold_suggested_email(
     contact_name: str = "",
     recipient_email: str = "",
     alternate_times: Optional[List[str]] = None,
+    tour_date: str = "",
 ) -> str:
     greeting_name = _safe_tour_greeting_name(contact_name, recipient_email)
     alternate_text = ""
     if alternate_times:
-        alternate_text = f" I saw the alternate time you suggested ({', '.join(alternate_times)})."
+        date_label = format_tour_date_label(tour_date)
+        alternate_label = ", ".join(alternate_times)
+        if date_label and date_label.lower() not in alternate_label.lower():
+            alternate_label = f"{date_label} at {alternate_label}"
+        alternate_text = f" I saw the alternate time you suggested ({alternate_label})."
 
     return f"""Hi {greeting_name},
 
@@ -904,6 +916,7 @@ def _classify_tour_invite_reply(
     clean_text = _clean_tour_signal_text(raw_text)
     text = clean_text.lower()
     tour_invite_context = _is_tour_invite_thread(thread_data) or event.get("reason") == "tour_slot_reply"
+    tour_date = tour_date_from_thread_data(thread_data)
 
     if not tour_invite_context and not _looks_like_explicit_tour_offer_or_request(clean_text):
         return {
@@ -925,6 +938,7 @@ def _classify_tour_invite_reply(
         r"no\s+tour|not\s+touring|cancel(?:led)?\s+the\s+tour)\b",
         text,
     ))
+    tour_unavailable_signal = looks_like_tour_only_unavailable(clean_text)
     confirmation_signal = bool(re.search(
         r"\b(?:that\s+(?:time|slot)\s+works?|works\s+for\s+us|confirmed|confirming|"
         r"see\s+you\s+(?:then|there)|we\s+are\s+confirmed|we're\s+confirmed|sounds\s+good)\b",
@@ -932,19 +946,37 @@ def _classify_tour_invite_reply(
     ))
     alternate_times = _extract_tour_reply_time_mentions(clean_text)
 
+    if tour_invite_context and tour_unavailable_signal and not alternate_times:
+        suggested_email = build_tour_unavailable_reply(
+            contact_name,
+            recipient_email,
+            thread_data,
+            tour_date,
+        )
+        return {
+            "outcome": "tour_unavailable",
+            "needsOperatorAction": True,
+            "canCloseThread": False,
+            "alternateTimes": [],
+            "tourDate": tour_date,
+            "details": "Tours are unavailable for this property, but the property should remain in the campaign results.",
+            "suggestedEmail": suggested_email,
+        }
+
     if tour_invite_context and declined_signal and not alternate_times:
         return {
             "outcome": "declined",
             "needsOperatorAction": True,
             "canCloseThread": False,
             "alternateTimes": [],
+            "tourDate": tour_date,
             "details": "Broker declined or cancelled the requested tour slot.",
-            "suggestedEmail": _build_tour_reply_hold_suggested_email(contact_name, recipient_email),
+            "suggestedEmail": _build_tour_reply_hold_suggested_email(contact_name, recipient_email, tour_date=tour_date),
         }
 
     if tour_invite_context and (negative_time_signal or "instead" in text) and alternate_times:
         alternate_times = _filter_requested_tour_times(alternate_times, thread_data)
-        suggested_email = _build_tour_reply_hold_suggested_email(contact_name, recipient_email, alternate_times)
+        suggested_email = _build_tour_reply_hold_suggested_email(contact_name, recipient_email, alternate_times, tour_date=tour_date)
         if schedule_decision:
             suggested_email = build_schedule_aware_tour_reply(
                 contact_name,
@@ -958,6 +990,7 @@ def _classify_tour_invite_reply(
             "canCloseThread": False,
             "alternateTimes": alternate_times,
             "details": f"Broker said the requested tour slot does not work and offered {', '.join(alternate_times)}.",
+            "tourDate": tour_date,
             "scheduleDecision": schedule_decision,
             "suggestedEmail": suggested_email,
         }
@@ -968,6 +1001,7 @@ def _classify_tour_invite_reply(
             "needsOperatorAction": False,
             "canCloseThread": True,
             "alternateTimes": alternate_times,
+            "tourDate": tour_date,
             "details": "Broker confirmed the requested tour slot.",
             "suggestedEmail": "",
         }
@@ -977,6 +1011,7 @@ def _classify_tour_invite_reply(
         "needsOperatorAction": True,
         "canCloseThread": False,
         "alternateTimes": alternate_times,
+        "tourDate": tour_date,
         "details": "Broker tour/showing message needs operator review.",
         "suggestedEmail": "",
     }
@@ -989,6 +1024,7 @@ def _build_tour_invite_reply_state_update(
     classification = classification or {}
     outcome = str(classification.get("outcome") or "").strip().lower()
     alternate_times = list(classification.get("alternateTimes") or [])
+    tour_date = str(classification.get("tourDate") or "").strip()
 
     payload = {
         "tourInvite.lastReplyOutcome": outcome or None,
@@ -1021,6 +1057,16 @@ def _build_tour_invite_reply_state_update(
             "tourInvite.alternateTimes": alternate_times,
             "tourInvite.declinedAt": SERVER_TIMESTAMP,
         })
+    elif outcome == "tour_unavailable":
+        payload.update({
+            "tourStatus": "tour_unavailable",
+            "tourInvite.status": "tour_unavailable",
+            "tourInvite.alternateTimes": alternate_times,
+            "tourInvite.tourUnavailableAt": SERVER_TIMESTAMP,
+        })
+
+    if tour_date:
+        payload["tourInvite.tourDate"] = tour_date
 
     return {key: value for key, value in payload.items() if value is not None}
 
@@ -2391,7 +2437,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         reason = "tour_requested"
                         details = "Tour/showing offered - review and approve response"
 
-                        if tour_reply_classification.get("outcome") in {"alternate_requested", "declined"}:
+                        if tour_reply_classification.get("outcome") in {"alternate_requested", "declined", "tour_unavailable"}:
                             if (
                                 tour_reply_classification.get("outcome") == "alternate_requested"
                                 and tour_reply_classification.get("alternateTimes")
@@ -2418,11 +2464,12 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                                     ),
                                 }
 
-                            reason = (
-                                "tour_reschedule_requested"
-                                if tour_reply_classification.get("outcome") == "alternate_requested"
-                                else "tour_slot_declined"
-                            )
+                            if tour_reply_classification.get("outcome") == "alternate_requested":
+                                reason = "tour_reschedule_requested"
+                            elif tour_reply_classification.get("outcome") == "tour_unavailable":
+                                reason = "tour_unavailable"
+                            else:
+                                reason = "tour_slot_declined"
                             details = tour_reply_classification.get("details") or details
                             question = details
                             suggested_email = tour_reply_classification.get("suggestedEmail") or suggested_email
@@ -2467,7 +2514,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             meta=meta,
                             dedupe_key=(
                                 f"tour_reply:{thread_id}:{msg_id}"
-                                if reason in {"tour_reschedule_requested", "tour_slot_declined"}
+                                if reason in {"tour_reschedule_requested", "tour_slot_declined", "tour_unavailable"}
                                 else f"tour_requested:{thread_id}"
                             )
                         )

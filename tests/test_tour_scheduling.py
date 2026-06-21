@@ -1,6 +1,7 @@
 import unittest
 
 from email_automation.tour_scheduling import (
+    build_schedule_aware_tour_reply,
     evaluate_alternate_tour_time,
     format_tour_time,
     parse_tour_time_minutes,
@@ -141,6 +142,43 @@ class TourSchedulingTests(unittest.TestCase):
 
         self.assertEqual("conflict", decision["feasibility"])
         self.assertEqual(["1000 Busy St"], [item["address"] for item in decision["conflicts"]])
+
+    def test_evaluate_alternate_tour_time_carries_tour_date(self):
+        decision = evaluate_alternate_tour_time(
+            [
+                {
+                    "id": "current-thread",
+                    "propertyAddress": "4402 Rex Rd",
+                    "tourInvite": {
+                        "tourDate": "2026-06-23",
+                        "arrivalTime": "9:00 AM",
+                        "departureTime": "9:30 AM",
+                    },
+                },
+            ],
+            "current-thread",
+            "10:15 AM",
+        )
+
+        self.assertEqual("fits", decision["feasibility"])
+        self.assertEqual("2026-06-23", decision["tourDate"])
+
+    def test_schedule_aware_reply_includes_tour_date(self):
+        body = build_schedule_aware_tour_reply(
+            "Lawton",
+            "lawton@example.com",
+            {
+                "propertyAddress": "4402 Rex Rd",
+                "tourInvite": {"tourDate": "2026-06-23"},
+            },
+            {
+                "feasibility": "fits",
+                "arrivalTime": "2:15 PM",
+                "departureTime": "2:45 PM",
+            },
+        )
+
+        self.assertIn("Tuesday, June 23, 2026 at 2:15 PM works on our end for 4402 Rex Rd.", body)
 
 
 if __name__ == "__main__":
