@@ -29,6 +29,11 @@ from .notification_payloads import (
     build_wrong_contact_suggested_email,
     should_skip_original_reply_for_new_property_referral,
 )
+from .tour_scheduling import (
+    build_schedule_aware_tour_reply,
+    evaluate_alternate_tour_time,
+    parse_tour_time_minutes,
+)
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
                    format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff)
@@ -771,23 +776,7 @@ def _extract_tour_reply_time_mentions(text: str) -> List[str]:
 
 
 def _tour_time_minutes(value: str = "") -> Optional[int]:
-    text = re.sub(r"[\s.]+", "", str(value or "").strip().lower())
-    if text == "noon":
-        return 12 * 60
-    match = re.fullmatch(r"0?(\d{1,2})(?::?(\d{2}))?(am|pm)", text)
-    if not match:
-        return None
-    hour = int(match.group(1))
-    minute = int(match.group(2) or "0")
-    if minute > 59:
-        return None
-    if match.group(3) == "pm" and hour != 12:
-        hour += 12
-    if match.group(3) == "am" and hour == 12:
-        hour = 0
-    if hour > 23:
-        return None
-    return hour * 60 + minute
+    return parse_tour_time_minutes(value)
 
 
 def _filter_requested_tour_times(
@@ -827,6 +816,36 @@ def _build_tour_reply_hold_suggested_email(
 Thanks for letting me know.{alternate_text}
 
 I'm checking the route and schedule on my end and will circle back once I can confirm a workable time."""
+
+
+def _load_sibling_tour_schedule(
+    user_id: str,
+    client_id: str,
+    current_thread_id: str,
+    current_thread_data: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    current_thread_data = dict(current_thread_data or {})
+    schedule = []
+    schedule_complete = True
+    try:
+        threads_ref = _fs.collection("users").document(user_id).collection("threads")
+        campaign_id = current_thread_data.get("campaignId") or current_thread_data.get("campaign_id")
+        query = threads_ref.where(filter=FieldFilter("clientId", "==", client_id))
+        for doc in query.stream():
+            data = doc.to_dict() or {}
+            if campaign_id and campaign_id not in {data.get("campaignId"), data.get("campaign_id")}:
+                continue
+            if isinstance(data.get("tourInvite"), dict):
+                schedule.append({**data, "id": getattr(doc, "id", None)})
+    except Exception as e:
+        schedule_complete = False
+        print(f"⚠️ Could not load sibling tour schedule for schedule-aware reply: {e}")
+
+    if current_thread_id and not any(str(item.get("id") or "") == str(current_thread_id) for item in schedule):
+        schedule.append({**current_thread_data, "id": current_thread_id})
+    if not schedule_complete:
+        schedule = [{**item, "scheduleComplete": False} for item in schedule]
+    return schedule
 
 
 def _clean_tour_signal_text(*parts: str) -> str:
@@ -873,6 +892,7 @@ def _classify_tour_invite_reply(
     thread_data: Optional[Dict[str, Any]] = None,
     contact_name: str = "",
     recipient_email: str = "",
+    schedule_decision: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     event = event or {}
     thread_data = thread_data or {}
@@ -924,13 +944,22 @@ def _classify_tour_invite_reply(
 
     if tour_invite_context and (negative_time_signal or "instead" in text) and alternate_times:
         alternate_times = _filter_requested_tour_times(alternate_times, thread_data)
+        suggested_email = _build_tour_reply_hold_suggested_email(contact_name, recipient_email, alternate_times)
+        if schedule_decision:
+            suggested_email = build_schedule_aware_tour_reply(
+                contact_name,
+                recipient_email,
+                thread_data,
+                schedule_decision,
+            )
         return {
             "outcome": "alternate_requested",
             "needsOperatorAction": True,
             "canCloseThread": False,
             "alternateTimes": alternate_times,
             "details": f"Broker said the requested tour slot does not work and offered {', '.join(alternate_times)}.",
-            "suggestedEmail": _build_tour_reply_hold_suggested_email(contact_name, recipient_email, alternate_times),
+            "scheduleDecision": schedule_decision,
+            "suggestedEmail": suggested_email,
         }
 
     if tour_invite_context and confirmation_signal and not negative_time_signal and not declined_signal:
@@ -976,12 +1005,15 @@ def _build_tour_invite_reply_state_update(
             "tourInvite.alternateTimes": [],
         })
     elif outcome == "alternate_requested":
+        schedule_decision = classification.get("scheduleDecision")
         payload.update({
             "tourStatus": "alternate_requested",
             "tourInvite.status": "alternate_requested",
             "tourInvite.alternateTimes": alternate_times,
             "tourInvite.rescheduleRequestedAt": SERVER_TIMESTAMP,
         })
+        if schedule_decision:
+            payload["tourInvite.requestedAlternate"] = schedule_decision
     elif outcome == "declined":
         payload.update({
             "tourStatus": "declined",
@@ -2360,6 +2392,32 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         details = "Tour/showing offered - review and approve response"
 
                         if tour_reply_classification.get("outcome") in {"alternate_requested", "declined"}:
+                            if (
+                                tour_reply_classification.get("outcome") == "alternate_requested"
+                                and tour_reply_classification.get("alternateTimes")
+                            ):
+                                tour_schedule = _load_sibling_tour_schedule(
+                                    user_id,
+                                    client_id,
+                                    thread_id,
+                                    thread_data,
+                                )
+                                schedule_decision = evaluate_alternate_tour_time(
+                                    tour_schedule,
+                                    thread_id,
+                                    tour_reply_classification["alternateTimes"][0],
+                                )
+                                tour_reply_classification = {
+                                    **tour_reply_classification,
+                                    "scheduleDecision": schedule_decision,
+                                    "suggestedEmail": build_schedule_aware_tour_reply(
+                                        contact_name,
+                                        to_addr_lower,
+                                        thread_data,
+                                        schedule_decision,
+                                    ),
+                                }
+
                             reason = (
                                 "tour_reschedule_requested"
                                 if tour_reply_classification.get("outcome") == "alternate_requested"

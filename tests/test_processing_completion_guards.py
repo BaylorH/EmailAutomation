@@ -205,6 +205,86 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertEqual("Broker offered an alternate time.", payload["tourInvite.lastReplyDetails"])
         self.assertEqual(processing.SERVER_TIMESTAMP, payload["tourInvite.rescheduleRequestedAt"])
 
+    def test_tour_invite_alternate_reply_stores_schedule_decision(self):
+        decision = {
+            "feasibility": "fits",
+            "arrivalTime": "2:15 PM",
+            "departureTime": "2:45 PM",
+            "conflicts": [],
+            "suggestedOpenSlots": [],
+        }
+
+        payload = processing._build_tour_invite_reply_state_update({
+            "outcome": "alternate_requested",
+            "alternateTimes": ["2:15 PM"],
+            "scheduleDecision": decision,
+            "details": "Broker offered an alternate time.",
+        })
+
+        self.assertEqual(decision, payload["tourInvite.requestedAlternate"])
+
+    def test_tour_invite_alternate_reply_uses_schedule_aware_copy_when_decision_exists(self):
+        decision = {
+            "feasibility": "fits",
+            "arrivalTime": "2:15 PM",
+            "departureTime": "2:45 PM",
+            "conflicts": [],
+            "suggestedOpenSlots": [],
+        }
+
+        classification = processing._classify_tour_invite_reply(
+            "The 10:47 AM requested time does not work. I can do 2:15 PM instead.",
+            event={"type": "tour_requested", "question": "Broker offered 2:15 PM instead."},
+            thread_data={
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "propertyAddress": "4402 Rex Rd",
+                "tourInvite": {"arrivalTime": "10:47 AM", "departureTime": "11:17 AM"},
+            },
+            contact_name="Lawton",
+            recipient_email="lawton@example.com",
+            schedule_decision=decision,
+        )
+
+        self.assertEqual("alternate_requested", classification["outcome"])
+        self.assertIn("2:15 PM works on our end for 4402 Rex Rd.", classification["suggestedEmail"])
+        self.assertIn("Please consider that confirmed.", classification["suggestedEmail"])
+        self.assertNotIn("checking the route", classification["suggestedEmail"].lower())
+        self.assertNotRegex(
+            classification["suggestedEmail"],
+            r"(?im)^\s*(thanks|best|best regards|regards)[,!]?\s*$",
+        )
+
+    def test_tour_invite_alternate_reply_uses_nested_tour_invite_address(self):
+        decision = {
+            "feasibility": "fits",
+            "arrivalTime": "2:15 PM",
+            "departureTime": "2:45 PM",
+            "conflicts": [],
+            "suggestedOpenSlots": [],
+        }
+
+        classification = processing._classify_tour_invite_reply(
+            "The 10:47 AM requested time does not work. I can do 2:15 PM instead.",
+            event={"type": "tour_requested", "question": "Broker offered 2:15 PM instead."},
+            thread_data={
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "subject": "Tour slot: 4402 Rex Rd at 10:47 AM",
+                "tourInvite": {
+                    "address": "4402 Rex Rd",
+                    "arrivalTime": "10:47 AM",
+                    "departureTime": "11:17 AM",
+                },
+            },
+            contact_name="Lawton",
+            recipient_email="lawton@example.com",
+            schedule_decision=decision,
+        )
+
+        self.assertIn("2:15 PM works on our end for 4402 Rex Rd.", classification["suggestedEmail"])
+        self.assertNotIn("Tour slot:", classification["suggestedEmail"])
+
     def test_tour_invite_decline_reply_builds_durable_thread_state(self):
         payload = processing._build_tour_invite_reply_state_update({
             "outcome": "declined",
