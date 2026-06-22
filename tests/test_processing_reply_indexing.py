@@ -60,6 +60,55 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
         self.assertEqual("<closing@example.com>", sent["internetMessageId"])
         self.assertIn("sentDateTime ge 2026-06-09T19:09:00Z", requests_get.call_args.kwargs["params"]["$filter"])
 
+    def test_sent_but_unindexed_auto_response_is_not_queued_for_retry(self):
+        processing.send_reply_in_thread.last_error = "Failed to index reply after 3 attempts"
+        processing.send_reply_in_thread.sent_but_unindexed = True
+
+        with patch.object(processing, "queue_pending_response") as queue_retry, \
+                patch.object(processing, "record_sent_unindexed_response") as record_reconciliation:
+            outcome = processing._queue_response_retry_or_reconciliation(
+                "uid-1",
+                "thread-1",
+                "msg-1",
+                "bp21harrison@gmail.com",
+                "Hi,\n\nThanks.",
+                "client-1",
+                source_context="autoResponse",
+            )
+
+        self.assertEqual("sent_unindexed", outcome)
+        queue_retry.assert_not_called()
+        record_reconciliation.assert_called_once_with(
+            "uid-1",
+            "thread-1",
+            "msg-1",
+            "bp21harrison@gmail.com",
+            "Hi,\n\nThanks.",
+            "client-1",
+            "Failed to index reply after 3 attempts",
+            source_context="autoResponse",
+        )
+
+    def test_sent_but_unindexed_outcome_counts_as_response_attempted(self):
+        processing.send_reply_in_thread.last_error = "Failed to index reply after 3 attempts"
+        processing.send_reply_in_thread.sent_but_unindexed = True
+
+        with patch.object(processing, "queue_pending_response") as queue_retry, \
+                patch.object(processing, "record_sent_unindexed_response") as record_reconciliation:
+            attempted = processing._handle_auto_response_send_failure(
+                "uid-1",
+                "thread-1",
+                "msg-1",
+                "bp21harrison@gmail.com",
+                "Hi,\n\nThanks.",
+                "client-1",
+                failure_label="thank you email",
+            )
+
+        self.assertTrue(attempted)
+        queue_retry.assert_not_called()
+        record_reconciliation.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -135,6 +135,41 @@ class PendingResponsesTests(unittest.TestCase):
         self.assertEqual(retry_payload["attempts"], 2)
         self.assertEqual(retry_payload["lastError"], "HTTP 429 rate limited after 3 attempts")
 
+    def test_sent_but_unindexed_retry_moves_to_reconciliation_without_resending(self):
+        active_doc = FakeDoc("thread-active", {
+            "threadId": "thread-active",
+            "msgId": "message-2",
+            "recipient": "bp21harrison@gmail.com",
+            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "clientId": "client-1",
+            "attempts": 1,
+            "lastError": "Temporary failure",
+        })
+        fake_fs = FakeFirestore([active_doc])
+
+        def fake_send_reply_in_thread(**_kwargs):
+            return False
+
+        fake_send_reply_in_thread.last_error = "Graph accepted reply but Sent Items lookup failed"
+        fake_send_reply_in_thread.sent_but_unindexed = True
+
+        with patch.dict(sys.modules, {
+            "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
+            "email_automation.processing": types.SimpleNamespace(
+                send_reply_in_thread=fake_send_reply_in_thread,
+            ),
+        }):
+            sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
+
+        self.assertEqual(sent, 0)
+        self.assertEqual([], active_doc.reference.update_calls)
+        self.assertTrue(active_doc.reference.deleted)
+        dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
+        self.assertEqual(dead_letter["source"], "pendingResponses")
+        self.assertEqual(dead_letter["status"], "needs_reconciliation")
+        self.assertTrue(dead_letter["alreadySent"])
+        self.assertEqual(dead_letter["failureReason"], "Graph accepted reply but Sent Items lookup failed")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,7 +47,7 @@ from .email_operations import (
     send_thankyou_closing_with_new_property,
     send_thankyou_ask_alternatives
 )
-from .pending_responses import queue_pending_response
+from .pending_responses import queue_pending_response, record_sent_unindexed_response
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE, INBOX_SCAN_WINDOW_HOURS
 from .column_config import find_client_comment_column_index, find_notes_comment_column_index
 
@@ -60,6 +60,73 @@ class RetryableProcessingError(Exception):
 
 def _should_mark_processed_after_error(error: Optional[Exception]) -> bool:
     return not isinstance(error, RetryableProcessingError)
+
+
+def _queue_response_retry_or_reconciliation(
+    user_id: str,
+    thread_id: str,
+    msg_id: str,
+    recipient: str,
+    response_body: str,
+    client_id: Optional[str] = None,
+    *,
+    source_context: str = "autoResponse",
+) -> str:
+    """Queue a retry only when Graph did not already accept the reply."""
+    failure_reason = (
+        getattr(send_reply_in_thread, "last_error", None)
+        or "send_reply_in_thread returned False"
+    )
+    sent_but_unindexed = (
+        getattr(send_reply_in_thread, "sent_but_unindexed", False)
+        or getattr(send_reply_in_thread, "last_outcome", None) == "sent_but_unindexed"
+    )
+    if sent_but_unindexed:
+        record_sent_unindexed_response(
+            user_id,
+            thread_id,
+            msg_id,
+            recipient,
+            response_body,
+            client_id,
+            failure_reason,
+            source_context=source_context,
+        )
+        print("⚠️ Reply may have sent but was not indexed; recorded reconciliation item instead of retrying send")
+        return "sent_unindexed"
+
+    queue_pending_response(
+        user_id,
+        thread_id,
+        msg_id,
+        recipient,
+        response_body,
+        client_id,
+        error=failure_reason,
+    )
+    return "queued_retry"
+
+
+def _handle_auto_response_send_failure(
+    user_id: str,
+    thread_id: str,
+    msg_id: str,
+    recipient: str,
+    response_body: str,
+    client_id: Optional[str] = None,
+    *,
+    failure_label: str = "automatic response",
+) -> bool:
+    print(f"❌ Failed to send {failure_label}")
+    outcome = _queue_response_retry_or_reconciliation(
+        user_id,
+        thread_id,
+        msg_id,
+        recipient,
+        response_body,
+        client_id,
+    )
+    return outcome == "sent_unindexed"
 
 
 def _parse_graph_datetime(value: str) -> Optional[datetime]:
@@ -1452,9 +1519,19 @@ def _align_response_greeting(response_body: Optional[str], contact_name: Optiona
     return greeting_re.sub(lambda match: f"{match.group(1)}{expected}", response_body, count=1)
 
 
+def _mark_reply_sent_but_unindexed(reason: str) -> bool:
+    send_reply_in_thread.last_error = reason
+    send_reply_in_thread.sent_but_unindexed = True
+    send_reply_in_thread.last_outcome = "sent_but_unindexed"
+    print(f"   ⚠️ SENT-BUT-UNINDEXED: {reason}")
+    return False
+
+
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     send_reply_in_thread.last_error = None
+    send_reply_in_thread.sent_but_unindexed = False
+    send_reply_in_thread.last_outcome = None
     try:
         from .utils import (
             GRAPH_SEND_MAX_RETRIES,
@@ -1631,6 +1708,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
 
             if not reply_sent_successfully:
                 send_reply_in_thread.last_error = "All reply methods failed"
+                send_reply_in_thread.last_outcome = "send_failed"
                 print(f"   ❌ All reply methods failed")
                 return False
 
@@ -1683,11 +1761,8 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
 
                         if not msg_indexed:
                             error_msg = f"Failed to index reply after {MAX_RETRIES} attempts"
-                            send_reply_in_thread.last_error = error_msg
                             print(f"   ⚠️ CRITICAL: {error_msg} - future replies may be orphaned")
-                            # SAFETY: Return failure because email was sent but not indexed
-                            # Caller should be aware that conversation tracking is broken
-                            return False
+                            return _mark_reply_sent_but_unindexed(error_msg)
 
                         # Also save the message record
                         to_recipients = [r.get("emailAddress", {}).get("address", "") for r in sent_msg.get("toRecipients", [])]
@@ -1723,18 +1798,21 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
 
                         print(f"   📝 Indexed sent reply message: {sent_internet_msg_id[:50]}...")
                     else:
-                        print(f"   ⚠️ Sent message has no internetMessageId, cannot index")
+                        return _mark_reply_sent_but_unindexed("Sent message has no internetMessageId, cannot index")
                 else:
-                    print(f"   ⚠️ Could not find new sent message in SentItems to index")
+                    return _mark_reply_sent_but_unindexed("Could not find new sent message in SentItems to index")
             else:
-                print(f"   ⚠️ Could not get conversationId to index sent message")
+                return _mark_reply_sent_but_unindexed("Could not get conversationId to index sent message")
         except Exception as e:
-            print(f"   ⚠️ Failed to index sent reply (non-fatal): {e}")
+            return _mark_reply_sent_but_unindexed(f"Failed to index sent reply: {e}")
 
+        send_reply_in_thread.last_outcome = "sent_indexed"
         return True
 
     except Exception as e:
         send_reply_in_thread.last_error = str(e)
+        send_reply_in_thread.sent_but_unindexed = False
+        send_reply_in_thread.last_outcome = "send_failed"
         print(f"   ❌ Failed to send reply: {e}")
         return False
 
@@ -3422,8 +3500,10 @@ I'll review the new property details and get back to you if I have any questions
                         print(f"📧 Sent thank you + closing (new property suggested) to: {to_addr_lower}")
                         response_sent = True
                     else:
-                        print(f"❌ Failed to send thank you email")
-                        queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
+                        response_sent = _handle_auto_response_send_failure(
+                            user_id, thread_id, msg_id, to_addr_lower, response_body, client_id,
+                            failure_label="thank you email"
+                        )
                 
                 # Scenario 2: Property became non-viable but NO new property suggested
                 elif old_row_became_nonviable and not has_new_property_path:
@@ -3445,8 +3525,10 @@ Do you have any other properties that might be a good fit for our requirements?"
                         print(f"📧 Sent thank you + ask for alternatives to: {to_addr_lower}")
                         response_sent = True
                     else:
-                        print(f"❌ Failed to send alternatives request")
-                        queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
+                        response_sent = _handle_auto_response_send_failure(
+                            user_id, thread_id, msg_id, to_addr_lower, response_body, client_id,
+                            failure_label="alternatives request"
+                        )
                 
                 # Handle call request without phone number - send brief response asking for number
                 if call_requested_no_phone and not response_sent:
@@ -3459,8 +3541,10 @@ Could you please provide your phone number so I can give you a call?"""
                         print(f"📞 Sent request for phone number to: {to_addr_lower}")
                         response_sent = True
                     else:
-                        print(f"❌ Failed to send phone number request")
-                        queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
+                        response_sent = _handle_auto_response_send_failure(
+                            user_id, thread_id, msg_id, to_addr_lower, response_body, client_id,
+                            failure_label="phone number request"
+                        )
                 
                 # Scenario 3 & 4: Property is still viable - check missing fields
                 if not response_sent and not old_row_became_nonviable:
@@ -3543,8 +3627,10 @@ To complete the property details, could you please provide:
                                 except Exception as e:
                                     print(f"⚠️ Failed to reschedule follow-up after missing-fields response: {e}")
                             else:
-                                print(f"❌ Failed to send missing fields request")
-                                queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
+                                response_sent = _handle_auto_response_send_failure(
+                                    user_id, thread_id, msg_id, to_addr_lower, response_body, client_id,
+                                    failure_label="missing fields request"
+                                )
                         else:
                             # Scenario 4: All fields complete - send closing
                             # Use LLM-generated response if available, otherwise use template
@@ -3603,8 +3689,10 @@ We'll be in touch if we need any additional information."""
                                     print(f"⚠️ Could not clear row highlight: {e}")
                                 _maybe_mark_client_completed(user_id, client_id)
                             else:
-                                print(f"❌ Failed to send closing email")
-                                queue_pending_response(user_id, thread_id, msg_id, to_addr_lower, response_body, client_id)
+                                response_sent = _handle_auto_response_send_failure(
+                                    user_id, thread_id, msg_id, to_addr_lower, response_body, client_id,
+                                    failure_label="closing email"
+                                )
                         
             except Exception as e:
                 print(f"❌ Failed to send automatic response: {e}")

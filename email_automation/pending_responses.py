@@ -28,6 +28,46 @@ def _move_pending_response_to_dead_letter(user_id: str, doc, data: Dict[str, Any
     doc.reference.delete()
 
 
+def record_sent_unindexed_response(
+    user_id: str,
+    thread_id: str,
+    msg_id: str,
+    recipient: str,
+    response_body: str,
+    client_id: Optional[str] = None,
+    reason: Optional[str] = None,
+    *,
+    source_context: str = "autoResponse",
+    original_doc_id: Optional[str] = None,
+) -> None:
+    """Record a reply that Graph accepted but the worker could not index.
+
+    The email may already be in the sender mailbox, so this must be visible to
+    operators without re-queuing the same body for another send attempt.
+    """
+    from .clients import _fs
+
+    payload = {
+        "threadId": thread_id,
+        "msgId": msg_id,
+        "recipient": recipient,
+        "responseBody": response_body,
+        "clientId": client_id,
+        "source": source_context,
+        "status": "needs_reconciliation",
+        "alreadySent": True,
+        "failureReason": reason or "Graph accepted reply but sent-message indexing failed",
+        "deadLetteredAt": SERVER_TIMESTAMP,
+        "movedAt": SERVER_TIMESTAMP,
+        "createdAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+    }
+    if original_doc_id:
+        payload["originalDocId"] = original_doc_id
+
+    _fs.collection("users").document(user_id).collection("deadLetterQueue").add(payload)
+
+
 def queue_pending_response(
     user_id: str,
     thread_id: str,
@@ -152,6 +192,25 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> int:
                     getattr(send_reply_in_thread, "last_error", None)
                     or "send_reply_in_thread returned False"
                 )
+                sent_but_unindexed = (
+                    getattr(send_reply_in_thread, "sent_but_unindexed", False)
+                    or getattr(send_reply_in_thread, "last_outcome", None) == "sent_but_unindexed"
+                )
+                if sent_but_unindexed:
+                    record_sent_unindexed_response(
+                        user_id,
+                        thread_id,
+                        msg_id,
+                        recipient,
+                        response_body,
+                        data.get("clientId"),
+                        failure_reason,
+                        source_context="pendingResponses",
+                        original_doc_id=doc.id,
+                    )
+                    doc.reference.delete()
+                    print("    ⚠️ Reply may have sent but could not be indexed; moved to reconciliation instead of retrying")
+                    continue
                 # Update attempt count
                 doc.reference.update({
                     "attempts": attempts + 1,
