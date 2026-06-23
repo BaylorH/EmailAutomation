@@ -304,6 +304,11 @@ def fetch_url_as_text(url: str) -> Optional[str]:
     Returns None on any failure (fail-safe).
     """
     try:
+        from .property_images import is_blocked_listing_url
+        if is_blocked_listing_url(url):
+            print(f"ℹ️ Skipping listing-domain text fetch: {url}")
+            return None
+
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }

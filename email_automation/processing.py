@@ -9,7 +9,7 @@ from typing import Dict, Any, List, Optional
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
-from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, append_links_to_floorplan_column, is_floorplan_filename, _header_index_map, _find_row_by_email, clear_row_highlight, highlight_row, ROW_HIGHLIGHT_BLUE
+from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, append_links_to_floorplan_column, write_property_image_columns, is_floorplan_filename, _header_index_map, _find_row_by_email, clear_row_highlight, highlight_row, ROW_HIGHLIGHT_BLUE
 from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move, stop_threads_for_row, complete_threads_for_row
 from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
                        dump_thread_from_firestore, has_processed, mark_processed, set_last_scan_iso,
@@ -50,6 +50,11 @@ from .email_operations import (
 from .pending_responses import queue_pending_response, record_sent_unindexed_response
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE, INBOX_SCAN_WINDOW_HOURS
 from .column_config import find_client_comment_column_index, find_notes_comment_column_index
+from .property_images import (
+    PROPERTY_IMAGE_SOURCE_REASON,
+    build_property_image_sheet_updates,
+    select_property_image_candidate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -346,6 +351,43 @@ def _build_pdf_link_sheet_change_applied_record(
     }
 
 
+def _build_property_image_sheet_change_applied_record(
+    header: List[str],
+    rowvals: List[str],
+    image_updates_by_column: Dict[str, List[str]],
+    *,
+    row_number: Optional[int] = None,
+) -> Dict[str, Any]:
+    applied = []
+    for canonical_column, values in (image_updates_by_column or {}).items():
+        column_name = _find_header_column_name(header, canonical_column) or canonical_column
+        old_value = _read_row_cell_by_header(header, rowvals or [], column_name)
+        if old_value:
+            continue
+        new_value = ""
+        for raw_value in values or []:
+            value = str(raw_value or "").strip()
+            if value:
+                new_value = value
+                break
+        if not new_value:
+            continue
+        applied.append({
+            "column": column_name,
+            "oldValue": old_value,
+            "newValue": new_value,
+            "confidence": 1.0,
+            "reason": PROPERTY_IMAGE_SOURCE_REASON,
+        })
+
+    return {
+        "applied": applied,
+        "skipped": [],
+        "rowNumber": row_number,
+        "source": "property_image_write",
+    }
+
+
 def _store_pdf_link_sheet_change(
     user_id: str,
     client_id: str,
@@ -396,6 +438,59 @@ def _store_pdf_link_sheet_change(
         return doc_id
     except Exception as e:
         print(f"⚠️ Failed to store PDF link sheetChangeLog record: {e}")
+        return None
+
+
+def _store_property_image_sheet_change(
+    user_id: str,
+    client_id: str,
+    sheet_id: str,
+    header: List[str],
+    rownum: int,
+    rowvals: List[str],
+    thread_id: str,
+    email: str,
+    image_candidate: Optional[Dict[str, Any]],
+    image_updates_by_column: Dict[str, List[str]],
+) -> Optional[str]:
+    apply_result = _build_property_image_sheet_change_applied_record(
+        header,
+        rowvals,
+        image_updates_by_column,
+        row_number=rownum,
+    )
+    if not apply_result.get("applied"):
+        return None
+
+    try:
+        safe_candidate = {
+            key: (image_candidate or {}).get(key)
+            for key in ("url", "sourceLabel", "sourceType", "sourceFilename", "sourceDriveLink", "meta")
+            if (image_candidate or {}).get(key) is not None
+        }
+        applied_hash = hashlib.sha256(
+            json.dumps({"applyResult": apply_result, "candidate": safe_candidate}, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        now_id = datetime.now(timezone.utc).isoformat().replace(":", "-").replace(".", "-").replace("+00:00", "Z")
+        doc_id = f"{thread_id}__property_image__{now_id}"
+        _fs.collection("users").document(user_id).collection("sheetChangeLog").document(doc_id).set({
+            "clientId": client_id,
+            "email": email,
+            "sheetId": sheet_id,
+            "rowNumber": rownum,
+            "targetAnchor": get_row_anchor(rowvals, header),
+            "applied": apply_result,
+            "status": "applied",
+            "source": "property_image_write",
+            "threadId": thread_id,
+            "createdAt": SERVER_TIMESTAMP,
+            "propertyImage": safe_candidate,
+            "proposalHash": applied_hash,
+        })
+        print(f"💾 Stored property image sheetChangeLog/{doc_id}")
+        return doc_id
+    except Exception as e:
+        print(f"⚠️ Failed to store property image sheetChangeLog record: {e}")
         return None
 
 
@@ -2931,6 +3026,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             proposal["skip_response"] = True
 
                         # Create ACTION_NEEDED notification for approval (no row created yet)
+                        property_image_candidate = select_property_image_candidate(pdf_manifest)
+                        property_images_meta = [property_image_candidate] if property_image_candidate else []
                         notif_id = write_notification(
                             user_id, client_id,
                             kind="action_needed",
@@ -2970,10 +3067,17 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                                         "name": p.get("name"),
                                         "text": p.get("text", "")[:5000],  # Limit text to 5KB per PDF
                                         "drive_link": p.get("drive_link"),
-                                        "id": p.get("file_id") or p.get("id")  # OpenAI file ID for re-processing if needed
+                                        "id": p.get("file_id") or p.get("id"),  # OpenAI file ID for re-processing if needed
+                                        "property_image_url": p.get("property_image_url"),
+                                        "property_image_source": p.get("property_image_source"),
+                                        "property_image_source_type": p.get("property_image_source_type"),
+                                        "property_image_meta": p.get("property_image_meta"),
                                     }
                                     for p in (pdf_manifest or [])
-                                ]
+                                ],
+                                # Hosted property image previews for the eventual new row.
+                                # This intentionally excludes raw extracted images/base64.
+                                "propertyImages": property_images_meta,
                             },
                             dedupe_key=f"new_property_pending:{thread_id}:{address}:{city}:{new_property_email}"
                         )
@@ -3356,6 +3460,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 try:
                     sheets = _sheets_client()
                     pdf_link_updates_for_results: Dict[str, List[str]] = {}
+                    property_image_candidate = select_property_image_candidate(pdf_manifest)
+                    property_image_updates_for_results: Dict[str, List[str]] = {}
 
                     if flyer_links:
                         added_flyer_links = append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
@@ -3398,8 +3504,40 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             _append_ai_meta(sheets, sheet_id, rownum, "Floorplan", "\n".join(added_floorplan_links), override=False)
                         print(f"   📐 Applied {len(floorplan_links)} floorplan link(s) to current row")
 
+                    property_image_updates = build_property_image_sheet_updates(
+                        header,
+                        rowvals,
+                        property_image_candidate,
+                    )
+                    if property_image_updates:
+                        property_image_updates_for_results = write_property_image_columns(
+                            sheets,
+                            sheet_id,
+                            header,
+                            rownum,
+                            property_image_updates,
+                        )
+                        for column, values in property_image_updates_for_results.items():
+                            value = "\n".join(values or [])
+                            if not value:
+                                continue
+                            logger.debug(
+                                "sheet.ai_meta_append",
+                                extra={
+                                    "spreadsheet_id": sheet_id,
+                                    "rownum": rownum,
+                                    "column": column,
+                                    "value": value,
+                                    "override": False,
+                                    "source": "property_image_write",
+                                },
+                            )
+                            _append_ai_meta(sheets, sheet_id, rownum, column, value, override=False)
+                        if property_image_updates_for_results:
+                            print("   🖼️ Applied hosted property image preview to current row")
+
                     # Re-read header in case we just created columns
-                    if flyer_links or floorplan_links:
+                    if flyer_links or floorplan_links or property_image_updates_for_results:
                         try:
                             tab_title = _get_first_tab_title(sheets, sheet_id)
                             header = _read_header_row2(sheets, sheet_id, tab_title)
@@ -3420,8 +3558,21 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             pdf_manifest,
                             pdf_link_updates_for_results,
                         )
+                    if property_image_updates_for_results:
+                        _store_property_image_sheet_change(
+                            user_id,
+                            client_id,
+                            sheet_id,
+                            header,
+                            rownum,
+                            rowvals,
+                            thread_id,
+                            to_addr_lower,
+                            property_image_candidate,
+                            property_image_updates_for_results,
+                        )
                 except Exception as e:
-                    print(f"⚠️ Failed to write PDF links to sheet: {e}")
+                    print(f"⚠️ Failed to write PDF link/property image metadata to sheet: {e}")
             elif pdf_manifest and has_new_property_path:
                 print(f"   ℹ️ Skipping PDF link write to old row - PDFs belong to new property path")
 

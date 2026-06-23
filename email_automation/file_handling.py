@@ -1,5 +1,6 @@
 import os
 import base64
+import hashlib
 import requests
 import tempfile
 from typing import List, Dict, Any, Tuple, Optional
@@ -306,6 +307,94 @@ def upload_pdf_to_drive(name: str, content: bytes, folder_id: str = None) -> Opt
         print(f"❌ Failed to upload PDF to Drive: {e}")
         return None
 
+
+def render_pdf_first_page_preview(content: bytes, max_dimension: int = 1400) -> Optional[bytes]:
+    """Render the first PDF page to a PNG preview for property report imagery."""
+    if not content or not HAS_PYMUPDF:
+        return None
+
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+        if len(doc) < 1:
+            return None
+
+        page = doc[0]
+        matrix = fitz.Matrix(2, 2)
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        preview_bytes = pix.tobytes("png")
+
+        if HAS_PILLOW and max_dimension:
+            try:
+                image = Image.open(io.BytesIO(preview_bytes))
+                if max(image.size) > max_dimension:
+                    image.thumbnail((max_dimension, max_dimension))
+                    out = io.BytesIO()
+                    image.save(out, format="PNG", optimize=True)
+                    preview_bytes = out.getvalue()
+            except Exception as e:
+                print(f"⚠️ Could not resize PDF preview: {e}")
+
+        return preview_bytes
+    except Exception as e:
+        print(f"⚠️ Failed to render PDF preview: {e}")
+        return None
+
+
+def upload_property_image_to_drive(name: str, content: bytes, folder_id: str = None) -> Optional[Dict[str, Any]]:
+    """Upload a generated property preview image and return safe hosted metadata."""
+    if not content:
+        return None
+
+    try:
+        creds = _helper_google_creds()
+        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+        if not folder_id:
+            folder_id = ensure_drive_folder()
+
+        base_name = os.path.splitext(name or "property-preview.pdf")[0].strip() or "property-preview"
+        image_name = f"{base_name} preview.png"
+        file_metadata = {
+            "name": image_name,
+            "parents": [folder_id] if folder_id else [],
+        }
+
+        media = MediaIoBaseUpload(
+            io.BytesIO(content),
+            mimetype="image/png",
+            resumable=True,
+        )
+
+        file = drive.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id,webViewLink",
+        ).execute()
+
+        drive.permissions().create(
+            fileId=file.get("id"),
+            body={"role": "reader", "type": "anyone"},
+        ).execute()
+
+        file_id = file.get("id")
+        if not file_id:
+            return None
+
+        direct_url = f"https://drive.google.com/uc?export=view&id={file_id}"
+        result = {
+            "url": direct_url,
+            "driveLink": file.get("webViewLink") or direct_url,
+            "contentType": "image/png",
+            "byteCount": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        print(f"🖼️ Uploaded property preview: {image_name} -> {direct_url}")
+        return result
+
+    except Exception as e:
+        print(f"❌ Failed to upload property preview image: {e}")
+        return None
+
 def upload_pdf_user_data(filename: str, content: bytes) -> str:
     """Upload PDF to OpenAI with purpose='user_data' and return file_id."""
     try:
@@ -363,6 +452,24 @@ def fetch_and_process_pdfs(headers: Dict[str, str], graph_msg_id: str) -> List[D
         except Exception as e:
             print(f"⚠️ Drive upload failed: {e}")
             result['drive_link'] = None
+
+        try:
+            preview_bytes = render_pdf_first_page_preview(content)
+            if preview_bytes:
+                uploaded_preview = upload_property_image_to_drive(name, preview_bytes)
+                if uploaded_preview and uploaded_preview.get("url"):
+                    result["property_image_url"] = uploaded_preview["url"]
+                    result["property_image_source"] = f"Broker flyer preview: {name}, page 1"
+                    result["property_image_source_type"] = "broker_pdf_preview"
+                    result["property_image_meta"] = {
+                        "pageNumber": 1,
+                        "contentType": uploaded_preview.get("contentType") or "image/png",
+                        "byteCount": uploaded_preview.get("byteCount"),
+                        "sha256": uploaded_preview.get("sha256"),
+                        "driveLink": uploaded_preview.get("driveLink"),
+                    }
+        except Exception as e:
+            print(f"⚠️ Property preview image resolution failed: {e}")
 
         processed.append(result)
 

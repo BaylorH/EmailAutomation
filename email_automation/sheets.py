@@ -503,6 +503,81 @@ def append_links_to_floorplan_column(sheets, spreadsheet_id: str, header: list[s
         return []
 
 
+def write_property_image_columns(
+    sheets,
+    spreadsheet_id: str,
+    header: list[str],
+    rownum: int,
+    updates_by_column: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    """Find/create property image columns and write values only into blank cells."""
+    applied: dict[str, list[str]] = {}
+    try:
+        tab_title = _get_first_tab_title(sheets, spreadsheet_id)
+        working_header = list(header or [])
+
+        for canonical_column, values in (updates_by_column or {}).items():
+            value = ""
+            for candidate in values or []:
+                candidate = str(candidate or "").strip()
+                if candidate:
+                    value = candidate
+                    break
+            if not value:
+                continue
+
+            idx_map = _header_index_map(working_header)
+            col_idx = idx_map.get(canonical_column.strip().lower())
+            if col_idx is None:
+                col_idx = len(working_header) + 1
+                col_letter = _col_letter(col_idx)
+                _execute_with_retry(
+                    sheets.spreadsheets().values().update(
+                        spreadsheetId=spreadsheet_id,
+                        range=f"{tab_title}!{col_letter}2",
+                        valueInputOption="RAW",
+                        body={"values": [[canonical_column]]},
+                    ),
+                    "property_image_create_column",
+                )
+                working_header.append(canonical_column)
+                print(f"📋 Created '{canonical_column}' column at {col_letter}")
+
+            col_letter = _col_letter(col_idx)
+            cell_range = f"{tab_title}!{col_letter}{rownum}"
+            resp = _execute_with_retry(
+                sheets.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id,
+                    range=cell_range,
+                ),
+                "property_image_get_current",
+            )
+            current_value = ""
+            values_resp = resp.get("values", [])
+            if values_resp and values_resp[0]:
+                current_value = str(values_resp[0][0] or "").strip()
+            if current_value:
+                continue
+
+            _execute_with_retry(
+                sheets.spreadsheets().values().update(
+                    spreadsheetId=spreadsheet_id,
+                    range=cell_range,
+                    valueInputOption="RAW",
+                    body={"values": [[value]]},
+                ),
+                "property_image_update",
+            )
+            applied[canonical_column] = [value]
+
+        if applied:
+            print(f"🖼️ Wrote property image metadata columns: {', '.join(applied.keys())}")
+        return applied
+    except Exception as e:
+        print(f"❌ Failed to write property image columns: {e}")
+        return applied
+
+
 def is_floorplan_filename(filename: str) -> bool:
     """
     Detect if a PDF filename indicates it's a floorplan/building plan.
