@@ -284,6 +284,43 @@ def _clear_ai_processing_failure(user_id: str, thread_id: str, message_id: str):
         print(f"⚠️ Could not clear AI processing failure: {e}")
 
 
+def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[str, int]:
+    """Clear failure markers for messages that are already marked processed.
+
+    This is intentionally conservative: it never retries, sends, or changes
+    campaign state. Unprocessed failures stay visible for operator review.
+    """
+    result = {"checked": 0, "cleared": 0, "retained": 0}
+    try:
+        failures_ref = _fs.collection("users").document(user_id).collection("processingFailures")
+        query = failures_ref.limit(limit) if hasattr(failures_ref, "limit") else failures_ref
+        docs = list(query.stream())
+    except Exception as e:
+        print(f"⚠️ Could not read processing failures for reconciliation: {e}")
+        return result
+
+    for doc in docs:
+        result["checked"] += 1
+        try:
+            data = doc.to_dict() or {}
+            message_id = data.get("messageId")
+            if message_id and has_processed(user_id, message_id):
+                doc.reference.delete()
+                result["cleared"] += 1
+            else:
+                result["retained"] += 1
+        except Exception as e:
+            result["retained"] += 1
+            print(f"⚠️ Could not reconcile processing failure {getattr(doc, 'id', 'unknown')}: {e}")
+
+    if result["checked"]:
+        print(
+            "🧹 Processing failure reconciliation: "
+            f"checked={result['checked']}, cleared={result['cleared']}, retained={result['retained']}"
+        )
+    return result
+
+
 PDF_LINK_CHANGE_REASON = "Broker PDF attachment uploaded to Drive."
 PDF_LINK_COLUMN_ALIASES = {
     "Flyer / Link": ("flyer / link", "flyer/link", "flyer"),

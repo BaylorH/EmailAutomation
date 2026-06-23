@@ -5,7 +5,11 @@ from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token
 from email_automation.clients import list_user_ids, decode_token_payload, _fs
 from email_automation.email import send_outboxes
-from email_automation.processing import scan_inbox_against_index, scan_sent_items_for_manual_replies
+from email_automation.processing import (
+    reconcile_stale_processing_failures,
+    scan_inbox_against_index,
+    scan_sent_items_for_manual_replies,
+)
 from email_automation.followup import check_and_send_followups
 from email_automation.pending_responses import process_pending_responses
 from email_automation.app_config import CLIENT_ID, CLIENT_SECRET, AUTHORITY, SCOPES, TOKEN_CACHE, FIREBASE_API_KEY
@@ -250,6 +254,9 @@ def refresh_and_process_user(user_id: str):
 
     # Auto-cleanup Firestore if collections are getting large (stay within free tier)
     auto_cleanup_firestore(user_id)
+
+    # Keep dashboard health from staying red after a retry eventually succeeds.
+    reconcile_stale_processing_failures(user_id)
 
     record_user_health(
         user_id,

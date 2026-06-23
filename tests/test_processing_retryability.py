@@ -42,6 +42,48 @@ class ProcessingRetryabilityTests(unittest.TestCase):
 
         fake_fs.collection.assert_not_called()
 
+    def test_reconcile_processing_failures_clears_processed_messages_only(self):
+        processed_doc = MagicMock()
+        processed_doc.id = "failure-processed"
+        processed_doc.to_dict.return_value = {
+            "threadId": "thread-1",
+            "messageId": "message-processed",
+            "retryable": True,
+        }
+        retry_doc = MagicMock()
+        retry_doc.id = "failure-retry"
+        retry_doc.to_dict.return_value = {
+            "threadId": "thread-2",
+            "messageId": "message-retry",
+            "retryable": True,
+        }
+        missing_id_doc = MagicMock()
+        missing_id_doc.id = "failure-missing"
+        missing_id_doc.to_dict.return_value = {
+            "threadId": "thread-3",
+            "retryable": True,
+        }
+
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [
+            processed_doc,
+            retry_doc,
+            missing_id_doc,
+        ]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value.collection.return_value = failures_collection
+
+        def fake_has_processed(_user_id, message_id):
+            return message_id == "message-processed"
+
+        with patch.object(processing, "_fs", fake_fs), patch.object(processing, "has_processed", side_effect=fake_has_processed):
+            result = processing.reconcile_stale_processing_failures("uid-1")
+
+        self.assertEqual({"checked": 3, "cleared": 1, "retained": 2}, result)
+        processed_doc.reference.delete.assert_called_once()
+        retry_doc.reference.delete.assert_not_called()
+        missing_id_doc.reference.delete.assert_not_called()
+
     def test_new_property_duplicate_check_fails_open_on_sheet_read_error(self):
         class FailingSheets:
             def spreadsheets(self):
