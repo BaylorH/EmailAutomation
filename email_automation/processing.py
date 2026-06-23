@@ -274,6 +274,16 @@ def _record_ai_processing_failure(user_id: str, client_id: str, thread_id: str, 
         print(f"⚠️ Could not record AI processing failure: {e}")
 
 
+def _clear_ai_processing_failure(user_id: str, thread_id: str, message_id: str):
+    if not message_id:
+        return
+    try:
+        doc_id = f"{thread_id}__{message_id}"
+        _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).delete()
+    except Exception as e:
+        print(f"⚠️ Could not clear AI processing failure: {e}")
+
+
 PDF_LINK_CHANGE_REASON = "Broker PDF attachment uploaded to Drive."
 PDF_LINK_COLUMN_ALIASES = {
     "Flyer / Link": ("flyer / link", "flyer/link", "flyer"),
@@ -3985,6 +3995,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             try:
                 process_inbox_message(user_id, headers, last_msg)
                 processed_count += 1
+                _clear_ai_processing_failure(user_id, thread_id, last_msg.get("internetMessageId") or last_msg.get("id"))
             except Exception as e:
                 processing_error = e
                 print(f"❌ Failed to process batched message: {e}")
@@ -4001,6 +4012,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             try:
                 process_inbox_message(user_id, headers, msg)
                 processed_count += 1
+                _clear_ai_processing_failure(user_id, thread_id, msg.get("internetMessageId") or msg.get("id"))
             except Exception as e:
                 processing_error = e
                 print(f"❌ Failed to process message {msg.get('id', 'unknown')}: {e}")
