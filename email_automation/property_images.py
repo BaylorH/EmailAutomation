@@ -6,6 +6,12 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 PROPERTY_IMAGE_COLUMN = "Property Image"
 PROPERTY_IMAGE_SOURCE_COLUMN = "Property Image Source"
 PROPERTY_IMAGE_SOURCE_REASON = "Broker flyer preview image resolved from attachment."
+SAFE_SIGNAL_KEYS = (
+    "imageAreaRatio",
+    "textChars",
+    "positiveTerms",
+    "negativeTerms",
+)
 
 BLOCKED_LISTING_DOMAINS = (
     "costar.com",
@@ -15,6 +21,29 @@ BLOCKED_LISTING_DOMAINS = (
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _safe_signal_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [
+            item
+            for item in value[:12]
+            if isinstance(item, (str, int, float, bool))
+        ]
+    return None
+
+
+def _safe_signals(signals: Any) -> Dict[str, Any]:
+    if not isinstance(signals, dict):
+        return {}
+    safe = {}
+    for key in SAFE_SIGNAL_KEYS:
+        value = _safe_signal_value(signals.get(key))
+        if value is not None:
+            safe[key] = value
+    return safe
 
 
 def _host(url: str) -> str:
@@ -98,9 +127,24 @@ def _safe_candidate_from_manifest_item(item: Dict[str, Any]) -> Optional[Dict[st
     meta = item.get("property_image_meta") or {}
     safe_meta = {
         key: meta.get(key)
-        for key in ("pageNumber", "contentType", "byteCount", "sha256", "driveLink", "width", "height")
+        for key in (
+            "pageNumber",
+            "pageCount",
+            "strategy",
+            "selectionReason",
+            "score",
+            "contentType",
+            "byteCount",
+            "sha256",
+            "driveLink",
+            "width",
+            "height",
+        )
         if meta.get(key) is not None
     }
+    safe_signals = _safe_signals(meta.get("signals"))
+    if safe_signals:
+        safe_meta["signals"] = safe_signals
     return {
         "url": image_url,
         "sourceLabel": _clean(item.get("property_image_source"))

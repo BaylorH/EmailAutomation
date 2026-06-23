@@ -54,9 +54,18 @@ class PropertyImageResolverTests(unittest.TestCase):
                 "property_image_source": "Broker flyer preview: 4402 Rex Rd Flyer.pdf, page 1",
                 "property_image_meta": {
                     "pageNumber": 1,
+                    "pageCount": 4,
+                    "strategy": "property_preview_heuristic_v1",
+                    "selectionReason": "selected page with property-detail text",
+                    "signals": {
+                        "positiveTerms": ["sf"],
+                        "rawPreviewBytes": "RAW_SIGNAL_BYTES_SHOULD_NOT_LEAK",
+                        "nested": {"raw": "RAW_NESTED_SIGNAL_SHOULD_NOT_LEAK"},
+                    },
                     "contentType": "image/png",
                     "byteCount": 12345,
                     "sha256": "abc123",
+                    "rawPreviewBytes": "RAW_PREVIEW_SHOULD_NOT_LEAK",
                 },
             }
         ]
@@ -77,7 +86,12 @@ class PropertyImageResolverTests(unittest.TestCase):
         )
         serialized = repr(candidate) + repr(updates)
         self.assertNotIn("RAW_BASE64_SHOULD_NOT_LEAK", serialized)
+        self.assertNotIn("RAW_PREVIEW_SHOULD_NOT_LEAK", serialized)
+        self.assertNotIn("RAW_SIGNAL_BYTES_SHOULD_NOT_LEAK", serialized)
+        self.assertNotIn("RAW_NESTED_SIGNAL_SHOULD_NOT_LEAK", serialized)
         self.assertNotIn("images", serialized)
+        self.assertEqual("property_preview_heuristic_v1", candidate["meta"]["strategy"])
+        self.assertEqual(["sf"], candidate["meta"]["signals"]["positiveTerms"])
 
     def test_existing_property_image_is_not_overwritten(self):
         from email_automation.property_images import build_property_image_sheet_updates
@@ -106,6 +120,50 @@ class PropertyImageResolverTests(unittest.TestCase):
 
 
 class PropertyImageFileHandlingTests(unittest.TestCase):
+    def _make_test_pdf(self):
+        import fitz
+
+        doc = fitz.open()
+        cover = doc.new_page(width=612, height=792)
+        cover.insert_text(
+            (72, 90),
+            "Tour Packet\nPrepared for Metal Supermarkets\nCampaign overview and route map",
+            fontsize=24,
+        )
+        property_page = doc.new_page(width=612, height=792)
+        property_page.insert_text(
+            (72, 80),
+            (
+                "9950 Windmill Lakes Blvd\n"
+                "14,600 SF available industrial space\n"
+                "24 ft clear height, dock high loading, drive-in door, trailer parking\n"
+                "Lease rate and NNN details available from broker"
+            ),
+            fontsize=16,
+        )
+        property_page.draw_rect(
+            fitz.Rect(72, 210, 540, 520),
+            color=(0.1, 0.5, 0.3),
+            fill=(0.1, 0.5, 0.3),
+        )
+        return doc.tobytes()
+
+    def test_render_pdf_property_preview_skips_cover_page_for_property_page(self):
+        from email_automation import file_handling
+
+        if not file_handling.HAS_PYMUPDF:
+            self.skipTest("PyMuPDF is required for PDF preview selection")
+
+        preview = file_handling.render_pdf_property_preview(self._make_test_pdf())
+
+        self.assertIsNotNone(preview)
+        self.assertEqual(2, preview["pageNumber"])
+        self.assertEqual(2, preview["pageCount"])
+        self.assertEqual("property_preview_heuristic_v1", preview["strategy"])
+        self.assertIn("property", preview["selectionReason"])
+        self.assertIsInstance(preview["bytes"], bytes)
+        self.assertNotIn(preview["bytes"], repr(preview.get("signals", {})).encode("utf-8"))
+
     def test_fetch_and_process_pdfs_adds_hosted_property_preview_when_render_and_upload_succeed(self):
         from email_automation import file_handling
 
@@ -143,6 +201,62 @@ class PropertyImageFileHandlingTests(unittest.TestCase):
         )
         self.assertEqual(1, processed[0]["property_image_meta"]["pageNumber"])
         self.assertNotIn("PNG_BYTES", repr(processed[0]))
+
+    def test_fetch_and_process_pdfs_uses_selected_preview_page_metadata(self):
+        from email_automation import file_handling
+
+        with patch.object(file_handling, "fetch_pdf_attachments", return_value=[
+            {"name": "Tour Packet.pdf", "bytes": b"%PDF fake"}
+        ]), patch.object(file_handling, "process_pdf_for_ai", return_value={
+            "text": "Tour packet with property pages",
+            "images": [],
+            "method": "local_extraction",
+        }), patch.object(file_handling, "upload_pdf_to_drive", return_value="https://drive.google.com/file/d/pdf-id/view"), patch.object(
+            file_handling,
+            "render_pdf_property_preview",
+            return_value={
+                "bytes": b"PNG_BYTES",
+                "pageNumber": 3,
+                "pageIndex": 2,
+                "pageCount": 8,
+                "strategy": "property_preview_heuristic_v1",
+                "selectionReason": "selected page with property-detail text",
+                "score": 12.5,
+                "signals": {
+                    "textChars": 410,
+                    "positiveTerms": ["sf", "clear height"],
+                    "negativeTerms": [],
+                    "rawPreviewBytes": "RAW_SIGNAL_BYTES_SHOULD_NOT_LEAK",
+                    "nested": {"raw": "RAW_NESTED_SIGNAL_SHOULD_NOT_LEAK"},
+                },
+            },
+        ), patch.object(
+            file_handling,
+            "upload_property_image_to_drive",
+            return_value={
+                "url": "https://drive.google.com/uc?export=view&id=image-id",
+                "driveLink": "https://drive.google.com/file/d/image-id/view",
+                "contentType": "image/png",
+                "byteCount": 9,
+                "sha256": "abc123",
+            },
+        ):
+            processed = file_handling.fetch_and_process_pdfs({"Authorization": "Bearer fake"}, "msg-1")
+
+        self.assertEqual(
+            "Broker flyer preview: Tour Packet.pdf, page 3",
+            processed[0]["property_image_source"],
+        )
+        self.assertEqual(3, processed[0]["property_image_meta"]["pageNumber"])
+        self.assertEqual(8, processed[0]["property_image_meta"]["pageCount"])
+        self.assertEqual(
+            "property_preview_heuristic_v1",
+            processed[0]["property_image_meta"]["strategy"],
+        )
+        self.assertIn("positiveTerms", processed[0]["property_image_meta"]["signals"])
+        self.assertNotIn("PNG_BYTES", repr(processed[0]))
+        self.assertNotIn("RAW_SIGNAL_BYTES_SHOULD_NOT_LEAK", repr(processed[0]))
+        self.assertNotIn("RAW_NESTED_SIGNAL_SHOULD_NOT_LEAK", repr(processed[0]))
 
 
 if __name__ == "__main__":

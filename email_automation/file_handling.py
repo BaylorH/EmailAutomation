@@ -1,6 +1,7 @@
 import os
 import base64
 import hashlib
+import re
 import requests
 import tempfile
 from typing import List, Dict, Any, Tuple, Optional
@@ -308,33 +309,205 @@ def upload_pdf_to_drive(name: str, content: bytes, folder_id: str = None) -> Opt
         return None
 
 
-def render_pdf_first_page_preview(content: bytes, max_dimension: int = 1400) -> Optional[bytes]:
-    """Render the first PDF page to a PNG preview for property report imagery."""
+PROPERTY_PREVIEW_POSITIVE_TERMS = (
+    "sf",
+    "available",
+    "clear height",
+    "clear ht",
+    "dock",
+    "drive-in",
+    "drive in",
+    "office",
+    "warehouse",
+    "nnn",
+    "lease",
+    "parking",
+    "sprinkler",
+    "power",
+    "industrial",
+)
+
+PROPERTY_PREVIEW_NEGATIVE_TERMS = (
+    "tour packet",
+    "prepared for",
+    "prepared by",
+    "table of contents",
+    "map overview",
+    "route map",
+    "campaign report",
+    "confidential",
+)
+SAFE_PREVIEW_SIGNAL_KEYS = (
+    "imageAreaRatio",
+    "textChars",
+    "positiveTerms",
+    "negativeTerms",
+)
+
+
+def _safe_preview_signal_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [
+            item
+            for item in value[:12]
+            if isinstance(item, (str, int, float, bool))
+        ]
+    return None
+
+
+def _safe_preview_signals(signals: Any) -> Dict[str, Any]:
+    if not isinstance(signals, dict):
+        return {}
+    safe = {}
+    for key in SAFE_PREVIEW_SIGNAL_KEYS:
+        value = _safe_preview_signal_value(signals.get(key))
+        if value is not None:
+            safe[key] = value
+    return safe
+
+
+def _resize_png_preview(preview_bytes: bytes, max_dimension: int = 1400) -> bytes:
+    if not (HAS_PILLOW and max_dimension and preview_bytes):
+        return preview_bytes
+
+    try:
+        image = Image.open(io.BytesIO(preview_bytes))
+        if max(image.size) > max_dimension:
+            image.thumbnail((max_dimension, max_dimension))
+            out = io.BytesIO()
+            image.save(out, format="PNG", optimize=True)
+            return out.getvalue()
+    except Exception as e:
+        print(f"⚠️ Could not resize PDF preview: {e}")
+    return preview_bytes
+
+
+def _text_terms(text: str, terms: Tuple[str, ...]) -> List[str]:
+    lowered = f" {re.sub(r'[^a-z0-9]+', ' ', (text or '').lower())} "
+    found = []
+    for term in terms:
+        normalized = f" {re.sub(r'[^a-z0-9]+', ' ', term.lower()).strip()} "
+        if normalized in lowered:
+            found.append(term)
+    return found
+
+
+def _page_visual_area_ratio(page) -> float:
+    try:
+        page_area = max(float(page.rect.width * page.rect.height), 1.0)
+        visual_area = 0.0
+        text_dict = page.get_text("dict") or {}
+        for block in text_dict.get("blocks", []):
+            if block.get("type") == 1 and block.get("bbox"):
+                x0, y0, x1, y1 = block["bbox"]
+                visual_area += max(0.0, float(x1 - x0)) * max(0.0, float(y1 - y0))
+        for drawing in page.get_drawings() or []:
+            rect = drawing.get("rect")
+            if rect:
+                visual_area += max(0.0, float(rect.width)) * max(0.0, float(rect.height))
+        return min(visual_area / page_area, 1.0)
+    except Exception:
+        return 0.0
+
+
+def _score_pdf_preview_page(page, index: int, page_count: int) -> Dict[str, Any]:
+    try:
+        text = page.get_text("text") or ""
+    except Exception:
+        text = ""
+
+    positive_terms = _text_terms(text, PROPERTY_PREVIEW_POSITIVE_TERMS)
+    negative_terms = _text_terms(text, PROPERTY_PREVIEW_NEGATIVE_TERMS)
+    image_area_ratio = _page_visual_area_ratio(page)
+    score = (
+        len(positive_terms) * 2.5
+        + min(len(text.strip()) / 250.0, 3.0)
+        + image_area_ratio * 8.0
+        + (0.75 if index > 0 else 0.0)
+        - len(negative_terms) * 4.0
+    )
+
+    return {
+        "index": index,
+        "score": round(score, 3),
+        "signals": {
+            "imageAreaRatio": round(image_area_ratio, 4),
+            "textChars": len(text.strip()),
+            "positiveTerms": positive_terms[:8],
+            "negativeTerms": negative_terms[:8],
+        },
+    }
+
+
+def render_pdf_property_preview(
+    content: bytes,
+    max_dimension: int = 1400,
+    max_pages_to_scan: int = 8,
+) -> Optional[Dict[str, Any]]:
+    """Render the best property/detail PDF page to a PNG preview plus safe metadata."""
     if not content or not HAS_PYMUPDF:
         return None
 
     try:
         doc = fitz.open(stream=content, filetype="pdf")
-        if len(doc) < 1:
-            return None
+        try:
+            page_count = len(doc)
+            if page_count < 1:
+                return None
 
-        page = doc[0]
-        matrix = fitz.Matrix(2, 2)
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        preview_bytes = pix.tobytes("png")
+            scanned_count = max(1, min(page_count, max_pages_to_scan or page_count))
+            scored_pages = [
+                _score_pdf_preview_page(doc[index], index, page_count)
+                for index in range(scanned_count)
+            ]
+            selected = max(scored_pages, key=lambda item: (item["score"], item["index"]))
+            selected_page = doc[selected["index"]]
+            matrix = fitz.Matrix(2, 2)
+            pix = selected_page.get_pixmap(matrix=matrix, alpha=False)
+            preview_bytes = _resize_png_preview(pix.tobytes("png"), max_dimension=max_dimension)
+            page_number = selected["index"] + 1
+            reason = "selected page with property-detail text"
+            if selected["signals"]["imageAreaRatio"] >= 0.1:
+                reason = "selected page with property-detail text and large visual area"
+            elif page_number == 1:
+                reason = "fallback to first available preview page"
 
-        if HAS_PILLOW and max_dimension:
-            try:
-                image = Image.open(io.BytesIO(preview_bytes))
-                if max(image.size) > max_dimension:
-                    image.thumbnail((max_dimension, max_dimension))
-                    out = io.BytesIO()
-                    image.save(out, format="PNG", optimize=True)
-                    preview_bytes = out.getvalue()
-            except Exception as e:
-                print(f"⚠️ Could not resize PDF preview: {e}")
+            return {
+                "bytes": preview_bytes,
+                "pageNumber": page_number,
+                "pageIndex": selected["index"],
+                "pageCount": page_count,
+                "strategy": "property_preview_heuristic_v1",
+                "selectionReason": reason,
+                "score": selected["score"],
+                "signals": _safe_preview_signals(selected["signals"]),
+            }
+        finally:
+            doc.close()
+    except Exception as e:
+        print(f"⚠️ Failed to render PDF preview: {e}")
+        return None
 
-        return preview_bytes
+
+def render_pdf_first_page_preview(content: bytes, max_dimension: int = 1400) -> Optional[bytes]:
+    """Render the first PDF page to a PNG preview for legacy callers."""
+    if not content or not HAS_PYMUPDF:
+        return None
+
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+        try:
+            if len(doc) < 1:
+                return None
+
+            page = doc[0]
+            matrix = fitz.Matrix(2, 2)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            return _resize_png_preview(pix.tobytes("png"), max_dimension=max_dimension)
+        finally:
+            doc.close()
     except Exception as e:
         print(f"⚠️ Failed to render PDF preview: {e}")
         return None
@@ -454,15 +627,32 @@ def fetch_and_process_pdfs(headers: Dict[str, str], graph_msg_id: str) -> List[D
             result['drive_link'] = None
 
         try:
-            preview_bytes = render_pdf_first_page_preview(content)
-            if preview_bytes:
-                uploaded_preview = upload_property_image_to_drive(name, preview_bytes)
+            preview = render_pdf_property_preview(content)
+            if not preview:
+                legacy_preview_bytes = render_pdf_first_page_preview(content)
+                preview = {
+                    "bytes": legacy_preview_bytes,
+                    "pageNumber": 1,
+                    "pageIndex": 0,
+                    "pageCount": 1,
+                    "strategy": "first_page_preview_fallback",
+                    "selectionReason": "fallback to first available preview page",
+                    "score": 0,
+                    "signals": {},
+                } if legacy_preview_bytes else None
+            if preview and preview.get("bytes"):
+                uploaded_preview = upload_property_image_to_drive(name, preview["bytes"])
                 if uploaded_preview and uploaded_preview.get("url"):
                     result["property_image_url"] = uploaded_preview["url"]
-                    result["property_image_source"] = f"Broker flyer preview: {name}, page 1"
+                    result["property_image_source"] = f"Broker flyer preview: {name}, page {preview.get('pageNumber') or 1}"
                     result["property_image_source_type"] = "broker_pdf_preview"
                     result["property_image_meta"] = {
-                        "pageNumber": 1,
+                        "pageNumber": preview.get("pageNumber") or 1,
+                        "pageCount": preview.get("pageCount"),
+                        "strategy": preview.get("strategy"),
+                        "selectionReason": preview.get("selectionReason"),
+                        "score": preview.get("score"),
+                        "signals": _safe_preview_signals(preview.get("signals")),
                         "contentType": uploaded_preview.get("contentType") or "image/png",
                         "byteCount": uploaded_preview.get("byteCount"),
                         "sha256": uploaded_preview.get("sha256"),
