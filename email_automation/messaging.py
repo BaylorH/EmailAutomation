@@ -715,14 +715,17 @@ def build_event_key(event_type: str, event: dict = None, thread_id: str = None) 
     - property_issue: unique per issue text
     - close_conversation: unique per thread
     """
+    def event_text(key: str) -> str:
+        return str((event or {}).get(key) or "").strip()
+
     if event_type == "needs_user_input":
         reason = (event or {}).get("reason", "unclear")
         return f"needs_user_input:{reason}"
 
     elif event_type == "new_property":
-        address = (event or {}).get("address", "")
-        city = (event or {}).get("city", "")
-        email = (event or {}).get("email", "")
+        address = event_text("address")
+        city = event_text("city")
+        email = event_text("email")
         return f"new_property:{address}:{city}:{email}"
 
     elif event_type == "wrong_contact":

@@ -1305,6 +1305,10 @@ def _close_event_can_bypass_missing_fields(event: Dict[str, Any]) -> bool:
     return _close_reason_from_event(event) in TERMINAL_CLOSE_REASONS_WITHOUT_COMPLETE_FIELDS
 
 
+def _event_text(event: Dict[str, Any], key: str) -> str:
+    return str((event or {}).get(key) or "").strip()
+
+
 def _response_mentions_missing_fields(response_body: str, missing_fields: List[str]) -> bool:
     """Detect whether an LLM response is actually asking for the missing fields."""
     body = (response_body or "").lower()
@@ -1332,8 +1336,8 @@ def _response_mentions_missing_fields(response_body: str, missing_fields: List[s
 
 
 def _format_event_property(event: Dict[str, Any]) -> str:
-    address = (event.get("address") or "").strip()
-    city = (event.get("city") or "").strip()
+    address = _event_text(event, "address")
+    city = _event_text(event, "city")
     if address and city:
         return f"{address}, {city}"
     return address or city
@@ -1346,7 +1350,7 @@ def _build_property_unavailable_comment(current_date: str, found_keyword: str, e
     alternates = []
     for event in new_property_events:
         alternate = _format_event_property(event)
-        notes = (event.get("notes") or "").strip()
+        notes = _event_text(event, "notes")
 
         if alternate:
             alternates.append(f"Suggested alternate: {alternate}")
@@ -2923,12 +2927,12 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
                 elif event_type == "new_property":
                     try:
-                        address = event.get("address", "")
-                        city = event.get("city", "")
+                        address = _event_text(event, "address")
+                        city = _event_text(event, "city")
                         # AI can provide specific email for new property contact (different from current sender)
-                        new_property_email = event.get("email", "").strip().lower() or to_addr_lower
+                        new_property_email = _event_text(event, "email").lower() or to_addr_lower
                         # Extract contact name if AI provided one (e.g., "Joe" from "email Joe at joe@email.com")
-                        new_contact_name = event.get("contactName", "").strip()
+                        new_contact_name = _event_text(event, "contactName")
 
                         # Determine if this is a different contact than the original sender
                         is_different_contact = new_property_email != to_addr_lower
@@ -2958,9 +2962,6 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             print("⚠️ No address provided for new_property event, skipping")
                             continue
 
-                        address = address.strip()
-                        city = city.strip() if city else ""
-
                         # Check if property already exists in sheet
                         tab_title = _get_first_tab_title(sheets, sheet_id)
 
@@ -2979,8 +2980,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             continue  # Skip this event - property already exists
 
                         # Property doesn't exist - store for approval (DON'T create row yet)
-                        link = event.get("link", "")
-                        notes = event.get("notes", "")
+                        link = _event_text(event, "link")
+                        notes = _event_text(event, "notes")
 
                         # Fetch client criteria from Firestore for AI email generation
                         client_criteria = ""

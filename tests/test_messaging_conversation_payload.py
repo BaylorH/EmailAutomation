@@ -12,6 +12,19 @@ from email_automation import messaging
 
 
 class MessagingConversationPayloadTests(unittest.TestCase):
+    def test_new_property_event_key_normalizes_null_optional_fields(self):
+        key = messaging.build_event_key(
+            "new_property",
+            {
+                "address": "27610 Commerce Oaks Dr",
+                "city": None,
+                "email": None,
+            },
+            thread_id="thread-1",
+        )
+
+        self.assertEqual("new_property:27610 Commerce Oaks Dr::", key)
+
     def test_build_conversation_payload_tolerates_string_body_messages(self):
         mixed_history = [
             {

@@ -685,9 +685,10 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
                 {
                     "type": "new_property",
                     "address": "27610 Commerce Oaks Dr",
-                    "city": "The Woodlands",
-                    "email": from_email,
-                    "notes": "Suggested alternate with tour availability",
+                    "city": None,
+                    "email": None,
+                    "contactName": None,
+                    "notes": None,
                 },
                 {
                     "type": "tour_requested",
