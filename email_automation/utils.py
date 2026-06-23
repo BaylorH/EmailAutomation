@@ -649,12 +649,16 @@ def _professional_fields_from_user_data(user_data: Dict[str, Any]) -> Dict[str, 
     user_email = _clean_signature_value(user_data.get("email"))
     defaults = get_signature_domain_defaults(user_email)
     organization_name = _clean_signature_value(user_data.get("organizationName"))
+    first_name = _clean_signature_value(user_data.get("firstName"))
+    last_name = _clean_signature_value(user_data.get("lastName"))
+    saved_name = " ".join(part for part in [first_name, last_name] if part).strip()
 
     fields = {
         "name": _clean_signature_value(
             professional_signature.get("name")
             or user_data.get("preferredDisplayName")
             or user_data.get("displayName")
+            or saved_name
         ),
         "title": _clean_signature_value(professional_signature.get("title")),
         "team": _clean_signature_value(professional_signature.get("team")),

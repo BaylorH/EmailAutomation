@@ -116,6 +116,24 @@ class SignatureFooterTests(unittest.TestCase):
         self.assertNotIn("Jill Ames", footer)
         self.assertEqual(1, len(attachments))
 
+    def test_professional_signature_uses_saved_first_name_when_display_name_missing(self):
+        signature, mode, user_email = resolve_signature_settings({
+            "email": "baylor.freelance@outlook.com",
+            "firstName": "Baylor",
+            "signatureMode": "professional",
+            "professionalSignature": {
+                "title": "Principal",
+                "email": "baylor.freelance@outlook.com",
+                "company": "Manifold Engineering",
+            },
+        })
+
+        self.assertEqual("professional", mode)
+        self.assertEqual("baylor.freelance@outlook.com", user_email)
+        self.assertIn("Baylor", signature)
+        self.assertNotIn("BP21", signature)
+        self.assertNotIn("Jill Ames", signature)
+
     def test_professional_signature_without_logo_stays_presentable_and_attachment_free(self):
         signature = build_professional_signature_html({
             "name": "Avery Broker",

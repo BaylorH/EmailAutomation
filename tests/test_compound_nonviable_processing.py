@@ -35,39 +35,380 @@ class FakeDocumentRef:
         self._data.update(data)
 
 
+class FakeQuerySnapshot(FakeSnapshot):
+    def __init__(self, doc_id, data=None, exists=True):
+        super().__init__(data, exists)
+        self.id = doc_id
+
+
+class FakeQuery:
+    def __init__(self, docs):
+        self.docs = docs or {}
+
+    def stream(self):
+        return [
+            FakeQuerySnapshot(doc_id, doc_ref._data, doc_ref._exists)
+            for doc_id, doc_ref in self.docs.items()
+        ]
+
+
 class FakeUserRef:
-    def __init__(self, thread_ref, client_ref):
+    def __init__(self, thread_ref, client_ref, thread_docs=None):
         self.thread_ref = thread_ref
         self.client_ref = client_ref
+        self.thread_docs = thread_docs or {}
 
     def collection(self, name):
         if name == "threads":
-            return FakeCollection(self.thread_ref)
+            return FakeCollection(self.thread_ref, docs=self.thread_docs)
         if name == "clients":
             return FakeCollection(self.client_ref)
         return FakeCollection(FakeDocumentRef({}, exists=False))
 
 
 class FakeCollection:
-    def __init__(self, doc_ref):
+    def __init__(self, doc_ref, docs=None):
         self.doc_ref = doc_ref
+        self.docs = docs or {}
 
-    def document(self, *_args):
+    def document(self, *args):
+        doc_id = str(args[0]) if args else ""
+        if doc_id and doc_id in self.docs:
+            return self.docs[doc_id]
         return self.doc_ref
+
+    def where(self, *args, **kwargs):
+        return FakeQuery(self.docs)
 
 
 class FakeFirestore:
-    def __init__(self, thread_ref, client_ref):
+    def __init__(self, thread_ref, client_ref, thread_docs=None):
         self.thread_ref = thread_ref
         self.client_ref = client_ref
+        self.thread_docs = thread_docs or {}
 
     def collection(self, name):
         if name == "users":
-            return FakeCollection(FakeUserRef(self.thread_ref, self.client_ref))
+            return FakeCollection(FakeUserRef(self.thread_ref, self.client_ref, self.thread_docs))
         return FakeCollection(FakeDocumentRef({}, exists=False))
 
 
 class CompoundNonviableProcessingTests(unittest.TestCase):
+    def _common_graph_message(self, *, msg_id, subject, from_email, body, internet_message_id, conversation_id):
+        return {
+            "id": msg_id,
+            "subject": subject,
+            "from": {"emailAddress": {"address": from_email, "name": "BP21"}},
+            "toRecipients": [{"emailAddress": {"address": "baylor.freelance@outlook.com"}}],
+            "internetMessageId": internet_message_id,
+            "conversationId": conversation_id,
+            "receivedDateTime": "2026-06-19T19:12:39Z",
+            "bodyPreview": body[:200],
+            "hasAttachments": False,
+            "internetMessageHeaders": [
+                {"name": "In-Reply-To", "value": "<tour-invite@mock.test>"},
+            ],
+        }
+
+    def _run_tour_invite_reply_processing(
+        self,
+        *,
+        thread_id,
+        body,
+        proposal,
+        thread_ref,
+        thread_docs=None,
+        row_anchor="912-930 Gemini St",
+        rownum=3,
+        contact_name="Ryan",
+        from_email="bp21harrison@gmail.com",
+    ):
+        user_id = "test-user"
+        client_id = "client-1"
+        msg = self._common_graph_message(
+            msg_id=f"msg-{thread_id}",
+            subject=f"RE: Tour slot: {row_anchor}",
+            from_email=from_email,
+            body=body,
+            internet_message_id=f"<{thread_id}@mock.test>",
+            conversation_id=f"conv-{thread_id}",
+        )
+        header = [
+            "Property Address",
+            "City",
+            "Leasing Contact",
+            "Email",
+            "Total SF",
+            "Rent/SF/Yr",
+            "Ops Ex / SF",
+        ]
+        rowvals = [
+            row_anchor,
+            "Houston",
+            contact_name,
+            from_email,
+            "4531",
+            "10.00",
+            "3.31",
+        ]
+        client_ref = FakeDocumentRef({"criteria": "Industrial search"})
+        full_body_response = MagicMock()
+        full_body_response.json.return_value = {
+            "body": {"content": body, "contentType": "Text"},
+            "hasAttachments": False,
+        }
+        me_response = MagicMock(status_code=200)
+        me_response.json.return_value = {"mail": "baylor.freelance@outlook.com"}
+
+        notifications = []
+        handled_events = []
+        status_updates = []
+
+        def fake_write_notification(*args, **kwargs):
+            notif_id = f"notif-{len(notifications) + 1}"
+            notifications.append({"args": args, "kwargs": kwargs, "id": notif_id})
+            return notif_id
+
+        def fake_mark_event_handled(_user_id, _thread_id, event_key, _msg_id, notif_id):
+            handled_events.append({"eventKey": event_key, "notifId": notif_id})
+
+        def fake_update_thread_status(_user_id, _thread_id, status, reason):
+            status_updates.append({"status": status, "reason": reason})
+
+        move_row = MagicMock(return_value=11)
+        stop_threads = MagicMock(return_value=1)
+        send_reply = MagicMock(return_value=True)
+        thread_docs = thread_docs or {thread_id: thread_ref}
+        patches = [
+            patch.object(processing, "_fs", FakeFirestore(thread_ref, client_ref, thread_docs=thread_docs)),
+            patch.object(processing, "exponential_backoff_request", return_value=full_body_response),
+            patch.object(processing.requests, "get", return_value=me_response),
+            patch.object(processing, "lookup_thread_by_message_id", return_value=thread_id),
+            patch.object(processing, "lookup_thread_by_conversation_id", return_value=None),
+            patch.object(processing, "get_thread_status", return_value=processing.THREAD_STATUS["active"]),
+            patch.object(processing, "save_message", return_value=True),
+            patch.object(processing, "index_message_id", return_value=True),
+            patch.object(processing, "dump_thread_from_firestore"),
+            patch("email_automation.followup.cancel_followup_on_response"),
+            patch.object(
+                processing,
+                "fetch_and_log_sheet_for_thread",
+                return_value=(client_id, "sheet-1", header, rownum, rowvals, None, []),
+            ),
+            patch.object(
+                processing,
+                "_resolve_reply_identity",
+                return_value={
+                    "recipient_email": from_email,
+                    "contact_name": contact_name,
+                    "original_email": from_email,
+                    "source": "test",
+                },
+            ),
+            patch.object(processing, "fetch_and_process_pdfs", return_value=[]),
+            patch.object(processing, "write_message_order_test"),
+            patch.object(processing, "fetch_url_as_text", return_value=None),
+            patch.object(processing, "propose_sheet_updates", return_value=proposal),
+            patch.object(processing, "_sheets_client", return_value=MagicMock()),
+            patch.object(processing, "_get_first_tab_title", return_value="Sheet1"),
+            patch.object(processing, "is_event_handled", return_value=False),
+            patch.object(processing, "write_notification", side_effect=fake_write_notification),
+            patch.object(processing, "mark_event_handled", side_effect=fake_mark_event_handled),
+            patch.object(processing, "ensure_nonviable_divider", return_value=10),
+            patch.object(processing, "move_row_below_divider", side_effect=move_row),
+            patch.object(processing, "sync_thread_row_numbers_after_move"),
+            patch.object(processing, "stop_threads_for_row", side_effect=stop_threads),
+            patch.object(processing, "find_notes_comment_column_index", return_value=None),
+            patch.object(processing, "format_sheet_columns_autosize_with_exceptions"),
+            patch.object(processing, "clear_row_highlight"),
+            patch.object(processing, "highlight_row"),
+            patch.object(processing, "send_reply_in_thread", side_effect=send_reply),
+            patch.object(processing, "update_thread_status", side_effect=fake_update_thread_status),
+            patch.object(processing, "complete_threads_for_row", return_value=1),
+            patch.object(processing, "_clear_thread_action_notifications"),
+            patch.object(processing, "_maybe_mark_client_completed"),
+            patch.object(processing, "check_missing_required_fields", return_value=[]),
+        ]
+
+        for patcher in patches:
+            patcher.start()
+        try:
+            processing.process_inbox_message(
+                user_id,
+                {"Authorization": "Bearer test-token"},
+                msg,
+            )
+        finally:
+            for patcher in reversed(patches):
+                patcher.stop()
+
+        return {
+            "notifications": notifications,
+            "handledEvents": handled_events,
+            "statusUpdates": status_updates,
+            "moveRow": move_row,
+            "stopThreads": stop_threads,
+            "sendReply": send_reply,
+            "threadRef": thread_ref,
+        }
+
+    def test_tour_invite_alternate_reply_processes_schedule_decision_without_auto_send(self):
+        body = "Hi Baylor,\n\n10:15 AM does not work for us. Could we do 11:45 AM instead?\n\nBest,\nBP21"
+        thread_id = "thread-tour-alt"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": {
+                "tourDate": "2026-06-23",
+                "arrivalTime": "10:15 AM",
+                "departureTime": "10:45 AM",
+                "travelBufferMinutes": 5,
+            },
+        })
+        busy_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison+busy@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 4,
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": {
+                "tourDate": "2026-06-23",
+                "arrivalTime": "10:00 AM",
+                "departureTime": "10:30 AM",
+                "travelBufferMinutes": 5,
+            },
+        })
+        proposal = {
+            "updates": [],
+            "events": [
+                {
+                    "type": "tour_requested",
+                    "question": "10:15 AM does not work. Could we do 11:45 AM instead?",
+                    "suggestedEmail": "Let me check and get back to you.",
+                }
+            ],
+            "response_email": None,
+        }
+
+        result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body=body,
+            proposal=proposal,
+            thread_ref=thread_ref,
+            thread_docs={thread_id: thread_ref, "thread-busy": busy_ref},
+        )
+
+        self.assertEqual(1, len(result["notifications"]))
+        meta = result["notifications"][0]["kwargs"]["meta"]
+        self.assertEqual("tour_reschedule_requested", meta["reason"])
+        classification = meta["tourReplyClassification"]
+        self.assertEqual("alternate_requested", classification["outcome"])
+        self.assertEqual("fits", classification["scheduleDecision"]["feasibility"])
+        self.assertIn("Tuesday, June 23, 2026 at 11:45 AM works on our end", meta["suggestedEmail"]["body"])
+        self.assertNotIn("Let me check", meta["suggestedEmail"]["body"])
+        result["sendReply"].assert_not_called()
+        self.assertEqual("alternate_requested", thread_ref._data["tourInvite.status"])
+        self.assertEqual("fits", thread_ref._data["tourInvite.requestedAlternate"]["feasibility"])
+        self.assertIn(
+            {"status": processing.THREAD_STATUS["paused"], "reason": "tour_reschedule_requested"},
+            result["statusUpdates"],
+        )
+
+    def test_tour_invite_unavailable_process_does_not_move_row_or_stop_property(self):
+        body = "Hi Baylor,\n\nThe space is still available, but tours are no longer available for this property.\n\nBest,\nBP21"
+        thread_id = "thread-tour-unavailable"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": {
+                "tourDate": "2026-06-23",
+                "arrivalTime": "9:00 AM",
+                "departureTime": "9:30 AM",
+            },
+        })
+        proposal = {
+            "updates": [],
+            "events": [
+                {"type": "property_unavailable", "reason": "leased"},
+                {
+                    "type": "tour_requested",
+                    "question": "Tours are no longer available for this property.",
+                    "suggestedEmail": "",
+                },
+            ],
+            "response_email": None,
+        }
+
+        result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body=body,
+            proposal=proposal,
+            thread_ref=thread_ref,
+        )
+
+        result["moveRow"].assert_not_called()
+        result["stopThreads"].assert_not_called()
+        self.assertEqual(1, len(result["notifications"]))
+        meta = result["notifications"][0]["kwargs"]["meta"]
+        self.assertEqual("tour_unavailable", meta["reason"])
+        self.assertEqual("tour_unavailable", meta["tourReplyClassification"]["outcome"])
+        self.assertIn("tours are unavailable", meta["suggestedEmail"]["body"].lower())
+        self.assertEqual("tour_unavailable", thread_ref._data["tourInvite.status"])
+        self.assertEqual("2026-06-23", thread_ref._data["tourInvite.tourDate"])
+
+    def test_tour_invite_declined_reply_preserves_date_and_drafts_operator_hold(self):
+        body = "Hi Baylor,\n\nWe can't show the space at that time anymore.\n\nBest,\nBP21"
+        thread_id = "thread-tour-declined"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "tourInvite": {
+                "tourDate": "2026-06-23",
+                "arrivalTime": "9:00 AM",
+                "departureTime": "9:30 AM",
+            },
+        })
+        proposal = {
+            "updates": [],
+            "events": [
+                {
+                    "type": "tour_requested",
+                    "question": "We can't show the space at that time anymore.",
+                    "suggestedEmail": "",
+                }
+            ],
+            "response_email": None,
+        }
+
+        result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body=body,
+            proposal=proposal,
+            thread_ref=thread_ref,
+        )
+
+        self.assertEqual(1, len(result["notifications"]))
+        meta = result["notifications"][0]["kwargs"]["meta"]
+        self.assertEqual("tour_slot_declined", meta["reason"])
+        self.assertEqual("declined", meta["tourReplyClassification"]["outcome"])
+        self.assertIn("Tuesday, June 23, 2026", meta["suggestedEmail"]["body"])
+        result["sendReply"].assert_not_called()
+        self.assertEqual("declined", thread_ref._data["tourInvite.status"])
+        self.assertEqual("2026-06-23", thread_ref._data["tourInvite.tourDate"])
+
     def test_tour_invite_confirmation_does_not_send_generic_completion_reply(self):
         user_id = "test-user"
         client_id = "client-1"
