@@ -25,6 +25,10 @@ class PropertyImageResolverTests(unittest.TestCase):
             "https://www.loopnet.com/Listing/902-910-Gemini-Houston-TX/40231241/",
             filename_hint="912 Gemini listing",
         )
+        direct_pdf = build_download_candidate(
+            "https://broker.example.com/flyers/4402-Rex-Rd.pdf",
+            filename_hint="4402 Rex Rd Flyer.pdf",
+        )
 
         self.assertEqual(
             "https://drive.google.com/uc?export=download&id=abc123",
@@ -38,6 +42,7 @@ class PropertyImageResolverTests(unittest.TestCase):
         )
         self.assertEqual("dropbox_pdf", dropbox["sourceType"])
         self.assertIsNone(loopnet)
+        self.assertIsNone(direct_pdf)
 
     def test_manifest_candidate_writes_safe_property_image_columns_without_raw_image_bytes(self):
         from email_automation.property_images import (
@@ -340,6 +345,15 @@ class PropertyImageFileHandlingTests(unittest.TestCase):
         with patch.object(file_handling.requests, "get") as mock_get:
             with self.assertRaises(ValueError):
                 file_handling._download_linked_asset("https://127.0.0.1/flyer.pdf")
+
+        mock_get.assert_not_called()
+
+    def test_linked_asset_download_rejects_unknown_hosts_before_request(self):
+        from email_automation import file_handling
+
+        with patch.object(file_handling.requests, "get") as mock_get:
+            with self.assertRaises(ValueError):
+                file_handling._download_linked_asset("https://broker.example.com/flyer.pdf")
 
         mock_get.assert_not_called()
 

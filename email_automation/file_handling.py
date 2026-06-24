@@ -347,6 +347,13 @@ SAFE_PREVIEW_SIGNAL_KEYS = (
     "negativeTerms",
 )
 MAX_LINKED_PROPERTY_ASSET_BYTES = int(os.getenv("LINKED_PROPERTY_ASSET_MAX_BYTES", str(20 * 1024 * 1024)))
+ALLOWED_LINKED_PROPERTY_ASSET_HOSTS = (
+    "drive.google.com",
+    "docs.google.com",
+    "googleusercontent.com",
+    "dropbox.com",
+    "dropboxusercontent.com",
+)
 
 
 def _safe_preview_signal_value(value: Any) -> Any:
@@ -591,6 +598,13 @@ def _is_public_ip_address(host: str) -> bool:
         return False
 
 
+def _is_allowed_linked_asset_host(host: str) -> bool:
+    return any(
+        host == allowed or host.endswith(f".{allowed}")
+        for allowed in ALLOWED_LINKED_PROPERTY_ASSET_HOSTS
+    )
+
+
 def _validate_public_https_url(url: str) -> str:
     parsed = urlparse(str(url or "").strip())
     if parsed.scheme.lower() != "https":
@@ -601,6 +615,8 @@ def _validate_public_https_url(url: str) -> str:
         raise ValueError("linked property asset URL is missing a host")
     if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
         raise ValueError("linked property asset URL points to a local host")
+    if not _is_allowed_linked_asset_host(host):
+        raise ValueError("linked property asset host is not allow-listed")
 
     try:
         literal_ip = ipaddress.ip_address(host)

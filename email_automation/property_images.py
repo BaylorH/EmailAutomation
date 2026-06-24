@@ -101,21 +101,6 @@ def build_download_candidate(url: str, filename_hint: str = "") -> Optional[Dict
             "sourceUrl": source_url,
         }
 
-    lower_path = urlparse(source_url).path.lower()
-    if lower_path.endswith(".pdf"):
-        return {
-            "downloadUrl": source_url,
-            "sourceType": "direct_pdf",
-            "sourceLabel": f"Broker flyer: {file_name}",
-            "sourceUrl": source_url,
-        }
-    if lower_path.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        return {
-            "downloadUrl": source_url,
-            "sourceType": "direct_image",
-            "sourceLabel": f"Broker image: {file_name}",
-            "sourceUrl": source_url,
-        }
     return None
 
 

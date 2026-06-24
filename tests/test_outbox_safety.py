@@ -462,6 +462,95 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(audit_payload["sentRecipients"], ["bp21harrison+sent@gmail.com"])
         self.assertEqual(audit_payload["remainingRecipients"], ["bp21harrison+failed@gmail.com"])
 
+    def test_graph_accepted_unindexed_outbox_moves_to_reconciliation_without_retry(self):
+        recipient = "bp21harrison+unindexed@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [recipient],
+            "script": "Hi,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "123 Reconciliation Way",
+            "rowNumber": 22,
+            "attempts": 0,
+            "actionAuditId": "audit-reconciliation",
+            "followUpConfig": {"enabled": False},
+        }, doc_id="outbox-reconciliation")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": [],
+                 "errors": {recipient: "CRITICAL: Failed to index message ID after 3 attempts"},
+                 "sentMessageIds": {recipient: "graph-accepted-1"},
+                 "internetMessageIds": {recipient: "<accepted-1@example.com>"},
+                 "threadIds": {recipient: "accepted-thread-1"},
+                 "conversationIds": {recipient: "conversation-1"},
+             }):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        self.assertTrue(doc.reference.deleted)
+        self.assertEqual([], doc.reference.set_calls)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "needs_reconciliation")
+        self.assertTrue(dead_letter_payload["alreadySent"])
+        self.assertEqual(dead_letter_payload["assignedEmails"], [recipient])
+        self.assertEqual(dead_letter_payload["sentRecipients"], [recipient])
+        self.assertEqual(dead_letter_payload["sentMessageIds"][recipient], "graph-accepted-1")
+
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual(audit_payload["status"], "needs_reconciliation")
+        self.assertTrue(audit_payload["alreadySent"])
+        self.assertEqual(audit_payload["sentRecipients"], [recipient])
+        self.assertEqual(audit_payload["sentMessageIds"][recipient], "graph-accepted-1")
+
+    def test_partial_retry_success_unions_prior_sent_and_clears_partial_audit_state(self):
+        doc = FakeDoc({
+            "assignedEmails": ["bp21harrison+failed@gmail.com"],
+            "sentRecipients": ["bp21harrison+sent@gmail.com"],
+            "partialSend": True,
+            "remainingRecipients": ["bp21harrison+failed@gmail.com"],
+            "script": "Hi,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "123 Partial Send Way",
+            "rowNumber": 21,
+            "attempts": 1,
+            "actionAuditId": "audit-partial",
+            "followUpConfig": {"enabled": False},
+        }, doc_id="outbox-partial")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": ["bp21harrison+failed@gmail.com"],
+                 "errors": {},
+                 "sentMessageIds": {"bp21harrison+failed@gmail.com": "graph-sent-2"},
+                 "internetMessageIds": {"bp21harrison+failed@gmail.com": "<sent-2@example.com>"},
+             }):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        self.assertTrue(doc.reference.deleted)
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual(audit_payload["status"], "sent")
+        self.assertEqual(
+            audit_payload["sentRecipients"],
+            ["bp21harrison+sent@gmail.com", "bp21harrison+failed@gmail.com"],
+        )
+        self.assertEqual(audit_payload["remainingRecipients"], [])
+        self.assertFalse(audit_payload["partialSend"])
+
     def test_decrement_notification_rollups_clamps_counts(self):
         updated = notifications_module._decrement_notification_rollups(
             {
@@ -543,6 +632,52 @@ class OutboxSafetyTests(unittest.TestCase):
         audit_payload = fake_fs.set_calls[-1][1]
         self.assertEqual(audit_payload["status"], "opt_out_skipped")
         self.assertEqual(audit_payload["outboxId"], "outbox-opt-out")
+
+    def test_grouped_graph_accepted_unindexed_outbox_moves_to_reconciliation_without_retry(self):
+        recipient = "bp21harrison+grouped@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [recipient],
+            "script": "Hi,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "123 Grouped Reconciliation Way",
+            "rowNumber": 23,
+            "attempts": 0,
+            "actionAuditId": "audit-grouped-reconciliation",
+            "followUpConfig": {"enabled": False},
+        }, doc_id="outbox-grouped-reconciliation")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch("email_automation.processing.is_contact_opted_out", return_value=None), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": [],
+                 "errors": {recipient: "CRITICAL: Failed to index message ID after 3 attempts"},
+                 "sentMessageIds": {recipient: "graph-grouped-accepted-1"},
+                 "internetMessageIds": {recipient: "<grouped-accepted-1@example.com>"},
+                 "threadIds": {recipient: "grouped-thread-1"},
+                 "conversationIds": {recipient: "grouped-conversation-1"},
+             }):
+            email_module._send_multi_property_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                recipient,
+                [{"doc": doc, "data": doc.to_dict()}],
+            )
+
+        self.assertTrue(doc.reference.deleted)
+        self.assertEqual([], doc.reference.set_calls)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "needs_reconciliation")
+        self.assertTrue(dead_letter_payload["alreadySent"])
+        self.assertEqual(dead_letter_payload["assignedEmails"], [recipient])
+        self.assertEqual(dead_letter_payload["sentMessageIds"][recipient], "graph-grouped-accepted-1")
+
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual(audit_payload["status"], "needs_reconciliation")
+        self.assertTrue(audit_payload["alreadySent"])
+        self.assertEqual(audit_payload["sentRecipients"], [recipient])
 
 
 if __name__ == "__main__":

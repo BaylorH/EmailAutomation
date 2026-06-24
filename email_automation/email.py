@@ -130,6 +130,28 @@ def _first_result_value(mapping: Any, preferred_keys: Optional[List[str]] = None
     return mapping
 
 
+def _ordered_unique(values: List[Any]) -> List[Any]:
+    result = []
+    for value in values or []:
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def _send_identity_recipients(send_result: Optional[Dict[str, Any]]) -> List[str]:
+    if not send_result:
+        return []
+    recipients = []
+    for key in ("sentMessageIds", "internetMessageIds", "threadIds", "conversationIds"):
+        values = send_result.get(key) or {}
+        if not isinstance(values, dict):
+            continue
+        for recipient, identity_value in values.items():
+            if isinstance(recipient, str) and recipient and identity_value:
+                recipients.append(recipient)
+    return _ordered_unique(recipients)
+
+
 def _send_identity_payload(send_result: Optional[Dict[str, Any]], recipients: Optional[List[str]] = None) -> Dict[str, Any]:
     if not send_result:
         return {}
@@ -941,6 +963,16 @@ def _finalize_successful_outbox_item(
         "updatedAt": SERVER_TIMESTAMP,
     }
     audit_payload.update(_send_identity_payload(send_result, data.get("assignedEmails") or []))
+    if data.get("sentRecipients"):
+        audit_payload["sentRecipients"] = _ordered_unique(
+            [
+                email for email in data.get("sentRecipients", [])
+                if isinstance(email, str)
+            ] + ((send_result or {}).get("sent") or [])
+        )
+    if data.get("partialSend") or data.get("remainingRecipients"):
+        audit_payload["partialSend"] = False
+        audit_payload["remainingRecipients"] = []
     _update_action_audit(user_id, data.get("actionAuditId"), audit_payload)
     _mark_tour_invite_thread_sent(
         user_id,
@@ -1451,6 +1483,58 @@ def _move_to_dead_letter(user_id: str, doc_ref, data: dict, reason: str):
     print(f"☠️ Moved item {doc_ref.id} to dead-letter queue: {reason}")
 
 
+def _record_outbox_reconciliation(
+    user_id: str,
+    doc_ref,
+    data: Dict[str, Any],
+    reason: str,
+    send_result: Dict[str, Any],
+    recipients: List[str],
+    *,
+    delete_original: bool = False,
+) -> None:
+    """Expose a Graph-accepted send that could not be fully indexed.
+
+    Graph has already accepted the message, so retrying the same outbox item could
+    duplicate-send. Operators need a visible reconciliation item instead.
+    """
+    from .clients import _fs
+
+    recipients = _ordered_unique([email for email in recipients if isinstance(email, str)])
+    identity_payload = _send_identity_payload({**(send_result or {}), "sent": recipients}, recipients)
+    dead_letter_payload = {
+        **data,
+        "originalDocId": getattr(doc_ref, "id", None),
+        "assignedEmails": recipients,
+        "sentRecipients": recipients,
+        "source": "outbox",
+        "status": "needs_reconciliation",
+        "alreadySent": True,
+        "failureReason": reason,
+        "deadLetteredAt": SERVER_TIMESTAMP,
+        "movedAt": SERVER_TIMESTAMP,
+        "createdAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+        **identity_payload,
+    }
+    _fs.collection("users").document(user_id).collection("deadLetterQueue").add(dead_letter_payload)
+
+    if delete_original:
+        _update_action_audit(user_id, data.get("actionAuditId"), {
+            "status": "needs_reconciliation",
+            "outboxId": getattr(doc_ref, "id", None),
+            "clientId": data.get("clientId"),
+            "notificationId": data.get("notificationId"),
+            "threadId": data.get("threadId"),
+            "alreadySent": True,
+            "failureReason": reason,
+            "deadLetteredAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+            **identity_payload,
+        })
+        doc_ref.delete()
+
+
 def send_outboxes(
     user_id: str,
     headers: Dict[str, str],
@@ -1720,6 +1804,20 @@ def _send_multi_property_email(
             else:
                 new_attempts = attempts + 1
                 error_msg = json.dumps(res["errors"])[:1500]
+                identity_recipients = _send_identity_recipients(res)
+
+                if identity_recipients:
+                    _record_outbox_reconciliation(
+                        user_id,
+                        item['doc'].reference,
+                        data,
+                        error_msg,
+                        {**res, "sent": identity_recipients},
+                        identity_recipients,
+                        delete_original=True,
+                    )
+                    print(f"  ⚠️ Moved grouped item to reconciliation; Graph accepted send but indexing failed")
+                    continue
 
                 if new_attempts >= MAX_OUTBOX_ATTEMPTS:
                     _move_to_dead_letter(user_id, item['doc'].reference, data,
@@ -2003,10 +2101,14 @@ def _send_single_outbox_item(
     any_errors = bool(all_errors)
 
     if not any_errors and all_sent:
+        final_sent = _ordered_unique([
+            email for email in (data.get("sentRecipients") or [])
+            if isinstance(email, str)
+        ] + all_sent)
         _finalize_successful_outbox_item(
             user_id, d.reference, data,
             row_number=row_number, client_id=clientId,
-            send_result={**send_identity, "sent": all_sent},
+            send_result={**send_identity, "sent": final_sent},
         )
         print(f"🗑️ Deleted outbox item {d.id}")
     elif not all_sent and _all_send_errors_are_opt_out(all_errors):
@@ -2023,16 +2125,45 @@ def _send_single_outbox_item(
         new_attempts = attempts + 1
         error_msg = json.dumps(all_errors)[:1500]
         sent_set = {email for email in all_sent if isinstance(email, str)}
+        identity_set = set(_send_identity_recipients(send_identity))
         previous_sent = [
             email for email in data.get("sentRecipients", [])
             if isinstance(email, str)
         ]
-        sent_recipients = []
-        for email in previous_sent + [email for email in emails if email in sent_set]:
-            if email not in sent_recipients:
-                sent_recipients.append(email)
-        remaining_recipients = [email for email in emails if email not in sent_set]
-        partial_send_retry = bool(all_sent and remaining_recipients and remaining_recipients != emails)
+        accepted_set = sent_set | identity_set
+        sent_recipients = _ordered_unique(
+            previous_sent + [email for email in emails if email in accepted_set]
+        )
+        sent_but_unindexed_recipients = [
+            email for email in emails
+            if email in identity_set and email not in sent_set
+        ]
+        remaining_recipients = [email for email in emails if email not in accepted_set]
+
+        if sent_but_unindexed_recipients and remaining_recipients:
+            _record_outbox_reconciliation(
+                user_id,
+                d.reference,
+                data,
+                error_msg,
+                {**send_identity, "sent": sent_but_unindexed_recipients},
+                sent_but_unindexed_recipients,
+            )
+
+        if accepted_set and not remaining_recipients:
+            _record_outbox_reconciliation(
+                user_id,
+                d.reference,
+                data,
+                error_msg,
+                {**send_identity, "sent": sent_recipients},
+                sent_recipients,
+                delete_original=True,
+            )
+            print(f"⚠️ Moved outbox item {d.id} to reconciliation; Graph accepted send but indexing failed")
+            return
+
+        partial_send_retry = bool(accepted_set and remaining_recipients and remaining_recipients != emails)
         retry_extra = {}
         if partial_send_retry:
             retry_extra = {
@@ -2043,6 +2174,7 @@ def _send_single_outbox_item(
         audit_retry_extra = {
             "sentRecipients": sent_recipients or None,
             "remainingRecipients": remaining_recipients if partial_send_retry else None,
+            "reconciliationRecipients": sent_but_unindexed_recipients or None,
             "partialSend": True if partial_send_retry else None,
         }
 
