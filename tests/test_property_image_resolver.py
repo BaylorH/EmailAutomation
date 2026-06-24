@@ -29,6 +29,10 @@ class PropertyImageResolverTests(unittest.TestCase):
             "https://broker.example.com/flyers/4402-Rex-Rd.pdf",
             filename_hint="4402 Rex Rd Flyer.pdf",
         )
+        direct_image = build_download_candidate(
+            "https://lh3.googleusercontent.com/p/AF1QipExample=w1200-h800",
+            filename_hint="410 Genesis Blvd.jpg",
+        )
 
         self.assertEqual(
             "https://drive.google.com/uc?export=download&id=abc123",
@@ -43,6 +47,12 @@ class PropertyImageResolverTests(unittest.TestCase):
         self.assertEqual("dropbox_pdf", dropbox["sourceType"])
         self.assertIsNone(loopnet)
         self.assertIsNone(direct_pdf)
+        self.assertEqual(
+            "https://lh3.googleusercontent.com/p/AF1QipExample=w1200-h800",
+            direct_image["downloadUrl"],
+        )
+        self.assertEqual("direct_image", direct_image["sourceType"])
+        self.assertIn("410 Genesis Blvd.jpg", direct_image["sourceLabel"])
 
     def test_manifest_candidate_writes_safe_property_image_columns_without_raw_image_bytes(self):
         from email_automation.property_images import (
@@ -338,6 +348,50 @@ class PropertyImageFileHandlingTests(unittest.TestCase):
         )
         self.assertNotIn("PNG_BYTES", repr(processed[0]))
         self.assertNotIn("RAW_SIGNAL_BYTES_SHOULD_NOT_LEAK", repr(processed[0]))
+
+    def test_fetch_and_process_linked_assets_resolves_safe_direct_image_link(self):
+        from email_automation import file_handling
+
+        response = type("Response", (), {})()
+        response.url = "https://lh3.googleusercontent.com/p/AF1QipExample=w1200-h800"
+        response.status_code = 200
+        response.headers = {"content-type": "image/jpeg"}
+        response.raise_for_status = lambda: None
+        response.iter_content = lambda chunk_size=65536: iter([b"JPEG linked image"])
+
+        with patch.object(file_handling.socket, "getaddrinfo", return_value=[
+            (None, None, None, None, ("142.250.72.225", 443)),
+        ]), patch.object(file_handling.requests, "get", return_value=response), patch.object(
+            file_handling,
+            "_image_link_to_png_preview",
+            return_value=b"PNG_BYTES",
+        ), patch.object(
+            file_handling,
+            "upload_property_image_to_drive",
+            return_value={
+                "url": "https://drive.google.com/uc?export=view&id=direct-linked-image",
+                "driveLink": "https://drive.google.com/file/d/direct-linked-image/view",
+                "contentType": "image/png",
+                "byteCount": 9,
+                "sha256": "abc123",
+            },
+        ):
+            processed = file_handling.fetch_and_process_linked_assets([
+                "https://lh3.googleusercontent.com/p/AF1QipExample=w1200-h800",
+            ])
+
+        self.assertEqual(1, len(processed))
+        self.assertEqual("direct_image_link", processed[0]["method"])
+        self.assertEqual(
+            "https://drive.google.com/uc?export=view&id=direct-linked-image",
+            processed[0]["property_image_url"],
+        )
+        self.assertEqual(
+            "Broker image link: broker property image.png",
+            processed[0]["property_image_source"],
+        )
+        self.assertEqual("broker_image_link", processed[0]["property_image_source_type"])
+        self.assertNotIn("PNG_BYTES", repr(processed[0]))
 
     def test_linked_asset_download_rejects_private_network_targets_before_request(self):
         from email_automation import file_handling

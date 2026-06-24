@@ -17,6 +17,19 @@ BLOCKED_LISTING_DOMAINS = (
     "costar.com",
     "loopnet.com",
 )
+DIRECT_IMAGE_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+)
+SAFE_DIRECT_IMAGE_HOSTS = (
+    "drive.google.com",
+    "googleusercontent.com",
+    "dropbox.com",
+    "dropboxusercontent.com",
+)
 
 
 def _clean(value: Any) -> str:
@@ -53,6 +66,25 @@ def _host(url: str) -> str:
         return ""
 
 
+def _host_matches(host: str, domain: str) -> bool:
+    return host == domain or host.endswith(f".{domain}")
+
+
+def _is_safe_direct_image_host(host: str) -> bool:
+    return any(_host_matches(host, domain) for domain in SAFE_DIRECT_IMAGE_HOSTS)
+
+
+def _looks_like_image_asset(source_url: str, filename_hint: str = "") -> bool:
+    lower_hint = _clean(filename_hint).lower()
+    if lower_hint.endswith(DIRECT_IMAGE_EXTENSIONS):
+        return True
+    try:
+        lower_path = urlparse(source_url).path.lower()
+    except Exception:
+        lower_path = ""
+    return lower_path.endswith(DIRECT_IMAGE_EXTENSIONS)
+
+
 def is_blocked_listing_url(url: str) -> bool:
     host = _host(url)
     return any(host == domain or host.endswith(f".{domain}") for domain in BLOCKED_LISTING_DOMAINS)
@@ -84,8 +116,19 @@ def build_download_candidate(url: str, filename_hint: str = "") -> Optional[Dict
 
     file_name = _clean(filename_hint) or "broker attachment"
     host = _host(source_url)
+    is_direct_image = (
+        _is_safe_direct_image_host(host)
+        and (_looks_like_image_asset(source_url, file_name) or host.endswith("googleusercontent.com"))
+    )
     drive_id = _drive_file_id(source_url)
     if drive_id:
+        if is_direct_image:
+            return {
+                "downloadUrl": f"https://drive.google.com/uc?export=download&id={drive_id}",
+                "sourceType": "direct_image",
+                "sourceLabel": f"Broker image: {file_name}",
+                "sourceUrl": source_url,
+            }
         return {
             "downloadUrl": f"https://drive.google.com/uc?export=download&id={drive_id}",
             "sourceType": "google_drive_pdf",
@@ -94,10 +137,25 @@ def build_download_candidate(url: str, filename_hint: str = "") -> Optional[Dict
         }
 
     if host.endswith("dropbox.com"):
+        if is_direct_image:
+            return {
+                "downloadUrl": _dropbox_download_url(source_url),
+                "sourceType": "direct_image",
+                "sourceLabel": f"Broker image: {file_name}",
+                "sourceUrl": source_url,
+            }
         return {
             "downloadUrl": _dropbox_download_url(source_url),
             "sourceType": "dropbox_pdf",
             "sourceLabel": f"Broker flyer: {file_name}",
+            "sourceUrl": source_url,
+        }
+
+    if is_direct_image:
+        return {
+            "downloadUrl": source_url,
+            "sourceType": "direct_image",
+            "sourceLabel": f"Broker image: {file_name}",
             "sourceUrl": source_url,
         }
 

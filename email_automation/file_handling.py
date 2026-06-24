@@ -777,6 +777,8 @@ def fetch_and_process_linked_assets(urls: List[str], max_assets: int = 3) -> Lis
             continue
 
         name = _filename_from_asset_url(candidate.get("sourceUrl") or source_url, filename_hint)
+        if candidate.get("sourceType") == "direct_image" and not name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            name = "broker property image.png"
         try:
             content, content_type = _download_linked_asset(candidate["downloadUrl"])
         except Exception as e:
