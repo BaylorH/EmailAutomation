@@ -262,11 +262,15 @@ class PropertyImageFileHandlingTests(unittest.TestCase):
         from email_automation import file_handling
 
         response = type("Response", (), {})()
-        response.content = b"%PDF linked flyer"
+        response.url = "https://www.dropbox.com/scl/fi/key/912-Gemini-Flyer.pdf?dl=1"
+        response.status_code = 200
         response.headers = {"content-type": "application/pdf"}
         response.raise_for_status = lambda: None
+        response.iter_content = lambda chunk_size=65536: iter([b"%PDF linked flyer"])
 
-        with patch.object(file_handling.requests, "get", return_value=response), patch.object(
+        with patch.object(file_handling.socket, "getaddrinfo", return_value=[
+            (None, None, None, None, ("93.184.216.34", 443)),
+        ]), patch.object(file_handling.requests, "get", return_value=response), patch.object(
             file_handling,
             "process_pdf_for_ai",
             return_value={
@@ -329,6 +333,45 @@ class PropertyImageFileHandlingTests(unittest.TestCase):
         )
         self.assertNotIn("PNG_BYTES", repr(processed[0]))
         self.assertNotIn("RAW_SIGNAL_BYTES_SHOULD_NOT_LEAK", repr(processed[0]))
+
+    def test_linked_asset_download_rejects_private_network_targets_before_request(self):
+        from email_automation import file_handling
+
+        with patch.object(file_handling.requests, "get") as mock_get:
+            with self.assertRaises(ValueError):
+                file_handling._download_linked_asset("https://127.0.0.1/flyer.pdf")
+
+        mock_get.assert_not_called()
+
+    def test_linked_asset_download_streams_and_stops_at_size_cap(self):
+        from email_automation import file_handling
+
+        class StreamingResponse:
+            url = "https://broker.example/flyer.pdf"
+            status_code = 200
+            headers = {"content-type": "application/pdf"}
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size=65536):
+                yield b"1234"
+                yield b"56"
+
+        with patch.object(file_handling, "MAX_LINKED_PROPERTY_ASSET_BYTES", 5), patch.object(
+            file_handling,
+            "_validate_public_https_url",
+            return_value="https://broker.example/flyer.pdf",
+        ), patch.object(
+            file_handling.requests,
+            "get",
+            return_value=StreamingResponse(),
+        ) as mock_get:
+            with self.assertRaises(ValueError):
+                file_handling._download_linked_asset("https://broker.example/flyer.pdf")
+
+        mock_get.assert_called_once()
+        self.assertTrue(mock_get.call_args.kwargs.get("stream"))
 
 
 if __name__ == "__main__":

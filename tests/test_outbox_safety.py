@@ -412,6 +412,56 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(audit_payload["maxAttempts"], email_module.MAX_OUTBOX_ATTEMPTS)
         self.assertIn("Request failed after 3 attempts", audit_payload["lastError"])
 
+    def test_partial_send_retry_keeps_only_failed_recipients(self):
+        doc = FakeDoc({
+            "assignedEmails": [
+                "bp21harrison+sent@gmail.com",
+                "bp21harrison+failed@gmail.com",
+            ],
+            "script": "Hi,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "123 Partial Send Way",
+            "rowNumber": 21,
+            "attempts": 0,
+            "actionAuditId": "audit-partial",
+            "followUpConfig": {"enabled": False},
+        }, doc_id="outbox-partial")
+        fake_fs = FakeFirestore()
+
+        def send_result(_user_id, _headers, _script, recipients, **_kwargs):
+            recipient = recipients[0]
+            if recipient == "bp21harrison+sent@gmail.com":
+                return {
+                    "sent": [recipient],
+                    "errors": {},
+                    "sentMessageIds": {recipient: "graph-sent-1"},
+                }
+            return {
+                "sent": [],
+                "errors": {recipient: "Graph send failed"},
+            }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
+             patch.object(email_module, "send_and_index_email", side_effect=send_result):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        retry_payload = doc.reference.set_calls[-1][0][0]
+        self.assertEqual(["bp21harrison+failed@gmail.com"], retry_payload["assignedEmails"])
+        self.assertEqual(["bp21harrison+sent@gmail.com"], retry_payload["sentRecipients"])
+        self.assertIn("Graph send failed", retry_payload["lastError"])
+
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual(audit_payload["status"], "retrying")
+        self.assertEqual(audit_payload["sentRecipients"], ["bp21harrison+sent@gmail.com"])
+        self.assertEqual(audit_payload["remainingRecipients"], ["bp21harrison+failed@gmail.com"])
+
     def test_decrement_notification_rollups_clamps_counts(self):
         updated = notifications_module._decrement_notification_rollups(
             {

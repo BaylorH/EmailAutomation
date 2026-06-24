@@ -94,19 +94,23 @@ def _mark_outbox_action_audit_retrying(
     data: Dict[str, Any],
     attempts: int,
     error_msg: str,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Expose a retryable send failure without terminalizing the action."""
+    payload = {
+        "attempts": attempts,
+        "maxAttempts": MAX_OUTBOX_ATTEMPTS,
+        "lastError": error_msg,
+        "lastFailedAt": SERVER_TIMESTAMP,
+    }
+    if extra:
+        payload.update({k: v for k, v in extra.items() if v is not None})
     _terminalize_outbox_action_audit(
         user_id,
         doc_ref,
         data,
         "retrying",
-        {
-            "attempts": attempts,
-            "maxAttempts": MAX_OUTBOX_ATTEMPTS,
-            "lastError": error_msg,
-            "lastFailedAt": SERVER_TIMESTAMP,
-        },
+        payload,
     )
 
 
@@ -2018,9 +2022,33 @@ def _send_single_outbox_item(
     else:
         new_attempts = attempts + 1
         error_msg = json.dumps(all_errors)[:1500]
+        sent_set = {email for email in all_sent if isinstance(email, str)}
+        previous_sent = [
+            email for email in data.get("sentRecipients", [])
+            if isinstance(email, str)
+        ]
+        sent_recipients = []
+        for email in previous_sent + [email for email in emails if email in sent_set]:
+            if email not in sent_recipients:
+                sent_recipients.append(email)
+        remaining_recipients = [email for email in emails if email not in sent_set]
+        partial_send_retry = bool(all_sent and remaining_recipients and remaining_recipients != emails)
+        retry_extra = {}
+        if partial_send_retry:
+            retry_extra = {
+                "assignedEmails": remaining_recipients,
+                "sentRecipients": sent_recipients,
+                "partialSend": True,
+            }
+        audit_retry_extra = {
+            "sentRecipients": sent_recipients or None,
+            "remainingRecipients": remaining_recipients if partial_send_retry else None,
+            "partialSend": True if partial_send_retry else None,
+        }
 
         if new_attempts >= MAX_OUTBOX_ATTEMPTS:
-            _move_to_dead_letter(user_id, d.reference, data, f"Send errors after {new_attempts} attempts: {error_msg}")
+            dead_letter_data = {**data, **retry_extra} if retry_extra else data
+            _move_to_dead_letter(user_id, d.reference, dead_letter_data, f"Send errors after {new_attempts} attempts: {error_msg}")
         else:
             # Release claim and update attempts so it can be retried
             d.reference.set(
@@ -2030,6 +2058,7 @@ def _send_single_outbox_item(
                     "status": "retrying",
                     "processingBy": None,
                     "processingAt": None,
+                    **retry_extra,
                 },
                 merge=True,
             )
@@ -2039,6 +2068,7 @@ def _send_single_outbox_item(
                 data,
                 new_attempts,
                 error_msg,
+                extra=audit_retry_extra,
             )
             print(f"⚠️ Kept item {d.id} with error; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
 

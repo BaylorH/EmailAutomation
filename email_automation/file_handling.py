@@ -1,11 +1,13 @@
 import os
 import base64
 import hashlib
+import ipaddress
 import re
 import requests
+import socket
 import tempfile
 from typing import List, Dict, Any, Tuple, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
@@ -582,22 +584,97 @@ def _filename_from_asset_url(url: str, fallback: str = "broker flyer.pdf") -> st
     return fallback
 
 
+def _is_public_ip_address(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return False
+
+
+def _validate_public_https_url(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme.lower() != "https":
+        raise ValueError("linked property asset URL must use https")
+
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise ValueError("linked property asset URL is missing a host")
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        raise ValueError("linked property asset URL points to a local host")
+
+    try:
+        literal_ip = ipaddress.ip_address(host)
+        if not literal_ip.is_global:
+            raise ValueError("linked property asset URL points to a private or reserved address")
+        return url
+    except ValueError as exc:
+        if "private or reserved" in str(exc):
+            raise
+
+    try:
+        address_infos = socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"linked property asset host could not be resolved: {host}") from exc
+
+    resolved_ips = {info[4][0] for info in address_infos if info and len(info) >= 5 and info[4]}
+    if not resolved_ips:
+        raise ValueError(f"linked property asset host had no resolved addresses: {host}")
+
+    for ip_text in resolved_ips:
+        if not _is_public_ip_address(ip_text):
+            raise ValueError("linked property asset URL resolves to a private or reserved address")
+
+    return url
+
+
 def _download_linked_asset(download_url: str) -> tuple[bytes, str]:
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; SiteSiftAI/1.0; property-image-resolver)"
     }
-    response = requests.get(
-        download_url,
-        headers=headers,
-        timeout=30,
-        allow_redirects=True,
-    )
-    response.raise_for_status()
+    current_url = _validate_public_https_url(download_url)
+    response = None
 
-    content = response.content or b""
-    if len(content) > MAX_LINKED_PROPERTY_ASSET_BYTES:
-        raise ValueError(f"linked property asset is too large ({len(content)} bytes)")
-    return content, (response.headers.get("content-type") or "").lower()
+    for _ in range(6):
+        response = requests.get(
+            current_url,
+            headers=headers,
+            timeout=30,
+            allow_redirects=False,
+            stream=True,
+        )
+        if 300 <= response.status_code < 400 and response.headers.get("location"):
+            current_url = _validate_public_https_url(urljoin(current_url, response.headers["location"]))
+            continue
+        break
+    else:
+        raise ValueError("linked property asset redirected too many times")
+
+    response.raise_for_status()
+    final_url = getattr(response, "url", current_url)
+    if final_url:
+        _validate_public_https_url(final_url)
+
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            expected_bytes = int(content_length)
+            if expected_bytes > MAX_LINKED_PROPERTY_ASSET_BYTES:
+                raise ValueError(f"linked property asset is too large ({expected_bytes} bytes)")
+        except ValueError as exc:
+            if "too large" in str(exc):
+                raise
+
+    chunks = []
+    total_bytes = 0
+    for chunk in response.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        total_bytes += len(chunk)
+        if total_bytes > MAX_LINKED_PROPERTY_ASSET_BYTES:
+            raise ValueError(f"linked property asset is too large ({total_bytes} bytes)")
+        chunks.append(chunk)
+
+    return b"".join(chunks), (response.headers.get("content-type") or "").lower()
 
 
 def _attach_pdf_property_preview(
