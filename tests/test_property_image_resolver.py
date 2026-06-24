@@ -258,6 +258,78 @@ class PropertyImageFileHandlingTests(unittest.TestCase):
         self.assertNotIn("RAW_SIGNAL_BYTES_SHOULD_NOT_LEAK", repr(processed[0]))
         self.assertNotIn("RAW_NESTED_SIGNAL_SHOULD_NOT_LEAK", repr(processed[0]))
 
+    def test_fetch_and_process_linked_assets_resolves_pdf_link_property_preview(self):
+        from email_automation import file_handling
+
+        response = type("Response", (), {})()
+        response.content = b"%PDF linked flyer"
+        response.headers = {"content-type": "application/pdf"}
+        response.raise_for_status = lambda: None
+
+        with patch.object(file_handling.requests, "get", return_value=response), patch.object(
+            file_handling,
+            "process_pdf_for_ai",
+            return_value={
+                "text": "912 Gemini St industrial availability with clear height and drive-in door",
+                "images": [],
+                "method": "local_extraction",
+            },
+        ), patch.object(
+            file_handling,
+            "upload_pdf_to_drive",
+            return_value="https://drive.google.com/file/d/linked-pdf/view",
+        ), patch.object(
+            file_handling,
+            "render_pdf_property_preview",
+            return_value={
+                "bytes": b"PNG_BYTES",
+                "pageNumber": 2,
+                "pageIndex": 1,
+                "pageCount": 4,
+                "strategy": "property_preview_heuristic_v1",
+                "selectionReason": "selected page with property-detail text",
+                "score": 9.25,
+                "signals": {
+                    "textChars": 320,
+                    "positiveTerms": ["sf", "clear height"],
+                    "negativeTerms": [],
+                    "rawPreviewBytes": "RAW_SIGNAL_BYTES_SHOULD_NOT_LEAK",
+                },
+            },
+        ), patch.object(
+            file_handling,
+            "upload_property_image_to_drive",
+            return_value={
+                "url": "https://drive.google.com/uc?export=view&id=linked-image",
+                "driveLink": "https://drive.google.com/file/d/linked-image/view",
+                "contentType": "image/png",
+                "byteCount": 9,
+                "sha256": "abc123",
+            },
+        ):
+            processed = file_handling.fetch_and_process_linked_assets([
+                "https://www.dropbox.com/scl/fi/key/912-Gemini-Flyer.pdf?dl=0",
+            ])
+
+        self.assertEqual(1, len(processed))
+        self.assertEqual("912-Gemini-Flyer.pdf", processed[0]["name"])
+        self.assertEqual("https://drive.google.com/file/d/linked-pdf/view", processed[0]["drive_link"])
+        self.assertEqual(
+            "https://drive.google.com/uc?export=view&id=linked-image",
+            processed[0]["property_image_url"],
+        )
+        self.assertEqual(
+            "Broker flyer link preview: 912-Gemini-Flyer.pdf, page 2",
+            processed[0]["property_image_source"],
+        )
+        self.assertEqual("broker_pdf_link_preview", processed[0]["property_image_source_type"])
+        self.assertEqual(
+            "https://www.dropbox.com/scl/fi/key/912-Gemini-Flyer.pdf?dl=0",
+            processed[0]["source_url"],
+        )
+        self.assertNotIn("PNG_BYTES", repr(processed[0]))
+        self.assertNotIn("RAW_SIGNAL_BYTES_SHOULD_NOT_LEAK", repr(processed[0]))
+
 
 if __name__ == "__main__":
     unittest.main()

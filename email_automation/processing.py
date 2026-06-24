@@ -19,7 +19,7 @@ from .messaging import (save_message, save_thread_root, index_message_id, index_
                        update_thread_status, get_thread_status, THREAD_STATUS)
 from .logging import write_message_order_test
 from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_row_anchor, check_missing_required_fields, _append_ai_meta
-from .file_handling import fetch_and_process_pdfs, upload_pdf_to_drive
+from .file_handling import fetch_and_process_linked_assets, fetch_and_process_pdfs, upload_pdf_to_drive
 from .notifications import (
     write_notification,
     add_client_notifications,
@@ -2565,14 +2565,31 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         
         # URL exploration - find URLs in message and fetch content for AI processing only
         url_texts = []
+        clean_urls = []
         url_pattern = r'https?://[^\s<>"\']+'
         urls_found = re.findall(url_pattern, _full_text)
         
         for url in urls_found[:3]:  # Limit to 3 URLs to avoid overwhelming
             clean = _sanitize_url(url)
+            clean_urls.append(clean)
             fetched_text = fetch_url_as_text(clean)
             if fetched_text:
                 url_texts.append({"url": clean, "text": fetched_text})
+
+        linked_asset_manifest = fetch_and_process_linked_assets(clean_urls)
+        if linked_asset_manifest:
+            pdf_manifest.extend(linked_asset_manifest)
+            for asset in linked_asset_manifest:
+                link = asset.get("drive_link")
+                if not link:
+                    continue
+                filename = asset.get("name", "")
+                if is_floorplan_filename(filename):
+                    floorplan_links.append(link)
+                    print(f"   📐 Categorized linked asset as floorplan: {filename}")
+                else:
+                    flyer_links.append(link)
+                    print(f"   📄 Categorized linked asset as flyer: {filename}")
         
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)

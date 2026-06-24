@@ -5,6 +5,7 @@ import re
 import requests
 import tempfile
 from typing import List, Dict, Any, Tuple, Optional
+from urllib.parse import unquote, urlparse
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
@@ -343,6 +344,7 @@ SAFE_PREVIEW_SIGNAL_KEYS = (
     "positiveTerms",
     "negativeTerms",
 )
+MAX_LINKED_PROPERTY_ASSET_BYTES = int(os.getenv("LINKED_PROPERTY_ASSET_MAX_BYTES", str(20 * 1024 * 1024)))
 
 
 def _safe_preview_signal_value(value: Any) -> Any:
@@ -568,6 +570,183 @@ def upload_property_image_to_drive(name: str, content: bytes, folder_id: str = N
         print(f"❌ Failed to upload property preview image: {e}")
         return None
 
+
+def _filename_from_asset_url(url: str, fallback: str = "broker flyer.pdf") -> str:
+    try:
+        path = unquote(urlparse(url or "").path or "")
+        name = os.path.basename(path).strip()
+        if name:
+            return name
+    except Exception:
+        pass
+    return fallback
+
+
+def _download_linked_asset(download_url: str) -> tuple[bytes, str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; SiteSiftAI/1.0; property-image-resolver)"
+    }
+    response = requests.get(
+        download_url,
+        headers=headers,
+        timeout=30,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+
+    content = response.content or b""
+    if len(content) > MAX_LINKED_PROPERTY_ASSET_BYTES:
+        raise ValueError(f"linked property asset is too large ({len(content)} bytes)")
+    return content, (response.headers.get("content-type") or "").lower()
+
+
+def _attach_pdf_property_preview(
+    result: Dict[str, Any],
+    name: str,
+    content: bytes,
+    *,
+    source_label_prefix: str,
+    source_type: str,
+) -> None:
+    try:
+        preview = render_pdf_property_preview(content)
+        if not preview:
+            legacy_preview_bytes = render_pdf_first_page_preview(content)
+            preview = {
+                "bytes": legacy_preview_bytes,
+                "pageNumber": 1,
+                "pageIndex": 0,
+                "pageCount": 1,
+                "strategy": "first_page_preview_fallback",
+                "selectionReason": "fallback to first available preview page",
+                "score": 0,
+                "signals": {},
+            } if legacy_preview_bytes else None
+        if preview and preview.get("bytes"):
+            uploaded_preview = upload_property_image_to_drive(name, preview["bytes"])
+            if uploaded_preview and uploaded_preview.get("url"):
+                result["property_image_url"] = uploaded_preview["url"]
+                result["property_image_source"] = f"{source_label_prefix}: {name}, page {preview.get('pageNumber') or 1}"
+                result["property_image_source_type"] = source_type
+                result["property_image_meta"] = {
+                    "pageNumber": preview.get("pageNumber") or 1,
+                    "pageCount": preview.get("pageCount"),
+                    "strategy": preview.get("strategy"),
+                    "selectionReason": preview.get("selectionReason"),
+                    "score": preview.get("score"),
+                    "signals": _safe_preview_signals(preview.get("signals")),
+                    "contentType": uploaded_preview.get("contentType") or "image/png",
+                    "byteCount": uploaded_preview.get("byteCount"),
+                    "sha256": uploaded_preview.get("sha256"),
+                    "driveLink": uploaded_preview.get("driveLink"),
+                }
+    except Exception as e:
+        print(f"⚠️ Property preview image resolution failed: {e}")
+
+
+def _image_link_to_png_preview(content: bytes) -> Optional[bytes]:
+    if not (content and HAS_PILLOW):
+        return None
+    try:
+        image = Image.open(io.BytesIO(content))
+        image.thumbnail((1400, 1400))
+        if image.mode not in ("RGB", "RGBA"):
+            image = image.convert("RGB")
+        out = io.BytesIO()
+        image.save(out, format="PNG", optimize=True)
+        return out.getvalue()
+    except Exception as e:
+        print(f"⚠️ Could not normalize linked image preview: {e}")
+        return None
+
+
+def fetch_and_process_linked_assets(urls: List[str], max_assets: int = 3) -> List[Dict[str, Any]]:
+    """Process safe broker-provided PDF/image links into the same manifest shape as attachments."""
+    try:
+        from .property_images import build_download_candidate
+    except Exception as e:
+        print(f"⚠️ Could not import property image URL helpers: {e}")
+        return []
+
+    processed: List[Dict[str, Any]] = []
+    seen_urls = set()
+    for raw_url in urls or []:
+        if len(processed) >= max_assets:
+            break
+        source_url = str(raw_url or "").strip()
+        if not source_url or source_url in seen_urls:
+            continue
+        seen_urls.add(source_url)
+
+        filename_hint = _filename_from_asset_url(source_url)
+        candidate = build_download_candidate(source_url, filename_hint=filename_hint)
+        if not candidate:
+            continue
+
+        name = _filename_from_asset_url(candidate.get("sourceUrl") or source_url, filename_hint)
+        try:
+            content, content_type = _download_linked_asset(candidate["downloadUrl"])
+        except Exception as e:
+            print(f"⚠️ Failed to download linked property asset {source_url}: {e}")
+            continue
+
+        source_type = candidate.get("sourceType") or ""
+        is_pdf = source_type.endswith("_pdf") or "pdf" in content_type or name.lower().endswith(".pdf")
+        is_image = source_type == "direct_image" or content_type.startswith("image/")
+
+        if is_pdf:
+            print(f"\n🔗 Processing linked PDF: {name} ({len(content)} bytes)")
+            result = process_pdf_for_ai(content, name)
+            result["name"] = name
+            result["source_url"] = source_url
+            result["source_type"] = source_type
+            try:
+                result["drive_link"] = upload_pdf_to_drive(name, content)
+            except Exception as e:
+                print(f"⚠️ Linked PDF Drive upload failed: {e}")
+                result["drive_link"] = None
+            _attach_pdf_property_preview(
+                result,
+                name,
+                content,
+                source_label_prefix="Broker flyer link preview",
+                source_type="broker_pdf_link_preview",
+            )
+            processed.append(result)
+        elif is_image:
+            preview_bytes = _image_link_to_png_preview(content)
+            if not preview_bytes:
+                continue
+            print(f"\n🔗 Processing linked property image: {name} ({len(content)} bytes)")
+            uploaded_preview = upload_property_image_to_drive(name, preview_bytes)
+            if not (uploaded_preview and uploaded_preview.get("url")):
+                continue
+            processed.append({
+                "name": name,
+                "text": "",
+                "images": [],
+                "method": "direct_image_link",
+                "source_url": source_url,
+                "source_type": source_type,
+                "drive_link": None,
+                "property_image_url": uploaded_preview["url"],
+                "property_image_source": f"Broker image link: {name}",
+                "property_image_source_type": "broker_image_link",
+                "property_image_meta": {
+                    "strategy": "direct_image_link_v1",
+                    "selectionReason": "broker-provided public image link",
+                    "contentType": uploaded_preview.get("contentType") or "image/png",
+                    "byteCount": uploaded_preview.get("byteCount"),
+                    "sha256": uploaded_preview.get("sha256"),
+                    "driveLink": uploaded_preview.get("driveLink"),
+                },
+            })
+
+    if processed:
+        print(f"🖼️ Resolved {len(processed)} linked property asset(s)")
+    return processed
+
+
 def upload_pdf_user_data(filename: str, content: bytes) -> str:
     """Upload PDF to OpenAI with purpose='user_data' and return file_id."""
     try:
@@ -626,40 +805,13 @@ def fetch_and_process_pdfs(headers: Dict[str, str], graph_msg_id: str) -> List[D
             print(f"⚠️ Drive upload failed: {e}")
             result['drive_link'] = None
 
-        try:
-            preview = render_pdf_property_preview(content)
-            if not preview:
-                legacy_preview_bytes = render_pdf_first_page_preview(content)
-                preview = {
-                    "bytes": legacy_preview_bytes,
-                    "pageNumber": 1,
-                    "pageIndex": 0,
-                    "pageCount": 1,
-                    "strategy": "first_page_preview_fallback",
-                    "selectionReason": "fallback to first available preview page",
-                    "score": 0,
-                    "signals": {},
-                } if legacy_preview_bytes else None
-            if preview and preview.get("bytes"):
-                uploaded_preview = upload_property_image_to_drive(name, preview["bytes"])
-                if uploaded_preview and uploaded_preview.get("url"):
-                    result["property_image_url"] = uploaded_preview["url"]
-                    result["property_image_source"] = f"Broker flyer preview: {name}, page {preview.get('pageNumber') or 1}"
-                    result["property_image_source_type"] = "broker_pdf_preview"
-                    result["property_image_meta"] = {
-                        "pageNumber": preview.get("pageNumber") or 1,
-                        "pageCount": preview.get("pageCount"),
-                        "strategy": preview.get("strategy"),
-                        "selectionReason": preview.get("selectionReason"),
-                        "score": preview.get("score"),
-                        "signals": _safe_preview_signals(preview.get("signals")),
-                        "contentType": uploaded_preview.get("contentType") or "image/png",
-                        "byteCount": uploaded_preview.get("byteCount"),
-                        "sha256": uploaded_preview.get("sha256"),
-                        "driveLink": uploaded_preview.get("driveLink"),
-                    }
-        except Exception as e:
-            print(f"⚠️ Property preview image resolution failed: {e}")
+        _attach_pdf_property_preview(
+            result,
+            name,
+            content,
+            source_label_prefix="Broker flyer preview",
+            source_type="broker_pdf_preview",
+        )
 
         processed.append(result)
 
