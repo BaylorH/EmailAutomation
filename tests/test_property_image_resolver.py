@@ -29,6 +29,10 @@ class PropertyImageResolverTests(unittest.TestCase):
             "https://broker.example.com/flyers/4402-Rex-Rd.pdf",
             filename_hint="4402 Rex Rd Flyer.pdf",
         )
+        generic_page = build_download_candidate(
+            "https://broker.example.com/listings/4402-rex-rd",
+            filename_hint="4402 Rex Rd",
+        )
         direct_image = build_download_candidate(
             "https://lh3.googleusercontent.com/p/AF1QipExample=w1200-h800",
             filename_hint="410 Genesis Blvd.jpg",
@@ -46,7 +50,13 @@ class PropertyImageResolverTests(unittest.TestCase):
         )
         self.assertEqual("dropbox_pdf", dropbox["sourceType"])
         self.assertIsNone(loopnet)
-        self.assertIsNone(direct_pdf)
+        self.assertEqual(
+            "https://broker.example.com/flyers/4402-Rex-Rd.pdf",
+            direct_pdf["downloadUrl"],
+        )
+        self.assertEqual("public_pdf", direct_pdf["sourceType"])
+        self.assertIn("4402 Rex Rd Flyer.pdf", direct_pdf["sourceLabel"])
+        self.assertIsNone(generic_page)
         self.assertEqual(
             "https://lh3.googleusercontent.com/p/AF1QipExample=w1200-h800",
             direct_image["downloadUrl"],
@@ -402,12 +412,39 @@ class PropertyImageFileHandlingTests(unittest.TestCase):
 
         mock_get.assert_not_called()
 
-    def test_linked_asset_download_rejects_unknown_hosts_before_request(self):
+    def test_linked_asset_download_allows_public_direct_asset_hosts(self):
+        from email_automation import file_handling
+
+        class Response:
+            url = "https://broker.example.com/flyer.pdf"
+            status_code = 200
+            headers = {"content-type": "application/pdf"}
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size=65536):
+                yield b"%PDF broker flyer"
+
+        with patch.object(file_handling.socket, "getaddrinfo", return_value=[
+            (None, None, None, None, ("93.184.216.34", 443)),
+        ]), patch.object(file_handling.requests, "get", return_value=Response()) as mock_get:
+            content, content_type = file_handling._download_linked_asset(
+                "https://broker.example.com/flyer.pdf"
+            )
+
+        self.assertEqual(b"%PDF broker flyer", content)
+        self.assertEqual("application/pdf", content_type)
+        mock_get.assert_called_once()
+
+    def test_linked_asset_download_rejects_blocked_listing_hosts_before_request(self):
         from email_automation import file_handling
 
         with patch.object(file_handling.requests, "get") as mock_get:
             with self.assertRaises(ValueError):
-                file_handling._download_linked_asset("https://broker.example.com/flyer.pdf")
+                file_handling._download_linked_asset(
+                    "https://www.loopnet.com/Listing/902-910-Gemini-Houston-TX/40231241/"
+                )
 
         mock_get.assert_not_called()
 

@@ -24,6 +24,9 @@ DIRECT_IMAGE_EXTENSIONS = (
     ".webp",
     ".gif",
 )
+DIRECT_PDF_EXTENSIONS = (
+    ".pdf",
+)
 SAFE_DIRECT_IMAGE_HOSTS = (
     "drive.google.com",
     "googleusercontent.com",
@@ -85,6 +88,17 @@ def _looks_like_image_asset(source_url: str, filename_hint: str = "") -> bool:
     return lower_path.endswith(DIRECT_IMAGE_EXTENSIONS)
 
 
+def _looks_like_pdf_asset(source_url: str, filename_hint: str = "") -> bool:
+    lower_hint = _clean(filename_hint).lower()
+    if lower_hint.endswith(DIRECT_PDF_EXTENSIONS):
+        return True
+    try:
+        lower_path = urlparse(source_url).path.lower()
+    except Exception:
+        lower_path = ""
+    return lower_path.endswith(DIRECT_PDF_EXTENSIONS)
+
+
 def is_blocked_listing_url(url: str) -> bool:
     host = _host(url)
     return any(host == domain or host.endswith(f".{domain}") for domain in BLOCKED_LISTING_DOMAINS)
@@ -116,10 +130,11 @@ def build_download_candidate(url: str, filename_hint: str = "") -> Optional[Dict
 
     file_name = _clean(filename_hint) or "broker attachment"
     host = _host(source_url)
-    is_direct_image = (
-        _is_safe_direct_image_host(host)
-        and (_looks_like_image_asset(source_url, file_name) or host.endswith("googleusercontent.com"))
+    looks_like_image = _looks_like_image_asset(source_url, file_name)
+    is_direct_image = looks_like_image or (
+        _is_safe_direct_image_host(host) and host.endswith("googleusercontent.com")
     )
+    is_direct_pdf = _looks_like_pdf_asset(source_url, file_name)
     drive_id = _drive_file_id(source_url)
     if drive_id:
         if is_direct_image:
@@ -156,6 +171,14 @@ def build_download_candidate(url: str, filename_hint: str = "") -> Optional[Dict
             "downloadUrl": source_url,
             "sourceType": "direct_image",
             "sourceLabel": f"Broker image: {file_name}",
+            "sourceUrl": source_url,
+        }
+
+    if is_direct_pdf:
+        return {
+            "downloadUrl": source_url,
+            "sourceType": "public_pdf",
+            "sourceLabel": f"Broker flyer: {file_name}",
             "sourceUrl": source_url,
         }
 
