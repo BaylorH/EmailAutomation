@@ -247,6 +247,24 @@ class JillJuneRegressionTests(unittest.TestCase):
 
         self.assertTrue(processing._has_new_property_path(events))
 
+    def test_new_property_event_text_tolerates_null_fields(self):
+        event = {
+            "type": "new_property",
+            "address": None,
+            "city": None,
+            "email": None,
+            "contactName": None,
+            "link": None,
+            "notes": None,
+        }
+
+        self.assertEqual("", processing._event_text(event, "address"))
+        self.assertEqual("", processing._event_text(event, "city"))
+        self.assertEqual("", processing._event_text(event, "email"))
+        self.assertEqual("", processing._event_text(event, "contactName"))
+        self.assertEqual("", processing._event_text(event, "link"))
+        self.assertEqual("", processing._event_text(event, "notes"))
+
     def test_terminalized_original_row_skips_stale_operator_escalations(self):
         for event_type in [
             "tour_requested",
