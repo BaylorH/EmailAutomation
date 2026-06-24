@@ -1,5 +1,6 @@
 import atexit
 import json
+import os
 from datetime import datetime
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token
@@ -22,6 +23,11 @@ from email_automation.system_health import record_user_health
 PROCESSED_MESSAGES_THRESHOLD = 500
 SHEET_CHANGELOG_THRESHOLD = 100
 GRAPH_TOKEN_REFRESH_BUFFER_SECONDS = 15 * 60
+
+
+def _processing_failure_retry_enabled() -> bool:
+    value = os.getenv("SITESIFT_ENABLE_PROCESSING_FAILURE_RETRY", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _headers_from_access_token(access_token: str) -> dict:
@@ -247,7 +253,10 @@ def refresh_and_process_user(user_id: str):
         scan_sent_items_for_manual_replies(user_id, get_graph_headers(), top=50)
     )
 
-    retry_processing_failures(user_id, get_graph_headers())
+    if _processing_failure_retry_enabled():
+        retry_processing_failures(user_id, get_graph_headers())
+    else:
+        print("ℹ️ Stored processing failure replay disabled; failures remain visible for review")
 
     # Retry any pending responses that failed to send previously
     process_pending_responses(user_id, get_graph_headers())
