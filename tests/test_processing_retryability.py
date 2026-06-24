@@ -84,6 +84,82 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         retry_doc.reference.delete.assert_not_called()
         missing_id_doc.reference.delete.assert_not_called()
 
+    def test_retry_processing_failures_processes_exact_graph_message_and_clears_success(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__message-1"
+        failure_doc.to_dict.return_value = {
+            "threadId": "thread-1",
+            "messageId": "message-1",
+            "retryable": True,
+            "processingAttempts": 1,
+        }
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value.collection.return_value = failures_collection
+        graph_response = MagicMock()
+        graph_response.json.return_value = {
+            "id": "message-1",
+            "subject": "RE: 16 Jupiter Ln",
+            "internetMessageId": "<message-1@example.test>",
+            "conversationId": "conversation-1",
+        }
+
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "has_processed", return_value=False), \
+             patch.object(processing, "exponential_backoff_request", return_value=graph_response), \
+             patch.object(processing, "process_inbox_message") as process_message, \
+             patch.object(processing, "mark_processed") as mark_processed:
+            result = processing.retry_processing_failures("uid-1", {"Authorization": "Bearer fake"})
+
+        self.assertEqual(
+            {"checked": 1, "retried": 1, "succeeded": 1, "failed": 0, "skipped": 0},
+            result,
+        )
+        process_message.assert_called_once()
+        mark_processed.assert_any_call("uid-1", "message-1")
+        mark_processed.assert_any_call("uid-1", "<message-1@example.test>")
+        self.assertEqual(2, mark_processed.call_count)
+        failure_doc.reference.delete.assert_called_once()
+
+    def test_retry_processing_failures_keeps_retryable_message_visible_on_retry_error(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__message-1"
+        failure_doc.to_dict.return_value = {
+            "threadId": "thread-1",
+            "messageId": "message-1",
+            "retryable": True,
+            "processingAttempts": 1,
+        }
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value.collection.return_value = failures_collection
+        graph_response = MagicMock()
+        graph_response.json.return_value = {
+            "id": "message-1",
+            "internetMessageId": "<message-1@example.test>",
+        }
+
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "has_processed", return_value=False), \
+             patch.object(processing, "exponential_backoff_request", return_value=graph_response), \
+             patch.object(processing, "process_inbox_message", side_effect=processing.RetryableProcessingError("still failing")), \
+             patch.object(processing, "mark_processed") as mark_processed:
+            result = processing.retry_processing_failures("uid-1", {"Authorization": "Bearer fake"}, max_attempts=3)
+
+        self.assertEqual(
+            {"checked": 1, "retried": 1, "succeeded": 0, "failed": 1, "skipped": 0},
+            result,
+        )
+        mark_processed.assert_not_called()
+        failure_doc.reference.delete.assert_not_called()
+        failure_doc.reference.set.assert_called_once()
+        update_payload = failure_doc.reference.set.call_args.args[0]
+        self.assertEqual(2, update_payload["processingAttempts"])
+        self.assertTrue(update_payload["retryable"])
+        self.assertIn("still failing", update_payload["lastRetryError"])
+
     def test_new_property_duplicate_check_fails_open_on_sheet_read_error(self):
         class FailingSheets:
             def spreadsheets(self):

@@ -6,6 +6,7 @@ import time
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
+from urllib.parse import quote
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
@@ -317,6 +318,100 @@ def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[
         print(
             "🧹 Processing failure reconciliation: "
             f"checked={result['checked']}, cleared={result['cleared']}, retained={result['retained']}"
+        )
+    return result
+
+
+def _fetch_graph_message_by_id(headers: Dict[str, str], message_id: str) -> Dict[str, Any]:
+    encoded_id = quote(str(message_id or ""), safe="")
+    response = exponential_backoff_request(
+        lambda: requests.get(
+            f"https://graph.microsoft.com/v1.0/me/messages/{encoded_id}",
+            headers=headers,
+            params={
+                "$select": (
+                    "id,subject,from,toRecipients,receivedDateTime,sentDateTime,"
+                    "conversationId,internetMessageId,internetMessageHeaders,bodyPreview,hasAttachments"
+                )
+            },
+            timeout=30,
+        )
+    )
+    return response.json() or {}
+
+
+def retry_processing_failures(
+    user_id: str,
+    headers: Dict[str, str],
+    *,
+    limit: int = 10,
+    max_attempts: int = 3,
+) -> Dict[str, int]:
+    """Retry exact stored processing failures outside the inbox scan time window."""
+    result = {"checked": 0, "retried": 0, "succeeded": 0, "failed": 0, "skipped": 0}
+    try:
+        failures_ref = _fs.collection("users").document(user_id).collection("processingFailures")
+        query = failures_ref.limit(limit) if hasattr(failures_ref, "limit") else failures_ref
+        docs = list(query.stream())
+    except Exception as e:
+        print(f"⚠️ Could not read processing failures for retry: {e}")
+        return result
+
+    for doc in docs:
+        result["checked"] += 1
+        data = doc.to_dict() or {}
+        message_id = data.get("messageId")
+        thread_id = data.get("threadId")
+        attempts = int(data.get("processingAttempts") or 0)
+
+        if not data.get("retryable", True) or not message_id or attempts >= max_attempts:
+            result["skipped"] += 1
+            continue
+
+        if has_processed(user_id, message_id):
+            doc.reference.delete()
+            result["skipped"] += 1
+            continue
+
+        result["retried"] += 1
+        processing_error = None
+        try:
+            msg = _fetch_graph_message_by_id(headers, message_id)
+            if not msg.get("id"):
+                raise RetryableProcessingError("Graph message fetch returned no message id")
+            process_inbox_message(user_id, headers, msg)
+            processed_keys = [
+                key
+                for key in [message_id, msg.get("id"), msg.get("internetMessageId")]
+                if key
+            ]
+            for processed_key in dict.fromkeys(processed_keys):
+                mark_processed(user_id, processed_key)
+            doc.reference.delete()
+            result["succeeded"] += 1
+        except Exception as e:
+            processing_error = e
+            result["failed"] += 1
+            next_attempts = attempts + 1
+            still_retryable = not _should_mark_processed_after_error(e) and next_attempts < max_attempts
+            try:
+                doc.reference.set({
+                    "processingAttempts": next_attempts,
+                    "retryable": still_retryable,
+                    "lastRetryAt": SERVER_TIMESTAMP,
+                    "lastRetryError": str(e),
+                    "updatedAt": SERVER_TIMESTAMP,
+                }, merge=True)
+            except Exception as update_error:
+                print(f"⚠️ Could not update processing failure retry state: {update_error}")
+            if _should_mark_processed_after_error(processing_error):
+                mark_processed(user_id, message_id)
+
+    if result["checked"]:
+        print(
+            "🔁 Processing failure retry: "
+            f"checked={result['checked']}, retried={result['retried']}, "
+            f"succeeded={result['succeeded']}, failed={result['failed']}, skipped={result['skipped']}"
         )
     return result
 

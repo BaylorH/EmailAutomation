@@ -7,6 +7,7 @@ from email_automation.clients import list_user_ids, decode_token_payload, _fs
 from email_automation.email import send_outboxes
 from email_automation.processing import (
     reconcile_stale_processing_failures,
+    retry_processing_failures,
     scan_inbox_against_index,
     scan_sent_items_for_manual_replies,
 )
@@ -245,6 +246,8 @@ def refresh_and_process_user(user_id: str):
     graph_operation_states.append(
         scan_sent_items_for_manual_replies(user_id, get_graph_headers(), top=50)
     )
+
+    retry_processing_failures(user_id, get_graph_headers())
 
     # Retry any pending responses that failed to send previously
     process_pending_responses(user_id, get_graph_headers())
