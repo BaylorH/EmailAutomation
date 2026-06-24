@@ -2037,6 +2037,11 @@ def _send_single_outbox_item(
                         user_id, thread_id, emails, subject_override,
                         script_content, user_signature, signature_mode, user_email
                     )
+                    if not (res.get("sentMessageId") or res.get("internetMessageId")):
+                        all_errors[recipient] = (
+                            "Graph accepted reply but Sent Items identity lookup failed; "
+                            "operator reconciliation required"
+                        )
                 else:
                     all_errors[emails[0] if emails else "unknown"] = res.get("error", "Unknown error")
 

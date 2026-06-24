@@ -100,6 +100,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
             "attempts": 0,
             "rowNumber": 12,
             "contactName": "Casey Broker",
+            "followUpConfig": {"enabled": False},
         })
 
     @patch.object(email_module, "_claim_outbox_item", return_value=True)
@@ -180,7 +181,12 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
 
     @patch.object(email_module, "_claim_outbox_item", return_value=True)
     @patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com")
-    @patch.object(email_module, "_send_outbox_as_reply", return_value={"sent": True, "error": None})
+    @patch.object(email_module, "_send_outbox_as_reply", return_value={
+        "sent": True,
+        "error": None,
+        "sentMessageId": "graph-reply-message-1",
+        "internetMessageId": "<graph-reply-message-1@example.com>",
+    })
     @patch.object(email_module, "_save_outbox_reply_message", create=True)
     @patch.object(email_module, "send_and_index_email")
     @patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1")
@@ -209,10 +215,56 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
         self.assertTrue(doc.reference.deleted)
 
     @patch.object(email_module, "_claim_outbox_item", return_value=True)
+    @patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com")
+    @patch.object(email_module, "_send_outbox_as_reply", return_value={"sent": True, "error": None})
+    @patch.object(email_module, "_save_outbox_reply_message", create=True)
+    @patch.object(email_module, "_record_outbox_reconciliation")
+    @patch.object(email_module, "_finalize_successful_outbox_item")
+    @patch.object(email_module, "send_and_index_email")
+    @patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1")
+    @patch.object(email_module, "highlight_row")
+    def test_graph_reply_without_graph_identity_moves_to_reconciliation(
+        self,
+        _highlight_row,
+        _get_sheet_id_or_fail,
+        send_and_index_email,
+        finalize_successful_outbox_item,
+        record_outbox_reconciliation,
+        save_outbox_reply_message,
+        send_outbox_as_reply,
+        _get_reply_message_sender,
+        _claim_outbox_item,
+    ):
+        doc = self._thread_reply_outbox("bp21harrison@gmail.com")
+
+        email_module._send_single_outbox_item(
+            "uid-1",
+            {"Authorization": "Bearer token"},
+            {"doc": doc, "data": doc.to_dict()},
+        )
+
+        send_and_index_email.assert_not_called()
+        send_outbox_as_reply.assert_called_once()
+        save_outbox_reply_message.assert_called_once()
+        finalize_successful_outbox_item.assert_not_called()
+        record_outbox_reconciliation.assert_called_once()
+        args, kwargs = record_outbox_reconciliation.call_args
+        self.assertEqual(args[0], "uid-1")
+        self.assertIs(args[1], doc.reference)
+        self.assertIn("Graph accepted reply", args[3])
+        self.assertEqual(args[5], ["bp21harrison@gmail.com"])
+        self.assertTrue(kwargs["delete_original"])
+
+    @patch.object(email_module, "_claim_outbox_item", return_value=True)
     @patch.object(email_module, "_get_thread_row_number", return_value=9, create=True)
     @patch.object(email_module, "_find_row_by_email", return_value=(3, []))
     @patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com")
-    @patch.object(email_module, "_send_outbox_as_reply", return_value={"sent": True, "error": None})
+    @patch.object(email_module, "_send_outbox_as_reply", return_value={
+        "sent": True,
+        "error": None,
+        "sentMessageId": "graph-reply-message-1",
+        "internetMessageId": "<graph-reply-message-1@example.com>",
+    })
     @patch.object(email_module, "_save_outbox_reply_message", create=True)
     @patch.object(email_module, "send_and_index_email")
     @patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1")

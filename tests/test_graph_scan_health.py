@@ -146,6 +146,7 @@ class GraphScanHealthTests(unittest.TestCase):
                  patch.object(main, "process_pending_responses"), \
                  patch.object(main, "check_and_send_followups"), \
                  patch.object(main, "auto_cleanup_firestore"), \
+                 patch.object(main, "reconcile_stale_processing_failures"), \
                  patch.object(main, "record_user_health", side_effect=capture_health):
                 main.refresh_and_process_user("uid-1")
         finally:
@@ -187,6 +188,7 @@ class GraphScanHealthTests(unittest.TestCase):
                  patch.object(main, "process_pending_responses"), \
                  patch.object(main, "check_and_send_followups"), \
                  patch.object(main, "auto_cleanup_firestore"), \
+                 patch.object(main, "reconcile_stale_processing_failures"), \
                  patch.object(main, "record_user_health"):
                 main.refresh_and_process_user("uid-1")
         finally:
@@ -221,6 +223,7 @@ class GraphScanHealthTests(unittest.TestCase):
                  patch.object(main, "process_pending_responses"), \
                  patch.object(main, "check_and_send_followups"), \
                  patch.object(main, "auto_cleanup_firestore"), \
+                 patch.object(main, "reconcile_stale_processing_failures"), \
                  patch.object(main, "record_user_health"):
                 main.refresh_and_process_user("uid-1")
         finally:
@@ -252,6 +255,7 @@ class GraphScanHealthTests(unittest.TestCase):
                  patch.object(main, "process_pending_responses"), \
                  patch.object(main, "check_and_send_followups"), \
                  patch.object(main, "auto_cleanup_firestore"), \
+                 patch.object(main, "reconcile_stale_processing_failures"), \
                  patch.object(main, "record_user_health"):
                 main.refresh_and_process_user("uid-1")
         finally:
