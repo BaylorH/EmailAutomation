@@ -139,6 +139,44 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
     if not latest_text:
         return proposal
 
+    unavailable_patterns = [
+        ("no_longer_available", r"\bno\s+longer\s+available\b"),
+        ("signed_loi", r"\bsigned\s+(?:an?\s+)?(?:loi|letter\s+of\s+intent)\b"),
+        ("signed_lease", r"\bsigned\s+(?:a\s+)?lease\b"),
+        ("no_longer_represented", r"\bno\s+longer\s+represent(?:s|ed|ing)?\s+(?:this\s+|the\s+)?property\b"),
+        ("no_space_available", r"\b(?:no|not\s+any|do(?:es)?\s+not\s+have\s+any)\s+space\s+available\b"),
+        ("no_availability", r"\bno\s+availability\b"),
+        ("fully_leased", r"\bfully\s+leased\b"),
+    ]
+
+    property_unavailable_reason = None
+    if not looks_like_tour_only_unavailable(latest_text_raw):
+        if _looks_like_requirements_mismatch_nonviable(latest_text):
+            property_unavailable_reason = "requirements_mismatch"
+        else:
+            for reason, pattern in unavailable_patterns:
+                if re.search(pattern, latest_text):
+                    property_unavailable_reason = reason
+                    break
+
+    if property_unavailable_reason:
+        has_replacement_property = any((event or {}).get("type") == "new_property" for event in events)
+        conflicting_event_types = {"close_conversation"}
+        if not has_replacement_property:
+            conflicting_event_types.add("tour_requested")
+
+        retained_events = [
+            event for event in events
+            if (event or {}).get("type") not in conflicting_event_types
+        ]
+        if not any((event or {}).get("type") == "property_unavailable" for event in retained_events):
+            retained_events.insert(0, {
+                "type": "property_unavailable",
+                "reason": property_unavailable_reason,
+            })
+        proposal["events"] = retained_events
+        return proposal
+
     tour_reply_reason = None
     if looks_like_tour_only_unavailable(latest_text_raw):
         tour_reply_reason = "tour_unavailable"
@@ -161,25 +199,6 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
 
     if any((event or {}).get("type") == "property_unavailable" for event in events):
         return proposal
-
-    if _looks_like_requirements_mismatch_nonviable(latest_text):
-        events.insert(0, {"type": "property_unavailable", "reason": "requirements_mismatch"})
-        return proposal
-
-    unavailable_patterns = [
-        ("no_longer_available", r"\bno\s+longer\s+available\b"),
-        ("signed_loi", r"\bsigned\s+(?:an?\s+)?(?:loi|letter\s+of\s+intent)\b"),
-        ("signed_lease", r"\bsigned\s+(?:a\s+)?lease\b"),
-        ("no_longer_represented", r"\bno\s+longer\s+represent(?:s|ed|ing)?\s+(?:this\s+|the\s+)?property\b"),
-        ("no_space_available", r"\b(?:no|not\s+any|do(?:es)?\s+not\s+have\s+any)\s+space\s+available\b"),
-        ("no_availability", r"\bno\s+availability\b"),
-        ("fully_leased", r"\bfully\s+leased\b"),
-    ]
-
-    for reason, pattern in unavailable_patterns:
-        if re.search(pattern, latest_text):
-            events.insert(0, {"type": "property_unavailable", "reason": reason})
-            return proposal
 
     return proposal
 

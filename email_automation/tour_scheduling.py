@@ -77,6 +77,14 @@ def looks_like_tour_only_unavailable(text: str = "") -> bool:
             r"unavailable|cancelled|canceled|not\s+being\s+offered)\b",
             latest,
         )
+        or re.search(
+            rf"\bno\s+{tour_context}\s+availability\b",
+            latest,
+        )
+        or re.search(
+            rf"\bno\s+availability\s+for\s+{tour_context}\b",
+            latest,
+        )
     )
 
 

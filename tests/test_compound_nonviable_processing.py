@@ -122,6 +122,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         rownum=3,
         contact_name="Ryan",
         from_email="bp21harrison@gmail.com",
+        row_below_nonviable=False,
     ):
         user_id = "test-user"
         client_id = "client-1"
@@ -214,6 +215,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             patch.object(processing, "is_event_handled", return_value=False),
             patch.object(processing, "write_notification", side_effect=fake_write_notification),
             patch.object(processing, "mark_event_handled", side_effect=fake_mark_event_handled),
+            patch.object(processing, "_is_row_below_nonviable", return_value=row_below_nonviable),
             patch.object(processing, "ensure_nonviable_divider", return_value=10),
             patch.object(processing, "move_row_below_divider", side_effect=move_row),
             patch.object(processing, "sync_thread_row_numbers_after_move"),
@@ -251,6 +253,50 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "sendReply": send_reply,
             "threadRef": thread_ref,
         }
+
+    def test_property_unavailable_already_below_nonviable_stops_thread_without_moving_row(self):
+        body = "Hi Baylor,\n\nThis space would not be a good fit for your client.\n\nBest,\nBP21"
+        thread_id = "thread-already-nonviable"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 11,
+        })
+        proposal = {
+            "updates": [],
+            "events": [{"type": "property_unavailable", "reason": "requirements_mismatch"}],
+            "response_email": None,
+        }
+
+        result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body=body,
+            proposal=proposal,
+            thread_ref=thread_ref,
+            row_anchor="951 Tristar Dr",
+            rownum=11,
+            row_below_nonviable=True,
+        )
+
+        result["moveRow"].assert_not_called()
+        result["stopThreads"].assert_called_once_with(
+            "test-user",
+            11,
+            client_id="client-1",
+            reason="property_unavailable",
+        )
+        self.assertIn(
+            {"status": processing.THREAD_STATUS["stopped"], "reason": "property_unavailable"},
+            result["statusUpdates"],
+        )
+        self.assertTrue(
+            any(
+                handled["eventKey"].startswith("property_unavailable")
+                and handled["notifId"] is None
+                for handled in result["handledEvents"]
+            )
+        )
 
     def test_tour_invite_alternate_reply_processes_schedule_decision_without_auto_send(self):
         body = "Hi Baylor,\n\n10:15 AM does not work for us. Could we do 11:45 AM instead?\n\nBest,\nBP21"

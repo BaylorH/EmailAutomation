@@ -395,6 +395,33 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertIn("Tuesday, June 23, 2026", classification["suggestedEmail"])
         self.assertIn("4402 Rex Rd", classification["suggestedEmail"])
 
+    def test_tour_invite_no_tour_availability_stays_tour_specific(self):
+        for message in [
+            "There is no tour availability for this space right now.",
+            "There is no availability for tours this week.",
+        ]:
+            with self.subTest(message=message):
+                classification = processing._classify_tour_invite_reply(
+                    message,
+                    event={"type": "tour_requested", "question": message},
+                    thread_data={
+                        "source": "dashboard_tour_planner",
+                        "actionType": "tour_invite",
+                        "propertyAddress": "4402 Rex Rd",
+                        "tourInvite": {
+                            "tourDate": "2026-06-23",
+                            "arrivalTime": "10:47 AM",
+                            "departureTime": "11:17 AM",
+                        },
+                    },
+                    contact_name="Lawton",
+                    recipient_email="lawton@example.com",
+                )
+
+                self.assertEqual("tour_unavailable", classification["outcome"])
+                self.assertTrue(classification["needsOperatorAction"])
+                self.assertFalse(classification["canCloseThread"])
+
     def test_tour_invite_unavailable_reply_builds_durable_thread_state(self):
         payload = processing._build_tour_invite_reply_state_update({
             "outcome": "tour_unavailable",

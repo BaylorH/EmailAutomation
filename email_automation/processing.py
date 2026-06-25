@@ -2969,7 +2969,33 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     try:
                         tab_title = _get_first_tab_title(sheets, sheet_id)
                         if _is_row_below_nonviable(sheets, sheet_id, tab_title, rownum):
-                            print(f"ℹ️ Row {rownum} already below NON-VIABLE divider, skipping property_unavailable processing")
+                            print(
+                                f"ℹ️ Row {rownum} already below NON-VIABLE divider; "
+                                "terminalizing thread state without moving the sheet row"
+                            )
+                            stopped_thread_count = stop_threads_for_row(
+                                user_id,
+                                rownum,
+                                client_id=client_id,
+                                reason="property_unavailable",
+                            )
+                            update_thread_status(user_id, thread_id, THREAD_STATUS["stopped"], "property_unavailable")
+                            unavailable_thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
+                            unavailable_thread_ref.set({
+                                "nonViableAt": SERVER_TIMESTAMP,
+                                "nonViableReason": event.get("reason") or "already_below_nonviable",
+                                "followUpStatus": "stopped",
+                                "updatedAt": SERVER_TIMESTAMP,
+                            }, merge=True)
+                            mark_event_handled(user_id, thread_id, event_key, msg_id, None)
+                            old_row_became_nonviable = True
+                            proposal["skip_response"] = True
+                            print(
+                                "🛑 Stopped already non-viable row thread(s): "
+                                f"{stopped_thread_count} row root(s) plus current thread"
+                            )
+                            if not any((evt or {}).get("type") == "new_property" for evt in events):
+                                _maybe_mark_client_completed(user_id, client_id)
                             continue
                     except Exception as e:
                         print(f"⚠️ Failed to check if row is below divider: {e}")
