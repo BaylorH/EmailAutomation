@@ -65,7 +65,7 @@ class RetryableProcessingError(Exception):
 
 
 def _should_mark_processed_after_error(error: Optional[Exception]) -> bool:
-    return not isinstance(error, RetryableProcessingError)
+    return error is None
 
 
 def _queue_response_retry_or_reconciliation(
@@ -273,6 +273,18 @@ def _record_ai_processing_failure(user_id: str, client_id: str, thread_id: str, 
         }, merge=True)
     except Exception as e:
         print(f"⚠️ Could not record AI processing failure: {e}")
+
+
+def _client_id_for_processing_failure(user_id: str, thread_id: str) -> str:
+    try:
+        if not thread_id:
+            return "unknown"
+        doc = _fs.collection("users").document(user_id).collection("threads").document(thread_id).get()
+        if not doc.exists:
+            return "unknown"
+        return (doc.to_dict() or {}).get("clientId") or "unknown"
+    except Exception:
+        return "unknown"
 
 
 def _clear_ai_processing_failure(user_id: str, thread_id: str, message_id: str):
@@ -1246,7 +1258,7 @@ def _classify_tour_invite_reply(
     ))
     tour_unavailable_signal = looks_like_tour_only_unavailable(clean_text)
     confirmation_signal = bool(re.search(
-        r"\b(?:that\s+(?:time|slot)\s+works?|works\s+for\s+us|confirmed|confirming|"
+        r"\b(?:that\s+(?:time|slot)\s+works?|works\s+for\s+(?:us|me|my\s+team|our\s+team|the\s+team|[\w#&'./-]+)|confirmed|confirming|"
         r"see\s+you\s+(?:then|there)|we\s+are\s+confirmed|we're\s+confirmed|sounds\s+good)\b",
         text,
     ))
@@ -2539,13 +2551,12 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
         # NEW: Handle PDF attachments with enhanced extraction for current message only
         pdf_manifest = fetch_and_process_pdfs(headers, msg_id)
+        flyer_links = []
+        floorplan_links = []
 
         if pdf_manifest:
             # Categorize PDFs into flyers vs floorplans based on filename
             # Categorize PDF links (but don't write yet - wait until after event detection)
-            flyer_links = []
-            floorplan_links = []
-
             for pdf in pdf_manifest:
                 link = pdf.get('drive_link')
                 if not link:
@@ -4141,6 +4152,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             # Process the last message (which will see all previous in conversation)
             last_msg = messages[-1]
             processing_error = None
+            processed_key = last_msg.get("internetMessageId") or last_msg.get("id")
             try:
                 process_inbox_message(user_id, headers, last_msg)
                 processed_count += 1
@@ -4148,8 +4160,14 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             except Exception as e:
                 processing_error = e
                 print(f"❌ Failed to process batched message: {e}")
+                _record_ai_processing_failure(
+                    user_id,
+                    _client_id_for_processing_failure(user_id, thread_id),
+                    thread_id,
+                    processed_key,
+                    str(e),
+                )
             finally:
-                processed_key = last_msg.get("internetMessageId") or last_msg.get("id")
                 if _should_mark_processed_after_error(processing_error):
                     mark_processed(user_id, processed_key)
                 else:
@@ -4158,6 +4176,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             # Single message - process normally
             msg = messages[0]
             processing_error = None
+            processed_key = msg.get("internetMessageId") or msg.get("id")
             try:
                 process_inbox_message(user_id, headers, msg)
                 processed_count += 1
@@ -4165,8 +4184,14 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             except Exception as e:
                 processing_error = e
                 print(f"❌ Failed to process message {msg.get('id', 'unknown')}: {e}")
+                _record_ai_processing_failure(
+                    user_id,
+                    _client_id_for_processing_failure(user_id, thread_id),
+                    thread_id,
+                    processed_key,
+                    str(e),
+                )
             finally:
-                processed_key = msg.get("internetMessageId") or msg.get("id")
                 if _should_mark_processed_after_error(processing_error):
                     mark_processed(user_id, processed_key)
                 else:
@@ -4179,13 +4204,20 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     # Process orphan messages (couldn't match to thread - will be ignored by process_inbox_message)
     for idx, msg in enumerate(orphan_messages):
         processing_error = None
+        processed_key = msg.get("internetMessageId") or msg.get("id")
         try:
             process_inbox_message(user_id, headers, msg)
         except Exception as e:
             processing_error = e
             print(f"❌ Failed to process orphan message: {e}")
+            _record_ai_processing_failure(
+                user_id,
+                "unknown",
+                "orphan",
+                processed_key,
+                str(e),
+            )
         finally:
-            processed_key = msg.get("internetMessageId") or msg.get("id")
             if _should_mark_processed_after_error(processing_error):
                 mark_processed(user_id, processed_key)
             else:

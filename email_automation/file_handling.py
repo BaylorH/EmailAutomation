@@ -768,12 +768,12 @@ def fetch_and_process_linked_assets(urls: List[str], max_assets: int = 3) -> Lis
             continue
         seen_urls.add(source_url)
 
-        filename_hint = _filename_from_asset_url(source_url)
+        filename_hint = _filename_from_asset_url(source_url, fallback="")
         candidate = build_download_candidate(source_url, filename_hint=filename_hint)
         if not candidate:
             continue
 
-        name = _filename_from_asset_url(candidate.get("sourceUrl") or source_url, filename_hint)
+        name = _filename_from_asset_url(candidate.get("sourceUrl") or source_url, filename_hint or "broker flyer.pdf")
         if candidate.get("sourceType") == "direct_image" and not name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
             name = "broker property image.png"
         try:

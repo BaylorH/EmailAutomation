@@ -1,5 +1,6 @@
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
@@ -10,6 +11,19 @@ os.environ.setdefault(
 
 
 class PropertyImageResolverTests(unittest.TestCase):
+    def test_processing_initializes_link_buckets_before_optional_pdf_manifest(self):
+        processing_source = Path("email_automation/processing.py").read_text()
+
+        pdf_manifest_branch = processing_source.index("if pdf_manifest:")
+        flyer_bucket = processing_source.index("flyer_links = []")
+        floorplan_bucket = processing_source.index("floorplan_links = []")
+        linked_asset_branch = processing_source.index("linked_asset_manifest = fetch_and_process_linked_assets")
+
+        self.assertLess(flyer_bucket, pdf_manifest_branch)
+        self.assertLess(floorplan_bucket, pdf_manifest_branch)
+        self.assertLess(flyer_bucket, linked_asset_branch)
+        self.assertLess(floorplan_bucket, linked_asset_branch)
+
     def test_download_candidates_allow_drive_and_dropbox_but_skip_listing_pages(self):
         from email_automation.property_images import build_download_candidate
 
@@ -402,6 +416,17 @@ class PropertyImageFileHandlingTests(unittest.TestCase):
         )
         self.assertEqual("broker_image_link", processed[0]["property_image_source_type"])
         self.assertNotIn("PNG_BYTES", repr(processed[0]))
+
+    def test_fetch_and_process_linked_assets_skips_generic_company_links(self):
+        from email_automation import file_handling
+
+        with patch.object(file_handling, "_download_linked_asset") as download:
+            processed = file_handling.fetch_and_process_linked_assets([
+                "https://example.com",
+            ])
+
+        self.assertEqual([], processed)
+        download.assert_not_called()
 
     def test_linked_asset_download_rejects_private_network_targets_before_request(self):
         from email_automation import file_handling

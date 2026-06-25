@@ -114,6 +114,34 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertFalse(classification["needsOperatorAction"])
         self.assertTrue(classification["canCloseThread"])
 
+    def test_tour_invite_property_specific_works_reply_closes_without_operator_action(self):
+        classification = processing._classify_tour_invite_reply(
+            (
+                "Hi John,\n\n"
+                "10:30 AM on Tuesday, June 30, 2026 works for 555 Geocoded Map Dr. "
+                "Please meet me at the front office entrance.\n\n"
+                "Best,\nTaylor"
+            ),
+            event={
+                "type": "tour_requested",
+                "reason": "tour_slot_reply",
+                "question": "10:30 AM on Tuesday, June 30, 2026 works for 555 Geocoded Map Dr.",
+            },
+            thread_data={
+                "source": "dashboard_tour_planner",
+                "actionType": "tour_invite",
+                "tourInvite": {
+                    "tourDate": "2026-06-30",
+                    "arrivalTime": "10:30 AM",
+                    "departureTime": "11:00 AM",
+                },
+            },
+        )
+
+        self.assertEqual("confirmed", classification["outcome"])
+        self.assertFalse(classification["needsOperatorAction"])
+        self.assertTrue(classification["canCloseThread"])
+
     def test_tour_invite_alternate_time_requires_operator_review_not_auto_shuffle(self):
         classification = processing._classify_tour_invite_reply(
             "The 10:47 AM requested time does not work. I can do 1:30 PM instead.",

@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
+    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
 )
 
 from email_automation import processing
@@ -18,7 +18,45 @@ class ProcessingRetryabilityTests(unittest.TestCase):
                 processing.RetryableProcessingError("AI proposal unavailable")
             )
         )
-        self.assertTrue(processing._should_mark_processed_after_error(ValueError("non-retryable bug")))
+        self.assertFalse(processing._should_mark_processed_after_error(ValueError("unexpected bug")))
+        self.assertTrue(processing._should_mark_processed_after_error(None))
+
+    def test_scan_records_unexpected_processing_crash_without_marking_processed(self):
+        response = MagicMock()
+        response.json.return_value = {
+            "value": [
+                {
+                    "id": "graph-message-1",
+                    "internetMessageId": "<message-1@example.test>",
+                    "subject": "RE: 4402 Rex Rd",
+                    "receivedDateTime": "2026-06-25T05:10:00Z",
+                }
+            ]
+        }
+
+        with patch.object(processing, "exponential_backoff_request", return_value=response), \
+             patch.object(processing, "has_processed", return_value=False), \
+             patch.object(processing, "_match_message_to_thread", return_value="thread-1"), \
+             patch.object(processing, "process_inbox_message", side_effect=ValueError("flyer_links crash")), \
+             patch.object(processing, "_record_ai_processing_failure") as record_failure, \
+             patch.object(processing, "mark_processed") as mark_processed, \
+             patch.object(processing, "set_last_scan_iso"):
+            result = processing.scan_inbox_against_index(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+                only_unread=False,
+                top=1,
+            )
+
+        record_failure.assert_called_once_with(
+            "uid-1",
+            "unknown",
+            "thread-1",
+            "<message-1@example.test>",
+            "flyer_links crash",
+        )
+        mark_processed.assert_not_called()
+        self.assertEqual(0, result["processed"])
 
     def test_successful_retry_can_clear_matching_processing_failure(self):
         fake_fs = MagicMock()
