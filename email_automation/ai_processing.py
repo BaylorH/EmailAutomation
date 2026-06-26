@@ -128,6 +128,32 @@ def _looks_like_tour_slot_reply(conversation: List[dict], latest_text: str) -> b
     return bool(reply_signal or time_signal)
 
 
+def _has_tour_scheduling_context(conversation: List[dict]) -> bool:
+    """Return true for actual tour-scheduling threads, not generic outreach asking for tour availability."""
+    outbound_texts = []
+    for message in reversed(conversation or []):
+        if (message or {}).get("direction") == "outbound":
+            outbound_texts.append(str(
+                (message or {}).get("content")
+                or (message or {}).get("body")
+                or (message or {}).get("preview")
+                or ""
+            ).lower())
+
+    if not outbound_texts:
+        return False
+
+    return any(
+        re.search(r"\btour\s+date\b", outbound_text)
+        or re.search(r"\brequested\s+arrival\b", outbound_text)
+        or re.search(r"\btour\s+slot\b", outbound_text)
+        or re.search(r"\bconfirm\s+whether\s+(?:this\s+)?tour\b", outbound_text)
+        or re.search(r"\bschedule\s+(?:a\s+)?tour\b", outbound_text)
+        or re.search(r"\btour\s+(?:at|on)\s+\d", outbound_text)
+        for outbound_text in outbound_texts
+    )
+
+
 def _augment_events_with_deterministic_signals(proposal: dict, conversation: List[dict]) -> dict:
     """Add high-confidence event signals from broker phrases the model can miss."""
     if not proposal:
@@ -179,7 +205,8 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
 
     tour_reply_reason = None
     if looks_like_tour_only_unavailable(latest_text_raw):
-        tour_reply_reason = "tour_unavailable"
+        if _has_tour_scheduling_context(conversation) or _looks_like_tour_slot_reply(conversation, latest_text):
+            tour_reply_reason = "tour_unavailable"
     elif _looks_like_tour_slot_reply(conversation, latest_text):
         tour_reply_reason = "tour_slot_reply"
 

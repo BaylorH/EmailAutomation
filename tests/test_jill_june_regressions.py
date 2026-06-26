@@ -235,6 +235,7 @@ class JillJuneRegressionTests(unittest.TestCase):
         for inbound in [
             "There is no tour availability for this space right now.",
             "There is no availability for tours this week.",
+            "The owner is not offering interior tours right now.",
         ]:
             with self.subTest(inbound=inbound):
                 proposal = {"updates": [], "events": [{"type": "property_unavailable", "reason": "model"}]}
@@ -264,6 +265,65 @@ class JillJuneRegressionTests(unittest.TestCase):
                 )
                 self.assertEqual("tour_requested", augmented["events"][0]["type"])
                 self.assertEqual("tour_unavailable", augmented["events"][0]["reason"])
+
+    def test_initial_outreach_tour_unavailable_note_does_not_emit_tour_request(self):
+        proposal = {"updates": [], "events": []}
+        conversation = [
+            {
+                "direction": "outbound",
+                "content": "Could you confirm availability and tour availability?",
+            },
+            {
+                "direction": "inbound",
+                "content": (
+                    "903 Bay Star Blvd is still available. The owner is not offering "
+                    "interior tours right now, but a drive-by is fine."
+                ),
+            },
+        ]
+
+        augmented = ai_processing._augment_events_with_deterministic_signals(
+            proposal,
+            conversation,
+        )
+
+        self.assertNotIn(
+            "tour_requested",
+            [event.get("type") for event in augmented["events"]],
+        )
+
+    def test_tour_scheduling_thread_with_intermediate_outbound_keeps_tour_unavailable(self):
+        proposal = {"updates": [], "events": [{"type": "property_unavailable", "reason": "model"}]}
+        conversation = [
+            {
+                "direction": "outbound",
+                "content": (
+                    "Tour date: Tuesday, June 30, 2026\n"
+                    "Requested arrival: 2:15 PM\n"
+                    "Please confirm whether this tour slot works."
+                ),
+            },
+            {
+                "direction": "outbound",
+                "content": "I am checking the route and schedule and will confirm shortly.",
+            },
+            {
+                "direction": "inbound",
+                "content": "The owner is not offering interior tours right now.",
+            },
+        ]
+
+        augmented = ai_processing._augment_events_with_deterministic_signals(
+            proposal,
+            conversation,
+        )
+
+        self.assertNotIn(
+            "property_unavailable",
+            [event.get("type") for event in augmented["events"]],
+        )
+        self.assertEqual("tour_requested", augmented["events"][0]["type"])
+        self.assertEqual("tour_unavailable", augmented["events"][0]["reason"])
 
     def test_requirements_mismatch_downstream_guard_applies_to_current_row(self):
         event = {"type": "property_unavailable", "reason": "requirements_mismatch"}

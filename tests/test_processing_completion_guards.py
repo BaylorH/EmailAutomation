@@ -399,6 +399,7 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         for message in [
             "There is no tour availability for this space right now.",
             "There is no availability for tours this week.",
+            "The owner is not offering interior tours right now.",
         ]:
             with self.subTest(message=message):
                 classification = processing._classify_tour_invite_reply(
