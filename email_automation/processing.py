@@ -3223,7 +3223,12 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             proposal["skip_response"] = True
 
                         # Create ACTION_NEEDED notification for approval (no row created yet)
-                        property_image_candidate = select_property_image_candidate(pdf_manifest)
+                        property_image_candidate = select_property_image_candidate(
+                            pdf_manifest,
+                            address=address,
+                            city=city,
+                            source_url=link,
+                        )
                         property_images_meta = [property_image_candidate] if property_image_candidate else []
                         notif_id = write_notification(
                             user_id, client_id,
@@ -3657,7 +3662,10 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 try:
                     sheets = _sheets_client()
                     pdf_link_updates_for_results: Dict[str, List[str]] = {}
-                    property_image_candidate = select_property_image_candidate(pdf_manifest)
+                    property_image_candidate = select_property_image_candidate(
+                        pdf_manifest,
+                        address=row_anchor,
+                    )
                     property_image_updates_for_results: Dict[str, List[str]] = {}
 
                     if flyer_links:

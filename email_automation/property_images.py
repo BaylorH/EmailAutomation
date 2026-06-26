@@ -222,12 +222,71 @@ def _safe_candidate_from_manifest_item(item: Dict[str, Any]) -> Optional[Dict[st
     }
 
 
-def select_property_image_candidate(pdf_manifest: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    for item in pdf_manifest or []:
-        candidate = _safe_candidate_from_manifest_item(item or {})
+def _match_tokens(*values: Any) -> List[str]:
+    raw = " ".join(_clean(value).lower() for value in values if _clean(value))
+    return [
+        token
+        for token in re.split(r"[^a-z0-9]+", raw)
+        if len(token) >= 3 and not token.isdigit()
+    ]
+
+
+def _manifest_item_match_score(
+    item: Dict[str, Any],
+    *,
+    address: str = "",
+    city: str = "",
+    source_url: str = "",
+) -> int:
+    haystack = " ".join(
+        _clean(item.get(key)).lower()
+        for key in (
+            "name",
+            "source_url",
+            "drive_link",
+            "property_image_source",
+            "text",
+        )
+    )
+    score = 0
+    requested_url = _clean(source_url).lower()
+    if requested_url and requested_url in haystack:
+        score += 100
+    for token in _match_tokens(address):
+        if token in haystack:
+            score += 15
+    for token in _match_tokens(city):
+        if token in haystack:
+            score += 3
+    return score
+
+
+def select_property_image_candidate(
+    pdf_manifest: List[Dict[str, Any]],
+    *,
+    address: str = "",
+    city: str = "",
+    source_url: str = "",
+) -> Optional[Dict[str, Any]]:
+    candidates: List[tuple[int, int, Dict[str, Any]]] = []
+    for index, item in enumerate(pdf_manifest or []):
+        item = item or {}
+        candidate = _safe_candidate_from_manifest_item(item)
         if candidate:
-            return candidate
-    return None
+            candidates.append((
+                _manifest_item_match_score(
+                    item,
+                    address=address,
+                    city=city,
+                    source_url=source_url,
+                ),
+                index,
+                candidate,
+            ))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda entry: (-entry[0], entry[1]))
+    return candidates[0][2]
 
 
 def _header_index(header: List[str], column: str) -> int:

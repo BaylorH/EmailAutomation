@@ -132,6 +132,42 @@ class PropertyImageResolverTests(unittest.TestCase):
         self.assertEqual("property_preview_heuristic_v1", candidate["meta"]["strategy"])
         self.assertEqual(["sf"], candidate["meta"]["signals"]["positiveTerms"])
 
+    def test_manifest_candidate_prefers_link_or_address_matching_replacement_property(self):
+        from email_automation.property_images import select_property_image_candidate
+
+        manifest = [
+            {
+                "name": "16_Jupiter_Lease_Brochure-5600-SF.pdf",
+                "source_url": "https://www.dropbox.com/scl/fi/key/16_Jupiter_Lease_Brochure-5600-SF.pdf?dl=0",
+                "drive_link": "https://drive.google.com/file/d/jupiter-pdf/view",
+                "property_image_url": "https://drive.google.com/uc?export=view&id=jupiter-image",
+                "property_image_source": "Broker flyer link preview: 16_Jupiter_Lease_Brochure-5600-SF.pdf, page 1",
+                "text": "16 Jupiter Park available office warehouse space",
+            },
+            {
+                "name": "12-Petra-Lease-Brochure-6686-SF.pdf",
+                "source_url": "https://www.dropbox.com/scl/fi/key/12-Petra-Lease-Brochure-6686-SF.pdf?dl=0",
+                "drive_link": "https://drive.google.com/file/d/petra-pdf/view",
+                "property_image_url": "https://drive.google.com/uc?export=view&id=petra-image",
+                "property_image_source": "Broker flyer link preview: 12-Petra-Lease-Brochure-6686-SF.pdf, page 1",
+                "text": "12 Petra 6,700 total SF with dock and drive-in",
+            },
+        ]
+
+        candidate = select_property_image_candidate(
+            manifest,
+            address="12 Petra",
+            city="Albany",
+            source_url="https://www.dropbox.com/scl/fi/key/12-Petra-Lease-Brochure-6686-SF.pdf?dl=0",
+        )
+
+        self.assertEqual(
+            "https://drive.google.com/uc?export=view&id=petra-image",
+            candidate["url"],
+        )
+        self.assertIn("12-Petra", candidate["sourceLabel"])
+        self.assertEqual("12-Petra-Lease-Brochure-6686-SF.pdf", candidate["sourceFilename"])
+
     def test_existing_property_image_is_not_overwritten(self):
         from email_automation.property_images import build_property_image_sheet_updates
 

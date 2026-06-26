@@ -1,5 +1,6 @@
 import unittest
 import os
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
@@ -23,13 +24,14 @@ class ProcessingRetryabilityTests(unittest.TestCase):
 
     def test_scan_records_unexpected_processing_crash_without_marking_processed(self):
         response = MagicMock()
+        received_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         response.json.return_value = {
             "value": [
                 {
                     "id": "graph-message-1",
                     "internetMessageId": "<message-1@example.test>",
                     "subject": "RE: 4402 Rex Rd",
-                    "receivedDateTime": "2026-06-25T05:10:00Z",
+                    "receivedDateTime": received_now,
                 }
             ]
         }
