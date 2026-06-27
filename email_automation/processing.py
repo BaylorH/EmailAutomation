@@ -681,6 +681,107 @@ def _mark_processing_failure_blocked_by_existing_artifact(doc, artifact: Dict[st
         print(f"⚠️ Could not mark processing failure blocked by existing artifact: {e}")
 
 
+def _find_sent_item_continuing_conversation(
+    headers: Dict[str, str],
+    conversation_id: Optional[str],
+    sent_after: Any,
+    *,
+    base: str = "https://graph.microsoft.com/v1.0",
+) -> Optional[Dict[str, Any]]:
+    """Return metadata for a newer Sent Items message in this conversation.
+
+    This is a privacy-preserving retry veto: it only reads message identity,
+    recipient metadata, subject, and sent time. It intentionally does not fetch
+    body or bodyPreview because the only question is whether the conversation
+    moved on after the failed inbound processing event.
+    """
+    if not conversation_id:
+        return None
+    sent_after_utc = _timestamp_to_utc(sent_after)
+    if not sent_after_utc:
+        return None
+
+    sent_after_iso = sent_after_utc.isoformat().replace("+00:00", "Z")
+    params = {
+        "$orderby": "sentDateTime desc",
+        "$top": "10",
+        "$select": "id,internetMessageId,conversationId,subject,toRecipients,sentDateTime",
+        "$filter": f"sentDateTime ge {sent_after_iso}",
+    }
+
+    try:
+        response = exponential_backoff_request(
+            lambda: requests.get(
+                f"{base}/me/mailFolders/SentItems/messages",
+                headers=headers,
+                params=params,
+                timeout=30,
+            )
+        )
+        status_code = getattr(response, "status_code", 200)
+        if status_code != 200:
+            return _guard_unreadable_artifact(
+                "SentItems/manualContinuation",
+                RuntimeError(f"Graph Sent Items returned HTTP {status_code}"),
+            )
+
+        for msg in (response.json() or {}).get("value", []):
+            if msg.get("conversationId") != conversation_id:
+                continue
+            sent_time = _timestamp_to_utc(msg.get("sentDateTime"))
+            if sent_time and sent_time < sent_after_utc:
+                continue
+            return {
+                "collection": "SentItems/manualContinuation",
+                "id": msg.get("id"),
+                "internetMessageId": msg.get("internetMessageId"),
+                "conversationId": conversation_id,
+                "sentDateTime": msg.get("sentDateTime"),
+                "subject": msg.get("subject"),
+                "recipientCount": len(msg.get("toRecipients") or []),
+            }
+    except Exception as e:
+        return _guard_unreadable_artifact("SentItems/manualContinuation", e)
+
+    return None
+
+
+def _mark_processing_failure_blocked_by_manual_continuation(doc, sent_artifact: Dict[str, Any]):
+    try:
+        guard_unreadable = bool(sent_artifact.get("guardUnreadable"))
+        recovery_status = (
+            "blocked_manual_retry_guard_unreadable"
+            if guard_unreadable
+            else "blocked_manual_conversation_continued"
+        )
+        last_retry_error = (
+            "Could not verify whether the user manually continued this conversation "
+            f"after the processing failure ({sent_artifact.get('guardError') or 'Sent Items unreadable'}); "
+            "leaving the failure visible for manual review before retry."
+            if guard_unreadable
+            else (
+                "Processing retry skipped because Sent Items shows this conversation "
+                "was continued after the failure; leaving visible for manual review "
+                "to avoid stale or duplicate handling."
+            )
+        )
+        doc.reference.set({
+            "retryable": False,
+            "recoveryStatus": recovery_status,
+            "recoveryArtifactCollection": sent_artifact.get("collection") or "SentItems/manualContinuation",
+            "recoverySentMessageId": sent_artifact.get("id"),
+            "recoverySentInternetMessageId": sent_artifact.get("internetMessageId"),
+            "recoveryConversationId": sent_artifact.get("conversationId"),
+            "recoverySentDateTime": sent_artifact.get("sentDateTime"),
+            "recoveryGuardError": sent_artifact.get("guardError"),
+            "lastRetryAt": SERVER_TIMESTAMP,
+            "lastRetryError": last_retry_error,
+            "updatedAt": SERVER_TIMESTAMP,
+        }, merge=True)
+    except Exception as e:
+        print(f"⚠️ Could not mark processing failure blocked by manual continuation: {e}")
+
+
 def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[str, int]:
     """Clear failure markers for messages that are already marked processed.
 
@@ -809,6 +910,15 @@ def retry_processing_failures(
             if expanded_existing_artifact:
                 result["skipped"] += 1
                 _mark_processing_failure_blocked_by_existing_artifact(doc, expanded_existing_artifact)
+                continue
+            manual_continuation = _find_sent_item_continuing_conversation(
+                headers,
+                msg.get("conversationId"),
+                data.get("createdAt") or data.get("updatedAt"),
+            )
+            if manual_continuation:
+                result["skipped"] += 1
+                _mark_processing_failure_blocked_by_manual_continuation(doc, manual_continuation)
                 continue
             result["retried"] += 1
             process_inbox_message(user_id, headers, msg)

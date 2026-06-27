@@ -372,6 +372,96 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         self.assertEqual("blocked_existing_outbound_artifact", update_payload["recoveryStatus"])
         self.assertEqual("outbox-existing", update_payload["recoveryArtifactId"])
 
+    def test_retry_processing_failures_blocks_when_conversation_was_manually_continued(self):
+        created_at = datetime(2026, 6, 22, 2, 19, tzinfo=timezone.utc)
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__internet-message-1"
+        failure_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "messageId": "<internet-message-1@example.test>",
+            "retryable": True,
+            "processingAttempts": 0,
+            "createdAt": created_at,
+        }
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        empty_collection = MagicMock()
+        empty_collection.limit.return_value.stream.return_value = []
+        thread_ref = MagicMock()
+        thread_ref.get.return_value.exists = False
+
+        user_doc = MagicMock()
+        user_doc.collection.side_effect = lambda name: {
+            "processingFailures": failures_collection,
+            "outbox": empty_collection,
+            "pendingResponses": empty_collection,
+            "deadLetterQueue": empty_collection,
+            "actionAudit": empty_collection,
+            "clients": MagicMock(document=MagicMock(return_value=MagicMock(collection=MagicMock(return_value=empty_collection)))),
+            "threads": MagicMock(document=MagicMock(return_value=thread_ref)),
+        }[name]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value = user_doc
+
+        graph_response = MagicMock()
+        graph_response.status_code = 200
+        graph_response.json.return_value = {
+            "id": "graph-message-1",
+            "internetMessageId": "<internet-message-1@example.test>",
+            "conversationId": "conversation-1",
+        }
+        sent_items_response = MagicMock()
+        sent_items_response.status_code = 200
+        sent_items_response.json.return_value = {
+            "value": [
+                {
+                    "id": "sent-manual-1",
+                    "internetMessageId": "<manual-reply@example.test>",
+                    "conversationId": "conversation-1",
+                    "subject": "RE: 16 Jupiter Ln",
+                    "toRecipients": [{"emailAddress": {"address": "broker@example.test"}}],
+                    "sentDateTime": "2026-06-22T03:00:00Z",
+                }
+            ]
+        }
+        requests_seen = []
+
+        def fake_get(url, **kwargs):
+            requests_seen.append((url, kwargs))
+            if "/mailFolders/SentItems/messages" in url:
+                return sent_items_response
+            return graph_response
+
+        def run_request(request_fn):
+            return request_fn()
+
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "has_processed", return_value=False), \
+             patch.object(processing, "exponential_backoff_request", side_effect=run_request), \
+             patch.object(processing.requests, "get", side_effect=fake_get), \
+             patch.object(processing, "process_inbox_message") as process_message, \
+             patch.object(processing, "mark_processed") as mark_processed:
+            result = processing.retry_processing_failures(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+            )
+
+        self.assertEqual(
+            {"checked": 1, "retried": 0, "succeeded": 0, "failed": 0, "skipped": 1},
+            result,
+        )
+        process_message.assert_not_called()
+        mark_processed.assert_not_called()
+        sent_query = next(kwargs for url, kwargs in requests_seen if "/mailFolders/SentItems/messages" in url)
+        self.assertNotIn("body", sent_query["params"]["$select"])
+        self.assertNotIn("bodyPreview", sent_query["params"]["$select"])
+        update_payload = failure_doc.reference.set.call_args.args[0]
+        self.assertFalse(update_payload["retryable"])
+        self.assertEqual("blocked_manual_conversation_continued", update_payload["recoveryStatus"])
+        self.assertEqual("sent-manual-1", update_payload["recoverySentMessageId"])
+        self.assertEqual("<manual-reply@example.test>", update_payload["recoverySentInternetMessageId"])
+
     def test_retry_processing_failures_blocks_existing_handled_event_for_source_message(self):
         failure_doc = MagicMock()
         failure_doc.id = "thread-1__internet-message-1"
