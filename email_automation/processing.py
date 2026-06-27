@@ -297,6 +297,43 @@ def _clear_ai_processing_failure(user_id: str, thread_id: str, message_id: str):
         print(f"⚠️ Could not clear AI processing failure: {e}")
 
 
+def _timestamp_to_utc(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "to_datetime"):
+            value = value.to_datetime()
+        elif isinstance(value, (int, float)):
+            value = datetime.fromtimestamp(float(value), tz=timezone.utc)
+        elif isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+    except Exception:
+        return None
+    return None
+
+
+def _mark_processing_failure_stale_for_manual_review(doc, max_failure_age_hours: float):
+    try:
+        label = f"{max_failure_age_hours:g}"
+        doc.reference.set({
+            "retryable": False,
+            "recoveryStatus": "stale_manual_review",
+            "lastRetryAt": SERVER_TIMESTAMP,
+            "lastRetryError": (
+                f"Processing failure is older than {label} hours; "
+                "leaving visible for manual review before any retry."
+            ),
+            "updatedAt": SERVER_TIMESTAMP,
+        }, merge=True)
+    except Exception as e:
+        print(f"⚠️ Could not mark stale processing failure for manual review: {e}")
+
+
 def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[str, int]:
     """Clear failure markers for messages that are already marked processed.
 
@@ -358,6 +395,7 @@ def retry_processing_failures(
     *,
     limit: int = 10,
     max_attempts: int = 3,
+    max_failure_age_hours: Optional[float] = None,
 ) -> Dict[str, int]:
     """Retry exact stored processing failures outside the inbox scan time window."""
     result = {"checked": 0, "retried": 0, "succeeded": 0, "failed": 0, "skipped": 0}
@@ -375,6 +413,13 @@ def retry_processing_failures(
         message_id = data.get("messageId")
         thread_id = data.get("threadId")
         attempts = int(data.get("processingAttempts") or 0)
+
+        if max_failure_age_hours and max_failure_age_hours > 0:
+            failure_time = _timestamp_to_utc(data.get("createdAt") or data.get("updatedAt"))
+            if failure_time and datetime.now(timezone.utc) - failure_time > timedelta(hours=max_failure_age_hours):
+                result["skipped"] += 1
+                _mark_processing_failure_stale_for_manual_review(doc, max_failure_age_hours)
+                continue
 
         if not data.get("retryable", True) or not message_id or attempts >= max_attempts:
             result["skipped"] += 1

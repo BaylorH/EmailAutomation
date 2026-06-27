@@ -1,6 +1,6 @@
 import unittest
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
@@ -199,6 +199,45 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         self.assertEqual(2, update_payload["processingAttempts"])
         self.assertTrue(update_payload["retryable"])
         self.assertIn("still failing", update_payload["lastRetryError"])
+
+    def test_retry_processing_failures_skips_stale_failure_without_fetching_graph(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__message-1"
+        failure_doc.to_dict.return_value = {
+            "threadId": "thread-1",
+            "messageId": "message-1",
+            "retryable": True,
+            "processingAttempts": 0,
+            "createdAt": datetime.now(timezone.utc) - timedelta(hours=8),
+        }
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value.collection.return_value = failures_collection
+
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "has_processed", return_value=False), \
+             patch.object(processing, "exponential_backoff_request") as fetch_graph_message, \
+             patch.object(processing, "process_inbox_message") as process_message, \
+             patch.object(processing, "mark_processed") as mark_processed:
+            result = processing.retry_processing_failures(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+                max_failure_age_hours=6,
+            )
+
+        self.assertEqual(
+            {"checked": 1, "retried": 0, "succeeded": 0, "failed": 0, "skipped": 1},
+            result,
+        )
+        fetch_graph_message.assert_not_called()
+        process_message.assert_not_called()
+        mark_processed.assert_not_called()
+        failure_doc.reference.set.assert_called_once()
+        update_payload = failure_doc.reference.set.call_args.args[0]
+        self.assertFalse(update_payload["retryable"])
+        self.assertEqual("stale_manual_review", update_payload["recoveryStatus"])
+        self.assertIn("older than 6 hours", update_payload["lastRetryError"])
 
     def test_new_property_duplicate_check_fails_open_on_sheet_read_error(self):
         class FailingSheets:

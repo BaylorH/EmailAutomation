@@ -199,13 +199,13 @@ class GraphScanHealthTests(unittest.TestCase):
         self.assertEqual("Bearer fresh-token", captured["refreshed_headers"]["Authorization"])
         self.assertIn(True, ExpiringMsalApp.calls)
 
-    def test_refresh_skips_processing_failure_replay_by_default(self):
+    def test_refresh_skips_processing_failure_replay_when_explicitly_disabled(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as token_file:
             token_file.write("{}")
             token_path = token_file.name
 
         try:
-            with patch.dict(os.environ, {"SITESIFT_ENABLE_PROCESSING_FAILURE_RETRY": ""}, clear=False), \
+            with patch.dict(os.environ, {"SITESIFT_ENABLE_PROCESSING_FAILURE_RETRY": "0"}, clear=False), \
                  patch.object(main, "TOKEN_CACHE", token_path), \
                  patch.object(main, "download_token"), \
                  patch.object(main, "SerializableTokenCache", FakeTokenCache), \
@@ -230,6 +230,39 @@ class GraphScanHealthTests(unittest.TestCase):
             os.unlink(token_path)
 
         retry_processing_failures.assert_not_called()
+
+    def test_refresh_runs_processing_failure_replay_by_default(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as token_file:
+            token_file.write("{}")
+            token_path = token_file.name
+
+        try:
+            with patch.dict(os.environ, {}, clear=False), \
+                 patch.object(main, "TOKEN_CACHE", token_path), \
+                 patch.object(main, "download_token"), \
+                 patch.object(main, "SerializableTokenCache", FakeTokenCache), \
+                 patch.object(main, "ConfidentialClientApplication", FakeMsalApp), \
+                 patch.object(main, "send_outboxes"), \
+                 patch.object(main, "scan_inbox_against_index", return_value={
+                     "status": "healthy",
+                     "operation": "inbox_scan",
+                 }), \
+                 patch.object(main, "scan_sent_items_for_manual_replies", return_value={
+                     "status": "healthy",
+                     "operation": "sent_items_scan",
+                 }), \
+                 patch.object(main, "retry_processing_failures") as retry_processing_failures, \
+                 patch.object(main, "process_pending_responses"), \
+                 patch.object(main, "check_and_send_followups"), \
+                 patch.object(main, "auto_cleanup_firestore"), \
+                 patch.object(main, "reconcile_stale_processing_failures"), \
+                 patch.object(main, "record_user_health"):
+                os.environ.pop("SITESIFT_ENABLE_PROCESSING_FAILURE_RETRY", None)
+                main.refresh_and_process_user("uid-1")
+        finally:
+            os.unlink(token_path)
+
+        retry_processing_failures.assert_called_once()
 
     def test_refresh_runs_processing_failure_replay_when_explicitly_enabled(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as token_file:

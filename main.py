@@ -23,11 +23,25 @@ from email_automation.system_health import record_user_health
 PROCESSED_MESSAGES_THRESHOLD = 500
 SHEET_CHANGELOG_THRESHOLD = 100
 GRAPH_TOKEN_REFRESH_BUFFER_SECONDS = 15 * 60
+PROCESSING_FAILURE_RETRY_DEFAULT_MAX_AGE_HOURS = 6
 
 
 def _processing_failure_retry_enabled() -> bool:
-    value = os.getenv("SITESIFT_ENABLE_PROCESSING_FAILURE_RETRY", "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    value = os.getenv("SITESIFT_ENABLE_PROCESSING_FAILURE_RETRY", "").strip().lower()
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _processing_failure_retry_max_age_hours() -> float:
+    value = os.getenv("SITESIFT_PROCESSING_FAILURE_RETRY_MAX_AGE_HOURS", "")
+    if not value.strip():
+        return PROCESSING_FAILURE_RETRY_DEFAULT_MAX_AGE_HOURS
+    try:
+        hours = float(value)
+    except ValueError:
+        return PROCESSING_FAILURE_RETRY_DEFAULT_MAX_AGE_HOURS
+    return max(0.0, hours)
 
 
 def _headers_from_access_token(access_token: str) -> dict:
@@ -254,7 +268,11 @@ def refresh_and_process_user(user_id: str):
     )
 
     if _processing_failure_retry_enabled():
-        retry_processing_failures(user_id, get_graph_headers())
+        retry_processing_failures(
+            user_id,
+            get_graph_headers(),
+            max_failure_age_hours=_processing_failure_retry_max_age_hours(),
+        )
     else:
         print("ℹ️ Stored processing failure replay disabled; failures remain visible for review")
 
