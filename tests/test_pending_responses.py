@@ -220,6 +220,57 @@ class PendingResponsesTests(unittest.TestCase):
         self.assertEqual(dead_letter["sentMessageId"], "sent-reply-1")
         self.assertEqual(dead_letter["internetMessageId"], "<sent-reply-1@example.com>")
 
+    def test_retry_blocks_when_conversation_was_manually_continued(self):
+        active_doc = FakeDoc("thread-active", {
+            "threadId": "thread-active",
+            "msgId": "message-2",
+            "recipient": "bp21harrison@gmail.com",
+            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "clientId": "client-1",
+            "attempts": 1,
+            "lastError": "Read timed out after Graph reply",
+            "lastSendAttemptAt": "2026-06-26T12:00:00Z",
+            "subject": "0 Gemini Ave, Houston",
+            "conversationId": "conv-1",
+        })
+        fake_fs = FakeFirestore([active_doc])
+        manual_continuation = {
+            "id": "manual-sent-1",
+            "internetMessageId": "<manual-sent-1@example.com>",
+            "conversationId": "conv-1",
+            "sentDateTime": "2026-06-26T12:04:00Z",
+        }
+
+        def fake_send_reply_in_thread(**_kwargs):
+            raise AssertionError("manual continuation guard should stop before resending")
+
+        with patch.dict(sys.modules, {
+            "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
+            "email_automation.processing": types.SimpleNamespace(
+                send_reply_in_thread=fake_send_reply_in_thread,
+            ),
+        }), patch.object(
+            pending_responses,
+            "find_matching_sent_message_for_retry",
+            return_value=None,
+            create=True,
+        ), patch.object(
+            pending_responses,
+            "find_sent_conversation_continuation_for_retry",
+            return_value=manual_continuation,
+            create=True,
+        ) as continuation_guard:
+            sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
+
+        self.assertEqual(sent, 0)
+        continuation_guard.assert_called_once()
+        self.assertEqual(continuation_guard.call_args.kwargs["conversation_id"], "conv-1")
+        self.assertTrue(active_doc.reference.deleted)
+        self.assertEqual([], active_doc.reference.update_calls)
+        dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
+        self.assertEqual(dead_letter["source"], "pendingResponses")
+        self.assertIn("manually continued", dead_letter["failureReason"])
+
     def test_retry_guard_lookup_failure_dead_letters_without_resending(self):
         active_doc = FakeDoc("thread-active", {
             "threadId": "thread-active",

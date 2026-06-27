@@ -505,6 +505,55 @@ class OutboxSafetyTests(unittest.TestCase):
         send_reply.assert_not_called()
         self.assertTrue(doc.reference.deleted)
 
+    def test_thread_reply_retry_blocks_when_conversation_was_manually_continued(self):
+        recipient = "bp21harrison+reply@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [recipient],
+            "script": "Hi Ron,\n\nThat time works.\n\nThanks",
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "replyToMessageId": "graph-message-1",
+            "attempts": 1,
+            "lastError": "Read timed out after Graph reply",
+            "lastSendAttemptAt": "2026-06-26T12:00:00Z",
+            "actionAuditId": "audit-thread-retry",
+        }, doc_id="outbox-thread-retry")
+        fake_fs = FakeFirestore()
+        manual_continuation = {
+            "id": "manual-sent-1",
+            "internetMessageId": "<manual-sent-1@example.com>",
+            "conversationId": "conv-thread-1",
+            "sentDateTime": "2026-06-26T12:04:00Z",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_thread_row_number", return_value=7), \
+             patch.object(email_module, "_get_reply_message_sender", return_value=recipient), \
+             patch.object(email_module, "_fetch_graph_message_metadata", return_value={
+                 "conversationId": "conv-thread-1",
+                 "subject": "RE: 0 Gemini Ave",
+             }), \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None, create=True), \
+             patch.object(email_module, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation, create=True) as continuation_guard, \
+             patch.object(email_module, "_send_outbox_as_reply") as send_reply:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        continuation_guard.assert_called_once()
+        self.assertEqual(continuation_guard.call_args.kwargs["conversation_id"], "conv-thread-1")
+        send_reply.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "dead_lettered")
+        self.assertIn("manually continued", dead_letter_payload["failureReason"])
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual(audit_payload["status"], "dead_lettered")
+        self.assertIn("manually continued", audit_payload["failureReason"])
+
     def test_retry_guard_lookup_failure_dead_letters_without_resending(self):
         recipient = "bp21harrison+leaguecity-row20@gmail.com"
         doc = FakeDoc({

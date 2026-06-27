@@ -219,3 +219,72 @@ def find_matching_sent_message_for_retry(
     if last_error:
         raise SentMailGuardLookupError(str(last_error))
     return None
+
+
+def find_sent_conversation_continuation_for_retry(
+    headers: Dict[str, str],
+    *,
+    conversation_id: Optional[str],
+    sent_after: Optional[datetime],
+    base: str = "https://graph.microsoft.com/v1.0",
+    attempts: int = 2,
+) -> Optional[Dict[str, Any]]:
+    """Return newer Sent Items metadata when the conversation moved on.
+
+    This guard is deliberately lighter than find_matching_sent_message_for_retry:
+    it does not prove our exact draft already sent, so it must not be used as a
+    successful-send reconciliation. It only answers whether a human/user sent
+    anything in the same conversation after a failed/queued retry point, which
+    means automated stale retry work should stop for manual review.
+
+    Privacy rule: select metadata only. Do not fetch body or bodyPreview.
+    """
+    if not conversation_id:
+        return None
+    sent_after_utc = coerce_utc_datetime(sent_after)
+    if not sent_after_utc:
+        return None
+
+    params = {
+        "$orderby": "sentDateTime desc",
+        "$top": "10",
+        "$select": "id,internetMessageId,conversationId,subject,toRecipients,sentDateTime",
+        "$filter": f"sentDateTime ge {sent_after_utc.isoformat().replace('+00:00', 'Z')}",
+    }
+
+    last_error: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            response = exponential_backoff_request(
+                lambda: requests.get(
+                    f"{base}/me/mailFolders/SentItems/messages",
+                    headers=headers,
+                    params=params,
+                    timeout=30,
+                )
+            )
+            if response.status_code != 200:
+                last_error = RuntimeError(f"Sent Items lookup returned HTTP {response.status_code}")
+                continue
+
+            for message in (response.json() or {}).get("value", []):
+                if message.get("conversationId") != conversation_id:
+                    continue
+                sent_time = coerce_utc_datetime(message.get("sentDateTime"))
+                if sent_time and sent_time < sent_after_utc:
+                    continue
+                identity = _message_identity(message)
+                identity["recipientCount"] = len(message.get("toRecipients") or [])
+                return identity
+        except Exception as exc:
+            last_error = exc
+            print(f"   ⚠️ Sent Items manual continuation guard lookup failed: {exc}")
+
+        if attempt < attempts - 1:
+            import time
+
+            time.sleep(0.5 * (attempt + 1))
+
+    if last_error:
+        raise SentMailGuardLookupError(str(last_error))
+    return None

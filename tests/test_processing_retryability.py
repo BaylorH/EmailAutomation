@@ -60,6 +60,60 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         mark_processed.assert_not_called()
         self.assertEqual(0, result["processed"])
 
+    def test_scan_skips_inbox_retry_when_user_manually_continued_conversation(self):
+        response = MagicMock()
+        received_at_dt = (datetime.now(timezone.utc) - timedelta(minutes=10)).replace(microsecond=0)
+        manual_sent_at = (received_at_dt + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+        received_at = received_at_dt.isoformat().replace("+00:00", "Z")
+        response.json.return_value = {
+            "value": [
+                {
+                    "id": "graph-message-1",
+                    "internetMessageId": "<message-1@example.test>",
+                    "subject": "RE: 4402 Rex Rd",
+                    "receivedDateTime": received_at,
+                    "conversationId": "conversation-1",
+                }
+            ]
+        }
+        manual_continuation = {
+            "id": "sent-manual-1",
+            "internetMessageId": "<manual-reply@example.test>",
+            "conversationId": "conversation-1",
+            "sentDateTime": manual_sent_at,
+        }
+
+        with patch.object(processing, "exponential_backoff_request", return_value=response), \
+             patch.object(processing, "has_processed", return_value=False), \
+             patch.object(processing, "_match_message_to_thread", return_value="thread-1"), \
+             patch.object(processing, "_has_processing_failure_record", return_value=True, create=True), \
+             patch.object(processing, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation, create=True) as continuation_guard, \
+             patch.object(processing, "process_inbox_message") as process_message, \
+             patch.object(processing, "mark_processed") as mark_processed, \
+             patch.object(processing, "_record_processing_failure_blocked_by_manual_continuation", create=True) as record_blocked, \
+             patch.object(processing, "set_last_scan_iso"):
+            result = processing.scan_inbox_against_index(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+                only_unread=False,
+                top=1,
+            )
+
+        continuation_guard.assert_called_once()
+        self.assertEqual("conversation-1", continuation_guard.call_args.kwargs["conversation_id"])
+        self.assertEqual(received_at_dt, continuation_guard.call_args.kwargs["sent_after"])
+        process_message.assert_not_called()
+        record_blocked.assert_called_once_with(
+            "uid-1",
+            "unknown",
+            "thread-1",
+            "<message-1@example.test>",
+            manual_continuation,
+        )
+        mark_processed.assert_called_once_with("uid-1", "<message-1@example.test>")
+        self.assertEqual(0, result["processed"])
+        self.assertEqual(1, result["skipped"])
+
     def test_successful_retry_can_clear_matching_processing_failure(self):
         fake_fs = MagicMock()
 

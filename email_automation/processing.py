@@ -49,6 +49,10 @@ from .email_operations import (
     send_thankyou_ask_alternatives
 )
 from .pending_responses import queue_pending_response, record_sent_unindexed_response
+from .sent_mail_guard import (
+    SentMailGuardLookupError,
+    find_sent_conversation_continuation_for_retry,
+)
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE, INBOX_SCAN_WINDOW_HOURS
 from .column_config import find_client_comment_column_index, find_notes_comment_column_index
 from .property_images import (
@@ -276,6 +280,64 @@ def _record_ai_processing_failure(user_id: str, client_id: str, thread_id: str, 
         }, merge=True)
     except Exception as e:
         print(f"⚠️ Could not record AI processing failure: {e}")
+
+
+def _has_processing_failure_record(user_id: str, thread_id: str, message_id: str) -> bool:
+    if not thread_id or not message_id:
+        return False
+    try:
+        doc_id = f"{thread_id}__{message_id}"
+        doc = _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).get()
+        return bool(getattr(doc, "exists", False))
+    except Exception as e:
+        print(f"⚠️ Could not check processing failure retry state: {e}")
+        return False
+
+
+def _record_processing_failure_blocked_by_manual_continuation(
+    user_id: str,
+    client_id: str,
+    thread_id: str,
+    message_id: str,
+    sent_artifact: Dict[str, Any],
+):
+    try:
+        doc_id = f"{thread_id}__{message_id or int(time.time())}"
+        guard_unreadable = bool(sent_artifact.get("guardUnreadable"))
+        recovery_status = (
+            "blocked_manual_retry_guard_unreadable"
+            if guard_unreadable
+            else "blocked_manual_conversation_continued"
+        )
+        last_retry_error = (
+            "Could not verify whether the user manually continued this conversation "
+            f"after the processing failure ({sent_artifact.get('guardError') or 'Sent Items unreadable'}); "
+            "leaving visible for manual review before retry."
+            if guard_unreadable
+            else (
+                "Inbox retry skipped because Sent Items shows this conversation was "
+                "continued after the failure; leaving visible for manual review to "
+                "avoid stale or duplicate handling."
+            )
+        )
+        _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).set({
+            "clientId": client_id,
+            "threadId": thread_id,
+            "messageId": message_id,
+            "retryable": False,
+            "recoveryStatus": recovery_status,
+            "recoveryArtifactCollection": sent_artifact.get("collection") or "SentItems/manualContinuation",
+            "recoverySentMessageId": sent_artifact.get("id") or sent_artifact.get("sentMessageId"),
+            "recoverySentInternetMessageId": sent_artifact.get("internetMessageId"),
+            "recoveryConversationId": sent_artifact.get("conversationId"),
+            "recoverySentDateTime": sent_artifact.get("sentDateTime"),
+            "recoveryGuardError": sent_artifact.get("guardError"),
+            "lastRetryAt": SERVER_TIMESTAMP,
+            "lastRetryError": last_retry_error,
+            "updatedAt": SERVER_TIMESTAMP,
+        }, merge=True)
+    except Exception as e:
+        print(f"⚠️ Could not record manual-continuation processing failure block: {e}")
 
 
 def _client_id_for_processing_failure(user_id: str, thread_id: str) -> str:
@@ -688,62 +750,15 @@ def _find_sent_item_continuing_conversation(
     *,
     base: str = "https://graph.microsoft.com/v1.0",
 ) -> Optional[Dict[str, Any]]:
-    """Return metadata for a newer Sent Items message in this conversation.
-
-    This is a privacy-preserving retry veto: it only reads message identity,
-    recipient metadata, subject, and sent time. It intentionally does not fetch
-    body or bodyPreview because the only question is whether the conversation
-    moved on after the failed inbound processing event.
-    """
-    if not conversation_id:
-        return None
-    sent_after_utc = _timestamp_to_utc(sent_after)
-    if not sent_after_utc:
-        return None
-
-    sent_after_iso = sent_after_utc.isoformat().replace("+00:00", "Z")
-    params = {
-        "$orderby": "sentDateTime desc",
-        "$top": "10",
-        "$select": "id,internetMessageId,conversationId,subject,toRecipients,sentDateTime",
-        "$filter": f"sentDateTime ge {sent_after_iso}",
-    }
-
     try:
-        response = exponential_backoff_request(
-            lambda: requests.get(
-                f"{base}/me/mailFolders/SentItems/messages",
-                headers=headers,
-                params=params,
-                timeout=30,
-            )
+        return find_sent_conversation_continuation_for_retry(
+            headers,
+            conversation_id=conversation_id,
+            sent_after=_timestamp_to_utc(sent_after),
+            base=base,
         )
-        status_code = getattr(response, "status_code", 200)
-        if status_code != 200:
-            return _guard_unreadable_artifact(
-                "SentItems/manualContinuation",
-                RuntimeError(f"Graph Sent Items returned HTTP {status_code}"),
-            )
-
-        for msg in (response.json() or {}).get("value", []):
-            if msg.get("conversationId") != conversation_id:
-                continue
-            sent_time = _timestamp_to_utc(msg.get("sentDateTime"))
-            if sent_time and sent_time < sent_after_utc:
-                continue
-            return {
-                "collection": "SentItems/manualContinuation",
-                "id": msg.get("id"),
-                "internetMessageId": msg.get("internetMessageId"),
-                "conversationId": conversation_id,
-                "sentDateTime": msg.get("sentDateTime"),
-                "subject": msg.get("subject"),
-                "recipientCount": len(msg.get("toRecipients") or []),
-            }
-    except Exception as e:
+    except SentMailGuardLookupError as e:
         return _guard_unreadable_artifact("SentItems/manualContinuation", e)
-
-    return None
 
 
 def _mark_processing_failure_blocked_by_manual_continuation(doc, sent_artifact: Dict[str, Any]):
@@ -956,6 +971,53 @@ def retry_processing_failures(
             f"succeeded={result['succeeded']}, failed={result['failed']}, skipped={result['skipped']}"
         )
     return result
+
+
+def _find_manual_continuation_for_inbox_retry(
+    user_id: str,
+    headers: Dict[str, str],
+    thread_id: str,
+    msg: Dict[str, Any],
+    processed_key: str,
+) -> Optional[Dict[str, Any]]:
+    if not _has_processing_failure_record(user_id, thread_id, processed_key):
+        return None
+    try:
+        return find_sent_conversation_continuation_for_retry(
+            headers,
+            conversation_id=msg.get("conversationId"),
+            sent_after=_timestamp_to_utc(msg.get("receivedDateTime") or msg.get("sentDateTime")),
+        )
+    except SentMailGuardLookupError as e:
+        return _guard_unreadable_artifact("SentItems/manualContinuation", e)
+
+
+def _skip_inbox_retry_after_manual_continuation(
+    user_id: str,
+    headers: Dict[str, str],
+    thread_id: str,
+    msg: Dict[str, Any],
+    processed_key: str,
+) -> bool:
+    manual_continuation = _find_manual_continuation_for_inbox_retry(
+        user_id,
+        headers,
+        thread_id,
+        msg,
+        processed_key,
+    )
+    if not manual_continuation:
+        return False
+
+    _record_processing_failure_blocked_by_manual_continuation(
+        user_id,
+        _client_id_for_processing_failure(user_id, thread_id),
+        thread_id,
+        processed_key,
+        manual_continuation,
+    )
+    mark_processed(user_id, processed_key)
+    return True
 
 
 PDF_LINK_CHANGE_REASON = "Broker PDF attachment uploaded to Drive."
@@ -4752,6 +4814,9 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             last_msg = messages[-1]
             processing_error = None
             processed_key = last_msg.get("internetMessageId") or last_msg.get("id")
+            if _skip_inbox_retry_after_manual_continuation(user_id, headers, thread_id, last_msg, processed_key):
+                skipped_count += 1
+                continue
             try:
                 process_inbox_message(user_id, headers, last_msg)
                 processed_count += 1
@@ -4776,6 +4841,9 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             msg = messages[0]
             processing_error = None
             processed_key = msg.get("internetMessageId") or msg.get("id")
+            if _skip_inbox_retry_after_manual_continuation(user_id, headers, thread_id, msg, processed_key):
+                skipped_count += 1
+                continue
             try:
                 process_inbox_message(user_id, headers, msg)
                 processed_count += 1

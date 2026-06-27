@@ -22,6 +22,7 @@ from .notifications import delete_notification_and_decrement_counters
 from .utils import normalize_message_id
 from .sent_mail_guard import (
     SentMailGuardLookupError,
+    find_sent_conversation_continuation_for_retry,
     find_matching_sent_message_for_retry,
     send_result_from_sent_match,
     sent_after_from_retry_data,
@@ -1569,7 +1570,28 @@ def _sent_retry_reconciliation_result(
         )
     except SentMailGuardLookupError as exc:
         return {"guardLookupError": str(exc)}
-    return send_result_from_sent_match(match or {}, recipient)
+    if match:
+        return send_result_from_sent_match(match, recipient)
+    try:
+        manual_continuation = find_sent_conversation_continuation_for_retry(
+            headers,
+            conversation_id=conversation_id,
+            sent_after=sent_after_from_retry_data(data),
+        )
+    except SentMailGuardLookupError as exc:
+        return {"guardLookupError": str(exc)}
+    if manual_continuation:
+        return {"manualContinuation": manual_continuation}
+    return {}
+
+
+def _manual_continuation_retry_reason(prior_send: Dict[str, Any]) -> str:
+    sent_at = ((prior_send or {}).get("manualContinuation") or {}).get("sentDateTime")
+    suffix = f" at {sent_at}" if sent_at else ""
+    return (
+        "Queued send stopped because Sent Items shows the user manually continued "
+        f"this conversation{suffix}; review before retrying the stale draft."
+    )
 
 
 def send_outboxes(
@@ -1832,6 +1854,14 @@ def _send_multi_property_email(
                     delete_original=True,
                 )
                 print(f"  ⚠️ Prior send detected for {recipient_email}; moved grouped item to reconciliation without retrying")
+                continue
+            if prior_send.get("manualContinuation"):
+                _move_to_dead_letter(
+                    user_id,
+                    item['doc'].reference,
+                    data,
+                    _manual_continuation_retry_reason(prior_send),
+                )
                 continue
             if prior_send.get("guardLookupError"):
                 _move_to_dead_letter(
@@ -2112,6 +2142,14 @@ def _send_single_outbox_item(
                     "Prior failed attempt appears already sent in Sent Items; "
                     "operator reconciliation required"
                 )
+            elif prior_send.get("manualContinuation"):
+                _move_to_dead_letter(
+                    user_id,
+                    d.reference,
+                    data,
+                    _manual_continuation_retry_reason(prior_send),
+                )
+                return
             elif prior_send.get("guardLookupError"):
                 _move_to_dead_letter(
                     user_id,
@@ -2178,6 +2216,14 @@ def _send_single_outbox_item(
                             "operator reconciliation required"
                         )
                         continue
+                    if prior_send.get("manualContinuation"):
+                        _move_to_dead_letter(
+                            user_id,
+                            d.reference,
+                            data,
+                            _manual_continuation_retry_reason(prior_send),
+                        )
+                        return
                     if prior_send.get("guardLookupError"):
                         _move_to_dead_letter(
                             user_id,
@@ -2228,6 +2274,14 @@ def _send_single_outbox_item(
                         "operator reconciliation required"
                     )
                     continue
+                if prior_send.get("manualContinuation"):
+                    _move_to_dead_letter(
+                        user_id,
+                        d.reference,
+                        data,
+                        _manual_continuation_retry_reason(prior_send),
+                    )
+                    return
                 if prior_send.get("guardLookupError"):
                     _move_to_dead_letter(
                         user_id,

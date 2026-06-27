@@ -31,6 +31,7 @@ from .utils import (
 from .messaging import save_message
 from .sent_mail_guard import (
     SentMailGuardLookupError,
+    find_sent_conversation_continuation_for_retry,
     find_matching_sent_message_for_retry,
     sent_after_from_retry_data,
 )
@@ -525,6 +526,26 @@ def _send_followup_email(
                     "followUpConfig.lastSendAttemptAt": sent_match.get("sentDateTime"),
                 })
                 return True
+            try:
+                manual_continuation = find_sent_conversation_continuation_for_retry(
+                    headers,
+                    conversation_id=conversation_id,
+                    sent_after=sent_after_from_retry_data(followup_config),
+                )
+            except SentMailGuardLookupError as exc:
+                _send_followup_email.last_error = f"Sent Items manual continuation guard failed: {exc}"
+                _send_followup_email.guard_failed_closed = True
+                print(f"   ⚠️ {_send_followup_email.last_error}")
+                return False
+
+            if manual_continuation:
+                _send_followup_email.last_error = (
+                    "Follow-up stopped because Sent Items shows the user manually continued "
+                    "this conversation; review before retrying the stale follow-up."
+                )
+                _send_followup_email.guard_failed_closed = True
+                print(f"   ⚠️ {_send_followup_email.last_error}")
+                return False
 
         # Send as reply with signature attachments
         send_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=5)

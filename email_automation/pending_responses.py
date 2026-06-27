@@ -11,6 +11,7 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 
 from .sent_mail_guard import (
     SentMailGuardLookupError,
+    find_sent_conversation_continuation_for_retry,
     find_matching_sent_message_for_retry,
     sent_after_from_retry_data,
 )
@@ -232,6 +233,30 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> int:
                     )
                     doc.reference.delete()
                     print("    ⚠️ Prior send found in Sent Items; moved to reconciliation without retrying")
+                    continue
+                try:
+                    manual_continuation = find_sent_conversation_continuation_for_retry(
+                        headers,
+                        conversation_id=data.get("conversationId"),
+                        sent_after=sent_after_from_retry_data(data),
+                    )
+                except SentMailGuardLookupError as exc:
+                    _move_pending_response_to_dead_letter(
+                        user_id,
+                        doc,
+                        data,
+                        f"Sent Items retry guard could not verify manual continuation before retry; manual review required: {exc}",
+                    )
+                    print("    ⚠️ Manual continuation guard failed closed; moved pending response to manual review")
+                    continue
+                if manual_continuation:
+                    _move_pending_response_to_dead_letter(
+                        user_id,
+                        doc,
+                        data,
+                        "Pending response stopped because Sent Items shows the user manually continued this conversation; review before retrying the stale draft.",
+                    )
+                    print("    ⚠️ Manual continuation found in Sent Items; moved pending response to manual review")
                     continue
 
             sent = send_reply_in_thread(

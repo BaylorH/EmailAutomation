@@ -291,6 +291,52 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertIn("Sent Items retry guard failed", followup._send_followup_email.last_error)
         self.assertTrue(followup._send_followup_email.guard_failed_closed)
 
+    def test_failed_followup_retry_blocks_when_conversation_was_manually_continued(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+        })
+        fake_fs = FakeFollowupFirestore([outbound])
+        followup_config = {
+            "lastSendError": "Read timed out after Graph accepted send",
+            "lastSendAttemptAt": "2026-06-26T12:05:00Z",
+            "followUps": [{"message": "Hi [NAME],\n\nJust following up."}],
+        }
+        thread_data = {
+            "email": ["bp21harrison@gmail.com"],
+            "contactName": "Ryan Broker",
+        }
+        manual_continuation = {
+            "id": "manual-sent-1",
+            "internetMessageId": "<manual-sent-1@example.com>",
+            "conversationId": "conv-1",
+            "sentDateTime": "2026-06-26T12:08:00Z",
+        }
+
+        with patch.object(followup, "_fs", fake_fs), \
+             patch.object(followup, "exponential_backoff_request", return_value=FakeResponse(200, {
+                 "value": [{"id": "graph-root", "subject": "0 Gemini Ave", "conversationId": "conv-1"}]
+             })), \
+             patch.object(followup, "find_matching_sent_message_for_retry", return_value=None), \
+             patch.object(followup, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation, create=True) as continuation_guard, \
+             patch.object(requests, "post") as post:
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+            )
+
+        self.assertFalse(result)
+        continuation_guard.assert_called_once()
+        self.assertEqual(continuation_guard.call_args.kwargs["conversation_id"], "conv-1")
+        post.assert_not_called()
+        self.assertIn("manually continued", followup._send_followup_email.last_error)
+        self.assertTrue(followup._send_followup_email.guard_failed_closed)
+
     def test_guard_lookup_failure_release_marks_manual_review(self):
         thread_ref = FakeThreadRef()
         attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)

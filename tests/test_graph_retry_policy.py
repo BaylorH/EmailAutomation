@@ -144,6 +144,53 @@ class GraphRetryPolicyTests(unittest.TestCase):
         self.assertEqual(match["id"], "valid")
         self.assertIn("sentDateTime ge 2026-06-26T12:00:00Z", captured["params"]["$filter"])
 
+    def test_manual_continuation_guard_uses_metadata_only(self):
+        messages = [
+            {
+                "id": "old-sent",
+                "internetMessageId": "<old-sent@example.com>",
+                "conversationId": "conv-1",
+                "subject": "RE: 0 Gemini Ave, Houston",
+                "sentDateTime": "2026-06-26T11:59:00Z",
+                "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
+            },
+            {
+                "id": "other-conversation",
+                "internetMessageId": "<other-conversation@example.com>",
+                "conversationId": "conv-2",
+                "subject": "RE: 0 Gemini Ave, Houston",
+                "sentDateTime": "2026-06-26T12:10:00Z",
+                "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
+            },
+            {
+                "id": "manual-continuation",
+                "internetMessageId": "<manual-continuation@example.com>",
+                "conversationId": "conv-1",
+                "subject": "RE: 0 Gemini Ave, Houston",
+                "sentDateTime": "2026-06-26T12:11:00Z",
+                "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
+            },
+        ]
+        captured = {}
+
+        def fake_get(_url, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse(200, {"value": messages})
+
+        with patch.object(sent_mail_guard.requests, "get", side_effect=fake_get):
+            match = sent_mail_guard.find_sent_conversation_continuation_for_retry(
+                {"Authorization": "Bearer token"},
+                conversation_id="conv-1",
+                sent_after=datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(match["id"], "manual-continuation")
+        self.assertEqual(match["internetMessageId"], "<manual-continuation@example.com>")
+        selected_fields = captured["params"]["$select"]
+        self.assertNotIn("body", selected_fields)
+        self.assertNotIn("bodyPreview", selected_fields)
+        self.assertIn("sentDateTime ge 2026-06-26T12:00:00Z", captured["params"]["$filter"])
+
     def test_sent_items_retry_guard_rejects_short_subset_body_match(self):
         messages = [
             {
