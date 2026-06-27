@@ -109,6 +109,9 @@ def _queue_response_retry_or_reconciliation(
         response_body,
         client_id,
         error=failure_reason,
+        subject=getattr(send_reply_in_thread, "last_subject", None),
+        conversation_id=getattr(send_reply_in_thread, "last_conversation_id", None),
+        last_send_attempt_at=getattr(send_reply_in_thread, "last_send_attempt_at", None),
     )
     return "queued_retry"
 
@@ -2202,6 +2205,9 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
     send_reply_in_thread.last_error = None
     send_reply_in_thread.sent_but_unindexed = False
     send_reply_in_thread.last_outcome = None
+    send_reply_in_thread.last_subject = None
+    send_reply_in_thread.last_conversation_id = None
+    send_reply_in_thread.last_send_attempt_at = None
     try:
         from .utils import (
             GRAPH_SEND_MAX_RETRIES,
@@ -2218,6 +2224,22 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         import time
 
         base = "https://graph.microsoft.com/v1.0"
+
+        try:
+            current_meta_resp = exponential_backoff_request(
+                lambda: requests.get(
+                    f"{base}/me/messages/{current_msg_id}",
+                    headers=headers,
+                    params={"$select": "conversationId,subject"},
+                    timeout=30,
+                )
+            )
+            if current_meta_resp.status_code == 200:
+                current_meta = current_meta_resp.json() or {}
+                send_reply_in_thread.last_subject = current_meta.get("subject")
+                send_reply_in_thread.last_conversation_id = current_meta.get("conversationId")
+        except Exception as exc:
+            print(f"   ⚠️ Could not fetch reply thread identity before send: {exc}")
 
         # Fetch user's signature settings to use the same signature as outbox emails
         user_signature = None
@@ -2287,9 +2309,11 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
 
                 # Send the reply
                 reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
+                send_reply_in_thread.last_send_attempt_at = reply_sent_after
                 resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-                    max_retries=GRAPH_SEND_MAX_RETRIES,
+                    max_retries=1,
+                    operation="graph_send",
                 )
 
                 if resp and resp.status_code in [200, 202]:
@@ -2311,10 +2335,12 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                 }
             }
             reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
+            send_reply_in_thread.last_send_attempt_at = reply_sent_after
             resp = exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{current_msg_id}/reply",
                                      headers=headers, json=reply_payload, timeout=30),
-                max_retries=GRAPH_SEND_MAX_RETRIES,
+                max_retries=1,
+                operation="graph_send",
             )
             reply_sent_successfully = resp and resp.status_code in [200, 201, 202]
             if reply_sent_successfully:
@@ -2357,9 +2383,11 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                         except:
                             pass
                     reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
+                    send_reply_in_thread.last_send_attempt_at = reply_sent_after
                     resp = exponential_backoff_request(
                         lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30),
-                        max_retries=GRAPH_SEND_MAX_RETRIES,
+                        max_retries=1,
+                        operation="graph_send",
                     )
                     if resp and resp.status_code in [200, 202]:
                         print(f"   ✅ Sent reply via sendMail fallback with attachments")
@@ -2367,10 +2395,12 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             else:
                 send_payload = {"message": msg, "saveToSentItems": True}
                 reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
+                send_reply_in_thread.last_send_attempt_at = reply_sent_after
                 resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/sendMail", headers=headers,
                                          json=send_payload, timeout=30),
-                    max_retries=GRAPH_SEND_MAX_RETRIES,
+                    max_retries=1,
+                    operation="graph_send",
                 )
                 if resp and resp.status_code in [200, 201, 202]:
                     print(f"   ✅ Sent reply via /sendMail fallback")
@@ -2400,6 +2430,8 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                 )
             )
             conversation_id = current_msg_resp.json().get("conversationId") if current_msg_resp.status_code == 200 else None
+            if conversation_id:
+                send_reply_in_thread.last_conversation_id = conversation_id
 
             if conversation_id:
                 sent_msg = _find_recent_sent_message_for_conversation(

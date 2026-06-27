@@ -386,6 +386,7 @@ class OutboxSafetyTests(unittest.TestCase):
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None), \
              patch.object(email_module, "send_and_index_email", return_value={
                  "sent": [],
                  "errors": {
@@ -411,6 +412,136 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(audit_payload["attempts"], 2)
         self.assertEqual(audit_payload["maxAttempts"], email_module.MAX_OUTBOX_ATTEMPTS)
         self.assertIn("Request failed after 3 attempts", audit_payload["lastError"])
+
+    def test_retry_with_matching_sent_item_moves_to_reconciliation_without_resending(self):
+        recipient = "bp21harrison+leaguecity-row20@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [recipient],
+            "script": "Hi Ron,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "0 Gemini Ave, Houston",
+            "rowNumber": 20,
+            "attempts": 1,
+            "lastError": "HTTPSConnectionPool read timed out",
+            "lastSendAttemptAt": "2026-06-26T12:00:00Z",
+            "actionAuditId": "audit-ambiguous-retry",
+            "followUpConfig": {"enabled": False},
+        }, doc_id="outbox-ambiguous-retry")
+        fake_fs = FakeFirestore()
+        sent_match = {
+            "id": "sent-graph-1",
+            "internetMessageId": "<sent-graph-1@example.com>",
+            "conversationId": "conversation-1",
+            "subject": "0 Gemini Ave, Houston",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match, create=True) as sent_guard, \
+             patch.object(email_module, "send_and_index_email") as send_and_index_email:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        sent_guard.assert_called_once()
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "needs_reconciliation")
+        self.assertTrue(dead_letter_payload["alreadySent"])
+        self.assertEqual(dead_letter_payload["sentRecipients"], [recipient])
+        self.assertEqual(dead_letter_payload["sentMessageIds"][recipient], "sent-graph-1")
+        self.assertEqual(dead_letter_payload["internetMessageIds"][recipient], "<sent-graph-1@example.com>")
+
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual(audit_payload["status"], "needs_reconciliation")
+        self.assertTrue(audit_payload["alreadySent"])
+        self.assertEqual(audit_payload["sentRecipients"], [recipient])
+
+    def test_thread_reply_retry_passes_conversation_identity_to_sent_guard(self):
+        recipient = "bp21harrison+reply@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [recipient],
+            "script": "Hi Ron,\n\nThat time works.\n\nThanks",
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "replyToMessageId": "graph-message-1",
+            "attempts": 1,
+            "lastError": "Read timed out after Graph reply",
+            "lastSendAttemptAt": "2026-06-26T12:00:00Z",
+            "actionAuditId": "audit-thread-retry",
+        }, doc_id="outbox-thread-retry")
+        fake_fs = FakeFirestore()
+        sent_match = {
+            "id": "sent-reply-1",
+            "internetMessageId": "<sent-reply-1@example.com>",
+            "conversationId": "conv-thread-1",
+            "subject": "RE: 0 Gemini Ave",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_thread_row_number", return_value=7), \
+             patch.object(email_module, "_get_reply_message_sender", return_value=recipient), \
+             patch.object(email_module, "_fetch_graph_message_metadata", return_value={
+                 "conversationId": "conv-thread-1",
+                 "subject": "RE: 0 Gemini Ave",
+             }), \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match, create=True) as sent_guard, \
+             patch.object(email_module, "_send_outbox_as_reply") as send_reply:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        sent_guard.assert_called_once()
+        self.assertEqual(sent_guard.call_args.kwargs["conversation_id"], "conv-thread-1")
+        self.assertEqual(sent_guard.call_args.kwargs["subject"], "RE: 0 Gemini Ave")
+        send_reply.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+
+    def test_retry_guard_lookup_failure_dead_letters_without_resending(self):
+        recipient = "bp21harrison+leaguecity-row20@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [recipient],
+            "script": "Hi Ron,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "0 Gemini Ave, Houston",
+            "rowNumber": 20,
+            "attempts": 1,
+            "lastError": "HTTPSConnectionPool read timed out",
+            "lastSendAttemptAt": "2026-06-26T12:00:00Z",
+            "actionAuditId": "audit-guard-failed",
+            "followUpConfig": {"enabled": False},
+        }, doc_id="outbox-guard-failed")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
+             patch.object(
+                 email_module,
+                 "find_matching_sent_message_for_retry",
+                 side_effect=email_module.SentMailGuardLookupError("Graph 401"),
+             ), \
+             patch.object(email_module, "send_and_index_email") as send_and_index_email:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "dead_lettered")
+        self.assertIn("Sent Items retry guard could not verify prior send", dead_letter_payload["failureReason"])
 
     def test_partial_send_retry_keeps_only_failed_recipients(self):
         doc = FakeDoc({
@@ -445,6 +576,7 @@ class OutboxSafetyTests(unittest.TestCase):
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None), \
              patch.object(email_module, "send_and_index_email", side_effect=send_result):
             email_module._send_single_outbox_item(
                 "uid-1",
@@ -529,6 +661,7 @@ class OutboxSafetyTests(unittest.TestCase):
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None), \
              patch.object(email_module, "send_and_index_email", return_value={
                  "sent": ["bp21harrison+failed@gmail.com"],
                  "errors": {},

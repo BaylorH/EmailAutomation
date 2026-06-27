@@ -1,7 +1,30 @@
+import os
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
+import requests
+
+os.environ.setdefault("E2E_TEST_MODE", "true")
+os.environ.setdefault(
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
+)
+
 from email_automation import followup
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(response=self)
 
 
 class FakeThreadRef:
@@ -48,6 +71,74 @@ class FakeMessageDoc:
 
     def to_dict(self):
         return self._data
+
+
+class FakeMessagesCollection:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def where(self, *_args, **_kwargs):
+        return self
+
+    def order_by(self, *_args, **_kwargs):
+        return self
+
+    def limit(self, *_args, **_kwargs):
+        return self
+
+    def stream(self):
+        return self.docs
+
+
+class FakeFollowupThreadNode:
+    def __init__(self, updates, messages):
+        self.updates = updates
+        self.messages = messages
+
+    def collection(self, name):
+        if name != "messages":
+            raise AssertionError(f"Unexpected thread collection: {name}")
+        return FakeMessagesCollection(self.messages)
+
+    def update(self, data):
+        self.updates.append(data)
+
+
+class FakeFollowupThreadsCollection:
+    def __init__(self, updates, messages):
+        self.updates = updates
+        self.messages = messages
+
+    def document(self, _thread_id):
+        return FakeFollowupThreadNode(self.updates, self.messages)
+
+
+class FakeFollowupUserNode:
+    def __init__(self, updates, messages):
+        self.updates = updates
+        self.messages = messages
+
+    def get(self):
+        return FakeThreadSnapshot({"email": "baylor.freelance@outlook.com"})
+
+    def collection(self, name):
+        if name != "threads":
+            raise AssertionError(f"Unexpected user collection: {name}")
+        return FakeFollowupThreadsCollection(self.updates, self.messages)
+
+
+class FakeFollowupFirestore:
+    def __init__(self, messages):
+        self.updates = []
+        self.messages = messages
+
+    def collection(self, name):
+        if name != "users":
+            raise AssertionError(f"Unexpected root collection: {name}")
+        return self
+
+    def document(self, _user_id):
+        return FakeFollowupUserNode(self.updates, self.messages)
 
 
 class FollowupTerminalStateTests(unittest.TestCase):
@@ -115,6 +206,137 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertFalse(update["hasInboundReply"])
         self.assertIsNone(update["followUpConfig.pausedAt"])
         self.assertIn("followUpConfig.nextFollowUpAt", update)
+
+    def test_failed_followup_retry_uses_sent_items_match_without_resending(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+        })
+        fake_fs = FakeFollowupFirestore([outbound])
+        followup_config = {
+            "lastSendError": "Read timed out after Graph accepted send",
+            "lastSendAttemptAt": "2026-06-26T12:05:00Z",
+            "followUps": [{"message": "Hi [NAME],\n\nJust following up."}],
+        }
+        thread_data = {
+            "email": ["bp21harrison@gmail.com"],
+            "contactName": "Ryan Broker",
+        }
+
+        with patch.object(followup, "_fs", fake_fs), \
+             patch.object(followup, "exponential_backoff_request", return_value=FakeResponse(200, {
+                 "value": [{"id": "graph-root", "subject": "0 Gemini Ave", "conversationId": "conv-1"}]
+             })), \
+             patch.object(followup, "find_matching_sent_message_for_retry", return_value={
+                 "id": "sent-followup-1",
+                 "internetMessageId": "<sent-followup-1@example.com>",
+                 "conversationId": "conv-1",
+             }) as sent_guard, \
+             patch.object(followup, "_save_followup_message") as save_followup, \
+             patch.object(requests, "post") as post:
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+            )
+
+        self.assertTrue(result)
+        sent_guard.assert_called_once()
+        post.assert_not_called()
+        save_followup.assert_called_once()
+        self.assertIsNone(fake_fs.updates[-1]["followUpConfig.lastSendError"])
+
+    def test_failed_followup_retry_blocks_when_sent_items_lookup_fails(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+        })
+        fake_fs = FakeFollowupFirestore([outbound])
+        followup_config = {
+            "lastSendError": "Read timed out after Graph accepted send",
+            "lastSendAttemptAt": "2026-06-26T12:05:00Z",
+            "followUps": [{"message": "Hi [NAME],\n\nJust following up."}],
+        }
+        thread_data = {
+            "email": ["bp21harrison@gmail.com"],
+            "contactName": "Ryan Broker",
+        }
+
+        with patch.object(followup, "_fs", fake_fs), \
+             patch.object(followup, "exponential_backoff_request", return_value=FakeResponse(200, {
+                 "value": [{"id": "graph-root", "subject": "0 Gemini Ave", "conversationId": "conv-1"}]
+             })), \
+             patch.object(
+                 followup,
+                 "find_matching_sent_message_for_retry",
+                 side_effect=followup.SentMailGuardLookupError("Graph 401"),
+             ), \
+             patch.object(requests, "post") as post:
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+            )
+
+        self.assertFalse(result)
+        post.assert_not_called()
+        self.assertIn("Sent Items retry guard failed", followup._send_followup_email.last_error)
+        self.assertTrue(followup._send_followup_email.guard_failed_closed)
+
+    def test_guard_lookup_failure_release_marks_manual_review(self):
+        thread_ref = FakeThreadRef()
+        attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)):
+            followup._release_followup_claim(
+                "uid-1",
+                "thread-1",
+                reason="Sent Items retry guard failed: Graph 401",
+                attempted_at=attempted_at,
+                current_index=1,
+                fail_closed=True,
+            )
+
+        update = thread_ref.updates[-1]
+        self.assertEqual(update["followUpStatus"], "needs_review")
+        self.assertEqual(update["status"], "action_needed")
+        self.assertEqual(update["statusReason"], "followup_send_guard_failed")
+        self.assertFalse(update["followUpConfig.enabled"])
+        self.assertEqual(update["followUpConfig.lastSendAttemptIndex"], 1)
+
+    def test_schedule_next_followup_clears_previous_retry_guard_state(self):
+        thread_ref = FakeThreadRef()
+        followup_config = {
+            "lastSendError": "Read timed out",
+            "lastSendAttemptAt": "2026-06-26T12:05:00Z",
+            "lastSendAttemptIndex": 0,
+            "followUps": [
+                {"waitTime": 1, "waitUnit": "hours", "message": "First"},
+                {"waitTime": 2, "waitUnit": "hours", "message": "Second"},
+            ],
+        }
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)):
+            followup._schedule_next_followup(
+                "uid-1",
+                "thread-1",
+                followup_config,
+                just_sent_index=0,
+            )
+
+        update = thread_ref.updates[-1]
+        self.assertEqual(update["followUpConfig.currentFollowUpIndex"], 1)
+        self.assertIsNone(update["followUpConfig.lastSendError"])
+        self.assertIsNone(update["followUpConfig.lastSendAttemptAt"])
+        self.assertIsNone(update["followUpConfig.lastSendAttemptIndex"])
 
 
 if __name__ == "__main__":

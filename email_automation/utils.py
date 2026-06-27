@@ -264,7 +264,7 @@ def safe_preview(content: str, max_len: int = 200) -> str:
         preview = preview[:max_len] + "..."
     return preview
 
-def exponential_backoff_request(func, max_retries: int = 3):
+def exponential_backoff_request(func, max_retries: int = 3, operation: Optional[str] = None):
     """Execute request with exponential backoff on rate limits."""
     for attempt in range(max_retries):
         try:

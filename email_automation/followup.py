@@ -29,6 +29,11 @@ from .utils import (
     resolve_signature_settings,
 )
 from .messaging import save_message
+from .sent_mail_guard import (
+    SentMailGuardLookupError,
+    find_matching_sent_message_for_retry,
+    sent_after_from_retry_data,
+)
 
 # Claim timeout for follow-up processing (prevent duplicate sends)
 FOLLOWUP_CLAIM_TIMEOUT_SECONDS = 60
@@ -97,14 +102,37 @@ def _claim_followup(user_id: str, thread_id: str, current_index: int) -> bool:
         return False
 
 
-def _release_followup_claim(user_id: str, thread_id: str):
+def _release_followup_claim(
+    user_id: str,
+    thread_id: str,
+    *,
+    reason: Optional[str] = None,
+    attempted_at: Optional[datetime] = None,
+    current_index: Optional[int] = None,
+    fail_closed: bool = False,
+):
     """Release claim on a follow-up (called on failure to allow retry)."""
     try:
         thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
-        thread_ref.update({
+        update_payload = {
             "followUpConfig.processingBy": None,
-            "followUpConfig.processingAt": None
-        })
+            "followUpConfig.processingAt": None,
+        }
+        if reason:
+            update_payload["followUpConfig.lastSendError"] = reason
+        if attempted_at:
+            update_payload["followUpConfig.lastSendAttemptAt"] = attempted_at
+        if current_index is not None:
+            update_payload["followUpConfig.lastSendAttemptIndex"] = current_index
+        if fail_closed:
+            update_payload.update({
+                "followUpStatus": "needs_review",
+                "status": "action_needed",
+                "statusReason": "followup_send_guard_failed",
+                "followUpConfig.enabled": False,
+                "followUpConfig.nextFollowUpAt": None,
+            })
+        thread_ref.update(update_payload)
     except Exception as e:
         print(f"   ⚠️ Failed to release follow-up claim: {e}")
 
@@ -302,7 +330,14 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
                 time.sleep(120)  # 2 minutes
         else:
             # Release the claim so it can be retried
-            _release_followup_claim(user_id, thread_id)
+            _release_followup_claim(
+                user_id,
+                thread_id,
+                reason=getattr(_send_followup_email, "last_error", None),
+                attempted_at=getattr(_send_followup_email, "last_attempt_at", None),
+                current_index=current_index,
+                fail_closed=getattr(_send_followup_email, "guard_failed_closed", False),
+            )
 
     print(f"\n   Sent {followups_sent} follow-up email(s)")
     return followups_sent
@@ -318,6 +353,10 @@ def _send_followup_email(
 ) -> bool:
     """Send a follow-up email for a specific thread."""
     import requests
+
+    _send_followup_email.last_error = None
+    _send_followup_email.last_attempt_at = None
+    _send_followup_email.guard_failed_closed = False
 
     try:
         followups = followup_config.get("followUps", [])
@@ -400,6 +439,7 @@ def _send_followup_email(
 
             graph_msg_id = messages[0]["id"]
             subject = messages[0].get("subject", thread_data.get("subject", "Follow-up"))
+            conversation_id = messages[0].get("conversationId")
         else:
             print(f"   No internetMessageId for reply")
             return False
@@ -449,7 +489,46 @@ def _send_followup_email(
             user_email=user_email,
         )
 
+        last_attempt_index = followup_config.get("lastSendAttemptIndex")
+        retry_state_matches_current_followup = (
+            last_attempt_index is None or last_attempt_index == followup_index
+        )
+        if retry_state_matches_current_followup and (
+            followup_config.get("lastSendError") or followup_config.get("lastSendAttemptAt")
+        ):
+            try:
+                sent_match = find_matching_sent_message_for_retry(
+                    headers,
+                    recipient=recipient,
+                    body=followup_message,
+                    subject=subject,
+                    conversation_id=conversation_id,
+                    sent_after=sent_after_from_retry_data(followup_config),
+                )
+            except SentMailGuardLookupError as exc:
+                _send_followup_email.last_error = f"Sent Items retry guard failed: {exc}"
+                _send_followup_email.guard_failed_closed = True
+                print(f"   ⚠️ {_send_followup_email.last_error}")
+                return False
+
+            if sent_match:
+                print(f"   ⚠️ Prior follow-up send found in Sent Items; recording without resending")
+                _save_followup_message(
+                    user_id, thread_id, recipient, subject,
+                    followup_message, user_signature, signature_mode, user_email
+                )
+                _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
+                    "lastOutboundAt": SERVER_TIMESTAMP,
+                    "updatedAt": SERVER_TIMESTAMP,
+                    "followUpConfig.lastFollowUpSentAt": SERVER_TIMESTAMP,
+                    "followUpConfig.lastSendError": None,
+                    "followUpConfig.lastSendAttemptAt": sent_match.get("sentDateTime"),
+                })
+                return True
+
         # Send as reply with signature attachments
+        send_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        _send_followup_email.last_attempt_at = send_attempt_at
         if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
             # Use createReply to get a draft, add attachments, then send
             create_reply_resp = exponential_backoff_request(
@@ -491,7 +570,9 @@ def _send_followup_email(
 
             # Send the reply
             reply_resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30)
+                lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
+                max_retries=1,
+                operation="graph_send",
             )
         else:
             # No attachments - use simple reply endpoint
@@ -512,7 +593,9 @@ def _send_followup_email(
                     headers=headers,
                     json=reply_body,
                     timeout=30
-                )
+                ),
+                max_retries=1,
+                operation="graph_send",
             )
 
         if reply_resp.status_code in [200, 201, 202]:
@@ -532,9 +615,11 @@ def _send_followup_email(
             return True
         else:
             print(f"   Failed to send follow-up: {reply_resp.status_code}")
+            _send_followup_email.last_error = f"Follow-up Graph send returned HTTP {reply_resp.status_code}"
             return False
 
     except Exception as e:
+        _send_followup_email.last_error = str(e)
         print(f"   Error sending follow-up: {e}")
         return False
 
@@ -573,6 +658,9 @@ def _schedule_next_followup(
         "followUpConfig.nextFollowUpAt": next_followup_at,
         "followUpConfig.processingBy": None,
         "followUpConfig.processingAt": None,
+        "followUpConfig.lastSendError": None,
+        "followUpConfig.lastSendAttemptAt": None,
+        "followUpConfig.lastSendAttemptIndex": None,
         "followUpStatus": "waiting",
         "updatedAt": SERVER_TIMESTAMP
     })

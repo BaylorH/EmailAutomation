@@ -20,6 +20,12 @@ from .clients import _get_sheet_id_or_fail, _sheets_client
 from .sheets import _find_row_by_email, _get_first_tab_title, _read_header_row2, _header_index_map, highlight_row
 from .notifications import delete_notification_and_decrement_counters
 from .utils import normalize_message_id
+from .sent_mail_guard import (
+    SentMailGuardLookupError,
+    find_matching_sent_message_for_retry,
+    send_result_from_sent_match,
+    sent_after_from_retry_data,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -625,7 +631,8 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
                 sent_after = datetime.now(timezone.utc) - timedelta(seconds=10)
                 resp = exponential_backoff_request(
                     lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-                    max_retries=GRAPH_SEND_MAX_RETRIES,
+                    max_retries=1,
+                    operation="graph_send",
                 )
 
                 if resp and resp.status_code in [200, 202]:
@@ -657,7 +664,8 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
         resp = exponential_backoff_request(
             lambda: requests.post(f"{base}/me/messages/{reply_to_msg_id}/reply",
                                  headers=headers, json=reply_payload, timeout=30),
-            max_retries=GRAPH_SEND_MAX_RETRIES,
+            max_retries=1,
+            operation="graph_send",
         )
 
         if resp and resp.status_code in [200, 201, 202]:
@@ -1298,7 +1306,8 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             # 3. Send draft
             exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30),
-                max_retries=GRAPH_SEND_MAX_RETRIES,
+                max_retries=1,
+                operation="graph_send",
             )
 
             # 4. Index in Firestore with retry logic
@@ -1533,6 +1542,34 @@ def _record_outbox_reconciliation(
             **identity_payload,
         })
         doc_ref.delete()
+
+
+def _should_preflight_sent_items_retry(data: Dict[str, Any]) -> bool:
+    return int((data or {}).get("attempts") or 0) > 0 or bool((data or {}).get("lastError"))
+
+
+def _sent_retry_reconciliation_result(
+    headers: Dict[str, str],
+    data: Dict[str, Any],
+    recipient: str,
+    body: str,
+    subject: Optional[str],
+    conversation_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not _should_preflight_sent_items_retry(data):
+        return {}
+    try:
+        match = find_matching_sent_message_for_retry(
+            headers,
+            recipient=recipient,
+            body=body,
+            subject=subject,
+            conversation_id=conversation_id,
+            sent_after=sent_after_from_retry_data(data),
+        )
+    except SentMailGuardLookupError as exc:
+        return {"guardLookupError": str(exc)}
+    return send_result_from_sent_match(match or {}, recipient)
 
 
 def send_outboxes(
@@ -1777,6 +1814,34 @@ def _send_multi_property_email(
 
             contact_name = data.get("contactName") or data.get("firstName")
             current_headers = _fresh_graph_headers(headers, headers_provider)
+            prior_send = _sent_retry_reconciliation_result(
+                current_headers,
+                data,
+                recipient_email,
+                script,
+                subject_override,
+            )
+            if prior_send.get("sent"):
+                _record_outbox_reconciliation(
+                    user_id,
+                    item['doc'].reference,
+                    data,
+                    "Prior failed attempt appears already sent in Sent Items; stopped before retry",
+                    prior_send,
+                    prior_send.get("sent", []),
+                    delete_original=True,
+                )
+                print(f"  ⚠️ Prior send detected for {recipient_email}; moved grouped item to reconciliation without retrying")
+                continue
+            if prior_send.get("guardLookupError"):
+                _move_to_dead_letter(
+                    user_id,
+                    item['doc'].reference,
+                    data,
+                    f"Sent Items retry guard could not verify prior send; manual review required before retry: {prior_send['guardLookupError']}",
+                )
+                continue
+            send_started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
             res = send_and_index_email(user_id, current_headers, script, [recipient_email],
                                        client_id_or_none=clientId, row_number=row_number,
                                        user_signature=user_signature, subject_override=subject_override,
@@ -1828,6 +1893,7 @@ def _send_multi_property_email(
                         {
                             "attempts": new_attempts,
                             "lastError": error_msg,
+                            "lastSendAttemptAt": send_started_at,
                             "status": "retrying",
                             "processingBy": None,
                             "processingAt": None,
@@ -1856,6 +1922,7 @@ def _send_multi_property_email(
                     {
                         "attempts": new_attempts,
                         "lastError": error_msg,
+                        "lastSendAttemptAt": datetime.now(timezone.utc) - timedelta(seconds=5),
                         "status": "retrying",
                         "processingBy": None,
                         "processingAt": None,
@@ -2006,6 +2073,19 @@ def _send_single_outbox_item(
             print(f"   ⚠️ Could not fetch followUpConfig from client: {e}")
 
     contact_name = data.get("contactName") or data.get("firstName")
+    reply_retry_metadata: Dict[str, Any] = {}
+    if is_thread_reply and _should_preflight_sent_items_retry(data) and reply_to_msg_id:
+        reply_retry_metadata = _fetch_graph_message_metadata(
+            _fresh_graph_headers(headers, headers_provider),
+            reply_to_msg_id,
+            "https://graph.microsoft.com/v1.0",
+        )
+    retry_subject = subject_override or reply_retry_metadata.get("subject")
+    retry_conversation_id = (
+        data.get("conversationId")
+        or data.get("sourceConversationId")
+        or reply_retry_metadata.get("conversationId")
+    )
 
     # If this is a reply to an existing thread, use _send_outbox_as_reply
     if is_thread_reply:
@@ -2016,38 +2096,62 @@ def _send_single_outbox_item(
         use_graph_reply = _assigned_emails_match_reply_sender(emails, reply_sender)
 
         if use_graph_reply:
-            try:
-                current_headers = _fresh_graph_headers(headers, headers_provider)
-                res = _send_outbox_as_reply(
-                    user_id, current_headers, script_content, reply_to_msg_id,
-                    thread_id, user_signature=user_signature,
-                    signature_mode=signature_mode, user_email=user_email
+            recipient = emails[0] if emails else "unknown"
+            current_headers = _fresh_graph_headers(headers, headers_provider)
+            prior_send = _sent_retry_reconciliation_result(
+                current_headers,
+                data,
+                recipient,
+                script_content,
+                retry_subject,
+                conversation_id=retry_conversation_id,
+            )
+            if prior_send.get("sent"):
+                _merge_send_identity(send_identity, prior_send)
+                all_errors[recipient] = (
+                    "Prior failed attempt appears already sent in Sent Items; "
+                    "operator reconciliation required"
                 )
-
-                if res.get("sent"):
-                    recipient = emails[0] if emails else "unknown"
-                    all_sent.append(recipient)
-                    if res.get("sentMessageId"):
-                        send_identity["sentMessageIds"][recipient] = res.get("sentMessageId")
-                    if res.get("internetMessageId"):
-                        send_identity["internetMessageIds"][recipient] = res.get("internetMessageId")
-                    if res.get("conversationId"):
-                        send_identity["conversationIds"][recipient] = res.get("conversationId")
-                    _save_outbox_reply_message(
-                        user_id, thread_id, emails, subject_override,
-                        script_content, user_signature, signature_mode, user_email
+            elif prior_send.get("guardLookupError"):
+                _move_to_dead_letter(
+                    user_id,
+                    d.reference,
+                    data,
+                    f"Sent Items retry guard could not verify prior send; manual review required before retry: {prior_send['guardLookupError']}",
+                )
+                return
+            else:
+                try:
+                    res = _send_outbox_as_reply(
+                        user_id, current_headers, script_content, reply_to_msg_id,
+                        thread_id, user_signature=user_signature,
+                        signature_mode=signature_mode, user_email=user_email
                     )
-                    if not (res.get("sentMessageId") or res.get("internetMessageId")):
-                        all_errors[recipient] = (
-                            "Graph accepted reply but Sent Items identity lookup failed; "
-                            "operator reconciliation required"
-                        )
-                else:
-                    all_errors[emails[0] if emails else "unknown"] = res.get("error", "Unknown error")
 
-            except Exception as e:
-                all_errors[emails[0] if emails else "unknown"] = str(e)
-                print(f"💥 Error sending reply: {e}")
+                    if res.get("sent"):
+                        recipient = emails[0] if emails else "unknown"
+                        all_sent.append(recipient)
+                        if res.get("sentMessageId"):
+                            send_identity["sentMessageIds"][recipient] = res.get("sentMessageId")
+                        if res.get("internetMessageId"):
+                            send_identity["internetMessageIds"][recipient] = res.get("internetMessageId")
+                        if res.get("conversationId"):
+                            send_identity["conversationIds"][recipient] = res.get("conversationId")
+                        _save_outbox_reply_message(
+                            user_id, thread_id, emails, subject_override,
+                            script_content, user_signature, signature_mode, user_email
+                        )
+                        if not (res.get("sentMessageId") or res.get("internetMessageId")):
+                            all_errors[recipient] = (
+                                "Graph accepted reply but Sent Items identity lookup failed; "
+                                "operator reconciliation required"
+                            )
+                    else:
+                        all_errors[emails[0] if emails else "unknown"] = res.get("error", "Unknown error")
+
+                except Exception as e:
+                    all_errors[emails[0] if emails else "unknown"] = str(e)
+                    print(f"💥 Error sending reply: {e}")
         else:
             if emails and reply_sender:
                 print(f"   ↪️ Dashboard recipient differs from reply sender ({reply_sender}); sending new indexed message")
@@ -2059,6 +2163,29 @@ def _send_single_outbox_item(
             for recipient_email in emails:
                 try:
                     current_headers = _fresh_graph_headers(headers, headers_provider)
+                    prior_send = _sent_retry_reconciliation_result(
+                        current_headers,
+                        data,
+                        recipient_email,
+                        script_content,
+                        retry_subject,
+                        conversation_id=retry_conversation_id,
+                    )
+                    if prior_send.get("sent"):
+                        _merge_send_identity(send_identity, prior_send)
+                        all_errors[recipient_email] = (
+                            "Prior failed attempt appears already sent in Sent Items; "
+                            "operator reconciliation required"
+                        )
+                        continue
+                    if prior_send.get("guardLookupError"):
+                        _move_to_dead_letter(
+                            user_id,
+                            d.reference,
+                            data,
+                            f"Sent Items retry guard could not verify prior send; manual review required before retry: {prior_send['guardLookupError']}",
+                        )
+                        return
                     res = send_and_index_email(
                         user_id, current_headers, script_content, [recipient_email],
                         client_id_or_none=clientId, row_number=row_number,
@@ -2087,6 +2214,28 @@ def _send_single_outbox_item(
 
             try:
                 current_headers = _fresh_graph_headers(headers, headers_provider)
+                prior_send = _sent_retry_reconciliation_result(
+                    current_headers,
+                    data,
+                    recipient_email,
+                    selected_script,
+                    subject_override,
+                )
+                if prior_send.get("sent"):
+                    _merge_send_identity(send_identity, prior_send)
+                    all_errors[recipient_email] = (
+                        "Prior failed attempt appears already sent in Sent Items; "
+                        "operator reconciliation required"
+                    )
+                    continue
+                if prior_send.get("guardLookupError"):
+                    _move_to_dead_letter(
+                        user_id,
+                        d.reference,
+                        data,
+                        f"Sent Items retry guard could not verify prior send; manual review required before retry: {prior_send['guardLookupError']}",
+                    )
+                    return
                 res = send_and_index_email(user_id, current_headers, selected_script, [recipient_email],
                                            client_id_or_none=clientId, row_number=row_number,
                                            user_signature=user_signature, subject_override=subject_override,
@@ -2192,6 +2341,7 @@ def _send_single_outbox_item(
                 {
                     "attempts": new_attempts,
                     "lastError": error_msg,
+                    "lastSendAttemptAt": datetime.now(timezone.utc) - timedelta(seconds=5),
                     "status": "retrying",
                     "processingBy": None,
                     "processingAt": None,

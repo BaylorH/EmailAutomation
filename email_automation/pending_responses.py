@@ -9,6 +9,12 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
 
+from .sent_mail_guard import (
+    SentMailGuardLookupError,
+    find_matching_sent_message_for_retry,
+    sent_after_from_retry_data,
+)
+
 # Maximum retry attempts before giving up
 MAX_RESPONSE_ATTEMPTS = 5
 
@@ -39,6 +45,7 @@ def record_sent_unindexed_response(
     *,
     source_context: str = "autoResponse",
     original_doc_id: Optional[str] = None,
+    sent_match: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Record a reply that Graph accepted but the worker could not index.
 
@@ -64,6 +71,13 @@ def record_sent_unindexed_response(
     }
     if original_doc_id:
         payload["originalDocId"] = original_doc_id
+    if sent_match:
+        payload.update({
+            "sentMessageId": sent_match.get("sentMessageId") or sent_match.get("id"),
+            "internetMessageId": sent_match.get("internetMessageId"),
+            "conversationId": sent_match.get("conversationId"),
+            "sentDateTime": sent_match.get("sentDateTime"),
+        })
 
     _fs.collection("users").document(user_id).collection("deadLetterQueue").add(payload)
 
@@ -75,7 +89,11 @@ def queue_pending_response(
     recipient: str,
     response_body: str,
     client_id: Optional[str] = None,
-    error: Optional[str] = None
+    error: Optional[str] = None,
+    *,
+    subject: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    last_send_attempt_at: Optional[Any] = None,
 ) -> str:
     """
     Queue a failed response for later retry.
@@ -97,6 +115,12 @@ def queue_pending_response(
         "createdAt": SERVER_TIMESTAMP,
         "updatedAt": SERVER_TIMESTAMP,
     }
+    if subject:
+        doc_data["subject"] = subject
+    if conversation_id:
+        doc_data["conversationId"] = conversation_id
+    if last_send_attempt_at:
+        doc_data["lastSendAttemptAt"] = last_send_attempt_at
 
     # Use thread_id as doc ID to prevent duplicates
     doc_ref = pending_ref.document(thread_id)
@@ -174,6 +198,42 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> int:
         print(f"  → Retrying response to {recipient} (attempt {attempts + 1}/{MAX_RESPONSE_ATTEMPTS})")
 
         try:
+            if attempts > 0 or data.get("lastError"):
+                try:
+                    sent_match = find_matching_sent_message_for_retry(
+                        headers,
+                        recipient=recipient,
+                        body=response_body,
+                        subject=data.get("subject"),
+                        conversation_id=data.get("conversationId"),
+                        sent_after=sent_after_from_retry_data(data),
+                    )
+                except SentMailGuardLookupError as exc:
+                    _move_pending_response_to_dead_letter(
+                        user_id,
+                        doc,
+                        data,
+                        f"Sent Items retry guard could not verify prior send; manual review required before retry: {exc}",
+                    )
+                    print("    ⚠️ Sent Items retry guard failed closed; moved pending response to manual review")
+                    continue
+                if sent_match:
+                    record_sent_unindexed_response(
+                        user_id,
+                        thread_id,
+                        msg_id,
+                        recipient,
+                        response_body,
+                        data.get("clientId"),
+                        "Prior failed attempt appears already sent in Sent Items; stopped before retry",
+                        source_context="pendingResponses",
+                        original_doc_id=doc.id,
+                        sent_match=sent_match,
+                    )
+                    doc.reference.delete()
+                    print("    ⚠️ Prior send found in Sent Items; moved to reconciliation without retrying")
+                    continue
+
             sent = send_reply_in_thread(
                 user_id=user_id,
                 headers=headers,

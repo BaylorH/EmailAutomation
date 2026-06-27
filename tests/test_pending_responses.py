@@ -127,7 +127,7 @@ class PendingResponsesTests(unittest.TestCase):
             "email_automation.processing": types.SimpleNamespace(
                 send_reply_in_thread=fake_send_reply_in_thread,
             ),
-        }):
+        }), patch.object(pending_responses, "find_matching_sent_message_for_retry", return_value=None):
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
         self.assertEqual(sent, 0)
@@ -158,7 +158,7 @@ class PendingResponsesTests(unittest.TestCase):
             "email_automation.processing": types.SimpleNamespace(
                 send_reply_in_thread=fake_send_reply_in_thread,
             ),
-        }):
+        }), patch.object(pending_responses, "find_matching_sent_message_for_retry", return_value=None):
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
         self.assertEqual(sent, 0)
@@ -169,6 +169,91 @@ class PendingResponsesTests(unittest.TestCase):
         self.assertEqual(dead_letter["status"], "needs_reconciliation")
         self.assertTrue(dead_letter["alreadySent"])
         self.assertEqual(dead_letter["failureReason"], "Graph accepted reply but Sent Items lookup failed")
+
+    def test_retry_with_matching_sent_item_moves_to_reconciliation_without_resending(self):
+        active_doc = FakeDoc("thread-active", {
+            "threadId": "thread-active",
+            "msgId": "message-2",
+            "recipient": "bp21harrison@gmail.com",
+            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "clientId": "client-1",
+            "attempts": 1,
+            "lastError": "Read timed out after Graph reply",
+            "lastSendAttemptAt": "2026-06-26T12:00:00Z",
+            "subject": "0 Gemini Ave, Houston",
+            "conversationId": "conv-1",
+        })
+        fake_fs = FakeFirestore([active_doc])
+        sent_match = {
+            "id": "sent-reply-1",
+            "internetMessageId": "<sent-reply-1@example.com>",
+            "conversationId": "conversation-1",
+            "subject": "RE: 0 Gemini Ave",
+        }
+
+        def fake_send_reply_in_thread(**_kwargs):
+            raise AssertionError("retry guard should stop before resending")
+
+        with patch.dict(sys.modules, {
+            "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
+            "email_automation.processing": types.SimpleNamespace(
+                send_reply_in_thread=fake_send_reply_in_thread,
+            ),
+        }), patch.object(
+            pending_responses,
+            "find_matching_sent_message_for_retry",
+            return_value=sent_match,
+            create=True,
+        ) as sent_guard:
+            sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
+
+        self.assertEqual(sent, 0)
+        sent_guard.assert_called_once()
+        self.assertEqual(sent_guard.call_args.kwargs["subject"], "0 Gemini Ave, Houston")
+        self.assertEqual(sent_guard.call_args.kwargs["conversation_id"], "conv-1")
+        self.assertEqual([], active_doc.reference.update_calls)
+        self.assertTrue(active_doc.reference.deleted)
+        dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
+        self.assertEqual(dead_letter["source"], "pendingResponses")
+        self.assertEqual(dead_letter["status"], "needs_reconciliation")
+        self.assertTrue(dead_letter["alreadySent"])
+        self.assertEqual(dead_letter["sentMessageId"], "sent-reply-1")
+        self.assertEqual(dead_letter["internetMessageId"], "<sent-reply-1@example.com>")
+
+    def test_retry_guard_lookup_failure_dead_letters_without_resending(self):
+        active_doc = FakeDoc("thread-active", {
+            "threadId": "thread-active",
+            "msgId": "message-2",
+            "recipient": "bp21harrison@gmail.com",
+            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "clientId": "client-1",
+            "attempts": 1,
+            "lastError": "Read timed out after Graph reply",
+            "lastSendAttemptAt": "2026-06-26T12:00:00Z",
+        })
+        fake_fs = FakeFirestore([active_doc])
+
+        def fake_send_reply_in_thread(**_kwargs):
+            raise AssertionError("retry guard should stop before resending")
+
+        with patch.dict(sys.modules, {
+            "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
+            "email_automation.processing": types.SimpleNamespace(
+                send_reply_in_thread=fake_send_reply_in_thread,
+            ),
+        }), patch.object(
+            pending_responses,
+            "find_matching_sent_message_for_retry",
+            side_effect=pending_responses.SentMailGuardLookupError("Graph 401"),
+        ):
+            sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
+
+        self.assertEqual(sent, 0)
+        self.assertTrue(active_doc.reference.deleted)
+        self.assertEqual([], active_doc.reference.update_calls)
+        dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
+        self.assertEqual(dead_letter["source"], "pendingResponses")
+        self.assertIn("Sent Items retry guard could not verify prior send", dead_letter["failureReason"])
 
 
 if __name__ == "__main__":
