@@ -334,6 +334,350 @@ def _mark_processing_failure_stale_for_manual_review(doc, max_failure_age_hours:
         print(f"⚠️ Could not mark stale processing failure for manual review: {e}")
 
 
+def _message_identity_candidates(*values: Any) -> set:
+    candidates = set()
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        candidates.add(text)
+        try:
+            normalized = normalize_message_id(text)
+            if normalized:
+                candidates.add(normalized)
+        except Exception:
+            pass
+    return candidates
+
+
+def _value_matches_message_candidates(value: Any, candidates: set) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        return any(_value_matches_message_candidates(item, candidates) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_value_matches_message_candidates(item, candidates) for item in value)
+    return bool(_message_identity_candidates(value) & candidates)
+
+
+def _source_message_match(data: Dict[str, Any], candidates: set) -> bool:
+    if not candidates:
+        return False
+
+    direct_keys = (
+        "msgId",
+        "replyToMessageId",
+        "sourceMessageId",
+        "sourceGraphMessageId",
+        "sourceInternetMessageId",
+        "originalMessageId",
+        "currentMsgId",
+        "detectedInMessageId",
+    )
+    for key in direct_keys:
+        if _value_matches_message_candidates((data or {}).get(key), candidates):
+            return True
+
+    for nested_key in ("meta", "tourInvite", "sourceMessage", "source"):
+        nested = (data or {}).get(nested_key)
+        if isinstance(nested, dict) and _source_message_match(nested, candidates):
+            return True
+
+    return False
+
+
+def _source_message_identity_meta(
+    msg_id: Optional[str] = None,
+    internet_message_id: Optional[str] = None,
+) -> Dict[str, str]:
+    payload = {}
+    if msg_id:
+        payload["sourceMessageId"] = msg_id
+        payload["sourceGraphMessageId"] = msg_id
+    if internet_message_id:
+        payload["sourceInternetMessageId"] = internet_message_id
+    return payload
+
+
+def _stream_limited(collection_ref, limit: int = 200):
+    query = collection_ref.limit(limit) if hasattr(collection_ref, "limit") else collection_ref
+    return list(query.stream())
+
+
+def _guard_unreadable_artifact(collection_name: str, error: Exception) -> Dict[str, Any]:
+    return {
+        "collection": collection_name,
+        "id": "unreadable",
+        "status": "guard_scan_failed",
+        "guardUnreadable": True,
+        "guardError": str(error),
+    }
+
+
+PROCESSING_RETRY_SOURCE_MESSAGE_FIELDS = (
+    "msgId",
+    "replyToMessageId",
+    "sourceMessageId",
+    "sourceGraphMessageId",
+    "sourceInternetMessageId",
+    "originalMessageId",
+    "currentMsgId",
+    "detectedInMessageId",
+    "meta.msgId",
+    "meta.replyToMessageId",
+    "meta.sourceMessageId",
+    "meta.sourceGraphMessageId",
+    "meta.sourceInternetMessageId",
+    "meta.originalMessageId",
+    "meta.currentMsgId",
+    "meta.detectedInMessageId",
+    "tourInvite.msgId",
+    "tourInvite.replyToMessageId",
+    "tourInvite.sourceMessageId",
+    "tourInvite.sourceGraphMessageId",
+    "tourInvite.sourceInternetMessageId",
+    "source.msgId",
+    "source.replyToMessageId",
+    "source.sourceMessageId",
+    "source.sourceGraphMessageId",
+    "source.sourceInternetMessageId",
+)
+
+
+def _query_source_message_artifacts(
+    collection_ref,
+    candidates: set,
+    fields: tuple,
+    limit_per_query: int = 10,
+) -> List[Any]:
+    docs = []
+    seen = set()
+    where = getattr(collection_ref, "where", None)
+    if not callable(where):
+        return docs
+
+    for field in fields:
+        for candidate in candidates:
+            query = collection_ref.where(filter=FieldFilter(field, "==", candidate)).limit(limit_per_query)
+            for doc in query.stream():
+                doc_id = getattr(doc, "id", None)
+                key = doc_id or id(doc)
+                if key in seen:
+                    continue
+                seen.add(key)
+                docs.append(doc)
+    return docs
+
+
+def _query_thread_artifacts(collection_ref, thread_id: Optional[str], limit: int = 100) -> List[Any]:
+    if not thread_id:
+        return []
+    where = getattr(collection_ref, "where", None)
+    if not callable(where):
+        return []
+    query = collection_ref.where(filter=FieldFilter("threadId", "==", thread_id)).limit(limit)
+    return list(query.stream())
+
+
+def _candidate_artifact_docs(
+    collection_ref,
+    candidates: set,
+    fields: tuple,
+    thread_id: Optional[str],
+) -> List[Any]:
+    docs = _query_thread_artifacts(collection_ref, thread_id)
+    if not docs and not thread_id:
+        docs = _query_source_message_artifacts(collection_ref, candidates, fields)
+    seen = {getattr(doc, "id", None) or id(doc) for doc in docs}
+    for doc in _stream_limited(collection_ref):
+        doc_id = getattr(doc, "id", None)
+        key = doc_id or id(doc)
+        if key in seen:
+            continue
+        seen.add(key)
+        docs.append(doc)
+    return docs
+
+
+def _find_handled_event_for_message(user_ref, thread_id: str, candidates: set) -> Optional[Dict[str, Any]]:
+    if not thread_id:
+        return None
+    try:
+        thread_snapshot = user_ref.collection("threads").document(thread_id).get()
+    except Exception as e:
+        return _guard_unreadable_artifact(f"threads/{thread_id}", e)
+
+    if getattr(thread_snapshot, "exists", False) is not True:
+        return None
+
+    thread_data = thread_snapshot.to_dict() or {}
+    handled_events = thread_data.get("handledEvents") or {}
+    if not isinstance(handled_events, dict):
+        return None
+
+    for event_key, event_data in handled_events.items():
+        if isinstance(event_data, dict) and _source_message_match(event_data, candidates):
+            return {
+                "collection": f"threads/{thread_id}/handledEvents",
+                "id": event_key,
+                "status": "handled",
+            }
+    return None
+
+
+def _artifact_matches_retry_source(
+    artifact,
+    collection_name: str,
+    candidates: set,
+    thread_id: Optional[str],
+    include_terminal_outbox: bool = False,
+) -> Optional[Dict[str, Any]]:
+    data = artifact.to_dict() or {}
+    if collection_name == "outbox" and not include_terminal_outbox:
+        status = str(data.get("status") or "").strip().lower()
+        if status in NON_PENDING_OUTBOX_STATUSES:
+            return None
+    if thread_id and data.get("threadId") and data.get("threadId") != thread_id:
+        return None
+    if _source_message_match(data, candidates):
+        return {
+            "collection": collection_name,
+            "id": getattr(artifact, "id", None),
+            "status": data.get("kind") or data.get("status"),
+        }
+    return None
+
+
+def _scan_retry_artifact_collection(
+    collection_ref,
+    collection_name: str,
+    candidates: set,
+    thread_id: Optional[str],
+    include_terminal_outbox: bool = False,
+) -> Optional[Dict[str, Any]]:
+    try:
+        docs = _candidate_artifact_docs(
+            collection_ref,
+            candidates,
+            PROCESSING_RETRY_SOURCE_MESSAGE_FIELDS,
+            thread_id,
+        )
+    except Exception as e:
+        print(f"⚠️ Could not scan processing retry guard collection {collection_name}: {e}")
+        return _guard_unreadable_artifact(collection_name, e)
+
+    for artifact in docs:
+        match = _artifact_matches_retry_source(
+            artifact,
+            collection_name,
+            candidates,
+            thread_id,
+            include_terminal_outbox=include_terminal_outbox,
+        )
+        if match:
+            return match
+    return None
+
+
+def _find_existing_retry_artifact_for_message(
+    user_id: str,
+    thread_id: str,
+    message_id: str,
+    client_id: Optional[str] = None,
+    additional_message_ids: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Find visible work already created for the broker message being replayed.
+
+    If replaying a failed message would duplicate a pending dashboard action,
+    pending response, or already-sent reconciliation item, leave the failure
+    visible for manual review instead of silently running the side effects again.
+    """
+    candidates = _message_identity_candidates(message_id, *(additional_message_ids or []))
+    if not candidates:
+        return None
+
+    try:
+        user_ref = _fs.collection("users").document(user_id)
+    except Exception as e:
+        return _guard_unreadable_artifact("users", e)
+
+    handled_event_artifact = _find_handled_event_for_message(user_ref, thread_id, candidates)
+    if handled_event_artifact:
+        return handled_event_artifact
+
+    collection_checks = (
+        ("outbox", False),
+        ("pendingResponses", True),
+        ("deadLetterQueue", True),
+        ("actionAudit", True),
+    )
+    for collection_name, include_terminal_outbox in collection_checks:
+        artifact = _scan_retry_artifact_collection(
+            user_ref.collection(collection_name),
+            collection_name,
+            candidates,
+            thread_id,
+            include_terminal_outbox=include_terminal_outbox,
+        )
+        if artifact:
+            return artifact
+
+    if client_id:
+        try:
+            notifications_ref = user_ref.collection("clients").document(client_id).collection("notifications")
+        except Exception as e:
+            print(f"⚠️ Could not scan client notifications before processing retry: {e}")
+            return _guard_unreadable_artifact(f"clients/{client_id}/notifications", e)
+        artifact = _scan_retry_artifact_collection(
+            notifications_ref,
+            f"clients/{client_id}/notifications",
+            candidates,
+            thread_id,
+            include_terminal_outbox=True,
+        )
+        if artifact:
+            return artifact
+
+    return None
+
+
+def _mark_processing_failure_blocked_by_existing_artifact(doc, artifact: Dict[str, Any]):
+    try:
+        collection = artifact.get("collection") or "unknown"
+        artifact_id = artifact.get("id") or "unknown"
+        guard_unreadable = bool(artifact.get("guardUnreadable"))
+        recovery_status = (
+            "blocked_retry_guard_unreadable"
+            if guard_unreadable
+            else "blocked_existing_outbound_artifact"
+        )
+        last_retry_error = (
+            "Could not verify duplicate-send guard before processing retry "
+            f"({collection}: {artifact.get('guardError') or 'unreadable'}); "
+            "leaving the failure visible for manual review."
+            if guard_unreadable
+            else (
+                "Processing retry skipped because an existing visible outbound/action "
+                f"artifact already references this source message ({collection}/{artifact_id})."
+            )
+        )
+        doc.reference.set({
+            "retryable": False,
+            "recoveryStatus": recovery_status,
+            "recoveryArtifactCollection": collection,
+            "recoveryArtifactId": artifact_id,
+            "recoveryArtifactStatus": artifact.get("status"),
+            "recoveryGuardError": artifact.get("guardError"),
+            "lastRetryAt": SERVER_TIMESTAMP,
+            "lastRetryError": last_retry_error,
+            "updatedAt": SERVER_TIMESTAMP,
+        }, merge=True)
+    except Exception as e:
+        print(f"⚠️ Could not mark processing failure blocked by existing artifact: {e}")
+
+
 def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[str, int]:
     """Clear failure markers for messages that are already marked processed.
 
@@ -412,14 +756,8 @@ def retry_processing_failures(
         data = doc.to_dict() or {}
         message_id = data.get("messageId")
         thread_id = data.get("threadId")
+        client_id = data.get("clientId")
         attempts = int(data.get("processingAttempts") or 0)
-
-        if max_failure_age_hours and max_failure_age_hours > 0:
-            failure_time = _timestamp_to_utc(data.get("createdAt") or data.get("updatedAt"))
-            if failure_time and datetime.now(timezone.utc) - failure_time > timedelta(hours=max_failure_age_hours):
-                result["skipped"] += 1
-                _mark_processing_failure_stale_for_manual_review(doc, max_failure_age_hours)
-                continue
 
         if not data.get("retryable", True) or not message_id or attempts >= max_attempts:
             result["skipped"] += 1
@@ -430,12 +768,46 @@ def retry_processing_failures(
             result["skipped"] += 1
             continue
 
-        result["retried"] += 1
+        existing_artifact = _find_existing_retry_artifact_for_message(
+            user_id,
+            thread_id,
+            message_id,
+            client_id,
+        )
+        if existing_artifact:
+            result["skipped"] += 1
+            _mark_processing_failure_blocked_by_existing_artifact(doc, existing_artifact)
+            continue
+
+        if max_failure_age_hours and max_failure_age_hours > 0:
+            failure_time = _timestamp_to_utc(data.get("createdAt") or data.get("updatedAt"))
+            if failure_time and datetime.now(timezone.utc) - failure_time > timedelta(hours=max_failure_age_hours):
+                result["skipped"] += 1
+                _mark_processing_failure_stale_for_manual_review(doc, max_failure_age_hours)
+                continue
+
         processing_error = None
+        msg = None
         try:
             msg = _fetch_graph_message_by_id(headers, message_id)
             if not msg.get("id"):
                 raise RetryableProcessingError("Graph message fetch returned no message id")
+            expanded_existing_artifact = _find_existing_retry_artifact_for_message(
+                user_id,
+                thread_id,
+                message_id,
+                client_id,
+                additional_message_ids=[
+                    msg.get("id"),
+                    msg.get("internetMessageId"),
+                    msg.get("conversationId"),
+                ],
+            )
+            if expanded_existing_artifact:
+                result["skipped"] += 1
+                _mark_processing_failure_blocked_by_existing_artifact(doc, expanded_existing_artifact)
+                continue
+            result["retried"] += 1
             process_inbox_message(user_id, headers, msg)
             processed_keys = [
                 key
@@ -2757,7 +3129,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         meta = {
                             "reason": "call_requested",
                             "details": "Call requested in conversation",
-                            "replyToMessageId": msg_id  # Graph API message ID for sending reply
+                            "replyToMessageId": msg_id,  # Graph API message ID for sending reply
+                            **_source_message_identity_meta(msg_id, internet_message_id),
                         }
                         if phone_number:
                             meta["phoneNumber"] = phone_number
@@ -2892,6 +3265,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             "originalMessage": tour_message_text[:500],
                             "status": "pending_response",  # Not pending_approval - no row creation needed
                             "replyToMessageId": msg_id,  # Graph API message ID for sending reply
+                            **_source_message_identity_meta(msg_id, internet_message_id),
                             "contactName": contact_name,  # For [NAME] replacement in frontend
                             "tourReplyClassification": tour_reply_classification,
                             "suggestedEmail": {
@@ -2955,6 +3329,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             "question": question,
                             "originalMessage": _full_text[:500],  # Include message context
                             "replyToMessageId": msg_id,  # Graph API message ID for sending reply
+                            **_source_message_identity_meta(msg_id, internet_message_id),
                             "contactName": contact_name  # For [NAME] replacement in frontend
                         }
 
@@ -3286,6 +3661,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             meta={
                                 "reason": "new_property_pending_approval",
                                 "status": "pending_approval",
+                                **_source_message_identity_meta(msg_id, internet_message_id),
                                 "address": address,
                                 "city": city,
                                 "link": link,
@@ -3593,6 +3969,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             meta={
                                 "reason": f"wrong_contact:{reason}",
                                 "details": details,
+                                **_source_message_identity_meta(msg_id, internet_message_id),
                                 "originalContact": sender_addr_lower,
                                 "contactName": contact_name,  # For [NAME] replacement in frontend
                                 "suggestedContact": suggested_contact,
@@ -3682,6 +4059,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                                 "issue": issue,
                                 "severity": severity,
                                 "severityLabel": severity_labels.get(severity, severity),
+                                **_source_message_identity_meta(msg_id, internet_message_id),
                                 "contact": sender_addr_lower,
                                 "contactName": contact_name,  # For [NAME] replacement in frontend
                                 "originalMessage": _full_text[:500],

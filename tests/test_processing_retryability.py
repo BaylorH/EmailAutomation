@@ -239,6 +239,258 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         self.assertEqual("stale_manual_review", update_payload["recoveryStatus"])
         self.assertIn("older than 6 hours", update_payload["lastRetryError"])
 
+    def test_retry_processing_failures_blocks_when_outbox_already_targets_source_message(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__message-1"
+        failure_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "messageId": "message-1",
+            "retryable": True,
+            "processingAttempts": 0,
+        }
+        outbox_doc = MagicMock()
+        outbox_doc.id = "outbox-existing"
+        outbox_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "replyToMessageId": "message-1",
+            "status": "queued",
+        }
+
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        outbox_collection = MagicMock()
+        outbox_collection.limit.return_value.stream.return_value = [outbox_doc]
+        empty_collection = MagicMock()
+        empty_collection.limit.return_value.stream.return_value = []
+        thread_ref = MagicMock()
+        thread_ref.get.return_value.exists = False
+
+        user_doc = MagicMock()
+        user_doc.collection.side_effect = lambda name: {
+            "processingFailures": failures_collection,
+            "outbox": outbox_collection,
+            "pendingResponses": empty_collection,
+            "deadLetterQueue": empty_collection,
+            "actionAudit": empty_collection,
+            "clients": MagicMock(document=MagicMock(return_value=MagicMock(collection=MagicMock(return_value=empty_collection)))),
+            "threads": MagicMock(document=MagicMock(return_value=thread_ref)),
+        }[name]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value = user_doc
+
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "has_processed", return_value=False), \
+             patch.object(processing, "exponential_backoff_request") as fetch_graph_message, \
+             patch.object(processing, "process_inbox_message") as process_message, \
+             patch.object(processing, "mark_processed") as mark_processed:
+            result = processing.retry_processing_failures(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+            )
+
+        self.assertEqual(
+            {"checked": 1, "retried": 0, "succeeded": 0, "failed": 0, "skipped": 1},
+            result,
+        )
+        fetch_graph_message.assert_not_called()
+        process_message.assert_not_called()
+        mark_processed.assert_not_called()
+        failure_doc.reference.set.assert_called_once()
+        update_payload = failure_doc.reference.set.call_args.args[0]
+        self.assertFalse(update_payload["retryable"])
+        self.assertEqual("blocked_existing_outbound_artifact", update_payload["recoveryStatus"])
+        self.assertIn("outbox", update_payload["lastRetryError"])
+        self.assertEqual("outbox-existing", update_payload["recoveryArtifactId"])
+
+    def test_retry_processing_failures_blocks_after_graph_identity_matches_outbox(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__internet-message-1"
+        failure_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "messageId": "<internet-message-1@example.test>",
+            "retryable": True,
+            "processingAttempts": 0,
+        }
+        outbox_doc = MagicMock()
+        outbox_doc.id = "outbox-existing"
+        outbox_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "replyToMessageId": "graph-message-1",
+            "status": "queued",
+        }
+
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        outbox_collection = MagicMock()
+        outbox_collection.limit.return_value.stream.side_effect = [[], [outbox_doc]]
+        empty_collection = MagicMock()
+        empty_collection.limit.return_value.stream.return_value = []
+        thread_ref = MagicMock()
+        thread_ref.get.return_value.exists = False
+
+        user_doc = MagicMock()
+        user_doc.collection.side_effect = lambda name: {
+            "processingFailures": failures_collection,
+            "outbox": outbox_collection,
+            "pendingResponses": empty_collection,
+            "deadLetterQueue": empty_collection,
+            "actionAudit": empty_collection,
+            "clients": MagicMock(document=MagicMock(return_value=MagicMock(collection=MagicMock(return_value=empty_collection)))),
+            "threads": MagicMock(document=MagicMock(return_value=thread_ref)),
+        }[name]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value = user_doc
+        graph_response = MagicMock()
+        graph_response.json.return_value = {
+            "id": "graph-message-1",
+            "internetMessageId": "<internet-message-1@example.test>",
+            "conversationId": "conversation-1",
+        }
+
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "has_processed", return_value=False), \
+             patch.object(processing, "exponential_backoff_request", return_value=graph_response) as fetch_graph_message, \
+             patch.object(processing, "process_inbox_message") as process_message, \
+             patch.object(processing, "mark_processed") as mark_processed:
+            result = processing.retry_processing_failures(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+            )
+
+        self.assertEqual(
+            {"checked": 1, "retried": 0, "succeeded": 0, "failed": 0, "skipped": 1},
+            result,
+        )
+        fetch_graph_message.assert_called_once()
+        process_message.assert_not_called()
+        mark_processed.assert_not_called()
+        update_payload = failure_doc.reference.set.call_args.args[0]
+        self.assertEqual("blocked_existing_outbound_artifact", update_payload["recoveryStatus"])
+        self.assertEqual("outbox-existing", update_payload["recoveryArtifactId"])
+
+    def test_retry_processing_failures_blocks_existing_handled_event_for_source_message(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__internet-message-1"
+        failure_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "messageId": "<internet-message-1@example.test>",
+            "retryable": True,
+            "processingAttempts": 0,
+        }
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        empty_collection = MagicMock()
+        empty_collection.limit.return_value.stream.return_value = []
+        thread_snapshot = MagicMock()
+        thread_snapshot.exists = True
+        thread_snapshot.to_dict.return_value = {
+            "handledEvents": {
+                "wrong_contact:broker@example.test": {
+                    "detectedInMessageId": "graph-message-1",
+                    "notificationId": "notification-1",
+                }
+            }
+        }
+        thread_ref = MagicMock()
+        thread_ref.get.return_value = thread_snapshot
+
+        user_doc = MagicMock()
+        user_doc.collection.side_effect = lambda name: {
+            "processingFailures": failures_collection,
+            "outbox": empty_collection,
+            "pendingResponses": empty_collection,
+            "deadLetterQueue": empty_collection,
+            "actionAudit": empty_collection,
+            "clients": MagicMock(document=MagicMock(return_value=MagicMock(collection=MagicMock(return_value=empty_collection)))),
+            "threads": MagicMock(document=MagicMock(return_value=thread_ref)),
+        }[name]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value = user_doc
+        graph_response = MagicMock()
+        graph_response.json.return_value = {
+            "id": "graph-message-1",
+            "internetMessageId": "<internet-message-1@example.test>",
+            "conversationId": "conversation-1",
+        }
+
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "has_processed", return_value=False), \
+             patch.object(processing, "exponential_backoff_request", return_value=graph_response), \
+             patch.object(processing, "process_inbox_message") as process_message, \
+             patch.object(processing, "mark_processed") as mark_processed:
+            result = processing.retry_processing_failures(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+            )
+
+        self.assertEqual(
+            {"checked": 1, "retried": 0, "succeeded": 0, "failed": 0, "skipped": 1},
+            result,
+        )
+        process_message.assert_not_called()
+        mark_processed.assert_not_called()
+        update_payload = failure_doc.reference.set.call_args.args[0]
+        self.assertEqual("blocked_existing_outbound_artifact", update_payload["recoveryStatus"])
+        self.assertEqual("threads/thread-1/handledEvents", update_payload["recoveryArtifactCollection"])
+
+    def test_retry_processing_failures_blocks_when_visibility_guard_cannot_scan_outbox(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__message-1"
+        failure_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "messageId": "message-1",
+            "retryable": True,
+            "processingAttempts": 0,
+        }
+
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        unreadable_outbox = MagicMock()
+        unreadable_outbox.limit.return_value.stream.side_effect = RuntimeError("firestore unavailable")
+        empty_collection = MagicMock()
+        empty_collection.limit.return_value.stream.return_value = []
+
+        user_doc = MagicMock()
+        user_doc.collection.side_effect = lambda name: {
+            "processingFailures": failures_collection,
+            "outbox": unreadable_outbox,
+            "pendingResponses": empty_collection,
+            "deadLetterQueue": empty_collection,
+            "actionAudit": empty_collection,
+            "clients": MagicMock(document=MagicMock(return_value=MagicMock(collection=MagicMock(return_value=empty_collection)))),
+        }[name]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value = user_doc
+
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "has_processed", return_value=False), \
+             patch.object(processing, "exponential_backoff_request") as fetch_graph_message, \
+             patch.object(processing, "process_inbox_message") as process_message, \
+             patch.object(processing, "mark_processed") as mark_processed:
+            result = processing.retry_processing_failures(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+            )
+
+        self.assertEqual(
+            {"checked": 1, "retried": 0, "succeeded": 0, "failed": 0, "skipped": 1},
+            result,
+        )
+        fetch_graph_message.assert_not_called()
+        process_message.assert_not_called()
+        mark_processed.assert_not_called()
+        failure_doc.reference.set.assert_called_once()
+        update_payload = failure_doc.reference.set.call_args.args[0]
+        self.assertFalse(update_payload["retryable"])
+        self.assertEqual("blocked_retry_guard_unreadable", update_payload["recoveryStatus"])
+        self.assertIn("Could not verify duplicate-send guard", update_payload["lastRetryError"])
+
     def test_new_property_duplicate_check_fails_open_on_sheet_read_error(self):
         class FailingSheets:
             def spreadsheets(self):
