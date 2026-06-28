@@ -4,7 +4,10 @@ One-time script to resend failed response emails.
 These responses were generated but failed to send due to Microsoft account block.
 
 Usage:
-    python resend_failed_responses.py [--dry-run]
+    python resend_failed_responses.py --dry-run
+
+Live resend mode is intentionally disabled. Use guarded pending-response or
+dead-letter recovery so Sent Items duplicate-send checks run before any retry.
 """
 
 import os
@@ -126,6 +129,13 @@ def get_latest_inbound_message_id(user_id: str, thread_id: str):
 
 def resend_responses(user_id: str, dry_run: bool = False, date_filter: str = "2026-03-01"):
     """Resend all pending responses for a user."""
+    if not dry_run:
+        print(
+            "❌ Live resend mode is disabled for this legacy script. "
+            "Use guarded pending-response or dead-letter recovery so Sent Items "
+            "checks can prevent duplicate sends."
+        )
+        return False
 
     # Get auth headers
     print(f"Getting auth headers for user {user_id}...")

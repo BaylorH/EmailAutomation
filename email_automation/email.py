@@ -1546,7 +1546,12 @@ def _record_outbox_reconciliation(
 
 
 def _should_preflight_sent_items_retry(data: Dict[str, Any]) -> bool:
-    return int((data or {}).get("attempts") or 0) > 0 or bool((data or {}).get("lastError"))
+    data = data or {}
+    return (
+        int(data.get("attempts") or 0) > 0
+        or bool(data.get("lastError"))
+        or bool(data.get("requiresSentItemsPreflight"))
+    )
 
 
 def _sent_retry_reconciliation_result(

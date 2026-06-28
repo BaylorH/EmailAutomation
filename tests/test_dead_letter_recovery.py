@@ -201,6 +201,7 @@ class DeadLetterRecoveryTests(unittest.TestCase):
         self.assertEqual(("collection", "users", "document", "uid-1", "collection", "outbox"), outbox_path)
         self.assertEqual(0, outbox_payload["attempts"])
         self.assertEqual("queued", outbox_payload["status"])
+        self.assertTrue(outbox_payload["requiresSentItemsPreflight"])
         self.assertEqual("dead-1", outbox_payload["recoveryFromDeadLetterId"])
         self.assertNotIn("failureReason", outbox_payload)
         self.assertNotIn("alreadySent", outbox_payload)

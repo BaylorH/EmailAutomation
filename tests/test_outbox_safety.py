@@ -462,6 +462,97 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertTrue(audit_payload["alreadySent"])
         self.assertEqual(audit_payload["sentRecipients"], [recipient])
 
+    def test_recovered_dead_letter_outbox_checks_sent_items_before_send(self):
+        recipient = "bp21harrison+recovered@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [recipient],
+            "script": "Hi Ron,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "0 Gemini Ave, Houston",
+            "rowNumber": 20,
+            "attempts": 0,
+            "status": "queued",
+            "requiresSentItemsPreflight": True,
+            "recoveryFromDeadLetterId": "dead-1",
+            "recoveredAt": "2026-06-26T12:00:00Z",
+            "actionAuditId": "audit-recovered",
+            "followUpConfig": {"enabled": False},
+        }, doc_id="outbox-recovered")
+        fake_fs = FakeFirestore()
+        sent_match = {
+            "id": "sent-recovered-1",
+            "internetMessageId": "<sent-recovered-1@example.com>",
+            "conversationId": "conversation-1",
+            "subject": "0 Gemini Ave, Houston",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match, create=True) as sent_guard, \
+             patch.object(email_module, "send_and_index_email") as send_and_index_email:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        sent_guard.assert_called_once()
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "needs_reconciliation")
+        self.assertTrue(dead_letter_payload["alreadySent"])
+        self.assertEqual(dead_letter_payload["sentMessageIds"][recipient], "sent-recovered-1")
+
+    def test_recovered_dead_letter_outbox_blocks_manual_continuation_before_send(self):
+        recipient = "bp21harrison+recovered@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [recipient],
+            "script": "Hi Ron,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "replyToMessageId": "graph-message-1",
+            "attempts": 0,
+            "status": "queued",
+            "requiresSentItemsPreflight": True,
+            "recoveryFromDeadLetterId": "dead-1",
+            "recoveredAt": "2026-06-26T12:00:00Z",
+            "actionAuditId": "audit-recovered",
+        }, doc_id="outbox-recovered")
+        fake_fs = FakeFirestore()
+        manual_continuation = {
+            "id": "manual-sent-1",
+            "internetMessageId": "<manual-sent-1@example.com>",
+            "conversationId": "conv-thread-1",
+            "sentDateTime": "2026-06-26T12:04:00Z",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_thread_row_number", return_value=7), \
+             patch.object(email_module, "_get_reply_message_sender", return_value=recipient), \
+             patch.object(email_module, "_fetch_graph_message_metadata", return_value={
+                 "conversationId": "conv-thread-1",
+                 "subject": "RE: 0 Gemini Ave",
+             }), \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None, create=True), \
+             patch.object(email_module, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation, create=True) as continuation_guard, \
+             patch.object(email_module, "_send_outbox_as_reply") as send_reply:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        continuation_guard.assert_called_once()
+        send_reply.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "dead_lettered")
+        self.assertIn("manually continued", dead_letter_payload["failureReason"])
+
     def test_thread_reply_retry_passes_conversation_identity_to_sent_guard(self):
         recipient = "bp21harrison+reply@gmail.com"
         doc = FakeDoc({

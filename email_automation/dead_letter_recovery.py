@@ -126,6 +126,7 @@ def _safe_outbox_payload(data: Dict[str, Any], dead_letter_id: str, operator_id:
     outbox_payload.update({
         "attempts": 0,
         "status": "queued",
+        "requiresSentItemsPreflight": True,
         "processingBy": None,
         "processingAt": None,
         "lastSendAttemptAt": None,
