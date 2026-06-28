@@ -2410,6 +2410,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         )
         from .messaging import save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
         from .clients import _fs
+        from .email import _filter_reply_all_draft_recipients
         from datetime import datetime, timezone
         import requests
         import time
@@ -2456,156 +2457,96 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         reply_sent_successfully = False
         reply_sent_after = None
 
-        # Check if we need to attach signature images (for professional mode)
-        # CID attachments require using createReply + draft + send pattern
+        create_reply_resp = exponential_backoff_request(
+            lambda: requests.post(f"{base}/me/messages/{current_msg_id}/createReplyAll", headers=headers, timeout=30),
+            max_retries=GRAPH_SEND_MAX_RETRIES,
+        )
+        if not create_reply_resp or create_reply_resp.status_code not in [200, 201]:
+            send_reply_in_thread.last_error = f"createReplyAll failed: {create_reply_resp.status_code if create_reply_resp else 'no response'}"
+            send_reply_in_thread.last_outcome = "send_failed"
+            print(f"   ❌ {send_reply_in_thread.last_error}")
+            return False
+
+        reply_draft = create_reply_resp.json() or {}
+        reply_draft_id = reply_draft.get("id")
+        if not reply_draft_id:
+            send_reply_in_thread.last_error = "createReplyAll returned no draft id"
+            send_reply_in_thread.last_outcome = "send_failed"
+            print("   ❌ createReplyAll returned no draft id")
+            return False
+
+        recipient_result = _filter_reply_all_draft_recipients(
+            user_id,
+            reply_draft,
+            user_email=user_email,
+        )
+        recipient_payload = recipient_result["payload"]
+        if not (recipient_payload["toRecipients"] or recipient_payload["ccRecipients"]):
+            send_reply_in_thread.last_error = "No safe reply-all recipients remained after filtering"
+            send_reply_in_thread.last_outcome = "send_failed"
+            print("   ❌ No safe reply-all recipients remained after filtering")
+            return False
+
+        patch_payload = {
+            "body": {"contentType": "HTML", "content": html_body},
+            "toRecipients": recipient_payload["toRecipients"],
+            "ccRecipients": recipient_payload["ccRecipients"],
+        }
+        patch_resp = exponential_backoff_request(
+            lambda: requests.patch(
+                f"{base}/me/messages/{reply_draft_id}",
+                headers=headers,
+                json=patch_payload,
+                timeout=30
+            ),
+            max_retries=GRAPH_SEND_MAX_RETRIES,
+        )
+        if not patch_resp or patch_resp.status_code not in [200, 202, 204]:
+            send_reply_in_thread.last_error = f"Reply-all draft patch failed: {patch_resp.status_code if patch_resp else 'no response'}"
+            send_reply_in_thread.last_outcome = "send_failed"
+            print(f"   ❌ {send_reply_in_thread.last_error}")
+            return False
+
+        signature_attachments = []
         if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
-            # Use createReply to get a draft, add attachments, then send
-            create_reply_resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{current_msg_id}/createReply", headers=headers, timeout=30),
-                max_retries=GRAPH_SEND_MAX_RETRIES,
-            )
+            signature_attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
 
-            if create_reply_resp.status_code in [200, 201]:
-                reply_draft = create_reply_resp.json()
-                reply_draft_id = reply_draft.get("id")
-
-                # Update draft body
-                exponential_backoff_request(
-                    lambda: requests.patch(
-                        f"{base}/me/messages/{reply_draft_id}",
+        for attachment in signature_attachments:
+            try:
+                att_resp = exponential_backoff_request(
+                    lambda att=attachment: requests.post(
+                        f"{base}/me/messages/{reply_draft_id}/attachments",
                         headers=headers,
-                        json={"body": {"contentType": "HTML", "content": html_body}},
+                        json=att,
                         timeout=30
                     ),
                     max_retries=GRAPH_SEND_MAX_RETRIES,
                 )
+                if att_resp.status_code in [200, 201]:
+                    print(f"   📎 Attached {attachment['name']}")
+            except Exception as e:
+                print(f"   ⚠️ Error attaching {attachment['name']}: {e}")
 
-                # Add signature attachments
-                signature_attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
-                for attachment in signature_attachments:
-                    try:
-                        att_resp = exponential_backoff_request(
-                            lambda att=attachment: requests.post(
-                                f"{base}/me/messages/{reply_draft_id}/attachments",
-                                headers=headers,
-                                json=att,
-                                timeout=30
-                            ),
-                            max_retries=GRAPH_SEND_MAX_RETRIES,
-                        )
-                        if att_resp.status_code in [200, 201]:
-                            print(f"   📎 Attached {attachment['name']}")
-                    except Exception as e:
-                        print(f"   ⚠️ Error attaching {attachment['name']}: {e}")
+        reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
+        send_reply_in_thread.last_send_attempt_at = reply_sent_after
+        resp = exponential_backoff_request(
+            lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
+            max_retries=1,
+            operation="graph_send",
+        )
+        reply_sent_successfully = resp and resp.status_code in [200, 202]
+        if reply_sent_successfully:
+            print(f"   ✅ Sent reply via createReplyAll draft")
 
-                # Send the reply
-                reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
-                send_reply_in_thread.last_send_attempt_at = reply_sent_after
-                resp = exponential_backoff_request(
-                    lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-                    max_retries=1,
-                    operation="graph_send",
-                )
-
-                if resp and resp.status_code in [200, 202]:
-                    print(f"   ✅ Sent reply with signature attachments via createReply+send")
-                    reply_sent_successfully = True
-                else:
-                    print(f"   ❌ Send draft failed: {resp.status_code if resp else 'None'}")
-            else:
-                print(f"   ⚠️ createReply failed: {create_reply_resp.status_code}, trying simple reply")
-
-        # If professional mode failed or not needed, try simple /reply endpoint
         if not reply_sent_successfully:
-            reply_payload = {
-                "message": {
-                    "body": {
-                        "contentType": "HTML",
-                        "content": html_body
-                    }
-                }
-            }
-            reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
-            send_reply_in_thread.last_send_attempt_at = reply_sent_after
-            resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{current_msg_id}/reply",
-                                     headers=headers, json=reply_payload, timeout=30),
-                max_retries=1,
-                operation="graph_send",
-            )
-            reply_sent_successfully = resp and resp.status_code in [200, 201, 202]
-            if reply_sent_successfully:
-                print(f"   ✅ Sent reply via /reply endpoint")
-
-        # Check if reply was sent successfully (either path)
-        if not reply_sent_successfully:
-            print(f"   ❌ Reply failed")
-            # Fallback: send a new email with proper threading headers
-            msg = {
-                "subject": "Re: Property information",
-                "body": {"contentType": "HTML", "content": html_body},
-                "toRecipients": [{"emailAddress": {"address": recipient}}],
-                "internetMessageHeaders": [
-                    {"name": "In-Reply-To", "value": thread_id},
-                    {"name": "References", "value": thread_id}
-                ]
-            }
-
-            if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
-                # Create draft, add attachments, send
-                create_resp = exponential_backoff_request(
-                    lambda: requests.post(f"{base}/me/messages", headers=headers, json=msg, timeout=30),
-                    max_retries=GRAPH_SEND_MAX_RETRIES,
-                )
-                if create_resp.status_code in [200, 201]:
-                    draft_id = create_resp.json()["id"]
-                    signature_attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
-                    for attachment in signature_attachments:
-                        try:
-                            exponential_backoff_request(
-                                lambda att=attachment: requests.post(
-                                    f"{base}/me/messages/{draft_id}/attachments",
-                                    headers=headers,
-                                    json=att,
-                                    timeout=30
-                                ),
-                                max_retries=GRAPH_SEND_MAX_RETRIES,
-                            )
-                        except:
-                            pass
-                    reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
-                    send_reply_in_thread.last_send_attempt_at = reply_sent_after
-                    resp = exponential_backoff_request(
-                        lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30),
-                        max_retries=1,
-                        operation="graph_send",
-                    )
-                    if resp and resp.status_code in [200, 202]:
-                        print(f"   ✅ Sent reply via sendMail fallback with attachments")
-                        reply_sent_successfully = True
-            else:
-                send_payload = {"message": msg, "saveToSentItems": True}
-                reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
-                send_reply_in_thread.last_send_attempt_at = reply_sent_after
-                resp = exponential_backoff_request(
-                    lambda: requests.post(f"{base}/me/sendMail", headers=headers,
-                                         json=send_payload, timeout=30),
-                    max_retries=1,
-                    operation="graph_send",
-                )
-                if resp and resp.status_code in [200, 201, 202]:
-                    print(f"   ✅ Sent reply via /sendMail fallback")
-                    reply_sent_successfully = True
-
-            if not reply_sent_successfully:
-                send_reply_in_thread.last_error = "All reply methods failed"
-                send_reply_in_thread.last_outcome = "send_failed"
-                print(f"   ❌ All reply methods failed")
-                return False
+            send_reply_in_thread.last_error = f"Reply-all draft send failed: {resp.status_code if resp else 'no response'}"
+            send_reply_in_thread.last_outcome = "send_failed"
+            print(f"   ❌ {send_reply_in_thread.last_error}")
+            return False
 
         # Reply was sent successfully - now index it
         # CRITICAL: Index the sent message so future replies can find the thread
-        # The /reply endpoint doesn't return the message ID, so we need to fetch it from SentItems
+        # Graph draft sends do not return the sent message ID, so fetch it from SentItems.
         try:
             # Wait a moment for the message to appear in SentItems
             time.sleep(1)
@@ -2659,6 +2600,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
 
                         # Also save the message record
                         to_recipients = [r.get("emailAddress", {}).get("address", "") for r in sent_msg.get("toRecipients", [])]
+                        cc_recipients = [r.get("emailAddress", {}).get("address", "") for r in sent_msg.get("ccRecipients", [])]
                         body_obj = sent_msg.get("body", {}) or {}
                         body_content = body_obj.get("content", "")
 
@@ -2667,6 +2609,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                             "subject": sent_msg.get("subject", ""),
                             "from": "me",
                             "to": to_recipients,
+                            "cc": cc_recipients,
                             "sentDateTime": sent_msg.get("sentDateTime"),
                             "receivedDateTime": None,
                             "headers": {

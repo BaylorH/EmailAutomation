@@ -63,10 +63,25 @@ class GraphRetryPolicyTests(unittest.TestCase):
             retry_calls.append(kwargs)
             return func()
 
+        def fake_post(url, **_kwargs):
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "reply-draft-1",
+                    "toRecipients": [
+                        {"emailAddress": {"address": "bp21harrison@gmail.com"}},
+                    ],
+                    "ccRecipients": [],
+                })
+            if url.endswith("/reply-draft-1/send"):
+                return FakeResponse(202)
+            return FakeResponse(500, text=f"Unexpected POST {url}")
+
         with patch.object(email_module, "exponential_backoff_request", side_effect=fake_retry), \
              patch.object(email_module, "_fetch_graph_message_metadata", return_value={"conversationId": "conv-1"}), \
              patch.object(email_module, "_find_recent_sent_reply_identity", return_value={"sentMessageId": "sent-1"}), \
-             patch.object(email_module.requests, "post", return_value=FakeResponse(202)):
+             patch.object(email_module.requests, "post", side_effect=fake_post), \
+             patch.object(email_module.requests, "patch", return_value=FakeResponse(200)), \
+             patch("email_automation.processing.is_contact_opted_out", return_value=None):
             result = email_module._send_outbox_as_reply(
                 "uid-1",
                 {"Authorization": "Bearer token"},
@@ -82,6 +97,115 @@ class GraphRetryPolicyTests(unittest.TestCase):
         ]
         self.assertTrue(send_calls)
         self.assertEqual(send_calls[-1].get("max_retries"), 1)
+
+    def test_dashboard_thread_reply_preserves_safe_cc_with_reply_all_draft(self):
+        posts = []
+        patch_payloads = []
+
+        def fake_retry(func, **_kwargs):
+            return func()
+
+        def fake_post(url, **_kwargs):
+            posts.append(url)
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "reply-draft-1",
+                    "toRecipients": [
+                        {"emailAddress": {"address": "bp21harrison@gmail.com"}},
+                    ],
+                    "ccRecipients": [
+                        {"emailAddress": {"address": "baylor@manifoldengineering.ai"}},
+                        {"emailAddress": {"address": "baylor.freelance@outlook.com"}},
+                    ],
+                })
+            if url.endswith("/reply-draft-1/send"):
+                return FakeResponse(202)
+            return FakeResponse(500, text=f"Unexpected POST {url}")
+
+        def fake_patch(_url, **kwargs):
+            patch_payloads.append(kwargs.get("json") or {})
+            return FakeResponse(200)
+
+        with patch.object(email_module, "exponential_backoff_request", side_effect=fake_retry), \
+             patch.object(email_module, "_fetch_graph_message_metadata", return_value={"conversationId": "conv-1"}), \
+             patch.object(email_module, "_find_recent_sent_reply_identity", return_value={"sentMessageId": "sent-1"}), \
+             patch.object(email_module.requests, "post", side_effect=fake_post), \
+             patch.object(email_module.requests, "patch", side_effect=fake_patch), \
+             patch("email_automation.processing.is_contact_opted_out", return_value=None):
+            result = email_module._send_outbox_as_reply(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "Hi Broker,\n\nThanks.",
+                "reply-message-1",
+                "thread-1",
+                user_email="baylor.freelance@outlook.com",
+            )
+
+        self.assertTrue(result["sent"])
+        self.assertTrue(any(url.endswith("/createReplyAll") for url in posts))
+        self.assertFalse(any(url.endswith("/reply") for url in posts))
+        patch_payload = patch_payloads[0]
+        self.assertEqual(
+            [r["emailAddress"]["address"] for r in patch_payload["toRecipients"]],
+            ["bp21harrison@gmail.com"],
+        )
+        self.assertEqual(
+            [r["emailAddress"]["address"] for r in patch_payload["ccRecipients"]],
+            ["baylor@manifoldengineering.ai"],
+        )
+
+    def test_dashboard_thread_reply_filters_opted_out_cc_before_send(self):
+        patch_payloads = []
+
+        def fake_retry(func, **_kwargs):
+            return func()
+
+        def fake_post(url, **_kwargs):
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "reply-draft-1",
+                    "toRecipients": [
+                        {"emailAddress": {"address": "bp21harrison@gmail.com"}},
+                    ],
+                    "ccRecipients": [
+                        {"emailAddress": {"address": "baylor@manifoldengineering.ai"}},
+                    ],
+                })
+            if url.endswith("/reply-draft-1/send"):
+                return FakeResponse(202)
+            return FakeResponse(500, text=f"Unexpected POST {url}")
+
+        def fake_patch(_url, **kwargs):
+            patch_payloads.append(kwargs.get("json") or {})
+            return FakeResponse(200)
+
+        def fake_optout(_user_id, email):
+            if email.lower() == "baylor@manifoldengineering.ai":
+                return {"reason": "unsubscribe"}
+            return None
+
+        with patch.object(email_module, "exponential_backoff_request", side_effect=fake_retry), \
+             patch.object(email_module, "_fetch_graph_message_metadata", return_value={"conversationId": "conv-1"}), \
+             patch.object(email_module, "_find_recent_sent_reply_identity", return_value={"sentMessageId": "sent-1"}), \
+             patch.object(email_module.requests, "post", side_effect=fake_post), \
+             patch.object(email_module.requests, "patch", side_effect=fake_patch), \
+             patch("email_automation.processing.is_contact_opted_out", side_effect=fake_optout):
+            result = email_module._send_outbox_as_reply(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "Hi Broker,\n\nThanks.",
+                "reply-message-1",
+                "thread-1",
+                user_email="baylor.freelance@outlook.com",
+            )
+
+        self.assertTrue(result["sent"])
+        patch_payload = patch_payloads[0]
+        self.assertEqual(
+            [r["emailAddress"]["address"] for r in patch_payload["toRecipients"]],
+            ["bp21harrison@gmail.com"],
+        )
+        self.assertEqual(patch_payload["ccRecipients"], [])
 
     def test_sent_items_retry_guard_matches_recipient_subject_body_after_cutoff(self):
         messages = [

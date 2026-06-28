@@ -284,18 +284,35 @@ class BackendActionAuditTests(unittest.TestCase):
                 }]
             }),
         ]
-        requests_post.return_value = FakeResponse(202)
+        def fake_post(url, **_kwargs):
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "reply-draft-1",
+                    "toRecipients": [
+                        {"emailAddress": {"address": "bp21harrison@gmail.com"}},
+                    ],
+                    "ccRecipients": [],
+                })
+            if url.endswith("/reply-draft-1/send"):
+                return FakeResponse(202)
+            if url.endswith("/attachments"):
+                return FakeResponse(201)
+            return FakeResponse(500)
 
-        result = email_module._send_outbox_as_reply(
-            "uid-1",
-            {"Authorization": "Bearer token"},
-            "Hi Morgan,\n\nThanks.",
-            "reply-message-1",
-            "thread-1",
-            user_signature="Baylor Harrison\nbaylor.freelance@outlook.com",
-            signature_mode="professional",
-            user_email="baylor.freelance@outlook.com",
-        )
+        requests_post.side_effect = fake_post
+
+        with patch.object(email_module.requests, "patch", return_value=FakeResponse(200)), \
+                patch("email_automation.processing.is_contact_opted_out", return_value=None):
+            result = email_module._send_outbox_as_reply(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "Hi Morgan,\n\nThanks.",
+                "reply-message-1",
+                "thread-1",
+                user_signature="Baylor Harrison\nbaylor.freelance@outlook.com",
+                signature_mode="professional",
+                user_email="baylor.freelance@outlook.com",
+            )
 
         self.assertTrue(result["sent"])
         self.assertEqual(result["sentMessageId"], "graph-message-1")

@@ -216,6 +216,53 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
 
     @patch.object(email_module, "_claim_outbox_item", return_value=True)
     @patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com")
+    @patch.object(email_module, "_send_outbox_as_reply", return_value={
+        "sent": True,
+        "error": None,
+        "sentMessageId": "graph-reply-message-1",
+        "internetMessageId": "<graph-reply-message-1@example.com>",
+        "toRecipients": ["bp21harrison@gmail.com"],
+        "ccRecipients": ["baylor@manifoldengineering.ai"],
+        "sentRecipients": ["bp21harrison@gmail.com", "baylor@manifoldengineering.ai"],
+    })
+    @patch.object(email_module, "_save_outbox_reply_message", create=True)
+    @patch.object(email_module, "_finalize_successful_outbox_item")
+    @patch.object(email_module, "send_and_index_email")
+    @patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1")
+    @patch.object(email_module, "highlight_row")
+    def test_thread_reply_with_cc_records_reply_all_recipients(
+        self,
+        _highlight_row,
+        _get_sheet_id_or_fail,
+        send_and_index_email,
+        finalize_successful_outbox_item,
+        save_outbox_reply_message,
+        _send_outbox_as_reply,
+        _get_reply_message_sender,
+        _claim_outbox_item,
+    ):
+        doc = self._thread_reply_outbox("bp21harrison@gmail.com")
+
+        email_module._send_single_outbox_item(
+            "uid-1",
+            {"Authorization": "Bearer token"},
+            {"doc": doc, "data": doc.to_dict()},
+        )
+
+        send_and_index_email.assert_not_called()
+        save_outbox_reply_message.assert_called_once()
+        _, kwargs = save_outbox_reply_message.call_args
+        self.assertEqual(kwargs["cc_emails"], ["baylor@manifoldengineering.ai"])
+
+        finalize_successful_outbox_item.assert_called_once()
+        send_result = finalize_successful_outbox_item.call_args.kwargs["send_result"]
+        self.assertEqual(
+            send_result["sent"],
+            ["bp21harrison@gmail.com", "baylor@manifoldengineering.ai"],
+        )
+
+    @patch.object(email_module, "_claim_outbox_item", return_value=True)
+    @patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com")
     @patch.object(email_module, "_send_outbox_as_reply", return_value={"sent": True, "error": None})
     @patch.object(email_module, "_save_outbox_reply_message", create=True)
     @patch.object(email_module, "_record_outbox_reconciliation")

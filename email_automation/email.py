@@ -488,6 +488,99 @@ def _assigned_emails_match_reply_sender(assigned_emails: List[str], reply_sender
     return normalized[0] == _normalize_email(reply_sender)
 
 
+def _recipient_address(recipient: Dict[str, Any]) -> str:
+    return (
+        ((recipient or {}).get("emailAddress") or {}).get("address")
+        or ""
+    ).strip()
+
+
+def _recipient_display_name(recipient: Dict[str, Any]) -> str:
+    return (
+        ((recipient or {}).get("emailAddress") or {}).get("name")
+        or ""
+    ).strip()
+
+
+def _graph_recipient(address: str, name: Optional[str] = None) -> Dict[str, Any]:
+    email_address = {"address": address}
+    if name:
+        email_address["name"] = name
+    return {"emailAddress": email_address}
+
+
+def _filter_reply_all_draft_recipients(
+    user_id: str,
+    draft: Dict[str, Any],
+    *,
+    user_email: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Keep Microsoft Graph's reply-all audience, but remove unsafe recipients
+    before the draft is sent.
+
+    Direct /replyAll does not let us filter CCs. Using createReplyAll + patch
+    lets Graph preserve thread semantics while SiteSift still honors opt-outs,
+    blocked contacts, duplicate prevention, and the operator's own address.
+    """
+    from .processing import is_contact_opted_out
+
+    operator = _normalize_email(user_email)
+    seen = set()
+    payload = {"toRecipients": [], "ccRecipients": []}
+    skipped = {
+        "operator": [],
+        "duplicate": [],
+        "invalid": [],
+        "optedOut": [],
+    }
+
+    for key in ("toRecipients", "ccRecipients"):
+        for recipient in draft.get(key) or []:
+            raw_address = _recipient_address(recipient)
+            normalized = _normalize_email(raw_address)
+            if not normalized:
+                skipped["invalid"].append(raw_address)
+                continue
+            if operator and normalized == operator:
+                skipped["operator"].append(normalized)
+                continue
+            if normalized in seen:
+                skipped["duplicate"].append(normalized)
+                continue
+            if not is_valid_email(normalized):
+                skipped["invalid"].append(normalized)
+                continue
+
+            optout_record = is_contact_opted_out(user_id, normalized)
+            if optout_record:
+                skipped["optedOut"].append({
+                    "email": normalized,
+                    "reason": optout_record.get("reason", "unknown"),
+                })
+                continue
+
+            seen.add(normalized)
+            payload[key].append(
+                _graph_recipient(normalized, _recipient_display_name(recipient))
+            )
+
+    return {
+        "payload": payload,
+        "skipped": {key: value for key, value in skipped.items() if value},
+        "sentRecipients": [
+            _recipient_address(recipient)
+            for recipient in payload["toRecipients"] + payload["ccRecipients"]
+            if _recipient_address(recipient)
+        ],
+        "ccRecipients": [
+            _recipient_address(recipient)
+            for recipient in payload["ccRecipients"]
+            if _recipient_address(recipient)
+        ],
+    }
+
+
 def _get_thread_row_number(user_id: str, thread_id: str) -> Optional[int]:
     """Return the stored Sheet row number for a known thread, if present."""
     if not thread_id:
@@ -517,8 +610,9 @@ def _save_outbox_reply_message(
     user_signature: str = None,
     signature_mode: str = None,
     user_email: str = None,
+    cc_emails: Optional[List[str]] = None,
 ) -> bool:
-    """Persist a dashboard-approved Graph /reply send into the conversation history."""
+    """Persist a dashboard-approved Graph reply-all draft send into conversation history."""
     if not thread_id:
         return False
 
@@ -536,6 +630,7 @@ def _save_outbox_reply_message(
             "direction": "outbound",
             "from": "me",
             "to": assigned_emails or [],
+            "cc": cc_emails or [],
             "subject": subject,
             "body": {
                 "content": html_body,
@@ -587,101 +682,111 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
     )
 
     try:
-        # Check if we need signature attachments (professional mode)
-        if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
-            # Use createReply to get a draft, add attachments, then send
-            create_reply_resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{reply_to_msg_id}/createReply", headers=headers, timeout=30),
-                max_retries=GRAPH_SEND_MAX_RETRIES,
-            )
+        create_reply_resp = exponential_backoff_request(
+            lambda: requests.post(
+                f"{base}/me/messages/{reply_to_msg_id}/createReplyAll",
+                headers=headers,
+                timeout=30,
+            ),
+            max_retries=GRAPH_SEND_MAX_RETRIES,
+        )
 
-            if create_reply_resp.status_code in [200, 201]:
-                reply_draft = create_reply_resp.json()
-                reply_draft_id = reply_draft.get("id")
+        if not create_reply_resp or create_reply_resp.status_code not in [200, 201]:
+            error_msg = f"createReplyAll failed: {create_reply_resp.status_code if create_reply_resp else 'None'}"
+            print(f"   ❌ {error_msg}")
+            return {"sent": False, "error": error_msg}
 
-                # Update draft body
-                exponential_backoff_request(
-                    lambda: requests.patch(
-                        f"{base}/me/messages/{reply_draft_id}",
-                        headers=headers,
-                        json={"body": {"contentType": "HTML", "content": html_body}},
-                        timeout=30
-                    ),
-                    max_retries=GRAPH_SEND_MAX_RETRIES,
-                )
+        reply_draft = create_reply_resp.json() or {}
+        reply_draft_id = reply_draft.get("id")
+        if not reply_draft_id:
+            error_msg = "createReplyAll did not return a draft id"
+            print(f"   ❌ {error_msg}")
+            return {"sent": False, "error": error_msg}
 
-                # Add signature attachments
-                signature_attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
-                for attachment in signature_attachments:
-                    try:
-                        att_resp = exponential_backoff_request(
-                            lambda att=attachment: requests.post(
-                                f"{base}/me/messages/{reply_draft_id}/attachments",
-                                headers=headers,
-                                json=att,
-                                timeout=30
-                            ),
-                            max_retries=GRAPH_SEND_MAX_RETRIES,
-                        )
-                        if att_resp.status_code in [200, 201]:
-                            print(f"   📎 Attached {attachment['name']}")
-                    except Exception as e:
-                        print(f"   ⚠️ Error attaching {attachment['name']}: {e}")
-
-                # Send the reply
-                sent_after = datetime.now(timezone.utc) - timedelta(seconds=10)
-                resp = exponential_backoff_request(
-                    lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-                    max_retries=1,
-                    operation="graph_send",
-                )
-
-                if resp and resp.status_code in [200, 202]:
-                    print(f"   ✅ Sent reply (with attachments) to thread {thread_id}")
-                    identity = _find_recent_sent_reply_identity(
-                        headers,
-                        base,
-                        source_metadata.get("conversationId"),
-                        sent_after,
-                    )
-                    return {"sent": True, "error": None, **identity}
-                else:
-                    error_msg = f"Send draft failed: {resp.status_code if resp else 'None'}"
-                    print(f"   ❌ {error_msg}")
-                    return {"sent": False, "error": error_msg}
-            else:
-                print(f"   ⚠️ createReply failed: {create_reply_resp.status_code}, trying simple reply")
-
-        # Simple reply without attachments
-        reply_payload = {
-            "message": {
-                "body": {
-                    "contentType": "HTML",
-                    "content": html_body
-                }
+        recipient_result = _filter_reply_all_draft_recipients(
+            user_id,
+            reply_draft,
+            user_email=user_email,
+        )
+        recipient_payload = recipient_result["payload"]
+        if not (recipient_payload["toRecipients"] or recipient_payload["ccRecipients"]):
+            error_msg = "Reply-all draft has no safe recipients after filtering"
+            print(f"   ❌ {error_msg}")
+            return {
+                "sent": False,
+                "error": error_msg,
+                "skippedRecipients": recipient_result.get("skipped"),
             }
+
+        patch_payload = {
+            "body": {"contentType": "HTML", "content": html_body},
+            "toRecipients": recipient_payload["toRecipients"],
+            "ccRecipients": recipient_payload["ccRecipients"],
         }
+        patch_resp = exponential_backoff_request(
+            lambda: requests.patch(
+                f"{base}/me/messages/{reply_draft_id}",
+                headers=headers,
+                json=patch_payload,
+                timeout=30,
+            ),
+            max_retries=GRAPH_SEND_MAX_RETRIES,
+        )
+        if not patch_resp or patch_resp.status_code not in [200, 202, 204]:
+            error_msg = f"Patch reply-all draft failed: {patch_resp.status_code if patch_resp else 'None'}"
+            print(f"   ❌ {error_msg}")
+            return {"sent": False, "error": error_msg}
+
+        if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
+            signature_attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
+            for attachment in signature_attachments:
+                try:
+                    att_resp = exponential_backoff_request(
+                        lambda att=attachment: requests.post(
+                            f"{base}/me/messages/{reply_draft_id}/attachments",
+                            headers=headers,
+                            json=att,
+                            timeout=30,
+                        ),
+                        max_retries=GRAPH_SEND_MAX_RETRIES,
+                    )
+                    if att_resp.status_code in [200, 201]:
+                        print(f"   📎 Attached {attachment['name']}")
+                except Exception as e:
+                    print(f"   ⚠️ Error attaching {attachment['name']}: {e}")
+
         sent_after = datetime.now(timezone.utc) - timedelta(seconds=10)
         resp = exponential_backoff_request(
-            lambda: requests.post(f"{base}/me/messages/{reply_to_msg_id}/reply",
-                                 headers=headers, json=reply_payload, timeout=30),
+            lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
             max_retries=1,
             operation="graph_send",
         )
 
-        if resp and resp.status_code in [200, 201, 202]:
-            print(f"   ✅ Sent reply to thread {thread_id}")
+        if resp and resp.status_code in [200, 202]:
+            print(f"   ✅ Sent reply-all draft to thread {thread_id}")
             identity = _find_recent_sent_reply_identity(
                 headers,
                 base,
                 source_metadata.get("conversationId"),
                 sent_after,
             )
-            return {"sent": True, "error": None, **identity}
-        else:
-            error_msg = f"Reply failed: {resp.status_code if resp else 'None'}"
-            print(f"   ❌ {error_msg}")
-            return {"sent": False, "error": error_msg}
+            return {
+                "sent": True,
+                "error": None,
+                "toRecipients": [
+                    _recipient_address(recipient)
+                    for recipient in recipient_payload["toRecipients"]
+                    if _recipient_address(recipient)
+                ],
+                "ccRecipients": recipient_result.get("ccRecipients") or [],
+                "sentRecipients": recipient_result.get("sentRecipients") or [],
+                "skippedRecipients": recipient_result.get("skipped"),
+                **identity,
+            }
+
+        error_msg = f"Send draft failed: {resp.status_code if resp else 'None'}"
+        print(f"   ❌ {error_msg}")
+        return {"sent": False, "error": error_msg}
 
     except Exception as e:
         error_msg = str(e)
@@ -2173,7 +2278,8 @@ def _send_single_outbox_item(
 
                     if res.get("sent"):
                         recipient = emails[0] if emails else "unknown"
-                        all_sent.append(recipient)
+                        sent_recipients = res.get("sentRecipients") or [recipient]
+                        all_sent.extend(sent_recipients)
                         if res.get("sentMessageId"):
                             send_identity["sentMessageIds"][recipient] = res.get("sentMessageId")
                         if res.get("internetMessageId"):
@@ -2181,8 +2287,9 @@ def _send_single_outbox_item(
                         if res.get("conversationId"):
                             send_identity["conversationIds"][recipient] = res.get("conversationId")
                         _save_outbox_reply_message(
-                            user_id, thread_id, emails, subject_override,
-                            script_content, user_signature, signature_mode, user_email
+                            user_id, thread_id, res.get("toRecipients") or emails, subject_override,
+                            script_content, user_signature, signature_mode, user_email,
+                            cc_emails=res.get("ccRecipients") or [],
                         )
                         if not (res.get("sentMessageId") or res.get("internetMessageId")):
                             all_errors[recipient] = (
