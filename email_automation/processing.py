@@ -1507,12 +1507,13 @@ def _active_replacement_context(thread_data: Optional[Dict[str, Any]], message_t
     if not isinstance(replacement, dict):
         return None
 
-    address = (
+    raw_address = (
         replacement.get("address")
         or replacement.get("propertyAddress")
         or replacement.get("rowAnchor")
         or ""
-    ).strip()
+    )
+    address = str(raw_address or "").strip()
     if not address:
         return None
 
@@ -1530,7 +1531,7 @@ def _active_replacement_context(thread_data: Optional[Dict[str, Any]], message_t
     return {
         **replacement,
         "address": address,
-        "city": (replacement.get("city") or "").strip(),
+        "city": str(replacement.get("city") or "").strip(),
         "rowNumber": row_number,
     }
 
@@ -2055,6 +2056,24 @@ def _event_text(event: Dict[str, Any], key: str) -> str:
     return str((event or {}).get(key) or "").strip()
 
 
+def _proposal_events(proposal: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_events = (proposal or {}).get("events") or []
+    if not isinstance(raw_events, list):
+        return []
+
+    normalized_events = []
+    for event in raw_events:
+        if not isinstance(event, dict):
+            continue
+        event_type = _event_text(event, "type")
+        if not event_type:
+            continue
+        normalized = dict(event)
+        normalized["type"] = event_type
+        normalized_events.append(normalized)
+    return normalized_events
+
+
 def _response_mentions_missing_fields(response_body: str, missing_fields: List[str]) -> bool:
     """Detect whether an LLM response is actually asking for the missing fields."""
     body = (response_body or "").lower()
@@ -2167,17 +2186,17 @@ def _property_exists_in_sheet(
     if addr_col is None:
         return False
 
-    address_normalized = (address or "").strip().lower()
-    city_normalized = (city or "").strip().lower()
+    address_normalized = str(address or "").strip().lower()
+    city_normalized = str(city or "").strip().lower()
 
     for row_idx, row in enumerate(existing_rows, start=3):
         if len(row) <= (addr_col - 1):
             continue
-        existing_addr = (row[addr_col - 1] or "").strip().lower()
+        existing_addr = str(row[addr_col - 1] or "").strip().lower()
         existing_city = ""
 
         if city_col is not None and len(row) > (city_col - 1):
-            existing_city = (row[city_col - 1] or "").strip().lower()
+            existing_city = str(row[city_col - 1] or "").strip().lower()
 
         if existing_addr == address_normalized and existing_city == city_normalized:
             print(f"ℹ️ Property '{address}, {city}' already exists in row {row_idx}, skipping")
@@ -3286,7 +3305,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             sheets = _sheets_client()
             row_anchor = get_row_anchor(rowvals, header)
 
-            events = proposal.get("events", [])
+            events = _proposal_events(proposal)
             print(f"\n{'='*60}")
             print(f"📋 EVENT PROCESSING: {len(events)} event(s) detected by AI")
             print(f"{'='*60}")

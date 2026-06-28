@@ -25,6 +25,16 @@ class MessagingConversationPayloadTests(unittest.TestCase):
 
         self.assertEqual("new_property:27610 Commerce Oaks Dr::", key)
 
+    def test_property_issue_event_key_tolerates_null_and_non_string_issue(self):
+        self.assertEqual(
+            "property_issue:",
+            messaging.build_event_key("property_issue", {"issue": None}, thread_id="thread-1"),
+        )
+        self.assertEqual(
+            "property_issue:12345",
+            messaging.build_event_key("property_issue", {"issue": 12345}, thread_id="thread-1"),
+        )
+
     def test_build_conversation_payload_tolerates_string_body_messages(self):
         mixed_history = [
             {

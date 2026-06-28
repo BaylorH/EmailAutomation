@@ -662,6 +662,48 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             )
         )
 
+    def test_new_property_duplicate_check_normalizes_non_string_sheet_cells(self):
+        class SheetWithNumericCells:
+            def spreadsheets(self):
+                return self
+
+            def values(self):
+                return self
+
+            def get(self, **_kwargs):
+                return self
+
+            def execute(self):
+                return {
+                    "values": [
+                        [777, None],
+                        ["888 Replacement Signal Ave", 123],
+                    ]
+                }
+
+        header = ["Property Address", "City"]
+
+        self.assertTrue(
+            processing._property_exists_in_sheet(
+                SheetWithNumericCells(),
+                "sheet-1",
+                "Properties",
+                header,
+                "777",
+                "",
+            )
+        )
+        self.assertTrue(
+            processing._property_exists_in_sheet(
+                SheetWithNumericCells(),
+                "sheet-1",
+                "Properties",
+                header,
+                "888 Replacement Signal Ave",
+                "123",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

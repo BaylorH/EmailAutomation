@@ -715,11 +715,13 @@ def build_event_key(event_type: str, event: dict = None, thread_id: str = None) 
     - property_issue: unique per issue text
     - close_conversation: unique per thread
     """
+    event_data = event if isinstance(event, dict) else {}
+
     def event_text(key: str) -> str:
-        return str((event or {}).get(key) or "").strip()
+        return str(event_data.get(key) or "").strip()
 
     if event_type == "needs_user_input":
-        reason = (event or {}).get("reason", "unclear")
+        reason = event_text("reason") or "unclear"
         return f"needs_user_input:{reason}"
 
     elif event_type == "new_property":
@@ -729,15 +731,15 @@ def build_event_key(event_type: str, event: dict = None, thread_id: str = None) 
         return f"new_property:{address}:{city}:{email}"
 
     elif event_type == "wrong_contact":
-        suggested = (event or {}).get("suggestedEmail") or (event or {}).get("suggestedContact", "")
+        suggested = event_text("suggestedEmail") or event_text("suggestedContact")
         return f"wrong_contact:{suggested}"
 
     elif event_type == "property_issue":
-        issue = (event or {}).get("issue", "")[:50]  # Truncate for key
+        issue = event_text("issue")[:50]  # Truncate for key
         return f"property_issue:{issue}"
 
     elif event_type == "contact_optout":
-        reason = (event or {}).get("reason", "not_interested")
+        reason = event_text("reason") or "not_interested"
         return f"contact_optout:{reason}"
 
     else:

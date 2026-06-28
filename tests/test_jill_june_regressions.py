@@ -394,6 +394,24 @@ class JillJuneRegressionTests(unittest.TestCase):
         self.assertEqual("", processing._event_text(event, "link"))
         self.assertEqual("", processing._event_text(event, "notes"))
 
+    def test_proposal_events_none_is_treated_as_empty(self):
+        self.assertEqual([], processing._proposal_events({"events": None}))
+
+    def test_proposal_events_skip_non_dict_entries_without_dropping_valid_events(self):
+        proposal = {
+            "events": [
+                None,
+                "new_property",
+                {"type": None, "address": "No type should skip"},
+                {"type": "new_property", "address": "27610 Commerce Oaks Dr"},
+            ]
+        }
+
+        self.assertEqual(
+            [{"type": "new_property", "address": "27610 Commerce Oaks Dr"}],
+            processing._proposal_events(proposal),
+        )
+
     def test_terminalized_original_row_skips_stale_operator_escalations(self):
         for event_type in [
             "tour_requested",

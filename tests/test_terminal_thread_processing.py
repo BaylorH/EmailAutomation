@@ -59,6 +59,44 @@ class TerminalThreadProcessingTests(unittest.TestCase):
             )
         )
 
+    def test_replacement_context_ignores_blank_address_without_crashing(self):
+        thread_data = {
+            "status": processing.THREAD_STATUS["stopped"],
+            "activeReplacementProperty": {
+                "address": None,
+                "propertyAddress": None,
+                "rowAnchor": None,
+                "city": None,
+                "rowNumber": 7,
+            },
+        }
+
+        self.assertIsNone(
+            processing._active_replacement_context(
+                thread_data,
+                message_text="The alternate property is available.",
+            )
+        )
+
+    def test_replacement_context_normalizes_non_string_property_fields(self):
+        thread_data = {
+            "status": processing.THREAD_STATUS["stopped"],
+            "activeReplacementProperty": {
+                "address": 414,
+                "city": 12345,
+                "rowNumber": "7",
+            },
+        }
+
+        context = processing._active_replacement_context(
+            thread_data,
+            message_text="Here are the details for 414.",
+        )
+
+        self.assertEqual("414", context["address"])
+        self.assertEqual("12345", context["city"])
+        self.assertEqual(7, context["rowNumber"])
+
     def test_completed_threads_remain_terminal_even_with_replacement_context(self):
         thread_data = {
             "activeReplacementProperty": {
