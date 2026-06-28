@@ -3308,47 +3308,14 @@ def dump_thread_from_firestore(user_id: str, thread_id: str):
 
 def send_outboxes(user_id: str, headers):
     """
-    Modified to use send_and_index_email instead of send_email.
+    Legacy scheduler_runner is retained for read/listing compatibility only.
+    The active worker must use email_automation.email.send_outboxes, which
+    performs Sent Items/manual-continuation guards before retrying sends.
     """
-    outbox_ref = _fs.collection("users").document(user_id).collection("outbox")
-    docs = list(outbox_ref.stream())
-
-    if not docs:
-        print("📭 Outbox empty")
-        return
-
-    print(f"📬 Found {len(docs)} outbox item(s)")
-    for d in docs:
-        data = d.to_dict() or {}
-        emails = data.get("assignedEmails") or []
-        script = data.get("script") or ""
-        clientId = (data.get("clientId") or "").strip()
-
-        print(f"→ Sending outbox item {d.id} to {len(emails)} recipient(s) (clientId={clientId or 'n/a'})")
-
-        try:
-            # Use new send_and_index_email function
-            res = send_and_index_email(user_id, headers, script, emails, client_id_or_none=clientId)
-            any_errors = bool(res["errors"])
-
-            if not any_errors and res["sent"]:
-                d.reference.delete()
-                print(f"🗑️ Deleted outbox item {d.id}")
-            else:
-                attempts = int(data.get("attempts") or 0) + 1
-                d.reference.set(
-                    {"attempts": attempts, "lastError": json.dumps(res["errors"])[:1500]},
-                    merge=True,
-                )
-                print(f"⚠️ Kept item {d.id} with error; attempts={attempts}")
-
-        except Exception as e:
-            attempts = int(data.get("attempts") or 0) + 1
-            d.reference.set(
-                {"attempts": attempts, "lastError": str(e)[:1500]},
-                merge=True,
-            )
-            print(f"💥 Error sending item {d.id}: {e}; attempts={attempts}")
+    raise RuntimeError(
+        "Legacy scheduler_runner.send_outboxes is disabled; use guarded "
+        "email_automation.email.send_outboxes so Sent Items checks can prevent duplicate sends."
+    )
 
 # --- Legacy Functions (kept for compatibility) ---
 
