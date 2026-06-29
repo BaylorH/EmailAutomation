@@ -297,6 +297,101 @@ class GraphRetryPolicyTests(unittest.TestCase):
         self.assertEqual(patch_payload["ccRecipients"], [])
         self.assertEqual(result["skippedRecipients"]["optedOut"][0]["email"], "baylor@manifoldengineering.ai")
 
+    def test_dashboard_thread_reply_falls_back_to_reviewed_outbox_recipients_when_graph_stays_empty(self):
+        posts = []
+        gets = []
+        patch_payloads = []
+
+        def fake_retry(func, **_kwargs):
+            return func()
+
+        def fake_post(url, **_kwargs):
+            posts.append(url)
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {"id": "reply-draft-1"})
+            if url.endswith("/reply-draft-1/send"):
+                return FakeResponse(202)
+            return FakeResponse(500, text=f"Unexpected POST {url}")
+
+        def fake_get(url, **_kwargs):
+            gets.append(url)
+            if url.endswith("/reply-message-1"):
+                return FakeResponse(200, {
+                    "conversationId": "conv-1",
+                    "subject": "RE: 410 Genesis Blvd, Webster",
+                })
+            if url.endswith("/reply-draft-1"):
+                return FakeResponse(200, {
+                    "id": "reply-draft-1",
+                    "toRecipients": [],
+                    "ccRecipients": [],
+                })
+            return FakeResponse(404, text=f"Unexpected GET {url}")
+
+        def fake_patch(_url, **kwargs):
+            patch_payloads.append(kwargs.get("json") or {})
+            return FakeResponse(200)
+
+        with patch.object(email_module, "exponential_backoff_request", side_effect=fake_retry), \
+             patch.object(email_module, "_find_recent_sent_reply_identity", return_value={"sentMessageId": "sent-1"}), \
+             patch.object(email_module.requests, "post", side_effect=fake_post), \
+             patch.object(email_module.requests, "get", side_effect=fake_get), \
+             patch.object(email_module.requests, "patch", side_effect=fake_patch), \
+             patch("email_automation.processing.is_contact_opted_out", return_value=None):
+            result = email_module._send_outbox_as_reply(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "Hi Jason,\n\nThanks.",
+                "reply-message-1",
+                "thread-1",
+                user_email="baylor.freelance@outlook.com",
+                fallback_to_emails=["bp21harrison@gmail.com"],
+                fallback_cc_emails=["baylor@manifoldengineering.ai"],
+            )
+
+        self.assertTrue(result["sent"])
+        self.assertTrue(any(url.endswith("/createReplyAll") for url in posts))
+        self.assertTrue(any(url.endswith("/reply-message-1") for url in gets))
+        self.assertTrue(any(url.endswith("/reply-draft-1") for url in gets))
+        patch_payload = patch_payloads[0]
+        self.assertEqual(
+            [r["emailAddress"]["address"] for r in patch_payload["toRecipients"]],
+            ["bp21harrison@gmail.com"],
+        )
+        self.assertEqual(
+            [r["emailAddress"]["address"] for r in patch_payload["ccRecipients"]],
+            ["baylor@manifoldengineering.ai"],
+        )
+        self.assertEqual(result["toRecipients"], ["bp21harrison@gmail.com"])
+        self.assertEqual(result["ccRecipients"], ["baylor@manifoldengineering.ai"])
+
+    def test_reply_all_source_fallback_accepts_stored_envelope_address_lists(self):
+        draft = {"id": "reply-draft-1", "toRecipients": [], "ccRecipients": []}
+        stored_envelope = {
+            "from": "bp21harrison@gmail.com",
+            "to": ["baylor.freelance@outlook.com"],
+            "cc": ["baylor@manifoldengineering.ai"],
+        }
+
+        rebuilt = email_module._source_message_reply_all_fallback(draft, stored_envelope)
+
+        with patch("email_automation.processing.is_contact_opted_out", return_value=None):
+            recipient_result = email_module._filter_reply_all_draft_recipients(
+                "uid-1",
+                rebuilt,
+                user_email="baylor.freelance@outlook.com",
+            )
+
+        payload = recipient_result["payload"]
+        self.assertEqual(
+            [r["emailAddress"]["address"] for r in payload["toRecipients"]],
+            ["bp21harrison@gmail.com"],
+        )
+        self.assertEqual(
+            [r["emailAddress"]["address"] for r in payload["ccRecipients"]],
+            ["baylor@manifoldengineering.ai"],
+        )
+
     def test_dashboard_thread_reply_filters_opted_out_cc_before_send(self):
         patch_payloads = []
 

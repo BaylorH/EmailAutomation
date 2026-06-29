@@ -453,16 +453,88 @@ def _source_message_match(data: Dict[str, Any], candidates: set) -> bool:
     return False
 
 
+def _recipient_email_address(recipient: Any) -> str:
+    if isinstance(recipient, str):
+        return recipient.strip()
+    if isinstance(recipient, dict):
+        return (
+            ((recipient or {}).get("emailAddress") or {}).get("address")
+            or ""
+        ).strip()
+    return ""
+
+
+def _recipient_email_addresses(recipients: Any) -> List[str]:
+    addresses = []
+    seen = set()
+    for recipient in recipients or []:
+        address = _recipient_email_address(recipient)
+        normalized = address.lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        addresses.append(address)
+    return addresses
+
+
+def _source_message_envelope(msg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(msg, dict) or not msg:
+        return {}
+
+    envelope: Dict[str, Any] = {}
+    id_mappings = (
+        ("id", "graphMessageId"),
+        ("internetMessageId", "internetMessageId"),
+        ("conversationId", "conversationId"),
+        ("subject", "subject"),
+        ("receivedDateTime", "receivedDateTime"),
+        ("sentDateTime", "sentDateTime"),
+    )
+    for source_key, target_key in id_mappings:
+        value = msg.get(source_key)
+        if value:
+            envelope[target_key] = value
+
+    for key in ("from", "sender"):
+        recipient = msg.get(key)
+        address = _recipient_email_address(recipient)
+        if recipient:
+            envelope[key] = recipient
+        if address:
+            envelope[f"{key}Email"] = address
+
+    recipient_list_keys = (
+        ("replyTo", "replyToEmails"),
+        ("toRecipients", "to"),
+        ("ccRecipients", "cc"),
+    )
+    for source_key, address_key in recipient_list_keys:
+        recipients = msg.get(source_key) or []
+        addresses = _recipient_email_addresses(recipients)
+        if recipients:
+            envelope[source_key] = recipients
+        if addresses:
+            envelope[address_key] = addresses
+
+    return envelope
+
+
 def _source_message_identity_meta(
     msg_id: Optional[str] = None,
     internet_message_id: Optional[str] = None,
-) -> Dict[str, str]:
+    msg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     payload = {}
     if msg_id:
         payload["sourceMessageId"] = msg_id
         payload["sourceGraphMessageId"] = msg_id
     if internet_message_id:
         payload["sourceInternetMessageId"] = internet_message_id
+    envelope = _source_message_envelope(msg)
+    if envelope:
+        payload["sourceMessage"] = envelope
+        if envelope.get("cc"):
+            payload["ccEmails"] = envelope["cc"]
     return payload
 
 
@@ -842,8 +914,9 @@ def _fetch_graph_message_by_id(headers: Dict[str, str], message_id: str) -> Dict
             headers=headers,
             params={
                 "$select": (
-                    "id,subject,from,toRecipients,receivedDateTime,sentDateTime,"
-                    "conversationId,internetMessageId,internetMessageHeaders,bodyPreview,hasAttachments"
+                    "id,subject,from,sender,replyTo,toRecipients,ccRecipients,"
+                    "receivedDateTime,sentDateTime,conversationId,internetMessageId,"
+                    "internetMessageHeaders,bodyPreview,hasAttachments"
                 )
             },
             timeout=30,
@@ -2414,6 +2487,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             _delete_graph_reply_draft,
             _filter_reply_all_draft_recipients,
             _hydrate_reply_all_draft_recipients,
+            _reviewed_recipient_reply_all_fallback,
             _source_message_reply_all_fallback,
         )
         from datetime import datetime, timezone
@@ -2494,6 +2568,10 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         reply_draft = _source_message_reply_all_fallback(
             reply_draft,
             current_meta,
+        )
+        reply_draft = _reviewed_recipient_reply_all_fallback(
+            reply_draft,
+            to_emails=[recipient],
         )
 
         recipient_result = _filter_reply_all_draft_recipients(
@@ -2807,13 +2885,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     body_preview = msg.get("bodyPreview", "")
     has_attachments = bool(msg.get("hasAttachments"))
     
+    full_msg = {}
     # NEW: fetch full message body and normalize to plain text
     try:
         full_msg = exponential_backoff_request(
             lambda: requests.get(
                 f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}",
                 headers=headers,
-                params={"$select": "body,hasAttachments"},
+                params={"$select": "body,hasAttachments,sender,replyTo,ccRecipients"},
                 timeout=30
             )
         ).json() or {}
@@ -2830,7 +2909,12 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     # This prevents the AI from misinterpreting quoted content as the broker's message
     _text_for_ai = strip_email_quotes(_full_text)
 
-    to_recipients = [r.get("emailAddress", {}).get("address", "") for r in msg.get("toRecipients", [])]
+    merged_msg = {**msg, **{k: v for k, v in full_msg.items() if k not in msg or not msg.get(k)}}
+    to_recipients = _recipient_email_addresses(merged_msg.get("toRecipients"))
+    cc_recipients = _recipient_email_addresses(merged_msg.get("ccRecipients"))
+    reply_to_recipients = _recipient_email_addresses(merged_msg.get("replyTo"))
+    sender_addr = _recipient_email_address(merged_msg.get("sender"))
+    source_envelope = _source_message_envelope(merged_msg)
     
     # Get headers if not present
     internet_message_headers = msg.get("internetMessageHeaders")
@@ -3010,7 +3094,10 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         "direction": "inbound",
         "subject": subject,
         "from": from_addr,
+        "sender": sender_addr,
         "to": to_recipients,
+        "cc": cc_recipients,
+        "replyTo": reply_to_recipients,
         "sentDateTime": sent_dt,
         "receivedDateTime": received_dt,
         "headers": {
@@ -3024,6 +3111,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             "preview": safe_preview(_full_text)
         },
         "hasAttachments": has_attachments,
+        "sourceMessage": source_envelope,
     }
     
     # Save to Firestore with retry logic for reliability
@@ -3057,7 +3145,10 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     
     # Update thread timestamp
     try:
-        thread_ref.set({"updatedAt": SERVER_TIMESTAMP}, merge=True)
+        update_payload = {"updatedAt": SERVER_TIMESTAMP}
+        if source_envelope:
+            update_payload["lastInboundEnvelope"] = source_envelope
+        thread_ref.set(update_payload, merge=True)
     except Exception as e:
         print(f"⚠️ Failed to update thread timestamp: {e}")
 
@@ -3318,7 +3409,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             "reason": "call_requested",
                             "details": "Call requested in conversation",
                             "replyToMessageId": msg_id,  # Graph API message ID for sending reply
-                            **_source_message_identity_meta(msg_id, internet_message_id),
+                            **_source_message_identity_meta(msg_id, internet_message_id, msg),
                         }
                         if phone_number:
                             meta["phoneNumber"] = phone_number
@@ -3453,7 +3544,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             "originalMessage": tour_message_text[:500],
                             "status": "pending_response",  # Not pending_approval - no row creation needed
                             "replyToMessageId": msg_id,  # Graph API message ID for sending reply
-                            **_source_message_identity_meta(msg_id, internet_message_id),
+                            **_source_message_identity_meta(msg_id, internet_message_id, msg),
                             "contactName": contact_name,  # For [NAME] replacement in frontend
                             "tourReplyClassification": tour_reply_classification,
                             "suggestedEmail": {
@@ -3517,7 +3608,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             "question": question,
                             "originalMessage": _full_text[:500],  # Include message context
                             "replyToMessageId": msg_id,  # Graph API message ID for sending reply
-                            **_source_message_identity_meta(msg_id, internet_message_id),
+                            **_source_message_identity_meta(msg_id, internet_message_id, msg),
                             "contactName": contact_name  # For [NAME] replacement in frontend
                         }
 
@@ -3849,7 +3940,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             meta={
                                 "reason": "new_property_pending_approval",
                                 "status": "pending_approval",
-                                **_source_message_identity_meta(msg_id, internet_message_id),
+                                **_source_message_identity_meta(msg_id, internet_message_id, msg),
                                 "address": address,
                                 "city": city,
                                 "link": link,
@@ -4157,7 +4248,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             meta={
                                 "reason": f"wrong_contact:{reason}",
                                 "details": details,
-                                **_source_message_identity_meta(msg_id, internet_message_id),
+                                **_source_message_identity_meta(msg_id, internet_message_id, msg),
                                 "originalContact": sender_addr_lower,
                                 "contactName": contact_name,  # For [NAME] replacement in frontend
                                 "suggestedContact": suggested_contact,
@@ -4247,7 +4338,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                                 "issue": issue,
                                 "severity": severity,
                                 "severityLabel": severity_labels.get(severity, severity),
-                                **_source_message_identity_meta(msg_id, internet_message_id),
+                                **_source_message_identity_meta(msg_id, internet_message_id, msg),
                                 "contact": sender_addr_lower,
                                 "contactName": contact_name,  # For [NAME] replacement in frontend
                                 "originalMessage": _full_text[:500],
@@ -4698,7 +4789,11 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     params = {
         "$top": str(top),
         "$orderby": "receivedDateTime asc",  # CHANGED: oldest first for proper batching
-        "$select": "id,subject,from,toRecipients,receivedDateTime,sentDateTime,conversationId,internetMessageId,internetMessageHeaders,bodyPreview,hasAttachments",
+        "$select": (
+            "id,subject,from,sender,replyTo,toRecipients,ccRecipients,"
+            "receivedDateTime,sentDateTime,conversationId,internetMessageId,"
+            "internetMessageHeaders,bodyPreview,hasAttachments"
+        ),
         "$filter": filter_str
     }
 
@@ -4967,19 +5062,29 @@ def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: di
     received_dt = msg.get("receivedDateTime")
     sent_dt = msg.get("sentDateTime")
     subject = msg.get("subject", "")
-    to_recipients = [r.get("emailAddress", {}).get("address", "") for r in msg.get("toRecipients", [])]
+    to_recipients = _recipient_email_addresses(msg.get("toRecipients"))
+    cc_recipients = _recipient_email_addresses(msg.get("ccRecipients"))
+    reply_to_recipients = _recipient_email_addresses(msg.get("replyTo"))
+    sender_addr = _recipient_email_address(msg.get("sender"))
+    source_envelope = _source_message_envelope(msg)
     has_attachments = bool(msg.get("hasAttachments"))
 
+    full_msg = {}
     # Fetch full body
     try:
         full_msg = exponential_backoff_request(
             lambda: requests.get(
                 f"https://graph.microsoft.com/v1.0/me/messages/{msg.get('id')}",
                 headers=headers,
-                params={"$select": "body,hasAttachments"},
+                params={"$select": "body,hasAttachments,sender,replyTo,ccRecipients"},
                 timeout=30
             )
         ).json() or {}
+        merged_msg = {**msg, **{k: v for k, v in full_msg.items() if k not in msg or not msg.get(k)}}
+        cc_recipients = _recipient_email_addresses(merged_msg.get("ccRecipients"))
+        reply_to_recipients = _recipient_email_addresses(merged_msg.get("replyTo"))
+        sender_addr = _recipient_email_address(merged_msg.get("sender"))
+        source_envelope = _source_message_envelope(merged_msg)
         full_body_resp = full_msg.get("body", {}) or {}
         has_attachments = bool(has_attachments or full_msg.get("hasAttachments"))
         _raw_content = full_body_resp.get("content", "") or ""
@@ -5006,7 +5111,10 @@ def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: di
         "direction": "inbound",
         "subject": subject,
         "from": from_addr,
+        "sender": sender_addr,
         "to": to_recipients,
+        "cc": cc_recipients,
+        "replyTo": reply_to_recipients,
         "sentDateTime": sent_dt,
         "receivedDateTime": received_dt,
         "headers": {
@@ -5020,6 +5128,7 @@ def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: di
             "preview": safe_preview(_full_text)
         },
         "hasAttachments": has_attachments,
+        "sourceMessage": source_envelope,
     }
 
     # Save to Firestore
@@ -5030,7 +5139,10 @@ def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: di
     # Update thread timestamp
     try:
         thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
-        thread_ref.set({"updatedAt": SERVER_TIMESTAMP}, merge=True)
+        update_payload = {"updatedAt": SERVER_TIMESTAMP}
+        if source_envelope:
+            update_payload["lastInboundEnvelope"] = source_envelope
+        thread_ref.set(update_payload, merge=True)
     except Exception:
         pass
 

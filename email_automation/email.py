@@ -494,6 +494,8 @@ def _assigned_emails_match_reply_sender(assigned_emails: List[str], reply_sender
 
 
 def _recipient_address(recipient: Dict[str, Any]) -> str:
+    if isinstance(recipient, str):
+        return recipient.strip()
     return (
         ((recipient or {}).get("emailAddress") or {}).get("address")
         or ""
@@ -501,6 +503,8 @@ def _recipient_address(recipient: Dict[str, Any]) -> str:
 
 
 def _recipient_display_name(recipient: Dict[str, Any]) -> str:
+    if not isinstance(recipient, dict):
+        return ""
     return (
         ((recipient or {}).get("emailAddress") or {}).get("name")
         or ""
@@ -653,17 +657,21 @@ def _source_message_reply_all_fallback(
     if not isinstance(source_message, dict) or not source_message:
         return draft
 
-    primary_recipients = list(source_message.get("replyTo") or [])
+    primary_recipients = list(
+        source_message.get("replyTo")
+        or source_message.get("replyToEmails")
+        or []
+    )
     if not primary_recipients:
-        for key in ("from", "sender"):
+        for key in ("from", "fromEmail", "sender", "senderEmail"):
             recipient = source_message.get(key)
             if recipient:
                 primary_recipients.append(recipient)
                 break
 
     copied_recipients = []
-    copied_recipients.extend(source_message.get("toRecipients") or [])
-    copied_recipients.extend(source_message.get("ccRecipients") or [])
+    copied_recipients.extend(source_message.get("toRecipients") or source_message.get("to") or [])
+    copied_recipients.extend(source_message.get("ccRecipients") or source_message.get("cc") or [])
 
     if not (primary_recipients or copied_recipients):
         return draft
@@ -672,6 +680,43 @@ def _source_message_reply_all_fallback(
     rebuilt["toRecipients"] = primary_recipients
     rebuilt["ccRecipients"] = copied_recipients
     print("   🧭 Rebuilt reply-all recipients from source message metadata")
+    return rebuilt
+
+
+def _reviewed_recipient_reply_all_fallback(
+    draft: Dict[str, Any],
+    *,
+    to_emails: Optional[List[str]] = None,
+    cc_emails: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Last-resort fallback when Microsoft Graph returns an empty reply-all draft
+    and source metadata is unavailable. The supplied emails are already the
+    dashboard-reviewed/current-processing recipients; normal safety filtering
+    still runs after this helper before the draft can send.
+    """
+    if not isinstance(draft, dict):
+        return {}
+    if _draft_has_recipients(draft):
+        return draft
+
+    to_recipients = [
+        _graph_recipient(email)
+        for email in (to_emails or [])
+        if isinstance(email, str) and email.strip()
+    ]
+    cc_recipients = [
+        _graph_recipient(email)
+        for email in (cc_emails or [])
+        if isinstance(email, str) and email.strip()
+    ]
+    if not (to_recipients or cc_recipients):
+        return draft
+
+    rebuilt = dict(draft)
+    rebuilt["toRecipients"] = to_recipients
+    rebuilt["ccRecipients"] = cc_recipients
+    print("   🧭 Rebuilt reply-all recipients from reviewed recipient fallback")
     return rebuilt
 
 
@@ -773,7 +818,9 @@ def _save_outbox_reply_message(
 
 def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_id: str,
                           thread_id: str, user_signature: str = None,
-                          signature_mode: str = None, user_email: str = None) -> dict:
+                          signature_mode: str = None, user_email: str = None,
+                          fallback_to_emails: Optional[List[str]] = None,
+                          fallback_cc_emails: Optional[List[str]] = None) -> dict:
     """
     Send an outbox item as a reply to an existing message in a thread.
 
@@ -835,6 +882,11 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
         reply_draft = _source_message_reply_all_fallback(
             reply_draft,
             source_metadata,
+        )
+        reply_draft = _reviewed_recipient_reply_all_fallback(
+            reply_draft,
+            to_emails=fallback_to_emails,
+            cc_emails=fallback_cc_emails,
         )
 
         recipient_result = _filter_reply_all_draft_recipients(
@@ -2408,7 +2460,9 @@ def _send_single_outbox_item(
                     res = _send_outbox_as_reply(
                         user_id, current_headers, script_content, reply_to_msg_id,
                         thread_id, user_signature=user_signature,
-                        signature_mode=signature_mode, user_email=user_email
+                        signature_mode=signature_mode, user_email=user_email,
+                        fallback_to_emails=emails,
+                        fallback_cc_emails=data.get("ccEmails") or data.get("ccRecipients") or [],
                     )
 
                     if res.get("sent"):
