@@ -780,6 +780,38 @@ def _find_existing_retry_artifact_for_message(
     return None
 
 
+def _new_property_failure_has_visible_approval(
+    user_ref,
+    *,
+    client_id: Optional[str],
+    thread_id: Optional[str],
+    reason: Any,
+) -> bool:
+    """Return true when a stale new-property failure already surfaced an approval card."""
+    if not client_id or not thread_id:
+        return False
+    if not str(reason or "").startswith("new_property_event_failed"):
+        return False
+
+    try:
+        notifications_ref = user_ref.collection("clients").document(client_id).collection("notifications")
+        docs = _query_thread_artifacts(notifications_ref, thread_id, limit=100)
+    except Exception as e:
+        print(f"⚠️ Could not scan new-property notifications during reconciliation: {e}")
+        return False
+
+    for doc in docs:
+        data = doc.to_dict() or {}
+        meta = data.get("meta") or {}
+        if data.get("kind") != "action_needed":
+            continue
+        if data.get("threadId") != thread_id:
+            continue
+        if meta.get("reason") == "new_property_pending_approval":
+            return True
+    return False
+
+
 def _mark_processing_failure_blocked_by_existing_artifact(doc, artifact: Dict[str, Any]):
     try:
         collection = artifact.get("collection") or "unknown"
@@ -877,7 +909,8 @@ def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[
     """
     result = {"checked": 0, "cleared": 0, "retained": 0}
     try:
-        failures_ref = _fs.collection("users").document(user_id).collection("processingFailures")
+        user_ref = _fs.collection("users").document(user_id)
+        failures_ref = user_ref.collection("processingFailures")
         query = failures_ref.limit(limit) if hasattr(failures_ref, "limit") else failures_ref
         docs = list(query.stream())
     except Exception as e:
@@ -890,6 +923,14 @@ def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[
             data = doc.to_dict() or {}
             message_id = data.get("messageId")
             if message_id and has_processed(user_id, message_id):
+                doc.reference.delete()
+                result["cleared"] += 1
+            elif _new_property_failure_has_visible_approval(
+                user_ref,
+                client_id=data.get("clientId"),
+                thread_id=data.get("threadId"),
+                reason=data.get("reason") or data.get("lastRetryError"),
+            ):
                 doc.reference.delete()
                 result["cleared"] += 1
             else:

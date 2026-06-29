@@ -178,6 +178,46 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         retry_doc.reference.delete.assert_not_called()
         missing_id_doc.reference.delete.assert_not_called()
 
+    def test_reconcile_new_property_failure_clears_when_approval_notification_exists(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "failure-new-property"
+        failure_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "messageId": "message-1",
+            "reason": "new_property_event_failed:'NoneType' object has no attribute 'strip'",
+            "retryable": False,
+            "recoveryStatus": "stale_manual_review",
+        }
+
+        notification_doc = MagicMock()
+        notification_doc.to_dict.return_value = {
+            "kind": "action_needed",
+            "threadId": "thread-1",
+            "meta": {"reason": "new_property_pending_approval"},
+        }
+
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        notifications_collection = MagicMock()
+        notifications_collection.where.return_value.limit.return_value.stream.return_value = [notification_doc]
+        clients_collection = MagicMock()
+        clients_collection.document.return_value.collection.return_value = notifications_collection
+
+        user_doc = MagicMock()
+        user_doc.collection.side_effect = lambda name: {
+            "processingFailures": failures_collection,
+            "clients": clients_collection,
+        }[name]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value = user_doc
+
+        with patch.object(processing, "_fs", fake_fs), patch.object(processing, "has_processed", return_value=False):
+            result = processing.reconcile_stale_processing_failures("uid-1")
+
+        self.assertEqual({"checked": 1, "cleared": 1, "retained": 0}, result)
+        failure_doc.reference.delete.assert_called_once()
+
     def test_retry_processing_failures_processes_exact_graph_message_and_clears_success(self):
         failure_doc = MagicMock()
         failure_doc.id = "thread-1__message-1"
