@@ -1441,7 +1441,8 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                         client_id_or_none: Optional[str] = None, row_number: int = None, user_signature: str = None,
                         subject_override: str = None, signature_mode: str = None, followup_config: Dict = None,
                         contact_name: str = None, user_email: str = None,
-                        thread_context: Optional[Dict[str, Any]] = None):
+                        thread_context: Optional[Dict[str, Any]] = None,
+                        allow_scheduling_language: bool = False):
     """
     Send email and immediately index it in Firestore for reply tracking.
 
@@ -1469,6 +1470,15 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
     """
     if not recipients:
         return {"sent": [], "errors": {"_all": "No recipients"}}
+
+    body_validation = validate_outbound_body(
+        script,
+        allow_scheduling_language=allow_scheduling_language,
+    )
+    if not body_validation.is_safe:
+        reason = f"{body_validation.reason}; manual review required before sending"
+        print(f"🛑 Blocked unsafe send_and_index_email body: {reason}")
+        return {"sent": [], "errors": {"_all": reason}}
 
     # CRITICAL: Check for opted-out contacts before sending
     from .processing import is_contact_opted_out
@@ -2247,7 +2257,8 @@ def _send_multi_property_email(
                                        client_id_or_none=clientId, row_number=row_number,
                                        user_signature=user_signature, subject_override=subject_override,
                                        signature_mode=signature_mode, followup_config=followup_config,
-                                       contact_name=contact_name, user_email=user_email)
+                                       contact_name=contact_name, user_email=user_email,
+                                       allow_scheduling_language=_is_tour_invite_outbox(data))
             any_errors = bool([e for e in res.get("errors", {}) if "opted out" not in str(res["errors"].get(e, ""))])
 
             if not any_errors and res["sent"]:
@@ -2625,6 +2636,7 @@ def _send_single_outbox_item(
                         signature_mode=signature_mode, followup_config=followup_config,
                         contact_name=contact_name, user_email=user_email,
                         thread_context=_thread_context_from_outbox(data),
+                        allow_scheduling_language=_is_tour_invite_outbox(data),
                     )
                     all_sent.extend(res.get("sent", []))
                     all_errors.update(res.get("errors", {}))
@@ -2685,7 +2697,8 @@ def _send_single_outbox_item(
                                            user_signature=user_signature, subject_override=subject_override,
                                            signature_mode=signature_mode, followup_config=followup_config,
                                            contact_name=contact_name, user_email=user_email,
-                                           thread_context=_thread_context_from_outbox(data))
+                                           thread_context=_thread_context_from_outbox(data),
+                                           allow_scheduling_language=_is_tour_invite_outbox(data))
 
                 all_sent.extend(res.get("sent", []))
                 all_errors.update(res.get("errors", {}))

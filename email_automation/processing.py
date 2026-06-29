@@ -39,6 +39,7 @@ from .tour_scheduling import (
     parse_tour_time_minutes,
     tour_date_from_thread_data,
 )
+from .outbound_safety import validate_outbound_body
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
                    format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff)
@@ -2473,6 +2474,12 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
     send_reply_in_thread.last_subject = None
     send_reply_in_thread.last_conversation_id = None
     send_reply_in_thread.last_send_attempt_at = None
+    body_validation = validate_outbound_body(body)
+    if not body_validation.is_safe:
+        send_reply_in_thread.last_error = f"{body_validation.reason}; manual review required before auto-reply"
+        send_reply_in_thread.last_outcome = "blocked_unsafe_body"
+        print(f"   🛑 Blocked unsafe auto-reply body: {body_validation.reason}")
+        return False
     try:
         from .utils import (
             GRAPH_SEND_MAX_RETRIES,

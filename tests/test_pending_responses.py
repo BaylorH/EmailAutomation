@@ -7,7 +7,7 @@ from unittest.mock import patch
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
+    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
 )
 
 from email_automation import pending_responses
@@ -134,6 +134,37 @@ class PendingResponsesTests(unittest.TestCase):
         retry_payload = active_doc.reference.update_calls[-1]
         self.assertEqual(retry_payload["attempts"], 2)
         self.assertEqual(retry_payload["lastError"], "HTTP 429 rate limited after 3 attempts")
+
+    def test_unsafe_pending_response_moves_to_dead_letter_without_sending(self):
+        active_doc = FakeDoc("thread-active", {
+            "threadId": "thread-active",
+            "msgId": "message-2",
+            "recipient": "bp21harrison@gmail.com",
+            "responseBody": "Hi [NAME],\n\nCan you confirm the availability?",
+            "clientId": "client-1",
+            "attempts": 0,
+        })
+        fake_fs = FakeFirestore([active_doc])
+
+        def fake_send_reply_in_thread(**_kwargs):
+            raise AssertionError("unsafe pending response should stop before Graph send")
+
+        with patch.dict(sys.modules, {
+            "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
+            "email_automation.processing": types.SimpleNamespace(
+                send_reply_in_thread=fake_send_reply_in_thread,
+            ),
+        }):
+            sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
+
+        self.assertEqual(sent, 0)
+        self.assertTrue(active_doc.reference.deleted)
+        self.assertEqual([], active_doc.reference.update_calls)
+        dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
+        self.assertEqual(dead_letter["source"], "pendingResponses")
+        self.assertEqual(dead_letter["originalDocId"], "thread-active")
+        self.assertIn("Unresolved outbound placeholder", dead_letter["failureReason"])
+        self.assertIn("manual review", dead_letter["failureReason"])
 
     def test_sent_but_unindexed_retry_moves_to_reconciliation_without_resending(self):
         active_doc = FakeDoc("thread-active", {

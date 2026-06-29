@@ -15,6 +15,7 @@ from .sent_mail_guard import (
     find_matching_sent_message_for_retry,
     sent_after_from_retry_data,
 )
+from .outbound_safety import validate_outbound_body
 
 # Maximum retry attempts before giving up
 MAX_RESPONSE_ATTEMPTS = 5
@@ -199,6 +200,17 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> int:
         print(f"  → Retrying response to {recipient} (attempt {attempts + 1}/{MAX_RESPONSE_ATTEMPTS})")
 
         try:
+            body_validation = validate_outbound_body(response_body)
+            if not body_validation.is_safe:
+                _move_pending_response_to_dead_letter(
+                    user_id,
+                    doc,
+                    data,
+                    f"{body_validation.reason}; manual review required before retry",
+                )
+                print("    🛑 Unsafe pending response body moved to manual review before retry")
+                continue
+
             if attempts > 0 or data.get("lastError"):
                 try:
                     sent_match = find_matching_sent_message_for_retry(
