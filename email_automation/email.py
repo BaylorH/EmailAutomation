@@ -27,6 +27,11 @@ from .sent_mail_guard import (
     send_result_from_sent_match,
     sent_after_from_retry_data,
 )
+from .results_feature_gate import (
+    RESULTS_FEATURE_PAUSED_REASON,
+    is_tour_invite_outbox,
+    should_pause_results_outbox_for_user,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,12 +189,18 @@ def _send_identity_payload(send_result: Optional[Dict[str, Any]], recipients: Op
 
 
 def _is_tour_invite_outbox(data: Optional[Dict[str, Any]] = None) -> bool:
-    data = data or {}
-    return bool(
-        str(data.get("actionType") or "").strip().lower() == "tour_invite"
-        or isinstance(data.get("tourInvite"), dict)
-        or str(data.get("source") or "").strip().lower() == "dashboard_tour_planner"
-    )
+    return is_tour_invite_outbox(data)
+
+
+def _should_pause_results_outbox_for_user(user_id: Optional[str], data: Optional[Dict[str, Any]] = None) -> bool:
+    return should_pause_results_outbox_for_user(user_id, data)
+
+
+def _pause_results_outbox_item_if_needed(user_id: str, doc_ref, data: dict) -> bool:
+    if not _should_pause_results_outbox_for_user(user_id, data):
+        return False
+    _move_to_dead_letter(user_id, doc_ref, data, RESULTS_FEATURE_PAUSED_REASON)
+    return True
 
 
 def _mark_tour_invite_thread_sent(
@@ -2327,6 +2338,10 @@ def _send_single_outbox_item(
         data = fresh_data
 
     if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id):
+        return
+
+    if _pause_results_outbox_item_if_needed(user_id, d.reference, data):
+        print(f"   ⏸️ Paused Results/Tour outbox item {d.id} for non-admin user {user_id}")
         return
 
     emails = data.get("assignedEmails") or []
