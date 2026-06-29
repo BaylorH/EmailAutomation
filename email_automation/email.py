@@ -895,6 +895,25 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
             user_email=user_email,
         )
         recipient_payload = recipient_result["payload"]
+        if (
+            not (recipient_payload["toRecipients"] or recipient_payload["ccRecipients"])
+            and (fallback_to_emails or fallback_cc_emails)
+        ):
+            reviewed_reply_draft = dict(reply_draft)
+            reviewed_reply_draft["toRecipients"] = []
+            reviewed_reply_draft["ccRecipients"] = []
+            reviewed_reply_draft = _reviewed_recipient_reply_all_fallback(
+                reviewed_reply_draft,
+                to_emails=fallback_to_emails,
+                cc_emails=fallback_cc_emails,
+            )
+            recipient_result = _filter_reply_all_draft_recipients(
+                user_id,
+                reviewed_reply_draft,
+                user_email=user_email,
+            )
+            recipient_payload = recipient_result["payload"]
+
         if not (recipient_payload["toRecipients"] or recipient_payload["ccRecipients"]):
             error_msg = "Reply-all draft has no safe recipients after filtering"
             print(f"   ❌ {error_msg}")
