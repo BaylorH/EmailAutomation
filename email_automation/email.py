@@ -236,7 +236,12 @@ def _fetch_graph_message_metadata(headers: dict, message_id: str, base: str) -> 
             lambda: requests.get(
                 f"{base}/me/messages/{message_id}",
                 headers=headers,
-                params={"$select": "conversationId,subject"},
+                params={
+                    "$select": (
+                        "conversationId,subject,from,sender,replyTo,"
+                        "toRecipients,ccRecipients"
+                    )
+                },
                 timeout=30,
             )
         )
@@ -628,6 +633,48 @@ def _hydrate_reply_all_draft_recipients(
         return draft
 
 
+def _draft_has_recipients(draft: Dict[str, Any]) -> bool:
+    return bool((draft or {}).get("toRecipients") or (draft or {}).get("ccRecipients"))
+
+
+def _source_message_reply_all_fallback(
+    draft: Dict[str, Any],
+    source_message: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Rebuild a reply-all audience from the source message when Graph creates an
+    empty draft. Safety filtering still happens afterward, so operator,
+    duplicate, invalid, and opted-out recipients are removed before send.
+    """
+    if not isinstance(draft, dict):
+        return {}
+    if _draft_has_recipients(draft):
+        return draft
+    if not isinstance(source_message, dict) or not source_message:
+        return draft
+
+    primary_recipients = list(source_message.get("replyTo") or [])
+    if not primary_recipients:
+        for key in ("from", "sender"):
+            recipient = source_message.get(key)
+            if recipient:
+                primary_recipients.append(recipient)
+                break
+
+    copied_recipients = []
+    copied_recipients.extend(source_message.get("toRecipients") or [])
+    copied_recipients.extend(source_message.get("ccRecipients") or [])
+
+    if not (primary_recipients or copied_recipients):
+        return draft
+
+    rebuilt = dict(draft)
+    rebuilt["toRecipients"] = primary_recipients
+    rebuilt["ccRecipients"] = copied_recipients
+    print("   🧭 Rebuilt reply-all recipients from source message metadata")
+    return rebuilt
+
+
 def _delete_graph_reply_draft(
     headers: Dict[str, str],
     draft_id: Optional[str],
@@ -784,6 +831,10 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
             headers,
             reply_draft,
             base=base,
+        )
+        reply_draft = _source_message_reply_all_fallback(
+            reply_draft,
+            source_metadata,
         )
 
         recipient_result = _filter_reply_all_draft_recipients(

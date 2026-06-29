@@ -307,6 +307,106 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
         )
         self.assertEqual(saved_messages[0][3]["cc"], ["baylor@manifoldengineering.ai"])
 
+    def test_auto_thread_reply_rebuilds_reply_all_from_source_when_draft_stays_empty(self):
+        posts = []
+        gets = []
+        patch_payloads = []
+        saved_messages = []
+
+        def fake_retry(func, **_kwargs):
+            return func()
+
+        def fake_post(url, **_kwargs):
+            posts.append(url)
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {"id": "auto-reply-draft-1"})
+            if url.endswith("/auto-reply-draft-1/send"):
+                return FakeResponse(202)
+            return FakeResponse(500)
+
+        def fake_get(url, **_kwargs):
+            gets.append(url)
+            if url.endswith("/me/messages/msg-1"):
+                return FakeResponse(200, {
+                    "conversationId": "conv-1",
+                    "subject": "RE: 101 Launch Complete Way",
+                    "from": {
+                        "emailAddress": {
+                            "name": "Avery",
+                            "address": "bp21harrison@gmail.com",
+                        }
+                    },
+                    "toRecipients": [
+                        {"emailAddress": {"address": "baylor.freelance@outlook.com"}},
+                    ],
+                    "ccRecipients": [
+                        {"emailAddress": {"address": "baylor@manifoldengineering.ai"}},
+                    ],
+                })
+            if url.endswith("/me/messages/auto-reply-draft-1"):
+                return FakeResponse(200, {
+                    "id": "auto-reply-draft-1",
+                    "toRecipients": [],
+                    "ccRecipients": [],
+                })
+            return FakeResponse(404)
+
+        def fake_patch(_url, **kwargs):
+            patch_payloads.append(kwargs.get("json") or {})
+            return FakeResponse(200)
+
+        sent_message = {
+            "id": "sent-1",
+            "internetMessageId": "<sent-1@example.com>",
+            "conversationId": "conv-1",
+            "subject": "RE: 101 Launch Complete Way",
+            "sentDateTime": "2026-06-28T16:00:00Z",
+            "toRecipients": [
+                {"emailAddress": {"address": "bp21harrison@gmail.com"}},
+            ],
+            "ccRecipients": [],
+            "body": {"contentType": "HTML", "content": "Thanks"},
+            "bodyPreview": "Thanks",
+        }
+
+        def fake_optout(_user_id, email):
+            if email.lower() == "baylor@manifoldengineering.ai":
+                return {"reason": "temporary proof opt-out"}
+            return None
+
+        with patch("email_automation.utils.exponential_backoff_request", side_effect=fake_retry), \
+                patch("email_automation.clients._fs", FakeFirestore()), \
+                patch.object(processing.requests, "get", side_effect=fake_get), \
+                patch.object(processing.requests, "post", side_effect=fake_post), \
+                patch.object(processing.requests, "patch", side_effect=fake_patch), \
+                patch.object(processing.time, "sleep", return_value=None), \
+                patch.object(processing, "_find_recent_sent_message_for_conversation", return_value=sent_message), \
+                patch("email_automation.messaging.index_message_id", return_value=True), \
+                patch("email_automation.messaging.lookup_thread_by_message_id", return_value="thread-1"), \
+                patch("email_automation.messaging.index_conversation_id", return_value=True), \
+                patch("email_automation.messaging.save_message", side_effect=lambda *_args: saved_messages.append(_args)), \
+                patch("email_automation.processing.is_contact_opted_out", side_effect=fake_optout):
+            sent = processing.send_reply_in_thread(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "Hi Broker,\n\nThanks.",
+                "msg-1",
+                "bp21harrison@gmail.com",
+                "thread-1",
+            )
+
+        self.assertTrue(sent)
+        self.assertTrue(any(url.endswith("/createReplyAll") for url in posts))
+        self.assertTrue(any(url.endswith("/me/messages/msg-1") for url in gets))
+        self.assertTrue(any(url.endswith("/me/messages/auto-reply-draft-1") for url in gets))
+        patch_payload = patch_payloads[0]
+        self.assertEqual(
+            [r["emailAddress"]["address"] for r in patch_payload["toRecipients"]],
+            ["bp21harrison@gmail.com"],
+        )
+        self.assertEqual(patch_payload["ccRecipients"], [])
+        self.assertEqual(saved_messages[0][3]["cc"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

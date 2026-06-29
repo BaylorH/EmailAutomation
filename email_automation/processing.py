@@ -2414,19 +2414,26 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             _delete_graph_reply_draft,
             _filter_reply_all_draft_recipients,
             _hydrate_reply_all_draft_recipients,
+            _source_message_reply_all_fallback,
         )
         from datetime import datetime, timezone
         import requests
         import time
 
         base = "https://graph.microsoft.com/v1.0"
+        current_meta = {}
 
         try:
             current_meta_resp = exponential_backoff_request(
                 lambda: requests.get(
                     f"{base}/me/messages/{current_msg_id}",
                     headers=headers,
-                    params={"$select": "conversationId,subject"},
+                    params={
+                        "$select": (
+                            "conversationId,subject,from,sender,replyTo,"
+                            "toRecipients,ccRecipients"
+                        )
+                    },
                     timeout=30,
                 )
             )
@@ -2483,6 +2490,10 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             headers,
             reply_draft,
             base=base,
+        )
+        reply_draft = _source_message_reply_all_fallback(
+            reply_draft,
+            current_meta,
         )
 
         recipient_result = _filter_reply_all_draft_recipients(
