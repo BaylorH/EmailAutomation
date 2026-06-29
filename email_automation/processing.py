@@ -60,6 +60,7 @@ from .property_images import (
     build_property_image_sheet_updates,
     select_property_image_candidate,
 )
+from .campaign_safety import get_client_automation_pause, stopped_followup_patch
 
 logger = logging.getLogger(__name__)
 
@@ -3057,11 +3058,31 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     except Exception as e:
         print(f"⚠️ Could not fetch thread status data: {e}")
 
+    thread_status = thread_data.get("status") or get_thread_status(user_id, thread_id)
+    client_paused, client_pause_reason, _client_data = get_client_automation_pause(
+        user_id,
+        thread_data.get("clientId"),
+    )
+    if client_paused:
+        try:
+            thread_ref.update(stopped_followup_patch(client_pause_reason))
+        except Exception as e:
+            print(f"⚠️ Could not mark paused client thread stopped: {e}")
+        thread_data.update({
+            "status": THREAD_STATUS["stopped"],
+            "followUpStatus": "stopped",
+            "statusReason": client_pause_reason,
+        })
+        thread_status = THREAD_STATUS["stopped"]
+        print(
+            f"⏹️ Client automation is paused/stopped for thread {thread_id[:20]}...; "
+            "saving inbound message for history only"
+        )
+
     # Terminal threads keep late replies for history but must not generate new AI work or auto-replies,
     # except when the user approved a same-contact replacement property in this email thread.
-    thread_status = thread_data.get("status") or get_thread_status(user_id, thread_id)
     replacement_context = _active_replacement_context(thread_data, _full_text)
-    if replacement_context and thread_status == THREAD_STATUS["stopped"]:
+    if replacement_context and thread_status == THREAD_STATUS["stopped"] and not client_paused:
         replacement_subject = replacement_context["address"]
         if replacement_context.get("city"):
             replacement_subject = f"{replacement_subject}, {replacement_context['city']}"

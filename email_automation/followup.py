@@ -35,6 +35,8 @@ from .sent_mail_guard import (
     find_matching_sent_message_for_retry,
     sent_after_from_retry_data,
 )
+from .campaign_safety import get_client_automation_pause, stopped_followup_patch
+from .outbound_safety import validate_outbound_body
 
 # Claim timeout for follow-up processing (prevent duplicate sends)
 FOLLOWUP_CLAIM_TIMEOUT_SECONDS = 60
@@ -259,6 +261,21 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
         thread_data = thread_doc.to_dict()
         thread_id = thread_doc.id
 
+        client_paused, client_pause_reason, _client_data = get_client_automation_pause(
+            user_id,
+            thread_data.get("clientId"),
+        )
+        if client_paused:
+            print(
+                f"   ⏹️ Thread {thread_id[:20]}... belongs to paused/stopped client; "
+                "stopping follow-up tracking"
+            )
+            try:
+                thread_doc.reference.update(stopped_followup_patch(client_pause_reason))
+            except Exception as e:
+                print(f"   ⚠️ Failed to stop follow-up for paused/stopped client: {e}")
+            continue
+
         followup_config = thread_data.get("followUpConfig", {})
 
         if not followup_config.get("enabled", False):
@@ -472,6 +489,15 @@ def _send_followup_email(
         if contact_name and "[NAME]" in followup_message:
             first_name = contact_name.split()[0] if contact_name else ""
             followup_message = followup_message.replace("[NAME]", first_name)
+
+        body_validation = validate_outbound_body(followup_message)
+        if not body_validation.is_safe:
+            _send_followup_email.last_error = (
+                f"{body_validation.reason}; manual review required before sending follow-up"
+            )
+            _send_followup_email.guard_failed_closed = True
+            print(f"   🛑 {_send_followup_email.last_error}")
+            return False
 
         # Get user's signature settings
         user_doc = _fs.collection("users").document(user_id).get()

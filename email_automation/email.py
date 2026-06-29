@@ -32,6 +32,8 @@ from .results_feature_gate import (
     is_tour_invite_outbox,
     should_pause_results_outbox_for_user,
 )
+from .campaign_safety import get_client_automation_pause
+from .outbound_safety import validate_outbound_body
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +202,38 @@ def _pause_results_outbox_item_if_needed(user_id: str, doc_ref, data: dict) -> b
     if not _should_pause_results_outbox_for_user(user_id, data):
         return False
     _move_to_dead_letter(user_id, doc_ref, data, RESULTS_FEATURE_PAUSED_REASON)
+    return True
+
+
+def _pause_client_outbox_item_if_needed(user_id: str, doc_ref, data: dict) -> bool:
+    client_id = (data.get("clientId") or "").strip()
+    paused, reason, _client_data = get_client_automation_pause(user_id, client_id)
+    if not paused:
+        return False
+    _move_to_dead_letter(
+        user_id,
+        doc_ref,
+        data,
+        f"Client automation is paused/stopped; manual review required before sending: {reason}",
+    )
+    return True
+
+
+def _dead_letter_unsafe_outbound_body_if_needed(
+    user_id: str,
+    doc_ref,
+    data: dict,
+    body: str,
+) -> bool:
+    validation = validate_outbound_body(body)
+    if validation.is_safe:
+        return False
+    _move_to_dead_letter(
+        user_id,
+        doc_ref,
+        data,
+        f"{validation.reason}; manual review required before sending",
+    )
     return True
 
 
@@ -2123,6 +2157,10 @@ def _send_multi_property_email(
         attempts = int(data.get("attempts") or 0)
         row_number = data.get("rowNumber") or prop.get('rowNumber')
 
+        if _pause_client_outbox_item_if_needed(user_id, item['doc'].reference, data):
+            print(f"   ⏸️ Moved outbox item for paused/stopped client {clientId or 'n/a'} to dead letter")
+            continue
+
         # DUPLICATE CHECK: Skip if we've already sent to this recipient about this property
         property_address = prop.get('subject') or prop.get('name') or ''
         if _has_existing_thread_for_property(user_id, recipient_email, property_address, client_id=clientId):
@@ -2140,6 +2178,9 @@ def _send_multi_property_email(
 
         # Use the original approved script without modification
         script = data.get("script", prop['script'])
+        if _dead_letter_unsafe_outbound_body_if_needed(user_id, item['doc'].reference, data, script):
+            print(f"   🛑 Blocked unsafe outbound body for {recipient_email}; manual review required")
+            continue
 
         print(f"  → Property {idx + 1}/{len(properties)}: {prop['name'] or 'Unknown'} (attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
 
@@ -2346,6 +2387,10 @@ def _send_single_outbox_item(
 
     emails = data.get("assignedEmails") or []
     clientId = (data.get("clientId") or "").strip()
+    if _pause_client_outbox_item_if_needed(user_id, d.reference, data):
+        print(f"   ⏸️ Moved outbox item {d.id} for paused/stopped client {clientId or 'n/a'} to dead letter")
+        return
+
     attempts = int(data.get("attempts") or 0)
     row_number = data.get("rowNumber")
     thread_id = data.get("threadId")
@@ -2452,6 +2497,9 @@ def _send_single_outbox_item(
     if is_thread_reply:
         # For replies, use the script directly (already personalized by frontend)
         script_content = email_scripts[0] if email_scripts else ""
+        if _dead_letter_unsafe_outbound_body_if_needed(user_id, d.reference, data, script_content):
+            print(f"   🛑 Blocked unsafe dashboard reply body in outbox item {d.id}; manual review required")
+            return
         current_headers = _fresh_graph_headers(headers, headers_provider)
         reply_sender = _get_reply_message_sender(current_headers, reply_to_msg_id)
         use_graph_reply = _assigned_emails_match_reply_sender(emails, reply_sender)
@@ -2592,6 +2640,10 @@ def _send_single_outbox_item(
                 selected_script = _select_script_for_recipient(
                     user_id, recipient_email, email_scripts, contact_name=contact_name
                 )
+
+            if _dead_letter_unsafe_outbound_body_if_needed(user_id, d.reference, data, selected_script):
+                print(f"   🛑 Blocked unsafe outbound body for {recipient_email}; manual review required")
+                return
 
             try:
                 current_headers = _fresh_graph_headers(headers, headers_provider)

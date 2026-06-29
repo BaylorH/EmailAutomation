@@ -259,6 +259,41 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertNotIn("Jill Ames", captured_signature["html"])
         self.assertNotIn("jill.ames@mohrpartners.com", captured_signature["html"])
 
+    def test_paused_client_outbox_item_moves_to_dead_letter_before_send(self):
+        doc_ref = FakeDocRef("paused-outbox")
+        data = {"clientId": "client-1", "script": "Hi Avery"}
+
+        with patch.object(
+            email_module,
+            "get_client_automation_pause",
+            return_value=(True, "admin_incident_pause", {"automationPaused": True}),
+        ), patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter:
+            blocked = email_module._pause_client_outbox_item_if_needed(
+                "uid-1",
+                doc_ref,
+                data,
+            )
+
+        self.assertTrue(blocked)
+        move_to_dead_letter.assert_called_once()
+        self.assertIn("paused/stopped", move_to_dead_letter.call_args.args[3])
+
+    def test_unresolved_name_placeholder_outbox_item_moves_to_dead_letter_before_send(self):
+        doc_ref = FakeDocRef("unsafe-outbox")
+        data = {"clientId": "client-1", "script": "Hi [NAME],\n\nCould you confirm?"}
+
+        with patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter:
+            blocked = email_module._dead_letter_unsafe_outbound_body_if_needed(
+                "uid-1",
+                doc_ref,
+                data,
+                data["script"],
+            )
+
+        self.assertTrue(blocked)
+        move_to_dead_letter.assert_called_once()
+        self.assertIn("[NAME]", move_to_dead_letter.call_args.args[3])
+
     def test_tour_planner_outbox_uses_reviewed_body_even_for_existing_contact(self):
         reviewed_body = (
             "Property: 555 Geocoded Map Dr\n"
@@ -287,7 +322,7 @@ class OutboxSafetyTests(unittest.TestCase):
              }) as send_and_index_email, \
              patch.object(email_module, "_finalize_successful_outbox_item"):
             email_module._send_single_outbox_item(
-                "uid-1",
+                "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
                 {"Authorization": "Bearer token"},
                 {"doc": doc, "data": doc.to_dict()},
             )
@@ -324,7 +359,7 @@ class OutboxSafetyTests(unittest.TestCase):
              }) as send_and_index_email, \
              patch.object(email_module, "_finalize_successful_outbox_item"):
             email_module._send_single_outbox_item(
-                "uid-1",
+                "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
                 {"Authorization": "Bearer token"},
                 {"doc": doc, "data": doc.to_dict()},
             )
