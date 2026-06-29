@@ -581,6 +581,83 @@ def _filter_reply_all_draft_recipients(
     }
 
 
+def _hydrate_reply_all_draft_recipients(
+    headers: Dict[str, str],
+    draft: Dict[str, Any],
+    *,
+    base: str = "https://graph.microsoft.com/v1.0",
+) -> Dict[str, Any]:
+    """
+    Microsoft Graph may return only the draft id from createReplyAll even though
+    the saved draft has the computed To/CC audience. Fetch the draft before
+    applying SiteSift's safety filter so a sparse response does not strand the
+    outbox item as retrying.
+    """
+    if not isinstance(draft, dict):
+        return {}
+    if draft.get("toRecipients") or draft.get("ccRecipients"):
+        return draft
+
+    draft_id = draft.get("id")
+    if not draft_id:
+        return draft
+
+    try:
+        fetched_resp = exponential_backoff_request(
+            lambda: requests.get(
+                f"{base}/me/messages/{draft_id}",
+                headers=headers,
+                params={"$select": "id,toRecipients,ccRecipients"},
+                timeout=30,
+            ),
+            max_retries=GRAPH_SEND_MAX_RETRIES,
+        )
+        if not fetched_resp or fetched_resp.status_code != 200:
+            print(
+                "   ⚠️ Could not fetch reply-all draft recipients: "
+                f"{fetched_resp.status_code if fetched_resp else 'None'}"
+            )
+            return draft
+        fetched = fetched_resp.json() or {}
+        hydrated = dict(draft)
+        hydrated["toRecipients"] = fetched.get("toRecipients") or []
+        hydrated["ccRecipients"] = fetched.get("ccRecipients") or []
+        return hydrated
+    except Exception as exc:
+        print(f"   ⚠️ Could not fetch reply-all draft recipients: {exc}")
+        return draft
+
+
+def _delete_graph_reply_draft(
+    headers: Dict[str, str],
+    draft_id: Optional[str],
+    *,
+    base: str = "https://graph.microsoft.com/v1.0",
+) -> bool:
+    """Best-effort cleanup for createReplyAll drafts that are abandoned pre-send."""
+    if not draft_id:
+        return False
+    try:
+        delete_resp = exponential_backoff_request(
+            lambda: requests.delete(
+                f"{base}/me/messages/{draft_id}",
+                headers=headers,
+                timeout=30,
+            ),
+            max_retries=1,
+        )
+        if delete_resp and delete_resp.status_code in {200, 202, 204}:
+            print(f"   🧹 Deleted abandoned reply-all draft {draft_id}")
+            return True
+        print(
+            "   ⚠️ Could not delete abandoned reply-all draft "
+            f"{draft_id}: {delete_resp.status_code if delete_resp else 'None'}"
+        )
+    except Exception as exc:
+        print(f"   ⚠️ Could not delete abandoned reply-all draft {draft_id}: {exc}")
+    return False
+
+
 def _get_thread_row_number(user_id: str, thread_id: str) -> Optional[int]:
     """Return the stored Sheet row number for a known thread, if present."""
     if not thread_id:
@@ -703,6 +780,12 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
             print(f"   ❌ {error_msg}")
             return {"sent": False, "error": error_msg}
 
+        reply_draft = _hydrate_reply_all_draft_recipients(
+            headers,
+            reply_draft,
+            base=base,
+        )
+
         recipient_result = _filter_reply_all_draft_recipients(
             user_id,
             reply_draft,
@@ -712,6 +795,7 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
         if not (recipient_payload["toRecipients"] or recipient_payload["ccRecipients"]):
             error_msg = "Reply-all draft has no safe recipients after filtering"
             print(f"   ❌ {error_msg}")
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
             return {
                 "sent": False,
                 "error": error_msg,

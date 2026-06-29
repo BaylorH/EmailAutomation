@@ -154,6 +154,70 @@ class GraphRetryPolicyTests(unittest.TestCase):
             ["baylor@manifoldengineering.ai"],
         )
 
+    def test_dashboard_thread_reply_fetches_created_draft_when_graph_omits_recipients(self):
+        posts = []
+        gets = []
+        patch_payloads = []
+
+        def fake_retry(func, **_kwargs):
+            return func()
+
+        def fake_post(url, **_kwargs):
+            posts.append(url)
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {"id": "reply-draft-1"})
+            if url.endswith("/reply-draft-1/send"):
+                return FakeResponse(202)
+            return FakeResponse(500, text=f"Unexpected POST {url}")
+
+        def fake_get(url, **_kwargs):
+            gets.append(url)
+            if url.endswith("/reply-draft-1"):
+                return FakeResponse(200, {
+                    "id": "reply-draft-1",
+                    "toRecipients": [
+                        {"emailAddress": {"address": "bp21harrison@gmail.com"}},
+                    ],
+                    "ccRecipients": [
+                        {"emailAddress": {"address": "baylor@manifoldengineering.ai"}},
+                        {"emailAddress": {"address": "baylor.freelance@outlook.com"}},
+                    ],
+                })
+            return FakeResponse(404, text=f"Unexpected GET {url}")
+
+        def fake_patch(_url, **kwargs):
+            patch_payloads.append(kwargs.get("json") or {})
+            return FakeResponse(200)
+
+        with patch.object(email_module, "exponential_backoff_request", side_effect=fake_retry), \
+             patch.object(email_module, "_fetch_graph_message_metadata", return_value={"conversationId": "conv-1"}), \
+             patch.object(email_module, "_find_recent_sent_reply_identity", return_value={"sentMessageId": "sent-1"}), \
+             patch.object(email_module.requests, "post", side_effect=fake_post), \
+             patch.object(email_module.requests, "get", side_effect=fake_get), \
+             patch.object(email_module.requests, "patch", side_effect=fake_patch), \
+             patch("email_automation.processing.is_contact_opted_out", return_value=None):
+            result = email_module._send_outbox_as_reply(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "Hi Broker,\n\nThanks.",
+                "reply-message-1",
+                "thread-1",
+                user_email="baylor.freelance@outlook.com",
+            )
+
+        self.assertTrue(result["sent"])
+        self.assertTrue(any(url.endswith("/createReplyAll") for url in posts))
+        self.assertTrue(any(url.endswith("/reply-draft-1") for url in gets))
+        patch_payload = patch_payloads[0]
+        self.assertEqual(
+            [r["emailAddress"]["address"] for r in patch_payload["toRecipients"]],
+            ["bp21harrison@gmail.com"],
+        )
+        self.assertEqual(
+            [r["emailAddress"]["address"] for r in patch_payload["ccRecipients"]],
+            ["baylor@manifoldengineering.ai"],
+        )
+
     def test_dashboard_thread_reply_filters_opted_out_cc_before_send(self):
         patch_payloads = []
 
@@ -206,6 +270,51 @@ class GraphRetryPolicyTests(unittest.TestCase):
             ["bp21harrison@gmail.com"],
         )
         self.assertEqual(patch_payload["ccRecipients"], [])
+
+    def test_dashboard_thread_reply_deletes_created_draft_when_all_recipients_filtered(self):
+        deleted_urls = []
+
+        def fake_retry(func, **_kwargs):
+            return func()
+
+        def fake_post(url, **_kwargs):
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "reply-draft-1",
+                    "toRecipients": [
+                        {"emailAddress": {"address": "baylor.freelance@outlook.com"}},
+                    ],
+                    "ccRecipients": [
+                        {"emailAddress": {"address": "baylor@manifoldengineering.ai"}},
+                    ],
+                })
+            return FakeResponse(500, text=f"Unexpected POST {url}")
+
+        def fake_delete(url, **_kwargs):
+            deleted_urls.append(url)
+            return FakeResponse(204)
+
+        def fake_optout(_user_id, email):
+            if email.lower() == "baylor@manifoldengineering.ai":
+                return {"reason": "unsubscribe"}
+            return None
+
+        with patch.object(email_module, "exponential_backoff_request", side_effect=fake_retry), \
+             patch.object(email_module.requests, "post", side_effect=fake_post), \
+             patch.object(email_module.requests, "delete", side_effect=fake_delete), \
+             patch("email_automation.processing.is_contact_opted_out", side_effect=fake_optout):
+            result = email_module._send_outbox_as_reply(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "Hi Broker,\n\nThanks.",
+                "reply-message-1",
+                "thread-1",
+                user_email="baylor.freelance@outlook.com",
+            )
+
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["error"], "Reply-all draft has no safe recipients after filtering")
+        self.assertTrue(any(url.endswith("/reply-draft-1") for url in deleted_urls))
 
     def test_sent_items_retry_guard_matches_recipient_subject_body_after_cutoff(self):
         messages = [

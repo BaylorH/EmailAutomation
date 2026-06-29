@@ -2410,7 +2410,11 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         )
         from .messaging import save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
         from .clients import _fs
-        from .email import _filter_reply_all_draft_recipients
+        from .email import (
+            _delete_graph_reply_draft,
+            _filter_reply_all_draft_recipients,
+            _hydrate_reply_all_draft_recipients,
+        )
         from datetime import datetime, timezone
         import requests
         import time
@@ -2475,6 +2479,12 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             print("   ❌ createReplyAll returned no draft id")
             return False
 
+        reply_draft = _hydrate_reply_all_draft_recipients(
+            headers,
+            reply_draft,
+            base=base,
+        )
+
         recipient_result = _filter_reply_all_draft_recipients(
             user_id,
             reply_draft,
@@ -2485,6 +2495,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             send_reply_in_thread.last_error = "No safe reply-all recipients remained after filtering"
             send_reply_in_thread.last_outcome = "send_failed"
             print("   ❌ No safe reply-all recipients remained after filtering")
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
             return False
 
         patch_payload = {
