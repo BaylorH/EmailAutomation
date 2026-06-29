@@ -12,14 +12,25 @@ from email_automation import system_health
 
 
 class FakeCollection:
-    def __init__(self, count):
+    def __init__(self, count=0, docs=None):
         self.count = count
+        self.docs = docs
 
     def limit(self, count):
         return self
 
     def stream(self):
+        if self.docs is not None:
+            return self.docs
         return [object() for _ in range(self.count)]
+
+
+class FakeHealthDoc:
+    def __init__(self, data):
+        self._data = dict(data)
+
+    def to_dict(self):
+        return dict(self._data)
 
 
 class FakeDocRef:
@@ -28,6 +39,8 @@ class FakeDocRef:
         self.path = tuple(path)
 
     def collection(self, name):
+        if name in self.root.docs_by_collection:
+            return FakeCollection(docs=self.root.docs_by_collection[name])
         if name in self.root.counts:
             return FakeCollection(self.root.counts[name])
         return FakeNode(self.root, list(self.path) + ["collection", name])
@@ -43,6 +56,8 @@ class FakeNode:
 
     def collection(self, name):
         key = name
+        if key in self.root.docs_by_collection:
+            return FakeCollection(docs=self.root.docs_by_collection[key])
         if key in self.root.counts:
             return FakeCollection(self.root.counts[key])
         return FakeNode(self.root, self.path + ["collection", name])
@@ -52,8 +67,9 @@ class FakeNode:
 
 
 class FakeFirestore:
-    def __init__(self, counts):
+    def __init__(self, counts, docs_by_collection=None):
         self.counts = counts
+        self.docs_by_collection = docs_by_collection or {}
         self.set_calls = []
 
     def collection(self, name):
@@ -84,6 +100,32 @@ class SystemHealthTests(unittest.TestCase):
         self.assertEqual(3, payload["queues"]["processingFailures"])
         self.assertEqual("healthy", payload["token"]["status"])
         self.assertEqual("healthy", payload["graph"]["status"])
+
+    def test_collect_user_health_ignores_resolved_dead_letters(self):
+        fs = FakeFirestore(
+            {
+                "outbox": 0,
+                "pendingResponses": 0,
+                "processingFailures": 0,
+            },
+            docs_by_collection={
+                "deadLetterQueue": [
+                    FakeHealthDoc({"status": "requeued", "recoveryStatus": "requeued"}),
+                    FakeHealthDoc({"status": "discarded", "resolution": "discard"}),
+                    FakeHealthDoc({"status": "dead_lettered", "failureReason": "still needs review"}),
+                ],
+            },
+        )
+
+        payload = system_health.collect_user_health(
+            "uid-1",
+            fs_client=fs,
+            token_state={"status": "healthy"},
+            graph_state={"status": "healthy"},
+        )
+
+        self.assertEqual("warning", payload["status"])
+        self.assertEqual(1, payload["queues"]["deadLetterQueue"])
 
     def test_collect_user_health_errors_on_token_failure(self):
         fs = FakeFirestore({

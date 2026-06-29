@@ -64,6 +64,12 @@ def _user_collection(user_id: str, collection_name: str):
     return _fs.collection("users").document(user_id).collection(collection_name)
 
 
+def _doc_ref_from_add_result(add_result):
+    if isinstance(add_result, tuple) and len(add_result) >= 2:
+        return add_result[1]
+    return add_result
+
+
 def _recipient_from_dead_letter(data: Dict[str, Any]) -> str:
     for value in data.get("assignedEmails") or data.get("sentRecipients") or []:
         if isinstance(value, str) and value.strip():
@@ -265,9 +271,10 @@ def _requeue_verified_unsent(
         )
         return {"success": False, "code": "blocked_manual_continuation"}
 
-    outbox_ref = _user_collection(user_id, "outbox").add(
+    add_result = _user_collection(user_id, "outbox").add(
         _safe_outbox_payload(data, dead_letter_id, operator_id, note)
     )
+    outbox_ref = _doc_ref_from_add_result(add_result)
     outbox_id = getattr(outbox_ref, "id", None)
     ref.update({
         "status": "requeued",

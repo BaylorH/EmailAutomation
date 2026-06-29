@@ -17,6 +17,13 @@ QUEUE_COLLECTIONS = (
     "processingFailures",
 )
 
+RESOLVED_DEAD_LETTER_STATUSES = {
+    "acknowledged",
+    "discarded",
+    "reconciled",
+    "requeued",
+}
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -29,6 +36,32 @@ def _count_collection(user_ref, collection_name: str, limit: int = 500) -> int:
         return len(list(query.stream()))
     except Exception as exc:
         print(f"⚠️ Could not count {collection_name}: {exc}")
+        return -1
+
+
+def _snapshot_data(snapshot) -> Dict:
+    if hasattr(snapshot, "to_dict"):
+        return snapshot.to_dict() or {}
+    return {}
+
+
+def _is_resolved_dead_letter(data: Dict) -> bool:
+    status = str(data.get("status") or "").strip().lower()
+    recovery_status = str(data.get("recoveryStatus") or "").strip().lower()
+    return status in RESOLVED_DEAD_LETTER_STATUSES or recovery_status in RESOLVED_DEAD_LETTER_STATUSES
+
+
+def _count_active_dead_letters(user_ref, limit: int = 500) -> int:
+    try:
+        collection_ref = user_ref.collection("deadLetterQueue")
+        query = collection_ref.limit(limit) if hasattr(collection_ref, "limit") else collection_ref
+        return sum(
+            1
+            for snapshot in query.stream()
+            if not _is_resolved_dead_letter(_snapshot_data(snapshot))
+        )
+    except Exception as exc:
+        print(f"⚠️ Could not count active deadLetterQueue: {exc}")
         return -1
 
 
@@ -56,7 +89,11 @@ def collect_user_health(
     now = now or _utc_now()
     user_ref = fs_client.collection("users").document(user_id)
     queues = {
-        name: _count_collection(user_ref, name)
+        name: (
+            _count_active_dead_letters(user_ref)
+            if name == "deadLetterQueue"
+            else _count_collection(user_ref, name)
+        )
         for name in QUEUE_COLLECTIONS
     }
 

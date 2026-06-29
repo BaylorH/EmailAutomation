@@ -53,15 +53,19 @@ class FakeFirestoreNode:
         doc_id = f"auto-{len(self.root.add_calls)}"
         doc_path = tuple(self.path + ["document", doc_id])
         self.root.docs[doc_path] = dict(data)
-        return FakeFirestoreNode(self.root, list(doc_path))
+        doc_ref = FakeFirestoreNode(self.root, list(doc_path))
+        if self.root.firestore_add_returns_tuple:
+            return (None, doc_ref)
+        return doc_ref
 
 
 class FakeFirestore:
-    def __init__(self, dead_letter_payload):
+    def __init__(self, dead_letter_payload, *, firestore_add_returns_tuple=False):
         self.docs = {}
         self.add_calls = []
         self.set_calls = []
         self.update_calls = []
+        self.firestore_add_returns_tuple = firestore_add_returns_tuple
         self.dead_letter_path = (
             "collection", "users", "document", "uid-1",
             "collection", "deadLetterQueue", "document", "dead-1",
@@ -209,6 +213,25 @@ class DeadLetterRecoveryTests(unittest.TestCase):
         audit_payload = fake_fs.set_calls[-1][1]
         self.assertEqual("queued", audit_payload["status"])
         self.assertEqual("auto-1", audit_payload["outboxId"])
+
+    def test_requeue_verified_unsent_handles_firestore_tuple_add_return(self):
+        fake_fs = FakeFirestore(base_dead_letter(), firestore_add_returns_tuple=True)
+
+        with self.fake_clients(fake_fs), \
+             patch.object(dead_letter_recovery, "find_matching_sent_message_for_retry", return_value=None), \
+             patch.object(dead_letter_recovery, "find_sent_conversation_continuation_for_retry", return_value=None):
+            result = dead_letter_recovery.resolve_dead_letter_item(
+                "uid-1",
+                "dead-1",
+                action="requeue_verified_unsent",
+                headers={"Authorization": "Bearer fake"},
+                operator_id="operator-1",
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual("auto-1", result["outboxId"])
+        self.assertEqual("auto-1", fake_fs.update_calls[-1][1]["requeuedOutboxId"])
+        self.assertEqual("auto-1", fake_fs.set_calls[-1][1]["outboxId"])
 
 
 if __name__ == "__main__":
