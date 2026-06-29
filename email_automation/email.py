@@ -225,7 +225,10 @@ def _dead_letter_unsafe_outbound_body_if_needed(
     data: dict,
     body: str,
 ) -> bool:
-    validation = validate_outbound_body(body)
+    validation = validate_outbound_body(
+        body,
+        allow_scheduling_language=_is_tour_invite_outbox(data),
+    )
     if validation.is_safe:
         return False
     _move_to_dead_letter(

@@ -142,6 +142,21 @@ class FakeFollowupFirestore:
 
 
 class FollowupTerminalStateTests(unittest.TestCase):
+    def test_weekend_followup_window_defers_to_monday_business_start(self):
+        sunday = datetime(2026, 6, 21, 17, 1, tzinfo=timezone.utc)
+
+        deferred = followup._next_business_followup_time(sunday)
+
+        self.assertEqual(
+            deferred.isoformat(),
+            "2026-06-22T13:00:00+00:00",
+        )
+
+    def test_weekday_followup_window_is_unchanged(self):
+        monday = datetime(2026, 6, 22, 15, 1, tzinfo=timezone.utc)
+
+        self.assertEqual(followup._next_business_followup_time(monday), monday)
+
     @patch.object(followup, "_clear_followup_row_highlight", create=True)
     def test_max_reached_stops_thread_and_clears_highlight(self, clear_highlight):
         thread_ref = FakeThreadRef()

@@ -294,6 +294,30 @@ class OutboxSafetyTests(unittest.TestCase):
         move_to_dead_letter.assert_called_once()
         self.assertIn("[NAME]", move_to_dead_letter.call_args.args[3])
 
+    def test_normal_campaign_tour_language_moves_to_dead_letter_before_send(self):
+        doc_ref = FakeDocRef("tour-language-outbox")
+        data = {
+            "clientId": "client-1",
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "script": (
+                "Hi Connor,\n\nBefore we proceed with tour scheduling and/or LOIs, "
+                "can you please confirm the following?"
+            ),
+        }
+
+        with patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter:
+            blocked = email_module._dead_letter_unsafe_outbound_body_if_needed(
+                "uid-1",
+                doc_ref,
+                data,
+                data["script"],
+            )
+
+        self.assertTrue(blocked)
+        move_to_dead_letter.assert_called_once()
+        self.assertIn("Tour/LOI", move_to_dead_letter.call_args.args[3])
+
     def test_tour_planner_outbox_uses_reviewed_body_even_for_existing_contact(self):
         reviewed_body = (
             "Property: 555 Geocoded Map Dr\n"

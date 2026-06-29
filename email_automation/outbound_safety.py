@@ -12,6 +12,18 @@ PLACEHOLDER_HINT_RE = re.compile(
     r"address|tenant|client|date|time|day|city|state|title|role)\b",
     re.IGNORECASE,
 )
+UNREVIEWED_SCHEDULING_LANGUAGE_RE = re.compile(
+    r"\b("
+    r"tour\s+scheduling|"
+    r"tour\s+is\s+being\s+scheduled|"
+    r"before\s+we\s+proceed\s+with\s+tour|"
+    r"include\s+(?:it|the\s+space|this\s+space)\s+as\s+(?:a\s+)?tour\s+option|"
+    r"include\s+the\s+space\s+for\s+tours|"
+    r"proceed\s+with\s+.*\blois?\b|"
+    r"\blois?\b"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -45,12 +57,30 @@ def find_unresolved_placeholders(body: Optional[str]) -> List[str]:
     return found
 
 
-def validate_outbound_body(body: Optional[str]) -> OutboundBodyValidation:
+def contains_unreviewed_scheduling_language(body: Optional[str]) -> bool:
+    """Return True when normal outreach copy drifts into tour/LOI scheduling."""
+    return bool(UNREVIEWED_SCHEDULING_LANGUAGE_RE.search(body or ""))
+
+
+def validate_outbound_body(
+    body: Optional[str],
+    *,
+    allow_scheduling_language: bool = False,
+) -> OutboundBodyValidation:
     placeholders = find_unresolved_placeholders(body)
     if placeholders:
         return OutboundBodyValidation(
             is_safe=False,
             placeholders=placeholders,
             reason=f"Unresolved outbound placeholder(s): {', '.join(placeholders)}",
+        )
+    if not allow_scheduling_language and contains_unreviewed_scheduling_language(body):
+        return OutboundBodyValidation(
+            is_safe=False,
+            placeholders=[],
+            reason=(
+                "Tour/LOI scheduling language is not allowed in normal outreach "
+                "or follow-up automation; manual review required"
+            ),
         )
     return OutboundBodyValidation(is_safe=True, placeholders=[])

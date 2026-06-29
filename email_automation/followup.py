@@ -17,6 +17,7 @@ Called from main.py after inbox scanning.
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
+from zoneinfo import ZoneInfo
 from google.cloud.firestore import SERVER_TIMESTAMP
 
 from .clients import _fs
@@ -41,6 +42,44 @@ from .outbound_safety import validate_outbound_body
 # Claim timeout for follow-up processing (prevent duplicate sends)
 FOLLOWUP_CLAIM_TIMEOUT_SECONDS = 60
 SYNTHETIC_OUTBOUND_SOURCES = {"dashboard_outbox_reply", "followup_scheduler"}
+DEFAULT_FOLLOWUP_BUSINESS_TIMEZONE = "America/New_York"
+FOLLOWUP_BUSINESS_START_HOUR = 9
+
+
+def _followup_business_timezone(followup_config: Optional[Dict[str, Any]] = None):
+    timezone_name = (
+        (followup_config or {}).get("timeZone")
+        or (followup_config or {}).get("timezone")
+        or DEFAULT_FOLLOWUP_BUSINESS_TIMEZONE
+    )
+    try:
+        return ZoneInfo(str(timezone_name))
+    except Exception:
+        return ZoneInfo(DEFAULT_FOLLOWUP_BUSINESS_TIMEZONE)
+
+
+def _next_business_followup_time(
+    candidate: datetime,
+    followup_config: Optional[Dict[str, Any]] = None,
+) -> datetime:
+    """Move weekend follow-up times to Monday morning in the campaign business timezone."""
+    if candidate.tzinfo is None:
+        candidate = candidate.replace(tzinfo=timezone.utc)
+
+    business_tz = _followup_business_timezone(followup_config)
+    local_candidate = candidate.astimezone(business_tz)
+    weekday = local_candidate.weekday()
+    if weekday < 5:
+        return candidate
+
+    days_until_monday = 7 - weekday
+    local_monday = (local_candidate + timedelta(days=days_until_monday)).replace(
+        hour=FOLLOWUP_BUSINESS_START_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return local_monday.astimezone(timezone.utc)
 
 
 def _claim_followup(user_id: str, thread_id: str, current_index: int) -> bool:
@@ -298,6 +337,22 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
         if now < next_followup_dt:
             time_remaining = next_followup_dt - now
             print(f"   Thread {thread_id[:20]}... - {time_remaining} until follow-up")
+            continue
+
+        safe_send_time = _next_business_followup_time(now, followup_config)
+        if safe_send_time > now:
+            print(
+                f"   🗓️ Weekend follow-up window for {thread_id[:20]}...; "
+                f"deferring until {safe_send_time.strftime('%Y-%m-%d %H:%M')} UTC"
+            )
+            try:
+                thread_doc.reference.update({
+                    "followUpConfig.nextFollowUpAt": safe_send_time,
+                    "followUpConfig.lastWeekendDeferralAt": SERVER_TIMESTAMP,
+                    "updatedAt": SERVER_TIMESTAMP,
+                })
+            except Exception as e:
+                print(f"   ⚠️ Could not defer weekend follow-up for {thread_id[:20]}...: {e}")
             continue
 
         # Check if broker has responded
@@ -698,7 +753,10 @@ def _schedule_next_followup(
     else:
         delta = timedelta(days=wait_time)
 
-    next_followup_at = datetime.now(timezone.utc) + delta
+    next_followup_at = _next_business_followup_time(
+        datetime.now(timezone.utc) + delta,
+        followup_config,
+    )
 
     _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
         "followUpConfig.currentFollowUpIndex": next_index,
@@ -748,7 +806,10 @@ def schedule_followup_after_auto_response(user_id: str, thread_id: str) -> bool:
         else:
             delta = timedelta(days=wait_time)
 
-        next_followup_at = datetime.now(timezone.utc) + delta
+        next_followup_at = _next_business_followup_time(
+            datetime.now(timezone.utc) + delta,
+            followup_config,
+        )
         thread_ref.update({
             "followUpStatus": "waiting",
             "followUpConfig.nextFollowUpAt": next_followup_at,
