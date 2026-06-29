@@ -4,6 +4,7 @@ import hashlib
 import json
 import time
 import logging
+import os
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 from urllib.parse import quote
@@ -64,6 +65,13 @@ from .property_images import (
 from .campaign_safety import get_client_automation_pause, stopped_followup_patch
 
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_AUTOMATIC_INBOX_REPLY_ALLOWLIST = {
+    # Baylor test lane and Jill remain available for controlled proof/production rescue.
+    "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
+    "C4X3UH1r6QhgP3ivXD1QjyhuGyI2",
+}
 
 
 class RetryableProcessingError(Exception):
@@ -2466,6 +2474,22 @@ def _mark_reply_sent_but_unindexed(reason: str) -> bool:
     return False
 
 
+def _automatic_inbox_replies_allowed(user_id: str) -> bool:
+    raw_allowlist = os.environ.get("SITESIFT_AUTO_REPLY_ALLOWLIST")
+    if raw_allowlist is None:
+        allowed = DEFAULT_AUTOMATIC_INBOX_REPLY_ALLOWLIST
+    else:
+        raw_allowlist = raw_allowlist.strip()
+        if raw_allowlist == "*":
+            return True
+        allowed = {
+            value.strip()
+            for value in re.split(r"[,\\s]+", raw_allowlist)
+            if value.strip()
+        }
+    return str(user_id or "").strip() in allowed
+
+
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     send_reply_in_thread.last_error = None
@@ -2479,6 +2503,14 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         send_reply_in_thread.last_error = f"{body_validation.reason}; manual review required before auto-reply"
         send_reply_in_thread.last_outcome = "blocked_unsafe_body"
         print(f"   🛑 Blocked unsafe auto-reply body: {body_validation.reason}")
+        return False
+    if not _automatic_inbox_replies_allowed(user_id):
+        send_reply_in_thread.last_error = (
+            "Automatic inbox replies are disabled for this user; "
+            "manual review required before auto-reply"
+        )
+        send_reply_in_thread.last_outcome = "blocked_auto_reply_policy"
+        print(f"   🛑 Blocked automatic inbox reply for non-allowlisted user {user_id}")
         return False
     try:
         from .utils import (

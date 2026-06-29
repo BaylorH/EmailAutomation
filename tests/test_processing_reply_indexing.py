@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
+os.environ.setdefault("SITESIFT_AUTO_REPLY_ALLOWLIST", "*")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
     "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
