@@ -13,16 +13,15 @@ PLACEHOLDER_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 UNREVIEWED_SCHEDULING_LANGUAGE_RE = re.compile(
-    r"\b("
-    r"tour\s+scheduling|"
-    r"tour\s+is\s+being\s+scheduled|"
-    r"before\s+we\s+proceed\s+with\s+tour|"
-    r"include\s+(?:it|the\s+space|this\s+space)\s+as\s+(?:a\s+)?tour\s+option|"
-    r"include\s+the\s+space\s+for\s+tours|"
-    r"proceed\s+with\s+.*\blois?\b|"
-    r"\blois?\b"
-    r")\b",
-    re.IGNORECASE,
+    r"(?:"
+    r"(?i:\btour\s+scheduling\b)|"
+    r"(?i:\btour\s+is\s+being\s+scheduled\b)|"
+    r"(?i:\bbefore\s+we\s+proceed\s+with\s+tour\b)|"
+    r"(?i:\binclude\s+(?:it|the\s+space|this\s+space)\s+as\s+(?:a\s+)?tour\s+option\b)|"
+    r"(?i:\binclude\s+the\s+space\s+for\s+tours\b)|"
+    r"(?i:\bproceed\s+with\s+.*\bLOIs?\b)|"
+    r"\bLOIs?\b"
+    r")",
 )
 
 

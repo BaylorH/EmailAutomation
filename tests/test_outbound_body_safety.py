@@ -37,6 +37,13 @@ class OutboundBodySafetyTests(unittest.TestCase):
 
         self.assertTrue(result.is_safe)
 
+    def test_broker_named_lois_does_not_trigger_loi_guard(self):
+        result = outbound_safety.validate_outbound_body(
+            "Hi Lois,\n\nCould you please confirm the asking rate and clear height?"
+        )
+
+        self.assertTrue(result.is_safe)
+
 
 if __name__ == "__main__":
     unittest.main()
