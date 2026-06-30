@@ -65,6 +65,15 @@ class FakeFirestore:
         return self.thread_ref.get()
 
 
+def _fixed_datetime(value):
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None) -> datetime:
+            return value.astimezone(tz) if tz else value
+
+    return FixedDateTime
+
+
 class FakeMessageDoc:
     def __init__(self, data):
         self._data = data
@@ -158,12 +167,6 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertEqual(followup._next_business_followup_time(monday), monday)
 
     def test_initial_followup_schedule_defers_weekend_due_time(self):
-        class FixedDateTime(datetime):
-            @classmethod
-            def now(cls, tz=None) -> datetime:
-                value = datetime(2026, 6, 19, 22, 0, tzinfo=timezone.utc)
-                return value.astimezone(tz) if tz else value
-
         thread_ref = FakeThreadRef()
         followup_config = {
             "enabled": True,
@@ -178,7 +181,11 @@ class FollowupTerminalStateTests(unittest.TestCase):
         }
 
         with patch.object(followup, "_fs", FakeFirestore(thread_ref)), \
-             patch.object(followup, "datetime", FixedDateTime):
+             patch.object(
+                 followup,
+                 "datetime",
+                 _fixed_datetime(datetime(2026, 6, 19, 22, 0, tzinfo=timezone.utc)),
+             ):
             followup.schedule_followup_for_thread("uid-1", "thread-1", followup_config)
 
         update = thread_ref.updates[-1]
@@ -189,12 +196,6 @@ class FollowupTerminalStateTests(unittest.TestCase):
         )
 
     def test_initial_followup_schedule_preserves_business_day_due_time(self):
-        class FixedDateTime(datetime):
-            @classmethod
-            def now(cls, tz=None) -> datetime:
-                value = datetime(2026, 6, 22, 15, 0, tzinfo=timezone.utc)
-                return value.astimezone(tz) if tz else value
-
         thread_ref = FakeThreadRef()
         followup_config = {
             "enabled": True,
@@ -209,7 +210,11 @@ class FollowupTerminalStateTests(unittest.TestCase):
         }
 
         with patch.object(followup, "_fs", FakeFirestore(thread_ref)), \
-             patch.object(followup, "datetime", FixedDateTime):
+             patch.object(
+                 followup,
+                 "datetime",
+                 _fixed_datetime(datetime(2026, 6, 22, 15, 0, tzinfo=timezone.utc)),
+             ):
             followup.schedule_followup_for_thread("uid-1", "thread-1", followup_config)
 
         update = thread_ref.updates[-1]
