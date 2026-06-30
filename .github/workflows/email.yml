@@ -53,6 +53,12 @@ jobs:
           GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Emergency launch safety gate: only Baylor's test mailbox is processed.
+          # This disables autonomous sends/scans/follow-ups for all live beta users
+          # until the full Baylor/BP21 proof is clean again.
+          SITESIFT_DEV_SCOPED_SCHEDULER: "1"
+          SITESIFT_SCHEDULER_TARGET_USER_IDS: "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
+          SITESIFT_SCHEDULER_ALLOWED_USER_IDS: "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
         # run: python noPopup_signin_emails_to_excel.py
         run: python main.py
         # run: python scheduler_runner.py

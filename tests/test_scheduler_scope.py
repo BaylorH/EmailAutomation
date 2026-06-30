@@ -29,6 +29,23 @@ class SchedulerScopeTests(unittest.TestCase):
         self.assertEqual(resolved.mode, "all")
         self.assertEqual(resolved.user_ids, [JILL_UID, BAYLOR_UID])
 
+    def test_scheduled_runs_can_be_emergency_scoped_to_baylor(self):
+        from email_automation.scheduler_scope import resolve_scheduler_user_ids
+
+        with self._clear_scope_env(), patch.dict(
+            os.environ,
+            {
+                "GITHUB_EVENT_NAME": "schedule",
+                "SITESIFT_DEV_SCOPED_SCHEDULER": "1",
+                "SITESIFT_SCHEDULER_TARGET_USER_IDS": BAYLOR_UID,
+                "SITESIFT_SCHEDULER_ALLOWED_USER_IDS": BAYLOR_UID,
+            },
+        ):
+            resolved = resolve_scheduler_user_ids([JILL_UID, BAYLOR_UID])
+
+        self.assertEqual(resolved.mode, "dev_scoped")
+        self.assertEqual(resolved.user_ids, [BAYLOR_UID])
+
     def test_manual_dispatch_requires_dev_scoped_guard(self):
         from email_automation.scheduler_scope import SchedulerScopeError, resolve_scheduler_user_ids
 

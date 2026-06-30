@@ -68,9 +68,8 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_AUTOMATIC_INBOX_REPLY_ALLOWLIST = {
-    # Baylor test lane and Jill remain available for controlled proof/production rescue.
+    # Emergency launch safety: Baylor test lane only by default.
     "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
-    "C4X3UH1r6QhgP3ivXD1QjyhuGyI2",
 }
 
 
