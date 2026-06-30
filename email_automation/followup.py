@@ -891,7 +891,10 @@ def schedule_followup_for_thread(
     else:
         delta = timedelta(days=wait_time)
 
-    next_followup_at = datetime.now(timezone.utc) + delta
+    next_followup_at = _next_business_followup_time(
+        datetime.now(timezone.utc) + delta,
+        followup_config,
+    )
 
     # Update thread with follow-up config
     thread_followup_config = {

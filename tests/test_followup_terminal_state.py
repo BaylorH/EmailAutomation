@@ -65,6 +65,15 @@ class FakeFirestore:
         return self.thread_ref.get()
 
 
+def _fixed_datetime(value):
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None) -> datetime:
+            return value.astimezone(tz) if tz else value
+
+    return FixedDateTime
+
+
 class FakeMessageDoc:
     def __init__(self, data):
         self._data = data
@@ -156,6 +165,64 @@ class FollowupTerminalStateTests(unittest.TestCase):
         monday = datetime(2026, 6, 22, 15, 1, tzinfo=timezone.utc)
 
         self.assertEqual(followup._next_business_followup_time(monday), monday)
+
+    def test_initial_followup_schedule_defers_weekend_due_time(self):
+        thread_ref = FakeThreadRef()
+        followup_config = {
+            "enabled": True,
+            "timeZone": "America/New_York",
+            "followUps": [
+                {
+                    "waitTime": 24,
+                    "waitUnit": "hours",
+                    "message": "Hi Alex,\n\nJust following up.",
+                }
+            ],
+        }
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)), \
+             patch.object(
+                 followup,
+                 "datetime",
+                 _fixed_datetime(datetime(2026, 6, 19, 22, 0, tzinfo=timezone.utc)),
+             ):
+            followup.schedule_followup_for_thread("uid-1", "thread-1", followup_config)
+
+        update = thread_ref.updates[-1]
+        scheduled_at = update["followUpConfig"]["nextFollowUpAt"]
+        self.assertEqual(
+            scheduled_at.isoformat(),
+            "2026-06-22T13:00:00+00:00",
+        )
+
+    def test_initial_followup_schedule_preserves_business_day_due_time(self):
+        thread_ref = FakeThreadRef()
+        followup_config = {
+            "enabled": True,
+            "timeZone": "America/New_York",
+            "followUps": [
+                {
+                    "waitTime": 24,
+                    "waitUnit": "hours",
+                    "message": "Hi Alex,\n\nJust following up.",
+                }
+            ],
+        }
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)), \
+             patch.object(
+                 followup,
+                 "datetime",
+                 _fixed_datetime(datetime(2026, 6, 22, 15, 0, tzinfo=timezone.utc)),
+             ):
+            followup.schedule_followup_for_thread("uid-1", "thread-1", followup_config)
+
+        update = thread_ref.updates[-1]
+        scheduled_at = update["followUpConfig"]["nextFollowUpAt"]
+        self.assertEqual(
+            scheduled_at.isoformat(),
+            "2026-06-23T15:00:00+00:00",
+        )
 
     @patch.object(followup, "_clear_followup_row_highlight", create=True)
     def test_max_reached_stops_thread_and_clears_highlight(self, clear_highlight):
