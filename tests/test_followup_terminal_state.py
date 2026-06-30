@@ -160,7 +160,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
     def test_initial_followup_schedule_defers_weekend_due_time(self):
         class FixedDateTime(datetime):
             @classmethod
-            def now(cls, tz=None):
+            def now(cls, tz=None) -> datetime:
                 value = datetime(2026, 6, 19, 22, 0, tzinfo=timezone.utc)
                 return value.astimezone(tz) if tz else value
 
@@ -186,6 +186,37 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertEqual(
             scheduled_at.isoformat(),
             "2026-06-22T13:00:00+00:00",
+        )
+
+    def test_initial_followup_schedule_preserves_business_day_due_time(self):
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None) -> datetime:
+                value = datetime(2026, 6, 22, 15, 0, tzinfo=timezone.utc)
+                return value.astimezone(tz) if tz else value
+
+        thread_ref = FakeThreadRef()
+        followup_config = {
+            "enabled": True,
+            "timeZone": "America/New_York",
+            "followUps": [
+                {
+                    "waitTime": 24,
+                    "waitUnit": "hours",
+                    "message": "Hi Alex,\n\nJust following up.",
+                }
+            ],
+        }
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)), \
+             patch.object(followup, "datetime", FixedDateTime):
+            followup.schedule_followup_for_thread("uid-1", "thread-1", followup_config)
+
+        update = thread_ref.updates[-1]
+        scheduled_at = update["followUpConfig"]["nextFollowUpAt"]
+        self.assertEqual(
+            scheduled_at.isoformat(),
+            "2026-06-23T15:00:00+00:00",
         )
 
     @patch.object(followup, "_clear_followup_row_highlight", create=True)
