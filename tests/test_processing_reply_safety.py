@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,11 @@ from email_automation import processing
 
 
 class ProcessingReplySafetyTests(unittest.TestCase):
+    def test_processing_does_not_import_legacy_email_operations_senders(self):
+        source = Path(processing.__file__).read_text()
+
+        self.assertNotIn("from .email_operations import", source)
+
     def test_send_reply_default_allowlist_is_baylor_only(self):
         with patch.dict(os.environ, {}, clear=True), patch(
             "email_automation.utils.exponential_backoff_request",

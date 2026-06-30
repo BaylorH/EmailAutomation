@@ -278,6 +278,26 @@ class OutboxSafetyTests(unittest.TestCase):
         move_to_dead_letter.assert_called_once()
         self.assertIn("paused/stopped", move_to_dead_letter.call_args.args[3])
 
+    def test_jill_tour_outbox_item_moves_to_dead_letter_before_send(self):
+        doc_ref = FakeDocRef("jill-tour-outbox")
+        data = {
+            "clientId": "client-1",
+            "source": "dashboard_tour_planner",
+            "actionType": "tour_invite",
+            "script": "Hi Avery,\n\nPlease confirm the 10:00 AM tour slot.",
+        }
+
+        with patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter:
+            blocked = email_module._pause_results_outbox_item_if_needed(
+                "C4X3UH1r6QhgP3ivXD1QjyhuGyI2",
+                doc_ref,
+                data,
+            )
+
+        self.assertTrue(blocked)
+        move_to_dead_letter.assert_called_once()
+        self.assertIn("Tour-planning emails", move_to_dead_letter.call_args.args[3])
+
     def test_unresolved_name_placeholder_outbox_item_moves_to_dead_letter_before_send(self):
         doc_ref = FakeDocRef("unsafe-outbox")
         data = {"clientId": "client-1", "script": "Hi [NAME],\n\nCould you confirm?"}

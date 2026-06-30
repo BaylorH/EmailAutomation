@@ -28,6 +28,7 @@ from .utils import (
     needs_signature_attachments,
     safe_preview,
     resolve_signature_settings,
+    validate_recipient_emails,
 )
 from .messaging import save_message
 from .sent_mail_guard import (
@@ -448,6 +449,38 @@ def _send_followup_email(
             return False
 
         recipient = recipient_emails[0] if isinstance(recipient_emails, list) else recipient_emails
+        valid_recipients, invalid_recipients = validate_recipient_emails([recipient])
+        if invalid_recipients or not valid_recipients:
+            invalid_value = invalid_recipients[0] if invalid_recipients else recipient
+            _send_followup_email.last_error = (
+                f"Invalid follow-up recipient {invalid_value}; "
+                "manual review required before sending follow-up"
+            )
+            _send_followup_email.guard_failed_closed = True
+            print(f"   🛑 {_send_followup_email.last_error}")
+            return False
+
+        recipient = valid_recipients[0]
+        try:
+            from .processing import is_contact_opted_out
+            optout_record = is_contact_opted_out(user_id, recipient)
+        except Exception as e:
+            _send_followup_email.last_error = (
+                f"Could not verify follow-up opt-out status for {recipient}: {e}; "
+                "manual review required before sending follow-up"
+            )
+            _send_followup_email.guard_failed_closed = True
+            print(f"   🛑 {_send_followup_email.last_error}")
+            return False
+
+        if optout_record:
+            _send_followup_email.last_error = (
+                f"Follow-up recipient {recipient} is opted out; "
+                "manual review required before sending follow-up"
+            )
+            _send_followup_email.guard_failed_closed = True
+            print(f"   🛑 {_send_followup_email.last_error}")
+            return False
 
         # Get the last outbound message to reply to
         messages_ref = (_fs.collection("users").document(user_id)

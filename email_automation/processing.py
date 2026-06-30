@@ -44,12 +44,6 @@ from .outbound_safety import validate_outbound_body
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
                    format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff)
-from .email_operations import (
-    send_remaining_questions_email,
-    send_closing_email,
-    send_thankyou_closing_with_new_property,
-    send_thankyou_ask_alternatives
-)
 from .pending_responses import queue_pending_response, record_sent_unindexed_response
 from .sent_mail_guard import (
     SentMailGuardLookupError,

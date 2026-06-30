@@ -289,6 +289,75 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertIsNone(update["followUpConfig.pausedAt"])
         self.assertIn("followUpConfig.nextFollowUpAt", update)
 
+    def test_followup_blocks_malformed_recipient_before_graph_send(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+        })
+        fake_fs = FakeFollowupFirestore([outbound])
+        followup_config = {
+            "followUps": [{"message": "Hi Riley,\n\nJust following up."}],
+        }
+        thread_data = {
+            "email": ["not an email"],
+            "contactName": "Riley Broker",
+        }
+
+        with patch.object(followup, "_fs", fake_fs), \
+             patch.object(followup, "exponential_backoff_request", return_value=FakeResponse(200, {
+                 "value": [{"id": "graph-root", "subject": "0 Gemini Ave", "conversationId": "conv-1"}]
+             })), \
+             patch.object(requests, "post") as post:
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+            )
+
+        self.assertFalse(result)
+        post.assert_not_called()
+        self.assertIn("Invalid follow-up recipient", followup._send_followup_email.last_error)
+        self.assertTrue(followup._send_followup_email.guard_failed_closed)
+
+    def test_followup_blocks_opted_out_recipient_before_graph_send(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+        })
+        fake_fs = FakeFollowupFirestore([outbound])
+        followup_config = {
+            "followUps": [{"message": "Hi Riley,\n\nJust following up."}],
+        }
+        thread_data = {
+            "email": ["optout@example.com"],
+            "contactName": "Riley Broker",
+        }
+
+        with patch.object(followup, "_fs", fake_fs), \
+             patch.object(followup, "exponential_backoff_request", return_value=FakeResponse(200, {
+                 "value": [{"id": "graph-root", "subject": "0 Gemini Ave", "conversationId": "conv-1"}]
+             })), \
+             patch("email_automation.processing.is_contact_opted_out", return_value={"reason": "unsubscribe"}), \
+             patch.object(requests, "post") as post:
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+            )
+
+        self.assertFalse(result)
+        post.assert_not_called()
+        self.assertIn("opted out", followup._send_followup_email.last_error)
+        self.assertTrue(followup._send_followup_email.guard_failed_closed)
+
     def test_failed_followup_retry_uses_sent_items_match_without_resending(self):
         outbound = FakeMessageDoc({
             "direction": "outbound",

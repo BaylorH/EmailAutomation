@@ -232,7 +232,7 @@ Thanks!"""
     }
 
 
-def _find_nonviable_divider_row(sheets, spreadsheet_id: str, tab_title: str) -> int | None:
+def _find_nonviable_divider_row(sheets, spreadsheet_id: str, tab_title: str) -> Optional[int]:
     """Return the divider row index if it exists, else None (no creation)."""
     try:
         resp = sheets.spreadsheets().values().get(
@@ -519,7 +519,7 @@ def write_notification(uid: str, client_id: str, *, kind: str, priority: str, em
 
 # --- NEW: URL Exploration ---
 
-def fetch_url_as_text(url: str) -> str | None:
+def fetch_url_as_text(url: str) -> Optional[str]:
     """
     Try to fetch URL content and extract visible text using BeautifulSoup.
     Returns None on any failure (fail-safe).
@@ -991,8 +991,8 @@ Best regards"""
         print(f"❌ Failed to send closing email: {e}")
         return False
 
-def send_new_property_email(uid: str, client_id: str, headers: dict, recipient: str, 
-                          address: str, city: str, row_number: int) -> str | None:
+def send_new_property_email(uid: str, client_id: str, headers: dict, recipient: str,
+                          address: str, city: str, row_number: int) -> Optional[str]:
     """
     Send a new thread email for a new property suggestion.
     Returns the new thread ID if successful.
@@ -1136,7 +1136,7 @@ def _ensure_ai_meta_tab(sheets, spreadsheet_id: str) -> None:
     except Exception as e:
         print(f"⚠️ Could not create AI_META tab: {e}")
 
-def _read_ai_meta_row(sheets, spreadsheet_id: str, rownum: int, column: str) -> dict | None:
+def _read_ai_meta_row(sheets, spreadsheet_id: str, rownum: int, column: str) -> Optional[dict]:
     """Read AI_META record for specific row/column."""
     try:
         _ensure_ai_meta_tab(sheets, spreadsheet_id)
@@ -1251,7 +1251,7 @@ def ensure_drive_folder():
         print(f"❌ Failed to ensure Drive folder: {e}")
         return None
 
-def upload_pdf_to_drive(name: str, content: bytes, folder_id: str = None) -> str | None:
+def upload_pdf_to_drive(name: str, content: bytes, folder_id: str = None) -> Optional[str]:
     """Upload PDF to Drive and return webViewLink."""
     try:
         creds = _helper_google_creds()
@@ -1693,7 +1693,7 @@ def _get_thread_messages_chronological(uid: str, thread_id: str) -> list[dict]:
         return []
 
 
-def _get_last_logged_message_id(sheets, spreadsheet_id: str, tab_title: str, thread_id: str) -> str | None:
+def _get_last_logged_message_id(sheets, spreadsheet_id: str, tab_title: str, thread_id: str) -> Optional[str]:
     """Get the last message ID that was logged for this thread."""
     try:
         # Read all values from Log tab
@@ -1879,8 +1879,8 @@ def propose_sheet_updates(uid: str,
                           rownum: int,
                           rowvals: list[str],
                           thread_id: str,
-                          file_manifest: list[dict] = None,   # [{"id": "...", "name": "..."}]
-                          url_texts: list[dict] = None) -> dict | None:
+                          file_manifest: Optional[List[dict]] = None,   # [{"id": "...", "name": "..."}]
+                          url_texts: Optional[List[dict]] = None) -> Optional[dict]:
     """
     Uses OpenAI Responses API to propose sheet updates.
     - Grounds on the current row's (address, city) as TARGET PROPERTY.
@@ -2135,7 +2135,7 @@ OUTPUT ONLY valid JSON in this exact format:
 
 # --- EXISTING FUNCTIONS (updated to integrate new features) ---
 
-def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email: str | None):
+def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email: Optional[str]):
     # Read thread (to get clientId)
     tdoc = (_fs.collection("users").document(uid)
             .collection("threads").document(thread_id).get())
@@ -2321,7 +2321,7 @@ def exponential_backoff_request(func, max_retries: int = 3):
     raise Exception(f"Request failed after {max_retries} attempts")
 
 
-def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> str | None:
+def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> Optional[str]:
     """
     Look up the row by email and return 'property address, city' as subject.
     Falls back to None if sheet/row/columns not found.
@@ -2348,7 +2348,7 @@ def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> st
             "city", "town", "municipality"
         ]
 
-        def _get_val(keys: list[str]) -> str | None:
+        def _get_val(keys: List[str]) -> Optional[str]:
             for k in keys:
                 if k in idx_map:
                     i = idx_map[k] - 1  # 0-based for rowvals
@@ -2504,8 +2504,8 @@ def add_client_notifications(
     client_id: str,
     email: str,
     thread_id: str,
-    applied_updates: list[dict],
-    notes: str | None = None,
+    applied_updates: List[dict],
+    notes: Optional[str] = None,
 ):
     """
     UPDATED: Writes one notification doc per applied field change.
@@ -2580,7 +2580,7 @@ def _sync_ref(user_id: str):
     """Get reference to sync document."""
     return _fs.collection("users").document(user_id).collection("sync").document("inbox")
 
-def get_last_scan_iso(user_id: str) -> str | None:
+def get_last_scan_iso(user_id: str) -> Optional[str]:
     """Get the last scan timestamp."""
     try:
         doc = _sync_ref(user_id).get()
@@ -3319,7 +3319,7 @@ def send_outboxes(user_id: str, headers):
 
 # --- Legacy Functions (kept for compatibility) ---
 
-def send_email(headers, script: str, emails: list[str], client_id: str | None = None):
+def send_email(headers, script: str, emails: List[str], client_id: Optional[str] = None):
     """Legacy function - redirects to send_and_index_email"""
     # Note: This legacy function doesn't have user_id, so it can't use the new pipeline
     # Users should migrate to send_and_index_email directly
