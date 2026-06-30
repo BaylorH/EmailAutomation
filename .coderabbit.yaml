@@ -1,0 +1,136 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+tone_instructions: "Be direct, practical, and safety-focused. Prioritize production email risks over style comments."
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  review_details: true
+  collapse_walkthrough: false
+  changed_files_summary: true
+  sequence_diagrams: true
+  estimate_code_review_effort: true
+  assess_linked_issues: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    ignore_title_keywords:
+      - "WIP"
+      - "[skip review]"
+  path_filters:
+    - "!**/__pycache__/**"
+    - "!**/.pytest_cache/**"
+    - "!**/.playwright-mcp/**"
+    - "!**/graphify-out/**"
+    - "!**/node_modules/**"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/*.jpeg"
+    - "!**/*.gif"
+    - "!**/*.pdf"
+    - "!**/*.xlsx"
+  path_instructions:
+    - path: ".github/workflows/email.yml"
+      instructions: |
+        Treat this as a production scheduler file. Flag any change that widens the scheduler from the explicitly intended user scope, removes the scheduler lease/concurrency behavior, runs a legacy sender, or changes the command away from the reviewed production entrypoint without a rollback/test plan.
+
+        The workflow must not introduce unscoped all-user processing during recovery. If a PR changes scheduler environment variables, require an explanation of which user accounts can be processed and why.
+
+    - path: "main.py"
+      instructions: |
+        Review scheduler ordering and production side effects. The safe order is: send existing outbox, scan inbox replies, scan Sent Items/manual user continuations, retry visible processing failures, process pending responses, then send follow-ups.
+
+        Flag any change that sends follow-ups or auto-replies before checking inbound/manual replies, bypasses scheduler scope resolution, bypasses the scheduler lease, hides per-user health, or makes cleanup destructive to support evidence.
+
+    - path: "app.py"
+      instructions: |
+        Treat Flask routes as support/debug surfaces, not production email shortcuts. Flag any unauthenticated or broad route that can trigger the scheduler, delete Firestore evidence, clear mail, send email, or mutate live campaign state.
+
+        Manual scheduler/debug endpoints must be explicitly development-scoped and must not process Jill/live users unless there is an exact approved repair path.
+
+    - path: "email_automation/email.py"
+      instructions: |
+        This is the primary outbound email chokepoint. Flag any Graph send/reply path that bypasses recipient validation, opt-out filtering, placeholder blocking, signature selection, reply-all/CC preservation, duplicate-send protection, actionAudit terminalization, msgIndex/thread indexing, cancellation checks, or dead-letter visibility.
+
+        Dashboard replies, tour invites, campaign outreach, and multi-property sends must preserve row/thread/client anchors and must not remove an unresolved action before a send has actually reached a terminal audited state.
+
+    - path: "email_automation/followup.py"
+      instructions: |
+        Review follow-ups as autonomous sends. Flag follow-up sends after an inbound reply, manual user continuation, stop, completion, max-followup terminal state, opt-out, or send-guard uncertainty.
+
+        Placeholder text, local-part greetings, missing signatures, or lack of Sent Items reconciliation on retry are production blockers.
+
+    - path: "email_automation/processing.py"
+      instructions: |
+        Review inbox classification and auto-response paths for prompt/contract drift. Flag new event types or changed event semantics without matching tests, notification handling, sheet behavior, and dashboard copy.
+
+        Tour Scheduling must remain a separate lane from normal property data gathering. Normal campaigns may gather availability/specs, but must not schedule tours or send tour/LOI coordination unless that lane is explicitly enabled and tested.
+
+    - path: "email_automation/pending_responses.py"
+      instructions: |
+        Pending responses are autonomous retries. Flag silent deletion, hidden max-attempt failure, duplicate-send risk after partial Graph success, or any path that retries without visible operator recovery state and Sent Items/manual-continuation checks.
+
+    - path: "email_automation/ai_processing.py"
+      instructions: |
+        Review AI prompt/schema changes as contract changes. Flag hallucinated property facts, fake CoStar-style fields, scheduling language in core outreach, client identity leakage, and event taxonomy drift without fixture updates.
+
+        Any classifier change should include realistic broker language variants for non-viable, unavailable, wrong-contact, opt-out, tour unavailable, alternate tour time, and manual intervention cases.
+
+    - path: "email_automation/sheet_operations.py"
+      instructions: |
+        Review row movement and sheet updates for durable identity. Flag updates that depend only on row number after rows can move, overwrite formulas/custom fields, or lose AI provenance/audit metadata.
+
+    - path: "email_automation/scheduler_scope.py"
+      instructions: |
+        Scheduler scope is a production kill switch. Flag any change that makes manual dispatch process live users by default, removes the allowed-user guard, or makes the emergency Baylor-only lane ambiguous.
+
+    - path: "email_automation/service_providers.py"
+      instructions: |
+        Review Microsoft Graph calls as privileged email operations. Flag send/reply implementations that do not return usable message/conversation identifiers where Graph provides them, or that make retry/dedupe impossible for callers.
+
+    - path: "tests/**"
+      instructions: |
+        Test changes should prove the safety promise, not just match implementation. For email-processing changes, require fixtures for happy path, terminal states, bad placeholders, wrong recipient, manual user continuation, duplicate-send retry, and operator-visible failure.
+
+  pre_merge_checks:
+    override_requested_reviewers_only: false
+    docstrings:
+      mode: "off"
+    title:
+      mode: "warning"
+      requirements: "Use a concise title that names the production lane touched, for example scheduler, outbox, inbox processing, sheets, signatures, or release safety."
+    description:
+      mode: "warning"
+    issue_assessment:
+      mode: "warning"
+    custom_checks:
+      - name: "Outbound safety chokepoint"
+        mode: "warning"
+        instructions: |
+          Pass only if every changed outbound email path still goes through reviewed safeguards for recipients, CC/reply-all, placeholders, signatures, opt-outs, duplicate-send protection, actionAudit terminal state, thread/msg indexing, cancellation, and visible dead-letter/recovery state. Fail if a direct Graph send/reply path bypasses those safeguards or if the PR does not explain why a changed send path is safe.
+
+      - name: "Scheduler scope and order"
+        mode: "warning"
+        instructions: |
+          Pass only if scheduler changes keep scope explicit and preserve safe processing order: outbox, inbox scan, Sent Items/manual-continuation scan, processing retry, pending-response retry, follow-ups, cleanup, health. Fail if manual/global runs can process live users by accident, if follow-ups run before reply/manual checks, or if the scheduler lease/concurrency story is weakened.
+
+      - name: "Feature lane isolation"
+        mode: "warning"
+        instructions: |
+          Pass only if normal core campaign automation remains isolated from Results/Tour/Admin experiments. Fail if Tour Scheduling, result generation, map/geocode/routing, usage admin, or support/debug behavior can affect normal user emailing without backend entitlement checks and tests. UI-only gating is not sufficient.
+
+      - name: "AI contract drift"
+        mode: "warning"
+        instructions: |
+          Pass only if prompt, classifier, extraction, or notification contract changes include matching parser/UI/sheet tests and realistic language variants. Fail if new event types, changed event meaning, scheduling language, client identity language, or fake/inferred property fields are introduced without explicit fixtures and downstream handling.
+
+      - name: "Recovery and privacy boundary"
+        mode: "warning"
+        instructions: |
+          Pass only if recovery/debug behavior is operator-visible, privacy-scoped, and auditable. Fail if code reads unrelated user inbox content, deletes support evidence wholesale, retries dead letters without duplicate-send checks, or mutates Jill/live data without an exact approved path.
