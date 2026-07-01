@@ -187,6 +187,15 @@
       "CodeRabbit check or explicit human reviewer role verdict"
     ]
   },
+  "fixtureClasses": {
+    "happy_path": "Nominal behavior works with realistic broker/operator data and source-of-truth readbacks.",
+    "terminal_state": "Stopped, completed, archived, cancelled, or unavailable state blocks further autonomous action.",
+    "bad_placeholder": "Missing/ambiguous variables such as [NAME] hard-stop before outbox or Graph send.",
+    "wrong_recipient": "Wrong To/Cc/reply-all recipient risk fails closed or pauses visibly before any send.",
+    "manual_continuation": "Human mailbox/dashboard continuation suppresses or reconciles autonomous retry/follow-up.",
+    "duplicate_retry": "Ambiguous Graph/indexing/retry paths prove prior send state before retrying.",
+    "operator_visible_failure": "The operator can see, diagnose, and recover or cancel failures without hidden state."
+  },
   "gradingRoles": {
     "broker_operator": "Would the broker receive professional, accurate, non-annoying communication with correct recipients?",
     "tenant_rep": "Would Jill/Karsen/Tyneesia understand current state and avoid embarrassing client-facing output?",
@@ -2006,6 +2015,15 @@
         "blocked or opt-out contact cannot be reintroduced by reply-all",
         "wrong row cannot be updated after sheet reorder"
       ],
+      "requiredFixtureClasses": [
+        "happy_path",
+        "terminal_state",
+        "bad_placeholder",
+        "wrong_recipient",
+        "manual_continuation",
+        "duplicate_retry",
+        "operator_visible_failure"
+      ],
       "proofArtifacts": [
         "unit/integration fixtures for each required event class",
         "Baylor/BP21-only live or emulator campaign transcript for happy path and at least two collision playbooks",
@@ -2048,6 +2066,15 @@
         "generated artifacts never invent CoStar-style facts without source",
         "Results workspace cannot queue or send email",
         "saved report reopens without forcing regeneration"
+      ],
+      "requiredFixtureClasses": [
+        "happy_path",
+        "terminal_state",
+        "bad_placeholder",
+        "wrong_recipient",
+        "manual_continuation",
+        "duplicate_retry",
+        "operator_visible_failure"
       ],
       "proofArtifacts": [
         "rendered Summary/Packet PDF screenshots and text extraction",
@@ -2095,6 +2122,15 @@
         "alternate time draft includes date and checks route conflicts before suggesting copy",
         "tour invite uses saved sender first name/signature and never placeholder/fallback slop"
       ],
+      "requiredFixtureClasses": [
+        "happy_path",
+        "terminal_state",
+        "bad_placeholder",
+        "wrong_recipient",
+        "manual_continuation",
+        "duplicate_retry",
+        "operator_visible_failure"
+      ],
       "proofArtifacts": [
         "backend entitlement tests proving normal-user deny path",
         "frontend hidden/denied screenshots for non-admin users",
@@ -2138,6 +2174,15 @@
         "Cloud Tasks retries cannot double-send after Graph accept",
         "Firestore rules/entitlements deny normal users from dev-only side effects",
         "scheduler scope is explicit and observable per user"
+      ],
+      "requiredFixtureClasses": [
+        "happy_path",
+        "terminal_state",
+        "bad_placeholder",
+        "wrong_recipient",
+        "manual_continuation",
+        "duplicate_retry",
+        "operator_visible_failure"
       ],
       "proofArtifacts": [
         "emulator proof using Firestore/Auth rules",

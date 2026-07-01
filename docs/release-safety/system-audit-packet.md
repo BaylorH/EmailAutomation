@@ -106,7 +106,8 @@ The minimum evidence set is:
 
 - all changed feature ids are named,
 - all changed feature ids select fresh gradebook events, variations,
-  combinations, state permutations, and negative controls,
+  combinations, state permutations, fixture classes, negative controls,
+  evidence requirements, and human grading roles,
 - all touched send-risk matrix entries pass their fixture classes,
 - backend targeted safety tests pass,
 - frontend denied-path and happy-path tests pass,

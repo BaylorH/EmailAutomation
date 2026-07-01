@@ -157,6 +157,7 @@ REQUIRED_GRADEBOOK_DIMENSIONS = {
     "statePermutations",
     "actorAndAccountAxes",
     "evidenceRequirements",
+    "fixtureClasses",
     "gradingRoles",
     "freshnessRules",
     "releaseSuites",
@@ -457,6 +458,11 @@ class ReleaseFeatureRegistryTests(unittest.TestCase):
             REQUIRED_GRADING_ROLES.issubset(set(gradebook["gradingRoles"])),
             "Grading roles must force reviewers to judge safety, UX, privacy, and support/recovery separately.",
         )
+        self.assertEqual(
+            SEND_RISK_BASE_FIXTURE_CATEGORIES,
+            set(gradebook["fixtureClasses"]),
+            "The gradebook must name the mandatory adversarial fixture classes used by release suites.",
+        )
         self.assertTrue(
             REQUIRED_RELEASE_SUITES.issubset(set(gradebook["releaseSuites"])),
             "Release suites must force full Product V1, Results, Tour, and Firebase-native proof tracks instead of isolated spot checks.",
@@ -561,6 +567,11 @@ class ReleaseFeatureRegistryTests(unittest.TestCase):
                 self.assertTrue(suite.get("requiredCombinationPlaybooks"))
                 self.assertTrue(suite.get("requiredStatePermutations"))
                 self.assertTrue(suite.get("requiredNegativeControls"))
+                self.assertEqual(
+                    SEND_RISK_BASE_FIXTURE_CATEGORIES,
+                    set(suite.get("requiredFixtureClasses", [])),
+                    f"{suite_id} must require the full adversarial fixture class set before it can pass.",
+                )
                 self.assertTrue(suite.get("proofArtifacts"))
 
         for feature in registry.get("features", []):

@@ -195,11 +195,25 @@ class SystemAuditPacketTests(unittest.TestCase):
             )
 
         minimum_evidence_section = contract[contract.index("## Minimum Evidence Before Merge") :]
-        self.assertIn(
+        for phrase in (
             "feature-gradebook",
-            minimum_evidence_section,
-            "CodeRabbit minimum merge evidence must repeat the gradebook requirement.",
-        )
+            "fixture classes",
+            "evidence",
+            "human grading roles",
+        ):
+            self.assertIn(
+                phrase,
+                minimum_evidence_section,
+                "CodeRabbit minimum merge evidence must repeat the gradebook evidence and grading-role requirements.",
+            )
+
+        packet_minimum_evidence = PACKET_PATH.read_text()[PACKET_PATH.read_text().index("The minimum evidence set is:") :]
+        for phrase in ("fixture classes", "evidence", "human grading roles"):
+            self.assertIn(
+                phrase,
+                packet_minimum_evidence,
+                "System audit packet minimum evidence must stay aligned with CodeRabbit's gradebook contract.",
+            )
 
     def test_matrix_send_risk_entries_have_gradebook_scenarios(self):
         registry = _read_json(REGISTRY_PATH)

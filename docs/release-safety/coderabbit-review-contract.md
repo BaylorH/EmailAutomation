@@ -143,7 +143,8 @@ For production-impacting changes, reviewers should expect:
 - focused unit tests for changed lane,
 - affected dependency tests from the release-safety map,
 - selected `feature-gradebook` events, trigger variations, combinations, state
-  permutations, and negative controls for changed feature ids,
+  permutations, fixture classes, negative controls, evidence requirements, and
+  human grading roles for changed feature ids,
 - `python3 -m py_compile` for changed Python files,
 - `git diff --check`,
 - GitHub Actions/scheduler readback for backend deploys,
