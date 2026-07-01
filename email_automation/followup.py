@@ -277,7 +277,7 @@ def _followup_terminal_block_reason(
 
     if (thread_data or {}).get("hasInboundReply"):
         return "the broker has already replied"
-    if status in {"stopped", "completed", "archived"}:
+    if status in {"stopped", "completed", "archived", "action_needed"}:
         return f"the thread is {status}"
     if followup_status in {"paused", "needs_review", "max_reached", "complete", "completed", "stopped"}:
         return f"follow-up tracking is {followup_status}"
@@ -797,6 +797,19 @@ def _send_followup_email(
         recipient_payload = recipient_result["payload"]
         if not recipient_payload["toRecipients"] and recipient:
             recipient_lower = recipient.lower()
+            safe_sent_recipients = {
+                (address or "").strip().lower()
+                for address in recipient_result.get("sentRecipients", [])
+            }
+            if recipient_lower not in safe_sent_recipients:
+                _send_followup_email.last_error = (
+                    "Primary follow-up recipient did not pass reply-all safety filtering; "
+                    "manual review required before sending follow-up"
+                )
+                _send_followup_email.guard_failed_closed = True
+                _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+                print(f"   🛑 {_send_followup_email.last_error}")
+                return False
             recipient_payload["ccRecipients"] = [
                 cc_recipient
                 for cc_recipient in recipient_payload["ccRecipients"]

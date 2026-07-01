@@ -443,6 +443,72 @@ class FollowupTerminalStateTests(unittest.TestCase):
             ["assistant@example.com"],
         )
 
+    def test_followup_does_not_readd_primary_recipient_removed_by_reply_all_filter(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+            "to": ["bp21harrison@gmail.com"],
+        })
+        fake_fs = FakeFollowupFirestore([outbound])
+        followup_config = {
+            "followUps": [{"message": "Hi Riley,\n\nJust following up."}],
+        }
+        thread_data = {
+            "email": ["bp21harrison@gmail.com"],
+            "contactName": "Riley Broker",
+        }
+        deleted_urls = []
+        send_urls = []
+
+        def run_request(callback, *args, **kwargs):
+            return callback()
+
+        def fake_get(url, **kwargs):
+            return FakeResponse(200, {
+                "value": [{
+                    "id": "graph-root",
+                    "subject": "0 Gemini Ave",
+                    "conversationId": "conv-1",
+                }]
+            })
+
+        def fake_post(url, **kwargs):
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {"id": "reply-draft-1", "toRecipients": [], "ccRecipients": []})
+            if url.endswith("/send"):
+                send_urls.append(url)
+                return FakeResponse(202, {})
+            raise AssertionError(f"Unexpected post: {url}")
+
+        def fake_delete(url, **kwargs):
+            deleted_urls.append(url)
+            return FakeResponse(204, {})
+
+        with patch.object(followup, "_fs", fake_fs), \
+             patch.object(followup, "exponential_backoff_request", side_effect=run_request), \
+             patch.object(requests, "get", side_effect=fake_get), \
+             patch.object(requests, "post", side_effect=fake_post), \
+             patch.object(requests, "delete", side_effect=fake_delete), \
+             patch("email_automation.email._filter_reply_all_draft_recipients", return_value={
+                 "payload": {"toRecipients": [], "ccRecipients": []},
+                 "sentRecipients": [],
+             }):
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+            )
+
+        self.assertFalse(result)
+        self.assertFalse(send_urls)
+        self.assertTrue(any(url.endswith("/reply-draft-1") for url in deleted_urls))
+        self.assertIn("did not pass reply-all safety filtering", followup._send_followup_email.last_error)
+        self.assertTrue(followup._send_followup_email.guard_failed_closed)
+
     def test_followup_rechecks_terminal_state_before_reply_all_draft(self):
         outbound = FakeMessageDoc({
             "direction": "outbound",
@@ -484,6 +550,49 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertFalse(result)
         post.assert_not_called()
         self.assertIn("completed", followup._send_followup_email.last_error)
+        self.assertTrue(followup._send_followup_email.guard_failed_closed)
+
+    def test_followup_rechecks_action_needed_state_before_reply_all_draft(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+        })
+        fake_fs = FakeFollowupFirestore(
+            [outbound],
+            thread_data={
+                "status": "action_needed",
+                "followUpStatus": "waiting",
+                "followUpConfig": {"enabled": True, "currentFollowUpIndex": 0},
+            },
+        )
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "followUps": [{"message": "Hi Riley,\n\nJust following up."}],
+        }
+        thread_data = {
+            "email": ["bp21harrison@gmail.com"],
+            "contactName": "Riley Broker",
+        }
+
+        with patch.object(followup, "_fs", fake_fs), \
+             patch.object(followup, "exponential_backoff_request", return_value=FakeResponse(200, {
+                 "value": [{"id": "graph-root", "subject": "0 Gemini Ave", "conversationId": "conv-1"}]
+             })), \
+             patch.object(requests, "post") as post:
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+            )
+
+        self.assertFalse(result)
+        post.assert_not_called()
+        self.assertIn("action_needed", followup._send_followup_email.last_error)
         self.assertTrue(followup._send_followup_email.guard_failed_closed)
 
     def test_followup_reply_all_filter_failure_deletes_draft_and_fails_closed(self):
