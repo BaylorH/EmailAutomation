@@ -47,14 +47,16 @@
     {
       "path": "email_automation/email_operations.py",
       "lane": "legacy_processing_helpers",
-      "policyStatus": "guarded",
+      "policyStatus": "legacy_disabled",
       "trigger": "Older helper functions for completion/remaining-question/new-property replies used by processing-era code paths.",
       "risk": "Helper-level Graph sends are easy to miss during safety reviews and may not share the latest placeholder, reply-all, or feature-lane checks.",
       "currentControls": [
+        "disabled by default unless SITESIFT_ENABLE_LEGACY_EMAIL_OPERATIONS=1 is explicitly set",
+        "focused regression test confirms helpers raise before Graph by default",
         "some helper-specific retry behavior",
         "some reply/new-message indexing"
       ],
-      "nextGate": "Either migrate callers into email_automation/email.py or wrap this module with the shared outbound policy and add path-specific tests."
+      "nextGate": "Delete the legacy helpers or migrate any proven caller into email_automation/email.py before enabling this lane again."
     },
     {
       "path": "email_automation/service_providers.py",

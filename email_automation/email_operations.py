@@ -1,4 +1,5 @@
 import hashlib
+import os
 import requests
 from typing import List, Dict, Tuple, Optional
 from google.cloud.firestore import FieldFilter
@@ -12,6 +13,23 @@ from .utils import (
     resolve_signature_settings,
 )
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
+
+
+LEGACY_EMAIL_OPERATIONS_FLAG = "SITESIFT_ENABLE_LEGACY_EMAIL_OPERATIONS"
+
+
+class LegacyEmailOperationsDisabled(RuntimeError):
+    """Raised when historical direct-Graph helpers are called outside migration work."""
+
+
+def _require_legacy_email_operations_enabled(function_name: str) -> None:
+    if os.environ.get(LEGACY_EMAIL_OPERATIONS_FLAG) == "1":
+        return
+    raise LegacyEmailOperationsDisabled(
+        f"{function_name} is a legacy direct-Graph send helper and is disabled by "
+        f"default. Route sends through email_automation.email or explicitly set "
+        f"{LEGACY_EMAIL_OPERATIONS_FLAG}=1 for a controlled local migration test."
+    )
 
 
 def _get_user_signature_settings(uid: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -70,6 +88,7 @@ def send_remaining_questions_email(uid: str, client_id: str, headers: dict, reci
     Send a remaining questions email in the same thread (idempotent).
     Returns True if sent, False if skipped (duplicate).
     """
+    _require_legacy_email_operations_enabled("send_remaining_questions_email")
     try:
         # Create content hash for idempotency
         content_key = f"missing:{','.join(sorted(missing_fields))}"
@@ -231,6 +250,7 @@ Could you please provide these details when you have a moment?"""
 def send_closing_email(uid: str, client_id: str, headers: dict, recipient: str, 
                       thread_id: str, row_number: int, row_anchor: str) -> bool:
     """Send polite closing email when all required fields are complete."""
+    _require_legacy_email_operations_enabled("send_closing_email")
     try:
         body = """Hi,
 
@@ -314,6 +334,7 @@ def send_new_property_email(uid: str, client_id: str, headers: dict, recipient: 
     Send a new thread email for a new property suggestion.
     Returns the new thread ID if successful.
     """
+    _require_legacy_email_operations_enabled("send_new_property_email")
     try:
         subject = f"{address}, {city}" if city else address
         
@@ -449,6 +470,7 @@ def send_thankyou_closing_with_new_property(uid: str, client_id: str, headers: d
     This closes out the current thread and informs the broker we'll follow up
     separately about the new property.
     """
+    _require_legacy_email_operations_enabled("send_thankyou_closing_with_new_property")
     try:
         body = f"""Hi,
 
@@ -586,6 +608,7 @@ def send_thankyou_ask_alternatives(uid: str, client_id: str, headers: dict,
                                   recipient: str, thread_id: str, 
                                   row_number: int, row_anchor: str) -> bool:
     """Send thank you + ask for alternatives when property is unavailable."""
+    _require_legacy_email_operations_enabled("send_thankyou_ask_alternatives")
     try:
         body = """Hi,
 
