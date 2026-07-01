@@ -1,5 +1,7 @@
 import json
+import re
 import unittest
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -81,9 +83,9 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
                                 for test_file in cell["testFiles"]
                             )
                             for test_id in cell["testIds"]:
-                                self.assertIn(
-                                    test_id,
+                                self.assertRegex(
                                     test_corpus,
+                                    rf"def\s+{re.escape(test_id)}\s*\(",
                                     f"{feature_id}/{fixture_class} references stale or descriptive testId {test_id}.",
                                 )
                         else:
@@ -108,6 +110,17 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
         self.assertTrue(set(suite["requiredEventClasses"]).issubset(covered_events))
         self.assertTrue(set(suite["requiredCombinationPlaybooks"]).issubset(covered_combinations))
         self.assertTrue(set(suite["requiredStatePermutations"]).issubset(covered_states))
+
+    def test_summary_counts_match_fixture_cells(self):
+        fixture_map = _read_json(FIXTURE_MAP_PATH)
+        cells = [
+            cell
+            for feature_cells in fixture_map["featureFixtureMatrix"].values()
+            for cell in feature_cells.values()
+        ]
+        counts = Counter(cell["status"] for cell in cells)
+
+        self.assertEqual(dict(counts), fixture_map["summary"])
 
     def test_known_incident_rows_are_named_and_not_generic(self):
         fixture_map = _read_json(FIXTURE_MAP_PATH)

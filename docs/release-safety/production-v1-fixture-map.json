@@ -19,8 +19,8 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "covered": 44,
-    "needs_fixture": 65,
+    "covered": 40,
+    "needs_fixture": 69,
     "needs_live_proof": 10
   },
   "featureFixtureMatrix": {
@@ -363,7 +363,7 @@
         "incidentId": "karsen_raw_name_message"
       },
       "wrong_recipient": {
-        "status": "covered",
+        "status": "needs_fixture",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -377,15 +377,9 @@
           "automated",
           "firestore"
         ],
-        "testFiles": [
-          "tests/test_processing_reply_safety.py",
-          "tests/test_scheduler_scope.py"
-        ],
-        "testIds": [
-          "test_send_reply_blocks_non_allowlisted_auto_reply_before_graph_request",
-          "test_manual_dispatch_requires_dev_scoped_guard"
-        ],
-        "incidentId": "wrong_recipient_launch_guard"
+        "incidentId": "wrong_recipient_launch_guard",
+        "gapReason": "The current proof reuses generic auto-reply/scheduler guard tests and does not independently prove initial launch drafting/sending cannot target non-campaign or non-allowlisted recipients.",
+        "nextProof": "Add a launch-draft wrong-recipient fixture covering row mapping, recipient allowlist/blocked contact handling, reply-all exclusions, and outbox prevention before Graph."
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -519,7 +513,7 @@
         ]
       },
       "wrong_recipient": {
-        "status": "covered",
+        "status": "needs_fixture",
         "eventClasses": [
           "reply_all_cc_context"
         ],
@@ -534,14 +528,8 @@
           "firestore",
           "email"
         ],
-        "testFiles": [
-          "tests/test_processing_reply_safety.py",
-          "tests/test_results_feature_admin_gate.py"
-        ],
-        "testIds": [
-          "test_send_reply_blocks_non_allowlisted_auto_reply_before_graph_request",
-          "test_pauses_non_admin_tour_invite_outbox_items"
-        ]
+        "gapReason": "The current proof mixes auto-reply and tour-admin gate evidence and does not independently prove the generic outbox sender enforces recipient safety for Production V1 core messages.",
+        "nextProof": "Add an outbox-send wrong-recipient fixture that queues a core campaign outbox item with unsafe recipients/CCs, proves the sender filters or blocks it before Graph, and leaves operator-visible evidence."
       },
       "manual_continuation": {
         "status": "covered",
@@ -778,7 +766,7 @@
     },
     "core.manual_reply": {
       "happy_path": {
-        "status": "covered",
+        "status": "needs_fixture",
         "eventClasses": [
           "manual_user_continuation"
         ],
@@ -793,14 +781,8 @@
           "firestore",
           "email"
         ],
-        "testFiles": [
-          "tests/test_action_audit_backend.py",
-          "tests/test_outbox_safety.py"
-        ],
-        "testIds": [
-          "test_successful_dashboard_send_marks_action_audit_sent",
-          "test_successful_dashboard_outbox_finalizes_notification_and_thread_after_send"
-        ]
+        "gapReason": "The current proof reuses generic dashboard/outbox send tests and does not independently exercise a manual dashboard reply from draft through Graph send, actionAudit, thread state, and Gmail/readback evidence.",
+        "nextProof": "Add a deterministic manual-reply fixture that starts from an action-needed dashboard draft, sends through the manual reply surface, preserves recipients, records actionAudit/Graph IDs, updates the thread, and proves the broker-visible message body."
       },
       "terminal_state": {
         "status": "needs_fixture",
@@ -821,7 +803,7 @@
         "nextProof": "Add or identify a deterministic core.manual_reply / terminal_state fixture, then wire it to this map before reopening users."
       },
       "bad_placeholder": {
-        "status": "covered",
+        "status": "needs_fixture",
         "eventClasses": [
           "manual_user_continuation"
         ],
@@ -835,12 +817,8 @@
           "automated",
           "email"
         ],
-        "testFiles": [
-          "tests/test_processing_reply_safety.py"
-        ],
-        "testIds": [
-          "test_send_reply_blocks_placeholder_before_graph_request"
-        ]
+        "gapReason": "The current proof reuses the automatic inbox reply placeholder guard and does not independently prove the manual dashboard reply composer/outbox path blocks unresolved placeholders before Graph.",
+        "nextProof": "Add a manual dashboard reply fixture with [NAME], bracket placeholders, and malformed greeting variants, then prove the item becomes operator-visible review/dead-letter state without a Graph call."
       },
       "wrong_recipient": {
         "status": "covered",
@@ -858,12 +836,10 @@
           "email"
         ],
         "testFiles": [
-          "tests/test_graph_retry_policy.py",
-          "tests/test_processing_reply_safety.py"
+          "tests/test_graph_retry_policy.py"
         ],
         "testIds": [
-          "test_dashboard_thread_reply_falls_back_when_graph_recipients_filter_to_zero",
-          "test_send_reply_blocks_non_allowlisted_auto_reply_before_graph_request"
+          "test_dashboard_thread_reply_falls_back_when_graph_recipients_filter_to_zero"
         ]
       },
       "manual_continuation": {
@@ -1027,7 +1003,7 @@
           "same_broker_multiple_properties"
         ],
         "statePermutations": [
-          "live_waiting"
+          "retry_reconciled"
         ],
         "evidence": [
           "automated",
@@ -1046,7 +1022,7 @@
           "same_broker_multiple_properties"
         ],
         "statePermutations": [
-          "live_waiting"
+          "dead_letter_visible"
         ],
         "evidence": [
           "automated",
@@ -1342,7 +1318,7 @@
           "tour_unavailable_but_property_viable"
         ],
         "statePermutations": [
-          "live_waiting"
+          "retry_reconciled"
         ],
         "evidence": [
           "automated",
@@ -1361,7 +1337,7 @@
           "tour_unavailable_but_property_viable"
         ],
         "statePermutations": [
-          "live_waiting"
+          "dead_letter_visible"
         ],
         "evidence": [
           "automated",
@@ -1483,7 +1459,7 @@
           "partial_specs_plus_pdf_plus_followup"
         ],
         "statePermutations": [
-          "live_waiting"
+          "retry_reconciled"
         ],
         "evidence": [
           "automated",
@@ -1502,7 +1478,7 @@
           "partial_specs_plus_pdf_plus_followup"
         ],
         "statePermutations": [
-          "live_waiting"
+          "dead_letter_visible"
         ],
         "evidence": [
           "automated",
@@ -1622,7 +1598,7 @@
           "row_move_during_pending_action"
         ],
         "statePermutations": [
-          "live_waiting"
+          "retry_reconciled"
         ],
         "evidence": [
           "automated",
@@ -1641,7 +1617,7 @@
           "row_move_during_pending_action"
         ],
         "statePermutations": [
-          "live_waiting"
+          "dead_letter_visible"
         ],
         "evidence": [
           "automated",
@@ -1928,7 +1904,7 @@
           "graph_accepted_but_index_missing"
         ],
         "statePermutations": [
-          "live_waiting"
+          "retry_reconciled"
         ],
         "evidence": [
           "automated",
@@ -1947,7 +1923,7 @@
           "graph_accepted_but_index_missing"
         ],
         "statePermutations": [
-          "live_waiting"
+          "dead_letter_visible"
         ],
         "evidence": [
           "automated",
@@ -2527,7 +2503,7 @@
           "graph_accepted_but_index_missing"
         ],
         "statePermutations": [
-          "live_waiting"
+          "retry_reconciled"
         ],
         "evidence": [
           "automated",
@@ -2546,7 +2522,7 @@
           "graph_accepted_but_index_missing"
         ],
         "statePermutations": [
-          "live_waiting"
+          "dead_letter_visible"
         ],
         "evidence": [
           "automated",
