@@ -17,6 +17,37 @@ scope, and feature-lane leakage.
 7. Treat CodeRabbit findings as review evidence; still verify with unit tests,
    Firestore readback, scheduler readback, and Baylor/BP21 proof where relevant.
 
+## Feature Registry Contract
+
+Every production-impacting pull request must be reviewed against:
+
+- `AGENTS.md`
+- `docs/release-safety/feature-registry.json`
+- `docs/release-safety/adversarial-rubrics.json`
+- `docs/release-safety/outbound-send-surface-inventory.json`
+
+CodeRabbit should flag a PR when changed behavior is not mapped to a registry
+feature with a lane, owner modules, dependencies, send risk, data writes, prompt
+contracts, UI surfaces, fixtures, manual screenshot rubrics, and CodeRabbit
+checks.
+
+Production V1 currently means the `production_v1_core` and
+`production_v1_admin` lanes only. The `dev_results`, `dev_tour`, and
+`later_firebase_native` lanes are not normal-user production behavior. Changes
+that expose those lanes to normal users, allow their side effects through
+Firestore/Functions/backend paths, or mix their prompt contracts into core
+campaign sending should be treated as release blockers.
+
+Useful review prompt:
+
+> Review this PR as a SiteSift release-safety change. Compare changed files to
+> `AGENTS.md`, `docs/release-safety/feature-registry.json`,
+> `docs/release-safety/adversarial-rubrics.json`, and
+> `docs/release-safety/outbound-send-surface-inventory.json`. Flag missing
+> feature rows, send-risk mismatches, Results/Tour leakage into Production V1,
+> UI-only gates for backend-capable behavior, prompt changes without fixtures,
+> and any production send path not tied to the outbound safety inventory.
+
 ## Production Entry Points
 
 | Area | Files | What must stay true |

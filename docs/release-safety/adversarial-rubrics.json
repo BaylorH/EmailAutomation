@@ -1,0 +1,204 @@
+{
+  "schemaVersion": 1,
+  "rubrics": [
+    {
+      "id": "placeholder_name_resolution",
+      "goal": "Block any outreach or reply that would expose a raw placeholder, especially [NAME], {{name}}, or blank first-name variants.",
+      "breakAttempts": [
+        "Upload sheets with Contact, Broker, Name, First Name, full-name-only, blank-name, and unrelated name columns.",
+        "Generate launch drafts and dashboard replies with missing or ambiguous recipient variables."
+      ],
+      "evidence": [
+        "Setup UI shows an unmistakable variable review warning before launch.",
+        "Outbox validator blocks raw placeholders before send.",
+        "Sheet/readback proves the chosen first-name source matches the broker row."
+      ],
+      "stopConditions": [
+        "A placeholder reaches outbox.",
+        "A draft greets an empty or wrong contact name.",
+        "The UI lets the user launch without resolving an ambiguous name column."
+      ]
+    },
+    {
+      "id": "core_vs_tour_language_isolation",
+      "goal": "Keep Production V1 outreach focused on information gathering; tour scheduling and LOI language must not leak unless the Tour lane is explicitly enabled.",
+      "breakAttempts": [
+        "Use rows with phrases like tour, showing, walk-through, LOI, client visit, and availability.",
+        "Process broker replies that mention tour availability in otherwise normal campaigns."
+      ],
+      "evidence": [
+        "Normal-user drafts do not request tour slots.",
+        "Tour statuses are hidden or quarantined outside the Tour lane.",
+        "Backend guards reject tour-invite outbox records for non-test users."
+      ],
+      "stopConditions": [
+        "A normal-user campaign auto-schedules or requests tours.",
+        "Tour invite records are created for a non-allowlisted user.",
+        "The classifier marks property viability incorrectly because a tour is unavailable."
+      ]
+    },
+    {
+      "id": "recipient_reply_all_preservation",
+      "goal": "Preserve intended To/Cc context and never drop broker-copied teammates when replying.",
+      "breakAttempts": [
+        "Replay broker replies with multiple Cc contacts and a sender different from the original recipient.",
+        "Send dashboard reply, auto-reply, follow-up, and pending-response retry variants."
+      ],
+      "evidence": [
+        "Graph payload preserves safe reply-all participants.",
+        "Blocked/opt-out contacts remain filtered.",
+        "Action audit records final recipients and Graph message identifiers."
+      ],
+      "stopConditions": [
+        "A safe Cc recipient is dropped.",
+        "A blocked or unrelated recipient is added.",
+        "Action audit cannot explain who received the message."
+      ]
+    },
+    {
+      "id": "blocked_contact_optout",
+      "goal": "Every outbound path must respect blocked contacts, opt-outs, and unsubscribe-style broker requests before creating or retrying a send.",
+      "breakAttempts": [
+        "Mark a broker and a copied teammate as blocked, then attempt launch, dashboard reply, auto-reply, follow-up, and dead-letter recovery sends.",
+        "Replay broker language such as remove me, do not contact, wrong person, and unsubscribe across direct replies and forwarded threads."
+      ],
+      "evidence": [
+        "Outbox validator rejects blocked recipients before Graph send.",
+        "Auto-reply and follow-up paths stop or escalate instead of sending.",
+        "Action audit records opt-out skipped or blocked-contact skipped as a terminal visible state."
+      ],
+      "stopConditions": [
+        "A blocked or opted-out address receives a message.",
+        "A blocked contact is reintroduced through Cc/reply-all.",
+        "An opt-out decision is hidden from the dashboard or action audit."
+      ]
+    },
+    {
+      "id": "manual_intervention_duplicate_send",
+      "goal": "Avoid double sends when a user manually continues a conversation outside the dashboard or Graph returns partial success.",
+      "breakAttempts": [
+        "Create outbox items, then simulate a user-sent message in Sent Items before worker retry.",
+        "Force Graph send success followed by audit/write failure."
+      ],
+      "evidence": [
+        "Worker checks recent Sent Items/thread state before retrying.",
+        "Duplicate-skipped actions are terminalized visibly.",
+        "Dead-letter recovery rechecks recipient and prior-send state."
+      ],
+      "stopConditions": [
+        "A retry sends a duplicate message.",
+        "A manual user send is ignored.",
+        "A failed audit hides a successfully sent email."
+      ]
+    },
+    {
+      "id": "ai_failure_visibility",
+      "goal": "AI, parse, and quota failures must stay visible and retryable instead of marking broker replies processed.",
+      "breakAttempts": [
+        "Force OpenAI quota and malformed JSON failures.",
+        "Replay replies with attached PDFs, forwards, short answers, and conflicting data."
+      ],
+      "evidence": [
+        "Processing failures appear in health and recovery views.",
+        "Messages are not marked complete until the extracted state is committed.",
+        "Retry paths preserve source message identity."
+      ],
+      "stopConditions": [
+        "A broker reply disappears after an AI failure.",
+        "The dashboard reports healthy while failures remain unresolved.",
+        "Retry loses the source message/thread identity."
+      ]
+    },
+    {
+      "id": "dashboard_state_truth",
+      "goal": "Dashboard badges, filters, counts, and expanded rows must show current action state without stale parent/child contradictions.",
+      "breakAttempts": [
+        "Stack stop, cancel, send reply, new property, non-viable, and terminal states on one client.",
+        "Refresh during queued, sent, failed, dismissed, archived, and completed states."
+      ],
+      "evidence": [
+        "Counts match Firestore queues and actionAudit.",
+        "Terminal child states are not hidden by stale parent rows.",
+        "Current actions are separated from read-only history."
+      ],
+      "stopConditions": [
+        "An unresolved action is hidden.",
+        "A failed send looks successful.",
+        "Completed/active filters contradict the row state."
+      ]
+    },
+    {
+      "id": "entitlement_bypass",
+      "goal": "Feature gates must hold at UI, callable, Firestore, scheduler, and backend worker layers.",
+      "breakAttempts": [
+        "Attempt direct Firestore writes for Results/Tour outbox and coordinates as a normal user.",
+        "Call Functions directly with normal-user auth.",
+        "Set runtime feature flags in the browser console."
+      ],
+      "evidence": [
+        "Denied-path tests cover UI, Functions, Firestore rules, and backend worker filters.",
+        "Normal users cannot access dev-only Results/Tour side effects.",
+        "Production flags cannot be overridden at runtime."
+      ],
+      "stopConditions": [
+        "A normal user can queue Tour or Results side effects.",
+        "A callable exposes usage or map data without the correct entitlement.",
+        "Firestore rules allow non-core outbox sources outside the lane."
+      ]
+    },
+    {
+      "id": "prompt_taxonomy_drift",
+      "goal": "Every AI event type must have downstream handling, UI copy, tests, and no confusing overlap with existing states.",
+      "breakAttempts": [
+        "Replay unavailable, tour-unavailable, wrong-contact, question, flyer, and redirect replies.",
+        "Add a new event label in prompts without adding fixture expectations."
+      ],
+      "evidence": [
+        "Prompt labels map to backend state transitions and UI labels.",
+        "Regression fixtures cover Karsen/Jill failure variants.",
+        "Unknown labels fall back to visible review instead of silent automation."
+      ],
+      "stopConditions": [
+        "Tour unavailable is treated as property unavailable.",
+        "A new event type lacks tests or dashboard handling.",
+        "A reply is auto-handled when it should escalate."
+      ]
+    },
+    {
+      "id": "signature_identity_boundary",
+      "goal": "Every outbound path uses the signed-in user's saved identity/signature and never inherits Jill/MOHR defaults for unrelated users.",
+      "breakAttempts": [
+        "Send launch, dashboard reply, follow-up, pending retry, new-property, and tour drafts for non-MOHR and MOHR-domain users.",
+        "Test missing logo, custom logo, custom first name, and organization fallback cases."
+      ],
+      "evidence": [
+        "Preview and actual Gmail/Outlook rendering match.",
+        "Sender first name comes from user settings/profile.",
+        "Organization defaults are domain-scoped and explicit."
+      ],
+      "stopConditions": [
+        "A non-Jill user sends Jill's signature.",
+        "A draft closes with the wrong sender name.",
+        "Preview differs from actual sent email."
+      ]
+    },
+    {
+      "id": "data_write_artifact_parity",
+      "goal": "Sheets, Firestore, PDFs, maps, and exported artifacts must reflect sourced campaign data without blanks, fake values, or row drift.",
+      "breakAttempts": [
+        "Move rows after launch, send PDFs/flyers, create new properties, and generate partial/final results.",
+        "Compare generated Summary/Packet/Map/Tour artifacts against Jill-style examples."
+      ],
+      "evidence": [
+        "Row anchors survive sheet moves.",
+        "Downloaded PDFs suppress blanks and show provenance-backed fields.",
+        "Route order matches Summary, Packet, Map, and Tour Planner."
+      ],
+      "stopConditions": [
+        "A generated artifact invents unsourced values.",
+        "A row update lands on the wrong property.",
+        "PDF/map/tour order disagree."
+      ]
+    }
+  ]
+}
