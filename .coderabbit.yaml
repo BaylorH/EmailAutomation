@@ -36,6 +36,12 @@ reviews:
     - "!**/*.pdf"
     - "!**/*.xlsx"
   path_instructions:
+    - path: "docs/release-safety/**"
+      instructions: |
+        Treat release-safety docs as enforceable product review contracts. Flag drift between feature-registry.json, adversarial-rubrics.json, outbound-send-surface-inventory.json, system-audit-matrix.json, and AGENTS.md.
+
+        For send-risk features, require frontend surfaces, backend surfaces, Firestore writes, email behavior, user-visible evidence, source-of-truth readbacks, CodeRabbit questions, and the full fixture class set: happy path, terminal state, bad placeholder, wrong recipient, manual continuation, duplicate retry, and operator-visible failure.
+
     - path: ".github/workflows/email.yml"
       instructions: |
         Treat this as a production scheduler file. Flag any change that widens the scheduler from the explicitly intended user scope, removes the scheduler lease/concurrency behavior, runs a legacy sender, or changes the command away from the reviewed production entrypoint without a rollback/test plan.

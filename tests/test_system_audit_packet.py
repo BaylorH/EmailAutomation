@@ -1,0 +1,164 @@
+import json
+import unittest
+from pathlib import Path
+from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REGISTRY_PATH = REPO_ROOT / "docs" / "release-safety" / "feature-registry.json"
+MATRIX_PATH = REPO_ROOT / "docs" / "release-safety" / "system-audit-matrix.json"
+PACKET_PATH = REPO_ROOT / "docs" / "release-safety" / "system-audit-packet.md"
+
+SEND_RISKS_REQUIRING_SYSTEM_AUDIT = {
+    "queues_email",
+    "sends_email_user_click",
+    "sends_email_autonomous",
+    "recovery_send",
+}
+
+REQUIRED_ENTRY_FIELDS = {
+    "frontendSurfaces",
+    "backendSurfaces",
+    "firestoreWrites",
+    "emailBehavior",
+    "userVisibleEvidence",
+    "sourceOfTruthReadbacks",
+    "codeRabbitQuestions",
+    "adversarialFixtureClasses",
+}
+
+REQUIRED_FIXTURE_CLASSES = {
+    "happy_path",
+    "terminal_state",
+    "bad_placeholder",
+    "wrong_recipient",
+    "manual_continuation",
+    "duplicate_retry",
+    "operator_visible_failure",
+}
+
+REQUIRED_REVIEW_ORDER = {
+    "frontend_surface",
+    "backend_surface",
+    "firestore_state",
+    "email_graph_state",
+    "sheet_results_state",
+    "coderabbit_review",
+}
+
+REQUIRED_INVARIANT_IDS = {
+    "normal_users_cannot_trigger_tour",
+    "raw_placeholders_never_reach_outbox",
+    "every_send_has_visible_audit",
+    "retry_checks_sent_items_and_manual_continuation",
+    "frontend_gates_match_backend_entitlements",
+    "reply_all_cc_context_is_preserved",
+}
+
+QUESTION_KEYWORDS = {
+    "send",
+    "recipient",
+    "placeholder",
+    "failure",
+    "entitlement",
+    "normal user",
+    "tour",
+    "duplicate",
+    "audit",
+    "cc",
+}
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    with path.open() as handle:
+        return json.load(handle)
+
+
+class SystemAuditPacketTests(unittest.TestCase):
+    def test_system_audit_packet_files_exist(self):
+        self.assertTrue(
+            MATRIX_PATH.exists(),
+            "docs/release-safety/system-audit-matrix.json must tie frontend, backend, Firestore, email, and evidence together.",
+        )
+        self.assertTrue(
+            PACKET_PATH.exists(),
+            "docs/release-safety/system-audit-packet.md must explain the cross-repo release review protocol.",
+        )
+
+    def test_matrix_covers_every_send_risk_feature(self):
+        registry = _read_json(REGISTRY_PATH)
+        matrix = _read_json(MATRIX_PATH)
+        registry_features = {feature["id"]: feature for feature in registry["features"]}
+        matrix_features = matrix.get("features", {})
+
+        self.assertEqual(1, matrix.get("schemaVersion"))
+        self.assertEqual(
+            set(matrix_features) - set(registry_features),
+            set(),
+            "System audit matrix cannot reference unknown feature ids.",
+        )
+
+        required_feature_ids = {
+            feature["id"]
+            for feature in registry["features"]
+            if feature.get("sendRisk") in SEND_RISKS_REQUIRING_SYSTEM_AUDIT
+        }
+        self.assertTrue(
+            required_feature_ids.issubset(set(matrix_features)),
+            "Every send-risk feature must have a cross-repo audit entry.",
+        )
+
+    def test_send_risk_entries_name_full_product_evidence_contract(self):
+        registry = _read_json(REGISTRY_PATH)
+        matrix = _read_json(MATRIX_PATH)
+        send_risk_ids = {
+            feature["id"]
+            for feature in registry["features"]
+            if feature.get("sendRisk") in SEND_RISKS_REQUIRING_SYSTEM_AUDIT
+        }
+
+        for feature_id in send_risk_ids:
+            with self.subTest(feature=feature_id):
+                entry = matrix["features"][feature_id]
+                self.assertTrue(
+                    REQUIRED_ENTRY_FIELDS.issubset(entry),
+                    "Send-risk entries must name frontend/backend/state/email/evidence review surfaces.",
+                )
+                for field in REQUIRED_ENTRY_FIELDS:
+                    self.assertTrue(entry[field], f"{field} cannot be empty for {feature_id}.")
+                self.assertEqual(
+                    REQUIRED_FIXTURE_CLASSES,
+                    set(entry["adversarialFixtureClasses"]),
+                    "Every send-risk system audit entry needs the full fixture class set.",
+                )
+                question_text = " ".join(entry["codeRabbitQuestions"]).lower()
+                self.assertTrue(
+                    any(keyword in question_text for keyword in QUESTION_KEYWORDS),
+                    "CodeRabbit questions must be specific to email/send/operator safety.",
+                )
+
+    def test_review_protocol_and_invariants_cover_known_incident_classes(self):
+        matrix = _read_json(MATRIX_PATH)
+        review_order = set(matrix.get("reviewProtocol", {}).get("reviewOrder", []))
+        invariant_ids = {
+            invariant.get("id") for invariant in matrix.get("crossRepoInvariants", [])
+        }
+
+        self.assertTrue(
+            REQUIRED_REVIEW_ORDER.issubset(review_order),
+            "Review protocol must force frontend, backend, Firestore, email, Sheet/results, and CodeRabbit review.",
+        )
+        self.assertTrue(
+            REQUIRED_INVARIANT_IDS.issubset(invariant_ids),
+            "Cross-repo invariants must cover the Karsen/Tyneesia/Jill/Baylor regression classes.",
+        )
+
+        packet = PACKET_PATH.read_text()
+        for phrase in (
+            "one SiteSift product",
+            "Normal users stay on Production V1",
+            "CodeRabbit",
+            "No live-user email or data mutation",
+        ):
+            self.assertIn(phrase, packet)
+

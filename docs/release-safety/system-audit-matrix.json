@@ -1,0 +1,216 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Treat SiteSift as one product across email-admin-ui, EmailAutomation, Firestore, Microsoft Graph, Google Sheets, and operator evidence before any production widening.",
+  "reviewProtocol": {
+    "reviewOrder": [
+      "frontend_surface",
+      "backend_surface",
+      "firestore_state",
+      "email_graph_state",
+      "sheet_results_state",
+      "coderabbit_review"
+    ],
+    "requiredBeforeProductionWidening": [
+      "identify changed feature ids in feature-registry.json",
+      "walk every send-risk feature through this matrix",
+      "run the fixture classes listed for each touched feature",
+      "request CodeRabbit review using this packet and both repo AGENTS.md files",
+      "read back Firestore, Graph/Sent Items, Sheet, dashboard, and actionAudit evidence",
+      "keep normal users paused or scoped off until the base proof passes"
+    ]
+  },
+  "crossRepoInvariants": [
+    {
+      "id": "normal_users_cannot_trigger_tour",
+      "rule": "Normal users cannot trigger Tour Scheduling email, drafts, pending invites, tour reply handling, or tour-specific dashboard actions from Production V1.",
+      "incidentClass": "Karsen weekend tour scheduling"
+    },
+    {
+      "id": "raw_placeholders_never_reach_outbox",
+      "rule": "Raw placeholders such as [NAME], {{name}}, local-part greetings, and blank first names must be blocked before outbox creation and again before Graph send.",
+      "incidentClass": "Karsen [NAME] outreach"
+    },
+    {
+      "id": "every_send_has_visible_audit",
+      "rule": "Every queued, sent, skipped, duplicate-skipped, cancelled, failed, or dead-lettered send must be visible in actionAudit or an operator recovery state.",
+      "incidentClass": "hidden failed send or unresolved action loss"
+    },
+    {
+      "id": "retry_checks_sent_items_and_manual_continuation",
+      "rule": "Any retry or recovery send must check recent Sent Items, thread state, and manual user continuation before sending again.",
+      "incidentClass": "manual user reply followed by autonomous duplicate"
+    },
+    {
+      "id": "frontend_gates_match_backend_entitlements",
+      "rule": "Frontend feature hiding is never enough; backend-capable Results, Tour, Usage, scheduler, and recovery behavior must fail closed by entitlement and user scope.",
+      "incidentClass": "UI-only feature gate leakage"
+    },
+    {
+      "id": "reply_all_cc_context_is_preserved",
+      "rule": "Dashboard replies, auto-replies, follow-ups, and recovery sends must preserve safe reply-all Cc context while filtering blocked or unrelated recipients.",
+      "incidentClass": "broker Cc teammate dropped"
+    }
+  ],
+  "features": {
+    "core.upload_mapping": {
+      "frontendSurfaces": ["StartProjectModal.jsx", "ColumnMappingStep.jsx", "Manage Clients upload", "Name Campaign", "Column Mapping", "Launch Preview"],
+      "backendSurfaces": ["email_automation/column_config.py", "email_automation/sheets.py"],
+      "firestoreWrites": ["users/{uid}/clients/{clientId}", "users/{uid}/outbox"],
+      "emailBehavior": ["Queues initial campaign outreach only after column/name/property review passes.", "Must not queue raw placeholders or tour-scheduling copy."],
+      "userVisibleEvidence": ["mapping warning state", "launch preview text", "row count and recipient review", "blocked launch error"],
+      "sourceOfTruthReadbacks": ["client doc columnConfig", "outbox docs for selected rows", "created Sheet headers/rows", "actionAudit queued state"],
+      "codeRabbitQuestions": ["Can this upload path queue email with a placeholder, wrong recipient, or normal-user tour language?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "core.name_resolution": {
+      "frontendSurfaces": ["StartProjectModal.jsx", "recipientVariableReview.js", "Column Mapping", "Launch Preview"],
+      "backendSurfaces": ["email_automation/outbound_safety.py", "email_automation/sheet_operations.py"],
+      "firestoreWrites": ["users/{uid}/clients/{clientId}", "users/{uid}/outbox"],
+      "emailBehavior": ["Resolves the greeting/name variable before any draft or send.", "Blocks [NAME], blank names, local-part greetings, and ambiguous contact columns."],
+      "userVisibleEvidence": ["red name/contact review", "sample row preview", "scroll-to-field guidance", "blocked send message"],
+      "sourceOfTruthReadbacks": ["chosen name column", "outbox subject/body", "sheet row source values", "outbound safety validation result"],
+      "codeRabbitQuestions": ["Can any recipient/name variation let a placeholder or wrong first name reach outbox or send?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "core.launch_draft": {
+      "frontendSurfaces": ["AddClientModal.jsx", "draftGuards.js", "Launch Preview", "Dashboard outbox"],
+      "backendSurfaces": ["email_automation/email.py", "email_automation/outbound_safety.py"],
+      "firestoreWrites": ["users/{uid}/outbox", "users/{uid}/actionAudit"],
+      "emailBehavior": ["Creates initial outreach drafts for approved campaign rows.", "Must not introduce tour, LOI, client-visit, or unresolved-variable language into Production V1."],
+      "userVisibleEvidence": ["preview body", "recipient/body/signature review", "blocked draft banner", "queued audit row"],
+      "sourceOfTruthReadbacks": ["outbox doc body/recipients", "actionAudit queued", "profile signature source", "sheet row anchor"],
+      "codeRabbitQuestions": ["Does this launch draft path send or queue unsafe copy, bad placeholders, tour language, or missing audit evidence?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "core.outbox_send": {
+      "frontendSurfaces": ["EmailSchedulerButton.jsx", "actionAudit.js", "health and pending-send indicators"],
+      "backendSurfaces": ["email_automation/email.py", "email_automation/outbound_safety.py", "email_automation/service_providers.py"],
+      "firestoreWrites": ["users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/deadLetterQueue", "users/{uid}/clients/{clientId}/threads"],
+      "emailBehavior": ["Autonomously sends already-approved outbox records through Microsoft Graph.", "Must dedupe partial successes, honor cancel-after-claim, and record Graph message identity when available."],
+      "userVisibleEvidence": ["pending send count", "sent/failed/dead-letter state", "cancelled or duplicate-skipped terminal state"],
+      "sourceOfTruthReadbacks": ["outbox drained", "actionAudit terminal status", "thread/message index", "Graph/Sent Items readback", "deadLetterQueue if failed"],
+      "codeRabbitQuestions": ["Can this autonomous send duplicate, lose audit, hide a failure, send to a wrong recipient, or miss Sent Items reconciliation?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "core.reply_all_cc": {
+      "frontendSurfaces": ["InlineReplyComposer.jsx", "ConversationsPanel.jsx", "recipient chip display"],
+      "backendSurfaces": ["email_automation/processing.py", "email_automation/email.py", "email_automation/service_providers.py"],
+      "firestoreWrites": ["users/{uid}/outbox", "users/{uid}/actionAudit"],
+      "emailBehavior": ["Preserves safe broker Cc/reply-all context for dashboard and automated replies while filtering blocked contacts."],
+      "userVisibleEvidence": ["To/Cc preview", "blocked/filtered recipient warning", "reply context in conversation panel"],
+      "sourceOfTruthReadbacks": ["Graph reply payload recipients", "actionAudit finalRecipients", "thread message recipients", "blocked contact readback"],
+      "codeRabbitQuestions": ["Does this reply-all path preserve safe CC recipients, filter bad recipients, and audit who received the send?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "core.manual_reply": {
+      "frontendSurfaces": ["InlineReplyComposer.jsx", "ConversationsPanel.jsx", "Send Reply action"],
+      "backendSurfaces": ["email_automation/email.py", "email_automation/pending_responses.py"],
+      "firestoreWrites": ["users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/pendingResponses"],
+      "emailBehavior": ["Queues or sends operator-approved replies only after exact body, recipient, signature, and action state are visible."],
+      "userVisibleEvidence": ["editable body", "recipient and signature preview", "pending/cancel state", "failed visible state"],
+      "sourceOfTruthReadbacks": ["pendingResponses or outbox record", "actionAudit queued/sent/failed", "Graph/Sent Items readback", "thread update after refresh"],
+      "codeRabbitQuestions": ["Can this manual reply hide failure, clear the action early, drop CCs, or send placeholders/wrong signatures?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "core.inbox_auto_reply": {
+      "frontendSurfaces": ["ConversationsPanel.jsx", "HealthWidget.jsx", "action notifications"],
+      "backendSurfaces": ["email_automation/processing.py", "email_automation/pending_responses.py", "email_automation/outbound_safety.py"],
+      "firestoreWrites": ["users/{uid}/pendingResponses", "users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/clients/{clientId}/threads"],
+      "emailBehavior": ["May draft or queue core information-gathering responses only under Production V1 rules.", "Must not auto-schedule tours or respond after terminal/manual continuation state."],
+      "userVisibleEvidence": ["generated response preview or action", "health pending count", "operator-visible failure"],
+      "sourceOfTruthReadbacks": ["source inbox message identity", "pending response status", "thread status", "actionAudit terminal state", "Sent Items if sent"],
+      "codeRabbitQuestions": ["Can inbox processing send an autonomous reply with tour language, bad placeholders, duplicate retry, or hidden failure?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "core.followups": {
+      "frontendSurfaces": ["EmailSchedulerButton.jsx", "ClientRow.jsx", "follow-up status badges"],
+      "backendSurfaces": ["email_automation/followup.py", "email_automation/email.py"],
+      "firestoreWrites": ["users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/clients/{clientId}"],
+      "emailBehavior": ["Autonomously sends follow-ups only after checking inbound replies, manual user replies, opt-outs, stopped/completed/max states, and recent Sent Items."],
+      "userVisibleEvidence": ["follow-up waiting/paused/stopped state", "sent or skipped audit", "blocked recovery notice"],
+      "sourceOfTruthReadbacks": ["thread followUpStatus", "Sent Items/manual continuation check result", "outbox/actionAudit", "scheduler log"],
+      "codeRabbitQuestions": ["Can this follow-up send after a broker reply, manual user reply, opt-out, terminal state, or duplicate-retry condition?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "core.signature_identity": {
+      "frontendSurfaces": ["SettingsPage.jsx", "signatureBuilder.js", "Signature Preview", "InlineReplyComposer.jsx"],
+      "backendSurfaces": ["email_automation/utils.py", "email_automation/email.py", "email_automation/outbound_safety.py"],
+      "firestoreWrites": ["users/{uid}", "users/{uid}/settings", "users/{uid}/outbox"],
+      "emailBehavior": ["Uses the signed-in user's selected signature and organization-safe defaults for every send path.", "Must not leak Jill/MOHR identity to unrelated users."],
+      "userVisibleEvidence": ["settings preview", "email composer signature", "logo/profile upload state", "sent Gmail/Graph render"],
+      "sourceOfTruthReadbacks": ["profile signature fields", "outbox body/attachments", "Graph MIME/body", "Sent Items screenshot/readback"],
+      "codeRabbitQuestions": ["Can this signature path send with missing identity, wrong organization, raw placeholder, or Jill/MOHR leakage?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "core.health_recovery": {
+      "frontendSurfaces": ["EmailSchedulerButton.jsx", "HealthWidget.jsx", "dead-letter/recovery controls"],
+      "backendSurfaces": ["email_automation/system_health.py", "email_automation/dead_letter_recovery.py", "email_automation/pending_responses.py"],
+      "firestoreWrites": ["users/{uid}/deadLetterQueue", "users/{uid}/processingFailures", "users/{uid}/pendingResponses"],
+      "emailBehavior": ["Recovery sends are explicit operator actions only, never hidden automatic retries.", "Must recheck Sent Items/manual continuation before send."],
+      "userVisibleEvidence": ["dead-letter card", "failed reason", "send/cancel/dismiss controls", "recovered terminal state"],
+      "sourceOfTruthReadbacks": ["deadLetterQueue before/after", "processingFailures", "pendingResponses", "actionAudit", "Sent Items"],
+      "codeRabbitQuestions": ["Can recovery hide a failure, delete evidence, duplicate-send, or send without a visible audit trail?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "core.scheduler_scope": {
+      "frontendSurfaces": ["HealthWidget.jsx", "operator health/readback surfaces"],
+      "backendSurfaces": ["main.py", "app.py", "email_automation/scheduler_scope.py"],
+      "firestoreWrites": ["schedulerLeases/emailAutomation", "systemHealth/emailAutomation", "users/{uid}/outbox", "users/{uid}/pendingResponses", "users/{uid}/processingFailures"],
+      "emailBehavior": ["Controls which users can be processed by autonomous worker runs.", "Must stay explicitly scoped during recovery and never surprise-process paused users."],
+      "userVisibleEvidence": ["health widget", "queue counts", "scheduler run notes", "paused/user-scoped status"],
+      "sourceOfTruthReadbacks": ["GitHub Actions environment/log", "scheduler lease", "per-user queue sweep", "system health doc"],
+      "codeRabbitQuestions": ["Can this scheduler change widen normal user scope, trigger unexpected sends, or hide failed queue state?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "tour.invite_queue": {
+      "frontendSurfaces": ["CompletedResultsWorkspace.jsx", "Tour Planner", "actionAudit.js"],
+      "backendSurfaces": ["email_automation/results_feature_gate.py", "email_automation/email.py"],
+      "firestoreWrites": ["users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/clients/{clientId}/tourPlan"],
+      "emailBehavior": ["Dev-only tour invite queueing; never normal-user Production V1.", "Requires explicit allowlist and preview approval before any email side effect."],
+      "userVisibleEvidence": ["disabled/unavailable normal-user state", "allowlisted preview", "queued invite audit", "tour date/time"],
+      "sourceOfTruthReadbacks": ["feature entitlement", "tourPlan state", "outbox/actionAudit", "normal-user denied-path test"],
+      "codeRabbitQuestions": ["Can a normal user trigger tour invite email, queued tour outbox, or hidden tour audit from Results?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "tour.reply_handling": {
+      "frontendSurfaces": ["ConversationsPanel.jsx", "InlineReplyComposer.jsx", "Tour Scheduling view"],
+      "backendSurfaces": ["email_automation/processing.py", "email_automation/tour_scheduling.py", "email_automation/ai_processing.py"],
+      "firestoreWrites": ["users/{uid}/clients/{clientId}/threads", "users/{uid}/clients/{clientId}/notifications", "users/{uid}/outbox"],
+      "emailBehavior": ["Dev-only tour reply classification and response drafting.", "Must distinguish tour unavailable from property unavailable and never run for normal users."],
+      "userVisibleEvidence": ["Tour Scheduling conversation tab", "tour unavailable status", "draft response preview", "normal-user disabled state"],
+      "sourceOfTruthReadbacks": ["thread event type", "notification/action", "tourPlan stop status", "outbox denied or queued audit"],
+      "codeRabbitQuestions": ["Can tour reply handling misclassify unavailable tours, send for a normal user, or create duplicate replies?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "tour.alternate_time": {
+      "frontendSurfaces": ["ConversationsPanel.jsx", "CompletedResultsMapView.jsx", "tour schedule panel"],
+      "backendSurfaces": ["email_automation/tour_scheduling.py"],
+      "firestoreWrites": ["users/{uid}/clients/{clientId}/tourPlan", "users/{uid}/outbox"],
+      "emailBehavior": ["Dev-only alternate-time response drafting tied to itinerary conflicts.", "Must not generic-reply or alter normal broker outreach."],
+      "userVisibleEvidence": ["requested alternate time", "conflict/free slot display", "confirm/deny draft", "tour date visible"],
+      "sourceOfTruthReadbacks": ["tourPlan proposed/confirmed/alternate status", "outbox/actionAudit", "thread message classification"],
+      "codeRabbitQuestions": ["Can alternate-time tour code send without entitlement, miss a conflict, duplicate-send, or hide operator failure?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "infra.cloud_scheduler": {
+      "frontendSurfaces": ["operator health/readback surfaces", "admin-only status if added later"],
+      "backendSurfaces": ["main.py", "email_automation/scheduler_scope.py", "future Firebase/GCP scheduler entrypoint"],
+      "firestoreWrites": ["schedulerLeases", "users/{uid}/processingState"],
+      "emailBehavior": ["Future Firebase-native scheduler must preserve the same user scope, order, lease, and send guards as the GitHub worker."],
+      "userVisibleEvidence": ["health run timestamp", "scoped user list", "queue counts", "disabled normal-user proof during recovery"],
+      "sourceOfTruthReadbacks": ["scheduler log", "lease doc", "per-user queues", "GitHub/GCP run id"],
+      "codeRabbitQuestions": ["Can the cloud scheduler widen user scope, change send order, bypass audit, or process normal users unexpectedly?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    },
+    "infra.cloud_tasks": {
+      "frontendSurfaces": ["operator recovery/status surfaces if added later"],
+      "backendSurfaces": ["email_automation/email.py", "email_automation/pending_responses.py", "future Cloud Tasks worker"],
+      "firestoreWrites": ["cloudTasks", "users/{uid}/actionAudit", "users/{uid}/deadLetterQueue"],
+      "emailBehavior": ["Future task worker must preserve actionAudit, dedupe, recipient validation, Sent Items/manual-continuation checks, and dead-letter visibility."],
+      "userVisibleEvidence": ["task pending/sent/failed state", "operator-visible recovery", "normal-user scope status"],
+      "sourceOfTruthReadbacks": ["task id", "actionAudit terminal state", "deadLetterQueue", "Graph/Sent Items readback"],
+      "codeRabbitQuestions": ["Can Cloud Tasks create duplicate sends, hide failure, bypass recipient checks, or skip audit terminalization?"],
+      "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
+    }
+  }
+}
