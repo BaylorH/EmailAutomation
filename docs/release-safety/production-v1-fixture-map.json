@@ -19,8 +19,8 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "covered": 41,
-    "needs_fixture": 68,
+    "covered": 43,
+    "needs_fixture": 66,
     "needs_live_proof": 10
   },
   "featureFixtureMatrix": {
@@ -159,22 +159,26 @@
     },
     "core.name_resolution": {
       "happy_path": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
         "combinationPlaybooks": [
-          "manual_reply_before_retry"
+          "placeholder_name_through_send_path"
         ],
         "statePermutations": [
-          "live_waiting"
+          "outbox_queued"
         ],
         "evidence": [
-          "automated",
-          "firestore"
+          "automated"
         ],
-        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.name_resolution yet.",
-        "nextProof": "Add or identify a deterministic core.name_resolution / happy_path fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_campaign_launch_replaces_name_placeholder_before_send_guard"
+        ],
+        "incidentId": "karsen_name_placeholder_positive_resolution"
       },
       "terminal_state": {
         "status": "needs_fixture",
@@ -300,22 +304,26 @@
     },
     "core.launch_draft": {
       "happy_path": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
         "combinationPlaybooks": [
-          "partial_specs_plus_pdf_plus_followup"
+          "placeholder_name_through_send_path"
         ],
         "statePermutations": [
-          "live_waiting"
+          "outbox_queued"
         ],
         "evidence": [
-          "automated",
-          "firestore"
+          "automated"
         ],
-        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.launch_draft yet.",
-        "nextProof": "Add or identify a deterministic core.launch_draft / happy_path fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_campaign_launch_replaces_name_placeholder_before_send_guard"
+        ],
+        "incidentId": "launch_draft_name_placeholder_positive_resolution"
       },
       "terminal_state": {
         "status": "needs_fixture",

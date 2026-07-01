@@ -259,6 +259,43 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertNotIn("Jill Ames", captured_signature["html"])
         self.assertNotIn("jill.ames@mohrpartners.com", captured_signature["html"])
 
+    def test_campaign_launch_replaces_name_placeholder_before_send_guard(self):
+        doc = FakeDoc({
+            "assignedEmails": ["bp21harrison@gmail.com"],
+            "script": "Hi [NAME],\n\nCould you confirm the SF available?",
+            "clientId": "client-1",
+            "subject": "100 Name Resolution Way",
+            "rowNumber": 3,
+            "contactName": "Avery Brooks",
+        }, doc_id="outbox-name-resolution")
+        captured_body = {}
+
+        def record_send(_user_id, _headers, script, *_args, **_kwargs):
+            captured_body["script"] = script
+            return {
+                "sent": ["bp21harrison@gmail.com"],
+                "errors": {},
+            }
+
+        with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "get_contact_email_count", return_value=0), \
+             patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter, \
+             patch.object(email_module, "send_and_index_email", side_effect=record_send) as send_and_index_email, \
+             patch.object(email_module, "_finalize_successful_outbox_item"):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        move_to_dead_letter.assert_not_called()
+        send_and_index_email.assert_called_once()
+        self.assertEqual(
+            "Hi Avery,\n\nCould you confirm the SF available?",
+            captured_body["script"],
+        )
+
     def test_paused_client_outbox_item_moves_to_dead_letter_before_send(self):
         doc_ref = FakeDocRef("paused-outbox")
         data = {"clientId": "client-1", "script": "Hi Avery"}

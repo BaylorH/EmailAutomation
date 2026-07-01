@@ -1,4 +1,5 @@
 import json
+import re
 import requests
 import time
 import uuid
@@ -1106,6 +1107,32 @@ def _extract_requirements_from_primary(primary_script: str) -> str:
     return ""
 
 
+NAME_PLACEHOLDER_RE = re.compile(
+    r"\[(?:name|first[\s_-]*name|contact[\s_-]*name|broker[\s_-]*name|recipient[\s_-]*name)\]",
+    re.IGNORECASE,
+)
+
+
+def _safe_greeting_first_name(contact_name: Optional[str]) -> Optional[str]:
+    candidate = (contact_name or "").strip()
+    if not candidate or "@" in candidate or "[" in candidate or "]" in candidate:
+        return None
+    first = candidate.split()[0].strip(" ,;:()[]{}")
+    if not first or not re.search(r"[A-Za-z]", first):
+        return None
+    return first
+
+
+def _personalize_name_placeholders(script: Optional[str], contact_name: Optional[str]) -> str:
+    body = script or ""
+    if "[" not in body:
+        return body
+    first_name = _safe_greeting_first_name(contact_name)
+    if not first_name:
+        return body
+    return NAME_PLACEHOLDER_RE.sub(first_name, body)
+
+
 def _select_script_for_recipient(user_id: str, recipient_email: str,
                                   scripts: List[str], contact_name: str = None) -> str:
     """
@@ -1131,7 +1158,7 @@ def _select_script_for_recipient(user_id: str, recipient_email: str,
 
     if email_count == 0:
         print(f"  → Using script[0] - PRIMARY (first contact)")
-        return primary_script
+        return _personalize_name_placeholders(primary_script, contact_name)
 
     # For subsequent contacts, try to use the matching script index
     script_index = email_count  # 1st contact uses [0], 2nd uses [1], etc.
@@ -1143,9 +1170,9 @@ def _select_script_for_recipient(user_id: str, recipient_email: str,
         # Add organized note for 3rd+ contacts
         if email_count >= 2:
             organized_note = "\n\nI want to keep things organized for both of us, so I'm sending separate emails for each of your properties I'm inquiring about."
-            return script_to_use.rstrip() + organized_note
+            return _personalize_name_placeholders(script_to_use.rstrip() + organized_note, contact_name)
 
-        return script_to_use
+        return _personalize_name_placeholders(script_to_use, contact_name)
 
     # Fallback: use the last available script
     last_script = None
@@ -1158,8 +1185,8 @@ def _select_script_for_recipient(user_id: str, recipient_email: str,
         print(f"  → Using last available script (fallback for contact #{email_count + 1})")
         if email_count >= 2:
             organized_note = "\n\nI want to keep things organized for both of us, so I'm sending separate emails for each of your properties I'm inquiring about."
-            return last_script.rstrip() + organized_note
-        return last_script
+            return _personalize_name_placeholders(last_script.rstrip() + organized_note, contact_name)
+        return _personalize_name_placeholders(last_script, contact_name)
 
     # Ultimate fallback: generate from primary
     print(f"  → Using GENERATED fallback (contact #{email_count + 1})")
@@ -2189,8 +2216,9 @@ def _send_multi_property_email(
             item['doc'].reference.delete()
             continue
 
-        # Use the original approved script without modification
-        script = data.get("script", prop['script'])
+        contact_name = data.get("contactName") or data.get("firstName")
+        # Personalize only name-style launch placeholders; unsafe leftovers still hard-stop below.
+        script = _personalize_name_placeholders(data.get("script", prop['script']), contact_name)
         if _dead_letter_unsafe_outbound_body_if_needed(user_id, item['doc'].reference, data, script):
             print(f"   🛑 Blocked unsafe outbound body for {recipient_email}; manual review required")
             continue
@@ -2215,7 +2243,6 @@ def _send_multi_property_email(
                 except Exception as e:
                     print(f"   ⚠️ Could not fetch followUpConfig from client: {e}")
 
-            contact_name = data.get("contactName") or data.get("firstName")
             current_headers = _fresh_graph_headers(headers, headers_provider)
             prior_send = _sent_retry_reconciliation_result(
                 current_headers,
