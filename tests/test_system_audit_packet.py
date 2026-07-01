@@ -8,6 +8,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = REPO_ROOT / "docs" / "release-safety" / "feature-registry.json"
 MATRIX_PATH = REPO_ROOT / "docs" / "release-safety" / "system-audit-matrix.json"
 PACKET_PATH = REPO_ROOT / "docs" / "release-safety" / "system-audit-packet.md"
+CODERABBIT_CONTRACT_PATH = (
+    REPO_ROOT / "docs" / "release-safety" / "coderabbit-review-contract.md"
+)
 
 SEND_RISKS_REQUIRING_SYSTEM_AUDIT = {
     "queues_email",
@@ -83,6 +86,10 @@ class SystemAuditPacketTests(unittest.TestCase):
         self.assertTrue(
             PACKET_PATH.exists(),
             "docs/release-safety/system-audit-packet.md must explain the cross-repo release review protocol.",
+        )
+        self.assertTrue(
+            CODERABBIT_CONTRACT_PATH.exists(),
+            "docs/release-safety/coderabbit-review-contract.md must keep CodeRabbit aligned with the system audit packet.",
         )
 
     def test_matrix_covers_every_send_risk_feature(self):
@@ -162,3 +169,17 @@ class SystemAuditPacketTests(unittest.TestCase):
         ):
             self.assertIn(phrase, packet)
 
+    def test_coderabbit_contract_names_cross_repo_source_of_truth(self):
+        contract = CODERABBIT_CONTRACT_PATH.read_text()
+        for phrase in (
+            "AGENTS.md",
+            "feature-registry.json",
+            "adversarial-rubrics.json",
+            "outbound-send-surface-inventory.json",
+            "system-audit-matrix.json",
+        ):
+            self.assertIn(
+                phrase,
+                contract,
+                "CodeRabbit review contract must include every release-safety source-of-truth artifact.",
+            )

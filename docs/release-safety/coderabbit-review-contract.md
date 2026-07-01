@@ -25,6 +25,7 @@ Every production-impacting pull request must be reviewed against:
 - `docs/release-safety/feature-registry.json`
 - `docs/release-safety/adversarial-rubrics.json`
 - `docs/release-safety/outbound-send-surface-inventory.json`
+- `docs/release-safety/system-audit-matrix.json`
 
 CodeRabbit should flag a PR when changed behavior is not mapped to a registry
 feature with a lane, owner modules, dependencies, send risk, data writes, prompt
@@ -43,7 +44,8 @@ Useful review prompt:
 > Review this PR as a SiteSift release-safety change. Compare changed files to
 > `AGENTS.md`, `docs/release-safety/feature-registry.json`,
 > `docs/release-safety/adversarial-rubrics.json`, and
-> `docs/release-safety/outbound-send-surface-inventory.json`. Flag missing
+> `docs/release-safety/outbound-send-surface-inventory.json`, and
+> `docs/release-safety/system-audit-matrix.json`. Flag missing
 > feature rows, send-risk mismatches, Results/Tour leakage into Production V1,
 > UI-only gates for backend-capable behavior, prompt changes without fixtures,
 > and any production send path not tied to the outbound safety inventory.
