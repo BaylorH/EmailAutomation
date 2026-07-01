@@ -19,8 +19,8 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "covered": 40,
-    "needs_fixture": 69,
+    "covered": 41,
+    "needs_fixture": 68,
     "needs_live_proof": 10
   },
   "featureFixtureMatrix": {
@@ -2002,7 +2002,7 @@
         ]
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "reply_all_cc_context"
         ],
@@ -2017,9 +2017,18 @@
           "firestore",
           "email"
         ],
-        "gapReason": "Jill/MOHR signature or identity leakage to another user is named as a Production V1 incident class but still needs a stronger wrong-recipient fixture beyond the existing non-MOHR fallback tests.",
-        "nextProof": "Add a deterministic signature identity fixture proving non-MOHR users never inherit Jill/MOHR branding across launch drafts, dashboard replies, follow-ups, and recovery retries before reopening users.",
-        "incidentId": "jill_mohr_signature_leakage"
+        "incidentId": "jill_mohr_signature_leakage",
+        "testFiles": [
+          "tests/test_signature_footer.py",
+          "tests/test_processing_reply_safety.py",
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_custom_signature_rejects_stale_jill_html_for_other_users",
+          "test_resolved_professional_signature_uses_structured_fields_over_stale_cached_html",
+          "test_send_reply_in_thread_rejects_stale_jill_custom_signature_before_graph_patch",
+          "test_send_outboxes_resolves_structured_professional_signature_before_send"
+        ]
       },
       "manual_continuation": {
         "status": "needs_fixture",

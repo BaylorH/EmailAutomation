@@ -97,6 +97,40 @@ class SignatureFooterTests(unittest.TestCase):
         self.assertNotIn("Jill Ames", signature)
         self.assertNotIn("jill.ames@mohrpartners.com", signature)
 
+    def test_custom_signature_rejects_stale_jill_html_for_other_users(self):
+        stale_jill_html = (
+            '<div data-sitesift-professional-signature="v1">'
+            '<strong>Jill Ames</strong><br>'
+            '<a href="mailto:jill.ames@mohrpartners.com">jill.ames@mohrpartners.com</a>'
+            '<br>Mohr Partners, Inc.'
+            '</div>'
+        )
+
+        for user_email in [
+            "baylor.freelance@outlook.com",
+            "drew.ingram@mohrpartners.com",
+        ]:
+            with self.subTest(user_email=user_email):
+                signature, mode, resolved_email = resolve_signature_settings({
+                    "email": user_email,
+                    "signatureMode": "custom",
+                    "emailSignature": stale_jill_html,
+                })
+                html = format_email_body_with_footer(
+                    "Hi Avery,\n\nCould you confirm the rate?",
+                    signature,
+                    mode,
+                    user_email=resolved_email,
+                )
+
+                self.assertEqual("custom", mode)
+                self.assertEqual(user_email, resolved_email)
+                self.assertIsNone(signature)
+                self.assertIn("Hi Avery", html)
+                self.assertNotIn("Jill Ames", html)
+                self.assertNotIn("jill.ames@mohrpartners.com", html)
+                self.assertNotIn("Mohr Partners, Inc.", html)
+
     def test_mohr_domain_defaults_fill_company_branding_without_person_impersonation(self):
         signature, mode, user_email = resolve_signature_settings({
             "email": "drew.ingram@mohrpartners.com",

@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
@@ -10,6 +11,54 @@ os.environ.setdefault(
 )
 
 from email_automation import processing
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise AssertionError(f"Unexpected HTTP status {self.status_code}")
+
+
+class FakeSnapshot:
+    def __init__(self, data=None, exists=True):
+        self._data = data or {}
+        self.exists = exists
+
+    def to_dict(self):
+        return self._data
+
+
+class FakeUserDoc:
+    def __init__(self, user_data):
+        self.user_data = user_data
+
+    def get(self):
+        return FakeSnapshot(self.user_data)
+
+
+class FakeUsersCollection:
+    def __init__(self, user_data):
+        self.user_data = user_data
+
+    def document(self, _user_id):
+        return FakeUserDoc(self.user_data)
+
+
+class FakeFirestore:
+    def __init__(self, user_data):
+        self.user_data = user_data
+
+    def collection(self, name):
+        if name != "users":
+            raise AssertionError(f"Unexpected collection {name}")
+        return FakeUsersCollection(self.user_data)
 
 
 class ProcessingReplySafetyTests(unittest.TestCase):
@@ -70,6 +119,88 @@ class ProcessingReplySafetyTests(unittest.TestCase):
         self.assertFalse(sent)
         self.assertEqual("blocked_unsafe_body", processing.send_reply_in_thread.last_outcome)
         self.assertIn("Unresolved outbound placeholder", processing.send_reply_in_thread.last_error)
+
+    def test_send_reply_in_thread_rejects_stale_jill_custom_signature_before_graph_patch(self):
+        stale_jill_html = (
+            '<div data-sitesift-professional-signature="v1">'
+            '<strong>Jill Ames</strong><br>'
+            '<a href="mailto:jill.ames@mohrpartners.com">jill.ames@mohrpartners.com</a>'
+            '<br>Mohr Partners, Inc.'
+            '</div>'
+        )
+        patched_payloads = []
+
+        def fake_post(url, **_kwargs):
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "draft-1",
+                    "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
+                    "ccRecipients": [],
+                })
+            if url.endswith("/send"):
+                return FakeResponse(202, {})
+            raise AssertionError(f"Unexpected POST {url}")
+
+        def fake_patch(_url, json=None, **_kwargs):
+            patched_payloads.append(json)
+            return FakeResponse(204, {})
+
+        current_meta = {
+            "conversationId": "conversation-1",
+            "subject": "RE: 100 Signature Way",
+        }
+        sent_message = {
+            "internetMessageId": "<sent-1@example.com>",
+            "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
+            "ccRecipients": [],
+            "subject": "RE: 100 Signature Way",
+            "sentDateTime": "2026-07-01T12:00:00Z",
+            "body": {"contentType": "HTML", "content": "Hi Avery"},
+            "bodyPreview": "Hi Avery",
+        }
+
+        with patch.dict(os.environ, {"SITESIFT_AUTO_REPLY_ALLOWLIST": "uid-1"}), \
+             patch("email_automation.clients._fs", FakeFirestore({
+                 "email": "baylor.freelance@outlook.com",
+                 "signatureMode": "custom",
+                 "emailSignature": stale_jill_html,
+             })), \
+             patch("requests.get", return_value=FakeResponse(200, current_meta)), \
+             patch("requests.post", side_effect=fake_post), \
+             patch("requests.patch", side_effect=fake_patch), \
+             patch("email_automation.utils.time.sleep", return_value=None), \
+             patch("email_automation.email._hydrate_reply_all_draft_recipients", side_effect=lambda _headers, draft, base=None: draft), \
+             patch("email_automation.email._source_message_reply_all_fallback", side_effect=lambda draft, _current_meta: draft), \
+             patch("email_automation.email._reviewed_recipient_reply_all_fallback", side_effect=lambda draft, to_emails=None: draft), \
+             patch("email_automation.email._filter_reply_all_draft_recipients", return_value={
+                 "payload": {
+                     "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
+                     "ccRecipients": [],
+                 }
+             }), \
+             patch("email_automation.processing._find_recent_sent_message_for_conversation", return_value=sent_message), \
+             patch("email_automation.messaging.index_message_id", return_value=True), \
+             patch("email_automation.messaging.lookup_thread_by_message_id", return_value="thread-1"), \
+             patch("email_automation.messaging.save_message"), \
+             patch("email_automation.messaging.index_conversation_id", return_value=True), \
+             patch("email_automation.processing.time", SimpleNamespace(sleep=lambda _seconds: None)):
+            sent = processing.send_reply_in_thread(
+                user_id="uid-1",
+                headers={"Authorization": "Bearer token"},
+                body="Hi Avery,\n\nCould you confirm the rate?",
+                current_msg_id="message-1",
+                recipient="bp21harrison@gmail.com",
+                thread_id="thread-1",
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual("sent_indexed", processing.send_reply_in_thread.last_outcome)
+        self.assertEqual(1, len(patched_payloads))
+        html_body = patched_payloads[0]["body"]["content"]
+        self.assertIn("Hi Avery", html_body)
+        self.assertNotIn("Jill Ames", html_body)
+        self.assertNotIn("jill.ames@mohrpartners.com", html_body)
+        self.assertNotIn("Mohr Partners, Inc.", html_body)
 
     def test_tour_actions_default_allowlist_is_baylor_only(self):
         with patch.dict(os.environ, {}, clear=True):
