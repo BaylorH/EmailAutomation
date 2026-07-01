@@ -1,0 +1,2537 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Executable Production V1 fixture map. This ties each release-gradebook fixture class to concrete tests or explicit gaps before normal users can be reopened.",
+  "sourceSuite": "production_v1_base_campaign",
+  "sourceGradebook": "docs/release-safety/feature-gradebook.json",
+  "safetyLane": "No live-user mutation or non-Baylor/BP21 email proof is allowed from this map. It is a planning/test-selection artifact only.",
+  "fixtureClasses": [
+    "happy_path",
+    "terminal_state",
+    "bad_placeholder",
+    "wrong_recipient",
+    "manual_continuation",
+    "duplicate_retry",
+    "operator_visible_failure"
+  ],
+  "statusLegend": {
+    "covered": "At least one existing deterministic test file is mapped to this fixture cell.",
+    "needs_fixture": "The cell is required but needs a deterministic test fixture or stronger mapping.",
+    "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
+  },
+  "summary": {
+    "covered": 40,
+    "needs_fixture": 69,
+    "needs_live_proof": 10
+  },
+  "featureFixtureMatrix": {
+    "core.upload_mapping": {
+      "happy_path": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.upload_mapping yet.",
+        "nextProof": "Add or identify a deterministic core.upload_mapping / happy_path fixture, then wire it to this map before reopening users."
+      },
+      "terminal_state": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "No explicit Production V1 terminal_state fixture is mapped for core.upload_mapping yet.",
+        "nextProof": "Add or identify a deterministic core.upload_mapping / terminal_state fixture, then wire it to this map before reopening users."
+      },
+      "bad_placeholder": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "outbox_queued"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.upload_mapping yet.",
+        "nextProof": "Add or identify a deterministic core.upload_mapping / bad_placeholder fixture, then wire it to this map before reopening users."
+      },
+      "wrong_recipient": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.upload_mapping yet.",
+        "nextProof": "Add or identify a deterministic core.upload_mapping / wrong_recipient fixture, then wire it to this map before reopening users."
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.upload_mapping yet.",
+        "nextProof": "Add or identify a deterministic core.upload_mapping / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.upload_mapping yet.",
+        "nextProof": "Add or identify a deterministic core.upload_mapping / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.upload_mapping yet.",
+        "nextProof": "Add or identify a deterministic core.upload_mapping / operator_visible_failure fixture, then wire it to this map before reopening users."
+      }
+    },
+    "core.name_resolution": {
+      "happy_path": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.name_resolution yet.",
+        "nextProof": "Add or identify a deterministic core.name_resolution / happy_path fixture, then wire it to this map before reopening users."
+      },
+      "terminal_state": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "No explicit Production V1 terminal_state fixture is mapped for core.name_resolution yet.",
+        "nextProof": "Add or identify a deterministic core.name_resolution / terminal_state fixture, then wire it to this map before reopening users."
+      },
+      "bad_placeholder": {
+        "status": "covered",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "outbox_queued",
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_outbox_safety.py",
+          "tests/test_processing_reply_safety.py"
+        ],
+        "testIds": [
+          "test_unresolved_name_placeholder_outbox_item_moves_to_dead_letter_before_send",
+          "test_send_reply_blocks_placeholder_before_graph_request"
+        ],
+        "incidentId": "karsen_name_placeholder"
+      },
+      "wrong_recipient": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.name_resolution yet.",
+        "nextProof": "Add or identify a deterministic core.name_resolution / wrong_recipient fixture, then wire it to this map before reopening users."
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.name_resolution yet.",
+        "nextProof": "Add or identify a deterministic core.name_resolution / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.name_resolution yet.",
+        "nextProof": "Add or identify a deterministic core.name_resolution / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.name_resolution yet.",
+        "nextProof": "Add or identify a deterministic core.name_resolution / operator_visible_failure fixture, then wire it to this map before reopening users."
+      }
+    },
+    "core.launch_draft": {
+      "happy_path": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.launch_draft yet.",
+        "nextProof": "Add or identify a deterministic core.launch_draft / happy_path fixture, then wire it to this map before reopening users."
+      },
+      "terminal_state": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "No explicit Production V1 terminal_state fixture is mapped for core.launch_draft yet.",
+        "nextProof": "Add or identify a deterministic core.launch_draft / terminal_state fixture, then wire it to this map before reopening users."
+      },
+      "bad_placeholder": {
+        "status": "covered",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "outbox_queued",
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_outbox_safety.py",
+          "tests/test_processing_reply_safety.py"
+        ],
+        "testIds": [
+          "test_unresolved_name_placeholder_outbox_item_moves_to_dead_letter_before_send",
+          "test_send_reply_blocks_placeholder_before_graph_request"
+        ],
+        "incidentId": "karsen_raw_name_message"
+      },
+      "wrong_recipient": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "reply_all_cc_plus_blocked_contact"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "incidentId": "wrong_recipient_launch_guard",
+        "gapReason": "The current proof reuses generic auto-reply/scheduler guard tests and does not independently prove initial launch drafting/sending cannot target non-campaign or non-allowlisted recipients.",
+        "nextProof": "Add a launch-draft wrong-recipient fixture covering row mapping, recipient allowlist/blocked contact handling, reply-all exclusions, and outbox prevention before Graph."
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.launch_draft yet.",
+        "nextProof": "Add or identify a deterministic core.launch_draft / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.launch_draft yet.",
+        "nextProof": "Add or identify a deterministic core.launch_draft / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "launch_with_variable_mapping"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.launch_draft yet.",
+        "nextProof": "Add or identify a deterministic core.launch_draft / operator_visible_failure fixture, then wire it to this map before reopening users."
+      }
+    },
+    "core.outbox_send": {
+      "happy_path": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_action_audit_backend.py",
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_successful_dashboard_send_marks_action_audit_sent",
+          "test_successful_dashboard_outbox_finalizes_notification_and_thread_after_send"
+        ]
+      },
+      "terminal_state": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_cancel_requested_item_is_deleted_without_sending",
+          "test_paused_client_outbox_item_moves_to_dead_letter_before_send"
+        ]
+      },
+      "bad_placeholder": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "outbox_queued"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_unresolved_name_placeholder_outbox_item_moves_to_dead_letter_before_send"
+        ]
+      },
+      "wrong_recipient": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "reply_all_cc_context"
+        ],
+        "combinationPlaybooks": [
+          "reply_all_cc_plus_blocked_contact"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "The current proof mixes auto-reply and tour-admin gate evidence and does not independently prove the generic outbox sender enforces recipient safety for Production V1 core messages.",
+        "nextProof": "Add an outbox-send wrong-recipient fixture that queues a core campaign outbox item with unsafe recipients/CCs, proves the sender filters or blocks it before Graph, and leaves operator-visible evidence."
+      },
+      "manual_continuation": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_thread_reply_retry_blocks_when_conversation_was_manually_continued",
+          "test_recovered_dead_letter_outbox_blocks_manual_continuation_before_send"
+        ]
+      },
+      "duplicate_retry": {
+        "status": "covered",
+        "eventClasses": [
+          "retry_after_uncertain_send"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing",
+          "partial_specs_plus_pdf_plus_followup",
+          "wrong_contact_plus_new_property",
+          "manual_reply_before_retry",
+          "reply_all_cc_plus_blocked_contact",
+          "row_move_during_pending_action",
+          "same_broker_multiple_properties",
+          "subject_drift_split_thread",
+          "opt_out_after_prior_interest"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_graph_accepted_unindexed_outbox_moves_to_reconciliation_without_retry",
+          "test_retry_with_matching_sent_item_moves_to_reconciliation_without_resending"
+        ],
+        "incidentId": "graph_accepted_index_missing"
+      },
+      "operator_visible_failure": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_retryable_send_failure_updates_action_audit_with_visible_retry_state",
+          "test_retry_guard_lookup_failure_dead_letters_without_resending"
+        ]
+      }
+    },
+    "core.reply_all_cc": {
+      "happy_path": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_outbox_reply_recipient_routing.py",
+          "tests/test_graph_retry_policy.py"
+        ],
+        "testIds": [
+          "test_thread_reply_with_cc_records_reply_all_recipients",
+          "test_dashboard_thread_reply_preserves_safe_cc_with_reply_all_draft"
+        ]
+      },
+      "terminal_state": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "No explicit Production V1 terminal_state fixture is mapped for core.reply_all_cc yet.",
+        "nextProof": "Add or identify a deterministic core.reply_all_cc / terminal_state fixture, then wire it to this map before reopening users."
+      },
+      "bad_placeholder": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "outbox_queued"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.reply_all_cc yet.",
+        "nextProof": "Add or identify a deterministic core.reply_all_cc / bad_placeholder fixture, then wire it to this map before reopening users."
+      },
+      "wrong_recipient": {
+        "status": "covered",
+        "eventClasses": [
+          "reply_all_cc_context"
+        ],
+        "combinationPlaybooks": [
+          "reply_all_cc_plus_blocked_contact"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_graph_retry_policy.py",
+          "tests/test_followup_terminal_state.py"
+        ],
+        "testIds": [
+          "test_dashboard_thread_reply_filters_opted_out_cc_before_send",
+          "test_followup_preserves_safe_ccs_with_reply_all_draft"
+        ],
+        "incidentId": "reply_all_cc_preservation"
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.reply_all_cc yet.",
+        "nextProof": "Add or identify a deterministic core.reply_all_cc / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "retry_after_uncertain_send"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.reply_all_cc yet.",
+        "nextProof": "Add or identify a deterministic core.reply_all_cc / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "email",
+          "firestore"
+        ],
+        "testFiles": [
+          "tests/test_followup_terminal_state.py",
+          "tests/test_graph_retry_policy.py"
+        ],
+        "testIds": [
+          "test_followup_reply_all_filter_failure_deletes_draft_and_fails_closed",
+          "test_dashboard_thread_reply_deletes_created_draft_when_all_recipients_filtered"
+        ]
+      }
+    },
+    "core.manual_reply": {
+      "happy_path": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "The current proof reuses generic dashboard/outbox send tests and does not independently exercise a manual dashboard reply from draft through Graph send, actionAudit, thread state, and Gmail/readback evidence.",
+        "nextProof": "Add a deterministic manual-reply fixture that starts from an action-needed dashboard draft, sends through the manual reply surface, preserves recipients, records actionAudit/Graph IDs, updates the thread, and proves the broker-visible message body."
+      },
+      "terminal_state": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "No explicit Production V1 terminal_state fixture is mapped for core.manual_reply yet.",
+        "nextProof": "Add or identify a deterministic core.manual_reply / terminal_state fixture, then wire it to this map before reopening users."
+      },
+      "bad_placeholder": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "outbox_queued"
+        ],
+        "evidence": [
+          "automated",
+          "email"
+        ],
+        "gapReason": "The current proof reuses the automatic inbox reply placeholder guard and does not independently prove the manual dashboard reply composer/outbox path blocks unresolved placeholders before Graph.",
+        "nextProof": "Add a manual dashboard reply fixture with [NAME], bracket placeholders, and malformed greeting variants, then prove the item becomes operator-visible review/dead-letter state without a Graph call."
+      },
+      "wrong_recipient": {
+        "status": "covered",
+        "eventClasses": [
+          "reply_all_cc_context"
+        ],
+        "combinationPlaybooks": [
+          "reply_all_cc_plus_blocked_contact"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_graph_retry_policy.py"
+        ],
+        "testIds": [
+          "test_dashboard_thread_reply_falls_back_when_graph_recipients_filter_to_zero"
+        ]
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.manual_reply yet.",
+        "nextProof": "Add or identify a deterministic core.manual_reply / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "retry_after_uncertain_send"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.manual_reply yet.",
+        "nextProof": "Add or identify a deterministic core.manual_reply / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.manual_reply yet.",
+        "nextProof": "Add or identify a deterministic core.manual_reply / operator_visible_failure fixture, then wire it to this map before reopening users."
+      }
+    },
+    "core.inbox_matching": {
+      "happy_path": {
+        "status": "needs_live_proof",
+        "eventClasses": [
+          "reply_all_cc_context"
+        ],
+        "combinationPlaybooks": [
+          "same_broker_multiple_properties"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "core.inbox_matching has partial automated coverage, but this happy_path class needs source-of-truth readback in the Baylor/BP21 proof.",
+        "nextProof": "Capture Firestore/Sheet/dashboard evidence for core.inbox_matching / happy_path during the Production V1 base campaign proof."
+      },
+      "terminal_state": {
+        "status": "needs_live_proof",
+        "eventClasses": [
+          "reply_all_cc_context"
+        ],
+        "combinationPlaybooks": [
+          "same_broker_multiple_properties"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "core.inbox_matching has partial automated coverage, but this terminal_state class needs source-of-truth readback in the Baylor/BP21 proof.",
+        "nextProof": "Capture Firestore/Sheet/dashboard evidence for core.inbox_matching / terminal_state during the Production V1 base campaign proof."
+      },
+      "bad_placeholder": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "reply_all_cc_context"
+        ],
+        "combinationPlaybooks": [
+          "same_broker_multiple_properties"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.inbox_matching yet.",
+        "nextProof": "Add or identify a deterministic core.inbox_matching / bad_placeholder fixture, then wire it to this map before reopening users."
+      },
+      "wrong_recipient": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "reply_all_cc_context"
+        ],
+        "combinationPlaybooks": [
+          "same_broker_multiple_properties"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.inbox_matching yet.",
+        "nextProof": "Add or identify a deterministic core.inbox_matching / wrong_recipient fixture, then wire it to this map before reopening users."
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "same_broker_multiple_properties"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.inbox_matching yet.",
+        "nextProof": "Add or identify a deterministic core.inbox_matching / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "reply_all_cc_context"
+        ],
+        "combinationPlaybooks": [
+          "same_broker_multiple_properties"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.inbox_matching yet.",
+        "nextProof": "Add or identify a deterministic core.inbox_matching / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "needs_live_proof",
+        "eventClasses": [
+          "reply_all_cc_context"
+        ],
+        "combinationPlaybooks": [
+          "same_broker_multiple_properties"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "core.inbox_matching has partial automated coverage, but this operator_visible_failure class needs source-of-truth readback in the Baylor/BP21 proof.",
+        "nextProof": "Capture Firestore/Sheet/dashboard evidence for core.inbox_matching / operator_visible_failure during the Production V1 base campaign proof."
+      }
+    },
+    "core.inbox_auto_reply": {
+      "happy_path": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.inbox_auto_reply yet.",
+        "nextProof": "Add or identify a deterministic core.inbox_auto_reply / happy_path fixture, then wire it to this map before reopening users."
+      },
+      "terminal_state": {
+        "status": "covered",
+        "eventClasses": [
+          "broker_tour_available",
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "tour_unavailable_but_property_viable"
+        ],
+        "statePermutations": [
+          "action_needed",
+          "paused_manual_review",
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_compound_nonviable_processing.py",
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_non_allowlisted_user_tour_offer_creates_no_tour_action",
+          "test_normal_campaign_tour_language_moves_to_dead_letter_before_send"
+        ],
+        "incidentId": "no_tour_scheduling_core_lane"
+      },
+      "bad_placeholder": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "outbox_queued"
+        ],
+        "evidence": [
+          "automated",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_processing_reply_safety.py"
+        ],
+        "testIds": [
+          "test_send_reply_blocks_placeholder_before_graph_request"
+        ]
+      },
+      "wrong_recipient": {
+        "status": "covered",
+        "eventClasses": [
+          "reply_all_cc_context"
+        ],
+        "combinationPlaybooks": [
+          "reply_all_cc_plus_blocked_contact"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_processing_reply_safety.py"
+        ],
+        "testIds": [
+          "test_send_reply_blocks_non_allowlisted_auto_reply_before_graph_request"
+        ]
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.inbox_auto_reply yet.",
+        "nextProof": "Add or identify a deterministic core.inbox_auto_reply / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "retry_after_uncertain_send"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.inbox_auto_reply yet.",
+        "nextProof": "Add or identify a deterministic core.inbox_auto_reply / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.inbox_auto_reply yet.",
+        "nextProof": "Add or identify a deterministic core.inbox_auto_reply / operator_visible_failure fixture, then wire it to this map before reopening users."
+      }
+    },
+    "core.event_classifier": {
+      "happy_path": {
+        "status": "covered",
+        "eventClasses": [
+          "broker_property_unavailable",
+          "launch_with_variable_mapping",
+          "broker_available_full_specs",
+          "broker_available_partial_specs",
+          "broker_attachment_or_link_only",
+          "broker_property_non_viable",
+          "broker_wrong_contact",
+          "broker_opt_out",
+          "broker_confidential_question",
+          "manual_user_continuation",
+          "reply_all_cc_context",
+          "followup_due",
+          "retry_after_uncertain_send",
+          "sheet_row_moved",
+          "token_or_graph_failure",
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "testFiles": [
+          "tests/test_jill_june_regressions.py",
+          "tests/test_compound_nonviable_processing.py"
+        ],
+        "testIds": [
+          "test_requirements_mismatch_adds_nonviable_event",
+          "test_property_unavailable_already_below_nonviable_stops_thread_without_moving_row"
+        ]
+      },
+      "terminal_state": {
+        "status": "covered",
+        "eventClasses": [
+          "broker_tour_unavailable",
+          "broker_property_non_viable",
+          "broker_property_unavailable"
+        ],
+        "combinationPlaybooks": [
+          "tour_unavailable_but_property_viable"
+        ],
+        "statePermutations": [
+          "paused_manual_review",
+          "stopped",
+          "completed"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "testFiles": [
+          "tests/test_jill_june_regressions.py",
+          "tests/test_compound_nonviable_processing.py"
+        ],
+        "testIds": [
+          "test_tour_unavailable_reply_does_not_mark_property_unavailable",
+          "test_tour_invite_unavailable_process_does_not_move_row_or_stop_property"
+        ],
+        "incidentId": "tour_unavailable_property_stays_viable"
+      },
+      "bad_placeholder": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_property_unavailable"
+        ],
+        "combinationPlaybooks": [
+          "tour_unavailable_but_property_viable"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.event_classifier yet.",
+        "nextProof": "Add or identify a deterministic core.event_classifier / bad_placeholder fixture, then wire it to this map before reopening users."
+      },
+      "wrong_recipient": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_property_unavailable"
+        ],
+        "combinationPlaybooks": [
+          "tour_unavailable_but_property_viable"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.event_classifier yet.",
+        "nextProof": "Add or identify a deterministic core.event_classifier / wrong_recipient fixture, then wire it to this map before reopening users."
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_property_unavailable"
+        ],
+        "combinationPlaybooks": [
+          "tour_unavailable_but_property_viable"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.event_classifier yet.",
+        "nextProof": "Add or identify a deterministic core.event_classifier / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_property_unavailable"
+        ],
+        "combinationPlaybooks": [
+          "tour_unavailable_but_property_viable"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.event_classifier yet.",
+        "nextProof": "Add or identify a deterministic core.event_classifier / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_property_unavailable"
+        ],
+        "combinationPlaybooks": [
+          "tour_unavailable_but_property_viable"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.event_classifier yet.",
+        "nextProof": "Add or identify a deterministic core.event_classifier / operator_visible_failure fixture, then wire it to this map before reopening users."
+      }
+    },
+    "core.property_extraction": {
+      "happy_path": {
+        "status": "covered",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "sheet"
+        ],
+        "testFiles": [
+          "tests/test_processing_completion_guards.py",
+          "tests/test_property_images.py",
+          "tests/test_property_image_resolver.py"
+        ],
+        "testIds": [
+          "test_deterministic_rent_fallback_extracts_asking_rent_not_nnn",
+          "test_manifest_candidate_writes_safe_property_image_columns_without_raw_image_bytes",
+          "test_fetch_and_process_linked_assets_resolves_pdf_link_property_preview"
+        ]
+      },
+      "terminal_state": {
+        "status": "needs_live_proof",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "core.property_extraction has partial automated coverage, but this terminal_state class needs source-of-truth readback in the Baylor/BP21 proof.",
+        "nextProof": "Capture Firestore/Sheet/dashboard evidence for core.property_extraction / terminal_state during the Production V1 base campaign proof."
+      },
+      "bad_placeholder": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.property_extraction yet.",
+        "nextProof": "Add or identify a deterministic core.property_extraction / bad_placeholder fixture, then wire it to this map before reopening users."
+      },
+      "wrong_recipient": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.property_extraction yet.",
+        "nextProof": "Add or identify a deterministic core.property_extraction / wrong_recipient fixture, then wire it to this map before reopening users."
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.property_extraction yet.",
+        "nextProof": "Add or identify a deterministic core.property_extraction / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.property_extraction yet.",
+        "nextProof": "Add or identify a deterministic core.property_extraction / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "needs_live_proof",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "core.property_extraction has partial automated coverage, but this operator_visible_failure class needs source-of-truth readback in the Baylor/BP21 proof.",
+        "nextProof": "Capture Firestore/Sheet/dashboard evidence for core.property_extraction / operator_visible_failure during the Production V1 base campaign proof."
+      }
+    },
+    "core.sheet_update": {
+      "happy_path": {
+        "status": "needs_live_proof",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "partial_specs_plus_pdf_plus_followup"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "core.sheet_update has partial automated coverage, but this happy_path class needs source-of-truth readback in the Baylor/BP21 proof.",
+        "nextProof": "Capture Firestore/Sheet/dashboard evidence for core.sheet_update / happy_path during the Production V1 base campaign proof."
+      },
+      "terminal_state": {
+        "status": "covered",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "row_move_during_pending_action"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "sheet"
+        ],
+        "testFiles": [
+          "tests/test_sheet_row_anchor_safety.py",
+          "tests/test_sheet_operations_formula.py"
+        ],
+        "testIds": [
+          "test_stale_row_uses_subject_address_before_duplicate_email_fallback",
+          "test_formula_handles_single_rent_values_and_rent_ranges"
+        ]
+      },
+      "bad_placeholder": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "row_move_during_pending_action"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.sheet_update yet.",
+        "nextProof": "Add or identify a deterministic core.sheet_update / bad_placeholder fixture, then wire it to this map before reopening users."
+      },
+      "wrong_recipient": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "row_move_during_pending_action"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.sheet_update yet.",
+        "nextProof": "Add or identify a deterministic core.sheet_update / wrong_recipient fixture, then wire it to this map before reopening users."
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "row_move_during_pending_action"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.sheet_update yet.",
+        "nextProof": "Add or identify a deterministic core.sheet_update / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "row_move_during_pending_action"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.sheet_update yet.",
+        "nextProof": "Add or identify a deterministic core.sheet_update / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "needs_live_proof",
+        "eventClasses": [
+          "broker_available_full_specs"
+        ],
+        "combinationPlaybooks": [
+          "row_move_during_pending_action"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "core.sheet_update has partial automated coverage, but this operator_visible_failure class needs source-of-truth readback in the Baylor/BP21 proof.",
+        "nextProof": "Capture Firestore/Sheet/dashboard evidence for core.sheet_update / operator_visible_failure during the Production V1 base campaign proof."
+      }
+    },
+    "core.followups": {
+      "happy_path": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_followup_terminal_state.py"
+        ],
+        "testIds": [
+          "test_weekday_followup_window_is_unchanged",
+          "test_auto_response_reschedules_paused_active_thread"
+        ]
+      },
+      "terminal_state": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_followup_terminal_state.py"
+        ],
+        "testIds": [
+          "test_followup_rechecks_terminal_state_before_reply_all_draft",
+          "test_followup_rechecks_action_needed_state_before_reply_all_draft"
+        ]
+      },
+      "bad_placeholder": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "outbox_queued"
+        ],
+        "evidence": [
+          "automated",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_followup_terminal_state.py"
+        ],
+        "testIds": [
+          "test_followup_blocks_malformed_recipient_before_graph_send"
+        ]
+      },
+      "wrong_recipient": {
+        "status": "covered",
+        "eventClasses": [
+          "reply_all_cc_context"
+        ],
+        "combinationPlaybooks": [
+          "reply_all_cc_plus_blocked_contact"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_followup_terminal_state.py"
+        ],
+        "testIds": [
+          "test_followup_blocks_opted_out_recipient_before_graph_send",
+          "test_followup_preserves_safe_ccs_with_reply_all_draft"
+        ]
+      },
+      "manual_continuation": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_followup_terminal_state.py"
+        ],
+        "testIds": [
+          "test_failed_followup_retry_blocks_when_conversation_was_manually_continued"
+        ],
+        "incidentId": "manual_sent_items_suppresses_followup"
+      },
+      "duplicate_retry": {
+        "status": "covered",
+        "eventClasses": [
+          "retry_after_uncertain_send"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_followup_terminal_state.py"
+        ],
+        "testIds": [
+          "test_failed_followup_retry_uses_sent_items_match_without_resending",
+          "test_failed_followup_retry_blocks_when_sent_items_lookup_fails"
+        ]
+      },
+      "operator_visible_failure": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "testFiles": [
+          "tests/test_followup_terminal_state.py"
+        ],
+        "testIds": [
+          "test_guard_lookup_failure_release_marks_manual_review",
+          "test_followup_reply_all_filter_failure_deletes_draft_and_fails_closed"
+        ]
+      }
+    },
+    "core.stop_cancel_dismiss": {
+      "happy_path": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.stop_cancel_dismiss yet.",
+        "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / happy_path fixture, then wire it to this map before reopening users."
+      },
+      "terminal_state": {
+        "status": "covered",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "testFiles": [
+          "tests/test_action_audit_backend.py",
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_cancelled_outbox_terminalizes_action_audit",
+          "test_cancel_requested_item_is_deleted_without_sending"
+        ]
+      },
+      "bad_placeholder": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.stop_cancel_dismiss yet.",
+        "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / bad_placeholder fixture, then wire it to this map before reopening users."
+      },
+      "wrong_recipient": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.stop_cancel_dismiss yet.",
+        "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / wrong_recipient fixture, then wire it to this map before reopening users."
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.stop_cancel_dismiss yet.",
+        "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "retry_after_uncertain_send"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.stop_cancel_dismiss yet.",
+        "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.stop_cancel_dismiss yet.",
+        "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / operator_visible_failure fixture, then wire it to this map before reopening users."
+      }
+    },
+    "core.signature_identity": {
+      "happy_path": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_signature_footer.py",
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_professional_mode_uses_user_signature_when_present",
+          "test_send_outboxes_resolves_structured_professional_signature_before_send"
+        ]
+      },
+      "terminal_state": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "No explicit Production V1 terminal_state fixture is mapped for core.signature_identity yet.",
+        "nextProof": "Add or identify a deterministic core.signature_identity / terminal_state fixture, then wire it to this map before reopening users."
+      },
+      "bad_placeholder": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "outbox_queued"
+        ],
+        "evidence": [
+          "automated",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_signature_footer.py",
+          "tests/test_whitelabel_defaults.py"
+        ],
+        "testIds": [
+          "test_professional_mode_without_user_signature_does_not_use_jill_for_non_mohr_users",
+          "test_ai_response_prompt_does_not_target_jill_style"
+        ]
+      },
+      "wrong_recipient": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "reply_all_cc_context"
+        ],
+        "combinationPlaybooks": [
+          "reply_all_cc_plus_blocked_contact"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "Jill/MOHR signature or identity leakage to another user is named as a Production V1 incident class but still needs a stronger wrong-recipient fixture beyond the existing non-MOHR fallback tests.",
+        "nextProof": "Add a deterministic signature identity fixture proving non-MOHR users never inherit Jill/MOHR branding across launch drafts, dashboard replies, follow-ups, and recovery retries before reopening users.",
+        "incidentId": "jill_mohr_signature_leakage"
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.signature_identity yet.",
+        "nextProof": "Add or identify a deterministic core.signature_identity / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "retry_after_uncertain_send"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.signature_identity yet.",
+        "nextProof": "Add or identify a deterministic core.signature_identity / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.signature_identity yet.",
+        "nextProof": "Add or identify a deterministic core.signature_identity / operator_visible_failure fixture, then wire it to this map before reopening users."
+      }
+    },
+    "core.health_recovery": {
+      "happy_path": {
+        "status": "covered",
+        "eventClasses": [
+          "token_or_graph_failure"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "testFiles": [
+          "tests/test_dead_letter_recovery.py",
+          "tests/test_system_health.py"
+        ],
+        "testIds": [
+          "test_requeue_verified_unsent_outbox_item_creates_fresh_outbox_and_updates_audit",
+          "test_collect_user_health_warns_on_backlog_counts"
+        ]
+      },
+      "terminal_state": {
+        "status": "covered",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "testFiles": [
+          "tests/test_dead_letter_recovery.py"
+        ],
+        "testIds": [
+          "test_requeue_refuses_already_sent_item_without_writing_outbox"
+        ]
+      },
+      "bad_placeholder": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "token_or_graph_failure"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "outbox_queued"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.health_recovery yet.",
+        "nextProof": "Add or identify a deterministic core.health_recovery / bad_placeholder fixture, then wire it to this map before reopening users."
+      },
+      "wrong_recipient": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "token_or_graph_failure"
+        ],
+        "combinationPlaybooks": [
+          "reply_all_cc_plus_blocked_contact"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.health_recovery yet.",
+        "nextProof": "Add or identify a deterministic core.health_recovery / wrong_recipient fixture, then wire it to this map before reopening users."
+      },
+      "manual_continuation": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_dead_letter_recovery.py"
+        ],
+        "testIds": [
+          "test_requeue_refuses_manual_continuation_without_sent_items_lookup"
+        ]
+      },
+      "duplicate_retry": {
+        "status": "covered",
+        "eventClasses": [
+          "retry_after_uncertain_send"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "testFiles": [
+          "tests/test_dead_letter_recovery.py"
+        ],
+        "testIds": [
+          "test_requeue_matching_sent_item_records_reconciliation_without_resending"
+        ]
+      },
+      "operator_visible_failure": {
+        "status": "covered",
+        "eventClasses": [
+          "token_or_graph_failure"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "testFiles": [
+          "tests/test_dead_letter_recovery.py",
+          "tests/test_system_health.py"
+        ],
+        "testIds": [
+          "test_requeue_guard_lookup_failure_keeps_item_visible_without_resending",
+          "test_collect_user_health_errors_on_token_failure"
+        ],
+        "incidentId": "dead_letter_visible_before_retry"
+      }
+    },
+    "core.scheduler_scope": {
+      "happy_path": {
+        "status": "covered",
+        "eventClasses": [
+          "followup_due"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "testFiles": [
+          "tests/test_scheduler_scope.py",
+          "tests/test_scheduler_lease.py"
+        ],
+        "testIds": [
+          "test_scheduled_runs_process_all_token_users",
+          "test_unexpired_lease_blocks_second_runner"
+        ]
+      },
+      "terminal_state": {
+        "status": "covered",
+        "eventClasses": [
+          "followup_due"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "testFiles": [
+          "tests/test_scheduler_scope.py"
+        ],
+        "testIds": [
+          "test_scheduled_runs_can_be_emergency_scoped_to_baylor"
+        ]
+      },
+      "bad_placeholder": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "followup_due"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "outbox_queued"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.scheduler_scope yet.",
+        "nextProof": "Add or identify a deterministic core.scheduler_scope / bad_placeholder fixture, then wire it to this map before reopening users."
+      },
+      "wrong_recipient": {
+        "status": "covered",
+        "eventClasses": [
+          "followup_due"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "paused_manual_review",
+          "not_started"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "testFiles": [
+          "tests/test_scheduler_scope.py"
+        ],
+        "testIds": [
+          "test_manual_dispatch_requires_dev_scoped_guard",
+          "test_manual_dispatch_rejects_jill_even_if_requested"
+        ],
+        "incidentId": "normal_users_scope_denied"
+      },
+      "manual_continuation": {
+        "status": "covered",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "testFiles": [
+          "tests/test_graph_scan_health.py",
+          "tests/test_followup_terminal_state.py"
+        ],
+        "testIds": [
+          "test_refresh_runs_processing_failure_replay_by_default",
+          "test_failed_followup_retry_blocks_when_conversation_was_manually_continued"
+        ]
+      },
+      "duplicate_retry": {
+        "status": "covered",
+        "eventClasses": [
+          "retry_after_uncertain_send"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "testFiles": [
+          "tests/test_scheduler_lease.py",
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_unexpired_lease_blocks_second_runner",
+          "test_grouped_graph_accepted_unindexed_outbox_moves_to_reconciliation_without_retry"
+        ]
+      },
+      "operator_visible_failure": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "token_or_graph_failure"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.scheduler_scope yet.",
+        "nextProof": "Add or identify a deterministic core.scheduler_scope / operator_visible_failure fixture, then wire it to this map before reopening users."
+      }
+    },
+    "admin.usage_readonly": {
+      "happy_path": {
+        "status": "needs_live_proof",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "admin.usage_readonly has partial automated coverage, but this happy_path class needs source-of-truth readback in the Baylor/BP21 proof.",
+        "nextProof": "Capture Firestore/Sheet/dashboard evidence for admin.usage_readonly / happy_path during the Production V1 base campaign proof."
+      },
+      "terminal_state": {
+        "status": "needs_live_proof",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "stopped"
+        ],
+        "evidence": [
+          "automated",
+          "firestore"
+        ],
+        "gapReason": "admin.usage_readonly has partial automated coverage, but this terminal_state class needs source-of-truth readback in the Baylor/BP21 proof.",
+        "nextProof": "Capture Firestore/Sheet/dashboard evidence for admin.usage_readonly / terminal_state during the Production V1 base campaign proof."
+      },
+      "bad_placeholder": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for admin.usage_readonly yet.",
+        "nextProof": "Add or identify a deterministic admin.usage_readonly / bad_placeholder fixture, then wire it to this map before reopening users."
+      },
+      "wrong_recipient": {
+        "status": "covered",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "paused_manual_review"
+        ],
+        "evidence": [
+          "automated",
+          "ui"
+        ],
+        "testFiles": [
+          "tests/test_results_feature_admin_gate.py"
+        ],
+        "testIds": [
+          "test_results_admin_visibility_is_separate_from_tour_email_send_permission"
+        ]
+      },
+      "manual_continuation": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "manual_user_continuation"
+        ],
+        "combinationPlaybooks": [
+          "manual_reply_before_retry"
+        ],
+        "statePermutations": [
+          "live_waiting"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for admin.usage_readonly yet.",
+        "nextProof": "Add or identify a deterministic admin.usage_readonly / manual_continuation fixture, then wire it to this map before reopening users."
+      },
+      "duplicate_retry": {
+        "status": "needs_fixture",
+        "eventClasses": [
+          "dashboard_action_resolution"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "retry_reconciled"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "email"
+        ],
+        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for admin.usage_readonly yet.",
+        "nextProof": "Add or identify a deterministic admin.usage_readonly / duplicate_retry fixture, then wire it to this map before reopening users."
+      },
+      "operator_visible_failure": {
+        "status": "needs_live_proof",
+        "eventClasses": [
+          "token_or_graph_failure"
+        ],
+        "combinationPlaybooks": [
+          "graph_accepted_but_index_missing"
+        ],
+        "statePermutations": [
+          "dead_letter_visible"
+        ],
+        "evidence": [
+          "automated",
+          "firestore",
+          "ui"
+        ],
+        "gapReason": "admin.usage_readonly has partial automated coverage, but this operator_visible_failure class needs source-of-truth readback in the Baylor/BP21 proof.",
+        "nextProof": "Capture Firestore/Sheet/dashboard evidence for admin.usage_readonly / operator_visible_failure during the Production V1 base campaign proof."
+      }
+    }
+  }
+}
