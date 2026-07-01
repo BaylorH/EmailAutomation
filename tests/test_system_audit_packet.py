@@ -6,6 +6,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = REPO_ROOT / "docs" / "release-safety" / "feature-registry.json"
+GRADEBOOK_PATH = REPO_ROOT / "docs" / "release-safety" / "feature-gradebook.json"
 MATRIX_PATH = REPO_ROOT / "docs" / "release-safety" / "system-audit-matrix.json"
 PACKET_PATH = REPO_ROOT / "docs" / "release-safety" / "system-audit-packet.md"
 CODERABBIT_CONTRACT_PATH = (
@@ -27,6 +28,7 @@ REQUIRED_ENTRY_FIELDS = {
     "userVisibleEvidence",
     "sourceOfTruthReadbacks",
     "codeRabbitQuestions",
+    "gradebookScenario",
     "adversarialFixtureClasses",
 }
 
@@ -82,6 +84,10 @@ class SystemAuditPacketTests(unittest.TestCase):
         self.assertTrue(
             MATRIX_PATH.exists(),
             "docs/release-safety/system-audit-matrix.json must tie frontend, backend, Firestore, email, and evidence together.",
+        )
+        self.assertTrue(
+            GRADEBOOK_PATH.exists(),
+            "docs/release-safety/feature-gradebook.json must force broad event, variation, combination, and role coverage.",
         )
         self.assertTrue(
             PACKET_PATH.exists(),
@@ -177,6 +183,7 @@ class SystemAuditPacketTests(unittest.TestCase):
         for phrase in (
             "AGENTS.md",
             "feature-registry.json",
+            "feature-gradebook.json",
             "adversarial-rubrics.json",
             "outbound-send-surface-inventory.json",
             "system-audit-matrix.json",
@@ -186,3 +193,36 @@ class SystemAuditPacketTests(unittest.TestCase):
                 feature_registry_section,
                 "CodeRabbit Feature Registry Contract must include every release-safety source-of-truth artifact.",
             )
+
+        minimum_evidence_section = contract[contract.index("## Minimum Evidence Before Merge") :]
+        self.assertIn(
+            "feature-gradebook",
+            minimum_evidence_section,
+            "CodeRabbit minimum merge evidence must repeat the gradebook requirement.",
+        )
+
+    def test_matrix_send_risk_entries_have_gradebook_scenarios(self):
+        registry = _read_json(REGISTRY_PATH)
+        gradebook = _read_json(GRADEBOOK_PATH)
+        matrix = _read_json(MATRIX_PATH)
+        send_risk_ids = {
+            feature["id"]
+            for feature in registry["features"]
+            if feature.get("sendRisk") in SEND_RISKS_REQUIRING_SYSTEM_AUDIT
+        }
+
+        for feature_id in send_risk_ids:
+            with self.subTest(feature=feature_id):
+                self.assertIn(feature_id, gradebook["featureScenarios"])
+                scenario = gradebook["featureScenarios"][feature_id]
+                entry = matrix["features"][feature_id]
+                self.assertTrue(scenario.get("eventClasses"))
+                self.assertTrue(scenario.get("variationAxes"))
+                self.assertTrue(scenario.get("combinationPlaybooks"))
+                self.assertTrue(scenario.get("statePermutations"))
+                self.assertTrue(scenario.get("negativeControls"))
+                self.assertEqual(
+                    feature_id,
+                    entry.get("gradebookScenario"),
+                    "System audit matrix entries must link directly to their feature-gradebook scenario.",
+                )

@@ -1,0 +1,2285 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Combinatorial SiteSift feature gradebook. Use this to generate fresh adversarial tests across event types, trigger variations, state permutations, actor/account scopes, and cross-feature collisions before any production widening.",
+  "eventTaxonomy": {
+    "launch_with_variable_mapping": "Campaign setup creates outreach from uploaded rows, mapped variables, selected custom fields, and launch preview copy.",
+    "broker_available_full_specs": "Broker says the property is available and gives all requested economics/specs in one reply.",
+    "broker_available_partial_specs": "Broker says available but leaves missing fields that require follow-up or manual review.",
+    "broker_attachment_or_link_only": "Broker sends a PDF, flyer, floorplan, Drive/Dropbox/link, or \"see attached\" with little body text.",
+    "broker_property_unavailable": "Broker says the space/property is no longer available.",
+    "broker_property_non_viable": "Broker says the space is not a fit for requirements, such as office-heavy instead of warehouse.",
+    "broker_wrong_contact": "Broker says they are not the right contact, redirects to another person, or copies a teammate.",
+    "broker_opt_out": "Broker asks to be removed, unsubscribed, or not contacted again.",
+    "broker_confidential_question": "Broker asks for client identity, budget, use, credit, timing, or other info the AI should not reveal alone.",
+    "broker_tour_available": "Broker offers a tour, call, showing, walkthrough, or visit while property remains potentially viable.",
+    "broker_tour_unavailable": "Broker says tours/showings are unavailable while property may still be viable for packet/results.",
+    "broker_alternate_tour_time": "Broker rejects proposed tour slot and suggests another date/time or asks to coordinate.",
+    "broker_new_property_referral": "Broker says a different property may fit better or sends an alternate address.",
+    "manual_user_continuation": "The human user replies directly in their mailbox or edits the conversation outside the dashboard.",
+    "reply_all_cc_context": "Broker replies include safe Cc contacts, teammate aliases, sender changes, or multi-party context.",
+    "followup_due": "A tracked thread reaches a scheduled follow-up window with no new inbound reply.",
+    "retry_after_uncertain_send": "Graph accepts a send but indexing/audit/thread persistence is incomplete or ambiguous.",
+    "sheet_row_moved": "The Google Sheet row order changes after launch while thread/action metadata still points to durable row identity.",
+    "token_or_graph_failure": "MSAL token, Graph, attachment download, or provider call fails mid-run.",
+    "dashboard_action_resolution": "Operator clicks Send Reply, Stop, Cancel, Dismiss, Approve, Archive, Unarchive, or recovery action."
+  },
+  "triggerVariationAxes": {
+    "phrasing": [
+      "direct",
+      "hedged",
+      "forwarded",
+      "abbreviated",
+      "negative-with-positive-context",
+      "multi-intent"
+    ],
+    "thread_shape": [
+      "same-thread",
+      "split-subject",
+      "forwarded-chain",
+      "message-clipped",
+      "quoted-history-heavy",
+      "multiple-properties-one-thread"
+    ],
+    "sender_identity": [
+      "original-broker",
+      "assistant-sender",
+      "teammate-on-cc",
+      "wrong-contact",
+      "manual-user-sent-item",
+      "unknown-sender"
+    ],
+    "recipient_shape": [
+      "single-to",
+      "reply-all-cc",
+      "blocked-contact-present",
+      "alias-plus-address",
+      "external-redirect",
+      "safe-test-inbox-only"
+    ],
+    "attachment_shape": [
+      "none",
+      "pdf-flyer",
+      "floorplan",
+      "drive-link",
+      "dropbox-link",
+      "image-heavy-pdf",
+      "broken-link"
+    ],
+    "data_quality": [
+      "complete",
+      "missing-name",
+      "ambiguous-name-column",
+      "partial-fields",
+      "conflicting-values",
+      "formula-field",
+      "row-moved"
+    ],
+    "timing": [
+      "before-send",
+      "after-claim-before-send",
+      "after-graph-accept-before-index",
+      "after-manual-user-reply",
+      "after-stop",
+      "after-complete"
+    ],
+    "campaign_state": [
+      "draft",
+      "queued",
+      "live",
+      "paused",
+      "action-needed",
+      "stopped",
+      "completed",
+      "archived"
+    ],
+    "operator_action": [
+      "no-click",
+      "send-reply",
+      "ai-help",
+      "cancel",
+      "dismiss",
+      "stop",
+      "approve-new-property",
+      "recover-dead-letter"
+    ],
+    "entitlement_scope": [
+      "baylor-proof",
+      "jill-admin-readonly",
+      "normal-user",
+      "dev-results-only",
+      "dev-tour-only",
+      "unauthenticated"
+    ]
+  },
+  "combinationPlaybooks": {
+    "partial_specs_plus_pdf_plus_followup": "Available reply gives partial facts plus a PDF/link; extractor must use evidence, ask only missing fields, and avoid duplicate follow-up after completion.",
+    "wrong_contact_plus_new_property": "Broker redirects contact and suggests an alternate property in one message; system must not send outside allowed recipients without explicit approval and must preserve referral as an action.",
+    "tour_unavailable_but_property_viable": "Broker says tours are unavailable; classifier must not mark property non-viable or stopped unless the property itself is unavailable/not a fit.",
+    "manual_reply_before_retry": "User replies manually or continues the thread before pending/dead-letter/follow-up retry; autonomous send must suppress or reconcile.",
+    "reply_all_cc_plus_blocked_contact": "Reply-all contains safe copied broker plus blocked/opt-out contact; final recipients must preserve safe CCs and filter blocked contacts.",
+    "row_move_during_pending_action": "Sheet rows move after launch while an action/outbox/follow-up is pending; updates must use durable anchors and not write the wrong row.",
+    "same_broker_multiple_properties": "Same broker inbox handles multiple properties; reply matching must not update all rows or wrong row by email alone.",
+    "subject_drift_split_thread": "Broker changes subject, forwards, or replies from a different chain; matcher must link only when safe and visible otherwise.",
+    "opt_out_after_prior_interest": "Broker previously engaged but later opts out; all future autonomous and manual sends to that contact must stop.",
+    "graph_accepted_but_index_missing": "Graph returns/accepts sent message but thread/message indexing fails; retry must reconcile Sent Items instead of double-sending."
+  },
+  "statePermutations": {
+    "not_started": "Client exists but no campaign outreach should be queued/sent.",
+    "outbox_queued": "Outbox row exists and can be cancelled or revalidated before send.",
+    "live_waiting": "Thread is active and waiting for broker response or follow-up.",
+    "action_needed": "Operator action is required before any send or terminal state change.",
+    "paused_manual_review": "AI or safety guard paused thread for user review.",
+    "stopped": "Thread/client row is stopped and must not reactivate autonomously.",
+    "completed": "Thread has enough info and must not send further asks.",
+    "archived": "Client is hidden from active workflow and should not be processed as active.",
+    "dead_letter_visible": "Failure is visible and recoverable only through explicit operator action.",
+    "retry_reconciled": "Retry path proves prior send/manual continuation before deciding to resend or skip."
+  },
+  "actorAndAccountAxes": {
+    "operator": [
+      "baylor.freelance proof sender",
+      "Jill admin/read-only",
+      "normal MOHR user",
+      "unauthenticated user"
+    ],
+    "broker": [
+      "bp21 safe test broker",
+      "same-domain broker",
+      "external broker",
+      "assistant/teammate reply",
+      "redirected contact"
+    ],
+    "system": [
+      "frontend dashboard",
+      "Firebase Function",
+      "GitHub scheduled worker",
+      "Graph provider",
+      "Google Sheet"
+    ]
+  },
+  "evidenceRequirements": {
+    "automated": [
+      "unit/integration test name",
+      "fixture id",
+      "expected terminal state",
+      "negative-control assertion"
+    ],
+    "ui": [
+      "dashboard screenshot when relevant",
+      "visible warning/action state",
+      "mobile/theme proof when visual surface changes"
+    ],
+    "firestore": [
+      "client/thread/outbox/actionAudit/notification before-after readback",
+      "queue counts"
+    ],
+    "email": [
+      "Graph IDs when sent",
+      "Sent Items/Gmail proof for Baylor/BP21 only",
+      "recipient and Cc readback"
+    ],
+    "sheet": [
+      "row anchor",
+      "cell values",
+      "highlight/formula/provenance readback"
+    ],
+    "review": [
+      "CodeRabbit check or explicit human reviewer role verdict"
+    ]
+  },
+  "gradingRoles": {
+    "broker_operator": "Would the broker receive professional, accurate, non-annoying communication with correct recipients?",
+    "tenant_rep": "Would Jill/Karsen/Tyneesia understand current state and avoid embarrassing client-facing output?",
+    "backend_safety_reviewer": "Are send paths, retries, dedupe, scopes, terminal states, and audit evidence safe?",
+    "frontend_ux_reviewer": "Can the operator see what happened, what is pending, and what buttons do without hidden state?",
+    "privacy_reviewer": "Does the test avoid unrelated inbox browsing and protect Jill/live users and blocked contacts?",
+    "support_recovery_reviewer": "Can a failed/ambiguous run be diagnosed and recovered without double sending or deleting evidence?"
+  },
+  "featureScenarios": {
+    "core.upload_mapping": {
+      "eventClasses": [
+        "launch_with_variable_mapping",
+        "sheet_row_moved",
+        "dashboard_action_resolution"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "manual_reply_before_retry",
+        "row_move_during_pending_action",
+        "same_broker_multiple_properties"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "outbox_queued",
+        "paused_manual_review",
+        "retry_reconciled",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot trigger dev tour/results side effects",
+        "raw placeholders must not reach outbox or Graph",
+        "wrong_recipient must be blocked or visibly paused before Graph send"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "email",
+        "firestore",
+        "review",
+        "sheet",
+        "ui"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "broker_operator",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "core.name_resolution": {
+      "eventClasses": [
+        "launch_with_variable_mapping",
+        "broker_wrong_contact",
+        "manual_user_continuation"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "manual_reply_before_retry",
+        "same_broker_multiple_properties",
+        "wrong_contact_plus_new_property"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "outbox_queued",
+        "paused_manual_review",
+        "retry_reconciled",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot trigger dev tour/results side effects",
+        "raw placeholders must not reach outbox or Graph",
+        "wrong_recipient must be blocked or visibly paused before Graph send"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "email",
+        "firestore",
+        "review",
+        "sheet",
+        "ui"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "broker_operator",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "core.launch_draft": {
+      "eventClasses": [
+        "launch_with_variable_mapping",
+        "broker_confidential_question",
+        "dashboard_action_resolution"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "manual_reply_before_retry",
+        "partial_specs_plus_pdf_plus_followup",
+        "reply_all_cc_plus_blocked_contact"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "outbox_queued",
+        "paused_manual_review",
+        "retry_reconciled",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot trigger dev tour/results side effects",
+        "raw placeholders must not reach outbox or Graph",
+        "wrong_recipient must be blocked or visibly paused before Graph send"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "email",
+        "firestore",
+        "review",
+        "sheet",
+        "ui"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "broker_operator",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "core.outbox_send": {
+      "eventClasses": [
+        "manual_user_continuation",
+        "reply_all_cc_context",
+        "retry_after_uncertain_send"
+      ],
+      "variationAxes": [
+        "phrasing",
+        "thread_shape",
+        "sender_identity",
+        "recipient_shape",
+        "data_quality",
+        "timing",
+        "campaign_state",
+        "operator_action",
+        "entitlement_scope"
+      ],
+      "combinationPlaybooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact"
+      ],
+      "statePermutations": [
+        "outbox_queued",
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed",
+        "dead_letter_visible",
+        "retry_reconciled"
+      ],
+      "negativeControls": [
+        "wrong_recipient must be blocked or visibly paused before Graph send",
+        "raw placeholders must not reach outbox or Graph",
+        "normal user cannot trigger dev tour/results side effects"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "email",
+        "sheet",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "broker_operator",
+        "tenant_rep",
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "core.reply_all_cc": {
+      "eventClasses": [
+        "manual_user_continuation",
+        "reply_all_cc_context",
+        "retry_after_uncertain_send"
+      ],
+      "variationAxes": [
+        "phrasing",
+        "thread_shape",
+        "sender_identity",
+        "recipient_shape",
+        "data_quality",
+        "timing",
+        "campaign_state",
+        "operator_action",
+        "entitlement_scope"
+      ],
+      "combinationPlaybooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact"
+      ],
+      "statePermutations": [
+        "outbox_queued",
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed",
+        "dead_letter_visible",
+        "retry_reconciled"
+      ],
+      "negativeControls": [
+        "wrong_recipient must be blocked or visibly paused before Graph send",
+        "raw placeholders must not reach outbox or Graph",
+        "normal user cannot trigger dev tour/results side effects"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "email",
+        "sheet",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "broker_operator",
+        "tenant_rep",
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "core.manual_reply": {
+      "eventClasses": [
+        "manual_user_continuation",
+        "reply_all_cc_context",
+        "retry_after_uncertain_send"
+      ],
+      "variationAxes": [
+        "phrasing",
+        "thread_shape",
+        "sender_identity",
+        "recipient_shape",
+        "data_quality",
+        "timing",
+        "campaign_state",
+        "operator_action",
+        "entitlement_scope"
+      ],
+      "combinationPlaybooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact"
+      ],
+      "statePermutations": [
+        "outbox_queued",
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed",
+        "dead_letter_visible",
+        "retry_reconciled"
+      ],
+      "negativeControls": [
+        "wrong_recipient must be blocked or visibly paused before Graph send",
+        "raw placeholders must not reach outbox or Graph",
+        "normal user cannot trigger dev tour/results side effects"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "email",
+        "sheet",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "broker_operator",
+        "tenant_rep",
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "core.inbox_matching": {
+      "eventClasses": [
+        "reply_all_cc_context",
+        "broker_attachment_or_link_only",
+        "manual_user_continuation",
+        "sheet_row_moved"
+      ],
+      "variationAxes": [
+        "phrasing",
+        "thread_shape",
+        "sender_identity",
+        "recipient_shape",
+        "data_quality",
+        "timing",
+        "attachment_shape"
+      ],
+      "combinationPlaybooks": [
+        "same_broker_multiple_properties",
+        "subject_drift_split_thread",
+        "row_move_during_pending_action"
+      ],
+      "statePermutations": [
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed"
+      ],
+      "negativeControls": [
+        "wrong_recipient negative control must fail closed or visibly pause",
+        "normal user cannot access disabled/dev lane behavior"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "core.inbox_auto_reply": {
+      "eventClasses": [
+        "manual_user_continuation",
+        "reply_all_cc_context",
+        "retry_after_uncertain_send"
+      ],
+      "variationAxes": [
+        "phrasing",
+        "thread_shape",
+        "sender_identity",
+        "recipient_shape",
+        "data_quality",
+        "timing",
+        "campaign_state",
+        "operator_action",
+        "entitlement_scope"
+      ],
+      "combinationPlaybooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact"
+      ],
+      "statePermutations": [
+        "outbox_queued",
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed",
+        "dead_letter_visible",
+        "retry_reconciled"
+      ],
+      "negativeControls": [
+        "wrong_recipient must be blocked or visibly paused before Graph send",
+        "raw placeholders must not reach outbox or Graph",
+        "normal user cannot trigger dev tour/results side effects"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "email",
+        "sheet",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "broker_operator",
+        "tenant_rep",
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "core.event_classifier": {
+      "eventClasses": [
+        "broker_property_unavailable",
+        "broker_property_non_viable",
+        "broker_wrong_contact",
+        "broker_opt_out",
+        "broker_confidential_question",
+        "broker_tour_available",
+        "broker_tour_unavailable",
+        "broker_new_property_referral"
+      ],
+      "variationAxes": [
+        "phrasing",
+        "thread_shape",
+        "sender_identity",
+        "recipient_shape",
+        "data_quality",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "tour_unavailable_but_property_viable",
+        "wrong_contact_plus_new_property",
+        "opt_out_after_prior_interest",
+        "partial_specs_plus_pdf_plus_followup"
+      ],
+      "statePermutations": [
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed"
+      ],
+      "negativeControls": [
+        "wrong_recipient negative control must fail closed or visibly pause",
+        "normal user cannot access disabled/dev lane behavior",
+        "tour unavailable must not be classified as non-viable, property unavailable, stopped, or completed"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "core.property_extraction": {
+      "eventClasses": [
+        "broker_available_full_specs",
+        "broker_available_partial_specs",
+        "broker_attachment_or_link_only",
+        "broker_property_non_viable",
+        "sheet_row_moved"
+      ],
+      "variationAxes": [
+        "phrasing",
+        "thread_shape",
+        "sender_identity",
+        "recipient_shape",
+        "data_quality",
+        "timing",
+        "attachment_shape"
+      ],
+      "combinationPlaybooks": [
+        "partial_specs_plus_pdf_plus_followup",
+        "row_move_during_pending_action",
+        "same_broker_multiple_properties"
+      ],
+      "statePermutations": [
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed"
+      ],
+      "negativeControls": [
+        "wrong_recipient negative control must fail closed or visibly pause",
+        "normal user cannot access disabled/dev lane behavior",
+        "do not invent source-free property facts; every extracted value needs email, attachment, sheet, or manual provenance"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review",
+        "sheet"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "core.sheet_update": {
+      "eventClasses": [
+        "broker_available_full_specs",
+        "broker_available_partial_specs",
+        "broker_attachment_or_link_only",
+        "sheet_row_moved",
+        "dashboard_action_resolution"
+      ],
+      "variationAxes": [
+        "phrasing",
+        "thread_shape",
+        "sender_identity",
+        "recipient_shape",
+        "data_quality",
+        "timing",
+        "attachment_shape"
+      ],
+      "combinationPlaybooks": [
+        "row_move_during_pending_action",
+        "partial_specs_plus_pdf_plus_followup",
+        "same_broker_multiple_properties"
+      ],
+      "statePermutations": [
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed"
+      ],
+      "negativeControls": [
+        "wrong_recipient negative control must fail closed or visibly pause",
+        "normal user cannot access disabled/dev lane behavior",
+        "wrong row cannot be updated after sheet reorder, formula shift, or duplicate broker/property match"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review",
+        "sheet"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "core.followups": {
+      "eventClasses": [
+        "manual_user_continuation",
+        "reply_all_cc_context",
+        "retry_after_uncertain_send"
+      ],
+      "variationAxes": [
+        "phrasing",
+        "thread_shape",
+        "sender_identity",
+        "recipient_shape",
+        "data_quality",
+        "timing",
+        "campaign_state",
+        "operator_action",
+        "entitlement_scope"
+      ],
+      "combinationPlaybooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact"
+      ],
+      "statePermutations": [
+        "outbox_queued",
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed",
+        "dead_letter_visible",
+        "retry_reconciled"
+      ],
+      "negativeControls": [
+        "wrong_recipient must be blocked or visibly paused before Graph send",
+        "raw placeholders must not reach outbox or Graph",
+        "normal user cannot trigger dev tour/results side effects"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "email",
+        "sheet",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "broker_operator",
+        "tenant_rep",
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "core.stop_cancel_dismiss": {
+      "eventClasses": [
+        "dashboard_action_resolution",
+        "broker_opt_out",
+        "broker_property_unavailable",
+        "manual_user_continuation",
+        "retry_after_uncertain_send"
+      ],
+      "variationAxes": [
+        "phrasing",
+        "thread_shape",
+        "sender_identity",
+        "recipient_shape",
+        "data_quality",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "manual_reply_before_retry",
+        "opt_out_after_prior_interest",
+        "graph_accepted_but_index_missing"
+      ],
+      "statePermutations": [
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed"
+      ],
+      "negativeControls": [
+        "wrong_recipient negative control must fail closed or visibly pause",
+        "normal user cannot access disabled/dev lane behavior",
+        "stopped, cancelled, or dismissed threads cannot reactivate autonomous follow-up or inbox auto-reply"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "core.signature_identity": {
+      "eventClasses": [
+        "manual_user_continuation",
+        "reply_all_cc_context",
+        "retry_after_uncertain_send"
+      ],
+      "variationAxes": [
+        "phrasing",
+        "thread_shape",
+        "sender_identity",
+        "recipient_shape",
+        "data_quality",
+        "timing",
+        "campaign_state",
+        "operator_action",
+        "entitlement_scope"
+      ],
+      "combinationPlaybooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact"
+      ],
+      "statePermutations": [
+        "outbox_queued",
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed",
+        "dead_letter_visible",
+        "retry_reconciled"
+      ],
+      "negativeControls": [
+        "wrong_recipient must be blocked or visibly paused before Graph send",
+        "raw placeholders must not reach outbox or Graph",
+        "normal user cannot trigger dev tour/results side effects"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "email",
+        "sheet",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "broker_operator",
+        "tenant_rep",
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "core.health_recovery": {
+      "eventClasses": [
+        "token_or_graph_failure",
+        "retry_after_uncertain_send",
+        "manual_user_continuation",
+        "dashboard_action_resolution"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "outbox_queued",
+        "paused_manual_review",
+        "retry_reconciled",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot trigger dev tour/results side effects",
+        "raw placeholders must not reach outbox or Graph",
+        "wrong_recipient must be blocked or visibly paused before Graph send"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "email",
+        "firestore",
+        "review",
+        "sheet",
+        "ui"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "broker_operator",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "admin.usage_readonly": {
+      "eventClasses": [
+        "dashboard_action_resolution",
+        "manual_user_continuation",
+        "token_or_graph_failure"
+      ],
+      "variationAxes": [
+        "phrasing",
+        "thread_shape",
+        "sender_identity",
+        "recipient_shape",
+        "data_quality",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "manual_reply_before_retry",
+        "graph_accepted_but_index_missing"
+      ],
+      "statePermutations": [
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed"
+      ],
+      "negativeControls": [
+        "wrong_recipient negative control must fail closed or visibly pause",
+        "normal user cannot access disabled/dev lane behavior",
+        "non-admin users cannot read admin usage/cost data or infer another user campaign activity"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "support_recovery_reviewer"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "core.scheduler_scope": {
+      "eventClasses": [
+        "followup_due",
+        "manual_user_continuation",
+        "token_or_graph_failure",
+        "retry_after_uncertain_send"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "opt_out_after_prior_interest"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "outbox_queued",
+        "paused_manual_review",
+        "retry_reconciled",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot trigger dev tour/results side effects",
+        "raw placeholders must not reach outbox or Graph",
+        "wrong_recipient must be blocked or visibly paused before Graph send"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "email",
+        "firestore",
+        "review",
+        "sheet",
+        "ui"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "broker_operator",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "results.launcher": {
+      "eventClasses": [
+        "broker_available_full_specs",
+        "broker_attachment_or_link_only",
+        "sheet_row_moved",
+        "dashboard_action_resolution"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing",
+        "attachment_shape"
+      ],
+      "combinationPlaybooks": [
+        "partial_specs_plus_pdf_plus_followup",
+        "row_move_during_pending_action",
+        "same_broker_multiple_properties"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "paused_manual_review",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot access disabled/dev lane behavior",
+        "normal user cannot see or trigger dev/later lane side effects",
+        "wrong_recipient negative control must fail closed or visibly pause"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "results.summary_pdf": {
+      "eventClasses": [
+        "broker_available_full_specs",
+        "broker_available_partial_specs",
+        "broker_attachment_or_link_only",
+        "broker_property_non_viable",
+        "broker_tour_unavailable"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing",
+        "attachment_shape"
+      ],
+      "combinationPlaybooks": [
+        "partial_specs_plus_pdf_plus_followup",
+        "tour_unavailable_but_property_viable",
+        "row_move_during_pending_action"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "paused_manual_review",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot access disabled/dev lane behavior",
+        "normal user cannot see or trigger dev/later lane side effects",
+        "wrong_recipient negative control must fail closed or visibly pause",
+        "blank fields stay hidden in downloads and source-free facts are omitted instead of filled with guesses"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review",
+        "sheet"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "results.packet_pdf": {
+      "eventClasses": [
+        "broker_attachment_or_link_only",
+        "broker_available_full_specs",
+        "broker_available_partial_specs",
+        "broker_new_property_referral",
+        "sheet_row_moved"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing",
+        "attachment_shape"
+      ],
+      "combinationPlaybooks": [
+        "partial_specs_plus_pdf_plus_followup",
+        "same_broker_multiple_properties",
+        "row_move_during_pending_action"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "paused_manual_review",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot access disabled/dev lane behavior",
+        "normal user cannot see or trigger dev/later lane side effects",
+        "wrong_recipient negative control must fail closed or visibly pause",
+        "do not invent source-free CoStar-style facts; hide blank packet fields unless supplied or extracted with provenance"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review",
+        "sheet"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "results.map_geocode": {
+      "eventClasses": [
+        "broker_available_full_specs",
+        "broker_new_property_referral",
+        "sheet_row_moved",
+        "dashboard_action_resolution"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "same_broker_multiple_properties",
+        "row_move_during_pending_action",
+        "partial_specs_plus_pdf_plus_followup"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "paused_manual_review",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot access disabled/dev lane behavior",
+        "normal user cannot see or trigger dev/later lane side effects",
+        "wrong_recipient negative control must fail closed or visibly pause",
+        "low-confidence geocode or ambiguous address requires manual review and cannot silently plot the wrong property"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "results.saved_rebuild": {
+      "eventClasses": [
+        "dashboard_action_resolution",
+        "sheet_row_moved",
+        "broker_attachment_or_link_only"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing",
+        "attachment_shape"
+      ],
+      "combinationPlaybooks": [
+        "row_move_during_pending_action",
+        "partial_specs_plus_pdf_plus_followup",
+        "same_broker_multiple_properties"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "paused_manual_review",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot access disabled/dev lane behavior",
+        "normal user cannot see or trigger dev/later lane side effects",
+        "wrong_recipient negative control must fail closed or visibly pause"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review",
+        "sheet"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "tour.planner_preview": {
+      "eventClasses": [
+        "broker_tour_available",
+        "broker_tour_unavailable",
+        "broker_alternate_tour_time",
+        "dashboard_action_resolution"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "tour_unavailable_but_property_viable",
+        "same_broker_multiple_properties",
+        "reply_all_cc_plus_blocked_contact"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "paused_manual_review",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot access disabled/dev lane behavior",
+        "normal user cannot see or trigger dev/later lane side effects",
+        "wrong_recipient negative control must fail closed or visibly pause"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "tour.route_timing": {
+      "eventClasses": [
+        "broker_tour_available",
+        "broker_alternate_tour_time",
+        "dashboard_action_resolution",
+        "token_or_graph_failure"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "tour_unavailable_but_property_viable",
+        "same_broker_multiple_properties",
+        "manual_reply_before_retry"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "paused_manual_review",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot access disabled/dev lane behavior",
+        "normal user cannot see or trigger dev/later lane side effects",
+        "wrong_recipient negative control must fail closed or visibly pause"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "tour.invite_queue": {
+      "eventClasses": [
+        "broker_tour_available",
+        "broker_alternate_tour_time",
+        "reply_all_cc_context",
+        "dashboard_action_resolution",
+        "manual_user_continuation"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact",
+        "tour_unavailable_but_property_viable"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "outbox_queued",
+        "paused_manual_review",
+        "retry_reconciled",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot see or trigger dev/later lane side effects",
+        "normal user cannot trigger dev tour/results side effects",
+        "raw placeholders must not reach outbox or Graph",
+        "wrong_recipient must be blocked or visibly paused before Graph send"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "email",
+        "firestore",
+        "review",
+        "sheet",
+        "ui"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "broker_operator",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "tour.reply_handling": {
+      "eventClasses": [
+        "broker_tour_available",
+        "broker_tour_unavailable",
+        "broker_alternate_tour_time",
+        "manual_user_continuation",
+        "reply_all_cc_context"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact",
+        "tour_unavailable_but_property_viable"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "outbox_queued",
+        "paused_manual_review",
+        "retry_reconciled",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot see or trigger dev/later lane side effects",
+        "normal user cannot trigger dev tour/results side effects",
+        "raw placeholders must not reach outbox or Graph",
+        "wrong_recipient must be blocked or visibly paused before Graph send",
+        "tour unavailable must not classify the property as non-viable, property unavailable, stopped, or removed from results"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "email",
+        "firestore",
+        "review",
+        "sheet",
+        "ui"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "broker_operator",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "tour.alternate_time": {
+      "eventClasses": [
+        "broker_alternate_tour_time",
+        "broker_tour_unavailable",
+        "manual_user_continuation",
+        "dashboard_action_resolution"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "manual_reply_before_retry",
+        "same_broker_multiple_properties",
+        "tour_unavailable_but_property_viable"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "outbox_queued",
+        "paused_manual_review",
+        "retry_reconciled",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot see or trigger dev/later lane side effects",
+        "normal user cannot trigger dev tour/results side effects",
+        "raw placeholders must not reach outbox or Graph",
+        "wrong_recipient must be blocked or visibly paused before Graph send",
+        "alternate-time draft must include the tour date and route conflict/free-slot proof before any send"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "email",
+        "firestore",
+        "review",
+        "sheet",
+        "ui"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "broker_operator",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "infra.shared_entitlements": {
+      "eventClasses": [
+        "dashboard_action_resolution",
+        "token_or_graph_failure",
+        "launch_with_variable_mapping"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "tour_unavailable_but_property_viable",
+        "manual_reply_before_retry",
+        "graph_accepted_but_index_missing"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "paused_manual_review",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot access disabled/dev lane behavior",
+        "normal user cannot see or trigger dev/later lane side effects",
+        "wrong_recipient negative control must fail closed or visibly pause"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "infra.cloud_scheduler": {
+      "eventClasses": [
+        "followup_due",
+        "retry_after_uncertain_send",
+        "manual_user_continuation",
+        "token_or_graph_failure"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "opt_out_after_prior_interest"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "outbox_queued",
+        "paused_manual_review",
+        "retry_reconciled",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot see or trigger dev/later lane side effects",
+        "normal user cannot trigger dev tour/results side effects",
+        "raw placeholders must not reach outbox or Graph",
+        "wrong_recipient must be blocked or visibly paused before Graph send"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "email",
+        "firestore",
+        "review",
+        "sheet",
+        "ui"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "broker_operator",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "infra.cloud_tasks": {
+      "eventClasses": [
+        "retry_after_uncertain_send",
+        "token_or_graph_failure",
+        "manual_user_continuation",
+        "dashboard_action_resolution"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "outbox_queued",
+        "paused_manual_review",
+        "retry_reconciled",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot see or trigger dev/later lane side effects",
+        "normal user cannot trigger dev tour/results side effects",
+        "raw placeholders must not reach outbox or Graph",
+        "wrong_recipient must be blocked or visibly paused before Graph send"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "email",
+        "firestore",
+        "review",
+        "sheet",
+        "ui"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "broker_operator",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass only when happy path and negative controls both succeed across automated tests plus source-of-truth readback; any wrong recipient, placeholder, hidden failure, or duplicate send is automatic fail."
+    },
+    "infra.firestore_lane_rules": {
+      "eventClasses": [
+        "dashboard_action_resolution",
+        "launch_with_variable_mapping",
+        "broker_tour_available",
+        "token_or_graph_failure"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "tour_unavailable_but_property_viable",
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "paused_manual_review",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot access disabled/dev lane behavior",
+        "normal user cannot see or trigger dev/later lane side effects",
+        "wrong_recipient negative control must fail closed or visibly pause"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    },
+    "infra.observability": {
+      "eventClasses": [
+        "token_or_graph_failure",
+        "retry_after_uncertain_send",
+        "dashboard_action_resolution",
+        "manual_user_continuation"
+      ],
+      "variationAxes": [
+        "campaign_state",
+        "data_quality",
+        "entitlement_scope",
+        "operator_action",
+        "phrasing",
+        "recipient_shape",
+        "sender_identity",
+        "thread_shape",
+        "timing"
+      ],
+      "combinationPlaybooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "row_move_during_pending_action"
+      ],
+      "statePermutations": [
+        "action_needed",
+        "archived",
+        "completed",
+        "dead_letter_visible",
+        "live_waiting",
+        "not_started",
+        "paused_manual_review",
+        "stopped"
+      ],
+      "negativeControls": [
+        "normal user cannot access disabled/dev lane behavior",
+        "normal user cannot see or trigger dev/later lane side effects",
+        "wrong_recipient negative control must fail closed or visibly pause"
+      ],
+      "evidenceRequired": [
+        "automated",
+        "firestore",
+        "ui",
+        "review"
+      ],
+      "gradingRoles": [
+        "backend_safety_reviewer",
+        "frontend_ux_reviewer",
+        "privacy_reviewer",
+        "support_recovery_reviewer",
+        "tenant_rep"
+      ],
+      "passBar": "Pass when each selected event variant has automated or readback evidence, visible operator state, and no known incident-class regression."
+    }
+  },
+  "releaseUse": {
+    "beforeCodeRabbit": "Changed feature ids must be mapped to featureScenarios, then reviewers choose at least one fresh value from each listed variation axis.",
+    "beforeProductionPush": "Every touched send-risk feature must pass happy path, negative controls, and at least two combination playbooks with source-of-truth readbacks.",
+    "beforeNormalUsersReturn": "Production V1 base proof must cover all production_v1_core send-risk features and at least one cross-feature collision from every required combination playbook."
+  },
+  "freshnessRules": {
+    "variantRotation": "Do not replay only the last proof. For every production-impacting change, pick at least three fresh values across phrasing, thread_shape, timing, and data_quality that were not used in the previous release evidence.",
+    "pairwiseMinimum": "For each touched send-risk feature, combine at least one event class with five variation axes, two state permutations, and two combination playbooks; include one negative control that must block before Graph send.",
+    "subagentBreakPass": "At least one reviewer/subagent must try to break the feature from the broker/operator view, one from backend send/retry safety, and one from privacy/support recovery.",
+    "realismRule": "Fixtures should be written in plausible broker language, including forwarded chains, Cc teammates, abbreviations, partial facts, attachments-only replies, and mixed intent replies.",
+    "sourceOfTruthRule": "A scenario cannot pass from UI appearance alone; it needs Firestore/actionAudit/outbox, Sent Items or explicit no-send proof, Sheet/readback, and screenshot proof when applicable."
+  },
+  "releaseSuites": {
+    "production_v1_base_campaign": {
+      "purpose": "Prove the base product that normal users are allowed to use: upload, variable mapping, launch, reply processing, sheet updates, dashboard actions, follow-ups, stop/cancel/dismiss, signature identity, health, scheduler scope, and reply-all safety.",
+      "featureIds": [
+        "core.upload_mapping",
+        "core.name_resolution",
+        "core.launch_draft",
+        "core.outbox_send",
+        "core.reply_all_cc",
+        "core.manual_reply",
+        "core.inbox_matching",
+        "core.inbox_auto_reply",
+        "core.event_classifier",
+        "core.property_extraction",
+        "core.sheet_update",
+        "core.followups",
+        "core.stop_cancel_dismiss",
+        "core.signature_identity",
+        "core.health_recovery",
+        "core.scheduler_scope",
+        "admin.usage_readonly"
+      ],
+      "requiredEventClasses": [
+        "launch_with_variable_mapping",
+        "broker_available_full_specs",
+        "broker_available_partial_specs",
+        "broker_attachment_or_link_only",
+        "broker_property_unavailable",
+        "broker_property_non_viable",
+        "broker_wrong_contact",
+        "broker_opt_out",
+        "broker_confidential_question",
+        "manual_user_continuation",
+        "reply_all_cc_context",
+        "followup_due",
+        "retry_after_uncertain_send",
+        "sheet_row_moved",
+        "token_or_graph_failure",
+        "dashboard_action_resolution"
+      ],
+      "requiredCombinationPlaybooks": [
+        "partial_specs_plus_pdf_plus_followup",
+        "wrong_contact_plus_new_property",
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact",
+        "row_move_during_pending_action",
+        "same_broker_multiple_properties",
+        "subject_drift_split_thread",
+        "opt_out_after_prior_interest",
+        "graph_accepted_but_index_missing"
+      ],
+      "requiredStatePermutations": [
+        "not_started",
+        "outbox_queued",
+        "live_waiting",
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "completed",
+        "dead_letter_visible",
+        "retry_reconciled"
+      ],
+      "requiredNegativeControls": [
+        "raw [NAME] or unresolved placeholder blocks launch/outbox",
+        "manual Sent Items continuation suppresses autonomous retry/follow-up",
+        "normal user cannot trigger dev Results/Tour side effects",
+        "blocked or opt-out contact cannot be reintroduced by reply-all",
+        "wrong row cannot be updated after sheet reorder"
+      ],
+      "proofArtifacts": [
+        "unit/integration fixtures for each required event class",
+        "Baylor/BP21-only live or emulator campaign transcript for happy path and at least two collision playbooks",
+        "Firestore outbox/actionAudit/notifications/thread readbacks",
+        "Sent Items/Gmail proof or explicit no-send proof",
+        "Sheet row-anchor/readback proof",
+        "dashboard screenshots for operator-visible states",
+        "CodeRabbit packet-aware review"
+      ]
+    },
+    "results_dev_artifact_workspace": {
+      "purpose": "Prove Results/PDF/3D Map as a dev-only artifact workspace before it can graduate toward normal users.",
+      "featureIds": [
+        "results.launcher",
+        "results.summary_pdf",
+        "results.packet_pdf",
+        "results.map_geocode",
+        "results.saved_rebuild"
+      ],
+      "requiredEventClasses": [
+        "broker_available_full_specs",
+        "broker_available_partial_specs",
+        "broker_attachment_or_link_only",
+        "sheet_row_moved",
+        "dashboard_action_resolution"
+      ],
+      "requiredCombinationPlaybooks": [
+        "partial_specs_plus_pdf_plus_followup",
+        "row_move_during_pending_action",
+        "same_broker_multiple_properties"
+      ],
+      "requiredStatePermutations": [
+        "live_waiting",
+        "action_needed",
+        "completed",
+        "archived"
+      ],
+      "requiredNegativeControls": [
+        "downloaded PDFs suppress blank/unknown fields",
+        "generated artifacts never invent CoStar-style facts without source",
+        "Results workspace cannot queue or send email",
+        "saved report reopens without forcing regeneration"
+      ],
+      "proofArtifacts": [
+        "rendered Summary/Packet PDF screenshots and text extraction",
+        "3D map desktop/mobile screenshots with route-order markers",
+        "source/provenance readback for every displayed fact/image",
+        "Jill-example comparison grader notes",
+        "CodeRabbit review for feature-lane isolation"
+      ]
+    },
+    "tour_dev_scheduling_lifecycle": {
+      "purpose": "Prove Tour Scheduling as an isolated dev lane only; normal users must not see or trigger it.",
+      "featureIds": [
+        "tour.planner_preview",
+        "tour.route_timing",
+        "tour.invite_queue",
+        "tour.reply_handling",
+        "tour.alternate_time"
+      ],
+      "requiredEventClasses": [
+        "broker_tour_available",
+        "broker_tour_unavailable",
+        "broker_alternate_tour_time",
+        "manual_user_continuation",
+        "reply_all_cc_context",
+        "dashboard_action_resolution",
+        "token_or_graph_failure"
+      ],
+      "requiredCombinationPlaybooks": [
+        "tour_unavailable_but_property_viable",
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact",
+        "same_broker_multiple_properties",
+        "graph_accepted_but_index_missing"
+      ],
+      "requiredStatePermutations": [
+        "action_needed",
+        "paused_manual_review",
+        "stopped",
+        "dead_letter_visible",
+        "retry_reconciled"
+      ],
+      "requiredNegativeControls": [
+        "normal user cannot trigger tour invite queue from Results or worker",
+        "tour unavailable does not mark property non-viable",
+        "alternate time draft includes date and checks route conflicts before suggesting copy",
+        "tour invite uses saved sender first name/signature and never placeholder/fallback slop"
+      ],
+      "proofArtifacts": [
+        "backend entitlement tests proving normal-user deny path",
+        "frontend hidden/denied screenshots for non-admin users",
+        "Baylor/BP21-only invite/reply/alternate proof when explicitly enabled",
+        "conversation split screenshot showing Broker Outreach vs Tour Scheduling",
+        "actionAudit/outbox/dead-letter readbacks"
+      ]
+    },
+    "firebase_native_worker_migration": {
+      "purpose": "Future migration acceptance suite so Firebase-native workers do not lose existing backend behavior.",
+      "featureIds": [
+        "infra.shared_entitlements",
+        "infra.cloud_scheduler",
+        "infra.cloud_tasks",
+        "infra.firestore_lane_rules",
+        "infra.observability"
+      ],
+      "requiredEventClasses": [
+        "followup_due",
+        "retry_after_uncertain_send",
+        "manual_user_continuation",
+        "reply_all_cc_context",
+        "token_or_graph_failure",
+        "dashboard_action_resolution"
+      ],
+      "requiredCombinationPlaybooks": [
+        "manual_reply_before_retry",
+        "reply_all_cc_plus_blocked_contact",
+        "graph_accepted_but_index_missing",
+        "row_move_during_pending_action"
+      ],
+      "requiredStatePermutations": [
+        "outbox_queued",
+        "live_waiting",
+        "dead_letter_visible",
+        "retry_reconciled",
+        "archived"
+      ],
+      "requiredNegativeControls": [
+        "single-runner lease prevents duplicate concurrent processing",
+        "Cloud Tasks retries cannot double-send after Graph accept",
+        "Firestore rules/entitlements deny normal users from dev-only side effects",
+        "scheduler scope is explicit and observable per user"
+      ],
+      "proofArtifacts": [
+        "emulator proof using Firestore/Auth rules",
+        "Cloud Functions/Tasks scoped dry-run logs",
+        "source-of-truth parity against current main.py ordering",
+        "CodeRabbit architecture review and migration checklist"
+      ]
+    }
+  },
+  "featureInteractionMatrix": {
+    "placeholder_name_through_send_path": {
+      "features": [
+        "core.upload_mapping",
+        "core.name_resolution",
+        "core.launch_draft",
+        "core.outbox_send",
+        "core.signature_identity"
+      ],
+      "breakThisBy": [
+        "missing-name column",
+        "ambiguous first/full-name column",
+        "formula-generated greeting",
+        "operator edits template after mapping"
+      ],
+      "mustProve": "No raw placeholders reach outbox/Graph, and the operator sees a hard-stop UI/readback explaining which row/field failed."
+    },
+    "manual_reply_retry_followup_collision": {
+      "features": [
+        "core.outbox_send",
+        "core.inbox_matching",
+        "core.inbox_auto_reply",
+        "core.followups",
+        "core.health_recovery",
+        "core.scheduler_scope"
+      ],
+      "breakThisBy": [
+        "Graph accepted but index missing",
+        "user manually replied in Sent Items",
+        "broker replied after dead-letter",
+        "scheduler runs twice"
+      ],
+      "mustProve": "Retry reconciles Sent Items and campaign thread state before any resend; duplicate send is impossible or visibly blocked."
+    },
+    "reply_all_privacy_boundary": {
+      "features": [
+        "core.reply_all_cc",
+        "core.manual_reply",
+        "core.inbox_auto_reply",
+        "core.followups"
+      ],
+      "breakThisBy": [
+        "broker adds teammate on Cc",
+        "blocked contact remains in Cc",
+        "wrong-contact redirects with a new email",
+        "alias/plus-address reply"
+      ],
+      "mustProve": "Safe Ccs are preserved, unsafe recipients are filtered or paused, and the final recipient list is visible before user-click sends."
+    },
+    "property_status_taxonomy": {
+      "features": [
+        "core.event_classifier",
+        "core.property_extraction",
+        "core.sheet_update",
+        "results.summary_pdf",
+        "results.packet_pdf",
+        "tour.reply_handling"
+      ],
+      "breakThisBy": [
+        "not a fit",
+        "no longer available",
+        "tour not available",
+        "only office-heavy",
+        "available but missing rent"
+      ],
+      "mustProve": "Property unavailable, non-viable, tour-unavailable, partial specs, and completed are distinct states in sheet/dashboard/results."
+    },
+    "dev_lane_containment": {
+      "features": [
+        "results.launcher",
+        "results.saved_rebuild",
+        "tour.planner_preview",
+        "tour.invite_queue",
+        "infra.shared_entitlements",
+        "infra.firestore_lane_rules"
+      ],
+      "breakThisBy": [
+        "normal user opens Results tab",
+        "old report has tour state",
+        "backend sees dev field set",
+        "frontend hidden button but callable API remains"
+      ],
+      "mustProve": "Normal users cannot see, call, or indirectly trigger Results/Tour side effects until the lane is explicitly promoted."
+    },
+    "operator_lifecycle_admin_visibility": {
+      "features": [
+        "core.stop_cancel_dismiss",
+        "admin.usage_readonly",
+        "core.health_recovery",
+        "core.scheduler_scope",
+        "infra.observability"
+      ],
+      "breakThisBy": [
+        "operator stops a campaign while scheduler is running",
+        "normal user opens usage URL directly",
+        "dead-letter appears after stop",
+        "admin cost chart reads another user activity"
+      ],
+      "mustProve": "Stopped/cancelled/dismissed states suppress autonomous work, and admin-only usage/health evidence is visible only to allowed admins."
+    },
+    "map_route_cost_surface": {
+      "features": [
+        "results.map_geocode",
+        "tour.route_timing",
+        "tour.alternate_time",
+        "admin.usage_readonly",
+        "infra.observability"
+      ],
+      "breakThisBy": [
+        "ambiguous geocode",
+        "route API failure",
+        "alternate tour time creates route conflict",
+        "mapping cost spike",
+        "normal user dev lane access"
+      ],
+      "mustProve": "Map/route outputs are source-labeled, low-confidence locations stay reviewable, costs are observable, and tour route changes do not send without entitlement."
+    },
+    "firebase_worker_execution_plane": {
+      "features": [
+        "core.scheduler_scope",
+        "infra.cloud_scheduler",
+        "infra.cloud_tasks",
+        "infra.firestore_lane_rules",
+        "infra.observability"
+      ],
+      "breakThisBy": [
+        "two workers claim same queue",
+        "Cloud Task retries after Graph accept",
+        "Firestore rule allows dev lane mutation",
+        "scheduler widens scope",
+        "observability omits failed user"
+      ],
+      "mustProve": "Firebase-native migration preserves single-runner scope, retry dedupe, lane entitlements, and visible per-user processing evidence."
+    }
+  }
+}

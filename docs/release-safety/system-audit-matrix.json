@@ -12,6 +12,7 @@
     ],
     "requiredBeforeProductionWidening": [
       "identify changed feature ids in feature-registry.json",
+      "select fresh feature-gradebook event classes, trigger variations, combination playbooks, state permutations, and negative controls for every changed feature id",
       "walk every send-risk feature through this matrix",
       "run the fixture classes listed for each touched feature",
       "request CodeRabbit review using this packet and both repo AGENTS.md files",
@@ -60,6 +61,7 @@
       "userVisibleEvidence": ["mapping warning state", "launch preview text", "row count and recipient review", "blocked launch error"],
       "sourceOfTruthReadbacks": ["client doc columnConfig", "outbox docs for selected rows", "created Sheet headers/rows", "actionAudit queued state"],
       "codeRabbitQuestions": ["Can this upload path queue email with a placeholder, wrong recipient, or normal-user tour language?"],
+      "gradebookScenario": "core.upload_mapping",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "core.name_resolution": {
@@ -70,6 +72,7 @@
       "userVisibleEvidence": ["red name/contact review", "sample row preview", "scroll-to-field guidance", "blocked send message"],
       "sourceOfTruthReadbacks": ["chosen name column", "outbox subject/body", "sheet row source values", "outbound safety validation result"],
       "codeRabbitQuestions": ["Can any recipient/name variation let a placeholder or wrong first name reach outbox or send?"],
+      "gradebookScenario": "core.name_resolution",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "core.launch_draft": {
@@ -80,6 +83,7 @@
       "userVisibleEvidence": ["preview body", "recipient/body/signature review", "blocked draft banner", "queued audit row"],
       "sourceOfTruthReadbacks": ["outbox doc body/recipients", "actionAudit queued", "profile signature source", "sheet row anchor"],
       "codeRabbitQuestions": ["Does this launch draft path send or queue unsafe copy, bad placeholders, tour language, or missing audit evidence?"],
+      "gradebookScenario": "core.launch_draft",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "core.outbox_send": {
@@ -90,6 +94,7 @@
       "userVisibleEvidence": ["pending send count", "sent/failed/dead-letter state", "cancelled or duplicate-skipped terminal state"],
       "sourceOfTruthReadbacks": ["outbox drained", "actionAudit terminal status", "thread/message index", "Graph/Sent Items readback", "deadLetterQueue if failed"],
       "codeRabbitQuestions": ["Can this autonomous send duplicate, lose audit, hide a failure, send to a wrong recipient, or miss Sent Items reconciliation?"],
+      "gradebookScenario": "core.outbox_send",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "core.reply_all_cc": {
@@ -100,6 +105,7 @@
       "userVisibleEvidence": ["To/Cc preview", "blocked/filtered recipient warning", "reply context in conversation panel"],
       "sourceOfTruthReadbacks": ["Graph reply payload recipients", "actionAudit finalRecipients", "thread message recipients", "blocked contact readback"],
       "codeRabbitQuestions": ["Does this reply-all path preserve safe CC recipients, filter bad recipients, and audit who received the send?"],
+      "gradebookScenario": "core.reply_all_cc",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "core.manual_reply": {
@@ -110,6 +116,7 @@
       "userVisibleEvidence": ["editable body", "recipient and signature preview", "pending/cancel state", "failed visible state"],
       "sourceOfTruthReadbacks": ["pendingResponses or outbox record", "actionAudit queued/sent/failed", "Graph/Sent Items readback", "thread update after refresh"],
       "codeRabbitQuestions": ["Can this manual reply hide failure, clear the action early, drop CCs, or send placeholders/wrong signatures?"],
+      "gradebookScenario": "core.manual_reply",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "core.inbox_auto_reply": {
@@ -120,6 +127,7 @@
       "userVisibleEvidence": ["generated response preview or action", "health pending count", "operator-visible failure"],
       "sourceOfTruthReadbacks": ["source inbox message identity", "pending response status", "thread status", "actionAudit terminal state", "Sent Items if sent"],
       "codeRabbitQuestions": ["Can inbox processing send an autonomous reply with tour language, bad placeholders, duplicate retry, or hidden failure?"],
+      "gradebookScenario": "core.inbox_auto_reply",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "core.followups": {
@@ -130,6 +138,7 @@
       "userVisibleEvidence": ["follow-up waiting/paused/stopped state", "sent or skipped audit", "blocked recovery notice"],
       "sourceOfTruthReadbacks": ["thread followUpStatus", "Sent Items/manual continuation check result", "outbox/actionAudit", "scheduler log"],
       "codeRabbitQuestions": ["Can this follow-up send after a broker reply, manual user reply, opt-out, terminal state, or duplicate-retry condition?"],
+      "gradebookScenario": "core.followups",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "core.signature_identity": {
@@ -140,6 +149,7 @@
       "userVisibleEvidence": ["settings preview", "email composer signature", "logo/profile upload state", "sent Gmail/Graph render"],
       "sourceOfTruthReadbacks": ["profile signature fields", "outbox body/attachments", "Graph MIME/body", "Sent Items screenshot/readback"],
       "codeRabbitQuestions": ["Can this signature path send with missing identity, wrong organization, raw placeholder, or Jill/MOHR leakage?"],
+      "gradebookScenario": "core.signature_identity",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "core.health_recovery": {
@@ -150,6 +160,7 @@
       "userVisibleEvidence": ["dead-letter card", "failed reason", "send/cancel/dismiss controls", "recovered terminal state"],
       "sourceOfTruthReadbacks": ["deadLetterQueue before/after", "processingFailures", "pendingResponses", "actionAudit", "Sent Items"],
       "codeRabbitQuestions": ["Can recovery hide a failure, delete evidence, duplicate-send, or send without a visible audit trail?"],
+      "gradebookScenario": "core.health_recovery",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "core.scheduler_scope": {
@@ -160,6 +171,7 @@
       "userVisibleEvidence": ["health widget", "queue counts", "scheduler run notes", "paused/user-scoped status"],
       "sourceOfTruthReadbacks": ["GitHub Actions environment/log", "scheduler lease", "per-user queue sweep", "system health doc"],
       "codeRabbitQuestions": ["Can this scheduler change widen normal user scope, trigger unexpected sends, or hide failed queue state?"],
+      "gradebookScenario": "core.scheduler_scope",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "tour.invite_queue": {
@@ -170,6 +182,7 @@
       "userVisibleEvidence": ["disabled/unavailable normal-user state", "allowlisted preview", "queued invite audit", "tour date/time"],
       "sourceOfTruthReadbacks": ["feature entitlement", "tourPlan state", "outbox/actionAudit", "normal-user denied-path test"],
       "codeRabbitQuestions": ["Can a normal user trigger tour invite email, queued tour outbox, or hidden tour audit from Results?"],
+      "gradebookScenario": "tour.invite_queue",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "tour.reply_handling": {
@@ -180,6 +193,7 @@
       "userVisibleEvidence": ["Tour Scheduling conversation tab", "tour unavailable status", "draft response preview", "normal-user disabled state"],
       "sourceOfTruthReadbacks": ["thread event type", "notification/action", "tourPlan stop status", "outbox denied or queued audit"],
       "codeRabbitQuestions": ["Can tour reply handling misclassify unavailable tours, send for a normal user, or create duplicate replies?"],
+      "gradebookScenario": "tour.reply_handling",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "tour.alternate_time": {
@@ -190,6 +204,7 @@
       "userVisibleEvidence": ["requested alternate time", "conflict/free slot display", "confirm/deny draft", "tour date visible"],
       "sourceOfTruthReadbacks": ["tourPlan proposed/confirmed/alternate status", "outbox/actionAudit", "thread message classification"],
       "codeRabbitQuestions": ["Can alternate-time tour code send without entitlement, miss a conflict, duplicate-send, or hide operator failure?"],
+      "gradebookScenario": "tour.alternate_time",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "infra.cloud_scheduler": {
@@ -200,6 +215,7 @@
       "userVisibleEvidence": ["health run timestamp", "scoped user list", "queue counts", "disabled normal-user proof during recovery"],
       "sourceOfTruthReadbacks": ["scheduler log", "lease doc", "per-user queues", "GitHub/GCP run id"],
       "codeRabbitQuestions": ["Can the cloud scheduler widen user scope, change send order, bypass audit, or process normal users unexpectedly?"],
+      "gradebookScenario": "infra.cloud_scheduler",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     },
     "infra.cloud_tasks": {
@@ -210,6 +226,7 @@
       "userVisibleEvidence": ["task pending/sent/failed state", "operator-visible recovery", "normal-user scope status"],
       "sourceOfTruthReadbacks": ["task id", "actionAudit terminal state", "deadLetterQueue", "Graph/Sent Items readback"],
       "codeRabbitQuestions": ["Can Cloud Tasks create duplicate sends, hide failure, bypass recipient checks, or skip audit terminalization?"],
+      "gradebookScenario": "infra.cloud_tasks",
       "adversarialFixtureClasses": ["happy_path", "terminal_state", "bad_placeholder", "wrong_recipient", "manual_continuation", "duplicate_retry", "operator_visible_failure"]
     }
   }

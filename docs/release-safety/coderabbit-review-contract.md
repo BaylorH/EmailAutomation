@@ -23,14 +23,15 @@ Every production-impacting pull request must be reviewed against:
 
 - `AGENTS.md`
 - `docs/release-safety/feature-registry.json`
+- `docs/release-safety/feature-gradebook.json`
 - `docs/release-safety/adversarial-rubrics.json`
 - `docs/release-safety/outbound-send-surface-inventory.json`
 - `docs/release-safety/system-audit-matrix.json`
 
 CodeRabbit should flag a PR when changed behavior is not mapped to a registry
 feature with a lane, owner modules, dependencies, send risk, data writes, prompt
-contracts, UI surfaces, fixtures, manual screenshot rubrics, and CodeRabbit
-checks.
+contracts, UI surfaces, fixture classes, feature-gradebook event scenarios,
+manual screenshot rubrics, and CodeRabbit checks.
 
 Production V1 currently means the `production_v1_core` and
 `production_v1_admin` lanes only. The `dev_results`, `dev_tour`, and
@@ -43,12 +44,14 @@ Useful review prompt:
 
 > Review this PR as a SiteSift release-safety change. Compare changed files to
 > `AGENTS.md`, `docs/release-safety/feature-registry.json`,
+> `docs/release-safety/feature-gradebook.json`,
 > `docs/release-safety/adversarial-rubrics.json`, and
 > `docs/release-safety/outbound-send-surface-inventory.json`, and
 > `docs/release-safety/system-audit-matrix.json`. Flag missing
 > feature rows, send-risk mismatches, Results/Tour leakage into Production V1,
-> UI-only gates for backend-capable behavior, prompt changes without fixtures,
-> and any production send path not tied to the outbound safety inventory.
+> UI-only gates for backend-capable behavior, prompt changes without fresh
+> gradebook event/variation/combination coverage, and any production send path
+> not tied to the outbound safety inventory.
 
 ## Production Entry Points
 
@@ -139,6 +142,8 @@ For production-impacting changes, reviewers should expect:
 
 - focused unit tests for changed lane,
 - affected dependency tests from the release-safety map,
+- selected `feature-gradebook` events, trigger variations, combinations, state
+  permutations, and negative controls for changed feature ids,
 - `python3 -m py_compile` for changed Python files,
 - `git diff --check`,
 - GitHub Actions/scheduler readback for backend deploys,
