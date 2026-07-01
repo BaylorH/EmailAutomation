@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Machine-readable inventory of every Python file that can directly call Microsoft Graph send/reply endpoints. Update this file whenever a Graph send surface is added, removed, or moved.",
+  "sendSurfaces": [
+    {
+      "path": "email_automation/email.py",
+      "lane": "core_outbox",
+      "policyStatus": "guarded",
+      "trigger": "Queued Firestore outbox items for campaign launch, dashboard replies, new-property outreach, dead-letter requeue, and reviewed tour invites.",
+      "risk": "This is the primary production send path; a bypass here can send placeholders, wrong recipients, duplicate retries, or paused-client messages.",
+      "currentControls": [
+        "outbound body validation",
+        "paused-client dead-letter guard",
+        "Results/Tour outbox pause gate",
+        "Sent Items retry reconciliation",
+        "actionAudit terminal states"
+      ],
+      "nextGate": "Centralize these controls into a shared outbound policy object and require every other send surface to call it or document why it is legacy-disabled."
+    },
+    {
+      "path": "email_automation/processing.py",
+      "lane": "inbox_auto_reply",
+      "policyStatus": "guarded",
+      "trigger": "Broker inbox reply processing that may send a same-thread response after AI classification/extraction.",
+      "risk": "This is the path most likely to auto-reply from a broker response; it must never create tour scheduling, placeholders, or wrong reply-all recipients for normal users.",
+      "currentControls": [
+        "reply-all draft path",
+        "tour action allowlist gate",
+        "reply indexing tests",
+        "Graph retry tests"
+      ],
+      "nextGate": "Route every processing reply through the same outbound policy used by outbox sends and keep tour interpretation separate from core event handling."
+    },
+    {
+      "path": "email_automation/followup.py",
+      "lane": "followup_scheduler",
+      "policyStatus": "guarded",
+      "trigger": "Scheduled follow-up replies for active campaign threads.",
+      "risk": "Follow-ups can annoy brokers or double-send if they ignore inbound replies, manual user replies, stops, opt-outs, or off-hours rules.",
+      "currentControls": [
+        "terminal-state checks",
+        "off-hours/weekend deferral",
+        "reply draft send path"
+      ],
+      "nextGate": "Add an explicit outbound policy call before Graph send and a fixture proving manual Sent Items continuation suppresses follow-up."
+    },
+    {
+      "path": "email_automation/email_operations.py",
+      "lane": "legacy_processing_helpers",
+      "policyStatus": "guarded",
+      "trigger": "Older helper functions for completion/remaining-question/new-property replies used by processing-era code paths.",
+      "risk": "Helper-level Graph sends are easy to miss during safety reviews and may not share the latest placeholder, reply-all, or feature-lane checks.",
+      "currentControls": [
+        "some helper-specific retry behavior",
+        "some reply/new-message indexing"
+      ],
+      "nextGate": "Either migrate callers into email_automation/email.py or wrap this module with the shared outbound policy and add path-specific tests."
+    },
+    {
+      "path": "email_automation/service_providers.py",
+      "lane": "graph_provider",
+      "policyStatus": "provider",
+      "trigger": "Low-level Microsoft Graph provider methods used by higher-level sending code.",
+      "risk": "A provider abstraction can become a bypass if product logic calls it directly without policy checks.",
+      "currentControls": [
+        "provider returns Graph identity for auditing",
+        "callers are expected to enforce policy"
+      ],
+      "nextGate": "Keep this provider dumb but add an inventory/code-review rule that only approved policy-aware modules call provider send methods."
+    },
+    {
+      "path": "scheduler_runner.py",
+      "lane": "legacy_scheduler",
+      "policyStatus": "legacy_disabled",
+      "trigger": "Historical monolithic scheduler and standalone helper functions retained for compatibility/listing only.",
+      "risk": "Contains old direct Graph send/reply helpers that would be unsafe if reactivated.",
+      "currentControls": [
+        "legacy send_outboxes raises RuntimeError",
+        "send_email raises NotImplementedError",
+        "active main.py imports email_automation.email.send_outboxes"
+      ],
+      "nextGate": "Delete or quarantine direct legacy Graph send helpers after proving no production workflow imports them."
+    },
+    {
+      "path": "noPopup_signin_emails_to_excel.py",
+      "lane": "legacy_script",
+      "policyStatus": "legacy_script",
+      "trigger": "Standalone historical script for sign-in/email-to-Excel flow.",
+      "risk": "Not part of the production scheduler, but direct Graph send/reply calls should not be confused with approved SiteSift send paths.",
+      "currentControls": [
+        "not imported by main.py",
+        "not part of GitHub Actions scheduler"
+      ],
+      "nextGate": "Move to an archived scripts folder or add a runtime guard before any future cleanup broadens scheduler entrypoints."
+    }
+  ]
+}
