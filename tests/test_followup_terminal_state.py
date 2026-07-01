@@ -358,6 +358,80 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertIn("opted out", followup._send_followup_email.last_error)
         self.assertTrue(followup._send_followup_email.guard_failed_closed)
 
+    def test_followup_preserves_safe_ccs_with_reply_all_draft(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+            "to": ["bp21harrison@gmail.com"],
+            "cc": ["assistant@example.com", "baylor.freelance@outlook.com"],
+        })
+        fake_fs = FakeFollowupFirestore([outbound])
+        followup_config = {
+            "followUps": [{"message": "Hi Riley,\n\nJust following up."}],
+        }
+        thread_data = {
+            "email": ["bp21harrison@gmail.com"],
+            "contactName": "Riley Broker",
+        }
+        post_urls = []
+        patched_payloads = []
+
+        def run_request(callback, *args, **kwargs):
+            return callback()
+
+        def fake_get(url, **kwargs):
+            self.assertIn("/me/messages", url)
+            return FakeResponse(200, {
+                "value": [{
+                    "id": "graph-root",
+                    "subject": "0 Gemini Ave",
+                    "conversationId": "conv-1",
+                }]
+            })
+
+        def fake_post(url, **kwargs):
+            post_urls.append(url)
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {"id": "reply-draft-1", "toRecipients": [], "ccRecipients": []})
+            if url.endswith("/send"):
+                return FakeResponse(202, {})
+            raise AssertionError(f"Follow-up used non reply-all endpoint: {url}")
+
+        def fake_patch(url, **kwargs):
+            patched_payloads.append(kwargs.get("json") or {})
+            return FakeResponse(200, {})
+
+        with patch.object(followup, "_fs", fake_fs), \
+             patch.object(followup, "exponential_backoff_request", side_effect=run_request), \
+             patch.object(requests, "get", side_effect=fake_get), \
+             patch.object(requests, "post", side_effect=fake_post), \
+             patch.object(requests, "patch", side_effect=fake_patch), \
+             patch.object(followup, "_save_followup_message") as save_followup, \
+             patch("email_automation.processing.is_contact_opted_out", return_value=None):
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+            )
+
+        self.assertTrue(result)
+        self.assertTrue(any(url.endswith("/createReplyAll") for url in post_urls))
+        self.assertTrue(any(url.endswith("/send") for url in post_urls))
+        patch_payload = patched_payloads[-1]
+        self.assertEqual(
+            [r["emailAddress"]["address"] for r in patch_payload["toRecipients"]],
+            ["bp21harrison@gmail.com"],
+        )
+        self.assertEqual(
+            [r["emailAddress"]["address"] for r in patch_payload["ccRecipients"]],
+            ["assistant@example.com"],
+        )
+        save_followup.assert_called_once()
+
     def test_failed_followup_retry_uses_sent_items_match_without_resending(self):
         outbound = FakeMessageDoc({
             "direction": "outbound",

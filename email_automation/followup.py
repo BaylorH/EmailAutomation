@@ -189,6 +189,7 @@ def _save_followup_message(
     user_signature: str = None,
     signature_mode: str = None,
     user_email: str = None,
+    cc_recipients: Optional[List[str]] = None,
 ) -> bool:
     """Persist a sent follow-up into thread history for dashboard reconciliation."""
     try:
@@ -207,6 +208,7 @@ def _save_followup_message(
                 "direction": "outbound",
                 "from": "me",
                 "to": [recipient] if recipient else [],
+                "cc": cc_recipients or [],
                 "subject": subject,
                 "body": html_body,
                 "bodyPreview": safe_preview(body, 300),
@@ -661,32 +663,101 @@ def _send_followup_email(
                 print(f"   ⚠️ {_send_followup_email.last_error}")
                 return False
 
-        # Send as reply with signature attachments
+        # Send as a filtered reply-all draft so broker CCs are preserved safely.
         send_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=5)
         _send_followup_email.last_attempt_at = send_attempt_at
-        if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
-            # Use createReply to get a draft, add attachments, then send
-            create_reply_resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{graph_msg_id}/createReply", headers=headers, timeout=30)
-            )
-            reply_draft = create_reply_resp.json()
-            reply_draft_id = reply_draft.get("id")
+        from .email import (
+            _delete_graph_reply_draft,
+            _filter_reply_all_draft_recipients,
+            _hydrate_reply_all_draft_recipients,
+            _reviewed_recipient_reply_all_fallback,
+            _source_message_reply_all_fallback,
+        )
 
-            # Update draft body AND set correct recipient
-            # (createReply on sent messages doesn't auto-populate toRecipients correctly)
-            exponential_backoff_request(
-                lambda: requests.patch(
-                    f"{base}/me/messages/{reply_draft_id}",
-                    headers=headers,
-                    json={
-                        "body": {"contentType": "HTML", "content": html_content},
-                        "toRecipients": [{"emailAddress": {"address": recipient}}]
-                    },
-                    timeout=30
+        create_reply_resp = exponential_backoff_request(
+            lambda: requests.post(
+                f"{base}/me/messages/{graph_msg_id}/createReplyAll",
+                headers=headers,
+                timeout=30,
+            )
+        )
+        if not create_reply_resp or create_reply_resp.status_code not in [200, 201, 202]:
+            _send_followup_email.last_error = (
+                f"createReplyAll failed: {create_reply_resp.status_code if create_reply_resp else 'no response'}"
+            )
+            print(f"   ❌ {_send_followup_email.last_error}")
+            return False
+
+        reply_draft = create_reply_resp.json() or {}
+        reply_draft_id = reply_draft.get("id")
+        if not reply_draft_id:
+            _send_followup_email.last_error = "createReplyAll returned no draft id"
+            print(f"   ❌ {_send_followup_email.last_error}")
+            return False
+
+        source_message = dict(last_outbound or {})
+        source_message["replyToEmails"] = [recipient]
+        reply_draft = _hydrate_reply_all_draft_recipients(headers, reply_draft, base=base)
+        reply_draft = _source_message_reply_all_fallback(reply_draft, source_message)
+        reply_draft = _reviewed_recipient_reply_all_fallback(
+            reply_draft,
+            to_emails=[recipient],
+            cc_emails=(
+                thread_data.get("ccEmails")
+                or thread_data.get("ccRecipients")
+                or source_message.get("ccRecipients")
+                or source_message.get("cc")
+                or []
+            ),
+        )
+
+        recipient_result = _filter_reply_all_draft_recipients(
+            user_id,
+            reply_draft,
+            user_email=user_email,
+        )
+        recipient_payload = recipient_result["payload"]
+        if not recipient_payload["toRecipients"] and recipient:
+            recipient_lower = recipient.lower()
+            recipient_payload["ccRecipients"] = [
+                cc_recipient
+                for cc_recipient in recipient_payload["ccRecipients"]
+                if (
+                    ((cc_recipient.get("emailAddress") or {}).get("address") or "")
+                    .strip()
+                    .lower()
+                    != recipient_lower
                 )
-            )
+            ]
+            recipient_payload["toRecipients"] = [{"emailAddress": {"address": recipient}}]
+        if not (recipient_payload["toRecipients"] or recipient_payload["ccRecipients"]):
+            _send_followup_email.last_error = "No safe reply-all recipients remained after filtering"
+            _send_followup_email.guard_failed_closed = True
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            print(f"   ❌ {_send_followup_email.last_error}")
+            return False
 
-            # Add signature attachments
+        patch_resp = exponential_backoff_request(
+            lambda: requests.patch(
+                f"{base}/me/messages/{reply_draft_id}",
+                headers=headers,
+                json={
+                    "body": {"contentType": "HTML", "content": html_content},
+                    "toRecipients": recipient_payload["toRecipients"],
+                    "ccRecipients": recipient_payload["ccRecipients"],
+                },
+                timeout=30,
+            )
+        )
+        if not patch_resp or patch_resp.status_code not in [200, 202]:
+            _send_followup_email.last_error = (
+                f"Patch reply-all draft failed: {patch_resp.status_code if patch_resp else 'no response'}"
+            )
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            print(f"   ❌ {_send_followup_email.last_error}")
+            return False
+
+        if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
             signature_attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
             for attachment in signature_attachments:
                 try:
@@ -703,41 +774,18 @@ def _send_followup_email(
                 except Exception as e:
                     print(f"      ⚠️ Error attaching {attachment['name']}: {e}")
 
-            # Send the reply
-            reply_resp = exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-                max_retries=1,
-                operation="graph_send",
-            )
-        else:
-            # No attachments - use simple reply endpoint
-            # Must explicitly set toRecipients since we're replying to our own sent message
-            reply_body = {
-                "message": {
-                    "toRecipients": [{"emailAddress": {"address": recipient}}],
-                    "body": {
-                        "contentType": "HTML",
-                        "content": html_content
-                    }
-                }
-            }
-
-            reply_resp = exponential_backoff_request(
-                lambda: requests.post(
-                    f"{base}/me/messages/{graph_msg_id}/reply",
-                    headers=headers,
-                    json=reply_body,
-                    timeout=30
-                ),
-                max_retries=1,
-                operation="graph_send",
-            )
+        reply_resp = exponential_backoff_request(
+            lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
+            max_retries=1,
+            operation="graph_send",
+        )
 
         if reply_resp.status_code in [200, 201, 202]:
             print(f"   Sent follow-up #{followup_index + 1} for thread {thread_id[:20]}...")
             _save_followup_message(
                 user_id, thread_id, recipient, subject,
-                followup_message, user_signature, signature_mode, user_email
+                followup_message, user_signature, signature_mode, user_email,
+                cc_recipients=recipient_result.get("ccRecipients") or [],
             )
 
             # Update thread
