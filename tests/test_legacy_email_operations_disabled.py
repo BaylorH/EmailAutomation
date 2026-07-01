@@ -263,6 +263,100 @@ class LegacyEmailOperationsDisabledTests(unittest.TestCase):
                         f"{func.__name__} did not reach the mocked Graph request path",
                     )
 
+    def test_legacy_reply_helpers_can_be_opted_in_to_existing_thread_path(self):
+        with patch.dict(
+            os.environ,
+            {
+                "E2E_TEST_MODE": "true",
+                "FIRESTORE_EMULATOR_HOST": "localhost:8080",
+                "GOOGLE_CLOUD_PROJECT": "email-automation-cache",
+                "SITESIFT_ENABLE_LEGACY_EMAIL_OPERATIONS": "1",
+            },
+            clear=False,
+        ):
+            from email_automation import email_operations
+
+            cases = [
+                (
+                    email_operations.send_remaining_questions_email,
+                    (
+                        "uid-1",
+                        "client-1",
+                        {"Authorization": "Bearer token"},
+                        "broker@example.com",
+                        ["Clear height"],
+                        "<root@example.com>",
+                        3,
+                        "row-3",
+                    ),
+                ),
+                (
+                    email_operations.send_thankyou_closing_with_new_property,
+                    (
+                        "uid-1",
+                        "client-1",
+                        {"Authorization": "Bearer token"},
+                        "broker@example.com",
+                        "<root@example.com>",
+                        3,
+                        "row-3",
+                        "456 Backup Rd",
+                    ),
+                ),
+                (
+                    email_operations.send_thankyou_ask_alternatives,
+                    (
+                        "uid-1",
+                        "client-1",
+                        {"Authorization": "Bearer token"},
+                        "broker@example.com",
+                        "<root@example.com>",
+                        3,
+                        "row-3",
+                    ),
+                ),
+            ]
+
+            def fake_get(_url, *_args, **_kwargs):
+                return _FakeResponse({"value": [{"id": "graph-root"}]})
+
+            for func, args in cases:
+                with self.subTest(func=func.__name__), patch.object(
+                    email_operations,
+                    "_fs",
+                    _EmptyFirestoreNode(),
+                ), patch.object(
+                    email_operations,
+                    "_get_user_signature_settings",
+                    return_value=(None, None, "operator@example.com"),
+                ), patch.object(
+                    email_operations,
+                    "write_notification",
+                ), patch.object(
+                    email_operations.requests,
+                    "get",
+                    side_effect=fake_get,
+                ), patch.object(
+                    email_operations.requests,
+                    "post",
+                    return_value=_FakeResponse({"id": "draft-1"}),
+                ) as mock_post:
+                    func(*args)
+
+                    post_urls = [
+                        call.args[0]
+                        for call in mock_post.call_args_list
+                        if call.args
+                    ]
+                    self.assertTrue(
+                        any(url.endswith("/reply") for url in post_urls),
+                        f"{func.__name__} did not reach the existing-thread reply path",
+                    )
+                    self.assertFalse(
+                        any(url.endswith("/sendMail") for url in post_urls),
+                        f"{func.__name__} unexpectedly used the no-thread fallback path",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
