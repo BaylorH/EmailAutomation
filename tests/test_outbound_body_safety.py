@@ -29,6 +29,19 @@ class OutboundBodySafetyTests(unittest.TestCase):
         self.assertFalse(result.is_safe)
         self.assertIn("tour", result.reason.lower())
 
+    def test_karsen_mattress_firm_launch_copy_is_blocked(self):
+        result = outbound_safety.validate_outbound_body(
+            "Hi [NAME],\n\n"
+            "I’m representing a tenant (national corporation, retail distributor "
+            "name to be disclosed once a tour is being scheduled) that is looking "
+            "to lease industrial space in the area.\n\n"
+            "Before we proceed with tour scheduling and/or LOIs, could you please "
+            "verify the SF available, lease rate, clear height, docks, and drive-ins?"
+        )
+
+        self.assertFalse(result.is_safe)
+        self.assertIn("[NAME]", result.placeholders)
+
     def test_reviewed_tour_invites_can_use_tour_language(self):
         result = outbound_safety.validate_outbound_body(
             "Hi Connor,\n\nWe are confirming the tour for Tuesday at 10:00 AM.",

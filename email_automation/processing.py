@@ -66,6 +66,11 @@ DEFAULT_AUTOMATIC_INBOX_REPLY_ALLOWLIST = {
     "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
 }
 
+DEFAULT_TOUR_ACTION_ALLOWLIST = {
+    # Tour scheduling is still in the Baylor proof lane, not general production.
+    "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
+}
+
 
 class RetryableProcessingError(Exception):
     """Raised when a message should remain unprocessed so the next scan can retry it."""
@@ -2483,6 +2488,22 @@ def _automatic_inbox_replies_allowed(user_id: str) -> bool:
     return str(user_id or "").strip() in allowed
 
 
+def _tour_actions_allowed(user_id: str) -> bool:
+    raw_allowlist = os.environ.get("SITESIFT_TOUR_ACTION_ALLOWLIST")
+    if raw_allowlist is None:
+        allowed = DEFAULT_TOUR_ACTION_ALLOWLIST
+    else:
+        raw_allowlist = raw_allowlist.strip()
+        if raw_allowlist == "*":
+            return True
+        allowed = {
+            value.strip()
+            for value in re.split(r"[,\s]+", raw_allowlist)
+            if value.strip()
+        }
+    return str(user_id or "").strip() in allowed
+
+
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     send_reply_in_thread.last_error = None
@@ -3502,6 +3523,15 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 elif event_type == "tour_requested":
                     # Broker offered a tour - create notification with suggested response
                     try:
+                        if not _tour_actions_allowed(user_id):
+                            mark_event_handled(user_id, thread_id, event_key, msg_id, None)
+                            proposal["skip_response"] = True
+                            print(
+                                "🏠 Tour actions disabled for this user; "
+                                "marked event handled without notification or reply draft"
+                            )
+                            continue
+
                         tour_message_text = _clean_tour_signal_text(_text_for_ai or _full_text)
                         clean_event = dict(event)
                         clean_event["question"] = _clean_tour_signal_text(

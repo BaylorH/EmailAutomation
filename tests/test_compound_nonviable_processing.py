@@ -117,6 +117,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         body,
         proposal,
         thread_ref,
+        user_id="NO7lVYVp6BaplKYEfMlWCgBnpdh2",
         thread_docs=None,
         row_anchor="912-930 Gemini St",
         rownum=3,
@@ -124,7 +125,6 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         from_email="bp21harrison@gmail.com",
         row_below_nonviable=False,
     ):
-        user_id = "test-user"
         client_id = "client-1"
         msg = self._common_graph_message(
             msg_id=f"msg-{thread_id}",
@@ -281,7 +281,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
 
         result["moveRow"].assert_not_called()
         result["stopThreads"].assert_called_once_with(
-            "test-user",
+            "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
             11,
             client_id="client-1",
             reason="property_unavailable",
@@ -363,6 +363,48 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         self.assertIn(
             {"status": processing.THREAD_STATUS["paused"], "reason": "tour_reschedule_requested"},
             result["statusUpdates"],
+        )
+
+    def test_non_allowlisted_user_tour_offer_creates_no_tour_action(self):
+        body = "Hi Baylor,\n\nThe space is available. Let me know if you would like to schedule a tour.\n\nBest,\nBP21"
+        thread_id = "thread-normal-tour-offer"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+        })
+        proposal = {
+            "updates": [],
+            "events": [
+                {
+                    "type": "tour_requested",
+                    "question": "Let me know if you would like to schedule a tour.",
+                    "suggestedEmail": "Hi Ryan,\n\nCan we tour Tuesday morning?",
+                }
+            ],
+            "response_email": None,
+        }
+
+        result = self._run_tour_invite_reply_processing(
+            user_id="regular-user",
+            thread_id=thread_id,
+            body=body,
+            proposal=proposal,
+            thread_ref=thread_ref,
+        )
+
+        self.assertEqual([], result["notifications"])
+        result["sendReply"].assert_not_called()
+        self.assertFalse(
+            any(update["reason"] == "tour_requested" for update in result["statusUpdates"])
+        )
+        self.assertTrue(
+            any(
+                handled["eventKey"] == "tour_requested"
+                and handled["notifId"] is None
+                for handled in result["handledEvents"]
+            )
         )
 
     def test_tour_invite_unavailable_process_does_not_move_row_or_stop_property(self):
@@ -456,7 +498,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         self.assertEqual("2026-06-23", thread_ref._data["tourInvite.tourDate"])
 
     def test_tour_invite_confirmation_does_not_send_generic_completion_reply(self):
-        user_id = "test-user"
+        user_id = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
         client_id = "client-1"
         thread_id = "thread-tour-confirmed"
         from_email = "bp21harrison@gmail.com"

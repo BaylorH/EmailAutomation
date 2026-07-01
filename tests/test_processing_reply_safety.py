@@ -71,6 +71,20 @@ class ProcessingReplySafetyTests(unittest.TestCase):
         self.assertEqual("blocked_unsafe_body", processing.send_reply_in_thread.last_outcome)
         self.assertIn("Unresolved outbound placeholder", processing.send_reply_in_thread.last_error)
 
+    def test_tour_actions_default_allowlist_is_baylor_only(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(processing._tour_actions_allowed("NO7lVYVp6BaplKYEfMlWCgBnpdh2"))
+            self.assertFalse(processing._tour_actions_allowed("ntR8ACrAgEcZ1i5FWyi6MFuCJfI2"))
+
+    def test_tour_actions_explicit_allowlist_supports_test_lane(self):
+        with patch.dict(os.environ, {"SITESIFT_TOUR_ACTION_ALLOWLIST": "test-user, other-user"}):
+            self.assertTrue(processing._tour_actions_allowed("test-user"))
+            self.assertFalse(processing._tour_actions_allowed("regular-user"))
+
+    def test_tour_actions_wildcard_is_explicit_only(self):
+        with patch.dict(os.environ, {"SITESIFT_TOUR_ACTION_ALLOWLIST": "*"}):
+            self.assertTrue(processing._tour_actions_allowed("regular-user"))
+
 
 if __name__ == "__main__":
     unittest.main()
