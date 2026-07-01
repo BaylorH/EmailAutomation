@@ -1,0 +1,992 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Canonical SiteSift feature map for Production V1 restoration, dev-only Results/Tour isolation, CodeRabbit review, and release testing.",
+  "lanes": {
+    "production_v1_core": "Base campaign workflow allowed back into production after proof.",
+    "production_v1_admin": "Admin-only readback/monitoring, not normal user workflow.",
+    "dev_results": "Results/PDF/3D Map work isolated from normal users until separately proven.",
+    "dev_tour": "Tour scheduling isolated from normal users until separately proven.",
+    "later_firebase_native": "Infrastructure migration work after Production V1 is stable."
+  },
+  "features": [
+    {
+      "id": "core.upload_mapping",
+      "name": "Campaign upload and column mapping",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/column_config.py", "email_automation/sheets.py"],
+        "frontend": ["src/components/StartProjectModal.jsx", "src/components/ColumnMappingStep.jsx"],
+        "functions": [],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": [],
+      "sendRisk": "queues_email",
+      "dataWrites": ["users/{uid}/clients/{clientId}", "users/{uid}/outbox"],
+      "promptContracts": ["core_campaign_setup", "no_tour_language_in_core_launch"],
+      "uiSurfaces": ["Manage Clients upload", "Name Campaign", "Column Mapping", "Launch Preview"],
+      "testFixtures": [
+        "happy_path_standard_contact_mapping",
+        "karsen_bad_placeholder_launch_guard",
+        "sheet_column_alias_matrix",
+        "terminal_cancelled_mapping_no_outbox",
+        "wrong_recipient_mapping_guard",
+        "manual_continuation_mapping_recheck",
+        "duplicate_retry_mapping_idempotent",
+        "operator_visible_missing_name_block"
+      ],
+      "manualScreenshotRubrics": ["mapping_required_fields_visible", "launch_preview_blocks_bad_variables"],
+      "codeRabbitChecks": ["Launch setup clarity", "Email action safety", "AI contract drift"],
+      "adversarialRubrics": ["placeholder_name_resolution", "core_vs_tour_language_isolation"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["placeholder_reaches_outbox", "tour_copy_reaches_core_launch"]
+      }
+    },
+    {
+      "id": "core.name_resolution",
+      "name": "Recipient name and contact resolution",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/outbound_safety.py", "email_automation/sheet_operations.py"],
+        "frontend": ["src/components/StartProjectModal.jsx", "src/utils/recipientVariableReview.js"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["core.upload_mapping"],
+      "sendRisk": "queues_email",
+      "dataWrites": ["users/{uid}/clients/{clientId}", "users/{uid}/outbox"],
+      "promptContracts": ["first_name_resolution", "placeholder_blocking"],
+      "uiSurfaces": ["Column Mapping", "Launch Preview", "Outbox validation"],
+      "testFixtures": [
+        "happy_path_first_name_column",
+        "full_name_only_sheet",
+        "bad_placeholder_blank_name_sheet",
+        "terminal_state_name_resolution_no_outbox",
+        "wrong_recipient_name_column_guard",
+        "manual_continuation_name_recheck",
+        "duplicate_retry_name_resolution_idempotent",
+        "ambiguous_contact_columns",
+        "operator_visible_name_resolution_failure"
+      ],
+      "manualScreenshotRubrics": ["red_variable_warning_visible", "scroll_to_name_issue"],
+      "codeRabbitChecks": ["Placeholder safety", "Variable mapping clarity", "Outbound body validation"],
+      "adversarialRubrics": ["placeholder_name_resolution"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["raw_name_placeholder_in_subject_or_body", "ambiguous_name_launch_allowed"]
+      }
+    },
+    {
+      "id": "core.launch_draft",
+      "name": "Initial outreach draft generation",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/email.py", "email_automation/outbound_safety.py"],
+        "frontend": ["src/components/AddClientModal.jsx", "src/utils/draftGuards.js"],
+        "functions": [],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["core.upload_mapping", "core.name_resolution", "core.signature_identity"],
+      "sendRisk": "queues_email",
+      "dataWrites": ["users/{uid}/outbox", "users/{uid}/actionAudit"],
+      "promptContracts": ["launch_draft_safety", "core_campaign_no_tour_language"],
+      "uiSurfaces": ["Launch Preview", "Dashboard outbox", "Action audit"],
+      "testFixtures": [
+        "happy_path_launch_draft",
+        "karsen_bad_placeholder_name_message",
+        "wrong_recipient_launch_recipient_mismatch",
+        "terminal_cancelled_launch_no_outbox",
+        "manual_continuation_launch_recheck",
+        "duplicate_retry_launch_draft_idempotent",
+        "no_tour_scheduling_copy",
+        "operator_visible_launch_block"
+      ],
+      "manualScreenshotRubrics": ["preview_matches_outbox_body", "blocked_draft_error_is_clear"],
+      "codeRabbitChecks": ["Email action safety", "AI contract drift", "Signature identity"],
+      "adversarialRubrics": ["placeholder_name_resolution", "core_vs_tour_language_isolation", "signature_identity_boundary"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["placeholder_reaches_outbox", "tour_request_reaches_launch_outreach"]
+      }
+    },
+    {
+      "id": "core.outbox_send",
+      "name": "Outbox send worker and Graph audit",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/email.py", "email_automation/outbound_safety.py", "email_automation/service_providers.py"],
+        "frontend": ["src/utils/actionAudit.js", "src/components/EmailSchedulerButton.jsx"],
+        "functions": [],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["core.launch_draft", "core.signature_identity"],
+      "sendRisk": "sends_email_autonomous",
+      "dataWrites": ["users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/deadLetterQueue"],
+      "promptContracts": ["outbound_body_policy"],
+      "uiSurfaces": ["Dashboard health", "Outbox", "Action audit"],
+      "testFixtures": [
+        "happy_path_graph_send",
+        "terminal_cancelled_no_send",
+        "bad_placeholder_outbox_send_block",
+        "wrong_recipient_safety_block",
+        "manual_continuation_detected",
+        "duplicate_retry_skipped_audit",
+        "graph_partial_success_retry",
+        "operator_visible_failed_send"
+      ],
+      "manualScreenshotRubrics": ["pending_send_visible", "failed_send_visible"],
+      "codeRabbitChecks": ["Outbound safety chokepoint", "Recovery and privacy boundary"],
+      "adversarialRubrics": ["manual_intervention_duplicate_send", "dashboard_state_truth", "recipient_reply_all_preservation", "blocked_contact_optout"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["hidden_failed_send", "double_send_retry", "missing_graph_ids_after_success"]
+      }
+    },
+    {
+      "id": "core.reply_all_cc",
+      "name": "Reply-all and CC preservation",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/processing.py", "email_automation/email.py", "email_automation/service_providers.py"],
+        "frontend": ["src/components/InlineReplyComposer.jsx", "src/components/ConversationsPanel.jsx"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["core.inbox_matching", "core.outbox_send"],
+      "sendRisk": "sends_email_user_click",
+      "dataWrites": ["users/{uid}/outbox", "users/{uid}/actionAudit"],
+      "promptContracts": ["safe_reply_all_context", "recipient_filter_policy"],
+      "uiSurfaces": ["Conversation panel", "Inline reply", "Outbox audit"],
+      "testFixtures": [
+        "happy_path_reply_all_cc",
+        "terminal_state_reply_all_no_send",
+        "bad_placeholder_reply_all_block",
+        "wrong_recipient_cc_preservation_reply",
+        "blocked_cc_filtering",
+        "manual_continuation_reply_all_recheck",
+        "duplicate_retry_reply_all_idempotent",
+        "operator_visible_blocked_cc"
+      ],
+      "manualScreenshotRubrics": ["reply_recipient_editor_shows_ccs", "audit_shows_final_recipients"],
+      "codeRabbitChecks": ["Recipient preservation", "Email action safety"],
+      "adversarialRubrics": ["recipient_reply_all_preservation"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["safe_cc_dropped", "blocked_contact_added", "audit_missing_final_recipients"]
+      }
+    },
+    {
+      "id": "core.manual_reply",
+      "name": "Dashboard manual reply and AI help",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/email.py", "email_automation/pending_responses.py"],
+        "frontend": ["src/components/InlineReplyComposer.jsx", "src/components/ConversationsPanel.jsx"],
+        "functions": ["functions/index.js"],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["core.reply_all_cc", "core.signature_identity"],
+      "sendRisk": "sends_email_user_click",
+      "dataWrites": ["users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/pendingResponses"],
+      "promptContracts": ["dashboard_reply_safety", "ai_help_no_placeholder"],
+      "uiSurfaces": ["Inline Reply Composer", "AI Help", "Action audit"],
+      "testFixtures": [
+        "happy_path_dashboard_reply_exact_body",
+        "bad_placeholder_ai_help_blocking",
+        "wrong_recipient_dashboard_reply_block",
+        "terminal_action_resolved",
+        "manual_continuation_dashboard_reply_recheck",
+        "duplicate_retry_dashboard_reply_idempotent",
+        "operator_visible_bad_draft_failure"
+      ],
+      "manualScreenshotRubrics": ["composer_blocks_bad_body", "sent_reply_resolves_action"],
+      "codeRabbitChecks": ["Dashboard action safety", "AI contract drift", "Outbound body validation"],
+      "adversarialRubrics": ["placeholder_name_resolution", "recipient_reply_all_preservation", "dashboard_state_truth", "blocked_contact_optout"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["bad_draft_allowed", "wrong_recipient_reply", "resolved_action_stays_pending"]
+      }
+    },
+    {
+      "id": "core.inbox_matching",
+      "name": "Broker inbox reply matching",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/processing.py", "email_automation/messaging.py", "email_automation/graph_scan_health.py"],
+        "frontend": ["src/components/ConversationsPanel.jsx"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["core.outbox_send"],
+      "sendRisk": "read_only",
+      "dataWrites": ["users/{uid}/clients/{clientId}/threads", "users/{uid}/processingFailures"],
+      "promptContracts": ["message_identity", "thread_matching"],
+      "uiSurfaces": ["Conversation panel", "Health widget"],
+      "testFixtures": ["thread_identity_reply", "forwarded_reply_match", "manual_user_intervention"],
+      "manualScreenshotRubrics": ["conversation_panel_matches_thread", "health_shows_scan_status"],
+      "codeRabbitChecks": ["Scheduler scope and order", "Recovery and privacy boundary"],
+      "adversarialRubrics": ["manual_intervention_duplicate_send", "ai_failure_visibility"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["reply_assigned_to_wrong_thread", "processed_message_lost_after_failure"]
+      }
+    },
+    {
+      "id": "core.inbox_auto_reply",
+      "name": "Inbox-triggered same-thread auto replies",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/processing.py", "email_automation/pending_responses.py", "email_automation/outbound_safety.py"],
+        "frontend": ["src/components/ConversationsPanel.jsx", "src/components/HealthWidget.jsx"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["core.inbox_matching", "core.event_classifier", "core.reply_all_cc", "core.signature_identity"],
+      "sendRisk": "sends_email_autonomous",
+      "dataWrites": ["users/{uid}/pendingResponses", "users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/clients/{clientId}/threads"],
+      "promptContracts": ["core_reply_body_policy", "no_tour_scheduling_auto_reply", "placeholder_blocking"],
+      "uiSurfaces": ["Conversation panel", "Health widget", "Action audit"],
+      "testFixtures": [
+        "happy_path_auto_closing_reply",
+        "terminal_state_no_auto_reply",
+        "bad_placeholder_karsen_name_message",
+        "wrong_recipient_reply_all_guard",
+        "non_allowlisted_auto_reply_blocked",
+        "manual_continuation_sent_suppresses_retry",
+        "duplicate_retry_suppressed",
+        "operator_visible_auto_reply_failure"
+      ],
+      "manualScreenshotRubrics": ["auto_reply_failure_visible", "thread_state_matches_dashboard"],
+      "codeRabbitChecks": ["Outbound safety chokepoint", "AI contract drift", "Recovery and privacy boundary"],
+      "adversarialRubrics": ["placeholder_name_resolution", "core_vs_tour_language_isolation", "recipient_reply_all_preservation", "manual_intervention_duplicate_send", "blocked_contact_optout", "signature_identity_boundary"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["placeholder_auto_reply_created", "tour_scheduling_auto_reply_created", "blocked_contact_auto_reply_created", "manual_user_reply_ignored"]
+      }
+    },
+    {
+      "id": "core.event_classifier",
+      "name": "Reply event classifier",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/ai_processing.py", "email_automation/processing.py"],
+        "frontend": ["src/utils/actionNotifications.js", "src/components/ClientRow.jsx"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["core.inbox_matching"],
+      "sendRisk": "read_only",
+      "dataWrites": ["users/{uid}/clients/{clientId}/notifications", "users/{uid}/processingFailures"],
+      "promptContracts": ["core_event_taxonomy", "no_tour_state_in_v1"],
+      "uiSurfaces": ["Dashboard badges", "Conversation panel", "Action Needed groups"],
+      "testFixtures": ["non_viable_office_heavy", "tour_unavailable_not_non_viable", "wrong_contact_redirect"],
+      "manualScreenshotRubrics": ["event_label_matches_message", "terminal_state_not_hidden"],
+      "codeRabbitChecks": ["AI contract drift", "Dashboard state truth"],
+      "adversarialRubrics": ["prompt_taxonomy_drift", "dashboard_state_truth", "core_vs_tour_language_isolation"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["new_prompt_label_without_handler", "tour_unavailable_marks_property_stopped"]
+      }
+    },
+    {
+      "id": "core.property_extraction",
+      "name": "Property data and attachment extraction",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/processing.py", "email_automation/file_handling.py", "email_automation/ai_processing.py"],
+        "frontend": ["src/components/ConversationsPanel.jsx", "src/components/InlineNewPropertyCard.jsx"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["core.event_classifier"],
+      "sendRisk": "read_only",
+      "dataWrites": ["users/{uid}/clients/{clientId}", "users/{uid}/sheetChangeLog"],
+      "promptContracts": ["property_fact_extraction", "pdf_attachment_summary"],
+      "uiSurfaces": ["Conversation panel", "New property card", "Sheet readback"],
+      "testFixtures": ["broker_pdf_specs", "flyer_link_only", "conflicting_property_facts"],
+      "manualScreenshotRubrics": ["extracted_facts_visible", "attachment_provenance_visible"],
+      "codeRabbitChecks": ["Data artifact parity", "AI failure visibility"],
+      "adversarialRubrics": ["ai_failure_visibility", "data_write_artifact_parity"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["facts_written_without_source", "attachment_failure_hidden"]
+      }
+    },
+    {
+      "id": "core.sheet_update",
+      "name": "Google Sheet update and row identity",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/sheets.py", "email_automation/sheet_operations.py"],
+        "frontend": ["src/components/ClientsTable.jsx", "src/components/ClientRow.jsx"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["core.property_extraction"],
+      "sendRisk": "none",
+      "dataWrites": ["Google Sheet rows", "users/{uid}/sheetChangeLog"],
+      "promptContracts": ["row_anchor_identity"],
+      "uiSurfaces": ["Open Source Sheet", "Dashboard row expanded details"],
+      "testFixtures": ["row_move_after_launch", "formula_column_default"],
+      "manualScreenshotRubrics": ["sheet_row_highlight_matches_property", "change_log_shows_row_anchor"],
+      "codeRabbitChecks": ["Data-write and artifact parity"],
+      "adversarialRubrics": ["data_write_artifact_parity"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["update_hits_wrong_row", "formula_overwritten_without_user_choice"]
+      }
+    },
+    {
+      "id": "core.followups",
+      "name": "Follow-up scheduler",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/followup.py", "email_automation/email.py"],
+        "frontend": ["src/components/EmailSchedulerButton.jsx", "src/components/ClientRow.jsx"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["core.outbox_send", "core.inbox_matching"],
+      "sendRisk": "sends_email_autonomous",
+      "dataWrites": ["users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/clients/{clientId}"],
+      "promptContracts": ["followup_copy_safety", "manual_intervention_suppression"],
+      "uiSurfaces": ["Dashboard timing", "Health widget", "Action audit"],
+      "testFixtures": [
+        "happy_path_followup",
+        "terminal_state_no_followup",
+        "bad_placeholder_followup_block",
+        "wrong_recipient_cc_preserved",
+        "manual_continuation_sent_suppresses_followup",
+        "duplicate_retry_followup_blocked",
+        "operator_visible_followup_failure"
+      ],
+      "manualScreenshotRubrics": ["followup_pending_visible", "stopped_client_no_followup"],
+      "codeRabbitChecks": ["Scheduler scope and order", "Outbound safety chokepoint"],
+      "adversarialRubrics": ["manual_intervention_duplicate_send", "recipient_reply_all_preservation", "blocked_contact_optout"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["followup_after_manual_user_reply", "followup_after_terminal_state"]
+      }
+    },
+    {
+      "id": "core.stop_cancel_dismiss",
+      "name": "Stop, cancel, dismiss, archive lifecycle controls",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/email.py", "email_automation/pending_responses.py"],
+        "frontend": ["src/components/ClientRow.jsx", "src/components/ClientsTable.jsx", "src/components/InlineReplyComposer.jsx"],
+        "functions": ["functions/index.js"],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["core.outbox_send", "core.health_recovery"],
+      "sendRisk": "none",
+      "dataWrites": ["users/{uid}/clients/{clientId}", "users/{uid}/outbox", "users/{uid}/actionAudit"],
+      "promptContracts": ["terminal_state_pre_send_recheck"],
+      "uiSurfaces": ["Dashboard row actions", "Filters", "Archive view"],
+      "testFixtures": ["cancel_race_no_send", "archive_unarchive_delete_throwaway"],
+      "manualScreenshotRubrics": ["cancelled_item_terminalized", "archive_actions_not_available_on_live_jill"],
+      "codeRabbitChecks": ["Dashboard action safety", "Recovery and privacy boundary"],
+      "adversarialRubrics": ["dashboard_state_truth", "manual_intervention_duplicate_send"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["cancelled_item_sends", "destructive_action_on_wrong_client"]
+      }
+    },
+    {
+      "id": "core.signature_identity",
+      "name": "User signature and sender identity",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/utils.py", "email_automation/email.py", "email_automation/outbound_safety.py"],
+        "frontend": ["src/components/SettingsPage.jsx", "src/utils/signatureBuilder.js"],
+        "functions": [],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": [],
+      "sendRisk": "queues_email",
+      "dataWrites": ["users/{uid}", "users/{uid}/settings", "users/{uid}/outbox"],
+      "promptContracts": ["sender_identity", "signature_rendering"],
+      "uiSurfaces": ["Settings", "Signature preview", "All email previews"],
+      "testFixtures": [
+        "happy_path_custom_signature",
+        "bad_placeholder_signature_identity_block",
+        "terminal_state_signature_no_outbox",
+        "wrong_recipient_signature_guard",
+        "manual_continuation_signature_recheck",
+        "duplicate_retry_signature_idempotent",
+        "mohr_domain_org_defaults",
+        "custom_logo_dimensions",
+        "non_mohr_blank_defaults",
+        "operator_visible_signature_failure"
+      ],
+      "manualScreenshotRubrics": ["settings_preview_matches_gmail", "no_jill_default_for_new_user"],
+      "codeRabbitChecks": ["Signature identity", "White-label defaults"],
+      "adversarialRubrics": ["signature_identity_boundary"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["wrong_signature_attached", "jill_defaults_leak_to_unrelated_user"]
+      }
+    },
+    {
+      "id": "core.health_recovery",
+      "name": "Health, dead-letter, and processing recovery",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["email_automation/system_health.py", "email_automation/dead_letter_recovery.py", "email_automation/pending_responses.py"],
+        "frontend": ["src/components/EmailSchedulerButton.jsx", "src/components/HealthWidget.jsx"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["core.outbox_send", "core.inbox_matching"],
+      "sendRisk": "recovery_send",
+      "dataWrites": ["users/{uid}/deadLetterQueue", "users/{uid}/processingFailures", "users/{uid}/pendingResponses"],
+      "promptContracts": ["visible_failure_recovery"],
+      "uiSurfaces": ["Dashboard health", "Dead letter recovery", "Processing failures"],
+      "testFixtures": [
+        "happy_path_dead_letter_requeue",
+        "terminal_state_recovery_no_send",
+        "bad_placeholder_recovery_block",
+        "wrong_recipient_recovery_block",
+        "manual_continuation_recovery_guard",
+        "duplicate_retry_dead_letter_rechecks_send",
+        "ai_failure_operator_visible",
+        "dead_letter_requeue_rechecks_send"
+      ],
+      "manualScreenshotRubrics": ["failure_counts_visible", "recovery_preview_before_send"],
+      "codeRabbitChecks": ["Recovery and privacy boundary", "Hidden failure prevention"],
+      "adversarialRubrics": ["ai_failure_visibility", "manual_intervention_duplicate_send", "blocked_contact_optout"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["failure_hidden_from_operator", "dead_letter_requeue_double_sends"]
+      }
+    },
+    {
+      "id": "admin.usage_readonly",
+      "name": "Admin usage and spend readback",
+      "lane": "production_v1_admin",
+      "releaseStatus": "prod_guarded",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": ["email_automation/usage_tracking.py"],
+        "frontend": ["src/components/UsagePage.jsx"],
+        "functions": ["functions/index.js"],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["core.health_recovery"],
+      "sendRisk": "read_only",
+      "dataWrites": [],
+      "promptContracts": ["usage_readonly_admin"],
+      "uiSurfaces": ["Usage admin page", "Spend charts"],
+      "testFixtures": ["admin_usage_baylor_jill_only", "normal_user_usage_denied"],
+      "manualScreenshotRubrics": ["usage_page_admin_only", "monthly_cost_by_user_visible"],
+      "codeRabbitChecks": ["Admin entitlement", "Privacy boundary"],
+      "adversarialRubrics": ["entitlement_bypass"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["normal_user_can_view_usage", "usage_page_exposes_email_content"]
+      }
+    },
+    {
+      "id": "core.scheduler_scope",
+      "name": "Current GitHub scheduler scope and processing order",
+      "lane": "production_v1_core",
+      "releaseStatus": "prod_required",
+      "normalUserAccess": true,
+      "ownerModules": {
+        "backend": ["main.py", "app.py", "email_automation/scheduler_scope.py"],
+        "frontend": ["src/components/HealthWidget.jsx"],
+        "functions": [],
+        "firestoreRules": [],
+        "githubActions": [".github/workflows/email.yml", ".github/workflows/email-dev-scoped.yml"]
+      },
+      "dependencies": ["core.outbox_send", "core.inbox_matching", "core.followups", "core.health_recovery"],
+      "sendRisk": "sends_email_autonomous",
+      "dataWrites": ["schedulerLeases/emailAutomation", "systemHealth/emailAutomation", "users/{uid}/outbox", "users/{uid}/pendingResponses", "users/{uid}/processingFailures"],
+      "promptContracts": ["scheduler_scope_policy", "dev_scoped_manual_dispatch"],
+      "uiSurfaces": ["GitHub Actions scheduler", "System health", "Scheduler lease readback"],
+      "testFixtures": [
+        "happy_path_baylor_scheduler",
+        "terminal_scope_noop",
+        "bad_placeholder_scheduler_block",
+        "wrong_recipient_scope_denied",
+        "scheduled_scope_normal_users_paused",
+        "manual_dispatch_baylor_only",
+        "manual_continuation_guard",
+        "duplicate_retry_idempotent_scheduler",
+        "operator_visible_scheduler_failure",
+        "jill_rejected_manual_dispatch"
+      ],
+      "manualScreenshotRubrics": ["scheduler_status_visible", "manual_dispatch_scope_visible"],
+      "codeRabbitChecks": ["Scheduler scope and order", "Recovery and privacy boundary", "Feature lane isolation"],
+      "adversarialRubrics": ["manual_intervention_duplicate_send", "ai_failure_visibility", "entitlement_bypass"],
+      "productionGate": {
+        "requiredBeforePush": true,
+        "stopConditions": ["scheduler_processes_user_outside_scope", "manual_dispatch_touches_jill", "scheduler_lease_does_not_release"]
+      }
+    },
+    {
+      "id": "results.launcher",
+      "name": "Completed Results workspace launcher",
+      "lane": "dev_results",
+      "releaseStatus": "dev_only",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": [],
+        "frontend": ["src/components/ClientsTable.jsx", "src/components/ClientRow.jsx", "src/components/CompletedResultsWorkspace.jsx"],
+        "functions": [],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["core.sheet_update"],
+      "sendRisk": "read_only",
+      "dataWrites": ["users/{uid}/clients/{clientId}/completedResults"],
+      "promptContracts": ["results_are_artifacts_not_campaign_actions"],
+      "uiSurfaces": ["Results button", "Rows & Rebuild tab"],
+      "testFixtures": ["normal_user_results_hidden", "saved_results_reopen"],
+      "manualScreenshotRubrics": ["results_not_visible_for_normal_user", "rows_rebuild_is_explicit"],
+      "codeRabbitChecks": ["Feature lane isolation", "Entitlement bypass"],
+      "adversarialRubrics": ["entitlement_bypass", "data_write_artifact_parity"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["normal_user_can_open_results", "results_side_effect_without_entitlement"]
+      }
+    },
+    {
+      "id": "results.summary_pdf",
+      "name": "Summary PDF artifact",
+      "lane": "dev_results",
+      "releaseStatus": "dev_only",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": ["email_automation/property_images.py"],
+        "frontend": ["src/components/CompletedResultsWorkspace.jsx"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["results.launcher", "core.sheet_update"],
+      "sendRisk": "read_only",
+      "dataWrites": ["browser_download", "users/{uid}/clients/{clientId}/completedResults"],
+      "promptContracts": ["summary_pdf_known_fields_only"],
+      "uiSurfaces": ["Summary tab", "Download Summary PDF"],
+      "testFixtures": ["jill_summary_parity", "blank_field_suppression"],
+      "manualScreenshotRubrics": ["summary_download_button_on_summary_tab", "summary_no_blank_fields"],
+      "codeRabbitChecks": ["Data artifact parity", "Feature lane isolation"],
+      "adversarialRubrics": ["data_write_artifact_parity", "entitlement_bypass"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["download_shows_fake_or_blank_values", "normal_user_can_generate_pdf"]
+      }
+    },
+    {
+      "id": "results.packet_pdf",
+      "name": "Tour Packet PDF artifact",
+      "lane": "dev_results",
+      "releaseStatus": "dev_only",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": ["email_automation/file_handling.py", "email_automation/property_images.py"],
+        "frontend": ["src/components/CompletedResultsWorkspace.jsx"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["results.launcher", "core.property_extraction"],
+      "sendRisk": "read_only",
+      "dataWrites": ["browser_download", "users/{uid}/clients/{clientId}/completedResults"],
+      "promptContracts": ["packet_pdf_provenance_backed_fields"],
+      "uiSurfaces": ["Packet tab", "Download Packet PDF"],
+      "testFixtures": ["jill_packet_parity", "media_full_page_fallback"],
+      "manualScreenshotRubrics": ["packet_images_have_source", "packet_no_unsourced_costar_fields"],
+      "codeRabbitChecks": ["Data artifact parity", "Media provenance"],
+      "adversarialRubrics": ["data_write_artifact_parity"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["packet_invents_costar_field", "packet_download_fails"]
+      }
+    },
+    {
+      "id": "results.map_geocode",
+      "name": "3D Map geocode and route display",
+      "lane": "dev_results",
+      "releaseStatus": "dev_only",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": [],
+        "frontend": ["src/components/CompletedResultsMapView.jsx", "src/components/CampaignEarthMap.jsx", "src/utils/geocodingClient.js"],
+        "functions": ["functions/index.js"],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["results.launcher"],
+      "sendRisk": "read_only",
+      "dataWrites": ["users/{uid}/clients/{clientId}/coordinates", "GraphHopper/Google usage logs"],
+      "promptContracts": ["map_coordinates_provenance"],
+      "uiSurfaces": ["3D Map tab", "Map/Satellite toggle", "Map side panel"],
+      "testFixtures": ["route_order_numbering", "normal_user_geocode_denied"],
+      "manualScreenshotRubrics": ["map_visible_without_scroll", "markers_match_side_panel_order"],
+      "codeRabbitChecks": ["Feature lane isolation", "Cost and entitlement"],
+      "adversarialRubrics": ["entitlement_bypass", "data_write_artifact_parity"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["normal_user_calls_geocode", "route_order_disagrees_with_pdf"]
+      }
+    },
+    {
+      "id": "results.saved_rebuild",
+      "name": "Saved Results reopen and rebuild",
+      "lane": "dev_results",
+      "releaseStatus": "dev_only",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": [],
+        "frontend": ["src/components/CompletedResultsWorkspace.jsx"],
+        "functions": [],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["results.launcher"],
+      "sendRisk": "read_only",
+      "dataWrites": ["users/{uid}/clients/{clientId}/completedResults"],
+      "promptContracts": ["artifact_rebuild_user_confirmed"],
+      "uiSurfaces": ["Results launcher", "Rows & Rebuild tab"],
+      "testFixtures": ["reopen_last_generated_results", "regenerate_selected_rows"],
+      "manualScreenshotRubrics": ["results_reopen_without_forced_regeneration", "rebuild_loading_state_clear"],
+      "codeRabbitChecks": ["Artifact persistence", "Feature lane isolation"],
+      "adversarialRubrics": ["data_write_artifact_parity", "entitlement_bypass"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["reopen_forces_regenerate", "changed_rows_without_user_confirm"]
+      }
+    },
+    {
+      "id": "tour.planner_preview",
+      "name": "Tour Planner preview",
+      "lane": "dev_tour",
+      "releaseStatus": "dev_only",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": ["email_automation/tour_scheduling.py"],
+        "frontend": ["src/components/CompletedResultsWorkspace.jsx", "src/components/CompletedResultsMapView.jsx"],
+        "functions": ["functions/index.js"],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["results.map_geocode"],
+      "sendRisk": "read_only",
+      "dataWrites": ["users/{uid}/clients/{clientId}/tourPlan"],
+      "promptContracts": ["tour_preview_no_send"],
+      "uiSurfaces": ["Tour Planner tab", "Tour invite preview"],
+      "testFixtures": ["tour_date_visible_everywhere", "normal_user_tour_tab_hidden"],
+      "manualScreenshotRubrics": ["tour_date_visible", "tour_planner_baylor_only"],
+      "codeRabbitChecks": ["Feature lane isolation", "Tour lifecycle"],
+      "adversarialRubrics": ["core_vs_tour_language_isolation", "entitlement_bypass"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["normal_user_sees_tour_planner", "preview_queues_outbox"]
+      }
+    },
+    {
+      "id": "tour.route_timing",
+      "name": "Tour route timing",
+      "lane": "dev_tour",
+      "releaseStatus": "dev_only",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": [],
+        "frontend": ["src/components/CompletedResultsMapView.jsx"],
+        "functions": ["functions/index.js"],
+        "firestoreRules": []
+      },
+      "dependencies": ["tour.planner_preview", "results.map_geocode"],
+      "sendRisk": "read_only",
+      "dataWrites": ["GraphHopper/Google usage logs", "users/{uid}/clients/{clientId}/tourPlan"],
+      "promptContracts": ["route_timing_provenance"],
+      "uiSurfaces": ["Tour Planner route", "Usage page"],
+      "testFixtures": ["route_matrix_fallback", "route_usage_cost_recorded"],
+      "manualScreenshotRubrics": ["route_times_visible", "usage_records_map_cost"],
+      "codeRabbitChecks": ["Cost and entitlement", "Tour lifecycle"],
+      "adversarialRubrics": ["entitlement_bypass", "data_write_artifact_parity"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["normal_user_consumes_route_api", "route_timing_hidden_in_invite"]
+      }
+    },
+    {
+      "id": "tour.invite_queue",
+      "name": "Tour invite queueing",
+      "lane": "dev_tour",
+      "releaseStatus": "dev_only",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": ["email_automation/results_feature_gate.py", "email_automation/email.py"],
+        "frontend": ["src/components/CompletedResultsWorkspace.jsx", "src/utils/actionAudit.js"],
+        "functions": [],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["tour.planner_preview", "tour.route_timing", "core.signature_identity"],
+      "sendRisk": "queues_email",
+      "dataWrites": ["users/{uid}/outbox", "users/{uid}/actionAudit", "users/{uid}/clients/{clientId}/tourPlan"],
+      "promptContracts": ["tour_invite_exact_script", "signature_identity"],
+      "uiSurfaces": ["Tour Planner confirm send", "Outbox", "Action audit"],
+      "testFixtures": [
+        "happy_path_tour_invite_baylor_only",
+        "terminal_tour_invite_no_send",
+        "bad_placeholder_tour_invite_block",
+        "wrong_recipient_normal_user_tour_invite_denied",
+        "manual_continuation_tour_invite_recheck",
+        "duplicate_retry_tour_invite_idempotent",
+        "bp21_tour_invite_baylor_only",
+        "operator_visible_tour_invite_block"
+      ],
+      "manualScreenshotRubrics": ["tour_confirm_modal_recipients", "sent_invite_uses_saved_signature"],
+      "codeRabbitChecks": ["Outbound safety chokepoint", "Feature lane isolation"],
+      "adversarialRubrics": ["entitlement_bypass", "signature_identity_boundary", "recipient_reply_all_preservation"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["normal_user_queues_tour_invite", "tour_invite_sends_without_explicit_confirm"]
+      }
+    },
+    {
+      "id": "tour.reply_handling",
+      "name": "Tour reply classification and dashboard handling",
+      "lane": "dev_tour",
+      "releaseStatus": "dev_only",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": ["email_automation/processing.py", "email_automation/tour_scheduling.py", "email_automation/ai_processing.py"],
+        "frontend": ["src/components/ConversationsPanel.jsx", "src/components/InlineReplyComposer.jsx"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["tour.invite_queue", "core.inbox_matching"],
+      "sendRisk": "queues_email",
+      "dataWrites": ["users/{uid}/clients/{clientId}/threads", "users/{uid}/clients/{clientId}/notifications", "users/{uid}/outbox"],
+      "promptContracts": ["tour_reply_taxonomy", "no_auto_reply_outside_tour_lane"],
+      "uiSurfaces": ["Tour Scheduling conversations", "Inline Reply Composer"],
+      "testFixtures": [
+        "happy_path_tour_reply",
+        "alternate_time_reply",
+        "tour_unavailable_reply",
+        "terminal_decline_tour_reply",
+        "bad_placeholder_tour_reply_block",
+        "wrong_recipient_tour_reply_guard",
+        "manual_continuation_tour_reply_recheck",
+        "duplicate_retry_tour_reply_idempotent",
+        "operator_visible_tour_reply_failure"
+      ],
+      "manualScreenshotRubrics": ["tour_schedule_panel_shows_state", "tour_conversation_separate_from_broker_outreach"],
+      "codeRabbitChecks": ["Tour lifecycle", "AI contract drift", "Feature lane isolation"],
+      "adversarialRubrics": ["prompt_taxonomy_drift", "core_vs_tour_language_isolation", "dashboard_state_truth"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["tour_reply_generates_normal_user_auto_reply", "tour_unavailable_marks_property_non_viable"]
+      }
+    },
+    {
+      "id": "tour.alternate_time",
+      "name": "Itinerary-aware alternate time handling",
+      "lane": "dev_tour",
+      "releaseStatus": "dev_only",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": ["email_automation/tour_scheduling.py"],
+        "frontend": ["src/components/ConversationsPanel.jsx", "src/components/CompletedResultsMapView.jsx"],
+        "functions": [],
+        "firestoreRules": []
+      },
+      "dependencies": ["tour.reply_handling", "tour.route_timing"],
+      "sendRisk": "queues_email",
+      "dataWrites": ["users/{uid}/clients/{clientId}/tourPlan", "users/{uid}/outbox"],
+      "promptContracts": ["itinerary_conflict_resolution", "tour_date_visible"],
+      "uiSurfaces": ["Tour Schedule side panel", "Inline reply draft"],
+      "testFixtures": [
+        "happy_path_alternate_time_no_conflict",
+        "terminal_alternate_time_conflict",
+        "bad_placeholder_alternate_time_block",
+        "wrong_recipient_alternate_time_guard",
+        "manual_continuation_alternate_time_recheck",
+        "duplicate_retry_alternate_time_idempotent",
+        "operator_visible_alternate_time_failure"
+      ],
+      "manualScreenshotRubrics": ["alternate_time_points_to_original_slot", "date_visible_in_draft_and_schedule"],
+      "codeRabbitChecks": ["Tour lifecycle", "Outbound safety chokepoint"],
+      "adversarialRubrics": ["core_vs_tour_language_isolation", "dashboard_state_truth"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["generic_let_me_check_draft", "conflicting_time_auto_confirmed"]
+      }
+    },
+    {
+      "id": "infra.shared_entitlements",
+      "name": "Shared feature entitlement registry",
+      "lane": "later_firebase_native",
+      "releaseStatus": "later",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": ["email_automation/results_feature_gate.py"],
+        "frontend": ["src/utils/adminAccess.js", "src/utils/resultsFeatureFlags.js"],
+        "functions": ["functions/index.js"],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["results.launcher", "tour.invite_queue"],
+      "sendRisk": "none",
+      "dataWrites": ["config/featureEntitlements"],
+      "promptContracts": ["shared_feature_lane_policy"],
+      "uiSurfaces": ["Admin settings", "Feature gates"],
+      "testFixtures": ["single_source_entitlement_denials"],
+      "manualScreenshotRubrics": ["normal_user_hidden_dev_features"],
+      "codeRabbitChecks": ["Feature lane isolation", "Entitlement bypass"],
+      "adversarialRubrics": ["entitlement_bypass"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["ui_backend_entitlement_mismatch", "runtime_flag_override"]
+      }
+    },
+    {
+      "id": "infra.cloud_scheduler",
+      "name": "Firebase-native scheduler",
+      "lane": "later_firebase_native",
+      "releaseStatus": "later",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": ["main.py", "email_automation/scheduler_scope.py"],
+        "frontend": [],
+        "functions": ["functions/index.js"],
+        "firestoreRules": []
+      },
+      "dependencies": ["infra.shared_entitlements", "core.health_recovery"],
+      "sendRisk": "sends_email_autonomous",
+      "dataWrites": ["schedulerLeases", "users/{uid}/processingState"],
+      "promptContracts": ["scheduler_scope_policy"],
+      "uiSurfaces": ["Health widget", "Admin scheduler readback"],
+      "testFixtures": [
+        "happy_path_single_runner_lease",
+        "terminal_scope_noop",
+        "bad_placeholder_cloud_scheduler_block",
+        "wrong_recipient_scoped_dev_run",
+        "manual_continuation_guard",
+        "duplicate_retry_idempotent_scheduler",
+        "operator_visible_cloud_scheduler_failure"
+      ],
+      "manualScreenshotRubrics": ["scheduler_status_visible"],
+      "codeRabbitChecks": ["Scheduler scope and order", "Recovery and privacy boundary"],
+      "adversarialRubrics": ["manual_intervention_duplicate_send", "ai_failure_visibility"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["global_scheduler_runs_unscoped_during_dev", "double_worker_lease"]
+      }
+    },
+    {
+      "id": "infra.cloud_tasks",
+      "name": "Cloud Tasks send and retry queues",
+      "lane": "later_firebase_native",
+      "releaseStatus": "later",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": ["email_automation/email.py", "email_automation/pending_responses.py"],
+        "frontend": [],
+        "functions": ["functions/index.js"],
+        "firestoreRules": []
+      },
+      "dependencies": ["infra.cloud_scheduler", "core.outbox_send"],
+      "sendRisk": "sends_email_autonomous",
+      "dataWrites": ["cloudTasks", "users/{uid}/actionAudit", "users/{uid}/deadLetterQueue"],
+      "promptContracts": ["task_retry_idempotency"],
+      "uiSurfaces": ["Health widget", "Dead-letter recovery"],
+      "testFixtures": [
+        "happy_path_task_send",
+        "terminal_state_task_no_send",
+        "bad_placeholder_task_block",
+        "wrong_recipient_task_guard",
+        "manual_continuation_task_guard",
+        "duplicate_retry_task_idempotent_send",
+        "operator_visible_task_dead_letter_failure",
+        "task_dead_letter_visible"
+      ],
+      "manualScreenshotRubrics": ["task_failure_visible"],
+      "codeRabbitChecks": ["Recovery and privacy boundary", "Outbound safety chokepoint"],
+      "adversarialRubrics": ["manual_intervention_duplicate_send", "ai_failure_visibility"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["task_retry_double_sends", "task_failure_hidden"]
+      }
+    },
+    {
+      "id": "infra.firestore_lane_rules",
+      "name": "Firestore feature-lane rules",
+      "lane": "later_firebase_native",
+      "releaseStatus": "later",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": [],
+        "frontend": [],
+        "functions": [],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["infra.shared_entitlements"],
+      "sendRisk": "none",
+      "dataWrites": ["firestore.rules"],
+      "promptContracts": ["firestore_lane_contract"],
+      "uiSurfaces": ["All Firestore-backed UI"],
+      "testFixtures": ["normal_user_tour_outbox_denied", "normal_user_results_state_denied"],
+      "manualScreenshotRubrics": ["denied_features_not_shown"],
+      "codeRabbitChecks": ["Entitlement bypass", "Feature lane isolation"],
+      "adversarialRubrics": ["entitlement_bypass"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["rules_allow_dev_feature_write", "rules_only_check_action_type"]
+      }
+    },
+    {
+      "id": "infra.observability",
+      "name": "Cross-user observability and cost monitoring",
+      "lane": "later_firebase_native",
+      "releaseStatus": "later",
+      "normalUserAccess": false,
+      "ownerModules": {
+        "backend": ["email_automation/usage_tracking.py", "email_automation/system_health.py"],
+        "frontend": ["src/components/UsagePage.jsx"],
+        "functions": ["functions/index.js"],
+        "firestoreRules": ["firestore.rules"]
+      },
+      "dependencies": ["admin.usage_readonly", "core.health_recovery"],
+      "sendRisk": "read_only",
+      "dataWrites": ["usageDaily", "systemHealth"],
+      "promptContracts": ["admin_readonly_usage"],
+      "uiSurfaces": ["Usage page", "Health widget"],
+      "testFixtures": ["monthly_spend_by_user", "graphhopper_free_tier_visibility"],
+      "manualScreenshotRubrics": ["usage_cost_day_by_day", "user_spike_drilldown"],
+      "codeRabbitChecks": ["Privacy boundary", "Cost visibility"],
+      "adversarialRubrics": ["entitlement_bypass", "ai_failure_visibility"],
+      "productionGate": {
+        "requiredBeforePush": false,
+        "stopConditions": ["normal_user_sees_cross_user_usage", "cost_spike_unattributed"]
+      }
+    }
+  ]
+}
