@@ -1086,6 +1086,7 @@
           "tour_unavailable_but_property_viable"
         ],
         "statePermutations": [
+          "action_needed",
           "paused_manual_review",
           "dead_letter_visible"
         ],
@@ -1394,7 +1395,8 @@
         ],
         "testIds": [
           "test_deterministic_rent_fallback_extracts_asking_rent_not_nnn",
-          "property image resolver tests"
+          "test_manifest_candidate_writes_safe_property_image_columns_without_raw_image_bytes",
+          "test_fetch_and_process_linked_assets_resolves_pdf_link_property_preview"
         ]
       },
       "terminal_state": {
@@ -1551,7 +1553,7 @@
         ],
         "testIds": [
           "test_stale_row_uses_subject_address_before_duplicate_email_fallback",
-          "formula column tests"
+          "test_formula_handles_single_rent_values_and_rent_ranges"
         ]
       },
       "bad_placeholder": {
@@ -2039,8 +2041,9 @@
           "firestore",
           "email"
         ],
-        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.signature_identity yet.",
-        "nextProof": "Add or identify a deterministic core.signature_identity / wrong_recipient fixture, then wire it to this map before reopening users."
+        "gapReason": "Jill/MOHR signature or identity leakage to another user is named as a Production V1 incident class but still needs a stronger wrong-recipient fixture beyond the existing non-MOHR fallback tests.",
+        "nextProof": "Add a deterministic signature identity fixture proving non-MOHR users never inherit Jill/MOHR branding across launch drafts, dashboard replies, follow-ups, and recovery retries before reopening users.",
+        "incidentId": "jill_mohr_signature_leakage"
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -2334,7 +2337,8 @@
           "graph_accepted_but_index_missing"
         ],
         "statePermutations": [
-          "paused_manual_review"
+          "paused_manual_review",
+          "not_started"
         ],
         "evidence": [
           "automated",

@@ -9,7 +9,6 @@ RELEASE_SAFETY_DIR = REPO_ROOT / "docs" / "release-safety"
 GRADEBOOK_PATH = RELEASE_SAFETY_DIR / "feature-gradebook.json"
 FIXTURE_MAP_PATH = RELEASE_SAFETY_DIR / "production-v1-fixture-map.json"
 
-VALID_STATUSES = {"covered", "needs_fixture", "needs_live_proof"}
 INCIDENT_ROWS = {
     ("core.name_resolution", "bad_placeholder"): "karsen_name_placeholder",
     ("core.launch_draft", "bad_placeholder"): "karsen_raw_name_message",
@@ -21,6 +20,7 @@ INCIDENT_ROWS = {
     ("core.followups", "manual_continuation"): "manual_sent_items_suppresses_followup",
     ("core.health_recovery", "operator_visible_failure"): "dead_letter_visible_before_retry",
     ("core.scheduler_scope", "wrong_recipient"): "normal_users_scope_denied",
+    ("core.signature_identity", "wrong_recipient"): "jill_mohr_signature_leakage",
 }
 
 
@@ -42,6 +42,7 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
         suite = gradebook["releaseSuites"]["production_v1_base_campaign"]
         required_features = set(suite["featureIds"])
         required_fixture_classes = set(suite["requiredFixtureClasses"])
+        valid_statuses = set(fixture_map["statusLegend"])
         matrix = fixture_map["featureFixtureMatrix"]
 
         self.assertEqual(1, fixture_map.get("schemaVersion"))
@@ -62,7 +63,7 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
                 )
                 for fixture_class, cell in fixture_cells.items():
                     with self.subTest(feature=feature_id, fixture_class=fixture_class):
-                        self.assertIn(cell.get("status"), VALID_STATUSES)
+                        self.assertIn(cell.get("status"), valid_statuses)
                         self.assertTrue(cell.get("eventClasses"))
                         self.assertTrue(cell.get("combinationPlaybooks"))
                         self.assertTrue(cell.get("statePermutations"))
@@ -74,6 +75,16 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
                                 self.assertTrue(
                                     (REPO_ROOT / test_file).exists(),
                                     f"{feature_id}/{fixture_class} references missing test file {test_file}.",
+                                )
+                            test_corpus = "\n".join(
+                                (REPO_ROOT / test_file).read_text(errors="ignore")
+                                for test_file in cell["testFiles"]
+                            )
+                            for test_id in cell["testIds"]:
+                                self.assertIn(
+                                    test_id,
+                                    test_corpus,
+                                    f"{feature_id}/{fixture_class} references stale or descriptive testId {test_id}.",
                                 )
                         else:
                             self.assertTrue(cell.get("gapReason"))
@@ -92,9 +103,11 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
         covered_combinations = {
             combination for cell in cells for combination in cell["combinationPlaybooks"]
         }
+        covered_states = {state for cell in cells for state in cell["statePermutations"]}
 
         self.assertTrue(set(suite["requiredEventClasses"]).issubset(covered_events))
         self.assertTrue(set(suite["requiredCombinationPlaybooks"]).issubset(covered_combinations))
+        self.assertTrue(set(suite["requiredStatePermutations"]).issubset(covered_states))
 
     def test_known_incident_rows_are_named_and_not_generic(self):
         fixture_map = _read_json(FIXTURE_MAP_PATH)
