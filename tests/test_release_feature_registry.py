@@ -93,6 +93,11 @@ SEND_RISKS_REQUIRING_FIXTURE_COVERAGE = {
 
 SEND_RISK_BASE_FIXTURE_CATEGORIES = {
     "happy_path",
+    "terminal_state",
+    "bad_placeholder",
+    "wrong_recipient",
+    "manual_continuation",
+    "duplicate_retry",
     "operator_visible_failure",
 }
 

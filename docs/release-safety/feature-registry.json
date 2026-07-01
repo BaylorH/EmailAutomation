@@ -30,6 +30,10 @@
         "happy_path_standard_contact_mapping",
         "karsen_bad_placeholder_launch_guard",
         "sheet_column_alias_matrix",
+        "terminal_cancelled_mapping_no_outbox",
+        "wrong_recipient_mapping_guard",
+        "manual_continuation_mapping_recheck",
+        "duplicate_retry_mapping_idempotent",
         "operator_visible_missing_name_block"
       ],
       "manualScreenshotRubrics": ["mapping_required_fields_visible", "launch_preview_blocks_bad_variables"],
@@ -61,6 +65,10 @@
         "happy_path_first_name_column",
         "full_name_only_sheet",
         "bad_placeholder_blank_name_sheet",
+        "terminal_state_name_resolution_no_outbox",
+        "wrong_recipient_name_column_guard",
+        "manual_continuation_name_recheck",
+        "duplicate_retry_name_resolution_idempotent",
         "ambiguous_contact_columns",
         "operator_visible_name_resolution_failure"
       ],
@@ -93,6 +101,9 @@
         "happy_path_launch_draft",
         "karsen_bad_placeholder_name_message",
         "wrong_recipient_launch_recipient_mismatch",
+        "terminal_cancelled_launch_no_outbox",
+        "manual_continuation_launch_recheck",
+        "duplicate_retry_launch_draft_idempotent",
         "no_tour_scheduling_copy",
         "operator_visible_launch_block"
       ],
@@ -124,6 +135,7 @@
       "testFixtures": [
         "happy_path_graph_send",
         "terminal_cancelled_no_send",
+        "bad_placeholder_outbox_send_block",
         "wrong_recipient_safety_block",
         "manual_continuation_detected",
         "duplicate_retry_skipped_audit",
@@ -157,8 +169,12 @@
       "uiSurfaces": ["Conversation panel", "Inline reply", "Outbox audit"],
       "testFixtures": [
         "happy_path_reply_all_cc",
+        "terminal_state_reply_all_no_send",
+        "bad_placeholder_reply_all_block",
         "wrong_recipient_cc_preservation_reply",
         "blocked_cc_filtering",
+        "manual_continuation_reply_all_recheck",
+        "duplicate_retry_reply_all_idempotent",
         "operator_visible_blocked_cc"
       ],
       "manualScreenshotRubrics": ["reply_recipient_editor_shows_ccs", "audit_shows_final_recipients"],
@@ -191,6 +207,8 @@
         "bad_placeholder_ai_help_blocking",
         "wrong_recipient_dashboard_reply_block",
         "terminal_action_resolved",
+        "manual_continuation_dashboard_reply_recheck",
+        "duplicate_retry_dashboard_reply_idempotent",
         "operator_visible_bad_draft_failure"
       ],
       "manualScreenshotRubrics": ["composer_blocks_bad_body", "sent_reply_resolves_action"],
@@ -360,6 +378,7 @@
       "testFixtures": [
         "happy_path_followup",
         "terminal_state_no_followup",
+        "bad_placeholder_followup_block",
         "wrong_recipient_cc_preserved",
         "manual_continuation_sent_suppresses_followup",
         "duplicate_retry_followup_blocked",
@@ -419,6 +438,10 @@
       "testFixtures": [
         "happy_path_custom_signature",
         "bad_placeholder_signature_identity_block",
+        "terminal_state_signature_no_outbox",
+        "wrong_recipient_signature_guard",
+        "manual_continuation_signature_recheck",
+        "duplicate_retry_signature_idempotent",
         "mohr_domain_org_defaults",
         "custom_logo_dimensions",
         "non_mohr_blank_defaults",
@@ -451,6 +474,8 @@
       "uiSurfaces": ["Dashboard health", "Dead letter recovery", "Processing failures"],
       "testFixtures": [
         "happy_path_dead_letter_requeue",
+        "terminal_state_recovery_no_send",
+        "bad_placeholder_recovery_block",
         "wrong_recipient_recovery_block",
         "manual_continuation_recovery_guard",
         "duplicate_retry_dead_letter_rechecks_send",
@@ -512,6 +537,7 @@
       "testFixtures": [
         "happy_path_baylor_scheduler",
         "terminal_scope_noop",
+        "bad_placeholder_scheduler_block",
         "wrong_recipient_scope_denied",
         "scheduled_scope_normal_users_paused",
         "manual_dispatch_baylor_only",
@@ -729,7 +755,11 @@
       "uiSurfaces": ["Tour Planner confirm send", "Outbox", "Action audit"],
       "testFixtures": [
         "happy_path_tour_invite_baylor_only",
+        "terminal_tour_invite_no_send",
+        "bad_placeholder_tour_invite_block",
         "wrong_recipient_normal_user_tour_invite_denied",
+        "manual_continuation_tour_invite_recheck",
+        "duplicate_retry_tour_invite_idempotent",
         "bp21_tour_invite_baylor_only",
         "operator_visible_tour_invite_block"
       ],
@@ -763,6 +793,10 @@
         "alternate_time_reply",
         "tour_unavailable_reply",
         "terminal_decline_tour_reply",
+        "bad_placeholder_tour_reply_block",
+        "wrong_recipient_tour_reply_guard",
+        "manual_continuation_tour_reply_recheck",
+        "duplicate_retry_tour_reply_idempotent",
         "operator_visible_tour_reply_failure"
       ],
       "manualScreenshotRubrics": ["tour_schedule_panel_shows_state", "tour_conversation_separate_from_broker_outreach"],
@@ -793,6 +827,10 @@
       "testFixtures": [
         "happy_path_alternate_time_no_conflict",
         "terminal_alternate_time_conflict",
+        "bad_placeholder_alternate_time_block",
+        "wrong_recipient_alternate_time_guard",
+        "manual_continuation_alternate_time_recheck",
+        "duplicate_retry_alternate_time_idempotent",
         "operator_visible_alternate_time_failure"
       ],
       "manualScreenshotRubrics": ["alternate_time_points_to_original_slot", "date_visible_in_draft_and_schedule"],
@@ -849,6 +887,7 @@
       "testFixtures": [
         "happy_path_single_runner_lease",
         "terminal_scope_noop",
+        "bad_placeholder_cloud_scheduler_block",
         "wrong_recipient_scoped_dev_run",
         "manual_continuation_guard",
         "duplicate_retry_idempotent_scheduler",
@@ -881,6 +920,8 @@
       "uiSurfaces": ["Health widget", "Dead-letter recovery"],
       "testFixtures": [
         "happy_path_task_send",
+        "terminal_state_task_no_send",
+        "bad_placeholder_task_block",
         "wrong_recipient_task_guard",
         "manual_continuation_task_guard",
         "duplicate_retry_task_idempotent_send",
