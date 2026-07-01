@@ -818,7 +818,10 @@ def resolve_signature_settings(user_data: Dict[str, Any] = None) -> Tuple[Option
         return None, "professional", user_email
 
     if signature_mode == "custom":
-        return email_signature, "custom", user_email
+        clean_signature = _clean_signature_value(email_signature)
+        if clean_signature and _professional_signature_html_belongs_to_sender(clean_signature, user_email):
+            return clean_signature, "custom", user_email
+        return None, "custom", user_email
 
     return None, "none", user_email
 
