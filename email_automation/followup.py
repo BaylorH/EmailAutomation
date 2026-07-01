@@ -265,6 +265,38 @@ def _select_reply_anchor_message(outbound_message_docs: List[Any]) -> Optional[D
     return None
 
 
+def _followup_terminal_block_reason(
+    thread_data: Dict[str, Any],
+    followup_config: Dict[str, Any],
+    followup_index: int,
+) -> Optional[str]:
+    """Return a human-readable reason when a follow-up must not send now."""
+    status = str((thread_data or {}).get("status") or "").strip().lower()
+    followup_status = str((thread_data or {}).get("followUpStatus") or "").strip().lower()
+    status_reason = str((thread_data or {}).get("statusReason") or "").strip().lower()
+
+    if (thread_data or {}).get("hasInboundReply"):
+        return "the broker has already replied"
+    if status in {"stopped", "completed", "archived"}:
+        return f"the thread is {status}"
+    if followup_status in {"paused", "needs_review", "max_reached", "complete", "completed", "stopped"}:
+        return f"follow-up tracking is {followup_status}"
+    if status_reason in {"manual_continuation", "followup_send_guard_failed"}:
+        return f"the thread requires review for {status_reason}"
+    if "enabled" in (followup_config or {}) and not (followup_config or {}).get("enabled"):
+        return "follow-up tracking is disabled"
+
+    current_index = (followup_config or {}).get("currentFollowUpIndex")
+    if current_index is not None and current_index != followup_index:
+        return f"the follow-up index changed from {followup_index} to {current_index}"
+
+    followups = (followup_config or {}).get("followUps") or []
+    if followups and followup_index >= len(followups):
+        return "the max follow-up count has already been reached"
+
+    return None
+
+
 def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
     """
     Main entry point: scan threads needing follow-ups and send them.
@@ -666,6 +698,40 @@ def _send_followup_email(
         # Send as a filtered reply-all draft so broker CCs are preserved safely.
         send_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=5)
         _send_followup_email.last_attempt_at = send_attempt_at
+
+        try:
+            latest_thread_doc = (
+                _fs.collection("users")
+                .document(user_id)
+                .collection("threads")
+                .document(thread_id)
+                .get()
+            )
+            latest_thread_data = latest_thread_doc.to_dict() if latest_thread_doc.exists else thread_data
+        except Exception as exc:
+            _send_followup_email.last_error = (
+                f"Could not verify latest follow-up thread state: {exc}; "
+                "manual review required before sending follow-up"
+            )
+            _send_followup_email.guard_failed_closed = True
+            print(f"   🛑 {_send_followup_email.last_error}")
+            return False
+
+        latest_followup_config = (latest_thread_data or {}).get("followUpConfig") or followup_config
+        terminal_reason = _followup_terminal_block_reason(
+            latest_thread_data or thread_data,
+            latest_followup_config,
+            followup_index,
+        )
+        if terminal_reason:
+            _send_followup_email.last_error = (
+                f"Follow-up stopped before send because {terminal_reason}; "
+                "manual review required before sending follow-up"
+            )
+            _send_followup_email.guard_failed_closed = True
+            print(f"   🛑 {_send_followup_email.last_error}")
+            return False
+
         from .email import (
             _delete_graph_reply_draft,
             _filter_reply_all_draft_recipients,
@@ -697,6 +763,7 @@ def _send_followup_email(
 
         source_message = dict(last_outbound or {})
         source_message["replyToEmails"] = [recipient]
+
         reply_draft = _hydrate_reply_all_draft_recipients(headers, reply_draft, base=base)
         reply_draft = _source_message_reply_all_fallback(reply_draft, source_message)
         reply_draft = _reviewed_recipient_reply_all_fallback(
@@ -711,11 +778,22 @@ def _send_followup_email(
             ),
         )
 
-        recipient_result = _filter_reply_all_draft_recipients(
-            user_id,
-            reply_draft,
-            user_email=user_email,
-        )
+        try:
+            recipient_result = _filter_reply_all_draft_recipients(
+                user_id,
+                reply_draft,
+                user_email=user_email,
+            )
+        except Exception as exc:
+            _send_followup_email.last_error = (
+                f"Could not filter reply-all recipients: {exc}; "
+                "manual review required before sending follow-up"
+            )
+            _send_followup_email.guard_failed_closed = True
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            print(f"   🛑 {_send_followup_email.last_error}")
+            return False
+
         recipient_payload = recipient_result["payload"]
         if not recipient_payload["toRecipients"] and recipient:
             recipient_lower = recipient.lower()
@@ -736,6 +814,12 @@ def _send_followup_email(
             _delete_graph_reply_draft(headers, reply_draft_id, base=base)
             print(f"   ❌ {_send_followup_email.last_error}")
             return False
+
+        final_cc_recipients = [
+            ((cc_recipient.get("emailAddress") or {}).get("address") or "").strip()
+            for cc_recipient in recipient_payload["ccRecipients"]
+            if ((cc_recipient.get("emailAddress") or {}).get("address") or "").strip()
+        ]
 
         patch_resp = exponential_backoff_request(
             lambda: requests.patch(
@@ -769,10 +853,26 @@ def _send_followup_email(
                             timeout=30
                         )
                     )
-                    if att_resp.status_code in [200, 201]:
+                    if att_resp and att_resp.status_code in [200, 201]:
                         print(f"      📎 Attached {attachment['name']}")
+                    else:
+                        _send_followup_email.last_error = (
+                            f"Could not attach required signature asset {attachment['name']}; "
+                            "manual review required before sending follow-up"
+                        )
+                        _send_followup_email.guard_failed_closed = True
+                        _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+                        print(f"      🛑 {_send_followup_email.last_error}")
+                        return False
                 except Exception as e:
-                    print(f"      ⚠️ Error attaching {attachment['name']}: {e}")
+                    _send_followup_email.last_error = (
+                        f"Could not attach required signature asset {attachment['name']}: {e}; "
+                        "manual review required before sending follow-up"
+                    )
+                    _send_followup_email.guard_failed_closed = True
+                    _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+                    print(f"      🛑 {_send_followup_email.last_error}")
+                    return False
 
         reply_resp = exponential_backoff_request(
             lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
@@ -785,7 +885,7 @@ def _send_followup_email(
             _save_followup_message(
                 user_id, thread_id, recipient, subject,
                 followup_message, user_signature, signature_mode, user_email,
-                cc_recipients=recipient_result.get("ccRecipients") or [],
+                cc_recipients=final_cc_recipients,
             )
 
             # Update thread
