@@ -2,14 +2,6 @@ import os
 import unittest
 from unittest.mock import patch
 
-os.environ.setdefault("E2E_TEST_MODE", "true")
-os.environ.setdefault(
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
-)
-
-from email_automation import email_operations
-
 
 class LegacyEmailOperationsDisabledTests(unittest.TestCase):
     def setUp(self):
@@ -18,6 +10,17 @@ class LegacyEmailOperationsDisabledTests(unittest.TestCase):
         self.addCleanup(self._env_patch.stop)
 
     def test_legacy_send_helpers_are_disabled_before_graph_by_default(self):
+        with patch.dict(
+            os.environ,
+            {
+                "E2E_TEST_MODE": "true",
+                "FIRESTORE_EMULATOR_HOST": "localhost:8080",
+                "GOOGLE_CLOUD_PROJECT": "email-automation-cache",
+            },
+            clear=False,
+        ):
+            from email_automation import email_operations
+
         self.assertTrue(hasattr(email_operations, "LegacyEmailOperationsDisabled"))
 
         cases = [
