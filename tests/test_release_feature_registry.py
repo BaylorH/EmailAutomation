@@ -7,6 +7,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = REPO_ROOT / "docs" / "release-safety" / "feature-registry.json"
 RUBRICS_PATH = REPO_ROOT / "docs" / "release-safety" / "adversarial-rubrics.json"
+GRADEBOOK_PATH = REPO_ROOT / "docs" / "release-safety" / "feature-gradebook.json"
 OUTBOUND_INVENTORY_PATH = (
     REPO_ROOT / "docs" / "release-safety" / "outbound-send-surface-inventory.json"
 )
@@ -149,6 +150,120 @@ FIXTURE_CATEGORY_ALIASES = {
     ),
 }
 
+REQUIRED_GRADEBOOK_DIMENSIONS = {
+    "eventTaxonomy",
+    "triggerVariationAxes",
+    "combinationPlaybooks",
+    "statePermutations",
+    "actorAndAccountAxes",
+    "evidenceRequirements",
+    "fixtureClasses",
+    "gradingRoles",
+    "freshnessRules",
+    "releaseSuites",
+    "featureInteractionMatrix",
+    "featureScenarios",
+}
+
+REQUIRED_EVENT_CLASSES = {
+    "launch_with_variable_mapping",
+    "broker_available_full_specs",
+    "broker_available_partial_specs",
+    "broker_attachment_or_link_only",
+    "broker_property_unavailable",
+    "broker_property_non_viable",
+    "broker_wrong_contact",
+    "broker_opt_out",
+    "broker_confidential_question",
+    "broker_tour_available",
+    "broker_tour_unavailable",
+    "broker_alternate_tour_time",
+    "broker_new_property_referral",
+    "manual_user_continuation",
+    "reply_all_cc_context",
+    "followup_due",
+    "retry_after_uncertain_send",
+    "sheet_row_moved",
+    "token_or_graph_failure",
+    "dashboard_action_resolution",
+}
+
+REQUIRED_TRIGGER_VARIATION_AXES = {
+    "phrasing",
+    "thread_shape",
+    "sender_identity",
+    "recipient_shape",
+    "attachment_shape",
+    "data_quality",
+    "timing",
+    "campaign_state",
+    "operator_action",
+    "entitlement_scope",
+}
+
+REQUIRED_COMBINATION_PLAYBOOKS = {
+    "partial_specs_plus_pdf_plus_followup",
+    "wrong_contact_plus_new_property",
+    "tour_unavailable_but_property_viable",
+    "manual_reply_before_retry",
+    "reply_all_cc_plus_blocked_contact",
+    "row_move_during_pending_action",
+    "same_broker_multiple_properties",
+    "subject_drift_split_thread",
+    "opt_out_after_prior_interest",
+    "graph_accepted_but_index_missing",
+}
+
+REQUIRED_STATE_PERMUTATIONS = {
+    "not_started",
+    "outbox_queued",
+    "live_waiting",
+    "action_needed",
+    "paused_manual_review",
+    "stopped",
+    "completed",
+    "archived",
+    "dead_letter_visible",
+    "retry_reconciled",
+}
+
+REQUIRED_GRADING_ROLES = {
+    "broker_operator",
+    "tenant_rep",
+    "backend_safety_reviewer",
+    "frontend_ux_reviewer",
+    "privacy_reviewer",
+    "support_recovery_reviewer",
+}
+
+REQUIRED_RELEASE_SUITES = {
+    "production_v1_base_campaign",
+    "results_dev_artifact_workspace",
+    "tour_dev_scheduling_lifecycle",
+    "firebase_native_worker_migration",
+}
+
+SHEET_EVIDENCE_FEATURE_IDS = {
+    "core.property_extraction",
+    "core.sheet_update",
+    "results.summary_pdf",
+    "results.packet_pdf",
+    "results.saved_rebuild",
+}
+
+FEATURE_SPECIFIC_NEGATIVE_CONTROL_KEYWORDS = {
+    "core.event_classifier": ("tour unavailable", "non-viable"),
+    "core.property_extraction": ("invent", "source"),
+    "core.sheet_update": ("wrong row",),
+    "core.stop_cancel_dismiss": ("stopped", "autonomous"),
+    "admin.usage_readonly": ("admin", "non-admin"),
+    "results.summary_pdf": ("blank", "source"),
+    "results.packet_pdf": ("invent", "source"),
+    "results.map_geocode": ("geocode", "manual review"),
+    "tour.reply_handling": ("tour unavailable", "non-viable"),
+    "tour.alternate_time": ("date", "route"),
+}
+
 
 def _read_json(path: Path) -> dict[str, Any]:
     with path.open() as handle:
@@ -164,6 +279,10 @@ class ReleaseFeatureRegistryTests(unittest.TestCase):
         self.assertTrue(
             RUBRICS_PATH.exists(),
             "docs/release-safety/adversarial-rubrics.json must define the adversarial test categories.",
+        )
+        self.assertTrue(
+            GRADEBOOK_PATH.exists(),
+            "docs/release-safety/feature-gradebook.json must define broad event, variation, combination, and grading coverage.",
         )
 
     def test_registry_has_required_features_and_unique_ids(self):
@@ -308,6 +427,182 @@ class ReleaseFeatureRegistryTests(unittest.TestCase):
                 self.assertTrue(rubric.get("breakAttempts"))
                 self.assertTrue(rubric.get("evidence"))
                 self.assertTrue(rubric.get("stopConditions"))
+
+    def test_feature_gradebook_forces_broad_event_and_combination_coverage(self):
+        registry = _read_json(REGISTRY_PATH)
+        gradebook = _read_json(GRADEBOOK_PATH)
+        feature_ids = {feature.get("id") for feature in registry.get("features", [])}
+
+        self.assertEqual(1, gradebook.get("schemaVersion"))
+        self.assertTrue(
+            REQUIRED_GRADEBOOK_DIMENSIONS.issubset(gradebook),
+            "The gradebook must cover taxonomy, variations, combinations, states, actors, evidence, roles, and feature scenarios.",
+        )
+        self.assertTrue(
+            REQUIRED_EVENT_CLASSES.issubset(set(gradebook["eventTaxonomy"])),
+            "Event taxonomy must include the real-world broker/operator events that have broken or could break SiteSift.",
+        )
+        self.assertTrue(
+            REQUIRED_TRIGGER_VARIATION_AXES.issubset(set(gradebook["triggerVariationAxes"])),
+            "Trigger variation axes must force fresh wording/account/thread/data variations instead of canned replays.",
+        )
+        self.assertTrue(
+            REQUIRED_COMBINATION_PLAYBOOKS.issubset(set(gradebook["combinationPlaybooks"])),
+            "Combination playbooks must cover multi-event collisions like manual replies before retry and tour-unavailable-but-viable.",
+        )
+        self.assertTrue(
+            REQUIRED_STATE_PERMUTATIONS.issubset(set(gradebook["statePermutations"])),
+            "State permutations must cover lifecycle states from queued through visible recovery.",
+        )
+        self.assertTrue(
+            REQUIRED_GRADING_ROLES.issubset(set(gradebook["gradingRoles"])),
+            "Grading roles must force reviewers to judge safety, UX, privacy, and support/recovery separately.",
+        )
+        self.assertEqual(
+            SEND_RISK_BASE_FIXTURE_CATEGORIES,
+            set(gradebook["fixtureClasses"]),
+            "The gradebook must name the mandatory adversarial fixture classes used by release suites.",
+        )
+        self.assertTrue(
+            REQUIRED_RELEASE_SUITES.issubset(set(gradebook["releaseSuites"])),
+            "Release suites must force full Product V1, Results, Tour, and Firebase-native proof tracks instead of isolated spot checks.",
+        )
+
+        feature_scenarios = gradebook["featureScenarios"]
+        self.assertEqual(
+            feature_ids,
+            set(feature_scenarios),
+            "Every feature in feature-registry.json must have an explicit gradebook scenario entry.",
+        )
+        used_variation_axes = set()
+
+        for feature_id, scenario in feature_scenarios.items():
+            with self.subTest(feature=feature_id):
+                for key in (
+                    "eventClasses",
+                    "variationAxes",
+                    "combinationPlaybooks",
+                    "statePermutations",
+                    "negativeControls",
+                    "evidenceRequired",
+                    "gradingRoles",
+                    "passBar",
+                ):
+                    self.assertTrue(scenario.get(key), f"{feature_id} is missing gradebook key {key}.")
+                self.assertTrue(
+                    set(scenario["eventClasses"]).issubset(set(gradebook["eventTaxonomy"])),
+                    f"{feature_id} references unknown event classes.",
+                )
+                self.assertTrue(
+                    set(scenario["variationAxes"]).issubset(set(gradebook["triggerVariationAxes"])),
+                    f"{feature_id} references unknown variation axes.",
+                )
+                self.assertTrue(
+                    set(scenario["combinationPlaybooks"]).issubset(set(gradebook["combinationPlaybooks"])),
+                    f"{feature_id} references unknown combination playbooks.",
+                )
+                self.assertTrue(
+                    set(scenario["statePermutations"]).issubset(set(gradebook["statePermutations"])),
+                    f"{feature_id} references unknown state permutations.",
+                )
+                self.assertTrue(
+                    set(scenario["gradingRoles"]).issubset(set(gradebook["gradingRoles"])),
+                    f"{feature_id} references unknown grading roles.",
+                )
+                used_variation_axes.update(scenario["variationAxes"])
+                if "broker_attachment_or_link_only" in scenario["eventClasses"]:
+                    self.assertIn(
+                        "attachment_shape",
+                        scenario["variationAxes"],
+                        f"{feature_id} handles attachment/link events and must vary attachment shape.",
+                    )
+                if feature_id in SHEET_EVIDENCE_FEATURE_IDS:
+                    self.assertIn(
+                        "sheet",
+                        scenario["evidenceRequired"],
+                        f"{feature_id} must prove Sheet row/cell/provenance readback.",
+                    )
+                if feature_id in FEATURE_SPECIFIC_NEGATIVE_CONTROL_KEYWORDS:
+                    negative_text = " ".join(scenario["negativeControls"]).lower()
+                    for keyword in FEATURE_SPECIFIC_NEGATIVE_CONTROL_KEYWORDS[feature_id]:
+                        self.assertIn(
+                            keyword,
+                            negative_text,
+                            f"{feature_id} negative controls must include {keyword}.",
+                        )
+
+        self.assertEqual(
+            set(gradebook["triggerVariationAxes"]),
+            used_variation_axes,
+            "Every trigger variation axis must be used by at least one feature scenario.",
+        )
+
+        suite_feature_ids = {
+            feature_id
+            for suite in gradebook["releaseSuites"].values()
+            for feature_id in suite.get("featureIds", [])
+        }
+        self.assertEqual(
+            feature_ids,
+            suite_feature_ids,
+            "Every feature must belong to at least one release suite.",
+        )
+
+        interaction_feature_ids = {
+            feature_id
+            for interaction in gradebook["featureInteractionMatrix"].values()
+            for feature_id in interaction.get("features", [])
+        }
+        self.assertEqual(
+            feature_ids,
+            interaction_feature_ids,
+            "Every feature must appear in at least one cross-feature interaction group.",
+        )
+
+        for suite_id, suite in gradebook["releaseSuites"].items():
+            with self.subTest(release_suite=suite_id):
+                self.assertTrue(suite.get("featureIds"))
+                self.assertTrue(set(suite["featureIds"]).issubset(feature_ids))
+                self.assertTrue(suite.get("requiredEventClasses"))
+                self.assertTrue(suite.get("requiredCombinationPlaybooks"))
+                self.assertTrue(suite.get("requiredStatePermutations"))
+                self.assertTrue(suite.get("requiredNegativeControls"))
+                self.assertEqual(
+                    SEND_RISK_BASE_FIXTURE_CATEGORIES,
+                    set(suite.get("requiredFixtureClasses", [])),
+                    f"{suite_id} must require the full adversarial fixture class set before it can pass.",
+                )
+                self.assertTrue(suite.get("proofArtifacts"))
+
+        for feature in registry.get("features", []):
+            if feature.get("sendRisk") in SEND_RISKS_REQUIRING_FIXTURE_COVERAGE:
+                scenario = feature_scenarios[feature["id"]]
+                with self.subTest(send_risk_feature=feature["id"]):
+                    self.assertGreaterEqual(
+                        len(scenario["eventClasses"]),
+                        3,
+                        "Send-risk features need multiple event classes, not a single happy path.",
+                    )
+                    self.assertGreaterEqual(
+                        len(scenario["variationAxes"]),
+                        5,
+                        "Send-risk features need broad variation axes to catch fresh real-world phrasings.",
+                    )
+                    self.assertGreaterEqual(
+                        len(scenario["combinationPlaybooks"]),
+                        2,
+                        "Send-risk features need combination/collision playbooks.",
+                    )
+                    self.assertIn(
+                        "manual_reply_before_retry",
+                        scenario["combinationPlaybooks"],
+                        "Every send-risk feature must consider manual user continuation before retry/autonomous send.",
+                    )
+                    self.assertIn(
+                        "wrong_recipient",
+                        " ".join(scenario["negativeControls"]).lower(),
+                        "Every send-risk feature must include a wrong-recipient negative control.",
+                    )
 
 
 if __name__ == "__main__":

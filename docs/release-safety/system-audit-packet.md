@@ -43,12 +43,16 @@ Use these files together:
 - backend `.coderabbit.yaml`
 - frontend `.coderabbit.yaml`
 - `docs/release-safety/feature-registry.json`
+- `docs/release-safety/feature-gradebook.json`
 - `docs/release-safety/adversarial-rubrics.json`
 - `docs/release-safety/outbound-send-surface-inventory.json`
 - `docs/release-safety/system-audit-matrix.json`
 
 If a change touches a send-risk feature, the matrix entry for that feature must
-be reviewed before it is considered production-safe.
+be reviewed before it is considered production-safe. The gradebook entry for
+that feature must also be used to pick fresh event classes, trigger variations,
+combination playbooks, state permutations, negative controls, evidence, and
+human grading roles; a narrow fixed happy path is not enough.
 
 ## Review Order
 
@@ -82,11 +86,12 @@ Use this prompt on recovery PRs and any future production-widening PR:
 > Review this PR as a cross-repo SiteSift release-safety change. Treat the
 > frontend and backend as one product. Compare the changed files against
 > `AGENTS.md`, `.coderabbit.yaml`, `feature-registry.json`,
-> `adversarial-rubrics.json`, `outbound-send-surface-inventory.json`, and
-> `system-audit-matrix.json`. Flag any send-risk feature whose frontend
-> surface, backend surface, Firestore writes, email behavior, user-visible
-> evidence, source-of-truth readbacks, adversarial fixture classes, or
-> CodeRabbit review questions are incomplete. In particular, look for normal
+> `feature-gradebook.json`, `adversarial-rubrics.json`,
+> `outbound-send-surface-inventory.json`, and `system-audit-matrix.json`. Flag
+> any send-risk feature whose frontend surface, backend surface, Firestore
+> writes, email behavior, user-visible evidence, source-of-truth readbacks,
+> adversarial fixture classes, gradebook event/variation/combination coverage,
+> or CodeRabbit review questions are incomplete. In particular, look for normal
 > users triggering Tour Scheduling, raw placeholders reaching outbox, dropped
 > Cc/reply-all recipients, duplicate sends after retry, hidden failed sends,
 > UI-only entitlements, and Jill/MOHR identity leakage.
@@ -100,6 +105,9 @@ and Baylor/BP21-only live proof when a real email send is explicitly needed.
 The minimum evidence set is:
 
 - all changed feature ids are named,
+- all changed feature ids select fresh gradebook events, variations,
+  combinations, state permutations, fixture classes, negative controls,
+  evidence requirements, and human grading roles,
 - all touched send-risk matrix entries pass their fixture classes,
 - backend targeted safety tests pass,
 - frontend denied-path and happy-path tests pass,
@@ -129,4 +137,3 @@ development branch uses the same packet to grow Results/Tour safely, but those
 features remain out of normal-user production until their own matrix rows pass.
 The future Firebase-native migration must preserve this packet as the acceptance
 test so the rewrite does not silently lose the existing product.
-
