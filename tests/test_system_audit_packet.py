@@ -171,6 +171,9 @@ class SystemAuditPacketTests(unittest.TestCase):
 
     def test_coderabbit_contract_names_cross_repo_source_of_truth(self):
         contract = CODERABBIT_CONTRACT_PATH.read_text()
+        section_start = contract.index("## Feature Registry Contract")
+        section_end = contract.index("\n## ", section_start + 1)
+        feature_registry_section = contract[section_start:section_end]
         for phrase in (
             "AGENTS.md",
             "feature-registry.json",
@@ -180,6 +183,6 @@ class SystemAuditPacketTests(unittest.TestCase):
         ):
             self.assertIn(
                 phrase,
-                contract,
-                "CodeRabbit review contract must include every release-safety source-of-truth artifact.",
+                feature_registry_section,
+                "CodeRabbit Feature Registry Contract must include every release-safety source-of-truth artifact.",
             )
