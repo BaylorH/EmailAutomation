@@ -20,8 +20,8 @@
   },
   "summary": {
     "covered": 41,
-    "needs_fixture": 68,
-    "needs_live_proof": 10
+    "needs_fixture": 67,
+    "needs_live_proof": 11
   },
   "featureFixtureMatrix": {
     "core.upload_mapping": {
@@ -159,22 +159,31 @@
     },
     "core.name_resolution": {
       "happy_path": {
-        "status": "needs_fixture",
+        "status": "needs_live_proof",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
         "combinationPlaybooks": [
-          "manual_reply_before_retry"
+          "placeholder_name_through_send_path"
         ],
         "statePermutations": [
-          "live_waiting"
+          "outbox_queued"
         ],
         "evidence": [
           "automated",
-          "firestore"
+          "firestore",
+          "email"
         ],
-        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.name_resolution yet.",
-        "nextProof": "Add or identify a deterministic core.name_resolution / happy_path fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_campaign_launch_replaces_name_placeholder_before_send_guard",
+          "test_grouped_outbox_replaces_name_placeholder_before_send_guard"
+        ],
+        "incidentId": "karsen_name_placeholder_positive_resolution",
+        "gapReason": "Automated send-path tests prove name placeholders are replaced before Graph send guards, but do not yet prove source-of-truth row/name-column readback through Firestore, Sheets, and delivered email.",
+        "nextProof": "Run the Baylor/BP21 Production V1 base campaign proof with a chosen name column, then read back queued outbox/body, Firestore thread contactName, Sheet row identity, and delivered email greeting before marking this covered."
       },
       "terminal_state": {
         "status": "needs_fixture",
@@ -305,17 +314,16 @@
           "launch_with_variable_mapping"
         ],
         "combinationPlaybooks": [
-          "partial_specs_plus_pdf_plus_followup"
+          "placeholder_name_through_send_path"
         ],
         "statePermutations": [
-          "live_waiting"
+          "outbox_queued"
         ],
         "evidence": [
-          "automated",
-          "firestore"
+          "automated"
         ],
-        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.launch_draft yet.",
-        "nextProof": "Add or identify a deterministic core.launch_draft / happy_path fixture, then wire it to this map before reopening users."
+        "gapReason": "The current fixture proves backend name-placeholder resolution after an outbox item exists, but does not independently prove the launch draft/setup path maps the intended name column before queueing.",
+        "nextProof": "Add a Production V1 launch-draft fixture that starts from uploaded sheet/template data, verifies the queued outbox body resolves the selected name variable, and leaves unresolved placeholders operator-visible before any Graph send."
       },
       "terminal_state": {
         "status": "needs_fixture",
