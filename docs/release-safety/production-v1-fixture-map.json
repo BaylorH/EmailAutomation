@@ -19,8 +19,8 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "covered": 53,
-    "needs_fixture": 55,
+    "covered": 54,
+    "needs_fixture": 54,
     "needs_live_proof": 11
   },
   "featureFixtureMatrix": {
@@ -178,6 +178,8 @@
         ],
         "testIds": [
           "test_campaign_launch_replaces_name_placeholder_before_send_guard",
+          "test_campaign_launch_recovers_missing_contact_name_from_sheet_row_before_send_guard",
+          "test_grouped_campaign_launch_recovers_missing_contact_name_from_sheet_row",
           "test_grouped_outbox_replaces_name_placeholder_before_send_guard"
         ],
         "incidentId": "karsen_name_placeholder_positive_resolution",
@@ -287,7 +289,7 @@
         "nextProof": "Add or identify a deterministic core.name_resolution / duplicate_retry fixture, then wire it to this map before reopening users."
       },
       "operator_visible_failure": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -302,8 +304,13 @@
           "firestore",
           "ui"
         ],
-        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.name_resolution yet.",
-        "nextProof": "Add or identify a deterministic core.name_resolution / operator_visible_failure fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_campaign_launch_refuses_ambiguous_sheet_contact_name_before_graph_send"
+        ],
+        "incidentId": "karsen_name_placeholder_ambiguous_source"
       }
     },
     "core.launch_draft": {

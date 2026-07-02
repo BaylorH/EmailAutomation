@@ -253,6 +253,87 @@ def _email_values_from_row(header: List[str], row_values: List[str]) -> List[str
     return _ordered_unique(values)
 
 
+CAMPAIGN_CONTACT_NAME_HEADER_KEYS = (
+    "contact name",
+    "leasing contact",
+    "broker name",
+    "broker",
+    "contact",
+    "name",
+)
+
+
+def _contact_name_from_campaign_row(header: List[str], row_values: List[str]) -> Optional[str]:
+    idx_map = _header_index_map(header)
+    candidates = []
+    for key in CAMPAIGN_CONTACT_NAME_HEADER_KEYS:
+        idx = idx_map.get(key)
+        if not idx:
+            continue
+        row_idx = idx - 1
+        if row_idx < 0 or row_idx >= len(row_values):
+            continue
+        value = str(row_values[row_idx] or "").strip()
+        if not value:
+            continue
+        if _safe_greeting_first_name(value):
+            candidates.append(value)
+
+    unique = _ordered_unique(candidates)
+    if len(unique) == 1:
+        return unique[0]
+    return None
+
+
+def _resolve_campaign_launch_contact_name_from_sheet(
+    user_id: str,
+    data: Dict[str, Any],
+    *,
+    row_number_override: Optional[object] = None,
+    sheet_metadata_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Optional[str]:
+    if not _is_campaign_launch_outbox(data):
+        return None
+
+    raw_row_number = data.get("rowNumber") or row_number_override
+    client_id = (data.get("clientId") or "").strip()
+    if not client_id or raw_row_number in (None, ""):
+        return None
+
+    try:
+        row_number = int(raw_row_number)
+    except (TypeError, ValueError):
+        return None
+    if row_number < 1:
+        return None
+
+    try:
+        sheet_id = _get_sheet_id_or_fail(user_id, client_id)
+        sheets = _sheets_client()
+        cache = sheet_metadata_cache if sheet_metadata_cache is not None else {}
+        metadata = cache.get(sheet_id)
+        if metadata:
+            tab_title = metadata["tab_title"]
+            header = metadata["header"]
+        else:
+            tab_title = _get_first_tab_title(sheets, sheet_id)
+            header = _read_header_row2(sheets, sheet_id, tab_title)
+            cache[sheet_id] = {"tab_title": tab_title, "header": header}
+        resp = _execute_with_retry(
+            sheets.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=f"{tab_title}!{row_number}:{row_number}",
+            ),
+            "outbox_contact_name_row_guard",
+        )
+        row_values = (resp.get("values") or [[]])[0]
+        padded_row = row_values + [""] * max(0, len(header) - len(row_values))
+        return _contact_name_from_campaign_row(header, padded_row)
+    except Exception as exc:
+        print(f"   ⚠️ Could not resolve campaign contact name from sheet row: {exc}")
+        return None
+
+
 def _dead_letter_campaign_recipient_row_mismatch_if_needed(
     user_id: str,
     doc_ref,
@@ -2358,8 +2439,16 @@ def _send_multi_property_email(
             continue
 
         contact_name = data.get("contactName") or data.get("firstName")
+        raw_script = data.get("script", prop["script"])
+        if not contact_name and NAME_PLACEHOLDER_RE.search(raw_script or ""):
+            contact_name = _resolve_campaign_launch_contact_name_from_sheet(
+                user_id,
+                data,
+                row_number_override=row_number,
+                sheet_metadata_cache=recipient_guard_sheet_cache,
+            )
         # Personalize only name-style launch placeholders; unsafe leftovers still hard-stop below.
-        script = _personalize_name_placeholders(data.get("script", prop['script']), contact_name)
+        script = _personalize_name_placeholders(raw_script, contact_name)
         if _dead_letter_unsafe_outbound_body_if_needed(user_id, item['doc'].reference, data, script):
             print(f"   🛑 Blocked unsafe outbound body for {recipient_email}; manual review required")
             continue
@@ -2817,6 +2906,7 @@ def _send_single_outbox_item(
         use_exact_script = _should_use_exact_outbox_script(data)
         recipient_guard_sheet_cache: Dict[str, Dict[str, Any]] = {}
         for recipient_email in emails:
+            recipient_contact_name = contact_name
             if _dead_letter_campaign_recipient_row_mismatch_if_needed(
                 user_id,
                 d.reference,
@@ -2828,12 +2918,20 @@ def _send_single_outbox_item(
                 print(f"   🛑 Blocked row-recipient mismatch for outbox item {d.id}")
                 return
 
+            if not recipient_contact_name and any(NAME_PLACEHOLDER_RE.search(script or "") for script in email_scripts):
+                recipient_contact_name = _resolve_campaign_launch_contact_name_from_sheet(
+                    user_id,
+                    data,
+                    row_number_override=row_number,
+                    sheet_metadata_cache=recipient_guard_sheet_cache,
+                )
+
             if use_exact_script:
                 selected_script = email_scripts[0] if email_scripts else ""
                 print(f"  → Using exact outbox script for {recipient_email}")
             else:
                 selected_script = _select_script_for_recipient(
-                    user_id, recipient_email, email_scripts, contact_name=contact_name
+                    user_id, recipient_email, email_scripts, contact_name=recipient_contact_name
                 )
 
             if _dead_letter_unsafe_outbound_body_if_needed(user_id, d.reference, data, selected_script):
@@ -2876,7 +2974,7 @@ def _send_single_outbox_item(
                                            client_id_or_none=clientId, row_number=row_number,
                                            user_signature=user_signature, subject_override=subject_override,
                                            signature_mode=signature_mode, followup_config=followup_config,
-                                           contact_name=contact_name, user_email=user_email,
+                                           contact_name=recipient_contact_name, user_email=user_email,
                                            thread_context=_thread_context_from_outbox(data),
                                            allow_scheduling_language=_is_tour_invite_outbox(data))
 
