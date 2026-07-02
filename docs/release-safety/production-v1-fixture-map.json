@@ -19,9 +19,9 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "covered": 42,
+    "covered": 41,
     "needs_fixture": 67,
-    "needs_live_proof": 10
+    "needs_live_proof": 11
   },
   "featureFixtureMatrix": {
     "core.upload_mapping": {
@@ -159,7 +159,7 @@
     },
     "core.name_resolution": {
       "happy_path": {
-        "status": "covered",
+        "status": "needs_live_proof",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -170,7 +170,9 @@
           "outbox_queued"
         ],
         "evidence": [
-          "automated"
+          "automated",
+          "firestore",
+          "email"
         ],
         "testFiles": [
           "tests/test_outbox_safety.py"
@@ -179,7 +181,9 @@
           "test_campaign_launch_replaces_name_placeholder_before_send_guard",
           "test_grouped_outbox_replaces_name_placeholder_before_send_guard"
         ],
-        "incidentId": "karsen_name_placeholder_positive_resolution"
+        "incidentId": "karsen_name_placeholder_positive_resolution",
+        "gapReason": "Automated send-path tests prove name placeholders are replaced before Graph send guards, but do not yet prove source-of-truth row/name-column readback through Firestore, Sheets, and delivered email.",
+        "nextProof": "Run the Baylor/BP21 Production V1 base campaign proof with a chosen name column, then read back queued outbox/body, Firestore thread contactName, Sheet row identity, and delivered email greeting before marking this covered."
       },
       "terminal_state": {
         "status": "needs_fixture",

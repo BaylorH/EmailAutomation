@@ -1192,10 +1192,8 @@ def _select_script_for_recipient(user_id: str, recipient_email: str,
     print(f"  → Using GENERATED fallback (contact #{email_count + 1})")
     requirements = _extract_requirements_from_primary(primary_script)
 
-    # Extract first name from contact_name for greeting
-    first_name = None
-    if contact_name:
-        first_name = contact_name.split()[0] if contact_name.strip() else None
+    # Extract first name from contact_name for greeting.
+    first_name = _safe_greeting_first_name(contact_name)
     greeting = f"Hi {first_name}," if first_name else "Hi,"
 
     if email_count == 1:

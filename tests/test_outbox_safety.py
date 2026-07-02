@@ -318,6 +318,25 @@ class OutboxSafetyTests(unittest.TestCase):
             body,
         )
 
+    def test_generated_fallback_greeting_rejects_markup_contact_name(self):
+        primary_script = (
+            "Hi [NAME],\n\n"
+            "Their requirements are:\n"
+            "- 10,000 SF warehouse\n\n"
+            "Thanks!"
+        )
+
+        with patch.object(email_module, "get_contact_email_count", return_value=1):
+            script = email_module._select_script_for_recipient(
+                "uid-1",
+                "bp21harrison@gmail.com",
+                [primary_script],
+                contact_name="Avery<script>",
+            )
+
+        self.assertTrue(script.startswith("Hi,"))
+        self.assertNotIn("Avery<script>", script)
+
     def test_paused_client_outbox_item_moves_to_dead_letter_before_send(self):
         doc_ref = FakeDocRef("paused-outbox")
         data = {"clientId": "client-1", "script": "Hi Avery"}
