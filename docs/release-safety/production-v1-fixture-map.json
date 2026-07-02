@@ -40,8 +40,16 @@
           "automated",
           "firestore"
         ],
-        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.upload_mapping yet.",
-        "nextProof": "Add or identify a deterministic core.upload_mapping / happy_path fixture, then wire it to this map before reopening users."
+        "incidentId": "happy_path_standard_contact_mapping",
+        "gapReason": "Deterministic launch-readiness helper coverage exists, but no Production V1 fixture proves the real upload/UI/Firestore launch path blocks or accepts this state yet.",
+        "nextProof": "Wire launch name-readiness into the campaign upload/start flow, then prove the UI and Firestore client/outbox state with a source-of-truth fixture before reopening users.",
+        "supportingTestFiles": [
+          "tests/test_column_config_launch_readiness.py"
+        ],
+        "supportingTestIds": [
+          "test_launch_name_mapping_happy_path_accepts_leasing_contact_header"
+        ],
+        "notes": "Standard upload headers map an explicit contact column in the helper; launch-path integration remains standing."
       },
       "terminal_state": {
         "status": "needs_fixture",
@@ -77,8 +85,18 @@
           "firestore",
           "email"
         ],
-        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.upload_mapping yet.",
-        "nextProof": "Add or identify a deterministic core.upload_mapping / bad_placeholder fixture, then wire it to this map before reopening users."
+        "incidentId": "karsen_bad_placeholder_launch_guard",
+        "gapReason": "Deterministic helper coverage rejects generic/stale Name mappings, but no Production V1 fixture proves the actual launch path prevents [NAME] from reaching outbox/email yet.",
+        "nextProof": "Add launch/upload integration coverage that attempts Karsen-style generic Name data and verifies visible blocking plus no outbox item is created.",
+        "supportingTestFiles": [
+          "tests/test_column_config_launch_readiness.py"
+        ],
+        "supportingTestIds": [
+          "test_launch_name_mapping_blocks_generic_name_header_before_placeholder_reaches_outbox",
+          "test_launch_name_mapping_rejects_stale_manual_mapping_to_generic_name",
+          "test_launch_name_mapping_rejects_missing_mapped_header"
+        ],
+        "notes": "Generic Name headers and stale manual Name mappings are unsafe in the helper; outbox-level blocking remains standing."
       },
       "wrong_recipient": {
         "status": "needs_fixture",
@@ -153,8 +171,16 @@
           "firestore",
           "ui"
         ],
-        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.upload_mapping yet.",
-        "nextProof": "Add or identify a deterministic core.upload_mapping / operator_visible_failure fixture, then wire it to this map before reopening users."
+        "incidentId": "operator_visible_missing_name_block",
+        "gapReason": "The helper returns operator-facing copy for ambiguous contact-name headers, but no Production V1 fixture proves the frontend shows it clearly and prevents launch.",
+        "nextProof": "Add frontend/upload integration proof that ambiguous contact-name columns scroll/highlight the operator-visible blocker and keep campaign launch disabled.",
+        "supportingTestFiles": [
+          "tests/test_column_config_launch_readiness.py"
+        ],
+        "supportingTestIds": [
+          "test_launch_name_mapping_reports_operator_visible_message_for_ambiguous_person_headers"
+        ],
+        "notes": "Multiple explicit contact-name columns produce helper guidance; UI blocking/readback remains standing."
       }
     },
     "core.name_resolution": {

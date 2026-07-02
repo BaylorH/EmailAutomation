@@ -19,6 +19,7 @@ from .utils import (
 )
 from .messaging import save_thread_root, save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
 from .clients import _get_sheet_id_or_fail, _sheets_client
+from .column_config import CAMPAIGN_CONTACT_NAME_HEADER_KEYS
 from .sheets import _find_row_by_email, _get_first_tab_title, _read_header_row2, _header_index_map, _execute_with_retry, highlight_row
 from .notifications import delete_notification_and_decrement_counters
 from .utils import normalize_message_id
@@ -251,23 +252,6 @@ def _email_values_from_row(header: List[str], row_values: List[str]) -> List[str
                 if normalized and is_valid_email(normalized):
                     values.append(normalized)
     return _ordered_unique(values)
-
-
-CAMPAIGN_CONTACT_NAME_HEADER_KEYS = (
-    "contact name",
-    "contact first name",
-    "leasing contact name",
-    "leasing contact",
-    "leasing agent name",
-    "leasing agent",
-    "broker name",
-    "broker contact",
-    "broker first name",
-    "recipient name",
-    "recipient first name",
-    "first name",
-    "full name",
-)
 
 
 def _contact_name_resolution_from_campaign_row(

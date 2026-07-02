@@ -51,8 +51,11 @@ def _execute_with_retry(request, operation_name: str = "Sheets API"):
     raise Exception(f"Unexpected error in retry loop for {operation_name}")
 
 def _header_index_map(header: list[str]) -> dict:
-    """Normalize headers for exact match regardless of spacing/case."""
-    return {(h or "").strip().lower(): i for i, h in enumerate(header, start=1)}  # 1-based
+    """Normalize headers for exact match regardless of spacing/case/underscores."""
+    return {
+        " ".join((h or "").strip().lower().replace("_", " ").split()): i
+        for i, h in enumerate(header, start=1)
+    }  # 1-based
 
 def _col_letter(n: int) -> str:
     """1-indexed column number -> A1 letter (1->A)."""
