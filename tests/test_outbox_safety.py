@@ -847,6 +847,207 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(thread_set[1]["followUpStatus"], "waiting")
         self.assertTrue(thread_set[2])
 
+    def _dashboard_manual_reply_doc(self, overrides=None, doc_id="outbox-dashboard-reply"):
+        data = {
+            "assignedEmails": ["bp21harrison@gmail.com"],
+            "script": "Hi Ron,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "notificationClientId": "client-1",
+            "notificationId": "notification-1",
+            "deleteNotificationOnSend": True,
+            "resumeThreadOnSend": True,
+            "subject": "RE: 0 Gemini Ave, Houston",
+            "threadId": "thread-1",
+            "replyToMessageId": "graph-message-1",
+            "conversationId": "conversation-1",
+            "rowNumber": 20,
+            "actionAuditId": "audit-dashboard-reply",
+            "source": "dashboard_manual_reply",
+            "followUpConfig": {"enabled": False},
+        }
+        if overrides:
+            data.update(overrides)
+        return FakeDoc(data, doc_id=doc_id)
+
+    def test_dashboard_manual_reply_success_records_audit_after_graph_reply(self):
+        doc = self._dashboard_manual_reply_doc()
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", return_value={
+                 "sent": True,
+                 "error": None,
+                 "sentMessageId": "graph-reply-message-1",
+                 "internetMessageId": "<graph-reply-message-1@example.com>",
+                 "conversationId": "conversation-1",
+                 "toRecipients": ["bp21harrison@gmail.com"],
+                 "ccRecipients": [],
+                 "sentRecipients": ["bp21harrison@gmail.com"],
+             }) as send_outbox_as_reply, \
+             patch.object(email_module, "_save_outbox_reply_message") as save_outbox_reply_message, \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"), \
+             patch.object(email_module, "delete_notification_and_decrement_counters") as delete_notification:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        send_outbox_as_reply.assert_called_once()
+        save_outbox_reply_message.assert_called_once()
+        delete_notification.assert_called_once_with("uid-1", "client-1", "notification-1")
+        self.assertTrue(doc.reference.deleted)
+        audit_payload = fake_fs.set_calls[-2][1]
+        self.assertEqual("sent", audit_payload["status"])
+        self.assertEqual("audit-dashboard-reply", doc.to_dict()["actionAuditId"])
+        self.assertEqual("graph-reply-message-1", audit_payload["sentMessageId"])
+        self.assertEqual("<graph-reply-message-1@example.com>", audit_payload["internetMessageId"])
+        thread_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual("active", thread_payload["status"])
+        self.assertEqual("waiting", thread_payload["followUpStatus"])
+
+    def test_dashboard_manual_reply_placeholder_dead_letters_before_graph_send(self):
+        doc = self._dashboard_manual_reply_doc({
+            "script": "Hi [NAME],\n\nCan you share details?\n\nThanks",
+        })
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender") as get_reply_sender, \
+             patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply, \
+             patch.object(email_module, "send_and_index_email") as send_and_index_email:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        get_reply_sender.assert_not_called()
+        send_outbox_as_reply.assert_not_called()
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual("dead_lettered", dead_letter_payload["status"])
+        self.assertIn("[NAME]", dead_letter_payload["failureReason"])
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual("dead_lettered", audit_payload["status"])
+
+    def test_dashboard_manual_reply_retry_reconciles_prior_sent_item_without_resending(self):
+        doc = self._dashboard_manual_reply_doc({
+            "attempts": 1,
+            "lastError": "HTTPSConnectionPool read timed out",
+            "lastSendAttemptAt": "2026-06-26T12:00:00Z",
+        })
+        fake_fs = FakeFirestore()
+        sent_match = {
+            "id": "sent-dashboard-reply-1",
+            "internetMessageId": "<sent-dashboard-reply-1@example.com>",
+            "conversationId": "conversation-1",
+            "subject": "RE: 0 Gemini Ave, Houston",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_fetch_graph_message_metadata", return_value={
+                 "conversationId": "conversation-1",
+                 "subject": "RE: 0 Gemini Ave, Houston",
+             }), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match, create=True) as sent_guard, \
+             patch.object(email_module, "find_sent_conversation_continuation_for_retry", create=True) as continuation_guard, \
+             patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        sent_guard.assert_called_once()
+        continuation_guard.assert_not_called()
+        send_outbox_as_reply.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual("needs_reconciliation", dead_letter_payload["status"])
+        self.assertTrue(dead_letter_payload["alreadySent"])
+        self.assertEqual(["bp21harrison@gmail.com"], dead_letter_payload["sentRecipients"])
+        self.assertEqual("sent-dashboard-reply-1", dead_letter_payload["sentMessageIds"]["bp21harrison@gmail.com"])
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual("needs_reconciliation", audit_payload["status"])
+        self.assertTrue(audit_payload["alreadySent"])
+
+    def test_dashboard_manual_reply_retry_blocks_when_user_manually_continued(self):
+        doc = self._dashboard_manual_reply_doc({
+            "attempts": 1,
+            "lastError": "HTTPSConnectionPool read timed out",
+            "lastSendAttemptAt": "2026-06-26T12:00:00Z",
+        })
+        fake_fs = FakeFirestore()
+        manual_continuation = {
+            "id": "manual-sent-1",
+            "internetMessageId": "<manual-sent-1@example.com>",
+            "conversationId": "conversation-1",
+            "sentDateTime": "2026-06-26T12:04:00Z",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_fetch_graph_message_metadata", return_value={
+                 "conversationId": "conversation-1",
+                 "subject": "RE: 0 Gemini Ave, Houston",
+             }), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None, create=True), \
+             patch.object(email_module, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation, create=True) as continuation_guard, \
+             patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        continuation_guard.assert_called_once()
+        send_outbox_as_reply.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual("dead_lettered", dead_letter_payload["status"])
+        self.assertIn("manually continued", dead_letter_payload["failureReason"])
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual("dead_lettered", audit_payload["status"])
+
+    def test_dashboard_manual_reply_failure_remains_visible_for_operator_retry(self):
+        doc = self._dashboard_manual_reply_doc(doc_id="outbox-dashboard-retry")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", return_value={
+                 "sent": False,
+                 "error": "Graph 500",
+             }), \
+             patch.object(email_module, "delete_notification_and_decrement_counters") as delete_notification:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        delete_notification.assert_not_called()
+        self.assertFalse(doc.reference.deleted)
+        retry_payload = doc.reference.set_calls[-1][0][0]
+        self.assertEqual("retrying", retry_payload["status"])
+        self.assertEqual(1, retry_payload["attempts"])
+        self.assertEqual(None, retry_payload["processingBy"])
+        self.assertIn("Graph 500", retry_payload["lastError"])
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual("retrying", audit_payload["status"])
+        self.assertEqual("outbox-dashboard-retry", audit_payload["outboxId"])
+        self.assertIn("Graph 500", audit_payload["lastError"])
+
     def test_retryable_send_failure_updates_action_audit_with_visible_retry_state(self):
         doc = FakeDoc({
             "assignedEmails": ["bp21harrison+leaguecity-row20@gmail.com"],
