@@ -141,7 +141,9 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
         manual_reply = fixture_map["featureFixtureMatrix"]["core.manual_reply"]
         required_cells = {
             "happy_path",
+            "terminal_state",
             "bad_placeholder",
+            "wrong_recipient",
             "manual_continuation",
             "duplicate_retry",
             "operator_visible_failure",
@@ -159,6 +161,7 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
         fixture_map = _read_json(FIXTURE_MAP_PATH)
         auto_reply = fixture_map["featureFixtureMatrix"]["core.inbox_auto_reply"]
         required_cells = {
+            "happy_path",
             "manual_continuation",
             "duplicate_retry",
             "operator_visible_failure",
@@ -169,7 +172,8 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
                 cell = auto_reply[fixture_class]
                 self.assertEqual("covered", cell["status"])
                 self.assertIn("broker_reply", cell["eventClasses"])
-                self.assertIn("manual_reply_before_retry", cell["combinationPlaybooks"])
+                if fixture_class != "happy_path":
+                    self.assertIn("manual_reply_before_retry", cell["combinationPlaybooks"])
                 self.assertTrue(cell.get("testIds"))
 
 
