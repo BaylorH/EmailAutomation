@@ -14,7 +14,8 @@ FIXTURE_MAP_PATH = RELEASE_SAFETY_DIR / "production-v1-fixture-map.json"
 INCIDENT_ROWS = {
     ("core.name_resolution", "bad_placeholder"): "karsen_name_placeholder",
     ("core.launch_draft", "bad_placeholder"): "karsen_raw_name_message",
-    ("core.launch_draft", "wrong_recipient"): "wrong_recipient_launch_guard",
+    ("core.launch_draft", "wrong_recipient"): "wrong_recipient_launch_recipient_mismatch",
+    ("core.outbox_send", "wrong_recipient"): "wrong_recipient_safety_block",
     ("core.outbox_send", "duplicate_retry"): "graph_accepted_index_missing",
     ("core.reply_all_cc", "wrong_recipient"): "reply_all_cc_preservation",
     ("core.inbox_auto_reply", "terminal_state"): "no_tour_scheduling_core_lane",
