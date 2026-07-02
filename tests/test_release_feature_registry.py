@@ -205,6 +205,7 @@ REQUIRED_TRIGGER_VARIATION_AXES = {
 
 REQUIRED_COMBINATION_PLAYBOOKS = {
     "partial_specs_plus_pdf_plus_followup",
+    "confidential_question_plus_partial_specs",
     "wrong_contact_plus_new_property",
     "tour_unavailable_but_property_viable",
     "manual_reply_before_retry",
@@ -517,6 +518,11 @@ class ReleaseFeatureRegistryTests(unittest.TestCase):
                 self.assertTrue(deck.get("eventClasses"))
                 self.assertTrue(deck.get("variantsToCross"))
                 self.assertTrue(deck.get("mustProve"))
+                self.assertGreaterEqual(
+                    len(deck["playbooks"]),
+                    3,
+                    "Each stress deck must cross at least three combination playbooks.",
+                )
                 self.assertGreaterEqual(
                     len(deck["eventClasses"]),
                     3,

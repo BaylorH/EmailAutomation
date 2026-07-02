@@ -495,6 +495,7 @@
   },
   "combinationPlaybooks": {
     "partial_specs_plus_pdf_plus_followup": "Available reply gives partial facts plus a PDF/link; extractor must use evidence, ask only missing fields, and avoid duplicate follow-up after completion.",
+    "confidential_question_plus_partial_specs": "Broker asks for confidential tenant/client information while also providing partial specs or attachments; system must extract sourced facts while escalating unsafe disclosure.",
     "wrong_contact_plus_new_property": "Broker redirects contact and suggests an alternate property in one message; system must not send outside allowed recipients without explicit approval and must preserve referral as an action.",
     "tour_unavailable_but_property_viable": "Broker says tours are unavailable; classifier must not mark property non-viable or stopped unless the property itself is unavailable/not a fit.",
     "manual_reply_before_retry": "User replies manually or continues the thread before pending/dead-letter/follow-up retry; autonomous send must suppress or reconcile.",
@@ -509,7 +510,8 @@
     "karsen_launch_placeholder_and_tour_leak": {
       "playbooks": [
         "manual_reply_before_retry",
-        "graph_accepted_but_index_missing"
+        "graph_accepted_but_index_missing",
+        "tour_unavailable_but_property_viable"
       ],
       "eventClasses": [
         "launch_with_variable_mapping",
@@ -530,7 +532,8 @@
     "jill_nonviable_vs_unavailable": {
       "playbooks": [
         "tour_unavailable_but_property_viable",
-        "partial_specs_plus_pdf_plus_followup"
+        "partial_specs_plus_pdf_plus_followup",
+        "subject_drift_split_thread"
       ],
       "eventClasses": [
         "broker_property_non_viable",
@@ -601,7 +604,8 @@
     "attachment_only_with_ai_failure": {
       "playbooks": [
         "partial_specs_plus_pdf_plus_followup",
-        "graph_accepted_but_index_missing"
+        "graph_accepted_but_index_missing",
+        "row_move_during_pending_action"
       ],
       "eventClasses": [
         "broker_attachment_or_link_only",
@@ -623,7 +627,8 @@
     "stop_cancel_during_claim": {
       "playbooks": [
         "manual_reply_before_retry",
-        "graph_accepted_but_index_missing"
+        "graph_accepted_but_index_missing",
+        "row_move_during_pending_action"
       ],
       "eventClasses": [
         "dashboard_action_resolution",
@@ -644,8 +649,9 @@
     },
     "confidential_question_with_partial_specs": {
       "playbooks": [
+        "confidential_question_plus_partial_specs",
         "partial_specs_plus_pdf_plus_followup",
-        "same_broker_multiple_properties"
+        "subject_drift_split_thread"
       ],
       "eventClasses": [
         "broker_confidential_question",
@@ -667,7 +673,8 @@
     "health_visibility_after_hidden_failure": {
       "playbooks": [
         "graph_accepted_but_index_missing",
-        "manual_reply_before_retry"
+        "manual_reply_before_retry",
+        "row_move_during_pending_action"
       ],
       "eventClasses": [
         "token_or_graph_failure",
