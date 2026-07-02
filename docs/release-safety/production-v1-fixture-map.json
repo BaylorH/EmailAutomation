@@ -308,7 +308,8 @@
           "tests/test_outbox_safety.py"
         ],
         "testIds": [
-          "test_campaign_launch_refuses_ambiguous_sheet_contact_name_before_graph_send"
+          "test_campaign_launch_refuses_ambiguous_sheet_contact_name_before_graph_send",
+          "test_grouped_campaign_launch_refuses_ambiguous_sheet_contact_name_before_graph_send"
         ],
         "incidentId": "karsen_name_placeholder_ambiguous_source"
       }

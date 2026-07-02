@@ -405,7 +405,7 @@ class OutboxSafetyTests(unittest.TestCase):
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
              patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
              patch.object(email_module, "_get_first_tab_title", return_value="Campaign"), \
-             patch.object(email_module, "_read_header_row2", return_value=["Leasing Contact", "Broker", "Email"]), \
+             patch.object(email_module, "_read_header_row2", return_value=["Leasing Contact", "Broker Name", "Email"]), \
              patch.object(email_module, "get_contact_email_count", return_value=0), \
              patch.object(email_module, "send_and_index_email") as send_and_index_email:
             email_module._send_single_outbox_item(
@@ -692,6 +692,43 @@ class OutboxSafetyTests(unittest.TestCase):
             "Hi Avery,\n\nCould you confirm the SF available?",
             captured_body["script"],
         )
+
+    def test_grouped_campaign_launch_refuses_ambiguous_sheet_contact_name_before_graph_send(self):
+        recipient = "bp21harrison+grouped-ambiguous-name@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [recipient],
+            "script": "Hi [NAME],\n\nCould you confirm the SF available?",
+            "clientId": "client-1",
+            "subject": "102 Grouped Ambiguous Name Way",
+            "rowNumber": 12,
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+        }, doc_id="outbox-grouped-ambiguous-name")
+        fake_fs = FakeFirestore()
+        fake_sheets = FakeSheetsClient(["Avery Brooks", "Casey Broker", recipient])
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch("email_automation.processing.is_contact_opted_out", return_value=None), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
+             patch.object(email_module, "_get_first_tab_title", return_value="Campaign"), \
+             patch.object(email_module, "_read_header_row2", return_value=["Leasing Contact", "Broker Name", "Email"]), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "send_and_index_email") as send_and_index_email, \
+             patch.object(email_module.time, "sleep"):
+            email_module._send_multi_property_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                recipient,
+                [{"doc": doc, "data": doc.to_dict()}],
+            )
+
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual("dead_lettered", dead_letter_payload["status"])
+        self.assertIn("[NAME]", dead_letter_payload["failureReason"])
 
     def test_grouped_campaign_launch_reuses_sheet_metadata_across_rows(self):
         recipient = "bp21harrison+grouped-cache@gmail.com"
