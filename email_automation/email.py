@@ -12,13 +12,14 @@ from .utils import (
     exponential_backoff_request,
     safe_preview,
     _body_kind,
+    _normalize_email,
     validate_recipient_emails,
     is_valid_email,
     resolve_signature_settings,
 )
 from .messaging import save_thread_root, save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
 from .clients import _get_sheet_id_or_fail, _sheets_client
-from .sheets import _find_row_by_email, _get_first_tab_title, _read_header_row2, _header_index_map, highlight_row
+from .sheets import _find_row_by_email, _get_first_tab_title, _read_header_row2, _header_index_map, _execute_with_retry, highlight_row
 from .notifications import delete_notification_and_decrement_counters
 from .utils import normalize_message_id
 from .sent_mail_guard import (
@@ -49,6 +50,9 @@ CLAIM_TIMEOUT_SECONDS = 300  # 5 minutes
 # copy. They must not be replaced by contact-history campaign fallback text.
 EXACT_OUTBOX_SOURCES = {"dashboard_tour_planner"}
 EXACT_OUTBOX_ACTION_TYPES = {"tour_invite"}
+
+CAMPAIGN_LAUNCH_SOURCES = {"dashboard_new_campaign"}
+CAMPAIGN_LAUNCH_ACTION_TYPES = {"campaign_creation", "campaign_launch"}
 
 # Unique worker ID for this process
 WORKER_ID = str(uuid.uuid4())[:8]
@@ -218,6 +222,133 @@ def _pause_client_outbox_item_if_needed(user_id: str, doc_ref, data: dict) -> bo
         f"Client automation is paused/stopped; manual review required before sending: {reason}",
     )
     return True
+
+
+def _is_campaign_launch_outbox(data: dict) -> bool:
+    source = str(data.get("source") or "").strip().lower()
+    action_type = str(data.get("actionType") or "").strip().lower()
+    return source in CAMPAIGN_LAUNCH_SOURCES or action_type in CAMPAIGN_LAUNCH_ACTION_TYPES
+
+
+def _email_values_from_row(header: List[str], row_values: List[str]) -> List[str]:
+    idx_map = _header_index_map(header)
+    email_indexes = [
+        idx_map[key] - 1
+        for key in ("email", "email address", "contact email", "e-mail", "e mail")
+        if key in idx_map
+    ]
+    values = []
+    for idx in email_indexes:
+        if 0 <= idx < len(row_values):
+            raw_value = str(row_values[idx] or "")
+            candidates = re.findall(
+                r"[A-Z0-9._%+\-']+@[A-Z0-9.\-]+\.[A-Z]{2,}",
+                raw_value,
+                flags=re.IGNORECASE,
+            ) or [raw_value]
+            for candidate in candidates:
+                normalized = _normalize_email(candidate)
+                if normalized and is_valid_email(normalized):
+                    values.append(normalized)
+    return _ordered_unique(values)
+
+
+def _dead_letter_campaign_recipient_row_mismatch_if_needed(
+    user_id: str,
+    doc_ref,
+    data: dict,
+    recipient_email: str,
+    row_number_override: Optional[object] = None,
+    sheet_metadata_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> bool:
+    if not _is_campaign_launch_outbox(data):
+        return False
+
+    client_id = (data.get("clientId") or "").strip()
+    raw_row_number = data.get("rowNumber") or row_number_override
+    recipient = _normalize_email(recipient_email)
+    missing = []
+    if not client_id:
+        missing.append("clientId")
+    if raw_row_number in (None, ""):
+        missing.append("rowNumber")
+    if not recipient:
+        missing.append("recipient")
+    if missing:
+        _move_to_dead_letter(
+            user_id,
+            doc_ref,
+            data,
+            "Campaign launch outbox is missing required campaign launch metadata "
+            f"({', '.join(missing)}); manual review required before sending.",
+        )
+        return True
+
+    try:
+        row_number = int(raw_row_number)
+    except (TypeError, ValueError):
+        _move_to_dead_letter(
+            user_id,
+            doc_ref,
+            data,
+            f"Campaign launch outbox has invalid rowNumber ({raw_row_number!r}); manual review required before sending.",
+        )
+        return True
+
+    if row_number < 1:
+        _move_to_dead_letter(
+            user_id,
+            doc_ref,
+            data,
+            f"Campaign launch outbox has invalid rowNumber ({row_number}); manual review required before sending.",
+        )
+        return True
+
+    try:
+        sheet_id = _get_sheet_id_or_fail(user_id, client_id)
+        sheets = _sheets_client()
+        cache = sheet_metadata_cache if sheet_metadata_cache is not None else {}
+        metadata = cache.get(sheet_id)
+        if metadata:
+            tab_title = metadata["tab_title"]
+            header = metadata["header"]
+        else:
+            tab_title = _get_first_tab_title(sheets, sheet_id)
+            header = _read_header_row2(sheets, sheet_id, tab_title)
+            cache[sheet_id] = {"tab_title": tab_title, "header": header}
+        resp = _execute_with_retry(
+            sheets.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=f"{tab_title}!{row_number}:{row_number}",
+            ),
+            "outbox_recipient_row_guard",
+        )
+        row_values = (resp.get("values") or [[]])[0]
+        padded_row = row_values + [""] * max(0, len(header) - len(row_values))
+        row_emails = _email_values_from_row(header, padded_row)
+    except Exception as exc:
+        _move_to_dead_letter(
+            user_id,
+            doc_ref,
+            data,
+            f"Could not verify queued recipient against sheet row {row_number}; manual review required before sending: {exc}",
+        )
+        return True
+
+    if recipient not in row_emails:
+        expected = ", ".join(row_emails) if row_emails else "no email found on row"
+        _move_to_dead_letter(
+            user_id,
+            doc_ref,
+            data,
+            (
+                f"Queued recipient does not match sheet row {row_number}; "
+                f"queued={recipient}, row={expected}. Manual review required before sending."
+            ),
+        )
+        return True
+
+    return False
 
 
 def _dead_letter_unsafe_outbound_body_if_needed(
@@ -2170,6 +2301,7 @@ def _send_multi_property_email(
 
     # Send each property as its own email/thread
     # Each email uses the exact script that was approved in the frontend
+    recipient_guard_sheet_cache: Dict[str, Dict[str, Any]] = {}
     for idx, prop in enumerate(properties):
         item = prop['item']
         data = item['data']
@@ -2197,6 +2329,17 @@ def _send_multi_property_email(
 
         if _pause_client_outbox_item_if_needed(user_id, item['doc'].reference, data):
             print(f"   ⏸️ Moved outbox item for paused/stopped client {clientId or 'n/a'} to dead letter")
+            continue
+
+        if _dead_letter_campaign_recipient_row_mismatch_if_needed(
+            user_id,
+            item['doc'].reference,
+            data,
+            recipient_email,
+            row_number_override=row_number,
+            sheet_metadata_cache=recipient_guard_sheet_cache,
+        ):
+            print(f"   🛑 Blocked row-recipient mismatch for {recipient_email}")
             continue
 
         # DUPLICATE CHECK: Skip if we've already sent to this recipient about this property
@@ -2672,7 +2815,19 @@ def _send_single_outbox_item(
     else:
         # For each recipient, select the appropriate script based on contact history
         use_exact_script = _should_use_exact_outbox_script(data)
+        recipient_guard_sheet_cache: Dict[str, Dict[str, Any]] = {}
         for recipient_email in emails:
+            if _dead_letter_campaign_recipient_row_mismatch_if_needed(
+                user_id,
+                d.reference,
+                data,
+                recipient_email,
+                row_number_override=row_number,
+                sheet_metadata_cache=recipient_guard_sheet_cache,
+            ):
+                print(f"   🛑 Blocked row-recipient mismatch for outbox item {d.id}")
+                return
+
             if use_exact_script:
                 selected_script = email_scripts[0] if email_scripts else ""
                 print(f"  → Using exact outbox script for {recipient_email}")

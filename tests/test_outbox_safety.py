@@ -128,6 +128,43 @@ class FakeFirestoreWithOutbox:
         return FakeUsersCollection(self.docs, self.user_data)
 
 
+class FakeSheetsRequest:
+    def __init__(self, values):
+        self.values = values
+
+    def execute(self):
+        return {"values": self.values}
+
+
+class FakeSheetsValues:
+    def __init__(self, row_values):
+        self.row_values = row_values
+        self.ranges = []
+
+    def get(self, **kwargs):
+        range_name = kwargs.get("range")
+        self.ranges.append((kwargs.get("spreadsheetId"), range_name))
+        if isinstance(self.row_values, dict):
+            return FakeSheetsRequest([self.row_values.get(range_name, [])])
+        return FakeSheetsRequest([self.row_values])
+
+
+class FakeSheetsSpreadsheets:
+    def __init__(self, row_values):
+        self.values_api = FakeSheetsValues(row_values)
+
+    def values(self):
+        return self.values_api
+
+
+class FakeSheetsClient:
+    def __init__(self, row_values):
+        self.spreadsheets_api = FakeSheetsSpreadsheets(row_values)
+
+    def spreadsheets(self):
+        return self.spreadsheets_api
+
+
 class OutboxSafetyTests(unittest.TestCase):
     def test_cancel_requested_item_is_deleted_without_sending(self):
         doc = FakeDoc({
@@ -294,6 +331,290 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(
             "Hi Avery,\n\nCould you confirm the SF available?",
             captured_body["script"],
+        )
+
+    def test_campaign_launch_recipient_mismatch_dead_letters_before_graph_send(self):
+        doc = FakeDoc({
+            "assignedEmails": ["wrong.recipient@example.com"],
+            "script": "Hi Casey,\n\nCould you confirm the SF available?",
+            "clientId": "client-1",
+            "subject": "100 Wrong Recipient Way",
+            "rowNumber": 12,
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "contactName": "Casey Broker",
+        }, doc_id="outbox-wrong-recipient")
+        fake_fs = FakeFirestore()
+        fake_sheets = FakeSheetsClient(["Casey Broker", "bp21harrison+correct@gmail.com"])
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
+             patch.object(email_module, "_get_first_tab_title", return_value="Campaign"), \
+             patch.object(email_module, "_read_header_row2", return_value=["Leasing Contact", "Email"]), \
+             patch.object(email_module, "get_contact_email_count", return_value=0), \
+             patch.object(email_module, "send_and_index_email") as send_and_index_email:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "dead_lettered")
+        self.assertIn("Queued recipient does not match sheet row", dead_letter_payload["failureReason"])
+
+    def test_campaign_launch_missing_row_metadata_dead_letters_before_graph_send(self):
+        doc = FakeDoc({
+            "assignedEmails": ["bp21harrison+missing-row@gmail.com"],
+            "script": "Hi Casey,\n\nCould you confirm the SF available?",
+            "clientId": "client-1",
+            "subject": "100 Missing Row Way",
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "contactName": "Casey Broker",
+        }, doc_id="outbox-missing-row")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "get_contact_email_count", return_value=0), \
+             patch.object(email_module, "_finalize_successful_outbox_item"), \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": ["bp21harrison+missing-row@gmail.com"],
+                 "errors": {},
+             }) as send_and_index_email:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "dead_lettered")
+        self.assertIn("missing required campaign launch metadata", dead_letter_payload["failureReason"])
+        self.assertIn("rowNumber", dead_letter_payload["failureReason"])
+
+    def test_campaign_launch_sheet_lookup_failure_dead_letters_before_graph_send(self):
+        doc = FakeDoc({
+            "assignedEmails": ["bp21harrison+lookup-failed@gmail.com"],
+            "script": "Hi Casey,\n\nCould you confirm the SF available?",
+            "clientId": "client-1",
+            "subject": "100 Lookup Failure Way",
+            "rowNumber": 12,
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "contactName": "Casey Broker",
+        }, doc_id="outbox-lookup-failed")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_get_sheet_id_or_fail", side_effect=RuntimeError("sheet unavailable")), \
+             patch.object(email_module, "get_contact_email_count", return_value=0), \
+             patch.object(email_module, "_finalize_successful_outbox_item"), \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": ["bp21harrison+lookup-failed@gmail.com"],
+                 "errors": {},
+             }) as send_and_index_email:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "dead_lettered")
+        self.assertIn("Could not verify queued recipient against sheet row 12", dead_letter_payload["failureReason"])
+        self.assertIn("sheet unavailable", dead_letter_payload["failureReason"])
+
+    def test_campaign_launch_invalid_row_number_dead_letters_before_graph_send(self):
+        doc = FakeDoc({
+            "assignedEmails": ["bp21harrison+bad-row@gmail.com"],
+            "script": "Hi Casey,\n\nCould you confirm the SF available?",
+            "clientId": "client-1",
+            "subject": "100 Invalid Row Way",
+            "rowNumber": "Row 12",
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "contactName": "Casey Broker",
+        }, doc_id="outbox-invalid-row")
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "get_contact_email_count", return_value=0), \
+             patch.object(email_module, "_finalize_successful_outbox_item"), \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": ["bp21harrison+bad-row@gmail.com"],
+                 "errors": {},
+             }) as send_and_index_email:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "dead_lettered")
+        self.assertIn("invalid rowNumber", dead_letter_payload["failureReason"])
+        self.assertIn("Row 12", dead_letter_payload["failureReason"])
+
+    def test_campaign_launch_recipient_guard_accepts_multi_email_row_cell(self):
+        recipient = "bp21harrison+correct@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [recipient],
+            "script": "Hi Casey,\n\nCould you confirm the SF available?",
+            "clientId": "client-1",
+            "subject": "101 Multi Email Way",
+            "rowNumber": 12,
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "contactName": "Casey Broker",
+        }, doc_id="outbox-multi-email-row")
+        fake_fs = FakeFirestore()
+        fake_sheets = FakeSheetsClient(["Casey Broker", f"casey@example.com; {recipient}"])
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
+             patch.object(email_module, "_get_first_tab_title", return_value="Campaign"), \
+             patch.object(email_module, "_read_header_row2", return_value=["Leasing Contact", "Email"]), \
+             patch.object(email_module, "get_contact_email_count", return_value=0), \
+             patch.object(email_module, "_finalize_successful_outbox_item") as finalize, \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": [recipient],
+                 "errors": {},
+             }) as send_and_index_email:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        send_and_index_email.assert_called_once()
+        finalize.assert_called_once()
+        self.assertFalse(doc.reference.deleted)
+        self.assertEqual([], fake_fs.add_calls)
+
+    def test_grouped_campaign_launch_uses_resolved_row_number_before_graph_send(self):
+        recipient = "bp21harrison+grouped-row-anchor@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [recipient],
+            "script": "Hi Casey,\n\nCould you confirm the SF available?",
+            "clientId": "client-1",
+            "subject": "102 Grouped Row Anchor Way",
+            "rowNumber": 12,
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "contactName": "Casey Broker",
+        }, doc_id="outbox-grouped-row-anchor")
+        fresh_without_row_number = {
+            "assignedEmails": [recipient],
+            "script": "Hi Casey,\n\nCould you confirm the SF available?",
+            "clientId": "client-1",
+            "subject": "102 Grouped Row Anchor Way",
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "contactName": "Casey Broker",
+        }
+        fake_fs = FakeFirestore()
+        fake_sheets = FakeSheetsClient(["Casey Broker", "other.broker@example.com"])
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch("email_automation.processing.is_contact_opted_out", return_value=None), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_current_outbox_data", return_value=fresh_without_row_number), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
+             patch.object(email_module, "_get_first_tab_title", return_value="Campaign"), \
+             patch.object(email_module, "_read_header_row2", return_value=["Leasing Contact", "Email"]), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "send_and_index_email") as send_and_index_email:
+            email_module._send_multi_property_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                recipient,
+                [{"doc": doc, "data": doc.to_dict()}],
+            )
+
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        dead_letter_payload = fake_fs.add_calls[-1][1]
+        self.assertEqual(dead_letter_payload["status"], "dead_lettered")
+        self.assertIn("Queued recipient does not match sheet row 12", dead_letter_payload["failureReason"])
+
+    def test_grouped_campaign_launch_reuses_sheet_metadata_across_rows(self):
+        recipient = "bp21harrison+grouped-cache@gmail.com"
+        docs = [
+            FakeDoc({
+                "assignedEmails": [recipient],
+                "script": "Hi Casey,\n\nCould you confirm the SF available?",
+                "clientId": "client-1",
+                "subject": "103 Cache Row A",
+                "rowNumber": 12,
+                "source": "dashboard_new_campaign",
+                "actionType": "campaign_creation",
+                "contactName": "Casey Broker",
+            }, doc_id="outbox-cache-a"),
+            FakeDoc({
+                "assignedEmails": [recipient],
+                "script": "Hi Casey,\n\nCould you confirm the SF available?",
+                "clientId": "client-1",
+                "subject": "104 Cache Row B",
+                "rowNumber": 13,
+                "source": "dashboard_new_campaign",
+                "actionType": "campaign_creation",
+                "contactName": "Casey Broker",
+            }, doc_id="outbox-cache-b"),
+        ]
+        fake_sheets = FakeSheetsClient({
+            "Campaign!12:12": ["Casey Broker", recipient],
+            "Campaign!13:13": ["Casey Broker", recipient],
+        })
+
+        with patch("email_automation.clients._fs", FakeFirestore()), \
+             patch("email_automation.processing.is_contact_opted_out", return_value=None), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
+             patch.object(email_module, "_get_first_tab_title", return_value="Campaign") as get_first_tab_title, \
+             patch.object(email_module, "_read_header_row2", return_value=["Leasing Contact", "Email"]) as read_header, \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": [recipient],
+                 "errors": {},
+             }) as send_and_index_email, \
+             patch.object(email_module, "_finalize_successful_outbox_item"), \
+             patch.object(email_module.time, "sleep"):
+            email_module._send_multi_property_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                recipient,
+                [{"doc": doc, "data": doc.to_dict()} for doc in docs],
+            )
+
+        self.assertEqual(2, send_and_index_email.call_count)
+        self.assertEqual(1, get_first_tab_title.call_count)
+        self.assertEqual(1, read_header.call_count)
+        self.assertEqual(
+            [("sheet-1", "Campaign!12:12"), ("sheet-1", "Campaign!13:13")],
+            fake_sheets.spreadsheets_api.values_api.ranges,
         )
 
     def test_name_placeholder_rejects_markup_contact_name(self):

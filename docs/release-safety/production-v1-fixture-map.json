@@ -19,8 +19,8 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "covered": 41,
-    "needs_fixture": 67,
+    "covered": 43,
+    "needs_fixture": 65,
     "needs_live_proof": 11
   },
   "featureFixtureMatrix": {
@@ -171,8 +171,7 @@
         ],
         "evidence": [
           "automated",
-          "firestore",
-          "email"
+          "firestore"
         ],
         "testFiles": [
           "tests/test_outbox_safety.py"
@@ -371,7 +370,7 @@
         "incidentId": "karsen_raw_name_message"
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -385,9 +384,17 @@
           "automated",
           "firestore"
         ],
-        "incidentId": "wrong_recipient_launch_guard",
-        "gapReason": "The current proof reuses generic auto-reply/scheduler guard tests and does not independently prove initial launch drafting/sending cannot target non-campaign or non-allowlisted recipients.",
-        "nextProof": "Add a launch-draft wrong-recipient fixture covering row mapping, recipient allowlist/blocked contact handling, reply-all exclusions, and outbox prevention before Graph."
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_campaign_launch_recipient_mismatch_dead_letters_before_graph_send",
+          "test_campaign_launch_missing_row_metadata_dead_letters_before_graph_send",
+          "test_campaign_launch_sheet_lookup_failure_dead_letters_before_graph_send",
+          "test_campaign_launch_invalid_row_number_dead_letters_before_graph_send"
+        ],
+        "incidentId": "wrong_recipient_launch_recipient_mismatch",
+        "notes": "Initial campaign launch has no reply-all audience; reply-all CC preservation is covered separately under core.reply_all_cc / wrong_recipient. This fixture proves row-recipient mismatch, missing/invalid row metadata, and Sheets lookup failure dead-letter before Graph send."
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -521,7 +528,7 @@
         ]
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "reply_all_cc_context"
         ],
@@ -533,11 +540,21 @@
         ],
         "evidence": [
           "automated",
-          "firestore",
-          "email"
+          "firestore"
         ],
-        "gapReason": "The current proof mixes auto-reply and tour-admin gate evidence and does not independently prove the generic outbox sender enforces recipient safety for Production V1 core messages.",
-        "nextProof": "Add an outbox-send wrong-recipient fixture that queues a core campaign outbox item with unsafe recipients/CCs, proves the sender filters or blocks it before Graph, and leaves operator-visible evidence."
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_campaign_launch_recipient_mismatch_dead_letters_before_graph_send",
+          "test_campaign_launch_missing_row_metadata_dead_letters_before_graph_send",
+          "test_campaign_launch_sheet_lookup_failure_dead_letters_before_graph_send",
+          "test_campaign_launch_invalid_row_number_dead_letters_before_graph_send",
+          "test_grouped_campaign_launch_uses_resolved_row_number_before_graph_send",
+          "test_grouped_campaign_launch_reuses_sheet_metadata_across_rows"
+        ],
+        "incidentId": "wrong_recipient_safety_block",
+        "notes": "The generic outbox sender now fails closed for campaign-launch row-recipient mismatch, missing/invalid row metadata, Sheets lookup failure, and grouped send row-anchor refresh drift before Graph. It also reuses stable sheet metadata within a batch while fetching each target row fresh. Manual reply/reply-all recipient risk remains covered by core.manual_reply and core.reply_all_cc cells."
       },
       "manual_continuation": {
         "status": "covered",
