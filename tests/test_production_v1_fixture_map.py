@@ -136,6 +136,42 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
                 )
                 self.assertTrue(cell.get("nextProof") or cell.get("testIds"))
 
+    def test_manual_dashboard_reply_has_dedicated_send_safety_fixtures(self):
+        fixture_map = _read_json(FIXTURE_MAP_PATH)
+        manual_reply = fixture_map["featureFixtureMatrix"]["core.manual_reply"]
+        required_cells = {
+            "happy_path",
+            "bad_placeholder",
+            "manual_continuation",
+            "duplicate_retry",
+            "operator_visible_failure",
+        }
+
+        for fixture_class in required_cells:
+            with self.subTest(fixture_class=fixture_class):
+                cell = manual_reply[fixture_class]
+                self.assertEqual("covered", cell["status"])
+                self.assertIn("dashboard_action_resolution", cell["eventClasses"])
+                self.assertIn("manual_reply_before_retry", cell["combinationPlaybooks"])
+                self.assertTrue(cell.get("testIds"))
+
+    def test_inbox_auto_reply_has_retry_and_visibility_fixtures(self):
+        fixture_map = _read_json(FIXTURE_MAP_PATH)
+        auto_reply = fixture_map["featureFixtureMatrix"]["core.inbox_auto_reply"]
+        required_cells = {
+            "manual_continuation",
+            "duplicate_retry",
+            "operator_visible_failure",
+        }
+
+        for fixture_class in required_cells:
+            with self.subTest(fixture_class=fixture_class):
+                cell = auto_reply[fixture_class]
+                self.assertEqual("covered", cell["status"])
+                self.assertIn("broker_reply", cell["eventClasses"])
+                self.assertIn("manual_reply_before_retry", cell["combinationPlaybooks"])
+                self.assertTrue(cell.get("testIds"))
+
 
 if __name__ == "__main__":
     unittest.main()

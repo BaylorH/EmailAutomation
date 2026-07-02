@@ -19,8 +19,8 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "covered": 43,
-    "needs_fixture": 65,
+    "covered": 51,
+    "needs_fixture": 57,
     "needs_live_proof": 11
   },
   "featureFixtureMatrix": {
@@ -791,23 +791,29 @@
     },
     "core.manual_reply": {
       "happy_path": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
+          "dashboard_action_resolution",
           "manual_user_continuation"
         ],
         "combinationPlaybooks": [
-          "graph_accepted_but_index_missing"
+          "graph_accepted_but_index_missing",
+          "manual_reply_before_retry"
         ],
         "statePermutations": [
           "live_waiting"
         ],
         "evidence": [
           "automated",
-          "firestore",
-          "email"
+          "email",
+          "firestore"
         ],
-        "gapReason": "The current proof reuses generic dashboard/outbox send tests and does not independently exercise a manual dashboard reply from draft through Graph send, actionAudit, thread state, and Gmail/readback evidence.",
-        "nextProof": "Add a deterministic manual-reply fixture that starts from an action-needed dashboard draft, sends through the manual reply surface, preserves recipients, records actionAudit/Graph IDs, updates the thread, and proves the broker-visible message body."
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_dashboard_manual_reply_success_records_audit_after_graph_reply"
+        ]
       },
       "terminal_state": {
         "status": "needs_fixture",
@@ -828,8 +834,9 @@
         "nextProof": "Add or identify a deterministic core.manual_reply / terminal_state fixture, then wire it to this map before reopening users."
       },
       "bad_placeholder": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
+          "dashboard_action_resolution",
           "manual_user_continuation"
         ],
         "combinationPlaybooks": [
@@ -840,10 +847,15 @@
         ],
         "evidence": [
           "automated",
-          "email"
+          "email",
+          "firestore"
         ],
-        "gapReason": "The current proof reuses the automatic inbox reply placeholder guard and does not independently prove the manual dashboard reply composer/outbox path blocks unresolved placeholders before Graph.",
-        "nextProof": "Add a manual dashboard reply fixture with [NAME], bracket placeholders, and malformed greeting variants, then prove the item becomes operator-visible review/dead-letter state without a Graph call."
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_dashboard_manual_reply_placeholder_dead_letters_before_graph_send"
+        ]
       },
       "wrong_recipient": {
         "status": "covered",
@@ -868,8 +880,9 @@
         ]
       },
       "manual_continuation": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
+          "dashboard_action_resolution",
           "manual_user_continuation"
         ],
         "combinationPlaybooks": [
@@ -880,49 +893,66 @@
         ],
         "evidence": [
           "automated",
-          "firestore",
-          "email"
+          "email",
+          "firestore"
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.manual_reply yet.",
-        "nextProof": "Add or identify a deterministic core.manual_reply / manual_continuation fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_dashboard_manual_reply_retry_blocks_when_user_manually_continued"
+        ]
       },
       "duplicate_retry": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
+          "dashboard_action_resolution",
           "retry_after_uncertain_send"
         ],
         "combinationPlaybooks": [
-          "graph_accepted_but_index_missing"
+          "graph_accepted_but_index_missing",
+          "manual_reply_before_retry"
         ],
         "statePermutations": [
           "retry_reconciled"
         ],
         "evidence": [
           "automated",
-          "firestore",
-          "email"
+          "email",
+          "firestore"
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.manual_reply yet.",
-        "nextProof": "Add or identify a deterministic core.manual_reply / duplicate_retry fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_dashboard_manual_reply_retry_reconciles_prior_sent_item_without_resending"
+        ]
       },
       "operator_visible_failure": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
+          "dashboard_action_resolution",
           "manual_user_continuation"
         ],
         "combinationPlaybooks": [
-          "graph_accepted_but_index_missing"
+          "graph_accepted_but_index_missing",
+          "manual_reply_before_retry"
         ],
         "statePermutations": [
           "dead_letter_visible"
         ],
         "evidence": [
           "automated",
+          "email",
           "firestore",
           "ui"
         ],
-        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.manual_reply yet.",
-        "nextProof": "Add or identify a deterministic core.manual_reply / operator_visible_failure fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_dashboard_manual_reply_failure_remains_visible_for_operator_retry"
+        ]
       }
     },
     "core.inbox_matching": {
@@ -1151,8 +1181,9 @@
         ]
       },
       "manual_continuation": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
+          "broker_reply",
           "manual_user_continuation"
         ],
         "combinationPlaybooks": [
@@ -1163,49 +1194,72 @@
         ],
         "evidence": [
           "automated",
-          "firestore",
-          "email"
+          "email",
+          "firestore"
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.inbox_auto_reply yet.",
-        "nextProof": "Add or identify a deterministic core.inbox_auto_reply / manual_continuation fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_pending_responses.py",
+          "tests/test_processing_retryability.py"
+        ],
+        "testIds": [
+          "test_retry_blocks_when_conversation_was_manually_continued",
+          "test_scan_skips_inbox_retry_when_user_manually_continued_conversation"
+        ]
       },
       "duplicate_retry": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
+          "broker_reply",
           "retry_after_uncertain_send"
         ],
         "combinationPlaybooks": [
-          "graph_accepted_but_index_missing"
+          "graph_accepted_but_index_missing",
+          "manual_reply_before_retry"
         ],
         "statePermutations": [
           "retry_reconciled"
         ],
         "evidence": [
           "automated",
-          "firestore",
-          "email"
+          "email",
+          "firestore"
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.inbox_auto_reply yet.",
-        "nextProof": "Add or identify a deterministic core.inbox_auto_reply / duplicate_retry fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_pending_responses.py",
+          "tests/test_processing_reply_indexing.py"
+        ],
+        "testIds": [
+          "test_retry_with_matching_sent_item_moves_to_reconciliation_without_resending",
+          "test_sent_but_unindexed_retry_moves_to_reconciliation_without_resending",
+          "test_sent_but_unindexed_auto_response_is_not_queued_for_retry"
+        ]
       },
       "operator_visible_failure": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
+          "broker_reply",
           "manual_user_continuation"
         ],
         "combinationPlaybooks": [
-          "graph_accepted_but_index_missing"
+          "graph_accepted_but_index_missing",
+          "manual_reply_before_retry"
         ],
         "statePermutations": [
           "dead_letter_visible"
         ],
         "evidence": [
           "automated",
+          "email",
           "firestore",
           "ui"
         ],
-        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.inbox_auto_reply yet.",
-        "nextProof": "Add or identify a deterministic core.inbox_auto_reply / operator_visible_failure fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_pending_responses.py"
+        ],
+        "testIds": [
+          "test_failed_retry_preserves_detailed_send_error_when_available",
+          "test_retry_guard_lookup_failure_dead_letters_without_resending"
+        ]
       }
     },
     "core.event_classifier": {
