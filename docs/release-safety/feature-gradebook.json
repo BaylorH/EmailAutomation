@@ -23,6 +23,388 @@
     "token_or_graph_failure": "MSAL token, Graph, attachment download, or provider call fails mid-run.",
     "dashboard_action_resolution": "Operator clicks Send Reply, Stop, Cancel, Dismiss, Approve, Archive, Unarchive, or recovery action."
   },
+  "eventVariantCatalog": {
+    "launch_with_variable_mapping": {
+      "sampleTriggers": [
+        "Uploaded sheet has Leasing Contact, Broker, First Name, and Contact Name columns with one selected for {{name}}.",
+        "Template says Hi [NAME] while the mapped sheet only has a full broker name.",
+        "User changes column names from Contact to Leasing Agent before launch."
+      ],
+      "nearMisses": [
+        "A company name appears in a name-like column but is not a human greeting.",
+        "Two name-like columns disagree and neither should be guessed."
+      ],
+      "expectedSignals": [
+        "launch preview clearly shows the resolved greeting name",
+        "ambiguous or missing names stop before outbox/Graph"
+      ],
+      "stopIf": [
+        "raw placeholder reaches queued outbox",
+        "backend guesses between two possible people"
+      ]
+    },
+    "broker_available_full_specs": {
+      "sampleTriggers": [
+        "Yes, available. 42,000 SF, $0.82 NNN, $0.21 opex, 28' clear, 4 docks, 1 drive-in.",
+        "Attached flyer has all specs and the body confirms it is ready now.",
+        "We can do 50k SF, $9.75 gross, ESFR, 2,000A, available September 1."
+      ],
+      "nearMisses": [
+        "Available for office use only while warehouse requirement remains unmet.",
+        "Available but asking rate is missing and should not be marked complete."
+      ],
+      "expectedSignals": [
+        "sheet/result fields fill from sourced values",
+        "thread moves toward completed without asking for already supplied facts"
+      ],
+      "stopIf": [
+        "system asks for fields already provided",
+        "unsourced economics are invented"
+      ]
+    },
+    "broker_available_partial_specs": {
+      "sampleTriggers": [
+        "The space is available; I can confirm 30,000 SF and 24' clear but need to check rate.",
+        "We have availability and a floorplan attached, but opex is still TBD.",
+        "Yes, it could work. Let me get you power and door details."
+      ],
+      "nearMisses": [
+        "Partial details plus a clear non-fit reason should become non-viable.",
+        "Partial details in a quoted old email should not overwrite newer facts."
+      ],
+      "expectedSignals": [
+        "known fields update with provenance",
+        "missing fields become a concise follow-up or visible action"
+      ],
+      "stopIf": [
+        "partial data marks the row completed",
+        "follow-up repeats known fields"
+      ]
+    },
+    "broker_attachment_or_link_only": {
+      "sampleTriggers": [
+        "See attached flyer and floor plan.",
+        "All details are in this Dropbox link.",
+        "Please review the attached brochure; happy to answer questions."
+      ],
+      "nearMisses": [
+        "Attachment belongs to a different property in a forwarded chain.",
+        "Broken link or protected Drive file should stay visible, not silently complete."
+      ],
+      "expectedSignals": [
+        "attachment/link metadata is saved with source labels",
+        "download/extraction failures are operator-visible"
+      ],
+      "stopIf": [
+        "message is marked processed after extraction failure",
+        "wrong property PDF populates the row"
+      ]
+    },
+    "broker_property_unavailable": {
+      "sampleTriggers": [
+        "That suite is no longer available.",
+        "We just leased the building.",
+        "Property is off market for now."
+      ],
+      "nearMisses": [
+        "Tours are unavailable but the property remains available.",
+        "One suite is leased but an alternate suite in the same property remains viable."
+      ],
+      "expectedSignals": [
+        "property row terminalizes unavailable with evidence",
+        "no further autonomous asks are sent"
+      ],
+      "stopIf": [
+        "tour-unavailable text marks property unavailable",
+        "follow-up sends after terminal unavailable"
+      ]
+    },
+    "broker_property_non_viable": {
+      "sampleTriggers": [
+        "This is more office-heavy and not a true warehouse fit.",
+        "We do not have drive-in doors, so it likely will not work.",
+        "Clear height is only 14', below your requirement."
+      ],
+      "nearMisses": [
+        "Broker asks a clarifying question before judging fit.",
+        "A quoted old rejection appears below a new positive reply."
+      ],
+      "expectedSignals": [
+        "row is marked non-viable with reason",
+        "dashboard/sheet keep the evidence visible"
+      ],
+      "stopIf": [
+        "non-viable reason disappears",
+        "system keeps asking the broker for specs after clear non-fit"
+      ]
+    },
+    "broker_wrong_contact": {
+      "sampleTriggers": [
+        "I am not the leasing contact; please reach out to Alex copied here.",
+        "Looping in our agency team who handles this listing.",
+        "Wrong person, but Sarah can help."
+      ],
+      "nearMisses": [
+        "Broker copies a teammate for awareness without redirecting authority.",
+        "Redirected contact is an opt-out or blocked recipient."
+      ],
+      "expectedSignals": [
+        "new recipient requires safe approval before outbound send",
+        "reply-all context is preserved where allowed"
+      ],
+      "stopIf": [
+        "system emails redirected contact without approval",
+        "safe CC teammate is dropped from reply-all"
+      ]
+    },
+    "broker_opt_out": {
+      "sampleTriggers": [
+        "Please remove me from your list.",
+        "Do not contact me about this again.",
+        "Unsubscribe."
+      ],
+      "nearMisses": [
+        "Broker says not this property but offers another listing.",
+        "Wrong-contact redirect is not necessarily a global opt-out."
+      ],
+      "expectedSignals": [
+        "blocked contact record is created or referenced",
+        "future sends to that address are skipped visibly"
+      ],
+      "stopIf": [
+        "follow-up sends after opt-out",
+        "blocked address reappears through CC"
+      ]
+    },
+    "broker_confidential_question": {
+      "sampleTriggers": [
+        "Who is the client?",
+        "Can you disclose the tenant name before we share pricing?",
+        "What is their credit and intended use?"
+      ],
+      "nearMisses": [
+        "Broker asks for generic requirements already in the campaign brief.",
+        "Broker asks for tour attendees after tour lane is disabled."
+      ],
+      "expectedSignals": [
+        "AI escalates or drafts safe non-disclosure language",
+        "client identity is not invented or revealed"
+      ],
+      "stopIf": [
+        "system reveals confidential client identity",
+        "system fabricates approval or budget details"
+      ]
+    },
+    "broker_tour_available": {
+      "sampleTriggers": [
+        "Happy to schedule a tour next week.",
+        "We can show it Friday afternoon.",
+        "Let me know when your client wants to walk the space."
+      ],
+      "nearMisses": [
+        "Broker says tours are not possible yet.",
+        "Normal Production V1 core lane should record interest, not schedule."
+      ],
+      "expectedSignals": [
+        "core lane records tour availability without auto-scheduling",
+        "tour lane remains gated unless explicitly enabled"
+      ],
+      "stopIf": [
+        "normal user campaign sends a tour invite",
+        "tour language leaks into core follow-up"
+      ]
+    },
+    "broker_tour_unavailable": {
+      "sampleTriggers": [
+        "Tours are not available this week, but the space is still available.",
+        "We cannot show it until the current tenant vacates.",
+        "No tours right now; I can send photos."
+      ],
+      "nearMisses": [
+        "Property itself is unavailable.",
+        "Broker rejects one proposed time but offers another."
+      ],
+      "expectedSignals": [
+        "state is Tours Unavailable, not property unavailable",
+        "property remains eligible for results/packet if otherwise viable"
+      ],
+      "stopIf": [
+        "property is marked stopped or non-viable",
+        "AI keeps pushing for a tour"
+      ]
+    },
+    "broker_alternate_tour_time": {
+      "sampleTriggers": [
+        "10 AM does not work; can you do 2 PM instead?",
+        "We are only available Thursday morning.",
+        "Can we move this showing to after lunch?"
+      ],
+      "nearMisses": [
+        "Tour Scheduling lane is disabled for normal users.",
+        "Alternate time conflicts with another confirmed stop."
+      ],
+      "expectedSignals": [
+        "itinerary check determines confirm versus conflict",
+        "date and proposed time remain visible in draft/conversation"
+      ],
+      "stopIf": [
+        "generic let me check response is drafted when slot is free",
+        "system changes tour order without operator visibility"
+      ]
+    },
+    "broker_new_property_referral": {
+      "sampleTriggers": [
+        "This one is not a fit, but 123 Replacement Way may work.",
+        "We also have another building nearby with more docks.",
+        "Please look at the attached alternate property."
+      ],
+      "nearMisses": [
+        "Broker mentions another property only in a signature/disclaimer.",
+        "Alternate property is outside campaign geography or requirements."
+      ],
+      "expectedSignals": [
+        "new-property action is visible before adding/sending",
+        "original property terminal state remains separate"
+      ],
+      "stopIf": [
+        "alternate property is added without review",
+        "original row is overwritten with new address"
+      ]
+    },
+    "manual_user_continuation": {
+      "sampleTriggers": [
+        "User replies directly in Outlook after dashboard draft failed.",
+        "User sends a correction before the scheduler retry.",
+        "User replies all manually to broker and copied teammate."
+      ],
+      "nearMisses": [
+        "System sent message exists but no user-authored continuation exists.",
+        "Quoted user text appears only inside broker reply history."
+      ],
+      "expectedSignals": [
+        "Sent Items reconciliation suppresses stale retry",
+        "operator-visible manual review record is created"
+      ],
+      "stopIf": [
+        "scheduler sends stale draft after manual reply",
+        "manual continuation is hidden from recovery view"
+      ]
+    },
+    "reply_all_cc_context": {
+      "sampleTriggers": [
+        "Broker replies with two leasing teammates copied.",
+        "Assistant replies from copied address while original broker remains on thread.",
+        "Forwarded chain includes safe CCs and unrelated quoted recipients."
+      ],
+      "nearMisses": [
+        "Quoted CC lines in old history should not become live recipients.",
+        "Blocked/opt-out contact appears in CC."
+      ],
+      "expectedSignals": [
+        "Graph reply-all payload preserves safe current recipients",
+        "blocked contacts are filtered with visible audit"
+      ],
+      "stopIf": [
+        "safe CC is dropped",
+        "quoted or blocked recipient is added"
+      ]
+    },
+    "followup_due": {
+      "sampleTriggers": [
+        "No broker reply after configured follow-up window.",
+        "Follow-up due while thread is action-needed.",
+        "Follow-up due after user stopped the row."
+      ],
+      "nearMisses": [
+        "Broker replied but inbox processing has not completed yet.",
+        "User manually followed up in Sent Items."
+      ],
+      "expectedSignals": [
+        "scheduler checks latest inbound/manual state before queueing",
+        "terminal/action-needed states suppress autonomous follow-up"
+      ],
+      "stopIf": [
+        "follow-up sends after broker or user reply",
+        "follow-up sends for stopped/completed row"
+      ]
+    },
+    "retry_after_uncertain_send": {
+      "sampleTriggers": [
+        "Graph accepted send but indexing failed.",
+        "Audit write failed after reply send.",
+        "Network timeout happened after createReplyAll draft send."
+      ],
+      "nearMisses": [
+        "Graph failed before any send attempt.",
+        "Retry item has different body or recipient from prior attempt."
+      ],
+      "expectedSignals": [
+        "Sent Items/identity guard runs before retry",
+        "ambiguous prior success moves to reconciliation instead of resend"
+      ],
+      "stopIf": [
+        "retry double-sends",
+        "operator cannot see uncertain-send state"
+      ]
+    },
+    "sheet_row_moved": {
+      "sampleTriggers": [
+        "User sorts the sheet between launch and broker reply.",
+        "Rows are inserted above a pending action.",
+        "Formula column changes position after campaign creation."
+      ],
+      "nearMisses": [
+        "Display row number changes but durable property anchor still matches.",
+        "Archived copy of sheet should not be updated."
+      ],
+      "expectedSignals": [
+        "durable row/property anchor resolves current row",
+        "wrong-row updates fail visibly"
+      ],
+      "stopIf": [
+        "updates land on wrong property",
+        "row movement blocks valid anchored update"
+      ]
+    },
+    "token_or_graph_failure": {
+      "sampleTriggers": [
+        "MSAL token expired mid-run.",
+        "Graph attachment download returns 401.",
+        "Graph send returns accepted but readback fails."
+      ],
+      "nearMisses": [
+        "Per-user missing token should not imply all users are broken.",
+        "Attachment failure should not mark message fully processed."
+      ],
+      "expectedSignals": [
+        "failure is per-user visible in health/recovery",
+        "message remains retryable until committed"
+      ],
+      "stopIf": [
+        "failure hides broker reply",
+        "scheduler widens or retries unsafe users"
+      ]
+    },
+    "dashboard_action_resolution": {
+      "sampleTriggers": [
+        "Operator clicks Send Reply on action-needed draft.",
+        "Operator cancels queued launch before worker claim.",
+        "Operator dismisses non-viable/new-property action."
+      ],
+      "nearMisses": [
+        "Read-only history action should not become sendable.",
+        "Terminal child action should not be hidden by active parent state."
+      ],
+      "expectedSignals": [
+        "actionAudit terminalizes with sent/cancelled/dismissed state",
+        "dashboard counts match Firestore queues after refresh"
+      ],
+      "stopIf": [
+        "unresolved action disappears",
+        "cancelled action still sends"
+      ]
+    }
+  },
   "triggerVariationAxes": {
     "phrasing": [
       "direct",
@@ -113,6 +495,7 @@
   },
   "combinationPlaybooks": {
     "partial_specs_plus_pdf_plus_followup": "Available reply gives partial facts plus a PDF/link; extractor must use evidence, ask only missing fields, and avoid duplicate follow-up after completion.",
+    "confidential_question_plus_partial_specs": "Broker asks for confidential tenant/client information while also providing partial specs or attachments; system must extract sourced facts while escalating unsafe disclosure.",
     "wrong_contact_plus_new_property": "Broker redirects contact and suggests an alternate property in one message; system must not send outside allowed recipients without explicit approval and must preserve referral as an action.",
     "tour_unavailable_but_property_viable": "Broker says tours are unavailable; classifier must not mark property non-viable or stopped unless the property itself is unavailable/not a fit.",
     "manual_reply_before_retry": "User replies manually or continues the thread before pending/dead-letter/follow-up retry; autonomous send must suppress or reconcile.",
@@ -122,6 +505,195 @@
     "subject_drift_split_thread": "Broker changes subject, forwards, or replies from a different chain; matcher must link only when safe and visible otherwise.",
     "opt_out_after_prior_interest": "Broker previously engaged but later opts out; all future autonomous and manual sends to that contact must stop.",
     "graph_accepted_but_index_missing": "Graph returns/accepts sent message but thread/message indexing fails; retry must reconcile Sent Items instead of double-sending."
+  },
+  "combinationStressDecks": {
+    "karsen_launch_placeholder_and_tour_leak": {
+      "playbooks": [
+        "manual_reply_before_retry",
+        "graph_accepted_but_index_missing",
+        "tour_unavailable_but_property_viable"
+      ],
+      "eventClasses": [
+        "launch_with_variable_mapping",
+        "broker_tour_available",
+        "retry_after_uncertain_send"
+      ],
+      "variantsToCross": [
+        "missing-name plus tour wording in uploaded template",
+        "normal-user entitlement plus scheduler retry",
+        "manual user reply before worker retry"
+      ],
+      "mustProve": [
+        "no tour scheduling email leaves Production V1 core lane",
+        "raw name placeholder blocks before Graph",
+        "manual continuation suppresses retry"
+      ]
+    },
+    "jill_nonviable_vs_unavailable": {
+      "playbooks": [
+        "tour_unavailable_but_property_viable",
+        "partial_specs_plus_pdf_plus_followup",
+        "subject_drift_split_thread"
+      ],
+      "eventClasses": [
+        "broker_property_non_viable",
+        "broker_property_unavailable",
+        "broker_tour_unavailable",
+        "broker_available_partial_specs"
+      ],
+      "variantsToCross": [
+        "office-heavy non-fit",
+        "space unavailable",
+        "tour unavailable but property viable",
+        "quoted old positive reply under new negative reply"
+      ],
+      "mustProve": [
+        "classifier keeps these states distinct",
+        "sheet/results display the right reason",
+        "follow-up only happens for missing information"
+      ]
+    },
+    "reply_all_with_redirect_and_blocked_contact": {
+      "playbooks": [
+        "wrong_contact_plus_new_property",
+        "reply_all_cc_plus_blocked_contact",
+        "opt_out_after_prior_interest"
+      ],
+      "eventClasses": [
+        "broker_wrong_contact",
+        "broker_new_property_referral",
+        "broker_opt_out",
+        "reply_all_cc_context"
+      ],
+      "variantsToCross": [
+        "safe teammate copied",
+        "blocked recipient copied",
+        "new property referral in same reply",
+        "redirected contact outside original thread"
+      ],
+      "mustProve": [
+        "safe CCs are preserved",
+        "blocked contacts are filtered",
+        "new contact/property needs explicit approval before send"
+      ]
+    },
+    "same_broker_multi_property_split_subject": {
+      "playbooks": [
+        "same_broker_multiple_properties",
+        "subject_drift_split_thread",
+        "row_move_during_pending_action"
+      ],
+      "eventClasses": [
+        "broker_available_full_specs",
+        "broker_available_partial_specs",
+        "sheet_row_moved",
+        "reply_all_cc_context"
+      ],
+      "variantsToCross": [
+        "same broker replies about two addresses",
+        "broker changes subject line",
+        "sheet row sort happens before processing",
+        "one property complete and one partial"
+      ],
+      "mustProve": [
+        "only intended row updates",
+        "split thread is linked only when safe",
+        "completed row does not receive follow-up for partial row"
+      ]
+    },
+    "attachment_only_with_ai_failure": {
+      "playbooks": [
+        "partial_specs_plus_pdf_plus_followup",
+        "graph_accepted_but_index_missing",
+        "row_move_during_pending_action"
+      ],
+      "eventClasses": [
+        "broker_attachment_or_link_only",
+        "token_or_graph_failure",
+        "broker_available_partial_specs"
+      ],
+      "variantsToCross": [
+        "PDF flyer only",
+        "protected Drive link",
+        "image-heavy PDF",
+        "attachment download/token failure"
+      ],
+      "mustProve": [
+        "source metadata is saved",
+        "failure remains visible and retryable",
+        "message is not marked processed until extraction commits"
+      ]
+    },
+    "stop_cancel_during_claim": {
+      "playbooks": [
+        "manual_reply_before_retry",
+        "graph_accepted_but_index_missing",
+        "row_move_during_pending_action"
+      ],
+      "eventClasses": [
+        "dashboard_action_resolution",
+        "retry_after_uncertain_send",
+        "followup_due"
+      ],
+      "variantsToCross": [
+        "cancel before worker claim",
+        "cancel after claim before send",
+        "stop while follow-up due",
+        "dismiss action while retry exists"
+      ],
+      "mustProve": [
+        "cancel/stop blocks Graph send",
+        "actionAudit terminal state is visible",
+        "no stale follow-up is generated"
+      ]
+    },
+    "confidential_question_with_partial_specs": {
+      "playbooks": [
+        "confidential_question_plus_partial_specs",
+        "partial_specs_plus_pdf_plus_followup",
+        "subject_drift_split_thread"
+      ],
+      "eventClasses": [
+        "broker_confidential_question",
+        "broker_available_partial_specs",
+        "broker_attachment_or_link_only"
+      ],
+      "variantsToCross": [
+        "broker asks tenant identity before specs",
+        "broker gives partial specs and asks client use",
+        "quoted client name appears in old thread history",
+        "attachment contains usable facts"
+      ],
+      "mustProve": [
+        "client identity is not revealed",
+        "usable specs still update with evidence",
+        "unsafe question becomes operator-visible"
+      ]
+    },
+    "health_visibility_after_hidden_failure": {
+      "playbooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "row_move_during_pending_action"
+      ],
+      "eventClasses": [
+        "token_or_graph_failure",
+        "retry_after_uncertain_send",
+        "manual_user_continuation",
+        "dashboard_action_resolution"
+      ],
+      "variantsToCross": [
+        "Graph send accepted but actionAudit fails",
+        "pending response reaches max attempts",
+        "user manually continues failed thread",
+        "operator opens dashboard after scheduler run"
+      ],
+      "mustProve": [
+        "health/recovery views show failure",
+        "retry guard checks Sent Items before sending",
+        "operator can cancel or recover without double-send"
+      ]
+    }
   },
   "statePermutations": {
     "not_started": "Client exists but no campaign outreach should be queued/sent.",

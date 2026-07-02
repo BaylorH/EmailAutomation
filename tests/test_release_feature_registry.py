@@ -152,8 +152,10 @@ FIXTURE_CATEGORY_ALIASES = {
 
 REQUIRED_GRADEBOOK_DIMENSIONS = {
     "eventTaxonomy",
+    "eventVariantCatalog",
     "triggerVariationAxes",
     "combinationPlaybooks",
+    "combinationStressDecks",
     "statePermutations",
     "actorAndAccountAxes",
     "evidenceRequirements",
@@ -203,6 +205,7 @@ REQUIRED_TRIGGER_VARIATION_AXES = {
 
 REQUIRED_COMBINATION_PLAYBOOKS = {
     "partial_specs_plus_pdf_plus_followup",
+    "confidential_question_plus_partial_specs",
     "wrong_contact_plus_new_property",
     "tour_unavailable_but_property_viable",
     "manual_reply_before_retry",
@@ -212,6 +215,17 @@ REQUIRED_COMBINATION_PLAYBOOKS = {
     "subject_drift_split_thread",
     "opt_out_after_prior_interest",
     "graph_accepted_but_index_missing",
+}
+
+REQUIRED_COMBINATION_STRESS_DECKS = {
+    "karsen_launch_placeholder_and_tour_leak",
+    "jill_nonviable_vs_unavailable",
+    "reply_all_with_redirect_and_blocked_contact",
+    "same_broker_multi_property_split_subject",
+    "attachment_only_with_ai_failure",
+    "stop_cancel_during_claim",
+    "confidential_question_with_partial_specs",
+    "health_visibility_after_hidden_failure",
 }
 
 REQUIRED_STATE_PERMUTATIONS = {
@@ -442,6 +456,47 @@ class ReleaseFeatureRegistryTests(unittest.TestCase):
             REQUIRED_EVENT_CLASSES.issubset(set(gradebook["eventTaxonomy"])),
             "Event taxonomy must include the real-world broker/operator events that have broken or could break SiteSift.",
         )
+        event_variants = gradebook["eventVariantCatalog"]
+        self.assertEqual(
+            set(gradebook["eventTaxonomy"]),
+            set(event_variants),
+            "Every event taxonomy entry must have concrete trigger variants and near-misses.",
+        )
+        for event_id, variant in event_variants.items():
+            with self.subTest(event_variant=event_id):
+                for key in ("sampleTriggers", "nearMisses", "expectedSignals", "stopIf"):
+                    self.assertTrue(
+                        variant.get(key),
+                        f"{event_id} must define {key} so release tests are not rigid canned cases.",
+                    )
+                self.assertGreaterEqual(
+                    len(variant["sampleTriggers"]),
+                    3,
+                    f"{event_id} needs at least three fresh trigger phrasings.",
+                )
+                self.assertGreaterEqual(
+                    len(variant["nearMisses"]),
+                    2,
+                    f"{event_id} needs near-misses so classifiers prove boundaries, not just positives.",
+                )
+                self.assertGreaterEqual(
+                    len(variant["expectedSignals"]),
+                    2,
+                    f"{event_id} needs source-of-truth signals for grading.",
+                )
+                self.assertGreaterEqual(
+                    len(variant["stopIf"]),
+                    2,
+                    f"{event_id} needs hard stop conditions for production-readiness grading.",
+                )
+                combined_text = " ".join(
+                    [*variant["sampleTriggers"], *variant["nearMisses"], *variant["expectedSignals"], *variant["stopIf"]]
+                ).lower()
+                self.assertNotIn(
+                    "todo",
+                    combined_text,
+                    "Variant catalog must contain usable concrete cases, not TODO placeholders.",
+                )
         self.assertTrue(
             REQUIRED_TRIGGER_VARIATION_AXES.issubset(set(gradebook["triggerVariationAxes"])),
             "Trigger variation axes must force fresh wording/account/thread/data variations instead of canned replays.",
@@ -450,6 +505,41 @@ class ReleaseFeatureRegistryTests(unittest.TestCase):
             REQUIRED_COMBINATION_PLAYBOOKS.issubset(set(gradebook["combinationPlaybooks"])),
             "Combination playbooks must cover multi-event collisions like manual replies before retry and tour-unavailable-but-viable.",
         )
+        stress_decks = gradebook["combinationStressDecks"]
+        self.assertTrue(
+            REQUIRED_COMBINATION_STRESS_DECKS.issubset(set(stress_decks)),
+            "Stress decks must include the known Karsen/Jill failure clusters and cross-feature collisions.",
+        )
+        all_playbooks = set(gradebook["combinationPlaybooks"])
+        all_events = set(gradebook["eventTaxonomy"])
+        for deck_id, deck in stress_decks.items():
+            with self.subTest(stress_deck=deck_id):
+                self.assertTrue(deck.get("playbooks"))
+                self.assertTrue(deck.get("eventClasses"))
+                self.assertTrue(deck.get("variantsToCross"))
+                self.assertTrue(deck.get("mustProve"))
+                self.assertGreaterEqual(
+                    len(deck["playbooks"]),
+                    3,
+                    "Each stress deck must cross at least three combination playbooks.",
+                )
+                self.assertGreaterEqual(
+                    len(deck["eventClasses"]),
+                    3,
+                    "Each stress deck must collide at least three event classes.",
+                )
+                self.assertGreaterEqual(
+                    len(deck["variantsToCross"]),
+                    3,
+                    "Each stress deck must name multiple concrete variant axes to cross.",
+                )
+                self.assertGreaterEqual(
+                    len(deck["mustProve"]),
+                    3,
+                    "Each stress deck must name source-of-truth proof obligations.",
+                )
+                self.assertTrue(set(deck["playbooks"]).issubset(all_playbooks))
+                self.assertTrue(set(deck["eventClasses"]).issubset(all_events))
         self.assertTrue(
             REQUIRED_STATE_PERMUTATIONS.issubset(set(gradebook["statePermutations"])),
             "State permutations must cover lifecycle states from queued through visible recovery.",
