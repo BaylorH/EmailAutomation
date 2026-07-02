@@ -847,7 +847,7 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(thread_set[1]["followUpStatus"], "waiting")
         self.assertTrue(thread_set[2])
 
-    def _dashboard_manual_reply_doc(self, overrides=None, doc_id="outbox-dashboard-reply"):
+    def _dashboard_manual_reply_doc(self, overrides=None, doc_id="outbox-dashboard-reply") -> FakeDoc:
         data = {
             "assignedEmails": ["bp21harrison@gmail.com"],
             "script": "Hi Ron,\n\nCan you share details?\n\nThanks",
@@ -868,6 +868,35 @@ class OutboxSafetyTests(unittest.TestCase):
         if overrides:
             data.update(overrides)
         return FakeDoc(data, doc_id=doc_id)
+
+    def test_dashboard_manual_reply_cancelled_after_claim_deletes_without_graph_send(self):
+        doc = self._dashboard_manual_reply_doc()
+        fake_fs = FakeFirestore()
+        cancelled_payload = {
+            **doc.to_dict(),
+            "cancelRequested": True,
+            "status": "cancel_requested",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_current_outbox_data", return_value=cancelled_payload), \
+             patch.object(email_module, "_get_reply_message_sender") as get_reply_sender, \
+             patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply, \
+             patch.object(email_module, "send_and_index_email") as send_and_index_email:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        get_reply_sender.assert_not_called()
+        send_outbox_as_reply.assert_not_called()
+        send_and_index_email.assert_not_called()
+        self.assertTrue(doc.reference.deleted)
+        audit_payload = fake_fs.set_calls[-1][1]
+        self.assertEqual("cancelled", audit_payload["status"])
+        self.assertEqual("outbox-dashboard-reply", audit_payload["outboxId"])
 
     def test_dashboard_manual_reply_success_records_audit_after_graph_reply(self):
         doc = self._dashboard_manual_reply_doc()
@@ -908,6 +937,88 @@ class OutboxSafetyTests(unittest.TestCase):
         thread_payload = fake_fs.set_calls[-1][1]
         self.assertEqual("active", thread_payload["status"])
         self.assertEqual("waiting", thread_payload["followUpStatus"])
+
+    def test_dashboard_manual_reply_preserves_reviewed_reply_all_ccs_in_audit_and_history(self):
+        doc = self._dashboard_manual_reply_doc({
+            "ccEmails": ["baylor@manifoldengineering.ai"],
+        })
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
+             patch.object(email_module, "_send_outbox_as_reply", return_value={
+                 "sent": True,
+                 "error": None,
+                 "sentMessageId": "graph-reply-message-1",
+                 "internetMessageId": "<graph-reply-message-1@example.com>",
+                 "conversationId": "conversation-1",
+                 "toRecipients": ["bp21harrison@gmail.com"],
+                 "ccRecipients": ["baylor@manifoldengineering.ai"],
+                 "sentRecipients": [
+                     "bp21harrison@gmail.com",
+                     "baylor@manifoldengineering.ai",
+                 ],
+             }) as send_outbox_as_reply, \
+             patch.object(email_module, "_save_outbox_reply_message") as save_outbox_reply_message, \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"), \
+             patch.object(email_module, "delete_notification_and_decrement_counters"):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        send_outbox_as_reply.assert_called_once()
+        self.assertEqual(
+            ["baylor@manifoldengineering.ai"],
+            send_outbox_as_reply.call_args.kwargs["fallback_cc_emails"],
+        )
+        self.assertEqual(
+            ["baylor@manifoldengineering.ai"],
+            save_outbox_reply_message.call_args.kwargs["cc_emails"],
+        )
+        audit_payload = fake_fs.set_calls[-2][1]
+        self.assertEqual("sent", audit_payload["status"])
+        self.assertEqual(
+            ["bp21harrison@gmail.com", "baylor@manifoldengineering.ai"],
+            audit_payload["sentRecipients"],
+        )
+
+    def test_dashboard_manual_reply_recipient_mismatch_uses_reviewed_recipient_not_graph_reply(self):
+        doc = self._dashboard_manual_reply_doc({
+            "assignedEmails": ["bp21harrison+reviewed@gmail.com"],
+        })
+        fake_fs = FakeFirestore()
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_reply_message_sender", return_value="wrong-broker@example.com"), \
+             patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply, \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": ["bp21harrison+reviewed@gmail.com"],
+                 "errors": {},
+                 "sentMessageIds": {"bp21harrison+reviewed@gmail.com": "draft-reviewed"},
+                 "internetMessageIds": {"bp21harrison+reviewed@gmail.com": "<reviewed@example.com>"},
+                 "threadIds": {"bp21harrison+reviewed@gmail.com": "thread-reviewed"},
+                 "conversationIds": {"bp21harrison+reviewed@gmail.com": "conversation-reviewed"},
+             }) as send_and_index_email, \
+             patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
+             patch.object(email_module, "highlight_row"):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        send_outbox_as_reply.assert_not_called()
+        send_and_index_email.assert_called_once()
+        self.assertEqual(["bp21harrison+reviewed@gmail.com"], send_and_index_email.call_args.args[3])
+        self.assertTrue(doc.reference.deleted)
+        audit_payload = fake_fs.set_calls[-2][1]
+        self.assertEqual("sent", audit_payload["status"])
+        self.assertEqual("draft-reviewed", audit_payload["sentMessageId"])
 
     def test_dashboard_manual_reply_placeholder_dead_letters_before_graph_send(self):
         doc = self._dashboard_manual_reply_doc({
@@ -957,8 +1068,8 @@ class OutboxSafetyTests(unittest.TestCase):
                  "subject": "RE: 0 Gemini Ave, Houston",
              }), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
-             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match, create=True) as sent_guard, \
-             patch.object(email_module, "find_sent_conversation_continuation_for_retry", create=True) as continuation_guard, \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match) as sent_guard, \
+             patch.object(email_module, "find_sent_conversation_continuation_for_retry") as continuation_guard, \
              patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply:
             email_module._send_single_outbox_item(
                 "uid-1",
@@ -1000,8 +1111,8 @@ class OutboxSafetyTests(unittest.TestCase):
                  "subject": "RE: 0 Gemini Ave, Houston",
              }), \
              patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com"), \
-             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None, create=True), \
-             patch.object(email_module, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation, create=True) as continuation_guard, \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None), \
+             patch.object(email_module, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation) as continuation_guard, \
              patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply:
             email_module._send_single_outbox_item(
                 "uid-1",
@@ -1118,7 +1229,7 @@ class OutboxSafetyTests(unittest.TestCase):
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
-             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match, create=True) as sent_guard, \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match) as sent_guard, \
              patch.object(email_module, "send_and_index_email") as send_and_index_email:
             email_module._send_single_outbox_item(
                 "uid-1",
@@ -1169,7 +1280,7 @@ class OutboxSafetyTests(unittest.TestCase):
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
-             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match, create=True) as sent_guard, \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match) as sent_guard, \
              patch.object(email_module, "send_and_index_email") as send_and_index_email:
             email_module._send_single_outbox_item(
                 "uid-1",
@@ -1216,8 +1327,8 @@ class OutboxSafetyTests(unittest.TestCase):
                  "conversationId": "conv-thread-1",
                  "subject": "RE: 0 Gemini Ave",
              }), \
-             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None, create=True), \
-             patch.object(email_module, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation, create=True) as continuation_guard, \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None), \
+             patch.object(email_module, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation) as continuation_guard, \
              patch.object(email_module, "_send_outbox_as_reply") as send_reply:
             email_module._send_single_outbox_item(
                 "uid-1",
@@ -1261,7 +1372,7 @@ class OutboxSafetyTests(unittest.TestCase):
                  "conversationId": "conv-thread-1",
                  "subject": "RE: 0 Gemini Ave",
              }), \
-             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match, create=True) as sent_guard, \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=sent_match) as sent_guard, \
              patch.object(email_module, "_send_outbox_as_reply") as send_reply:
             email_module._send_single_outbox_item(
                 "uid-1",
@@ -1304,8 +1415,8 @@ class OutboxSafetyTests(unittest.TestCase):
                  "conversationId": "conv-thread-1",
                  "subject": "RE: 0 Gemini Ave",
              }), \
-             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None, create=True), \
-             patch.object(email_module, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation, create=True) as continuation_guard, \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None), \
+             patch.object(email_module, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation) as continuation_guard, \
              patch.object(email_module, "_send_outbox_as_reply") as send_reply:
             email_module._send_single_outbox_item(
                 "uid-1",

@@ -19,8 +19,8 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "covered": 51,
-    "needs_fixture": 57,
+    "covered": 53,
+    "needs_fixture": 55,
     "needs_live_proof": 11
   },
   "featureFixtureMatrix": {
@@ -816,8 +816,9 @@
         ]
       },
       "terminal_state": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
+          "dashboard_action_resolution",
           "manual_user_continuation"
         ],
         "combinationPlaybooks": [
@@ -830,8 +831,12 @@
           "automated",
           "firestore"
         ],
-        "gapReason": "No explicit Production V1 terminal_state fixture is mapped for core.manual_reply yet.",
-        "nextProof": "Add or identify a deterministic core.manual_reply / terminal_state fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_outbox_safety.py"
+        ],
+        "testIds": [
+          "test_dashboard_manual_reply_cancelled_after_claim_deletes_without_graph_send"
+        ]
       },
       "bad_placeholder": {
         "status": "covered",
@@ -860,23 +865,31 @@
       "wrong_recipient": {
         "status": "covered",
         "eventClasses": [
+          "dashboard_action_resolution",
+          "manual_user_continuation",
           "reply_all_cc_context"
         ],
         "combinationPlaybooks": [
+          "manual_reply_before_retry",
           "reply_all_cc_plus_blocked_contact"
         ],
         "statePermutations": [
-          "paused_manual_review"
+          "paused_manual_review",
+          "live_waiting"
         ],
         "evidence": [
           "automated",
-          "email"
+          "email",
+          "firestore"
         ],
         "testFiles": [
-          "tests/test_graph_retry_policy.py"
+          "tests/test_graph_retry_policy.py",
+          "tests/test_outbox_safety.py"
         ],
         "testIds": [
-          "test_dashboard_thread_reply_falls_back_when_graph_recipients_filter_to_zero"
+          "test_dashboard_thread_reply_falls_back_when_graph_recipients_filter_to_zero",
+          "test_dashboard_manual_reply_preserves_reviewed_reply_all_ccs_in_audit_and_history",
+          "test_dashboard_manual_reply_recipient_mismatch_uses_reviewed_recipient_not_graph_reply"
         ]
       },
       "manual_continuation": {
@@ -1090,22 +1103,28 @@
     },
     "core.inbox_auto_reply": {
       "happy_path": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
-          "manual_user_continuation"
+          "broker_reply",
+          "reply_all_cc_context"
         ],
         "combinationPlaybooks": [
-          "graph_accepted_but_index_missing"
+          "reply_all_cc_plus_blocked_contact"
         ],
         "statePermutations": [
           "live_waiting"
         ],
         "evidence": [
           "automated",
+          "email",
           "firestore"
         ],
-        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.inbox_auto_reply yet.",
-        "nextProof": "Add or identify a deterministic core.inbox_auto_reply / happy_path fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_processing_reply_indexing.py"
+        ],
+        "testIds": [
+          "test_auto_thread_reply_preserves_safe_cc_with_reply_all_draft"
+        ]
       },
       "terminal_state": {
         "status": "covered",
