@@ -179,6 +179,7 @@
         "testIds": [
           "test_campaign_launch_replaces_name_placeholder_before_send_guard",
           "test_campaign_launch_recovers_missing_contact_name_from_sheet_row_before_send_guard",
+          "test_campaign_launch_exact_script_recovers_missing_contact_name_from_sheet_row",
           "test_grouped_campaign_launch_recovers_missing_contact_name_from_sheet_row",
           "test_grouped_outbox_replaces_name_placeholder_before_send_guard"
         ],
