@@ -296,6 +296,28 @@ class OutboxSafetyTests(unittest.TestCase):
             captured_body["script"],
         )
 
+    def test_name_placeholder_rejects_markup_contact_name(self):
+        body = email_module._personalize_name_placeholders(
+            "Hi [NAME],\n\nCould you confirm the SF available?",
+            "Avery<script>",
+        )
+
+        self.assertEqual(
+            "Hi [NAME],\n\nCould you confirm the SF available?",
+            body,
+        )
+
+    def test_name_placeholder_rejects_regex_like_contact_name_without_error(self):
+        body = email_module._personalize_name_placeholders(
+            "Hi [NAME],\n\nCould you confirm the SF available?",
+            r"Avery\1",
+        )
+
+        self.assertEqual(
+            "Hi [NAME],\n\nCould you confirm the SF available?",
+            body,
+        )
+
     def test_paused_client_outbox_item_moves_to_dead_letter_before_send(self):
         doc_ref = FakeDocRef("paused-outbox")
         data = {"clientId": "client-1", "script": "Hi Avery"}
@@ -1021,6 +1043,47 @@ class OutboxSafetyTests(unittest.TestCase):
         audit_payload = fake_fs.set_calls[-1][1]
         self.assertEqual(audit_payload["status"], "opt_out_skipped")
         self.assertEqual(audit_payload["outboxId"], "outbox-opt-out")
+
+    def test_grouped_outbox_replaces_name_placeholder_before_send_guard(self):
+        recipient = "bp21harrison+grouped@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [recipient],
+            "script": "Hi [first name],\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "123 Grouped Name Way",
+            "rowNumber": 12,
+            "contactName": "Morgan Lake",
+            "actionAuditId": "audit-grouped-name",
+        }, doc_id="outbox-grouped-name")
+        captured = {}
+
+        def record_guard(_user_id, _doc_ref, _data, body):
+            captured["guard_body"] = body
+            return False
+
+        def record_send(_user_id, _headers, script, *_args, **_kwargs):
+            captured["send_body"] = script
+            return {
+                "sent": [recipient],
+                "errors": {},
+            }
+
+        with patch("email_automation.clients._fs", FakeFirestore()), \
+             patch("email_automation.processing.is_contact_opted_out", return_value=None), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_dead_letter_unsafe_outbound_body_if_needed", side_effect=record_guard), \
+             patch.object(email_module, "send_and_index_email", side_effect=record_send), \
+             patch.object(email_module, "_finalize_successful_outbox_item"):
+            email_module._send_multi_property_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                recipient,
+                [{"doc": doc, "data": doc.to_dict()}],
+            )
+
+        self.assertEqual("Hi Morgan,\n\nCan you share details?\n\nThanks", captured["guard_body"])
+        self.assertEqual("Hi Morgan,\n\nCan you share details?\n\nThanks", captured["send_body"])
 
     def test_grouped_graph_accepted_unindexed_outbox_moves_to_reconciliation_without_retry(self):
         recipient = "bp21harrison+grouped@gmail.com"

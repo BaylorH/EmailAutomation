@@ -1118,7 +1118,7 @@ def _safe_greeting_first_name(contact_name: Optional[str]) -> Optional[str]:
     if not candidate or "@" in candidate or "[" in candidate or "]" in candidate:
         return None
     first = candidate.split()[0].strip(" ,;:()[]{}")
-    if not first or not re.search(r"[A-Za-z]", first):
+    if not first or not re.fullmatch(r"[A-Za-z][A-Za-z.'-]{0,63}", first):
         return None
     return first
 
@@ -1130,7 +1130,7 @@ def _personalize_name_placeholders(script: Optional[str], contact_name: Optional
     first_name = _safe_greeting_first_name(contact_name)
     if not first_name:
         return body
-    return NAME_PLACEHOLDER_RE.sub(first_name, body)
+    return NAME_PLACEHOLDER_RE.sub(lambda _match: first_name, body)
 
 
 def _select_script_for_recipient(user_id: str, recipient_email: str,

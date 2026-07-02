@@ -19,8 +19,8 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "covered": 43,
-    "needs_fixture": 66,
+    "covered": 42,
+    "needs_fixture": 67,
     "needs_live_proof": 10
   },
   "featureFixtureMatrix": {
@@ -176,7 +176,8 @@
           "tests/test_outbox_safety.py"
         ],
         "testIds": [
-          "test_campaign_launch_replaces_name_placeholder_before_send_guard"
+          "test_campaign_launch_replaces_name_placeholder_before_send_guard",
+          "test_grouped_outbox_replaces_name_placeholder_before_send_guard"
         ],
         "incidentId": "karsen_name_placeholder_positive_resolution"
       },
@@ -304,7 +305,7 @@
     },
     "core.launch_draft": {
       "happy_path": {
-        "status": "covered",
+        "status": "needs_fixture",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -317,13 +318,8 @@
         "evidence": [
           "automated"
         ],
-        "testFiles": [
-          "tests/test_outbox_safety.py"
-        ],
-        "testIds": [
-          "test_campaign_launch_replaces_name_placeholder_before_send_guard"
-        ],
-        "incidentId": "launch_draft_name_placeholder_positive_resolution"
+        "gapReason": "The current fixture proves backend name-placeholder resolution after an outbox item exists, but does not independently prove the launch draft/setup path maps the intended name column before queueing.",
+        "nextProof": "Add a Production V1 launch-draft fixture that starts from uploaded sheet/template data, verifies the queued outbox body resolves the selected name variable, and leaves unresolved placeholders operator-visible before any Graph send."
       },
       "terminal_state": {
         "status": "needs_fixture",
