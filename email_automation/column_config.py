@@ -259,6 +259,24 @@ NEVER_REQUEST_FIELDS = [k for k, v in CANONICAL_FIELDS.items() if v.get("never_r
 # Legacy alias for backward compatibility
 REQUIRED_FOR_CLOSE = DEFAULT_REQUIRED_FOR_CLOSE
 
+CAMPAIGN_CONTACT_NAME_HEADER_KEYS = (
+    "contact name",
+    "contact first name",
+    "leasing contact name",
+    "leasing contact",
+    "leasing agent name",
+    "leasing agent",
+    "broker name",
+    "broker contact",
+    "broker first name",
+    "recipient name",
+    "recipient first name",
+    "first name",
+    "full name",
+)
+
+LAUNCH_CONTACT_NAME_HEADER_ALIASES = CAMPAIGN_CONTACT_NAME_HEADER_KEYS
+
 # ============================================================================
 # COLUMN MODES - Used by frontend dropdown
 # ============================================================================
@@ -310,6 +328,106 @@ def get_default_column_config() -> Dict[str, Any]:
         "formulaFields": FORMULA_FIELDS,
         "neverRequest": NEVER_REQUEST_FIELDS,
         "customFields": {},  # {columnHeader: {mode, description}}
+    }
+
+
+def _normalized_header_key(name: str) -> str:
+    return " ".join(str(name or "").strip().lower().replace("_", " ").split())
+
+
+def _explicit_contact_name_headers(headers: List[str]) -> List[str]:
+    explicit_aliases = {_normalized_header_key(alias) for alias in LAUNCH_CONTACT_NAME_HEADER_ALIASES}
+    return [
+        header
+        for header in headers
+        if _normalized_header_key(header) in explicit_aliases
+    ]
+
+
+def analyze_launch_name_mapping(headers: List[str], mapping_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return launch-readiness guidance for campaigns that use [NAME] placeholders.
+
+    This is intentionally deterministic and conservative. Generic "Name" columns
+    often mean property/building name in real CRE sheets, so they must not be
+    treated as a person-name source without an explicit contact-name mapping.
+    """
+    headers = [header for header in headers if header]
+    mappings = (mapping_result or {}).get("mappings") or {}
+    mapped_contact_column = mappings.get("leasing_contact")
+    normalized_headers = {_normalized_header_key(header): header for header in headers}
+    normalized_mapped_contact = _normalized_header_key(mapped_contact_column)
+    candidate_columns = _explicit_contact_name_headers(headers)
+    blocking_issues: List[str] = []
+    warnings: List[str] = []
+
+    if len(candidate_columns) > 1:
+        blocking_issues.append("ambiguous_contact_name_columns")
+        return {
+            "status": "ambiguous_contact_name",
+            "contactNameColumn": mapped_contact_column,
+            "candidateContactNameColumns": candidate_columns,
+            "blockingIssues": blocking_issues,
+            "warnings": warnings,
+            "operatorMessage": (
+                "Multiple contact name columns were detected. Choose the exact broker/contact "
+                "name column before launching so [NAME] is personalized correctly."
+            ),
+        }
+
+    if not mapped_contact_column:
+        blocking_issues.append("missing_contact_name_column")
+        return {
+            "status": "missing_contact_name",
+            "contactNameColumn": None,
+            "candidateContactNameColumns": candidate_columns,
+            "blockingIssues": blocking_issues,
+            "warnings": warnings,
+            "operatorMessage": (
+                "Select a contact name column before launching. Generic columns like "
+                '"Name" are not safe for [NAME] personalization because they may be '
+                "property names instead of people."
+            ),
+        }
+
+    if normalized_mapped_contact not in normalized_headers:
+        blocking_issues.append("mapped_contact_name_column_missing_from_headers")
+        return {
+            "status": "missing_contact_name",
+            "contactNameColumn": mapped_contact_column,
+            "candidateContactNameColumns": candidate_columns,
+            "blockingIssues": blocking_issues,
+            "warnings": warnings,
+            "operatorMessage": (
+                "The selected contact name column is not in the uploaded sheet. Choose a real "
+                "broker/contact name column before launching so [NAME] is personalized correctly."
+            ),
+        }
+
+    if normalized_mapped_contact not in {
+        _normalized_header_key(candidate_column) for candidate_column in candidate_columns
+    }:
+        blocking_issues.append("unsafe_contact_name_column")
+        return {
+            "status": "unsafe_contact_name",
+            "contactNameColumn": normalized_headers[normalized_mapped_contact],
+            "candidateContactNameColumns": candidate_columns,
+            "blockingIssues": blocking_issues,
+            "warnings": warnings,
+            "operatorMessage": (
+                "The selected [NAME] column is not an explicit broker/contact name field. "
+                "Generic columns like \"Name\" may be property names, so choose a contact "
+                "name column before launching."
+            ),
+        }
+
+    return {
+        "status": "ready",
+        "contactNameColumn": normalized_headers[normalized_mapped_contact],
+        "candidateContactNameColumns": candidate_columns,
+        "blockingIssues": blocking_issues,
+        "warnings": warnings,
+        "operatorMessage": "",
     }
 
 
