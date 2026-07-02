@@ -253,13 +253,154 @@ def _email_values_from_row(header: List[str], row_values: List[str]) -> List[str
     return _ordered_unique(values)
 
 
+CAMPAIGN_CONTACT_NAME_HEADER_KEYS = (
+    "contact name",
+    "contact first name",
+    "leasing contact name",
+    "leasing contact",
+    "leasing agent name",
+    "leasing agent",
+    "broker name",
+    "broker contact",
+    "broker first name",
+    "recipient name",
+    "recipient first name",
+    "first name",
+    "full name",
+)
+
+
+def _contact_name_resolution_from_campaign_row(
+    header: List[str],
+    row_values: List[str],
+) -> Dict[str, Optional[str]]:
+    idx_map = _header_index_map(header)
+    candidates = []
+    for key in CAMPAIGN_CONTACT_NAME_HEADER_KEYS:
+        idx = idx_map.get(key)
+        if not idx:
+            continue
+        row_idx = idx - 1
+        if row_idx < 0 or row_idx >= len(row_values):
+            continue
+        value = str(row_values[row_idx] or "").strip()
+        if not value:
+            continue
+        if _safe_greeting_first_name(value):
+            candidates.append(value)
+
+    unique = _ordered_unique(candidates)
+    if len(unique) == 1:
+        return {"contact_name": unique[0], "failure_reason": None}
+    if len(unique) > 1:
+        return {
+            "contact_name": None,
+            "failure_reason": (
+                "Ambiguous sheet contact/name source for [NAME]; "
+                f"found {len(unique)} different safe values in explicit contact-name columns"
+            ),
+        }
+    return {
+        "contact_name": None,
+        "failure_reason": "No safe sheet contact/name source found for [NAME]",
+    }
+
+
+def _contact_name_from_campaign_row(header: List[str], row_values: List[str]) -> Optional[str]:
+    return _contact_name_resolution_from_campaign_row(header, row_values).get("contact_name")
+
+
+def _campaign_sheet_header_and_row(
+    user_id: str,
+    client_id: str,
+    row_number: int,
+    *,
+    operation_name: str,
+    sheet_metadata_cache: Optional[Dict[str, Any]] = None,
+) -> tuple[List[str], List[str]]:
+    sheet_id = _get_sheet_id_or_fail(user_id, client_id)
+    sheets = _sheets_client()
+    cache = sheet_metadata_cache if sheet_metadata_cache is not None else {}
+    metadata = cache.get(sheet_id)
+    if metadata:
+        tab_title = metadata["tab_title"]
+        header = metadata["header"]
+    else:
+        tab_title = _get_first_tab_title(sheets, sheet_id)
+        header = _read_header_row2(sheets, sheet_id, tab_title)
+        cache[sheet_id] = {"tab_title": tab_title, "header": header}
+
+    row_cache_key = f"{sheet_id}:row:{row_number}"
+    row_values = cache.get(row_cache_key)
+    if row_values is None:
+        resp = _execute_with_retry(
+            sheets.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=f"{tab_title}!{row_number}:{row_number}",
+            ),
+            operation_name,
+        )
+        row_values = (resp.get("values") or [[]])[0]
+        cache[row_cache_key] = row_values
+
+    padded_row = row_values + [""] * max(0, len(header) - len(row_values))
+    return header, padded_row
+
+
+def _resolve_campaign_launch_contact_name_result_from_sheet(
+    user_id: str,
+    data: Dict[str, Any],
+    *,
+    row_number_override: Optional[object] = None,
+    sheet_metadata_cache: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Optional[str]]:
+    if not _is_campaign_launch_outbox(data):
+        return {"contact_name": None, "failure_reason": None}
+
+    raw_row_number = data.get("rowNumber") or row_number_override
+    client_id = (data.get("clientId") or "").strip()
+    if not client_id or raw_row_number in (None, ""):
+        return {"contact_name": None, "failure_reason": "Missing sheet row metadata for [NAME]"}
+
+    try:
+        row_number = int(raw_row_number)
+    except (TypeError, ValueError):
+        return {"contact_name": None, "failure_reason": "Invalid sheet row metadata for [NAME]"}
+    if row_number < 1:
+        return {"contact_name": None, "failure_reason": "Invalid sheet row metadata for [NAME]"}
+
+    header, row_values = _campaign_sheet_header_and_row(
+        user_id,
+        client_id,
+        row_number,
+        operation_name="outbox_contact_name_row_guard",
+        sheet_metadata_cache=sheet_metadata_cache,
+    )
+    return _contact_name_resolution_from_campaign_row(header, row_values)
+
+
+def _resolve_campaign_launch_contact_name_from_sheet(
+    user_id: str,
+    data: Dict[str, Any],
+    *,
+    row_number_override: Optional[object] = None,
+    sheet_metadata_cache: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    return _resolve_campaign_launch_contact_name_result_from_sheet(
+        user_id,
+        data,
+        row_number_override=row_number_override,
+        sheet_metadata_cache=sheet_metadata_cache,
+    ).get("contact_name")
+
+
 def _dead_letter_campaign_recipient_row_mismatch_if_needed(
     user_id: str,
     doc_ref,
     data: dict,
     recipient_email: str,
     row_number_override: Optional[object] = None,
-    sheet_metadata_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+    sheet_metadata_cache: Optional[Dict[str, Any]] = None,
 ) -> bool:
     if not _is_campaign_launch_outbox(data):
         return False
@@ -305,27 +446,14 @@ def _dead_letter_campaign_recipient_row_mismatch_if_needed(
         return True
 
     try:
-        sheet_id = _get_sheet_id_or_fail(user_id, client_id)
-        sheets = _sheets_client()
-        cache = sheet_metadata_cache if sheet_metadata_cache is not None else {}
-        metadata = cache.get(sheet_id)
-        if metadata:
-            tab_title = metadata["tab_title"]
-            header = metadata["header"]
-        else:
-            tab_title = _get_first_tab_title(sheets, sheet_id)
-            header = _read_header_row2(sheets, sheet_id, tab_title)
-            cache[sheet_id] = {"tab_title": tab_title, "header": header}
-        resp = _execute_with_retry(
-            sheets.spreadsheets().values().get(
-                spreadsheetId=sheet_id,
-                range=f"{tab_title}!{row_number}:{row_number}",
-            ),
-            "outbox_recipient_row_guard",
+        header, row_values = _campaign_sheet_header_and_row(
+            user_id,
+            client_id,
+            row_number,
+            operation_name="outbox_recipient_row_guard",
+            sheet_metadata_cache=sheet_metadata_cache,
         )
-        row_values = (resp.get("values") or [[]])[0]
-        padded_row = row_values + [""] * max(0, len(header) - len(row_values))
-        row_emails = _email_values_from_row(header, padded_row)
+        row_emails = _email_values_from_row(header, row_values)
     except Exception as exc:
         _move_to_dead_letter(
             user_id,
@@ -368,6 +496,24 @@ def _dead_letter_unsafe_outbound_body_if_needed(
         doc_ref,
         data,
         f"{validation.reason}; manual review required before sending",
+    )
+    return True
+
+
+def _dead_letter_unresolved_name_placeholder_if_needed(
+    user_id: str,
+    doc_ref,
+    data: dict,
+    body: str,
+    failure_reason: Optional[str],
+) -> bool:
+    if not failure_reason or not NAME_PLACEHOLDER_RE.search(body or ""):
+        return False
+    _move_to_dead_letter(
+        user_id,
+        doc_ref,
+        data,
+        f"{failure_reason}; manual review required before sending",
     )
     return True
 
@@ -2301,7 +2447,7 @@ def _send_multi_property_email(
 
     # Send each property as its own email/thread
     # Each email uses the exact script that was approved in the frontend
-    recipient_guard_sheet_cache: Dict[str, Dict[str, Any]] = {}
+    recipient_guard_sheet_cache: Dict[str, Any] = {}
     for idx, prop in enumerate(properties):
         item = prop['item']
         data = item['data']
@@ -2357,16 +2503,36 @@ def _send_multi_property_email(
             item['doc'].reference.delete()
             continue
 
-        contact_name = data.get("contactName") or data.get("firstName")
-        # Personalize only name-style launch placeholders; unsafe leftovers still hard-stop below.
-        script = _personalize_name_placeholders(data.get("script", prop['script']), contact_name)
-        if _dead_letter_unsafe_outbound_body_if_needed(user_id, item['doc'].reference, data, script):
-            print(f"   🛑 Blocked unsafe outbound body for {recipient_email}; manual review required")
-            continue
-
         print(f"  → Property {idx + 1}/{len(properties)}: {prop['name'] or 'Unknown'} (attempt {attempts + 1}/{MAX_OUTBOX_ATTEMPTS})")
 
         try:
+            contact_name = data.get("contactName") or data.get("firstName")
+            contact_name_failure_reason = None
+            raw_script = data.get("script", prop["script"])
+            if not contact_name and NAME_PLACEHOLDER_RE.search(raw_script or ""):
+                name_resolution = _resolve_campaign_launch_contact_name_result_from_sheet(
+                    user_id,
+                    data,
+                    row_number_override=row_number,
+                    sheet_metadata_cache=recipient_guard_sheet_cache,
+                )
+                contact_name = name_resolution.get("contact_name")
+                contact_name_failure_reason = name_resolution.get("failure_reason")
+            # Personalize only name-style launch placeholders; unsafe leftovers still hard-stop below.
+            script = _personalize_name_placeholders(raw_script, contact_name)
+            if _dead_letter_unresolved_name_placeholder_if_needed(
+                user_id,
+                item['doc'].reference,
+                data,
+                script,
+                contact_name_failure_reason,
+            ):
+                print(f"   🛑 Blocked unresolved contact name for {recipient_email}; manual review required")
+                continue
+            if _dead_letter_unsafe_outbound_body_if_needed(user_id, item['doc'].reference, data, script):
+                print(f"   🛑 Blocked unsafe outbound body for {recipient_email}; manual review required")
+                continue
+
             # Use pre-computed subject from property data
             subject_override = prop.get('subject') or None
             followup_config = data.get("followUpConfig")
@@ -2815,8 +2981,10 @@ def _send_single_outbox_item(
     else:
         # For each recipient, select the appropriate script based on contact history
         use_exact_script = _should_use_exact_outbox_script(data)
-        recipient_guard_sheet_cache: Dict[str, Dict[str, Any]] = {}
+        recipient_guard_sheet_cache: Dict[str, Any] = {}
         for recipient_email in emails:
+            recipient_contact_name = contact_name
+            recipient_contact_name_failure_reason = None
             if _dead_letter_campaign_recipient_row_mismatch_if_needed(
                 user_id,
                 d.reference,
@@ -2828,13 +2996,40 @@ def _send_single_outbox_item(
                 print(f"   🛑 Blocked row-recipient mismatch for outbox item {d.id}")
                 return
 
+            if not recipient_contact_name and any(NAME_PLACEHOLDER_RE.search(script or "") for script in email_scripts):
+                try:
+                    name_resolution = _resolve_campaign_launch_contact_name_result_from_sheet(
+                        user_id,
+                        data,
+                        row_number_override=row_number,
+                        sheet_metadata_cache=recipient_guard_sheet_cache,
+                    )
+                    recipient_contact_name = name_resolution.get("contact_name")
+                    recipient_contact_name_failure_reason = name_resolution.get("failure_reason")
+                except Exception as e:
+                    all_errors[recipient_email] = f"Could not resolve contact name from sheet row: {e}"
+                    continue
+
             if use_exact_script:
-                selected_script = email_scripts[0] if email_scripts else ""
+                selected_script = _personalize_name_placeholders(
+                    email_scripts[0] if email_scripts else "",
+                    recipient_contact_name,
+                )
                 print(f"  → Using exact outbox script for {recipient_email}")
             else:
                 selected_script = _select_script_for_recipient(
-                    user_id, recipient_email, email_scripts, contact_name=contact_name
+                    user_id, recipient_email, email_scripts, contact_name=recipient_contact_name
                 )
+
+            if _dead_letter_unresolved_name_placeholder_if_needed(
+                user_id,
+                d.reference,
+                data,
+                selected_script,
+                recipient_contact_name_failure_reason,
+            ):
+                print(f"   🛑 Blocked unresolved contact name for {recipient_email}; manual review required")
+                return
 
             if _dead_letter_unsafe_outbound_body_if_needed(user_id, d.reference, data, selected_script):
                 print(f"   🛑 Blocked unsafe outbound body for {recipient_email}; manual review required")
@@ -2876,7 +3071,7 @@ def _send_single_outbox_item(
                                            client_id_or_none=clientId, row_number=row_number,
                                            user_signature=user_signature, subject_override=subject_override,
                                            signature_mode=signature_mode, followup_config=followup_config,
-                                           contact_name=contact_name, user_email=user_email,
+                                           contact_name=recipient_contact_name, user_email=user_email,
                                            thread_context=_thread_context_from_outbox(data),
                                            allow_scheduling_language=_is_tour_invite_outbox(data))
 
