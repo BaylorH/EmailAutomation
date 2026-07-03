@@ -1,6 +1,8 @@
 import atexit
 import json
 import os
+import signal
+import sys
 from datetime import datetime
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token
@@ -318,5 +320,24 @@ def run_all_users():
             )
 
 
+def _install_sigterm_atexit_bridge():
+    """Make atexit handlers (e.g. the token-cache upload registered in
+    refresh_and_process_user) survive container shutdown.
+
+    Under GitHub Actions the process ends naturally, so atexit fires. Under a
+    Cloud Run Job the platform sends SIGTERM before the container is stopped;
+    Python's default SIGTERM disposition terminates the process WITHOUT running
+    atexit handlers, which would drop a pending token-cache upload. Translating
+    SIGTERM into ``sys.exit`` raises SystemExit, which unwinds normally and lets
+    atexit-registered handlers run before exit.
+    """
+    def _handle_sigterm(signum, frame):
+        print("🛑 Received SIGTERM; exiting cleanly so atexit handlers run")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
 if __name__ == "__main__":
+    _install_sigterm_atexit_bridge()
     run_with_scheduler_lease(run_all_users)
