@@ -3490,5 +3490,77 @@
   "crossFeatureSummary": {
     "covered": 2,
     "needs_fixture": 6
-  }
+  },
+  "fullCampaignLanes": {
+    "upload": {
+      "status": "needs_fixture",
+      "stageDescription": "Operator uploads a broker/property workbook and the columns are mapped.",
+      "primaryFeature": "core.upload_mapping",
+      "gapReason": "No single chained full-campaign e2e drives the 'upload' stage in sequence with the others; the 'upload' behavior is only proven in isolation by per-feature rubric cells (core.upload_mapping), not as part of one end-to-end campaign run. A true e2e also needs the Firebase emulator for the Firestore-backed stages, which is unavailable here (no Java runtime).",
+      "nextProof": "Once a JRE + Firebase Emulator Suite (or an in-memory Firestore double) is wired, add a stage in tests/test_full_campaign_e2e.py that drives 'upload' as part of the upload->map->launch->send->reply->classify->sheet->followup->completion chain and asserts its output feeds the next stage."
+    },
+    "map": {
+      "status": "needs_fixture",
+      "stageDescription": "Uploaded rows are mapped to the campaign schema (headers -> fields).",
+      "primaryFeature": "core.upload_mapping",
+      "gapReason": "No single chained full-campaign e2e drives the 'map' stage in sequence with the others; the 'map' behavior is only proven in isolation by per-feature rubric cells (core.upload_mapping), not as part of one end-to-end campaign run. A true e2e also needs the Firebase emulator for the Firestore-backed stages, which is unavailable here (no Java runtime).",
+      "nextProof": "Once a JRE + Firebase Emulator Suite (or an in-memory Firestore double) is wired, add a stage in tests/test_full_campaign_e2e.py that drives 'map' as part of the upload->map->launch->send->reply->classify->sheet->followup->completion chain and asserts its output feeds the next stage."
+    },
+    "launch": {
+      "status": "needs_fixture",
+      "stageDescription": "Campaign launch drafts + queues an outbox item per property with a resolved recipient/name.",
+      "primaryFeature": "core.launch_draft",
+      "gapReason": "No single chained full-campaign e2e drives the 'launch' stage in sequence with the others; the 'launch' behavior is only proven in isolation by per-feature rubric cells (core.launch_draft), not as part of one end-to-end campaign run. A true e2e also needs the Firebase emulator for the Firestore-backed stages, which is unavailable here (no Java runtime).",
+      "nextProof": "Once a JRE + Firebase Emulator Suite (or an in-memory Firestore double) is wired, add a stage in tests/test_full_campaign_e2e.py that drives 'launch' as part of the upload->map->launch->send->reply->classify->sheet->followup->completion chain and asserts its output feeds the next stage."
+    },
+    "send": {
+      "status": "needs_fixture",
+      "stageDescription": "Queued outbox items pass the send-safety gate and reach Graph exactly once (or dead-letter).",
+      "primaryFeature": "core.outbox_send",
+      "gapReason": "No single chained full-campaign e2e drives the 'send' stage in sequence with the others; the 'send' behavior is only proven in isolation by per-feature rubric cells (core.outbox_send), not as part of one end-to-end campaign run. A true e2e also needs the Firebase emulator for the Firestore-backed stages, which is unavailable here (no Java runtime).",
+      "nextProof": "Once a JRE + Firebase Emulator Suite (or an in-memory Firestore double) is wired, add a stage in tests/test_full_campaign_e2e.py that drives 'send' as part of the upload->map->launch->send->reply->classify->sheet->followup->completion chain and asserts its output feeds the next stage."
+    },
+    "reply": {
+      "status": "needs_fixture",
+      "stageDescription": "A broker reply is ingested and matched to its originating thread.",
+      "primaryFeature": "core.inbox_matching",
+      "gapReason": "No single chained full-campaign e2e drives the 'reply' stage in sequence with the others; the 'reply' behavior is only proven in isolation by per-feature rubric cells (core.inbox_matching), not as part of one end-to-end campaign run. A true e2e also needs the Firebase emulator for the Firestore-backed stages, which is unavailable here (no Java runtime).",
+      "nextProof": "Once a JRE + Firebase Emulator Suite (or an in-memory Firestore double) is wired, add a stage in tests/test_full_campaign_e2e.py that drives 'reply' as part of the upload->map->launch->send->reply->classify->sheet->followup->completion chain and asserts its output feeds the next stage."
+    },
+    "classify": {
+      "status": "needs_fixture",
+      "stageDescription": "The reply is classified into an event (available/unavailable/non-viable/opt-out/etc.).",
+      "primaryFeature": "core.event_classifier",
+      "gapReason": "No single chained full-campaign e2e drives the 'classify' stage in sequence with the others; the 'classify' behavior is only proven in isolation by per-feature rubric cells (core.event_classifier), not as part of one end-to-end campaign run. A true e2e also needs the Firebase emulator for the Firestore-backed stages, which is unavailable here (no Java runtime).",
+      "nextProof": "Once a JRE + Firebase Emulator Suite (or an in-memory Firestore double) is wired, add a stage in tests/test_full_campaign_e2e.py that drives 'classify' as part of the upload->map->launch->send->reply->classify->sheet->followup->completion chain and asserts its output feeds the next stage."
+    },
+    "sheet": {
+      "status": "needs_fixture",
+      "stageDescription": "Extracted property facts are written to the client sheet (no placeholder leak).",
+      "primaryFeature": "core.sheet_update",
+      "gapReason": "No single chained full-campaign e2e drives the 'sheet' stage in sequence with the others; the 'sheet' behavior is only proven in isolation by per-feature rubric cells (core.sheet_update), not as part of one end-to-end campaign run. A true e2e also needs the Firebase emulator for the Firestore-backed stages, which is unavailable here (no Java runtime).",
+      "nextProof": "Once a JRE + Firebase Emulator Suite (or an in-memory Firestore double) is wired, add a stage in tests/test_full_campaign_e2e.py that drives 'sheet' as part of the upload->map->launch->send->reply->classify->sheet->followup->completion chain and asserts its output feeds the next stage."
+    },
+    "followup": {
+      "status": "needs_fixture",
+      "stageDescription": "A due follow-up is scheduled/sent unless the thread is terminal or manually continued.",
+      "primaryFeature": "core.followups",
+      "gapReason": "No single chained full-campaign e2e drives the 'followup' stage in sequence with the others; the 'followup' behavior is only proven in isolation by per-feature rubric cells (core.followups), not as part of one end-to-end campaign run. A true e2e also needs the Firebase emulator for the Firestore-backed stages, which is unavailable here (no Java runtime).",
+      "nextProof": "Once a JRE + Firebase Emulator Suite (or an in-memory Firestore double) is wired, add a stage in tests/test_full_campaign_e2e.py that drives 'followup' as part of the upload->map->launch->send->reply->classify->sheet->followup->completion chain and asserts its output feeds the next stage."
+    },
+    "completion": {
+      "status": "needs_fixture",
+      "stageDescription": "The campaign reaches a terminal/complete state with consistent Firestore+Sheet+Gmail evidence.",
+      "primaryFeature": "core.health_recovery",
+      "gapReason": "No single chained full-campaign e2e drives the 'completion' stage in sequence with the others; the 'completion' behavior is only proven in isolation by per-feature rubric cells (core.health_recovery), not as part of one end-to-end campaign run. A true e2e also needs the Firebase emulator for the Firestore-backed stages, which is unavailable here (no Java runtime).",
+      "nextProof": "Once a JRE + Firebase Emulator Suite (or an in-memory Firestore double) is wired, add a stage in tests/test_full_campaign_e2e.py that drives 'completion' as part of the upload->map->launch->send->reply->classify->sheet->followup->completion chain and asserts its output feeds the next stage."
+    }
+  },
+  "fullCampaignSummary": {
+    "needs_fixture": 9
+  },
+  "fullCampaignBlockers": [
+    "Firebase Emulator Suite requires a Java runtime (JRE); none is installed in the current environment, so the emulator-backed e2e (roadmap WS-D-i) cannot run here.",
+    "A full upload->completion run also crosses Microsoft Graph (send/inbox) and Google Sheets, which are external and require fakes or the live BP21<->BP21 lane (needs_live_proof)."
+  ]
 }
