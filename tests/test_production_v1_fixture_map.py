@@ -74,6 +74,13 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
                         if cell["status"] == "covered":
                             self.assertTrue(cell.get("testFiles"))
                             self.assertTrue(cell.get("testIds"))
+                            self.assertTrue(
+                                cell.get("provesBehavior"),
+                                f"{feature_id}/{fixture_class} is 'covered' but does not state "
+                                f"provesBehavior - a covered cell must name what its test proves "
+                                f"about THIS feature under THIS fixture class (borrowed/assert-nothing "
+                                f"greens cannot honestly produce this).",
+                            )
                             for test_file in cell["testFiles"]:
                                 self.assertTrue(
                                     (REPO_ROOT / test_file).exists(),
@@ -92,6 +99,61 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
                         else:
                             self.assertTrue(cell.get("gapReason"))
                             self.assertTrue(cell.get("nextProof"))
+
+    def test_covered_cells_state_distinct_proves_behavior(self):
+        """A covered cell must make a DISTINCT claim about what its test proves.
+
+        Two covered cells sharing an identical provesBehavior means one test is
+        being reused to satisfy an unrelated cell (a borrowed green). A test that
+        genuinely proves a specific feature x fixture-class cannot honestly carry
+        the same claim as a different cell.
+        """
+        fixture_map = _read_json(FIXTURE_MAP_PATH)
+        seen: dict[str, str] = {}
+        for feature_id, cells in fixture_map["featureFixtureMatrix"].items():
+            for fixture_class, cell in cells.items():
+                if cell.get("status") != "covered":
+                    continue
+                proves = " ".join((cell.get("provesBehavior") or "").split()).lower()
+                with self.subTest(feature=feature_id, fixture_class=fixture_class):
+                    self.assertTrue(
+                        proves,
+                        f"{feature_id}/{fixture_class} covered cell has no provesBehavior.",
+                    )
+                    self.assertNotIn(
+                        proves,
+                        seen,
+                        f"{feature_id}/{fixture_class} shares an identical provesBehavior "
+                        f"with {seen.get(proves)} - a borrowed/assert-nothing green.",
+                    )
+                seen[proves] = f"{feature_id}/{fixture_class}"
+
+    def test_gap_cells_state_distinct_gap_reasons(self):
+        """Templated boilerplate gap reasons are banned.
+
+        Each uncovered cell must name its own specific missing proof; identical
+        gapReasons signal copy-pasted placeholders that hide what is actually
+        unproven.
+        """
+        fixture_map = _read_json(FIXTURE_MAP_PATH)
+        seen: dict[str, str] = {}
+        for feature_id, cells in fixture_map["featureFixtureMatrix"].items():
+            for fixture_class, cell in cells.items():
+                if cell.get("status") == "covered":
+                    continue
+                reason = " ".join((cell.get("gapReason") or "").split()).lower()
+                with self.subTest(feature=feature_id, fixture_class=fixture_class):
+                    self.assertTrue(
+                        reason,
+                        f"{feature_id}/{fixture_class} gap cell has no gapReason.",
+                    )
+                    self.assertNotIn(
+                        reason,
+                        seen,
+                        f"{feature_id}/{fixture_class} shares an identical gapReason with "
+                        f"{seen.get(reason)} - templated boilerplate is banned.",
+                    )
+                seen[reason] = f"{feature_id}/{fixture_class}"
 
     def test_fixture_map_covers_required_events_and_combinations(self):
         gradebook = _read_json(GRADEBOOK_PATH)
