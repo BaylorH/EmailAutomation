@@ -29,7 +29,7 @@ os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
     "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
 )
-sys.path.insert(0, "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as appmod  # noqa: E402
 

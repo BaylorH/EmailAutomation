@@ -38,7 +38,7 @@ os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
     "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
 )
-sys.path.insert(0, "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as appmod  # noqa: E402
 
@@ -133,6 +133,16 @@ class TriggerSchedulerFuzz(unittest.TestCase):
         self._p_thread.start()
         self.addCleanup(self._p_thread.stop)
 
+        # --- Firebase ID-token verification: the hardened route now requires a
+        # verified token. Patch the Admin SDK verifier so the authorised path is
+        # exercised; requests still must carry an Authorization: Bearer header.
+        self._p_verify = patch(
+            "firebase_admin.auth.verify_id_token", return_value={"uid": "u1"}
+        )
+        self.verify_mock = self._p_verify.start()
+        self.addCleanup(self._p_verify.stop)
+        self.AUTH = {"Authorization": "Bearer testtoken"}
+
         self.addCleanup(self._restore_available)
 
     def _restore_available(self):
@@ -181,9 +191,10 @@ class TriggerSchedulerFuzz(unittest.TestCase):
 
     # ------------------------------------------------------------------- happy
     def test_happy_path_empty_json_body(self):
-        """Realistic FE payload: empty body, application/json -> 200 + triggers."""
+        """Realistic FE payload: empty body, application/json + auth -> 200 + triggers."""
         resp = self.client.post(
-            "/api/trigger-scheduler", data="", content_type="application/json"
+            "/api/trigger-scheduler", data="", content_type="application/json",
+            headers=self.AUTH,
         )
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
         data = resp.get_json()
@@ -199,8 +210,8 @@ class TriggerSchedulerFuzz(unittest.TestCase):
         self.assertFalse(appmod.scheduler_status["running"])
 
     def test_happy_path_no_body_at_all(self):
-        """Some callers POST with no Content-Type/body -> still handled."""
-        resp = self.client.post("/api/trigger-scheduler")
+        """Some callers POST with no Content-Type/body -> still handled (authorised)."""
+        resp = self.client.post("/api/trigger-scheduler", headers=self.AUTH)
         self._assert_robust(resp, "no-body")
         self.assertIn(resp.status_code, (200, 400, 415))
         self._assert_no_disallowed_send() if resp.status_code != 200 else None
@@ -210,7 +221,8 @@ class TriggerSchedulerFuzz(unittest.TestCase):
         """If a run is in progress the trigger is refused (correct guard)."""
         appmod.scheduler_status["running"] = True
         resp = self.client.post(
-            "/api/trigger-scheduler", data="", content_type="application/json"
+            "/api/trigger-scheduler", data="", content_type="application/json",
+            headers=self.AUTH,
         )
         self.assertEqual(resp.status_code, 409)
         self.assertFalse(resp.get_json().get("success"))
@@ -221,7 +233,8 @@ class TriggerSchedulerFuzz(unittest.TestCase):
         """If scheduler deps are missing -> 503 fail-closed, no send."""
         appmod.SCHEDULER_AVAILABLE = False
         resp = self.client.post(
-            "/api/trigger-scheduler", data="", content_type="application/json"
+            "/api/trigger-scheduler", data="", content_type="application/json",
+            headers=self.AUTH,
         )
         self.assertEqual(resp.status_code, 503)
         self.assertFalse(resp.get_json().get("success"))
@@ -315,6 +328,17 @@ class TriggerSchedulerFuzz(unittest.TestCase):
         )
         self.run_scheduler_mock.assert_not_called()
 
+    def test_invalid_token_is_rejected(self):
+        """A present-but-invalid bearer token must be refused (401), no send."""
+        self.verify_mock.side_effect = ValueError("bad token")
+        resp = self.client.post(
+            "/api/trigger-scheduler", data="", content_type="application/json",
+            headers={"Authorization": "Bearer not-a-real-token"},
+        )
+        self.assertEqual(resp.status_code, 401, resp.get_data(as_text=True))
+        self.run_scheduler_mock.assert_not_called()
+        self._assert_no_disallowed_send()
+
     def test_no_request_level_mutex_allows_double_trigger(self):
         """
         BUG (TOCTOU / duplicate-send). The 'already running' guard checks
@@ -328,11 +352,13 @@ class TriggerSchedulerFuzz(unittest.TestCase):
         with patch.object(appmod.threading, "Thread", DeferredThread):
             appmod.scheduler_status["running"] = False
             r1 = self.client.post(
-                "/api/trigger-scheduler", data="", content_type="application/json"
+                "/api/trigger-scheduler", data="", content_type="application/json",
+                headers=self.AUTH,
             )
             # Worker hasn't run yet (flag still False), exactly like the real race.
             r2 = self.client.post(
-                "/api/trigger-scheduler", data="", content_type="application/json"
+                "/api/trigger-scheduler", data="", content_type="application/json",
+                headers=self.AUTH,
             )
 
         statuses = (r1.status_code, r2.status_code)

@@ -122,9 +122,17 @@ class FirestoreCleanupFuzz(unittest.TestCase):
         # Force it on so the handler body (the thing under test) actually runs.
         self._sched = appmod.SCHEDULER_AVAILABLE
         appmod.SCHEDULER_AVAILABLE = True
+        # Route early-returns 403 unless destructive admin routes are enabled.
+        # In the target (non-prod dev) deployment this gate is open; enable it so
+        # the handler body under test runs (mirrors the SCHEDULER_AVAILABLE force).
+        self._destructive_patch = patch.object(
+            appmod, "_destructive_admin_routes_enabled", lambda: True
+        )
+        self._destructive_patch.start()
 
     def tearDown(self):
         appmod.SCHEDULER_AVAILABLE = self._sched
+        self._destructive_patch.stop()
 
     # -- helpers ----------------------------------------------------------
     def _post(self, payload=None, store=None, users=("u1",), raw=None,

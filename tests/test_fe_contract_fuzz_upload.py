@@ -37,7 +37,7 @@ os.environ.setdefault(
     "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
 )
 
-REPO = "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 import app as appmod  # noqa: E402
@@ -84,16 +84,27 @@ class UploadFuzz(unittest.TestCase):
         self._p2 = patch("email_automation.clients._fs", MagicMock())
         self._p1.start()
         self._p2.start()
+        # The hardened /api/upload requires a verified Firebase ID token and
+        # derives the uid from it (ignoring session/body). Patch the verifier;
+        # _set_uid() below controls which uid the token resolves to.
+        self._p_verify = patch("firebase_admin.auth.verify_id_token")
+        self.verify_mock = self._p_verify.start()
+        self.verify_mock.return_value = {"uid": "web_user"}
+        self.AUTH = {"Authorization": "Bearer testtoken"}
         self._cleanup_paths = []
 
     def tearDown(self):
         self._p1.stop()
         self._p2.stop()
+        self._p_verify.stop()
         for p in self._cleanup_paths:
             shutil.rmtree(p, ignore_errors=True)
 
     # ---- helpers -------------------------------------------------------
     def _set_uid(self, uid):
+        # Identity now flows from the verified token. Point the verifier at `uid`
+        # (session is set too, but the hardened handler ignores it).
+        self.verify_mock.return_value = {"uid": uid}
         with self.client.session_transaction() as sess:
             sess["uid"] = uid
 
@@ -109,9 +120,10 @@ class UploadFuzz(unittest.TestCase):
 
     def _post(self, mut):
         if "__json__" in mut:
-            return self.client.post("/api/upload", json=mut["__json__"])
+            return self.client.post("/api/upload", json=mut["__json__"], headers=self.AUTH)
         return self.client.post(
-            "/api/upload", data=mut["data"], content_type=mut["content_type"]
+            "/api/upload", data=mut["data"], content_type=mut["content_type"],
+            headers=self.AUTH,
         )
 
     # ---- happy path ----------------------------------------------------
@@ -120,7 +132,7 @@ class UploadFuzz(unittest.TestCase):
         self._make_cache(uid)
         self._set_uid(uid)
 
-        r = self.client.post("/api/upload", json={})
+        r = self.client.post("/api/upload", json={}, headers=self.AUTH)
         self.assertEqual(r.status_code, 200)
         body = r.get_json()
         self.assertTrue(body.get("success"), f"expected success, got {body}")
@@ -135,8 +147,8 @@ class UploadFuzz(unittest.TestCase):
         uid = "fuzz_dup_" + uuid.uuid4().hex[:8]
         self._make_cache(uid)
         self._set_uid(uid)
-        r1 = self.client.post("/api/upload", json={})
-        r2 = self.client.post("/api/upload", json={})
+        r1 = self.client.post("/api/upload", json={}, headers=self.AUTH)
+        r2 = self.client.post("/api/upload", json={}, headers=self.AUTH)
         self.assertEqual(r1.status_code, 200)
         self.assertEqual(r2.status_code, 200)
         self.assertTrue(r1.get_json().get("success"))
@@ -178,7 +190,7 @@ class UploadFuzz(unittest.TestCase):
 
         # uid the front-end could set via GET /?uid=../<x>
         self._set_uid("../" + sentinel)
-        r = self.client.post("/api/upload", json={})
+        r = self.client.post("/api/upload", json={}, headers=self.AUTH)
 
         # CORRECT behaviour: reject the traversal, create nothing outside msal_caches.
         # Current handler runs os.makedirs("msal_caches/../<sentinel>") -> escapes.
@@ -198,7 +210,7 @@ class UploadFuzz(unittest.TestCase):
         secret = "INTERNAL_SECRET_/srv/creds/service-account.json:line42"
         self.upload_mock.side_effect = Exception(secret)
 
-        r = self.client.post("/api/upload", json={})
+        r = self.client.post("/api/upload", json={}, headers=self.AUTH)
         text = r.get_data(as_text=True)
 
         # CORRECT: generic error, no internal detail. Current: returns str(e) verbatim.
@@ -212,7 +224,7 @@ class UploadFuzz(unittest.TestCase):
     def test_error_uses_4xx_status(self):
         uid = "fuzz_nostatus_" + uuid.uuid4().hex[:8]  # no cache -> error branch
         self._set_uid(uid)
-        r = self.client.post("/api/upload", json={})
+        r = self.client.post("/api/upload", json={}, headers=self.AUTH)
         body = r.get_json(silent=True) or {}
         self.assertIn("error", body)  # it is an error response...
         # CORRECT: an error response should carry a 4xx status, not 200.
@@ -223,6 +235,35 @@ class UploadFuzz(unittest.TestCase):
             "upload as success.",
         )
         # And it must not have reached the Firebase boundary.
+        self.assertEqual(self.upload_mock.call_count, 0)
+
+    # ---- Firebase ID-token auth (hardened contract) -------------------------
+    def test_missing_token_is_rejected(self):
+        """No Authorization header -> 401, and the Firebase boundary is untouched."""
+        self._make_cache("fuzz_auth_" + uuid.uuid4().hex[:8])
+        r = self.client.post("/api/upload", json={})  # no auth header
+        self.assertEqual(r.status_code, 401, r.get_data(as_text=True))
+        self.assertEqual(self.upload_mock.call_count, 0)
+
+    def test_invalid_token_is_rejected(self):
+        """Present-but-invalid bearer token -> 401, no upload."""
+        self.verify_mock.side_effect = ValueError("bad token")
+        r = self.client.post(
+            "/api/upload", json={}, headers={"Authorization": "Bearer nope"}
+        )
+        self.assertEqual(r.status_code, 401, r.get_data(as_text=True))
+        self.assertEqual(self.upload_mock.call_count, 0)
+
+    def test_traversal_uid_in_token_is_rejected_no_write(self):
+        """Even a (mock-)verified token whose uid contains traversal is rejected
+        before any filesystem/Firebase write (defense in depth on the token uid)."""
+        sentinel = "fuzz_tok_traversal_" + uuid.uuid4().hex[:8]
+        escaped_dir = os.path.join(REPO, sentinel)
+        self._cleanup_paths.append(escaped_dir)
+        self.verify_mock.return_value = {"uid": "../" + sentinel}
+        r = self.client.post("/api/upload", json={}, headers=self.AUTH)
+        self.assertEqual(r.status_code, 400, r.get_data(as_text=True))
+        self.assertFalse(os.path.isdir(escaped_dir))
         self.assertEqual(self.upload_mock.call_count, 0)
 
 

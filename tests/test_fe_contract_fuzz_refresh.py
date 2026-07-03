@@ -78,7 +78,17 @@ class RefreshContractFuzz(unittest.TestCase):
         )
         self._msal_patch.start()
 
+        # The hardened /api/refresh requires a verified Firebase ID token; the
+        # uid now comes from the token (not the session), so the verifier returns
+        # the "web_user" uid the cache path (msal_caches/web_user/...) expects.
+        self._verify_patch = patch(
+            "firebase_admin.auth.verify_id_token", return_value={"uid": "web_user"}
+        )
+        self.verify_mock = self._verify_patch.start()
+        self.AUTH = {"Authorization": "Bearer testtoken"}
+
     def tearDown(self):
+        self._verify_patch.stop()
         self._msal_patch.stop()
         self._fs_patch.stop()
         os.chdir(self._prev_cwd)
@@ -86,7 +96,9 @@ class RefreshContractFuzz(unittest.TestCase):
 
     # ---- helpers -----------------------------------------------------------
     def _post(self, **kw):
-        return self.client.post("/api/refresh", **kw)
+        # Every authorised request carries the bearer header (verifier patched).
+        headers = kw.pop("headers", None) or dict(self.AUTH)
+        return self.client.post("/api/refresh", headers=headers, **kw)
 
     def _assert_no_stacktrace_no_500(self, resp):
         body = resp.get_data(as_text=True)
@@ -108,6 +120,23 @@ class RefreshContractFuzz(unittest.TestCase):
         # never with anything resembling a message/recipient payload.
         for c in self.msal.return_value.acquire_token_silent.call_args_list:
             self.assertNotIn("@", str(c.args))
+
+    # ---- authentication ----------------------------------------------------
+    def test_missing_token_is_rejected(self):
+        """No Authorization header -> 401, no MSAL work, no cache written."""
+        resp = self.client.post("/api/refresh", json={})
+        self.assertEqual(resp.status_code, 401, resp.get_data(as_text=True))
+        self.assertFalse(self.msal.return_value.acquire_token_silent.called)
+        self.assertFalse(os.path.exists(CACHE_REL))
+
+    def test_invalid_token_is_rejected(self):
+        """Present-but-invalid bearer token -> 401, no MSAL work."""
+        self.verify_mock.side_effect = ValueError("bad token")
+        resp = self.client.post(
+            "/api/refresh", json={}, headers={"Authorization": "Bearer nope"}
+        )
+        self.assertEqual(resp.status_code, 401, resp.get_data(as_text=True))
+        self.assertFalse(self.msal.return_value.acquire_token_silent.called)
 
     # ---- happy path --------------------------------------------------------
     def test_happy_path(self):
@@ -199,7 +228,9 @@ class RefreshContractFuzz(unittest.TestCase):
         self._assert_no_stacktrace_no_500(resp)
         data = resp.get_json()
         self.assertIn("error", data)
-        self.assertNotIn("success", data)
+        # Hardened contract: an unauthenticated MSAL state fails closed with
+        # success:false (was previously a bare {"error": ...} 200 fail-open).
+        self.assertFalse(data.get("success"))
         # No cache written when there was nothing to refresh.
         self.assertFalse(os.path.exists(CACHE_REL))
         self._assert_no_disallowed_send()
