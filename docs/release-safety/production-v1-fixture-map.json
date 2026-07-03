@@ -19,9 +19,9 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "covered": 54,
-    "needs_fixture": 54,
-    "needs_live_proof": 11
+    "covered": 64,
+    "needs_fixture": 45,
+    "needs_live_proof": 10
   },
   "featureFixtureMatrix": {
     "core.upload_mapping": {
@@ -271,7 +271,7 @@
         "nextProof": "Add or identify a deterministic core.name_resolution / manual_continuation fixture, then wire it to this map before reopening users."
       },
       "duplicate_retry": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -281,13 +281,13 @@
         "statePermutations": [
           "retry_reconciled"
         ],
-        "evidence": [
-          "automated",
-          "firestore",
-          "email"
+        "evidence": "Calling the real email._resolve_campaign_launch_contact_name_from_sheet twice on the identical campaign-launch row returns the identical contact name (\"Avery Brooks\") while genuinely re-reading the sheet both times, proving the resolution is stable/idempotent under duplicate retry rather than short-circuited by caching.",
+        "testFiles": [
+          "tests/test_rubric_core_name_resolution_duplicate_retry.py"
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.name_resolution yet.",
-        "nextProof": "Add or identify a deterministic core.name_resolution / duplicate_retry fixture, then wire it to this map before reopening users."
+        "testIds": [
+          "test_resolving_same_row_twice_is_stable_and_idempotent"
+        ]
       },
       "operator_visible_failure": {
         "status": "covered",
@@ -979,7 +979,7 @@
     },
     "core.inbox_matching": {
       "happy_path": {
-        "status": "needs_live_proof",
+        "status": "covered",
         "eventClasses": [
           "reply_all_cc_context"
         ],
@@ -989,12 +989,13 @@
         "statePermutations": [
           "live_waiting"
         ],
-        "evidence": [
-          "automated",
-          "firestore"
+        "evidence": "Exercising the real messaging.index_message_id then messaging.lookup_thread_by_message_id against a stateful in-memory Firestore double, the assertion proves a reply's internetMessageId round-trips back to the exact owning thread id (thread-42) that scan_inbox_against_index relies on, including angle-bracket normalization, while an unrelated id resolves to None.",
+        "testFiles": [
+          "tests/test_rubric_core_inbox_matching_happy_path.py"
         ],
-        "gapReason": "core.inbox_matching has partial automated coverage, but this happy_path class needs source-of-truth readback in the Baylor/BP21 proof.",
-        "nextProof": "Capture Firestore/Sheet/dashboard evidence for core.inbox_matching / happy_path during the Production V1 base campaign proof."
+        "testIds": [
+          "test_reply_is_matched_to_its_thread_by_internet_message_id"
+        ]
       },
       "terminal_state": {
         "status": "needs_live_proof",
@@ -1034,7 +1035,7 @@
         "nextProof": "Add or identify a deterministic core.inbox_matching / bad_placeholder fixture, then wire it to this map before reopening users."
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "reply_all_cc_context"
         ],
@@ -1044,13 +1045,13 @@
         "statePermutations": [
           "paused_manual_review"
         ],
-        "evidence": [
-          "automated",
-          "firestore",
-          "email"
+        "evidence": "It proves that the real processing._match_message_to_thread routes an inbound reply from a sender other than the expected broker to its own campaign thread via In-Reply-To/References lineage and never misroutes it into a concurrent campaign's thread, because matching keys off message-id lineage rather than sender identity.",
+        "testFiles": [
+          "tests/test_rubric_core_inbox_matching_wrong_recipient.py"
         ],
-        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.inbox_matching yet.",
-        "nextProof": "Add or identify a deterministic core.inbox_matching / wrong_recipient fixture, then wire it to this map before reopening users."
+        "testIds": [
+          "test_reply_from_non_broker_sender_matches_origin_thread_not_other_campaign"
+        ]
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -1072,7 +1073,7 @@
         "nextProof": "Add or identify a deterministic core.inbox_matching / manual_continuation fixture, then wire it to this map before reopening users."
       },
       "duplicate_retry": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "reply_all_cc_context"
         ],
@@ -1082,13 +1083,13 @@
         "statePermutations": [
           "retry_reconciled"
         ],
-        "evidence": [
-          "automated",
-          "firestore",
-          "email"
+        "evidence": "Exercising the real messaging.has_processed/mark_processed (only Firestore _fs is faked), it proves the same inbound message reports unprocessed then processed after one mark, and reprocessing it writes exactly one processed-marker doc \u2014 so a retry is idempotent and cannot double-act, while a different message id remains unaffected.",
+        "testFiles": [
+          "tests/test_rubric_core_inbox_matching_duplicate_retry.py"
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.inbox_matching yet.",
-        "nextProof": "Add or identify a deterministic core.inbox_matching / duplicate_retry fixture, then wire it to this map before reopening users."
+        "testIds": [
+          "test_duplicate_inbound_message_marks_processed_once_and_is_idempotent"
+        ]
       },
       "operator_visible_failure": {
         "status": "needs_live_proof",
@@ -1379,7 +1380,7 @@
         "nextProof": "Add or identify a deterministic core.event_classifier / bad_placeholder fixture, then wire it to this map before reopening users."
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_property_unavailable"
         ],
@@ -1389,13 +1390,13 @@
         "statePermutations": [
           "paused_manual_review"
         ],
-        "evidence": [
-          "automated",
-          "firestore",
-          "email"
+        "evidence": "On a deterministic wrong-contact signal, the classifier's outbound routing (build_wrong_contact_suggested_email) targets the suggested corrected recipient and the correct property row, and never the original wrong recipient (empty recipient list when no valid corrected address exists rather than falling back to the wrong row/person).",
+        "testFiles": [
+          "tests/test_rubric_core_event_classifier_wrong_recipient.py"
         ],
-        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.event_classifier yet.",
-        "nextProof": "Add or identify a deterministic core.event_classifier / wrong_recipient fixture, then wire it to this map before reopening users."
+        "testIds": [
+          "test_wrong_contact_signal_routes_to_suggested_recipient_not_original_wrong_row"
+        ]
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -1417,7 +1418,7 @@
         "nextProof": "Add or identify a deterministic core.event_classifier / manual_continuation fixture, then wire it to this map before reopening users."
       },
       "duplicate_retry": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_property_unavailable"
         ],
@@ -1427,13 +1428,13 @@
         "statePermutations": [
           "retry_reconciled"
         ],
-        "evidence": [
-          "automated",
-          "firestore",
-          "email"
+        "evidence": "It proves that a re-detected identical event produces the same dedup key from messaging.build_event_key, so messaging.is_event_handled reports it already handled after one messaging.mark_event_handled call \u2014 the retry cannot fire the event twice, and an unrelated event's record is preserved (not clobbered) by the dotted-field merge.",
+        "testFiles": [
+          "tests/test_rubric_core_event_classifier_duplicate_retry.py"
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.event_classifier yet.",
-        "nextProof": "Add or identify a deterministic core.event_classifier / duplicate_retry fixture, then wire it to this map before reopening users."
+        "testIds": [
+          "test_same_event_is_not_handled_twice_across_retry"
+        ]
       },
       "operator_visible_failure": {
         "status": "needs_fixture",
@@ -1659,7 +1660,7 @@
         "nextProof": "Add or identify a deterministic core.sheet_update / bad_placeholder fixture, then wire it to this map before reopening users."
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_available_full_specs"
         ],
@@ -1669,13 +1670,13 @@
         "statePermutations": [
           "paused_manual_review"
         ],
-        "evidence": [
-          "automated",
-          "firestore",
-          "email"
+        "evidence": "When a thread's stored rowNumber has gone stale after a sheet move so it now points at a different recipient's row, the real _find_row_by_anchor re-anchors by subject and returns the correct thread row (row 3, 808 Correct Deal Rd, target-broker) instead of the wrong-recipient row 5, proving an update writes to the correct row after a move.",
+        "testFiles": [
+          "tests/test_rubric_core_sheet_update_wrong_recipient.py"
         ],
-        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.sheet_update yet.",
-        "nextProof": "Add or identify a deterministic core.sheet_update / wrong_recipient fixture, then wire it to this map before reopening users."
+        "testIds": [
+          "test_update_reanchors_to_correct_row_not_stale_wrong_recipient_row"
+        ]
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -1697,7 +1698,7 @@
         "nextProof": "Add or identify a deterministic core.sheet_update / manual_continuation fixture, then wire it to this map before reopening users."
       },
       "duplicate_retry": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_available_full_specs"
         ],
@@ -1707,13 +1708,13 @@
         "statePermutations": [
           "retry_reconciled"
         ],
-        "evidence": [
-          "automated",
-          "firestore",
-          "email"
+        "evidence": "Applying the same gross-rent formula proposal twice via the real _apply_gross_rent_formula_for_row lands one identical formula in the identical gross-rent cell with byte-identical sheet state, proving the sheet update is idempotent with no doubled/corrupted formula on duplicate retry.",
+        "testFiles": [
+          "tests/test_rubric_core_sheet_update_duplicate_retry.py"
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.sheet_update yet.",
-        "nextProof": "Add or identify a deterministic core.sheet_update / duplicate_retry fixture, then wire it to this map before reopening users."
+        "testIds": [
+          "test_reapplying_same_proposal_is_idempotent_no_double_formula"
+        ]
       },
       "operator_visible_failure": {
         "status": "needs_live_proof",
@@ -1800,10 +1801,12 @@
           "email"
         ],
         "testFiles": [
-          "tests/test_followup_terminal_state.py"
+          "tests/test_followup_terminal_state.py",
+          "tests/test_rubric_core_followups_bad_placeholder.py"
         ],
         "testIds": [
-          "test_followup_blocks_malformed_recipient_before_graph_send"
+          "test_followup_blocks_malformed_recipient_before_graph_send",
+          "test_unresolved_name_placeholder_blocks_followup_send"
         ]
       },
       "wrong_recipient": {
@@ -1904,7 +1907,7 @@
     },
     "core.stop_cancel_dismiss": {
       "happy_path": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "dashboard_action_resolution"
         ],
@@ -1914,12 +1917,13 @@
         "statePermutations": [
           "live_waiting"
         ],
-        "evidence": [
-          "automated",
-          "firestore"
+        "evidence": "It proves that when a stopped client's real state is read via the production get_client_automation_pause gate, automation is flagged paused and the real stopped_followup_patch disables followUpConfig.enabled and clears nextFollowUpAt, so nothing further sends.",
+        "testFiles": [
+          "tests/test_rubric_core_stop_cancel_dismiss_happy_path.py"
         ],
-        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.stop_cancel_dismiss yet.",
-        "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / happy_path fixture, then wire it to this map before reopening users."
+        "testIds": [
+          "test_stopping_client_pauses_automation_and_disables_further_sends"
+        ]
       },
       "terminal_state": {
         "status": "covered",
@@ -2003,7 +2007,7 @@
         "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / manual_continuation fixture, then wire it to this map before reopening users."
       },
       "duplicate_retry": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "retry_after_uncertain_send"
         ],
@@ -2013,13 +2017,13 @@
         "statePermutations": [
           "retry_reconciled"
         ],
-        "evidence": [
-          "automated",
-          "firestore",
-          "email"
+        "evidence": "Driving the real email._send_single_outbox_item with a sendable-looking stale queued snapshot but a live-cancelled state on the recheck proves the pre-send reconciliation deletes the item and writes a \"cancelled\" audit without any graph send, so a cancelled item is not re-sent on a subsequent run.",
+        "testFiles": [
+          "tests/test_rubric_core_stop_cancel_dismiss_duplicate_retry.py"
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.stop_cancel_dismiss yet.",
-        "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / duplicate_retry fixture, then wire it to this map before reopening users."
+        "testIds": [
+          "test_cancelled_item_is_not_resent_on_subsequent_run_presend_recheck"
+        ]
       },
       "operator_visible_failure": {
         "status": "needs_fixture",
@@ -2128,13 +2132,15 @@
         "testFiles": [
           "tests/test_signature_footer.py",
           "tests/test_processing_reply_safety.py",
-          "tests/test_outbox_safety.py"
+          "tests/test_outbox_safety.py",
+          "tests/test_rubric_core_signature_identity_wrong_recipient.py"
         ],
         "testIds": [
           "test_custom_signature_rejects_stale_jill_html_for_other_users",
           "test_resolved_professional_signature_uses_structured_fields_over_stale_cached_html",
           "test_send_reply_in_thread_rejects_stale_jill_custom_signature_before_graph_patch",
-          "test_send_outboxes_resolves_structured_professional_signature_before_send"
+          "test_send_outboxes_resolves_structured_professional_signature_before_send",
+          "test_cached_jill_mohr_signature_is_not_leaked_to_unrelated_sender"
         ]
       },
       "manual_continuation": {
