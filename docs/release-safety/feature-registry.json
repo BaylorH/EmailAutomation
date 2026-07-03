@@ -226,7 +226,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["email_automation/processing.py", "email_automation/messaging.py", "email_automation/graph_scan_health.py"],
+        "backend": ["email_automation/processing.py", "email_automation/messaging.py"],
         "frontend": ["src/components/ConversationsPanel.jsx"],
         "functions": [],
         "firestoreRules": []
@@ -497,7 +497,7 @@
       "releaseStatus": "prod_guarded",
       "normalUserAccess": false,
       "ownerModules": {
-        "backend": ["email_automation/usage_tracking.py"],
+        "backend": ["email_automation/openai_usage.py"],
         "frontend": ["src/components/UsagePage.jsx"],
         "functions": ["functions/index.js"],
         "firestoreRules": ["firestore.rules"]
@@ -969,7 +969,7 @@
       "releaseStatus": "later",
       "normalUserAccess": false,
       "ownerModules": {
-        "backend": ["email_automation/usage_tracking.py", "email_automation/system_health.py"],
+        "backend": ["email_automation/openai_usage.py", "email_automation/system_health.py"],
         "frontend": ["src/components/UsagePage.jsx"],
         "functions": ["functions/index.js"],
         "firestoreRules": ["firestore.rules"]
