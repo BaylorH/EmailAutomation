@@ -2,8 +2,10 @@ import os
 import sys
 import subprocess
 import json
+import re
+from functools import wraps
 from datetime import datetime
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, g
 from flask_cors import CORS
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
@@ -16,6 +18,24 @@ from email_automation.app_config import (
 )
 import threading
 import time
+
+# Firebase Admin SDK — used to verify frontend-issued Firebase ID tokens on the
+# mutating / send-capable /api/* routes. Import is defensive so the module still
+# loads in environments where firebase_admin isn't installed; the auth decorator
+# below fails closed (401) if verification is unavailable.
+try:
+    import firebase_admin
+    from firebase_admin import auth as firebase_auth
+
+    if not firebase_admin._apps:
+        try:
+            firebase_admin.initialize_app()
+        except Exception as _fb_init_err:  # pragma: no cover - env dependent
+            print(f"⚠️ firebase_admin.initialize_app() deferred: {_fb_init_err}")
+except Exception as _fb_import_err:  # pragma: no cover - env dependent
+    firebase_admin = None
+    firebase_auth = None
+    print(f"⚠️ firebase_admin unavailable: {_fb_import_err}")
 
 # Constants for basic Flask app functionality (same as before)
 AUTHORITY = "https://login.microsoftonline.com/common"
@@ -122,6 +142,84 @@ AUTHORITY        = "https://login.microsoftonline.com/common"
 SCOPES           = ["Mail.ReadWrite", "Mail.Send"]
 CACHE_FILE       = "msal_token_cache.bin"
 
+# ---------------------------------------------------------------------------
+# Request-hardening helpers (shared by every /api/* POST handler)
+# ---------------------------------------------------------------------------
+
+# Strict charset for any identifier that is interpolated into a filesystem path
+# or a Firebase storage object path. Rejects path separators, "..", null bytes,
+# and any other traversal / injection vector.
+_UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+# Generic, non-revealing client-facing error text. Internal detail is logged
+# server-side only — never echoed to the client.
+_GENERIC_BAD_REQUEST = "Invalid request"
+_GENERIC_SERVER_ERROR = "Internal server error"
+
+
+def _safe_uid(value):
+    """Return the value iff it is a path-safe identifier string, else None."""
+    if isinstance(value, str) and _UID_RE.match(value):
+        return value
+    return None
+
+
+def _is_nonempty_str(value):
+    """True for a non-empty (after strip) string; False for every other type."""
+    return isinstance(value, str) and value.strip() != ""
+
+
+def _require_json_object():
+    """
+    Safely parse the request body as a JSON object.
+
+    Returns (data, None) on success, or (None, (response, status)) on failure.
+    Fails closed with a clean 400 and a GENERIC message (never raw werkzeug /
+    Python internals) when the content-type isn't JSON, the body is malformed,
+    or the decoded value is not a dict (None/str/int/list/bool).
+    """
+    if not request.is_json:
+        return None, (jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return None, (jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400)
+    return data, None
+
+
+def verify_firebase_token(f):
+    """
+    Decorator: require a valid Firebase ID token on a mutating/send-capable route.
+
+    Reads `Authorization: Bearer <token>`, verifies it with the Firebase Admin
+    SDK, and stashes the verified uid on `g.firebase_uid`. Any missing / malformed
+    / unverifiable token fails closed with 401. The verified uid is the ONLY
+    trusted source of identity — handlers must ignore body/session uid.
+    """
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "") or ""
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"success": False, "error": "Authentication required"}), 401
+        token = auth_header[len("Bearer "):].strip()
+        if not token:
+            return jsonify({"success": False, "error": "Authentication required"}), 401
+        if firebase_auth is None:
+            print("❌ Firebase auth unavailable; rejecting authenticated request", flush=True)
+            return jsonify({"success": False, "error": "Authentication unavailable"}), 401
+        try:
+            decoded = firebase_auth.verify_id_token(token)
+        except Exception as e:
+            print(f"⚠️ Firebase token verification failed: {type(e).__name__}", flush=True)
+            return jsonify({"success": False, "error": "Invalid authentication token"}), 401
+        uid = decoded.get("uid") if isinstance(decoded, dict) else None
+        if not _is_nonempty_str(uid):
+            return jsonify({"success": False, "error": "Invalid authentication token"}), 401
+        g.firebase_uid = uid
+        return f(*args, **kwargs)
+
+    return wrapper
+
+
 # Get the base URL for redirect URI
 def get_base_url():
     return FRONTEND_EMAIL_ACCESS_URL
@@ -209,7 +307,12 @@ def run_scheduler():
 
 @app.route("/")
 def index():
-    uid = request.args.get("uid", "web_user")
+    # Sanitise the caller-supplied uid before it ever reaches the session (and,
+    # from there, filesystem / Firebase object paths). Anything that isn't a
+    # strict path-safe identifier falls back to the default rather than being
+    # trusted verbatim (previously a `?uid=../../..` set the session uid raw).
+    raw_uid = request.args.get("uid", "web_user")
+    uid = _safe_uid(raw_uid) or "web_user"
     session["uid"] = uid
     print(f"[INDEX] Setting UID in session: {uid}")
     status = check_token_status()
@@ -516,40 +619,52 @@ def api_status():
     return jsonify(check_token_status())
 
 @app.route("/api/upload", methods=["POST"])
+@verify_firebase_token
 def api_upload():
+    # Identity comes ONLY from the verified Firebase token, and is re-validated
+    # against the strict charset before touching the filesystem / Firebase path.
+    uid = _safe_uid(g.get("firebase_uid"))
+    if uid is None:
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
     try:
-        uid = session.get("uid", "web_user") 
         print(f"[UPLOAD] Upload requested for UID: {uid}")
-        
-        user_dir = f"msal_caches/{uid}" 
-        cache_file = f"{user_dir}/msal_token_cache.bin" 
+
+        user_dir = f"msal_caches/{uid}"
+        cache_file = f"{user_dir}/msal_token_cache.bin"
         os.makedirs(user_dir, exist_ok=True)
         if not os.path.exists(cache_file):
-            return jsonify({"error": "No token cache file found"})
-        
-        upload_token(FIREBASE_API_KEY, input_file=cache_file, user_id=session.get("uid", "web_user"))
+            return jsonify({"success": False, "error": "No token cache file found"}), 404
+
+        upload_token(FIREBASE_API_KEY, input_file=cache_file, user_id=uid)
         return jsonify({"success": True, "message": "Token uploaded to Firebase"})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        print(f"❌ Upload failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Upload failed"}), 500
 
 @app.route("/api/clear", methods=["POST"])
 def api_clear():
+    uid = _safe_uid(session.get("uid", "web_user"))
+    if uid is None:
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
     try:
-        uid = session.get("uid", "web_user") 
-        user_dir = f"msal_caches/{uid}" 
-        cache_file = f"{user_dir}/msal_token_cache.bin" 
+        user_dir = f"msal_caches/{uid}"
+        cache_file = f"{user_dir}/msal_token_cache.bin"
         os.makedirs(user_dir, exist_ok=True)
         if os.path.exists(cache_file):
             os.remove(cache_file)
         return jsonify({"success": True, "message": "Token cache cleared"})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        print(f"❌ Clear failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Failed to clear token cache"}), 500
 
 @app.route("/api/refresh", methods=["POST"])
+@verify_firebase_token
 def api_refresh():
+    uid = _safe_uid(g.get("firebase_uid"))
+    if uid is None:
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
     try:
-        uid = session.get("uid", "web_user") 
-        user_dir = f"msal_caches/{uid}" 
+        user_dir = f"msal_caches/{uid}"
         cache_file = f"{user_dir}/msal_token_cache.bin" 
         os.makedirs(user_dir, exist_ok=True)
         cache = SerializableTokenCache()
@@ -565,65 +680,72 @@ def api_refresh():
         
         accounts = app_obj.get_accounts()
         if not accounts:
-            return jsonify({"error": "No accounts found"})
-        
+            # Fail-closed: an unauthenticated MSAL state is a client error, not a 200.
+            return jsonify({"success": False, "error": "No accounts found"}), 401
+
         result = app_obj.acquire_token_silent(
-            SCOPES, 
-            account=accounts[0], 
+            SCOPES,
+            account=accounts[0],
             force_refresh=True
         )
-        
+
         if result and "access_token" in result:
             with open(cache_file, "w") as f:
                 f.write(cache.serialize())
             return jsonify({"success": True, "message": "Token refreshed successfully"})
         else:
-            return jsonify({"error": f"Failed to refresh token: {result.get('error_description', 'Unknown error')}"})
-    
+            # result may be None (silent refresh not possible -> interaction
+            # required) or a dict carrying an MSAL error. Either way this is a
+            # clean re-auth signal, never a leaked internal AttributeError.
+            return jsonify({"success": False, "error": "Re-authentication required"}), 401
+
     except Exception as e:
-        return jsonify({"error": str(e)})
+        # Upstream (MSAL / filesystem) failure. Fail closed with a generic 5xx
+        # (502) — never the raw exception text, never a fail-open 200.
+        print(f"❌ Token refresh failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Token refresh failed"}), 502
 
 # Global variable to track scheduler status
 scheduler_status = {"running": False, "last_run": None, "last_result": None}
+# Request-level mutex so two back-to-back triggers can't both pass the
+# "already running" guard before either worker thread flips the flag (TOCTOU).
+_scheduler_lock = threading.Lock()
 
 @app.route("/api/trigger-scheduler", methods=["POST"])
+@verify_firebase_token
 def api_trigger_scheduler():
     """
     API endpoint to manually trigger the email scheduler.
     This runs the same logic as the GitHub Actions workflow.
+
+    Send-capable (real Microsoft Graph Mail.Send) -> requires a verified Firebase
+    ID token (@verify_firebase_token) AND the dev-scope availability guard below.
     """
     global scheduler_status
-    
-    # Check if scheduler functionality is available
+
+    # Check if scheduler functionality is available (dev-scope guard).
     if not SCHEDULER_AVAILABLE:
         return jsonify({
             "success": False,
             "error": "Scheduler functionality not available - missing required environment variables or dependencies"
         }), 503
-    
-    # Check if scheduler is already running
-    if scheduler_status["running"]:
-        return jsonify({
-            "success": False, 
-            "error": "Scheduler is already running",
-            "status": scheduler_status
-        }), 409
-    
-    # Optional: Add basic authentication
-    auth_header = request.headers.get('Authorization')
-    api_key = request.headers.get('X-API-Key')
-    
-    # You can add your own API key validation here
-    # For now, we'll allow any request, but you should add security
-    
+
+    # Atomically claim the run so concurrent/rapid triggers can't double-start.
+    with _scheduler_lock:
+        if scheduler_status["running"]:
+            return jsonify({
+                "success": False,
+                "error": "Scheduler is already running",
+                "status": scheduler_status
+            }), 409
+        scheduler_status["running"] = True
+        scheduler_status["last_run"] = datetime.now().isoformat()
+
     def run_scheduler_async():
         """Run scheduler in background thread"""
         global scheduler_status
         import sys
         try:
-            scheduler_status["running"] = True
-            scheduler_status["last_run"] = datetime.now().isoformat()
-
             print("🚀 Manual scheduler trigger initiated", flush=True)
             result = run_scheduler()
 
@@ -638,12 +760,18 @@ def api_trigger_scheduler():
             scheduler_status["running"] = False
             print(f"💥 Manual scheduler failed: {e}", flush=True)
             sys.stdout.flush()
-    
-    # Start scheduler in background thread
+
+    # Start scheduler in background thread. If starting the thread fails, release
+    # the claimed run so the endpoint isn't wedged in a permanent "running" state.
     thread = threading.Thread(target=run_scheduler_async)
     thread.daemon = True
-    thread.start()
-    
+    try:
+        thread.start()
+    except Exception as e:
+        scheduler_status["running"] = False
+        print(f"💥 Failed to start scheduler thread: {e}", flush=True)
+        return jsonify({"success": False, "error": "Failed to start scheduler"}), 500
+
     return jsonify({
         "success": True,
         "message": "Scheduler started successfully",
@@ -678,18 +806,24 @@ def api_decline_property():
     Delete a property row from a Google Sheet when user declines a new property suggestion.
     Expects JSON body: { uid, clientId, rowNumber, sheetId }
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
-
         uid = data.get("uid")
         client_id = data.get("clientId")
         row_number = data.get("rowNumber")
         sheet_id = data.get("sheetId")
 
-        if not all([uid, client_id, row_number, sheet_id]):
-            return jsonify({"success": False, "error": "Missing required fields: uid, clientId, rowNumber, sheetId"}), 400
+        # uid / clientId / sheetId must be non-empty strings.
+        if not all(_is_nonempty_str(v) for v in (uid, client_id, sheet_id)):
+            return jsonify({"success": False, "error": "Missing required fields: uid, clientId, sheetId"}), 400
+
+        # rowNumber must be a POSITIVE INTEGER — validated BEFORE the destructive
+        # deleteDimension. bool is a subclass of int, so reject it explicitly;
+        # floats, strings, and non-positive values are rejected too.
+        if isinstance(row_number, bool) or not isinstance(row_number, int) or row_number < 1:
+            return jsonify({"success": False, "error": "rowNumber must be a positive integer"}), 400
 
         # Import sheets client
         from email_automation.clients import _sheets_client
@@ -726,8 +860,8 @@ def api_decline_property():
         })
 
     except Exception as e:
-        print(f"❌ Failed to decline property: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"❌ Failed to decline property: {type(e).__name__}: {e}")
+        return jsonify({"success": False, "error": "Failed to decline property"}), 500
 
 
 @app.route("/api/accept-new-property", methods=["POST"])
@@ -738,18 +872,22 @@ def api_accept_new_property():
     Expects JSON body: { uid, clientId, notificationId, propertyData }
     propertyData: { address, city, link, notes, leasingCompany, leasingContact, brokerEmail, sheetId, tabTitle }
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
-
         uid = data.get("uid")
         client_id = data.get("clientId")
         notification_id = data.get("notificationId")
         property_data = data.get("propertyData", {})
 
-        if not all([uid, client_id, notification_id]):
+        if not all(_is_nonempty_str(v) for v in (uid, client_id, notification_id)):
             return jsonify({"success": False, "error": "Missing required fields: uid, clientId, notificationId"}), 400
+
+        # propertyData must be an object (absent -> {} which then fails on the
+        # required sheetId/address checks below). null / str / int / list -> 400.
+        if not isinstance(property_data, dict):
+            return jsonify({"success": False, "error": "propertyData must be an object"}), 400
 
         # Extract property data
         address = property_data.get("address", "")
@@ -884,10 +1022,10 @@ def api_accept_new_property():
         })
 
     except Exception as e:
-        print(f"❌ Failed to accept new property: {e}")
+        print(f"❌ Failed to accept new property: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Failed to accept new property"}), 500
 
 
 @app.route("/api/resume-conversation", methods=["POST"])
@@ -901,17 +1039,22 @@ def api_resume_conversation():
 
     Expects JSON body: { uid, threadId, clientId? }
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json(silent=True) or request.form.to_dict() or request.args.to_dict()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
-
         uid = data.get("uid") or data.get("userId") or data.get("user_id")
         thread_id = data.get("threadId") or data.get("thread_id")
         client_id = data.get("clientId") or data.get("client_id")  # Optional, used to find sheet
 
-        if not uid or not thread_id:
+        # uid / threadId must be non-empty strings with no path separators (they
+        # are interpolated directly into a Firestore document path).
+        if not _is_nonempty_str(uid) or not _is_nonempty_str(thread_id):
             return jsonify({"success": False, "error": "Missing required fields: uid, threadId"}), 400
+        if "/" in uid or "/" in thread_id:
+            return jsonify({"success": False, "error": "Invalid uid or threadId"}), 400
+        if client_id is not None and not isinstance(client_id, str):
+            return jsonify({"success": False, "error": "Invalid clientId"}), 400
 
         from email_automation.clients import _fs, _get_client_config
         from email_automation.messaging import update_thread_status, THREAD_STATUS
@@ -975,10 +1118,10 @@ def api_resume_conversation():
         })
 
     except Exception as e:
-        print(f"❌ Failed to resume conversation: {e}", flush=True)
+        print(f"❌ Failed to resume conversation: {type(e).__name__}: {e}", flush=True)
         import traceback
         traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Failed to resume conversation"}), 500
 
 
 @app.route("/api/stop-conversation", methods=["POST"])
@@ -991,17 +1134,22 @@ def api_stop_conversation():
 
     Expects JSON body: { uid, threadId, clientId? }
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
-
         uid = data.get("uid")
         thread_id = data.get("threadId")
         client_id = data.get("clientId")  # Optional, used to find sheet
 
-        if not uid or not thread_id:
+        # uid / threadId must be non-empty strings with no path separators (they
+        # are interpolated directly into a Firestore document path).
+        if not _is_nonempty_str(uid) or not _is_nonempty_str(thread_id):
             return jsonify({"success": False, "error": "Missing required fields: uid, threadId"}), 400
+        if "/" in uid or "/" in thread_id:
+            return jsonify({"success": False, "error": "Invalid uid or threadId"}), 400
+        if client_id is not None and not isinstance(client_id, str):
+            return jsonify({"success": False, "error": "Invalid clientId"}), 400
 
         from email_automation.clients import _fs, _get_client_config
         from email_automation.messaging import update_thread_status, THREAD_STATUS
@@ -1058,10 +1206,10 @@ def api_stop_conversation():
         })
 
     except Exception as e:
-        print(f"❌ Failed to stop conversation: {e}", flush=True)
+        print(f"❌ Failed to stop conversation: {type(e).__name__}: {e}", flush=True)
         import traceback
         traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Failed to stop conversation"}), 500
 
 
 @app.route("/api/clear-optout", methods=["POST"])
@@ -1070,15 +1218,16 @@ def api_clear_optout():
     Clear an opt-out record for a contact, allowing emails to be sent again.
     Expects JSON body: { uid, email }
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
-
         uid = data.get("uid")
         email = data.get("email")
 
-        if not uid or not email:
+        # Both must be non-empty strings — a non-string email would blow up on
+        # .lower()/.strip(); a non-string uid would corrupt the Firestore path.
+        if not _is_nonempty_str(uid) or not _is_nonempty_str(email):
             return jsonify({"success": False, "error": "Missing required fields: uid, email"}), 400
 
         import hashlib
@@ -1115,8 +1264,8 @@ def api_clear_optout():
         })
 
     except Exception as e:
-        print(f"❌ Failed to clear opt-out: {e}", flush=True)
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"❌ Failed to clear opt-out: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Failed to clear opt-out"}), 500
 
 
 @app.route("/api/list-optouts", methods=["POST"])
@@ -1125,13 +1274,12 @@ def api_list_optouts():
     List all opted-out contacts for a user.
     Expects JSON body: { uid }
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
-
         uid = data.get("uid")
-        if not uid:
+        if not _is_nonempty_str(uid):
             return jsonify({"success": False, "error": "Missing required field: uid"}), 400
 
         from email_automation.clients import _fs
@@ -1159,8 +1307,8 @@ def api_list_optouts():
         })
 
     except Exception as e:
-        print(f"❌ Failed to list opt-outs: {e}", flush=True)
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"❌ Failed to list opt-outs: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Failed to list opt-outs"}), 500
 
 
 @app.route("/api/check-sheet-completion", methods=["POST"])
@@ -1169,13 +1317,12 @@ def api_check_sheet_completion():
     Check if all rows in a sheet have all required fields filled.
     Returns completion status and details.
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
-
         sheet_id = data.get("sheetId")
-        if not sheet_id:
+        if not _is_nonempty_str(sheet_id):
             return jsonify({"success": False, "error": "Missing sheetId"}), 400
 
         from email_automation.clients import _sheets_client
@@ -1243,8 +1390,8 @@ def api_check_sheet_completion():
         })
 
     except Exception as e:
-        print(f"❌ Failed to check sheet completion: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"❌ Failed to check sheet completion: {type(e).__name__}: {e}")
+        return jsonify({"success": False, "error": "Failed to check sheet completion"}), 500
 
 
 @app.route("/api/debug-inbox", methods=["GET"])
@@ -2250,18 +2397,32 @@ def api_firestore_cleanup():
     if not SCHEDULER_AVAILABLE:
         return jsonify({"success": False, "error": "Scheduler not available"}), 503
 
+    data, err = _require_json_object()
+    if err:
+        return err
+
+    # Destructive flags must be STRICT booleans — a string like "false"/"0"/"off"
+    # (or any non-empty string) must NEVER trigger a deletion. Only real `true`.
+    clear_dead_letter = data.get("clear_dead_letter", False) is True
+    clear_processed = data.get("clear_processed_messages", False) is True
+    clear_changelog = data.get("clear_sheet_change_log", False) is True
+
+    # clear_old_threads must be a real (non-bool) positive int; any other type
+    # (str/list/dict/bool) is treated as "don't clear" rather than crashing.
+    _raw_days = data.get("clear_old_threads", 0)
+    clear_old_threads_days = _raw_days if (type(_raw_days) is int and _raw_days > 0) else 0
+
+    # A blank / missing / non-string user_id must be REJECTED — never silently
+    # fanned out across every account by falling back to list_user_ids().
+    target_user = data.get("user_id")
+    if not _is_nonempty_str(target_user):
+        return jsonify({"success": False, "error": "user_id is required"}), 400
+
     try:
         from email_automation.clients import _fs, list_user_ids
         from datetime import datetime, timedelta
 
-        data = request.get_json() or {}
-        clear_dead_letter = data.get("clear_dead_letter", False)
-        clear_processed = data.get("clear_processed_messages", False)
-        clear_changelog = data.get("clear_sheet_change_log", False)
-        clear_old_threads_days = data.get("clear_old_threads", 0)
-        target_user = data.get("user_id")
-
-        users = [target_user] if target_user else list_user_ids()
+        users = [target_user]
         results = {}
 
         for uid in users:
@@ -2347,7 +2508,8 @@ def api_firestore_cleanup():
         return jsonify({"success": True, "results": results})
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"❌ Firestore cleanup failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Firestore cleanup failed"}), 500
 
 
 @app.route("/api/clear-outlook-emails", methods=["POST"])
@@ -2436,7 +2598,8 @@ def api_clear_outlook_emails():
         })
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"❌ Clear Outlook emails failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Failed to clear Outlook emails"}), 500
 
 
 if __name__ == "__main__":
