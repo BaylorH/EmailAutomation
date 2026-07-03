@@ -185,7 +185,9 @@
         ],
         "incidentId": "karsen_name_placeholder_positive_resolution",
         "gapReason": "Automated send-path tests prove name placeholders are replaced before Graph send guards, but do not yet prove source-of-truth row/name-column readback through Firestore, Sheets, and delivered email.",
-        "nextProof": "Run the Baylor/BP21 Production V1 base campaign proof with a chosen name column, then read back queued outbox/body, Firestore thread contactName, Sheet row identity, and delivered email greeting before marking this covered."
+        "nextProof": "Run the Baylor/BP21 Production V1 base campaign proof with a chosen name column, then read back queued outbox/body, Firestore thread contactName, Sheet row identity, and delivered email greeting before marking this covered.",
+        "liveEvidence": "LIVE (dashboard source-of-truth): outreach sent to the row12 broker opened 'Hi Jason,' - the contact name resolved to 'Jason' from the sheet and personalized the live send; signed by baylor.freelance@outlook.com (whitelabel, not Jill). Source: League City BP21 Golden Replay 20260617 / 410 Genesis Blvd, Webster thread (broker bp21harrison+leaguecity-row12@gmail.com -> delivers to bp21harrison@gmail.com), dashboard readback 2026-07-02.",
+        "liveEvidenceStatus": "dashboard_captured_raw_firestore_pending"
       },
       "terminal_state": {
         "status": "covered",
@@ -1631,7 +1633,9 @@
           "firestore"
         ],
         "gapReason": "core.sheet_update has partial automated coverage, but this happy_path class needs source-of-truth readback in the Baylor/BP21 proof.",
-        "nextProof": "Capture Firestore/Sheet/dashboard evidence for core.sheet_update / happy_path during the Production V1 base campaign proof."
+        "nextProof": "Capture Firestore/Sheet/dashboard evidence for core.sheet_update / happy_path during the Production V1 base campaign proof.",
+        "liveEvidence": "LIVE (dashboard source-of-truth): the broker reply's specs were extracted and WRITTEN to the sheet - visible 'Updated:' chips Total SF=10000, Rent/SF/Yr=11.25, Ops Ex/SF=2.85, Drive Ins=2, Ceiling Ht=18, Power='400 amps / 3-phase' - each matching the reply body verbatim. Source: League City BP21 Golden Replay 20260617 / 410 Genesis Blvd, Webster thread (broker bp21harrison+leaguecity-row12@gmail.com -> delivers to bp21harrison@gmail.com), dashboard readback 2026-07-02.",
+        "liveEvidenceStatus": "dashboard_captured_raw_firestore_pending"
       },
       "terminal_state": {
         "status": "needs_fixture",
@@ -2536,7 +2540,9 @@
           "firestore"
         ],
         "gapReason": "admin.usage_readonly has partial automated coverage, but this happy_path class needs source-of-truth readback in the Baylor/BP21 proof.",
-        "nextProof": "Capture Firestore/Sheet/dashboard evidence for admin.usage_readonly / happy_path during the Production V1 base campaign proof."
+        "nextProof": "Capture Firestore/Sheet/dashboard evidence for admin.usage_readonly / happy_path during the Production V1 base campaign proof.",
+        "liveEvidence": "LIVE (dashboard source-of-truth): the Usage admin view renders month-to-date spend by user/day/workflow (GPT token spend, conversation handling, map & tour spend, daily cost by account) WITHOUT exposing broker emails or prompt text - the read-only privacy boundary holds. Captured 2026-07-02 on the operator account.",
+        "liveEvidenceStatus": "dashboard_captured_raw_firestore_pending"
       },
       "terminal_state": {
         "status": "needs_live_proof",
