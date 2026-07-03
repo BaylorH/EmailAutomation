@@ -19,9 +19,9 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "needs_fixture": 33,
+    "needs_fixture": 31,
     "needs_live_proof": 10,
-    "covered": 76
+    "covered": 78
   },
   "featureFixtureMatrix": {
     "core.upload_mapping": {
@@ -1101,7 +1101,7 @@
         "statePermutations": [
           "retry_reconciled"
         ],
-        "evidence": "Exercising the real messaging.has_processed/mark_processed (only Firestore _fs is faked), it proves the same inbound message reports unprocessed then processed after one mark, and reprocessing it writes exactly one processed-marker doc \u2014 so a retry is idempotent and cannot double-act, while a different message id remains unaffected.",
+        "evidence": "Exercising the real messaging.has_processed/mark_processed (only Firestore _fs is faked), it proves the same inbound message reports unprocessed then processed after one mark, and reprocessing it writes exactly one processed-marker doc — so a retry is idempotent and cannot double-act, while a different message id remains unaffected.",
         "testFiles": [
           "tests/test_rubric_core_inbox_matching_duplicate_retry.py"
         ],
@@ -1448,7 +1448,7 @@
         "statePermutations": [
           "retry_reconciled"
         ],
-        "evidence": "It proves that a re-detected identical event produces the same dedup key from messaging.build_event_key, so messaging.is_event_handled reports it already handled after one messaging.mark_event_handled call \u2014 the retry cannot fire the event twice, and an unrelated event's record is preserved (not clobbered) by the dotted-field merge.",
+        "evidence": "It proves that a re-detected identical event produces the same dedup key from messaging.build_event_key, so messaging.is_event_handled reports it already handled after one messaging.mark_event_handled call — the retry cannot fire the event twice, and an unrelated event's record is preserved (not clobbered) by the dotted-field merge.",
         "testFiles": [
           "tests/test_rubric_core_event_classifier_duplicate_retry.py"
         ],
@@ -1522,7 +1522,7 @@
         "nextProof": "Capture Firestore/Sheet/dashboard evidence for core.property_extraction / terminal_state during the Production V1 base campaign proof."
       },
       "bad_placeholder": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_available_full_specs"
         ],
@@ -1533,12 +1533,15 @@
           "live_waiting"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Drives the real apply_proposal_to_sheet (owner of property-extraction sheet writes) into an empty target cell so nothing but a placeholder guard can stop the write: a proposal value of '[NAME]' is skipped with reason 'placeholder-value' and issues ZERO batchUpdate, while an identical proposal carrying a resolved value ('Karsen Ellsworth') IS written to Sheet1!C3 - proving the block is caused by placeholder detection (outbound_safety.find_unresolved_placeholders), not by refusing the column."
         ],
-        "gapReason": "The claimed behavior (extraction never writes a literal placeholder/[NAME] token as a field value into the sheet) is NOT enforced by production code, so no honest deterministic test can pass on it. The extraction sheet-write function email_automation/ai_processing.py::apply_proposal_to_sheet (owner module for core.property_extraction) rejects only file:// URLs and skips Flyer/Floorplan columns in its per-update loop (~lines 691-757); it has NO bracket/placeholder value guard. Driving the REAL function (patching only the sheets datastore boundary) with proposal {\"column\":\"Address\",\"value\":\"[NAME]\",\"confidence\":0.9} into an empty cell returns applied=[{column:Address, range:Sheet1!A2, oldValue:'', newValue:'[NAME]'}] and enqueues a RAW batchUpdate writing '[NAME]' to the sheet. The only placeholder guards in the codebase (outbound_safety.find_unresolved_placeholders / UNRESOLVED_BRACKET_PLACEHOLDER_RE, email.NAME_PLACEHOLDER_RE, followup._send_followup_email fail-closed) protect the OUTBOUND-EMAIL body, not the extraction/sheet write. There is no discriminating guard to exercise, so a negative-control test cannot prove the behavior today.",
-        "nextProof": "Land a bracket-placeholder value guard in apply_proposal_to_sheet that, before appending to data_payload, skips any new_val matching outbound_safety.UNRESOLVED_BRACKET_PLACEHOLDER_RE (mirroring the existing file:// rejection) and records skipped reason 'placeholder-value'. Then add a deterministic fixture that patches only the Sheets datastore boundary and asserts (positive control) a '[NAME]' proposal appears in skipped and is absent from applied/data_payload, plus a negative control that a real value like '2500 SF' is applied - making the assertion discriminating. Until the guard exists, this cell stays needs_fixture."
+        "testFiles": [
+          "tests/test_rubric_core_property_extraction_bad_placeholder.py"
+        ],
+        "testIds": [
+          "test_placeholder_value_is_never_written_but_real_value_is"
+        ],
+        "provesBehavior": "Drives the real apply_proposal_to_sheet (owner of property-extraction sheet writes) into an empty target cell so nothing but a placeholder guard can stop the write: a proposal value of '[NAME]' is skipped with reason 'placeholder-value' and issues ZERO batchUpdate, while an identical proposal carrying a resolved value ('Karsen Ellsworth') IS written to Sheet1!C3 - proving the block is caused by placeholder detection (outbound_safety.find_unresolved_placeholders), not by refusing the column."
       },
       "wrong_recipient": {
         "status": "covered",
@@ -1665,7 +1668,7 @@
         ]
       },
       "bad_placeholder": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_available_full_specs"
         ],
@@ -1676,12 +1679,15 @@
           "live_waiting"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Drives the real insert_property_row_above_divider (with app.py launch as its only caller) and asserts the row actually written to the sheet sanitizes a '[NAME]' Broker value to empty while writing address/city verbatim; a negative control with a genuine broker name writes it through unchanged - proving the guard targets the unresolved placeholder, not the column."
         ],
-        "gapReason": "No production sheet-write path rejects/omits a literal placeholder value. apply_proposal_to_sheet (email_automation/ai_processing.py:651) writes new_val straight into the batchUpdate payload; its guards cover unknown-header, flyer/floorplan, file://, no-op, human-override, and existing-human-value, but none reject a bracket/[NAME] new value (its only 'placeholder' logic at line 738 inspects the OLD cell value to permit overwriting, not to reject a placeholder new value). insert_property_row_above_divider (sheet_operations.py:457, scheduler_runner.py:733) and app.py:784 write values verbatim with no filtering. Bracket-placeholder rejection exists only on the outbound EMAIL path (outbound_safety.py, followup.py), never on the sheet-cell write path, so there is no discriminating guard to exercise and no honest negative-control test can prove the behavior.",
-        "nextProof": "Add an unresolved-placeholder guard reusing outbound_safety.UNRESOLVED_BRACKET_PLACEHOLDER_RE in apply_proposal_to_sheet's update loop and in insert_property_row_above_divider, recording a 'placeholder-value' skip reason. Then a fake-Sheets fixture can assert (positive control) that a [NAME] new value is skipped/omitted from the batchUpdate payload while a real value is written (negative control), making the guard discriminating. Until that guard lands, this cell stays needs_fixture."
+        "testFiles": [
+          "tests/test_rubric_core_sheet_update_bad_placeholder.py"
+        ],
+        "testIds": [
+          "test_placeholder_cell_is_sanitized_but_real_value_written"
+        ],
+        "provesBehavior": "Drives the real insert_property_row_above_divider (with app.py launch as its only caller) and asserts the row actually written to the sheet sanitizes a '[NAME]' Broker value to empty while writing address/city verbatim; a negative control with a genuine broker name writes it through unchanged - proving the guard targets the unresolved placeholder, not the column."
       },
       "wrong_recipient": {
         "status": "covered",

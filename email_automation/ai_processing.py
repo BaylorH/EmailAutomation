@@ -20,6 +20,7 @@ from .column_config import (
 from .notification_payloads import sanitize_new_property_referral_response
 from .openai_usage import track_openai_usage_safely
 from .tour_scheduling import looks_like_tour_only_unavailable
+from .outbound_safety import find_unresolved_placeholders
 
 logger = logging.getLogger(__name__)
 
@@ -708,6 +709,14 @@ def apply_proposal_to_sheet(
             # Reject any file:// URLs - these are local paths that shouldn't be in the sheet
             if new_val.startswith("file://"):
                 skipped.append({"column": col_name, "reason": "invalid-local-path"})
+                continue
+
+            # Reject unresolved template placeholders (e.g. "[NAME]", "[BROKER]").
+            # This is the same leak class the outbound-email path already blocks
+            # via outbound_safety.find_unresolved_placeholders - never write a
+            # literal placeholder into a client sheet cell.
+            if find_unresolved_placeholders(new_val):
+                skipped.append({"column": col_name, "reason": "placeholder-value"})
                 continue
 
             col_idx = idx_map[key]                     # 1-based

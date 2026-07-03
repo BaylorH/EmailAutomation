@@ -3,6 +3,7 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs, _sheets_client
 from .sheets import _get_first_tab_title, _read_header_row2, _header_index_map, _first_sheet_props, _execute_with_retry, _col_letter
 from .utils import _subject_to_address_city
+from .outbound_safety import find_unresolved_placeholders
 
 
 def sync_thread_row_numbers_after_move(
@@ -489,6 +490,11 @@ def insert_property_row_above_divider(sheets, sheet_id: str, tab_title: str, val
         for col_name in header:
             key = col_name.strip().lower()
             value = values_by_header.get(key, "")
+            # Never write an unresolved template placeholder (e.g. "[NAME]") into
+            # a client sheet cell - sanitize to empty, mirroring the outbound-email
+            # placeholder guard (outbound_safety.find_unresolved_placeholders).
+            if value and find_unresolved_placeholders(str(value)):
+                value = ""
             row_values.append(value)
         
         # Insert the row - FIXED: Use sheet_id for both internal ID lookup and API calls
