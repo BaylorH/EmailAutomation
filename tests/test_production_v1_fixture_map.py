@@ -238,6 +238,64 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
             "stressSummary must match the stress-matrix cell counts.",
         )
 
+    def test_cross_feature_matrix_models_every_interaction_group(self):
+        """The integrated lane: every gradebook featureInteractionMatrix group
+        must be modeled as a crossFeatureMatrix cell - covered by a real
+        integration test (def-exists + distinct provesBehavior) or an honestly
+        named gap (distinct gapReason + nextProof). This turns the interaction
+        groups from prose into enforced coverage.
+        """
+        gradebook = _read_json(GRADEBOOK_PATH)
+        fixture_map = _read_json(FIXTURE_MAP_PATH)
+        interaction_groups = set(gradebook["featureInteractionMatrix"])
+        matrix = fixture_map.get("crossFeatureMatrix")
+        valid_statuses = set(fixture_map["statusLegend"])
+
+        self.assertTrue(matrix, "Fixture map must declare crossFeatureMatrix.")
+        self.assertEqual(
+            interaction_groups,
+            set(matrix),
+            "Every featureInteractionMatrix group must be modeled as a cross-feature cell.",
+        )
+
+        proves_seen: dict[str, str] = {}
+        gap_seen: dict[str, str] = {}
+        counts: Counter = Counter()
+        for group_id, cell in matrix.items():
+            with self.subTest(group=group_id):
+                self.assertIn(cell.get("status"), valid_statuses)
+                self.assertTrue(cell.get("features"))
+                self.assertTrue(cell.get("breakThisBy"))
+                counts[cell["status"]] += 1
+                if cell["status"] == "covered":
+                    self.assertTrue(cell.get("testFiles"))
+                    self.assertTrue(cell.get("testIds"))
+                    proves = " ".join((cell.get("provesBehavior") or "").split()).lower()
+                    self.assertTrue(proves, f"{group_id} covered cross-feature cell needs provesBehavior.")
+                    self.assertNotIn(proves, proves_seen, f"{group_id} shares provesBehavior with {proves_seen.get(proves)}.")
+                    proves_seen[proves] = group_id
+                    test_corpus = "\n".join(
+                        (REPO_ROOT / tf).read_text(errors="ignore") for tf in cell["testFiles"]
+                    )
+                    for test_id in cell["testIds"]:
+                        self.assertRegex(
+                            test_corpus,
+                            rf"def\s+{re.escape(test_id)}\s*\(",
+                            f"{group_id} references missing integration testId {test_id}.",
+                        )
+                else:
+                    self.assertTrue(cell.get("nextProof"))
+                    reason = " ".join((cell.get("gapReason") or "").split()).lower()
+                    self.assertTrue(reason, f"{group_id} gap needs gapReason.")
+                    self.assertNotIn(reason, gap_seen, f"{group_id} shares gapReason with {gap_seen.get(reason)}.")
+                    gap_seen[reason] = group_id
+
+        self.assertEqual(
+            dict(counts),
+            fixture_map.get("crossFeatureSummary"),
+            "crossFeatureSummary must match the cross-feature cell counts.",
+        )
+
     def test_fixture_map_covers_required_events_and_combinations(self):
         gradebook = _read_json(GRADEBOOK_PATH)
         fixture_map = _read_json(FIXTURE_MAP_PATH)

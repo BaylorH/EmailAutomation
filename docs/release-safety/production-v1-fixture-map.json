@@ -3316,5 +3316,179 @@
   "stressSummary": {
     "needs_fixture": 101,
     "covered": 1
+  },
+  "crossFeatureMatrix": {
+    "placeholder_name_through_send_path": {
+      "features": [
+        "core.upload_mapping",
+        "core.name_resolution",
+        "core.launch_draft",
+        "core.outbox_send",
+        "core.signature_identity"
+      ],
+      "breakThisBy": [
+        "missing-name column",
+        "ambiguous first/full-name column",
+        "formula-generated greeting",
+        "operator edits template after mapping"
+      ],
+      "inBaseV1Scope": true,
+      "status": "covered",
+      "testFiles": [
+        "tests/test_rubric_cross_feature_lanes.py"
+      ],
+      "testIds": [
+        "test_placeholder_name_is_blocked_on_every_send_surface"
+      ],
+      "provesBehavior": "Integration test drives the two real independent send surfaces with the SAME '[NAME]' token - outbound_safety.validate_outbound_body (email body) and ai_processing.apply_proposal_to_sheet (sheet cell) - and proves BOTH reject it (no batchUpdate, is_safe False) while a resolved name passes both, so an unresolved name introduced upstream (upload/name_resolution/launch) cannot leak on either the email or sheet channel."
+    },
+    "manual_reply_retry_followup_collision": {
+      "features": [
+        "core.outbox_send",
+        "core.inbox_matching",
+        "core.inbox_auto_reply",
+        "core.followups",
+        "core.health_recovery",
+        "core.scheduler_scope"
+      ],
+      "breakThisBy": [
+        "Graph accepted but index missing",
+        "user manually replied in Sent Items",
+        "broker replied after dead-letter",
+        "scheduler runs twice"
+      ],
+      "inBaseV1Scope": true,
+      "status": "covered",
+      "testFiles": [
+        "tests/test_rubric_cross_feature_lanes.py"
+      ],
+      "testIds": [
+        "test_manual_continuation_is_the_shared_retry_followup_collision_guard",
+        "test_retry_and_recovery_paths_share_one_collision_guard"
+      ],
+      "provesBehavior": "Integration test drives the real shared guard sent_mail_guard.find_sent_conversation_continuation_for_retry (positive: a newer in-conversation human send is detected; negative controls: none / different conversation are silent) AND asserts both email.py (outbox retry) and dead_letter_recovery.py (health recovery) reference the SAME guard object - so a manual reply colliding with a queued retry/followup is suppressed uniformly, not on one feature while silently missing on another."
+    },
+    "reply_all_privacy_boundary": {
+      "features": [
+        "core.reply_all_cc",
+        "core.manual_reply",
+        "core.inbox_auto_reply",
+        "core.followups"
+      ],
+      "breakThisBy": [
+        "broker adds teammate on Cc",
+        "blocked contact remains in Cc",
+        "wrong-contact redirects with a new email",
+        "alias/plus-address reply"
+      ],
+      "inBaseV1Scope": true,
+      "status": "needs_fixture",
+      "gapReason": "Cross-feature group 'reply_all_privacy_boundary' (core.reply_all_cc, core.manual_reply, core.inbox_auto_reply, core.followups) has no executable integration test yet - its interaction invariant is asserted only in prose (breakThisBy), not driven end-to-end.",
+      "nextProof": "Add an integration test that composes core.reply_all_cc, core.manual_reply, core.inbox_auto_reply, core.followups in one scenario (break vectors: broker adds teammate on Cc; blocked contact remains in Cc; wrong-contact redirects with a new email) and asserts the interaction invariant holds."
+    },
+    "property_status_taxonomy": {
+      "features": [
+        "core.event_classifier",
+        "core.property_extraction",
+        "core.sheet_update",
+        "results.summary_pdf",
+        "results.packet_pdf",
+        "tour.reply_handling"
+      ],
+      "breakThisBy": [
+        "not a fit",
+        "no longer available",
+        "tour not available",
+        "only office-heavy",
+        "available but missing rent"
+      ],
+      "inBaseV1Scope": false,
+      "status": "needs_fixture",
+      "gapReason": "Cross-feature group 'property_status_taxonomy' spans features outside the Base-V1 send core (results.summary_pdf, results.packet_pdf, tour.reply_handling); it belongs to the next-gen/infra rubric, so no Base-V1 integration test drives it yet.",
+      "nextProof": "When the next-gen/infra lanes are stood up, add an integration test that exercises 'property_status_taxonomy' end-to-end across core.event_classifier, core.property_extraction, core.sheet_update, results.summary_pdf, results.packet_pdf, tour.reply_handling and wire its testId here."
+    },
+    "dev_lane_containment": {
+      "features": [
+        "results.launcher",
+        "results.saved_rebuild",
+        "tour.planner_preview",
+        "tour.invite_queue",
+        "infra.shared_entitlements",
+        "infra.firestore_lane_rules"
+      ],
+      "breakThisBy": [
+        "normal user opens Results tab",
+        "old report has tour state",
+        "backend sees dev field set",
+        "frontend hidden button but callable API remains"
+      ],
+      "inBaseV1Scope": false,
+      "status": "needs_fixture",
+      "gapReason": "Cross-feature group 'dev_lane_containment' spans features outside the Base-V1 send core (results.launcher, results.saved_rebuild, tour.planner_preview, tour.invite_queue, infra.shared_entitlements, infra.firestore_lane_rules); it belongs to the next-gen/infra rubric, so no Base-V1 integration test drives it yet.",
+      "nextProof": "When the next-gen/infra lanes are stood up, add an integration test that exercises 'dev_lane_containment' end-to-end across results.launcher, results.saved_rebuild, tour.planner_preview, tour.invite_queue, infra.shared_entitlements, infra.firestore_lane_rules and wire its testId here."
+    },
+    "operator_lifecycle_admin_visibility": {
+      "features": [
+        "core.stop_cancel_dismiss",
+        "admin.usage_readonly",
+        "core.health_recovery",
+        "core.scheduler_scope",
+        "infra.observability"
+      ],
+      "breakThisBy": [
+        "operator stops a campaign while scheduler is running",
+        "normal user opens usage URL directly",
+        "dead-letter appears after stop",
+        "admin cost chart reads another user activity"
+      ],
+      "inBaseV1Scope": false,
+      "status": "needs_fixture",
+      "gapReason": "Cross-feature group 'operator_lifecycle_admin_visibility' spans features outside the Base-V1 send core (infra.observability); it belongs to the next-gen/infra rubric, so no Base-V1 integration test drives it yet.",
+      "nextProof": "When the next-gen/infra lanes are stood up, add an integration test that exercises 'operator_lifecycle_admin_visibility' end-to-end across core.stop_cancel_dismiss, admin.usage_readonly, core.health_recovery, core.scheduler_scope, infra.observability and wire its testId here."
+    },
+    "map_route_cost_surface": {
+      "features": [
+        "results.map_geocode",
+        "tour.route_timing",
+        "tour.alternate_time",
+        "admin.usage_readonly",
+        "infra.observability"
+      ],
+      "breakThisBy": [
+        "ambiguous geocode",
+        "route API failure",
+        "alternate tour time creates route conflict",
+        "mapping cost spike",
+        "normal user dev lane access"
+      ],
+      "inBaseV1Scope": false,
+      "status": "needs_fixture",
+      "gapReason": "Cross-feature group 'map_route_cost_surface' spans features outside the Base-V1 send core (results.map_geocode, tour.route_timing, tour.alternate_time, infra.observability); it belongs to the next-gen/infra rubric, so no Base-V1 integration test drives it yet.",
+      "nextProof": "When the next-gen/infra lanes are stood up, add an integration test that exercises 'map_route_cost_surface' end-to-end across results.map_geocode, tour.route_timing, tour.alternate_time, admin.usage_readonly, infra.observability and wire its testId here."
+    },
+    "firebase_worker_execution_plane": {
+      "features": [
+        "core.scheduler_scope",
+        "infra.cloud_scheduler",
+        "infra.cloud_tasks",
+        "infra.firestore_lane_rules",
+        "infra.observability"
+      ],
+      "breakThisBy": [
+        "two workers claim same queue",
+        "Cloud Task retries after Graph accept",
+        "Firestore rule allows dev lane mutation",
+        "scheduler widens scope",
+        "observability omits failed user"
+      ],
+      "inBaseV1Scope": false,
+      "status": "needs_fixture",
+      "gapReason": "Cross-feature group 'firebase_worker_execution_plane' spans features outside the Base-V1 send core (infra.cloud_scheduler, infra.cloud_tasks, infra.firestore_lane_rules, infra.observability); it belongs to the next-gen/infra rubric, so no Base-V1 integration test drives it yet.",
+      "nextProof": "When the next-gen/infra lanes are stood up, add an integration test that exercises 'firebase_worker_execution_plane' end-to-end across core.scheduler_scope, infra.cloud_scheduler, infra.cloud_tasks, infra.firestore_lane_rules, infra.observability and wire its testId here."
+    }
+  },
+  "crossFeatureSummary": {
+    "covered": 2,
+    "needs_fixture": 6
   }
 }
