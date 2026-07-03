@@ -19,9 +19,9 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "covered": 64,
-    "needs_fixture": 45,
-    "needs_live_proof": 10
+    "needs_fixture": 33,
+    "needs_live_proof": 10,
+    "covered": 76
   },
   "featureFixtureMatrix": {
     "core.upload_mapping": {
@@ -188,7 +188,7 @@
         "nextProof": "Run the Baylor/BP21 Production V1 base campaign proof with a chosen name column, then read back queued outbox/body, Firestore thread contactName, Sheet row identity, and delivered email greeting before marking this covered."
       },
       "terminal_state": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -199,11 +199,14 @@
           "stopped"
         ],
         "evidence": [
-          "automated",
-          "firestore"
+          "Driving the real email._send_multi_property_email loop, a terminal (cancelled) outbox thread is short-circuited by the cancellation gate and the contact-name resolver is invoked 0 times, whereas an otherwise-identical live thread reaches the resolver exactly once - proving name resolution/launch personalization is genuinely suppressed for terminal threads."
         ],
-        "gapReason": "No explicit Production V1 terminal_state fixture is mapped for core.name_resolution yet.",
-        "nextProof": "Add or identify a deterministic core.name_resolution / terminal_state fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_rubric_core_name_resolution_terminal_state.py"
+        ],
+        "testIds": [
+          "test_terminal_thread_gets_no_name_resolution_but_live_thread_does"
+        ]
       },
       "bad_placeholder": {
         "status": "covered",
@@ -233,7 +236,7 @@
         "incidentId": "karsen_name_placeholder"
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -244,12 +247,14 @@
           "paused_manual_review"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Resolving campaign row 12 returns that row's contact (\"Avery Brooks\") and reads exactly range Campaign!12:12, never the neighbor row 13's name (\"Blake Turner\"), proving the resolved name binds to the intended row only; a negative-control test confirms row 13 independently yields \"Blake Turner\" so the rows are genuinely distinct and the assertion is discriminating."
         ],
-        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.name_resolution yet.",
-        "nextProof": "Add or identify a deterministic core.name_resolution / wrong_recipient fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_rubric_core_name_resolution_wrong_recipient.py"
+        ],
+        "testIds": [
+          "test_resolution_binds_to_intended_row_not_neighbor"
+        ]
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -334,9 +339,9 @@
         "nextProof": "Add a Production V1 launch-draft fixture that starts from uploaded sheet/template data, verifies the queued outbox body resolves the selected name variable, and leaves unresolved placeholders operator-visible before any Graph send."
       },
       "terminal_state": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
-          "dashboard_action_resolution"
+          "launch_with_variable_mapping"
         ],
         "combinationPlaybooks": [
           "manual_reply_before_retry"
@@ -345,11 +350,14 @@
           "stopped"
         ],
         "evidence": [
-          "automated",
-          "firestore"
+          "It proves that a real campaign-launch outbox (source=dashboard_new_campaign) whose client/thread is in a terminal/stopped state is dropped to the dead-letter queue before send by the real gate email._pause_client_outbox_item_if_needed (returns True, _move_to_dead_letter called), while an identical launch outbox for a live client is NOT dropped (returns False, _move_to_dead_letter not called)."
         ],
-        "gapReason": "No explicit Production V1 terminal_state fixture is mapped for core.launch_draft yet.",
-        "nextProof": "Add or identify a deterministic core.launch_draft / terminal_state fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_rubric_core_launch_draft_terminal_state.py"
+        ],
+        "testIds": [
+          "test_launch_outbox_for_terminal_client_is_dropped_before_send"
+        ]
       },
       "bad_placeholder": {
         "status": "covered",
@@ -425,7 +433,7 @@
         "nextProof": "Add or identify a deterministic core.launch_draft / manual_continuation fixture, then wire it to this map before reopening users."
       },
       "duplicate_retry": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -436,12 +444,14 @@
           "retry_reconciled"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "A second claim of an already-claimed launch outbox item is refused (returns False) while fresh and stale-expired items are claimable (True), proving _claim_outbox_item's transactional idempotency prevents the same launch draft from being sent twice."
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.launch_draft yet.",
-        "nextProof": "Add or identify a deterministic core.launch_draft / duplicate_retry fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_rubric_core_launch_draft_duplicate_retry.py"
+        ],
+        "testIds": [
+          "test_same_launch_item_is_not_claimed_twice"
+        ]
       },
       "operator_visible_failure": {
         "status": "needs_fixture",
@@ -673,41 +683,47 @@
         ]
       },
       "terminal_state": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
-          "manual_user_continuation"
+          "reply_all_cc_context"
         ],
         "combinationPlaybooks": [
-          "manual_reply_before_retry"
+          "reply_all_cc_plus_blocked_contact"
         ],
         "statePermutations": [
-          "stopped"
+          "stopped",
+          "completed"
         ],
         "evidence": [
-          "automated",
-          "firestore"
+          "It exercises the real production guard _should_skip_processing_for_terminal_thread (the gate process_incoming_message uses to return early before the reply-all send path) and asserts it returns True for completed and stopped threads while returning False for active and stopped-but-reactivated threads, proving no reply-all is emitted into an already-terminal/stopped thread yet still allowed on live threads."
         ],
-        "gapReason": "No explicit Production V1 terminal_state fixture is mapped for core.reply_all_cc yet.",
-        "nextProof": "Add or identify a deterministic core.reply_all_cc / terminal_state fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_rubric_core_reply_all_cc_terminal_state.py"
+        ],
+        "testIds": [
+          "test_terminal_thread_blocks_reply_all_send"
+        ]
       },
       "bad_placeholder": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
-          "manual_user_continuation"
+          "reply_all_cc_context"
         ],
         "combinationPlaybooks": [
-          "manual_reply_before_retry"
+          "reply_all_cc_plus_blocked_contact"
         ],
         "statePermutations": [
-          "outbox_queued"
+          "dead_letter_visible"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Proves that in the outbox reply-all send path the real outbound-safety gate dead-letters (blocks before send) a reply body still containing an unresolved [NAME] placeholder with a placeholder-specific manual-review reason, while an identical body with the name resolved is not blocked."
         ],
-        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.reply_all_cc yet.",
-        "nextProof": "Add or identify a deterministic core.reply_all_cc / bad_placeholder fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_rubric_core_reply_all_cc_bad_placeholder.py"
+        ],
+        "testIds": [
+          "test_unresolved_placeholder_blocks_reply_all_before_send"
+        ]
       },
       "wrong_recipient": {
         "status": "covered",
@@ -754,9 +770,9 @@
         "nextProof": "Add or identify a deterministic core.reply_all_cc / manual_continuation fixture, then wire it to this map before reopening users."
       },
       "duplicate_retry": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
-          "retry_after_uncertain_send"
+          "reply_all_cc_context"
         ],
         "combinationPlaybooks": [
           "graph_accepted_but_index_missing"
@@ -765,12 +781,14 @@
           "retry_reconciled"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "When an already-sent reply-all whose CC line carries the retry recipient exists in Sent Items, the real sent_mail_guard returns that message's identity and its send-result marks the recipient as already-sent (reconcile, no resend), while a negative control with no matching Sent Items reply returns None (a real send would proceed) - making the match discriminating."
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.reply_all_cc yet.",
-        "nextProof": "Add or identify a deterministic core.reply_all_cc / duplicate_retry fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_rubric_core_reply_all_cc_duplicate_retry.py"
+        ],
+        "testIds": [
+          "test_existing_sent_reply_all_reconciles_without_resending"
+        ]
       },
       "operator_visible_failure": {
         "status": "covered",
@@ -1399,23 +1417,25 @@
         ]
       },
       "manual_continuation": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
-          "broker_property_unavailable"
+          "manual_user_continuation"
         ],
         "combinationPlaybooks": [
-          "tour_unavailable_but_property_viable"
+          "manual_reply_before_retry"
         ],
         "statePermutations": [
-          "live_waiting"
+          "retry_reconciled"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "When Sent Items shows the operator manually continued the thread after a processing failure, the real retry_processing_failures guard skips the failure and never re-invokes the classifier/auto reply-processing path, whereas the negative control with no continuation runs process_inbox_message exactly once and clears the failure."
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.event_classifier yet.",
-        "nextProof": "Add or identify a deterministic core.event_classifier / manual_continuation fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_rubric_core_event_classifier_manual_continuation.py"
+        ],
+        "testIds": [
+          "test_manual_continuation_blocks_auto_reprocessing"
+        ]
       },
       "duplicate_retry": {
         "status": "covered",
@@ -1517,11 +1537,11 @@
           "firestore",
           "email"
         ],
-        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.property_extraction yet.",
-        "nextProof": "Add or identify a deterministic core.property_extraction / bad_placeholder fixture, then wire it to this map before reopening users."
+        "gapReason": "The claimed behavior (extraction never writes a literal placeholder/[NAME] token as a field value into the sheet) is NOT enforced by production code, so no honest deterministic test can pass on it. The extraction sheet-write function email_automation/ai_processing.py::apply_proposal_to_sheet (owner module for core.property_extraction) rejects only file:// URLs and skips Flyer/Floorplan columns in its per-update loop (~lines 691-757); it has NO bracket/placeholder value guard. Driving the REAL function (patching only the sheets datastore boundary) with proposal {\"column\":\"Address\",\"value\":\"[NAME]\",\"confidence\":0.9} into an empty cell returns applied=[{column:Address, range:Sheet1!A2, oldValue:'', newValue:'[NAME]'}] and enqueues a RAW batchUpdate writing '[NAME]' to the sheet. The only placeholder guards in the codebase (outbound_safety.find_unresolved_placeholders / UNRESOLVED_BRACKET_PLACEHOLDER_RE, email.NAME_PLACEHOLDER_RE, followup._send_followup_email fail-closed) protect the OUTBOUND-EMAIL body, not the extraction/sheet write. There is no discriminating guard to exercise, so a negative-control test cannot prove the behavior today.",
+        "nextProof": "Land a bracket-placeholder value guard in apply_proposal_to_sheet that, before appending to data_payload, skips any new_val matching outbound_safety.UNRESOLVED_BRACKET_PLACEHOLDER_RE (mirroring the existing file:// rejection) and records skipped reason 'placeholder-value'. Then add a deterministic fixture that patches only the Sheets datastore boundary and asserts (positive control) a '[NAME]' proposal appears in skipped and is absent from applied/data_payload, plus a negative control that a real value like '2500 SF' is applied - making the assertion discriminating. Until the guard exists, this cell stays needs_fixture."
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_available_full_specs"
         ],
@@ -1532,12 +1552,14 @@
           "paused_manual_review"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Driving the real apply_proposal_to_sheet, it proves an extraction proposal's write guard is keyed on the row's address+city anchor (get_row_anchor/_read_ai_meta_row), so a neighbor property's stale AI_META record sharing the same rowNumber is ignored and the proposal applies to the correct row (404 New Way), while the negative control flipping only the AI_META anchor to match the current row correctly blocks the write as human-override."
         ],
-        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.property_extraction yet.",
-        "nextProof": "Add or identify a deterministic core.property_extraction / wrong_recipient fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_rubric_core_property_extraction_wrong_recipient.py"
+        ],
+        "testIds": [
+          "test_neighbor_ai_meta_does_not_hijack_current_rows_extraction_proposal"
+        ]
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -1559,7 +1581,7 @@
         "nextProof": "Add or identify a deterministic core.property_extraction / manual_continuation fixture, then wire it to this map before reopening users."
       },
       "duplicate_retry": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_available_full_specs"
         ],
@@ -1570,12 +1592,14 @@
           "retry_reconciled"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Driving the real processing.retry_processing_failures with the genuine messaging.has_processed guard, extraction (process_inbox_message) is invoked exactly once - for the never-processed reply - and never for an already-processed reply, proving reprocessing the same reply does not double-apply property extraction."
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.property_extraction yet.",
-        "nextProof": "Add or identify a deterministic core.property_extraction / duplicate_retry fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_rubric_core_property_extraction_duplicate_retry.py"
+        ],
+        "testIds": [
+          "test_reprocessing_same_reply_does_not_double_apply_extraction"
+        ]
       },
       "operator_visible_failure": {
         "status": "needs_live_proof",
@@ -1656,8 +1680,8 @@
           "firestore",
           "email"
         ],
-        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.sheet_update yet.",
-        "nextProof": "Add or identify a deterministic core.sheet_update / bad_placeholder fixture, then wire it to this map before reopening users."
+        "gapReason": "No production sheet-write path rejects/omits a literal placeholder value. apply_proposal_to_sheet (email_automation/ai_processing.py:651) writes new_val straight into the batchUpdate payload; its guards cover unknown-header, flyer/floorplan, file://, no-op, human-override, and existing-human-value, but none reject a bracket/[NAME] new value (its only 'placeholder' logic at line 738 inspects the OLD cell value to permit overwriting, not to reject a placeholder new value). insert_property_row_above_divider (sheet_operations.py:457, scheduler_runner.py:733) and app.py:784 write values verbatim with no filtering. Bracket-placeholder rejection exists only on the outbound EMAIL path (outbound_safety.py, followup.py), never on the sheet-cell write path, so there is no discriminating guard to exercise and no honest negative-control test can prove the behavior.",
+        "nextProof": "Add an unresolved-placeholder guard reusing outbound_safety.UNRESOLVED_BRACKET_PLACEHOLDER_RE in apply_proposal_to_sheet's update loop and in insert_property_row_above_divider, recording a 'placeholder-value' skip reason. Then a fake-Sheets fixture can assert (positive control) that a [NAME] new value is skipped/omitted from the batchUpdate payload while a real value is written (negative control), making the guard discriminating. Until that guard lands, this cell stays needs_fixture."
       },
       "wrong_recipient": {
         "status": "covered",
@@ -1969,7 +1993,7 @@
         "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / bad_placeholder fixture, then wire it to this map before reopening users."
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "dashboard_action_resolution"
         ],
@@ -1980,12 +2004,14 @@
           "paused_manual_review"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Exercising the real email._send_single_outbox_item, it proves a queued send whose live recipient changed to the wrong address and was cancelled is deleted with zero Graph sends (wrong recipient never emailed), while a negative control with the recipient unchanged and uncancelled reaches the send path - making the gate discriminating."
         ],
-        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.stop_cancel_dismiss yet.",
-        "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / wrong_recipient fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_rubric_core_stop_cancel_dismiss_wrong_recipient.py"
+        ],
+        "testIds": [
+          "test_cancelled_wrong_recipient_change_blocks_send_but_valid_recipient_sends"
+        ]
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -2250,7 +2276,7 @@
         ]
       },
       "bad_placeholder": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "token_or_graph_failure"
         ],
@@ -2258,15 +2284,17 @@
           "manual_reply_before_retry"
         ],
         "statePermutations": [
-          "outbox_queued"
+          "dead_letter_visible"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "It proves that collect_user_health counts an unresolved placeholder-dead-lettered item in deadLetterQueue as active (count 1) and degrades overall health to \"warning\", while the negative control (same item flipped to a resolved \"discarded\" status) is counted as 0 and returns \"healthy\" - showing the count keys on active-failure state, not mere document presence."
         ],
-        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.health_recovery yet.",
-        "nextProof": "Add or identify a deterministic core.health_recovery / bad_placeholder fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_rubric_core_health_recovery_bad_placeholder.py"
+        ],
+        "testIds": [
+          "test_placeholder_dead_letter_is_counted_and_degrades_health"
+        ]
       },
       "wrong_recipient": {
         "status": "needs_fixture",
