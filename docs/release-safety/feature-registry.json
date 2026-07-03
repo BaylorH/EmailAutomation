@@ -122,7 +122,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["email_automation/email.py", "email_automation/outbound_safety.py", "email_automation/service_providers.py"],
+        "backend": ["email_automation/email.py", "email_automation/outbound_safety.py", "email_automation/service_providers.py", "email_automation/sent_mail_guard.py"],
         "frontend": ["src/utils/actionAudit.js", "src/components/EmailSchedulerButton.jsx"],
         "functions": [],
         "firestoreRules": ["firestore.rules"]
@@ -287,7 +287,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["email_automation/ai_processing.py", "email_automation/processing.py"],
+        "backend": ["email_automation/ai_processing.py", "email_automation/processing.py", "email_automation/notifications.py", "email_automation/notification_payloads.py"],
         "frontend": ["src/utils/actionNotifications.js", "src/components/ClientRow.jsx"],
         "functions": [],
         "firestoreRules": []
@@ -399,7 +399,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["email_automation/email.py", "email_automation/pending_responses.py"],
+        "backend": ["email_automation/email.py", "email_automation/pending_responses.py", "email_automation/campaign_safety.py", "email_automation/notifications.py"],
         "frontend": ["src/components/ClientRow.jsx", "src/components/ClientsTable.jsx", "src/components/InlineReplyComposer.jsx"],
         "functions": ["functions/index.js"],
         "firestoreRules": ["firestore.rules"]
@@ -523,7 +523,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["main.py", "app.py", "email_automation/scheduler_scope.py"],
+        "backend": ["main.py", "app.py", "email_automation/scheduler_scope.py", "email_automation/scheduler_lease.py", "email_automation/clients.py"],
         "frontend": ["src/components/HealthWidget.jsx"],
         "functions": [],
         "firestoreRules": [],
