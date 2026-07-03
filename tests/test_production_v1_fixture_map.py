@@ -155,6 +155,89 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
                     )
                 seen[reason] = f"{feature_id}/{fixture_class}"
 
+    def test_stress_matrix_covers_every_feature_and_stress_class(self):
+        """The additive stress lane widens coverage into adversarial operating
+        conditions (429/throttle, concurrency, malformed data, partial-batch
+        failure, retry storm, near-miss negatives) WITHOUT weakening the base
+        seven-class send-risk contract. Every Production V1 feature must name
+        every stress class - covered with a real test + provesBehavior, or an
+        honestly-named gap. Distinct provesBehavior / gapReason are enforced so a
+        stress cell cannot be a borrowed green or templated boilerplate.
+        """
+        gradebook = _read_json(GRADEBOOK_PATH)
+        fixture_map = _read_json(FIXTURE_MAP_PATH)
+        suite = gradebook["releaseSuites"]["production_v1_base_campaign"]
+        required_features = set(suite["featureIds"])
+        valid_statuses = set(fixture_map["statusLegend"])
+        stress_classes = fixture_map.get("stressFixtureClasses")
+        matrix = fixture_map.get("featureStressMatrix")
+
+        self.assertTrue(stress_classes, "Fixture map must declare stressFixtureClasses.")
+        self.assertTrue(matrix, "Fixture map must declare featureStressMatrix.")
+        self.assertEqual(
+            required_features,
+            set(matrix),
+            "Every Production V1 feature must appear in the stress matrix.",
+        )
+
+        proves_seen: dict[str, str] = {}
+        gap_seen: dict[str, str] = {}
+        counts: Counter = Counter()
+        for feature_id, cells in matrix.items():
+            with self.subTest(feature=feature_id):
+                self.assertEqual(
+                    set(stress_classes),
+                    set(cells),
+                    f"{feature_id} must name every stress class, including uncovered gaps.",
+                )
+            for stress_class, cell in cells.items():
+                with self.subTest(feature=feature_id, stress_class=stress_class):
+                    self.assertIn(cell.get("status"), valid_statuses)
+                    self.assertTrue(cell.get("stressScenario"))
+                    counts[cell["status"]] += 1
+                    if cell["status"] == "covered":
+                        self.assertTrue(cell.get("testFiles"))
+                        self.assertTrue(cell.get("testIds"))
+                        proves = " ".join((cell.get("provesBehavior") or "").split()).lower()
+                        self.assertTrue(
+                            proves,
+                            f"{feature_id}/{stress_class} covered stress cell needs provesBehavior.",
+                        )
+                        self.assertNotIn(
+                            proves,
+                            proves_seen,
+                            f"{feature_id}/{stress_class} shares provesBehavior with "
+                            f"{proves_seen.get(proves)} - borrowed stress green.",
+                        )
+                        proves_seen[proves] = f"{feature_id}/{stress_class}"
+                        test_corpus = "\n".join(
+                            (REPO_ROOT / test_file).read_text(errors="ignore")
+                            for test_file in cell["testFiles"]
+                        )
+                        for test_id in cell["testIds"]:
+                            self.assertRegex(
+                                test_corpus,
+                                rf"def\s+{re.escape(test_id)}\s*\(",
+                                f"{feature_id}/{stress_class} references missing testId {test_id}.",
+                            )
+                    else:
+                        self.assertTrue(cell.get("nextProof"))
+                        reason = " ".join((cell.get("gapReason") or "").split()).lower()
+                        self.assertTrue(reason, f"{feature_id}/{stress_class} gap needs gapReason.")
+                        self.assertNotIn(
+                            reason,
+                            gap_seen,
+                            f"{feature_id}/{stress_class} shares gapReason with "
+                            f"{gap_seen.get(reason)} - templated stress boilerplate.",
+                        )
+                        gap_seen[reason] = f"{feature_id}/{stress_class}"
+
+        self.assertEqual(
+            dict(counts),
+            fixture_map.get("stressSummary"),
+            "stressSummary must match the stress-matrix cell counts.",
+        )
+
     def test_fixture_map_covers_required_events_and_combinations(self):
         gradebook = _read_json(GRADEBOOK_PATH)
         fixture_map = _read_json(FIXTURE_MAP_PATH)
