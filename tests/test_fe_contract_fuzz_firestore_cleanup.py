@@ -2,16 +2,24 @@
 Frontend-contract adversarial fuzz for POST /api/firestore-cleanup
 (Admin firestore cleanup — DESTRUCTIVE).
 
-Every external boundary is faked: email_automation.clients._fs (a recording
-FakeFirestore that logs every .delete()) and email_automation.clients.list_user_ids
-(patched so no real Firebase Storage HTTP call is made). This route has NO
-send/email capability, so there is no Graph/send entrypoint to guard; instead the
-guard here is that NOTHING is deleted on the fakes unless the caller supplied a
-genuine, well-typed destructive instruction.
+HARDENED contract (app.py api_firestore_cleanup):
+  * @verify_firebase_token — a missing/invalid Bearer token is rejected 401
+    before any handler logic runs.
+  * Gated by _destructive_admin_routes_enabled() (403 when disabled) and the
+    SCHEDULER_AVAILABLE guard (503 when unavailable).
+  * The body must be a JSON object (400 otherwise), destructive flags must be
+    STRICT booleans (`is True`), clear_old_threads must be a real non-bool
+    positive int, and user_id must be a non-empty string (400 otherwise).
+  * user_id must EQUAL the verified caller uid — a signed-in user naming any
+    other tenant's uid is rejected 403 "Forbidden" and never reaches Firestore.
 
-Tests that assert the *correct* behavior and currently FAIL are pinning real
-handler bugs (documented in the module docstring of each). They are left red on
-purpose per the fuzz mandate — do not weaken them.
+Every external boundary is faked: firebase token verification is patched to a
+chosen verified uid, email_automation.clients._fs is a recording FakeFirestore
+that logs every .delete(), and email_automation.clients.list_user_ids is patched
+so no real Firebase Storage HTTP call is made. This route has NO send/email
+capability, so there is no Graph/send entrypoint to guard; instead the guard here
+is that NOTHING is deleted on the fakes unless an authenticated caller supplied a
+genuine, well-typed destructive instruction targeting THEIR OWN uid.
 """
 import os
 import unittest
@@ -20,13 +28,16 @@ from unittest.mock import patch
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
+    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
 )
 
 import app as appmod
 import email_automation.clients as cl
 
 URL = "/api/firestore-cleanup"
+# The verified Firebase caller identity used for authenticated requests. The
+# happy-path store is keyed on this same uid so a caller only ever touches its own.
+CALLER = "u1"
 
 
 # --------------------------------------------------------------------------
@@ -129,22 +140,35 @@ class FirestoreCleanupFuzz(unittest.TestCase):
             appmod, "_destructive_admin_routes_enabled", lambda: True
         )
         self._destructive_patch.start()
+        # Firebase ID-token verification: authorised requests resolve to the
+        # verified caller uid (default CALLER). This drives the effective identity
+        # the same way tests/test_surface_c_dashboard_auth.py does.
+        self._p_verify = patch(
+            "firebase_admin.auth.verify_id_token", return_value={"uid": CALLER}
+        )
+        self.verify_mock = self._p_verify.start()
+        self.AUTH = {"Authorization": "Bearer testtoken"}
 
     def tearDown(self):
         appmod.SCHEDULER_AVAILABLE = self._sched
         self._destructive_patch.stop()
+        self._p_verify.stop()
 
     # -- helpers ----------------------------------------------------------
     def _post(self, payload=None, store=None, users=("u1",), raw=None,
-              content_type=None):
+              content_type=None, caller=CALLER, auth=True):
         ctrl = FakeFirestore(store or {})
+        # The verified caller identity for this request.
+        self.verify_mock.return_value = {"uid": caller}
+        headers = dict(self.AUTH) if auth else None
         with patch.object(cl, "_fs", ctrl), \
              patch.object(cl, "list_user_ids", lambda: list(users)):
             if raw is not None:
                 r = self.client.post(URL, data=raw,
-                                     content_type=content_type or "application/json")
+                                     content_type=content_type or "application/json",
+                                     headers=headers)
             else:
-                r = self.client.post(URL, json=(payload or {}))
+                r = self.client.post(URL, json=(payload or {}), headers=headers)
         return r, ctrl
 
     def assert_no_server_error(self, r):
@@ -217,10 +241,14 @@ class FirestoreCleanupFuzz(unittest.TestCase):
         self.assert_no_server_error(r)
         self.assertEqual(ctrl.deleted, [], "negative day count must not delete")
 
-    def test_null_user_id_falls_back_to_all(self):
+    def test_null_user_id_rejected(self):
+        # A null user_id is not a non-empty string -> rejected 400 (never fanned
+        # out across all users), no crash, nothing deleted.
         r, ctrl = self._post({"user_id": None, "clear_dead_letter": True},
                              users=("u1", "u2"))
-        self.assert_no_server_error(r)  # no seeded docs -> nothing deleted
+        self.assert_no_server_error(r)
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(ctrl.deleted, [])
 
     def test_int_user_id_no_crash(self):
         r, ctrl = self._post({"user_id": 12345, "clear_dead_letter": True})
@@ -261,21 +289,23 @@ class FirestoreCleanupFuzz(unittest.TestCase):
         self.assertEqual(ctrl.deleted, [])
 
     def test_bool_thread_days_graceful(self):
-        # bool True passes `> 0` and is coerced to timedelta(days=1); at minimum
-        # it must not crash. (Loose truthiness on a numeric field is sketchy but
-        # not asserted as a hard bug here.)
+        # clear_old_threads must be a real (non-bool) positive int; `True` is a
+        # bool, so it is treated as "don't clear" (0) rather than coerced. Must
+        # not crash and must not delete.
         r, ctrl = self._post({"clear_old_threads": True, "user_id": "u1"})
         self.assert_no_server_error(r)
+        self.assertEqual(ctrl.deleted, [])
 
     def test_retry_idempotent(self):
         store = {"u1": {"deadLetterQueue": [{"id": "d1"}]}}
         ctrl = FakeFirestore(store)
+        self.verify_mock.return_value = {"uid": "u1"}
         with patch.object(cl, "_fs", ctrl), \
              patch.object(cl, "list_user_ids", lambda: ["u1"]):
             r1 = self.client.post(URL, json={"clear_dead_letter": True,
-                                             "user_id": "u1"})
+                                             "user_id": "u1"}, headers=self.AUTH)
             r2 = self.client.post(URL, json={"clear_dead_letter": True,
-                                             "user_id": "u1"})
+                                             "user_id": "u1"}, headers=self.AUTH)
         self.assertEqual(r1.status_code, 200)
         self.assertEqual(r2.status_code, 200)
         # Only one real delete despite two identical requests.
@@ -345,6 +375,34 @@ class FirestoreCleanupFuzz(unittest.TestCase):
         self.assertEqual(
             ctrl.deleted, [],
             "blank user_id fanned a destructive op out across ALL users",
+        )
+
+    # =====================================================================
+    # AUTHENTICATION + AUTHORIZATION gate (hardened contract)
+    # =====================================================================
+    def test_unauthenticated_is_rejected_no_delete(self):
+        # No Bearer token -> 401 before the handler body runs; a well-formed
+        # destructive instruction must NOT reach Firestore.
+        store = {"u1": {"deadLetterQueue": [{"id": "d1"}]}}
+        r, ctrl = self._post({"clear_dead_letter": True, "user_id": "u1"},
+                             store=store, auth=False)
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(ctrl.deleted, [], "unauthenticated request deleted data")
+
+    def test_caller_cannot_target_another_user(self):
+        # Authenticated as u1 but naming victim u2 as the cleanup target must be
+        # Forbidden (403) and must never reach the Firestore delete loop — even
+        # with a genuine, well-typed destructive flag and the admin gate open.
+        store = {
+            "u1": {"deadLetterQueue": [{"id": "d1"}]},
+            "u2": {"deadLetterQueue": [{"id": "d2"}]},
+        }
+        r, ctrl = self._post({"user_id": "u2", "clear_dead_letter": True},
+                             store=store, caller="u1", users=("u1", "u2"))
+        self.assertEqual(r.status_code, 403, r.get_json())
+        self.assertEqual(
+            ctrl.deleted, [],
+            "cross-tenant cleanup deleted another user's data",
         )
 
 

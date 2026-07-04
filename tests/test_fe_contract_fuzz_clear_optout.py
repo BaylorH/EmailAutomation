@@ -63,6 +63,15 @@ def build_fs(exists=True, record=None):
 class ClearOptoutContractFuzz(unittest.TestCase):
     def setUp(self):
         self.client = appmod.app.test_client()
+        # The route is now @verify_firebase_token: patch the Admin SDK verifier
+        # and attach a Bearer header to every request so the AUTHORISED path is
+        # exercised. Identity is the token uid; the body uid is ignored.
+        self._p_verify = patch(
+            "firebase_admin.auth.verify_id_token", return_value={"uid": "u1"}
+        )
+        self._p_verify.start()
+        self.addCleanup(self._p_verify.stop)
+        self.client.environ_base["HTTP_AUTHORIZATION"] = "Bearer testtoken"
         # Defense in depth: this route must never trigger a send.
         self.send_mock = MagicMock(name="send_and_index_email")
         self._send_patch = patch(

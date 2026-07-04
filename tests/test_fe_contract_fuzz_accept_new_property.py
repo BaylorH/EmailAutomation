@@ -84,13 +84,35 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
         self.propose = MagicMock(return_value={"updates": []})
         self.append_links = MagicMock()
 
-        # Firestore: client doc exists=False by default (safe / not-found)
+        # Firestore double. The hardened handler now loads the notification
+        # (users/{uid}/clients/{clientId}/notifications/{notificationId}) and
+        # requires the request sheetId to match the notification's stored
+        # meta.sheetId. This recursive node resolves EVERY collection/document
+        # path to the same doc, which exists and is anchored to the default
+        # valid sheetId ("sheet-abc") so the happy-path payload passes the
+        # ownership guard. (uid-mismatch tests reject before this read.)
+        notif_doc = MagicMock()
+        notif_doc.exists = True
+        notif_doc.to_dict.return_value = {
+            "kind": "action_needed",
+            "meta": {"status": "pending_approval", "sheetId": "sheet-abc",
+                     "address": "123 Main St"},
+            "sheetId": "sheet-abc",
+            "columnConfig": {},
+        }
         self.fake_fs = MagicMock()
-        client_doc = MagicMock()
-        client_doc.exists = False
-        client_doc.to_dict.return_value = {}
-        (self.fake_fs.collection.return_value.document.return_value
-             .collection.return_value.document.return_value.get.return_value) = client_doc
+        self.fake_fs.collection.return_value = self.fake_fs
+        self.fake_fs.document.return_value = self.fake_fs
+        self.fake_fs.get.return_value = notif_doc
+
+        # Identity now comes from a verified Firebase ID token; the valid payload
+        # uid ("user-1") is the token uid, and every request carries a bearer.
+        self._verify_patch = patch(
+            "firebase_admin.auth.verify_id_token", return_value={"uid": "user-1"}
+        )
+        self.verify_mock = self._verify_patch.start()
+        self.addCleanup(self._verify_patch.stop)
+        self.AUTH = {"Authorization": "Bearer testtoken"}
 
         self._patchers = [
             patch("email_automation.clients._sheets_client", MagicMock(return_value=MagicMock())),
@@ -121,7 +143,9 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
 
     # --- assertion helpers ---------------------------------------------------
     def _post(self, payload, **kw):
-        return self.client.post(ROUTE, json=payload, **kw)
+        # Every authorised request carries the verified bearer token.
+        headers = kw.pop("headers", None) or dict(self.AUTH)
+        return self.client.post(ROUTE, json=payload, headers=headers, **kw)
 
     def assert_no_leak(self, resp, label):
         """A rejection must not surface an internal exception string / stack trace."""
@@ -356,17 +380,17 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
     def test_non_json_body(self):
         # BUG CANDIDATE: wrong content-type -> get_json() raises 415 which is
         # caught by the bare except -> re-emitted as 500 with leaked message.
-        resp = self.client.post(ROUTE, data="not json at all", content_type="text/plain")
+        resp = self.client.post(ROUTE, data="not json at all", content_type="text/plain", headers=dict(self.AUTH))
         self.assert_fail_closed(resp, "non_json_body")
 
     def test_malformed_json_body(self):
         # BUG CANDIDATE: broken JSON with json content-type -> 400 raised then
         # caught -> re-emitted as 500 with leaked message.
-        resp = self.client.post(ROUTE, data="{bad json", content_type="application/json")
+        resp = self.client.post(ROUTE, data="{bad json", content_type="application/json", headers=dict(self.AUTH))
         self.assert_fail_closed(resp, "malformed_json_body")
 
     def test_empty_body(self):
-        resp = self.client.post(ROUTE, data="", content_type="application/json")
+        resp = self.client.post(ROUTE, data="", content_type="application/json", headers=dict(self.AUTH))
         self.assertNotEqual(resp.status_code, 500,
                             msg=f"empty body 500: {resp.get_data(as_text=True)[:200]}")
         self.assert_no_leak(resp, "empty_body")

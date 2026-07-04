@@ -124,6 +124,16 @@ def make_store(status="paused"):
 class ResumeConversationFuzzBase(unittest.TestCase):
     def setUp(self):
         self.client = appmod.app.test_client()
+        # The route is now @verify_firebase_token: patch the Admin SDK verifier
+        # (minting the SAME uid the in-memory store is keyed on) and attach a
+        # Bearer header to every request. Identity is the token uid; the body uid
+        # is ignored for the Firestore path.
+        self._p_verify = patch(
+            "firebase_admin.auth.verify_id_token", return_value={"uid": "u1"}
+        )
+        self._p_verify.start()
+        self.addCleanup(self._p_verify.stop)
+        self.client.environ_base["HTTP_AUTHORIZATION"] = "Bearer testtoken"
 
     def _invoke(self, payload=None, *, raw=None,
                 content_type="application/json", store_status="paused"):

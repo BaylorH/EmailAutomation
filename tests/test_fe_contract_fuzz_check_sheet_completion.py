@@ -109,8 +109,28 @@ class FakeSheets:
 
 
 class CheckSheetCompletionFuzz(unittest.TestCase):
+    # The hardened route resolves the sheet server-side from the authenticated
+    # user's client; the happy-path fake resolves to this id.
+    RESOLVED_SHEET = "sheet-resolved"
+
     def setUp(self):
         self.client = appmod.app.test_client()
+        # The route is now @verify_firebase_token AND takes the sheet from the
+        # caller's client (never a body sheetId). Patch the Admin SDK verifier,
+        # attach a Bearer header to every request, and resolve the client's sheet
+        # id server-side to RESOLVED_SHEET.
+        self._p_verify = patch(
+            "firebase_admin.auth.verify_id_token", return_value={"uid": "u1"}
+        )
+        self._p_verify.start()
+        self.addCleanup(self._p_verify.stop)
+        self.client.environ_base["HTTP_AUTHORIZATION"] = "Bearer testtoken"
+        self._p_gcc = patch(
+            "email_automation.clients._get_client_config",
+            return_value=(self.RESOLVED_SHEET, None, None),
+        )
+        self._p_gcc.start()
+        self.addCleanup(self._p_gcc.stop)
         # Send/refresh guard: patch every send-capable entrypoint and prove
         # none of them ever fire on this route.
         self.send_mocks = {}
@@ -184,21 +204,22 @@ class CheckSheetCompletionFuzz(unittest.TestCase):
     # ----------------------------------------------------------------------- #
     def test_happy_path_complete_sheet(self):
         fake = FakeSheets(rows=[list(COMPLETE_ROW)])
-        resp, body = self._post(fake, json={"sheetId": "sheet-abc"})
+        resp, body = self._post(fake, json={"clientId": "c1"})
         self.assertEqual(resp.status_code, 200, body)
         self.assertEqual(body["success"], True)
         self.assertEqual(body["isComplete"], True)
         self.assertEqual(body["totalViableProperties"], 1)
         self.assertEqual(body["completedProperties"], 1)
         self.assertEqual(body["completionPercentage"], 100.0)
-        # The real sheetId reached the (faked) Sheets boundary; no writes, no sends.
-        self.assertIn(("spreadsheets.get", "sheet-abc"), fake.calls)
+        # The SERVER-RESOLVED sheetId (never a body sheetId) reached the (faked)
+        # Sheets boundary; no writes, no sends.
+        self.assertIn(("spreadsheets.get", self.RESOLVED_SHEET), fake.calls)
         self._assert_read_only(fake)
         self._assert_no_send()
 
     def test_happy_path_incomplete_sheet(self):
         fake = FakeSheets(rows=[list(COMPLETE_ROW), list(INCOMPLETE_ROW)])
-        resp, body = self._post(fake, json={"sheetId": "sheet-xyz"})
+        resp, body = self._post(fake, json={"clientId": "c1"})
         self.assertEqual(resp.status_code, 200, body)
         self.assertEqual(body["isComplete"], False)
         self.assertEqual(body["totalViableProperties"], 2)
@@ -297,7 +318,7 @@ class CheckSheetCompletionFuzz(unittest.TestCase):
         fake = FakeSheets(rows=[list(COMPLETE_ROW)])
         resp, body = self._post(
             fake,
-            json={"sheetId": "s1", "uid": "u1", "__proto__": {"x": 1},
+            json={"clientId": "c1", "uid": "u1", "__proto__": {"x": 1},
                   "admin": True, "range": "A1:Z999", "unexpected": "field"},
         )
         self.assertEqual(resp.status_code, 200, body)
@@ -310,7 +331,7 @@ class CheckSheetCompletionFuzz(unittest.TestCase):
     # ----------------------------------------------------------------------- #
     def test_empty_sheet_no_rows(self):
         fake = FakeSheets(rows=[])
-        resp, body = self._post(fake, json={"sheetId": "empty"})
+        resp, body = self._post(fake, json={"clientId": "c1"})
         self.assertEqual(resp.status_code, 200, body)
         self.assertEqual(body["totalViableProperties"], 0)
         self.assertEqual(body["isComplete"], False)
@@ -323,7 +344,7 @@ class CheckSheetCompletionFuzz(unittest.TestCase):
             ["NON-VIABLE"],
             list(INCOMPLETE_ROW),  # below divider — must be ignored
         ])
-        resp, body = self._post(fake, json={"sheetId": "div"})
+        resp, body = self._post(fake, json={"clientId": "c1"})
         self.assertEqual(resp.status_code, 200, body)
         self.assertEqual(body["totalViableProperties"], 1)
         self.assertEqual(body["isComplete"], True)
@@ -334,9 +355,9 @@ class CheckSheetCompletionFuzz(unittest.TestCase):
     # ----------------------------------------------------------------------- #
     def test_duplicate_retry_idempotent(self):
         fake1 = FakeSheets(rows=[list(COMPLETE_ROW)])
-        r1, b1 = self._post(fake1, json={"sheetId": "dup"})
+        r1, b1 = self._post(fake1, json={"clientId": "c1"})
         fake2 = FakeSheets(rows=[list(COMPLETE_ROW)])
-        r2, b2 = self._post(fake2, json={"sheetId": "dup"})
+        r2, b2 = self._post(fake2, json={"clientId": "c1"})
         self.assertEqual(r1.status_code, 200)
         self.assertEqual(r2.status_code, 200)
         self.assertEqual(b1, b2)

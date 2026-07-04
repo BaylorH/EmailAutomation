@@ -518,6 +518,81 @@ def _dead_letter_unresolved_name_placeholder_if_needed(
     return True
 
 
+# Thread statuses that may still receive dashboard replies. Anything else
+# (stopped/completed/closed/unknown) is terminal for the send pipeline.
+OPEN_THREAD_STATUSES = {"active", "paused"}
+
+
+def _validate_outbox_thread_reply_target(user_id: str, data: dict) -> Dict[str, Any]:
+    """Re-validate the client-supplied thread binding on a dashboard thread reply.
+
+    The outbox document is written entirely client-side (InlineReplyComposer),
+    so threadId, replyToMessageId and clientId arrive unvalidated. Before any
+    Graph send the pipeline must confirm that:
+      - the thread exists under this user,
+      - the thread belongs to the same client as the outbox item,
+      - the thread is still open (active/paused, never stopped/completed),
+      - replyToMessageId is a message actually recorded under that thread
+        (doc id match, or sourceMessage.graphMessageId for messages keyed by
+        internetMessageId).
+
+    Fail-closed: lookup failures return ok=False so the item is dead-lettered
+    for manual review instead of sending with unverified context.
+    """
+    from .clients import _fs
+
+    thread_id = str(data.get("threadId") or "").strip()
+    reply_to_msg_id = str(data.get("replyToMessageId") or "").strip()
+    client_id = str(data.get("clientId") or "").strip()
+
+    if not thread_id or not reply_to_msg_id:
+        return {"ok": False, "reason": "thread_reply_missing_identifiers", "thread": None}
+
+    try:
+        thread_ref = (
+            _fs.collection("users").document(user_id)
+            .collection("threads").document(thread_id)
+        )
+        snapshot = thread_ref.get()
+    except Exception as e:
+        return {"ok": False, "reason": f"thread_lookup_failed: {e}", "thread": None}
+
+    if not getattr(snapshot, "exists", False):
+        return {"ok": False, "reason": "thread_not_found", "thread": None}
+
+    thread = snapshot.to_dict() or {}
+
+    thread_client_id = str(thread.get("clientId") or "").strip()
+    if thread_client_id and thread_client_id != client_id:
+        return {"ok": False, "reason": "thread_client_mismatch", "thread": None}
+
+    status = str(thread.get("status") or "active").strip().lower()
+    if status not in OPEN_THREAD_STATUSES:
+        return {"ok": False, "reason": f"thread_no_longer_open (status={status})", "thread": None}
+
+    recorded = False
+    try:
+        message_doc = thread_ref.collection("messages").document(reply_to_msg_id).get()
+        recorded = bool(getattr(message_doc, "exists", False))
+    except Exception:
+        recorded = False
+    if not recorded:
+        try:
+            matches = list(
+                thread_ref.collection("messages")
+                .where("sourceMessage.graphMessageId", "==", reply_to_msg_id)
+                .limit(1)
+                .stream()
+            )
+            recorded = bool(matches)
+        except Exception as e:
+            return {"ok": False, "reason": f"reply_target_lookup_failed: {e}", "thread": None}
+    if not recorded:
+        return {"ok": False, "reason": "reply_target_not_in_thread", "thread": None}
+
+    return {"ok": True, "reason": None, "thread": thread, "status": status}
+
+
 def _mark_tour_invite_thread_sent(
     user_id: str,
     data: Dict[str, Any],
@@ -1669,18 +1744,40 @@ def _finalize_successful_outbox_item(
 
     thread_id = data.get("threadId")
     if data.get("resumeThreadOnSend") and thread_id:
+        # resumeThreadOnSend and threadId are client-supplied (InlineReplyComposer),
+        # so re-check the thread's current state before flipping it active:
+        # never resurrect a terminal (stopped/completed) thread and never touch a
+        # thread that belongs to a different client. Fail closed on any doubt.
         try:
-            (
+            thread_ref = (
                 _fs.collection("users").document(user_id)
                 .collection("threads").document(thread_id)
-                .set({
+            )
+            resume_block_reason = None
+            snapshot = thread_ref.get()
+            if not getattr(snapshot, "exists", False):
+                resume_block_reason = "thread_not_found"
+            else:
+                thread = snapshot.to_dict() or {}
+                thread_client_id = str(thread.get("clientId") or "").strip()
+                status = str(thread.get("status") or "active").strip().lower()
+                if thread_client_id and thread_client_id != (client_id or ""):
+                    resume_block_reason = "thread_client_mismatch"
+                elif status not in OPEN_THREAD_STATUSES:
+                    resume_block_reason = f"thread_no_longer_open (status={status})"
+            if resume_block_reason:
+                print(
+                    f"   ⏭️ Skipped thread resume for {thread_id[:20]}... after send: "
+                    f"{resume_block_reason}"
+                )
+            else:
+                thread_ref.set({
                     "status": "active",
                     "followUpStatus": "waiting",
                     "lastOperatorReplySentAt": SERVER_TIMESTAMP,
                     "updatedAt": SERVER_TIMESTAMP,
                 }, merge=True)
-            )
-            print(f"   ▶️ Resumed thread {thread_id[:20]}... after dashboard send")
+                print(f"   ▶️ Resumed thread {thread_id[:20]}... after dashboard send")
         except Exception as e:
             print(f"   ⚠️ Could not resume thread {thread_id[:20]}... after send: {e}")
 
@@ -2768,6 +2865,34 @@ def _send_single_outbox_item(
 
     # Threading support: check if this is a reply to an existing thread
     is_thread_reply = bool(thread_id and reply_to_msg_id)
+
+    # SECURITY: threadId/replyToMessageId/clientId on the outbox doc are
+    # client-supplied. Before ANY send (including Graph metadata preflights),
+    # re-validate the binding against the server-side thread state. Fail closed
+    # to dead-letter so a stale or crafted outbox item can neither reply into
+    # a stopped/foreign thread nor silently convert into a new indexed send.
+    if is_thread_reply:
+        thread_reply_target = _validate_outbox_thread_reply_target(user_id, data)
+        if not thread_reply_target.get("ok"):
+            reason = thread_reply_target.get("reason") or "thread_reply_validation_failed"
+            _move_to_dead_letter(
+                user_id,
+                d.reference,
+                data,
+                f"Thread reply failed pre-send validation: {reason}; "
+                "manual review required before sending",
+            )
+            print(f"   🛑 Blocked thread reply outbox item {d.id}: {reason}")
+            return
+        # Re-resolve the sheet anchor from the confirmed thread, not the
+        # unvalidated client payload.
+        validated_thread = thread_reply_target.get("thread") or {}
+        try:
+            validated_row_number = int(validated_thread.get("rowNumber") or 0)
+        except (TypeError, ValueError):
+            validated_row_number = 0
+        if validated_row_number:
+            row_number = validated_row_number
 
     # Get scripts array (new format) or build from legacy fields
     email_scripts = data.get("emailScripts")

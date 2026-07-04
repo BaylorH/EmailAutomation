@@ -49,6 +49,16 @@ LEAK_SIGNATURES = (
 class StopConversationContractTest(unittest.TestCase):
     def setUp(self):
         self.client = appmod.app.test_client()
+        # The route is now @verify_firebase_token: patch the Admin SDK verifier
+        # and attach a Bearer header to every request so the AUTHORISED path is
+        # exercised. Identity is the token uid; the body uid is ignored for the
+        # Firestore path (a caller can only ever stop their OWN threads).
+        self._p_verify = patch(
+            "firebase_admin.auth.verify_id_token", return_value={"uid": "u1"}
+        )
+        self._p_verify.start()
+        self.addCleanup(self._p_verify.stop)
+        self.client.environ_base["HTTP_AUTHORIZATION"] = "Bearer testtoken"
 
     # ---- fake wiring -------------------------------------------------------
     def _make_fs(self, exists=True, data=None):

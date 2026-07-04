@@ -49,6 +49,16 @@ class DeclinePropertyFuzz(unittest.TestCase):
     def setUp(self):
         self.client = appmod.app.test_client()
 
+        # The route is now @verify_firebase_token: patch the Admin SDK verifier
+        # and attach a Bearer header to every request so the AUTHORISED path is
+        # exercised. Identity is the token uid; the body uid is untrusted.
+        self._p_verify = patch(
+            "firebase_admin.auth.verify_id_token", return_value={"uid": "u1"}
+        )
+        self._p_verify.start()
+        self.addCleanup(self._p_verify.stop)
+        self.client.environ_base["HTTP_AUTHORIZATION"] = "Bearer testtoken"
+
         # Fake Sheets client — records the destructive batchUpdate call.
         self.fake_sheets = MagicMock(name="fake_sheets")
         self.batch = self.fake_sheets.spreadsheets.return_value.batchUpdate
@@ -64,6 +74,10 @@ class DeclinePropertyFuzz(unittest.TestCase):
             patch("email_automation.clients._sheets_client", return_value=self.fake_sheets),
             patch("email_automation.sheets._first_sheet_props", return_value=(0, "Sheet1")),
             patch("email_automation.clients._fs", self.fake_fs),
+            # Ownership guard: the authorised sheet for the token uid's client is
+            # "s1" — the same sheetId valid() posts, so the happy path matches and
+            # any foreign sheetId is refused 403.
+            patch("email_automation.clients._get_client_config", return_value=("s1", None, None)),
             patch("email_automation.email.send_and_index_email", self.send_and_index),
             patch("email_automation.email.send_outboxes", self.send_outboxes),
         ]
