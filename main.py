@@ -1,6 +1,7 @@
 import atexit
 import json
 import os
+import traceback
 from datetime import datetime
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token
@@ -180,7 +181,9 @@ def _run_graph_send_operation(operation, func, *args, **kwargs):
     try:
         result = func(*args, **kwargs)
     except Exception as e:  # noqa: BLE001 - deliberately broad: any send failure is a health signal
-        print(f"❌ Graph send operation '{operation}' failed: {e}")
+        # Capture the traceback so a genuine code bug (not just a Graph HTTP
+        # error) stays diagnosable — fail-closed must not also erase the stack.
+        print(f"❌ Graph send operation '{operation}' failed: {e}\n{traceback.format_exc()}")
         return None, _graph_operation_error_state(operation, e)
     return result, _coerce_graph_operation_state(operation, result)
 
@@ -325,7 +328,7 @@ def refresh_and_process_user(user_id: str):
         graph_operation_states.append(send_state)
 
     # Scan for client replies (inbox - catch all replies, not just unread)
-    print(f"\n🔍 Scanning inbox for client replies...")
+    print("\n🔍 Scanning inbox for client replies...")
     graph_operation_states.append(
         scan_inbox_against_index(user_id, get_graph_headers(), only_unread=False, top=50)
     )

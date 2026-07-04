@@ -81,6 +81,46 @@ class FakeFirestore:
         return FakeUsersCollection(self._users)
 
 
+class _RaisingCollection:
+    """A collection whose read fails — models Firestore being unreachable."""
+
+    def limit(self, count):
+        return self
+
+    def stream(self):
+        raise RuntimeError("Firestore unavailable: deadLetterQueue read failed")
+
+
+class _EmptyCollection:
+    def limit(self, count):
+        return self
+
+    def stream(self):
+        return []
+
+
+class _RaisingDocRef:
+    def collection(self, name):
+        if name == "deadLetterQueue":
+            return _RaisingCollection()
+        return _EmptyCollection()
+
+
+class _RaisingUsersCollection:
+    def document(self, uid):
+        return _RaisingDocRef()
+
+
+class _RaisingFirestore:
+    """Firestore double whose deadLetterQueue read raises for every user, to
+    prove the inspect endpoint fails CLOSED (active error alert) rather than
+    reporting a clean board when a queue cannot be read."""
+
+    def collection(self, name):
+        assert name == "users"
+        return _RaisingUsersCollection()
+
+
 class DeadLetterReasonTests(unittest.TestCase):
     """The reason must never render blank when the real keys are populated."""
 
@@ -236,6 +276,34 @@ class DeadLetterInspectEndpointTests(unittest.TestCase):
         self.assertEqual(1, coll["needsReconciliation"])
         self.assertEqual(1, coll["activeCount"])
         self.assertEqual("error", data["alert"]["severity"])
+
+    def test_read_error_forces_alert_fail_closed_at_endpoint(self):
+        # CodeRabbit PR#18: prove the "health cannot lie" invariant end-to-end at
+        # the endpoint boundary, not just via the _dead_letter_alert helper. A
+        # Firestore read failure on deadLetterQueue must surface an active error
+        # alert instead of a clean success board.
+        fake_fs = _RaisingFirestore()
+        with patch("app.SCHEDULER_AVAILABLE", True), patch.dict(
+            os.environ, {"DEAD_LETTER_ALERT_THRESHOLD": "1"}
+        ), patch("email_automation.clients._fs", fake_fs), patch(
+            "email_automation.clients.list_user_ids", return_value=["uid-1"]
+        ):
+            with app.app.test_client() as client:
+                resp = client.get("/api/firestore-inspect")
+        self.assertEqual(200, resp.status_code)
+        payload = resp.get_json()
+        data = payload["data"]
+
+        # The unreadable queue is surfaced as an error, never silently dropped.
+        coll = data["users"]["uid-1"]["collections"]["deadLetterQueue"]
+        self.assertIn("error", coll)
+
+        # Fail-closed: an error-severity alert is raised despite zero countable
+        # active items, because the queue could not be ruled out.
+        alert = data["alert"]
+        self.assertIsNotNone(alert)
+        self.assertEqual("error", alert["severity"])
+        self.assertTrue(alert.get("readError"))
 
     def test_resolved_items_do_not_alert(self):
         users = {
