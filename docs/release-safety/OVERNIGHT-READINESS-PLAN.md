@@ -18,6 +18,9 @@
 | 9 | Observability (health can't lie; silent-drops emit evidence) | partial | verified |
 | 10 | Rollback + runbook current | — | written |
 
+## Live progress ledger (2026-07-04 overnight)
+- **04:0x — Surface A COMPLETE (gate 4 deterministic half).** All 20 broker-language events green; 54 pinned bugs fixed across 3 passes (pass 1 ~26 @ `e4ceb01`, passes 2+3 the remaining 28 @ `72db6c8`). Full suite 661 tests OK (0 fails, 1 pre-existing skip), 205/205 broker-language, 0 regressions. Recovery note: pass-2 ran to completion in background; a mid-flight `git stash` incident had trapped the `followup.py` + `sent_mail_guard.py` fixes in `stash@{0}` — detected, restored, union state verified fresh. Key hardening: fail-closed Sent Items continuation guard (conversationId-scoped + paginated), paused-thread follow-up block, plus-alias operator drop, company-name greeting guard, rejected-tour-time never confirmed, extraction failures raise `RetryableProcessingError` (no silent broker-payload loss), deterministic wrong-property flyer guard. Remaining for gate 4: Surface A′ real-AI classification (live OpenAI, launching next).
+
 ## Input corpus — how brokers actually talk
 Seeds: `feature-gradebook.eventVariantCatalog` (20 events × `sampleTriggers` × `nearMisses` × `stopIf`) + `combinationStressDecks` (8) + the real bp21 conversation threads (League City Golden Replay etc.). Each surface agent GENERATES many realistic phrasing variations per seed: terse / verbose / typo'd / partial / multi-intent / ambiguous / quoted-history / regional / attachment-only / conflicting-with-old-quote. Near-misses are the false-positive controls.
 
