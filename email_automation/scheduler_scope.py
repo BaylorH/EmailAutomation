@@ -57,8 +57,9 @@ def resolve_scheduler_user_ids(available_user_ids: Sequence[str] | None = None) 
     developer scoped scheduler and must request only allowlisted development
     users.
 
-    Cloud Run runtime (CLOUD_RUN_JOB / CLOUD_RUN_EXECUTION injected) is
-    fail-closed: on GitHub Actions the scope env was pinned in a git-reviewed
+    Cloud Run runtime (CLOUD_RUN_JOB / CLOUD_RUN_EXECUTION for Jobs, or
+    K_SERVICE / K_REVISION for Services) is fail-closed: on GitHub Actions the
+    scope env was pinned in a git-reviewed
     workflow file, but on Cloud Run it lives in mutable job config, so a
     dropped or mistyped SITESIFT_DEV_SCOPED_SCHEDULER must never silently
     widen to every live user. All-user processing on Cloud Run requires the

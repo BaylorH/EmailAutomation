@@ -24,10 +24,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application source.
 COPY . .
 
-# Run as an unprivileged user. /app is owned by root and read-only to the
-# worker; the token cache (msal_token_cache.bin) is written to the user's
-# home (see WORKDIR note in deploy/README.md) — here we keep CWD writable for
-# the current single-file cache the pipeline writes next to itself.
+# Run as an unprivileged user. /app (== WORKDIR == CWD) is chowned to appuser
+# so the token cache (msal_token_cache.bin), which the pipeline writes next to
+# itself via a relative path, remains writable at runtime.
 RUN useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app
 USER appuser

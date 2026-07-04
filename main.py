@@ -349,7 +349,7 @@ def _validate_startup_env():
     print("✅ Startup gate: AZURE_API_APP_ID prefix OK")
 
 
-def _install_sigterm_atexit_bridge():
+def _install_sigterm_atexit_bridge() -> None:
     """Make atexit handlers (e.g. the token-cache upload registered in
     refresh_and_process_user) survive container shutdown.
 
@@ -359,10 +359,22 @@ def _install_sigterm_atexit_bridge():
     atexit handlers, which would drop a pending token-cache upload. Translating
     SIGTERM into ``sys.exit`` raises SystemExit, which unwinds normally and lets
     atexit-registered handlers run before exit.
+
+    The exit status is non-zero (143 = 128 + SIGTERM), NOT 0: a Cloud Run task
+    is marked succeeded only when the container exits 0, so exiting 0 on a
+    timeout/cancel would mask an interrupted run (possibly stopped mid-send or
+    mid-write) as a success — and release the lease as if the work had
+    completed, letting the next execution repeat partial work. A non-zero exit
+    marks the interrupted run failed (triggering retry/alerting) while still
+    unwinding through atexit and run_with_scheduler_lease's ``finally`` so the
+    token-cache upload runs and the lease is released.
     """
-    def _handle_sigterm(signum, frame):
-        print("🛑 Received SIGTERM; exiting cleanly so atexit handlers run")
-        sys.exit(0)
+    def _handle_sigterm(signum, frame) -> None:  # noqa: ARG001 (signal API)
+        print(
+            "🛑 Received SIGTERM; exiting 143 (non-zero) so atexit handlers run "
+            "and the interrupted run is marked failed, not silently succeeded"
+        )
+        sys.exit(128 + signal.SIGTERM)
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 

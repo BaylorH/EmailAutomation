@@ -4,15 +4,18 @@ Cloud Run Jobs stop a container by sending SIGTERM (then SIGKILL after the
 grace period). Python's default SIGTERM disposition terminates the process
 WITHOUT running atexit handlers — which would drop the pending token-cache
 upload that refresh_and_process_user registers via atexit. main.py installs
-``_install_sigterm_atexit_bridge`` to translate SIGTERM into ``sys.exit(0)``
-so the interpreter unwinds normally.
+``_install_sigterm_atexit_bridge`` to translate SIGTERM into a non-zero
+``sys.exit(143)`` (128 + SIGTERM) so the interpreter unwinds normally AND the
+interrupted run is marked *failed* on Cloud Run (a task succeeds only on exit
+0), instead of masking a mid-send/write interruption as success.
 
 Two properties are pinned here (previously listed under 'Unverified' in
 deploy/README.md):
 
 (a) SIGTERM with the bridge installed → atexit handlers run and the process
-    exits 0. A CONTROL run without the bridge proves the test discriminates:
-    the process dies with signal 15 and the atexit handler never fires.
+    exits 143 (non-zero, the conventional 128+SIGTERM code). A CONTROL run
+    without the bridge proves the test discriminates: the process dies with
+    signal 15 and the atexit handler never fires.
 
 (b) A SystemExit raised mid-callback (exactly what the bridge produces if
     SIGTERM lands during the pipeline) still unwinds through the ``finally``
@@ -119,13 +122,15 @@ class SigtermAtexitBridgeSubprocessTests(unittest.TestCase):
                 proc.stdout.close()
             return returncode, os.path.exists(sentinel)
 
-    def test_sigterm_with_bridge_runs_atexit_and_exits_zero(self):
+    def test_sigterm_with_bridge_runs_atexit_and_exits_nonzero(self):
         returncode, sentinel_written = self._run_child_and_sigterm(
             install_bridge=True
         )
         self.assertEqual(
-            0, returncode,
-            "bridge must convert SIGTERM into a clean SystemExit(0) unwind",
+            128 + signal.SIGTERM, returncode,
+            "bridge must convert SIGTERM into a clean but NON-ZERO "
+            "SystemExit(143) unwind, so Cloud Run marks the interrupted task "
+            "failed (exit 0 would mask a timeout/cancel as success)",
         )
         self.assertTrue(
             sentinel_written,
@@ -201,8 +206,9 @@ class LeaseReleasedOnSystemExitTests(unittest.TestCase):
         fs = FakeFirestore()  # no lease yet
 
         def callback():
-            # What the SIGTERM bridge raises if the signal lands mid-pipeline.
-            raise SystemExit(0)
+            # What the SIGTERM bridge raises if the signal lands mid-pipeline:
+            # a non-zero SystemExit(143) (128 + SIGTERM).
+            raise SystemExit(128 + signal.SIGTERM)
 
         with patch.object(scheduler_lease, "transactional", lambda fn: fn):
             with self.assertRaises(SystemExit):

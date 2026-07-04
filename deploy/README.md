@@ -65,7 +65,7 @@ gcloud builds submit --tag "$IMAGE" .            # build from repo root (Dockerf
 gcloud run jobs replace deploy/cloudrun-job.yaml --region "$REGION"
 ```
 
-## Schedule it (replaces the '*/30 * * * *' Actions cron)
+## Schedule it (replaces the `*/30 * * * *` Actions cron)
 
 ```bash
 gcloud scheduler jobs create http email-automation-every-30m \
