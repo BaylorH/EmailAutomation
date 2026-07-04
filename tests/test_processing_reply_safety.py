@@ -102,6 +102,27 @@ class ProcessingReplySafetyTests(unittest.TestCase):
         self.assertEqual("blocked_auto_reply_policy", processing.send_reply_in_thread.last_outcome)
         self.assertIn("Automatic inbox replies are disabled", processing.send_reply_in_thread.last_error)
 
+    def test_auto_reply_allowlist_space_separated_matches_comma_separated(self):
+        # Rail 1: an operator who widens the allowlist with a space-separated
+        # list must get the same id set as a comma-separated list. The old
+        # r"[,\\s]+" character class matched comma/backslash/'s', mangling ids.
+        comma = "userAbc,userXyz"
+        space = "userAbc userXyz"
+        for allowlist in (comma, space):
+            with patch.dict(os.environ, {"SITESIFT_AUTO_REPLY_ALLOWLIST": allowlist}):
+                self.assertTrue(
+                    processing._automatic_inbox_replies_allowed("userAbc"),
+                    f"userAbc should be allowed with allowlist {allowlist!r}",
+                )
+                self.assertTrue(
+                    processing._automatic_inbox_replies_allowed("userXyz"),
+                    f"userXyz should be allowed with allowlist {allowlist!r}",
+                )
+                self.assertFalse(
+                    processing._automatic_inbox_replies_allowed("userOther"),
+                    f"userOther must stay blocked with allowlist {allowlist!r}",
+                )
+
     def test_send_reply_blocks_placeholder_before_graph_request(self):
         with patch(
             "email_automation.utils.exponential_backoff_request",

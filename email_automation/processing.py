@@ -2649,7 +2649,7 @@ def _automatic_inbox_replies_allowed(user_id: str) -> bool:
             return True
         allowed = {
             value.strip()
-            for value in re.split(r"[,\\s]+", raw_allowlist)
+            for value in re.split(r"[,\s]+", raw_allowlist)
             if value.strip()
         }
     return str(user_id or "").strip() in allowed

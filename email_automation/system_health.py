@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from google.cloud.firestore import SERVER_TIMESTAMP
 
@@ -25,8 +26,29 @@ RESOLVED_DEAD_LETTER_STATUSES = {
 }
 
 
+# A queue count of this sentinel means the Firestore read failed — the count is
+# UNKNOWN, not zero. Health must never treat an unknown count as an empty queue.
+COUNT_ERROR = -1
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _count_error_severity() -> str:
+    """Severity applied when a queue count could not be read.
+
+    Fail-closed by default: absence of config -> "error" (health cannot go green
+    while a queue read is failing). Operators may downgrade to "warning" via
+    HEALTH_COUNT_ERROR_SEVERITY, but there is deliberately no value that lets an
+    unreadable count report "healthy" — that would restore the silent-lie bug.
+    """
+    raw = str(os.environ.get("HEALTH_COUNT_ERROR_SEVERITY") or "").strip().lower()
+    return "warning" if raw == "warning" else "error"
+
+
+def _count_error_queues(queues: Dict[str, int]) -> List[str]:
+    return [name for name, value in queues.items() if isinstance(value, int) and value < 0]
 
 
 def _count_collection(user_ref, collection_name: str, limit: int = 500) -> int:
@@ -36,7 +58,7 @@ def _count_collection(user_ref, collection_name: str, limit: int = 500) -> int:
         return len(list(query.stream()))
     except Exception as exc:
         print(f"⚠️ Could not count {collection_name}: {exc}")
-        return -1
+        return COUNT_ERROR
 
 
 def _snapshot_data(snapshot) -> Dict:
@@ -62,13 +84,20 @@ def _count_active_dead_letters(user_ref, limit: int = 500) -> int:
         )
     except Exception as exc:
         print(f"⚠️ Could not count active deadLetterQueue: {exc}")
-        return -1
+        return COUNT_ERROR
 
 
 def _overall_status(token_state: Dict, graph_state: Dict, queues: Dict[str, int]) -> str:
     if token_state.get("status") == "error" or graph_state.get("status") == "error":
         return "error"
-    if any(value and value > 0 for value in queues.values()):
+    # Fail closed: a queue we could not read (COUNT_ERROR sentinel) is an UNKNOWN
+    # backlog, not an empty one. It must never be treated as healthy — a Firestore
+    # read outage could be hiding a growing dead-letter / pending backlog of stuck
+    # or misdirected sends. Default severity is "error"; operators may downgrade to
+    # "warning" via HEALTH_COUNT_ERROR_SEVERITY but never to "healthy".
+    if _count_error_queues(queues):
+        return _count_error_severity()
+    if any(value > 0 for value in queues.values()):
         return "warning"
     if token_state.get("status") == "unknown" or graph_state.get("status") == "unknown":
         return "warning"
@@ -102,6 +131,7 @@ def collect_user_health(
         "token": token_state,
         "graph": graph_state,
         "queues": queues,
+        "countErrors": _count_error_queues(queues),
         "lastCheckedAt": now,
         "updatedAt": SERVER_TIMESTAMP,
     }
