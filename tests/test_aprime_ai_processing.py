@@ -123,6 +123,20 @@ class FIX01_TargetGroundedTerminal(unittest.TestCase):
                 "2201 Pulaski Hwy is fully leased as of last month so take it off your list.")
         self.assertFalse(_fires_pu(text, target_anchor="4501 Hollins Ferry Rd"))
 
+    def test_terminal_shares_sentence_with_size_price_still_fires(self):
+        # CodeRabbit PR#15: a size/price figure sharing the terminal sentence
+        # ("42,000 SF at $8.75/SF") must NOT be read as a competing street
+        # address and mask the property_unavailable signal on the TARGET listing.
+        # The old raw-3-6-digit proxy treated the grouped "000" of "42,000" as a
+        # competing address and dropped the terminal.
+        text = "It's been leased, 42,000 SF at $8.75/SF NNN, sorry."
+        self.assertTrue(_fires_pu(text, target_anchor="699 Industrial Park Dr"))
+        # A genuinely competing STREET address in the terminal sentence must still
+        # be respected (no false terminal on the target).
+        self.assertFalse(_fires_pu(
+            "6200 Chemical Rd has been leased; the space is still available.",
+            target_anchor="699 Industrial Park Dr"))
+
 
 # ===========================================================================
 # FIX-07 — forwarded-message markers in _strip_quoted_history.

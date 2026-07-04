@@ -523,6 +523,36 @@ def _looks_like_out_of_office(text: str) -> bool:
     )
 
 
+def _address_binding_numbers(text: str) -> set:
+    """Digit runs usable as an address-binding proxy, EXCLUDING size/price/rate
+    figures that are not street numbers (CodeRabbit PR#15).
+
+    The terminal detector uses raw 3-6 digit tokens to decide whether a terminal
+    phrase is bound to the TARGET address or a competing one. A size or price
+    figure sharing the terminal sentence ("It's been leased, 42,000 SF at
+    $8.75/SF NNN") must not be mistaken for a competing street address, which
+    would drop a genuine property_unavailable signal. Grouped thousands
+    separators are collapsed first ("42,000" -> one token) and figures adjacent
+    to $, #, SF/PSF, %, /SF, NNN, ' (clear height), or a range dash are dropped.
+    """
+    collapsed = re.sub(r"(?<=\d),(?=\d{3}(?:\D|$))", "", (text or "").lower())
+    numbers = set()
+    for m in re.finditer(r"\b(\d{3,6})\b", collapsed):
+        start, end = m.start(1), m.end(1)
+        before = collapsed[max(0, start - 1):start]
+        after = collapsed[end:end + 8]
+        if before in ("$", "#"):
+            continue  # price / suite number, not a street address
+        if re.match(
+            r"\s*(?:sf\b|s\.?\s*f\.?|sq\b|square|psf\b|/\s*sf|per\s+sf|%|k\b|"
+            r"nnn\b|'|’|-\s*\d)",
+            after,
+        ):
+            continue  # size / rate / clear-height / numeric-range figure
+        numbers.add(m.group(1))
+    return numbers
+
+
 def _detect_target_terminal_reason(latest_text: str, target_anchor: Optional[str]) -> Optional[str]:
     """Return a terminal reason ONLY when a terminal phrase binds to the TARGET
     property — negation-aware and target-grounded (A′ FIX-01, CodeRabbit PR#15).
@@ -533,7 +563,7 @@ def _detect_target_terminal_reason(latest_text: str, target_anchor: Optional[str
     asserts the target remains viable.
     """
     text = (latest_text or "").lower()
-    target_numbers = set(re.findall(r"\b(\d{3,6})\b", (target_anchor or "").lower()))
+    target_numbers = _address_binding_numbers(target_anchor or "")
     has_global_viability = bool(_VIABILITY_RE.search(text))
     sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
 
@@ -547,7 +577,7 @@ def _detect_target_terminal_reason(latest_text: str, target_anchor: Optional[str
                 continue  # negated terminal
             if _ANCILLARY_SUBJECT_RE.search(sentence) or re.search(r"\bleased\s+separately\b", sentence):
                 continue  # lease bound to an ancillary asset / tour slot
-            sentence_numbers = set(re.findall(r"\b(\d{3,6})\b", sentence))
+            sentence_numbers = _address_binding_numbers(sentence)
             if target_numbers and (target_numbers & sentence_numbers):
                 return reason  # terminal explicitly about the TARGET address
             if sentence_numbers and target_numbers and not (target_numbers & sentence_numbers):

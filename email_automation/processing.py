@@ -1929,9 +1929,12 @@ def _reorder_alternate_tour_times(
 
     kept = [t for t in times if _tour_time_minutes(t) not in rejected]
     if not kept:
-        # Everything read as rejected: prefer the proposed offers if we found any,
-        # otherwise fall back to the original list rather than silently drop intent.
-        kept = [t for t in times if _tour_time_minutes(t) in proposed] or list(times)
+        # Everything read as rejected: keep only explicitly-proposed offers. When
+        # none was proposed we return [] (below) rather than restoring the original
+        # REJECTED order — the schedule pipeline skips evaluation on empty
+        # alternateTimes, so a refused slot never reaches alternateTimes[0]
+        # (CodeRabbit PR#15).
+        kept = [t for t in times if _tour_time_minutes(t) in proposed]
 
     proposed_first = [t for t in kept if _tour_time_minutes(t) in proposed]
     rest = [t for t in kept if _tour_time_minutes(t) not in proposed]
@@ -2123,12 +2126,17 @@ def _classify_tour_invite_reply(
                 thread_data,
                 schedule_decision,
             )
+        details = (
+            f"Broker said the requested tour slot does not work and offered {', '.join(alternate_times)}."
+            if alternate_times
+            else "Broker said the requested tour slot does not work but did not offer a usable alternate."
+        )
         return {
             "outcome": "alternate_requested",
             "needsOperatorAction": True,
             "canCloseThread": False,
             "alternateTimes": alternate_times,
-            "details": f"Broker said the requested tour slot does not work and offered {', '.join(alternate_times)}.",
+            "details": details,
             "tourDate": tour_date,
             "scheduleDecision": schedule_decision,
             "suggestedEmail": suggested_email,

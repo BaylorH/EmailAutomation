@@ -118,6 +118,14 @@ _COMPASS_DIRECTIONALS = frozenset((
 GEOGRAPHIC_QUALIFIER_TOKENS = (
     _US_STATE_ABBREVIATIONS | _US_STATE_NAMES | _COMPASS_DIRECTIONALS
 )
+# 2-letter state abbreviations that are also common English words. On their own
+# ("...-DIFFERENT-IN.pdf", "...-OR.pdf") these must NOT trigger the "City, ST"
+# rescue below — otherwise the preceding token gets misread as a city and a real
+# competing-property claim is hidden from manual review (CodeRabbit PR#15). The
+# rescue only fires for these when corroborated by an adjacent 5-digit ZIP.
+_AMBIGUOUS_STATE_ABBREVIATIONS = frozenset((
+    "in", "or", "me", "hi", "oh", "ok", "id", "la", "pa", "de", "ma", "mo",
+))
 
 
 def _guard_tokens(text: str) -> List[str]:
@@ -159,6 +167,14 @@ def _address_claims_in_tokens(tokens: List[str]):
             geographic.add(k)
         if is_state and k - 1 >= 0 and not tokens[k - 1].isdigit():
             # The immediately-preceding non-numeric token is the city name.
+            # A bare ambiguous 2-letter code (IN, OR, ...) only earns this rescue
+            # when a 5-digit ZIP corroborates a real "City ST ZIP" tail; without
+            # it, the code is treated as an ordinary word so it cannot mask a
+            # competing-property token (CodeRabbit PR#15).
+            if token in _AMBIGUOUS_STATE_ABBREVIATIONS:
+                nxt = tokens[k + 1] if k + 1 < n else ""
+                if not (nxt.isdigit() and len(nxt) == 5):
+                    continue
             geographic.add(k - 1)
 
     has_unverified_extra = bool(claims) and any(

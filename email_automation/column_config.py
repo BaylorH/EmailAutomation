@@ -530,7 +530,11 @@ def build_column_rules_prompt(column_config: Dict[str, Any]) -> str:
             hints = field.get("extraction_hints") or field["description"]
             lines.append(f'- "{actual_col}": {hints} Accept if provided but NEVER request.')
         else:
-            hints = field.get("extraction_hints", field["description"])
+            # `or` (not `.get(key, default)`): several CANONICAL_FIELDS set
+            # extraction_hints to None explicitly, so a key-present-but-None value
+            # must still fall back to the description instead of emitting "None"
+            # into the prompt (CodeRabbit PR#15 — matches the never-request branch).
+            hints = field.get("extraction_hints") or field["description"]
             synonyms = field.get("ai_synonyms", [])
             required_marker = " [REQUIRED]" if canonical in required_fields else ""
             if synonyms:

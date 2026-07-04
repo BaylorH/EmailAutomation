@@ -29,7 +29,7 @@ from unittest import mock
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json"),
 )
 
 from email_automation import file_handling as fh
@@ -126,6 +126,28 @@ class TestAddressGuardWithoutTargetHint(unittest.TestCase):
         candidate = pi.build_download_candidate(
             "https://www.dropbox.com/s/abc/1419-Atlantis-Dr-FL.pdf?dl=0",
             "1419-Atlantis-Dr-FL.pdf",
+        )
+        self.assertIsNotNone(candidate)
+
+    def test_ambiguous_state_code_does_not_mask_competing_token(self):
+        # CodeRabbit PR#15: "IN" (Indiana) / "OR" (Oregon) are also common English
+        # words. The "City, ST" rescue must NOT treat the token before a bare
+        # ambiguous 2-letter code as a city — otherwise "DIFFERENT" (a competing
+        # property claim) is hidden and the flyer skips manual review.
+        for fn in ("123-Main-St-DIFFERENT-IN.pdf", "123-Main-St-DIFFERENT-OR.pdf"):
+            self.assertIsNone(
+                pi.build_download_candidate(
+                    f"https://www.dropbox.com/s/other/{fn}?dl=0", fn
+                ),
+                f"{fn}: ambiguous state code masked a competing property token",
+            )
+
+    def test_ambiguous_state_code_with_zip_still_builds(self):
+        # Corroborated "City ST ZIP" tail (Bloomington IN 47401) is a real
+        # same-property geographic tail -> must still build.
+        candidate = pi.build_download_candidate(
+            "https://www.dropbox.com/s/abc/1419-Atlantis-Dr-Bloomington-IN-47401.pdf?dl=0",
+            "1419-Atlantis-Dr-Bloomington-IN-47401.pdf",
         )
         self.assertIsNotNone(candidate)
 

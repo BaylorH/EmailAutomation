@@ -74,5 +74,43 @@ class NeverRequestRendersHintsTest(unittest.TestCase):
             )
 
 
+class ExtractableFieldNoneHintsFallsBackToDescription(unittest.TestCase):
+    """CodeRabbit PR#15: the extractable (non-never-request) branch must fall back
+    to the description when extraction_hints is present-but-None, not only when the
+    key is missing. Otherwise a future field with extraction_hints=None +
+    extractable=True would emit the literal 'None' into the AI prompt."""
+
+    def test_none_hints_extractable_field_renders_description(self):
+        from unittest import mock
+
+        synthetic = {
+            "description": "Synthetic field description that must survive.",
+            "extraction_hints": None,
+            "extractable": True,
+            "is_formula": False,
+            "default_aliases": ["Synthetic Col"],
+            "ai_synonyms": [],
+        }
+        patched = {**CANONICAL_FIELDS, "synthetic_none_hints": synthetic}
+        config = {
+            "mappings": {"synthetic_none_hints": "Synthetic Col"},
+            "customFields": {},
+            "requiredFields": [],
+            "neverRequest": [],
+        }
+        with mock.patch.dict(
+            "email_automation.column_config.CANONICAL_FIELDS", patched, clear=True
+        ):
+            prompt = build_column_rules_prompt(config)
+
+        line = next(
+            (ln for ln in prompt.splitlines() if ln.startswith('- "Synthetic Col"')),
+            None,
+        )
+        self.assertIsNotNone(line)
+        self.assertIn("Synthetic field description that must survive.", line)
+        self.assertNotIn("None", line)
+
+
 if __name__ == "__main__":
     unittest.main()

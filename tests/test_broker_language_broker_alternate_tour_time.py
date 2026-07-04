@@ -242,5 +242,34 @@ class TestSlotFreeDraftsRealAnswerNotHold(unittest.TestCase):
         )
 
 
+class TestReorderDropsFullyRejected(unittest.TestCase):
+    """CodeRabbit PR#15: when every extracted time is explicitly rejected and none
+    is proposed, `_reorder_alternate_tour_times` must return [] rather than
+    restoring the original (rejected) order — otherwise a REJECTED slot lands at
+    alternateTimes[0] and the schedule pipeline evaluates/offers it."""
+
+    def test_all_rejected_none_proposed_returns_empty(self):
+        text = "Unfortunately 10 AM does not work and 2 PM does not work either."
+        self.assertEqual(
+            P._reorder_alternate_tour_times(["10:00 AM", "2:00 PM"], text, None),
+            [],
+        )
+
+    def test_stored_slot_rejected_none_proposed_returns_empty(self):
+        td = {"tourInvite": {"arrivalTime": "10:00 AM", "departureTime": "10:30 AM"}}
+        self.assertEqual(
+            P._reorder_alternate_tour_times(["10:00 AM"], "that time does not work for us", td),
+            [],
+        )
+
+    def test_proposed_slot_still_kept(self):
+        # Positive control: a genuine proposal is still surfaced.
+        text = "10 AM does not work, let's do 2 PM instead."
+        self.assertEqual(
+            P._reorder_alternate_tour_times(["10:00 AM", "2:00 PM"], text, None),
+            ["2:00 PM"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

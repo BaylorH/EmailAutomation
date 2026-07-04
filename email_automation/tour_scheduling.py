@@ -118,15 +118,28 @@ _TOUR_SCOPE_POST_RE = re.compile(
 )
 
 
+_CANONICAL_IMPORT_WARNED = False
+
+
 def _canonical_terminal_patterns() -> List[str]:
     """The single canonical property-terminal regex list (CodeRabbit PR#15).
 
     Imported lazily from ai_processing so the two surfaces never drift; falls back
-    to the literal copy above if ai_processing can't be imported."""
+    to the literal copy above ONLY if that module can't be imported. We catch
+    ImportError specifically (not bare Exception) so a genuine bug inside
+    ai_processing surfaces loudly instead of silently reintroducing the list drift
+    this bridge exists to eliminate (CodeRabbit PR#15)."""
+    global _CANONICAL_IMPORT_WARNED
     try:
         from .ai_processing import _UNAVAILABLE_PATTERNS
         return [pattern for _reason, pattern in _UNAVAILABLE_PATTERNS]
-    except Exception:
+    except ImportError as exc:
+        if not _CANONICAL_IMPORT_WARNED:
+            print(
+                f"⚠️ tour_scheduling: could not import ai_processing._UNAVAILABLE_PATTERNS "
+                f"({exc}); using literal terminal-phrase fallback (may drift)."
+            )
+            _CANONICAL_IMPORT_WARNED = True
         return _PROPERTY_TERMINAL_FALLBACK
 
 
