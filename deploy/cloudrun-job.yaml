@@ -29,10 +29,16 @@ spec:
       taskCount: 1
       template:
         spec:
-          # Cloud Run Jobs allow up to 24h. The full multi-user pipeline is
-          # far shorter, but a generous ceiling avoids mid-run task timeouts
-          # that the old 6h-Actions ceiling never risked.
-          timeoutSeconds: 3600
+          # INVARIANT (double-send guard, pinned by
+          # tests/test_ws_b_cloudrun_job_spec.py): timeoutSeconds MUST be <=
+          # the Firestore lease TTL (scheduler_lease.DEFAULT_TTL_SECONDS,
+          # 2700s). A task that outlives its lease holds an EXPIRED lease, so
+          # the next Cloud Scheduler trigger would acquire it and run
+          # concurrently. Legacy GHA avoided this via cancel-in-progress;
+          # Cloud Run has no cancel, so the ceiling stays under the TTL.
+          # 2400s (40m) leaves a 5m buffer under the 45m TTL and is still far
+          # above the pipeline's normal runtime.
+          timeoutSeconds: 2400
           # Do NOT auto-retry the whole task: a crashed run leaves the lease to
           # expire (TTL 45m) rather than stacking duplicate runners.
           maxRetries: 0
@@ -97,3 +103,13 @@ spec:
                 # NOTE: GOOGLE_APPLICATION_CREDENTIALS is intentionally absent.
                 # Cloud Run supplies ADC via the job's service account, so
                 # firestore.Client() authenticates with no key file.
+                #
+                # NOTE: three legacy email.yml env vars are intentionally
+                # omitted — unused by main.py's import closure (pinned by
+                # tests/test_ws_b_secret_coverage_contract.py; see
+                # deploy/README.md 'Intentionally omitted legacy env vars'):
+                #   - CLIENT_ID       (only noPopup_signin_emails_to_excel.py,
+                #                      an unused alternate entry point)
+                #   - FIREBASE_SA_KEY (only config.py -> Flask app, not main.py)
+                #   - AZURE_TENANT_ID (only config.py; scheduler AUTHORITY is
+                #                      hardcoded /common in app_config.py)

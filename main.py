@@ -320,6 +320,35 @@ def run_all_users():
             )
 
 
+EXPECTED_AZURE_APP_ID_PREFIX = "54cec"
+
+
+def _validate_startup_env():
+    """Hard pre-run gate, parity with the legacy GHA 'Validate CLIENT_ID
+    prefix' step (.github/workflows/email.yml): refuse to start when
+    AZURE_API_APP_ID is missing or does not carry the expected app prefix
+    (wrong tenant / wrong app registration). Runs BEFORE lease acquisition so
+    a misconfigured runtime can never touch Firestore or any user.
+
+    The in-run appid check at get_graph_headers is a soft warning only; this
+    is the fail-closed version. Skipped under E2E_TEST_MODE (mock env), same
+    as app_config's import-time missing-env validation.
+    """
+    if os.getenv("E2E_TEST_MODE") == "true":
+        print("ℹ️ E2E_TEST_MODE: skipping AZURE_API_APP_ID startup gate")
+        return
+
+    app_id = os.getenv("AZURE_API_APP_ID", "")
+    if not app_id.startswith(EXPECTED_AZURE_APP_ID_PREFIX):
+        problem = "missing" if not app_id else f"unexpected ('{app_id[:8]}…')"
+        raise SystemExit(
+            f"🚫 Startup gate: AZURE_API_APP_ID is {problem}; expected prefix "
+            f"'{EXPECTED_AZURE_APP_ID_PREFIX}'. Refusing to run before lease "
+            f"acquisition."
+        )
+    print("✅ Startup gate: AZURE_API_APP_ID prefix OK")
+
+
 def _install_sigterm_atexit_bridge():
     """Make atexit handlers (e.g. the token-cache upload registered in
     refresh_and_process_user) survive container shutdown.
@@ -339,5 +368,6 @@ def _install_sigterm_atexit_bridge():
 
 
 if __name__ == "__main__":
+    _validate_startup_env()
     _install_sigterm_atexit_bridge()
     run_with_scheduler_lease(run_all_users)

@@ -28,9 +28,19 @@ def _utc_now() -> datetime:
 
 
 def _default_owner() -> str:
+    # A globally-unique owner is what makes the lease safe: two runners must
+    # never resolve to the same string, or owner-checked release lets one free
+    # the other's lease and both process concurrently. On Cloud Run the
+    # container entrypoint is PID 1 and the hostname is not guaranteed unique,
+    # so hostname:pid can collide on "<host>:1" across executions — prefer the
+    # per-execution/per-task identifiers Cloud Run injects.
     run_id = os.getenv("GITHUB_RUN_ID") or os.getenv("RENDER_INSTANCE_ID")
     if run_id:
         return run_id
+    cloud_run_execution = os.getenv("CLOUD_RUN_EXECUTION")
+    if cloud_run_execution:
+        task_index = os.getenv("CLOUD_RUN_TASK_INDEX", "0")
+        return f"{cloud_run_execution}:{task_index}"
     return f"{socket.gethostname()}:{os.getpid()}"
 
 
