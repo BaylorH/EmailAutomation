@@ -33,6 +33,41 @@ def _find_header_name(header: List[str], target: str) -> Optional[str]:
     return None
 
 
+# Data placeholders a broker (or the model) may emit in lieu of a real value.
+# These are NOT data and must never be written verbatim into a client sheet cell.
+_DATA_PLACEHOLDER_VALUES = frozenset({
+    "tbd", "t.b.d", "t.b.d.", "tba", "t.b.a", "t.b.a.", "tbc", "t.b.c", "t.b.c.",
+    "n/a", "na", "n.a.", "n.a", "n/a.", "none", "null",
+    "pending", "unknown", "unk", "?", "-", "--",
+    "to follow", "to be determined", "to be confirmed", "to be advised",
+    "to be provided", "to be verified", "to come",
+})
+
+# "ask <the> landlord/broker/owner/agent/pm" — a deferral, not a value.
+_ASK_SOMEONE_RE = re.compile(
+    r"^ask\s+(?:the\s+|our\s+|their\s+)?(?:landlord|landl|broker|owner|agent|pm|property\s+manager|seller|lessor)",
+    re.IGNORECASE,
+)
+
+
+def _is_placeholder_data_value(value: str) -> bool:
+    """True if ``value`` is a data placeholder (TBD / N/A / pending / TBC /
+    'To follow' / 'ask landlord' ...) rather than an actual extracted value.
+
+    Matching is on the whole trimmed value (case- and trailing-punctuation-
+    insensitive) so a legitimate value that merely CONTAINS one of these tokens
+    (e.g. an address 'Pending Ave') is never falsely suppressed.
+    """
+    if value is None:
+        return False
+    norm = str(value).strip().lower()
+    # Strip a single trailing sentence punctuation ('N/A.', 'TBD!') before matching.
+    stripped = norm.rstrip(".!")
+    if norm in _DATA_PLACEHOLDER_VALUES or stripped in _DATA_PLACEHOLDER_VALUES:
+        return True
+    return bool(_ASK_SOMEONE_RE.match(norm))
+
+
 def _proposal_updates_column(proposal: dict, column_name: str) -> bool:
     target_key = (column_name or "").strip().lower()
     for update in (proposal or {}).get("updates", []) or []:
@@ -322,8 +357,18 @@ def _looks_like_requirements_mismatch_nonviable(text: str) -> bool:
     # --- clear / ceiling height below the client's spec ---
     height_term = r"(?:clear\s+height|ceiling\s+height|ceiling\s+clearance|clear\s+ceiling|clearance)"
     below_term = r"(?:below|under|beneath|less\s+than|short\s+of)"
+    # "under joist" / "under the roof deck" is the MEASUREMENT reference point for
+    # a clear height ("22 ft 9 in under joist"), not a below-spec complaint. A
+    # structural member immediately after the below-term flips it back to benign.
+    structural_ref = (
+        r"(?:the\s+)?(?:bar\s+)?(?:joists?|beams?|deck(?:ing)?|roof(?:\s+deck)?|"
+        r"steel|structure|truss(?:es)?|purlins?|canopy|ceiling)\b"
+    )
     height_mismatch = bool(
-        re.search(height_term + r"[^.]{0,45}?\b" + below_term + r"\b", latest_text)
+        re.search(
+            height_term + r"[^.]{0,45}?\b" + below_term + r"\b(?!\s+" + structural_ref + r")",
+            latest_text,
+        )
     )
 
     physical_mismatch = (
@@ -760,6 +805,56 @@ def _figure_is_non_rent(text: str, start: int, end: int, check_after: bool = Tru
     return bool(_BARE_TI_RE.search(adjacent))
 
 
+# Lease-basis suffix vocabulary. Multi-word forms ("triple net") are listed
+# before their single-word substrings ("net") so the alternation prefers the
+# longer match. Shared by every basis-bearing rent pattern below.
+_LEASE_BASIS = (
+    r"(?:triple\s+net|double\s+net|single\s+net|modified\s+gross|full\s+service|"
+    r"industrial\s+gross|gross|nnn|net|fsg|ig|mg)"
+)
+
+# Total ANNUAL rent (>= $1,000, comma-grouped or 4+ digits) stated per year.
+_TOTAL_ANNUAL_RENT_RE = re.compile(
+    r"\$\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,})(?:\.[0-9]{2})?\s*"
+    r"(?:/|\bper\s+)?\s*(?:yr|year|annum|annually|/yr)\b",
+    re.IGNORECASE,
+)
+# A building/suite area figure (>= 1,000 SF), used as the divisor.
+_AREA_SF_RE = re.compile(
+    r"([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,})\s*"
+    r"(?:sf|sq\.?\s*ft|square\s*f(?:ee|oo)t)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_total_annual_rent_over_sf(text: str) -> Optional[str]:
+    """Derive $/SF/yr from a stated TOTAL annual rent divided by the area.
+
+    e.g. '$105,000/yr gross on 12,000 SF' -> 105000 / 12000 = 8.75/SF/yr. Only
+    fires when BOTH a large ($1k+) annual dollar total AND a ($1k+) SF area are
+    present, so a normal per-SF quote ('$8.75/SF NNN') never triggers it.
+    """
+    if not text:
+        return None
+    rent_match = _TOTAL_ANNUAL_RENT_RE.search(text)
+    if not rent_match:
+        return None
+    area_match = _AREA_SF_RE.search(text)
+    if not area_match:
+        return None
+    try:
+        total = float(rent_match.group(1).replace(",", ""))
+        area = float(area_match.group(1).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    if area <= 0:
+        return None
+    per_sf = total / area
+    if per_sf < 1:
+        return None
+    return f"{per_sf:.2f}"
+
+
 def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     """Best-effort deterministic fallback for common asking-rent phrases.
 
@@ -770,6 +865,12 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     """
     if not text:
         return None
+
+    # A stated total annual rent + area ('$105,000/yr gross on 12,000 SF') is a
+    # rate expressed indirectly — resolve it before the per-SF patterns.
+    total_over_area = _extract_total_annual_rent_over_sf(text)
+    if total_over_area:
+        return total_over_area
 
     # Rent stated with a leading rent keyword, e.g. "asking $9.75/SF/yr".
     rent_context = re.compile(
@@ -787,8 +888,7 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     )
     # Bare rate with a lease-basis suffix but no /SF token, e.g. "$9.75 gross".
     dollar_rate_basis = re.compile(
-        r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
-        r"(?:gross|nnn|net|modified\s+gross|full\s+service|fsg|ig|industrial\s+gross|mg)\b",
+        r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*" + _LEASE_BASIS + r"\b",
         re.IGNORECASE,
     )
     # Dollar-SIGN-LESS rate with an explicit lease basis, e.g. "8.75 nnn",
@@ -798,13 +898,23 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     dollar_less_basis = re.compile(
         r"(?<![$\d])([0-9]{1,2}\.[0-9]{2})\s*"
         r"(?:p\.?s\.?f\.?|per\s+(?:sq\.?\s*)?f(?:oo)?t|a\s+(?:sq\.?\s*)?f(?:oo)?t|/\s*sf|per\s+sf)?\s*"
-        r"(?:gross|nnn|net|modified\s+gross|full\s+service|fsg|ig|industrial\s+gross|mg)\b",
+        + _LEASE_BASIS + r"\b",
+        re.IGNORECASE,
+    )
+    # Cents-per-SF rate with an explicit lease basis, e.g. "82 cents triple net"
+    # ($0.82/SF/mo NNN). Brokers quote low industrial rates in cents/SF/month;
+    # the value is inherently monthly, so it is annualized below.
+    cents_basis = re.compile(
+        r"(?<![$\d.])([0-9]{1,3})\s*(?:cents?|¢)\s*"
+        r"(?:p\.?s\.?f\.?|per\s+(?:sq\.?\s*)?f(?:oo)?t|a\s+(?:sq\.?\s*)?f(?:oo)?t|/\s*sf|per\s+sf)?\s*"
+        + _LEASE_BASIS + r"\b",
         re.IGNORECASE,
     )
     monthly_unit = re.compile(r"(?:/|\bper\s+)(?:mo|mos|month|monthly)\b|\bmonthly\b", re.IGNORECASE)
     annual_unit = re.compile(r"(?:/|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
 
-    for pattern in (rent_context, dollar_per_sf, dollar_rate_basis, dollar_less_basis):
+    basis_patterns = (dollar_rate_basis, dollar_less_basis, cents_basis)
+    for pattern in (rent_context, dollar_per_sf, dollar_rate_basis, dollar_less_basis, cents_basis):
         for match in pattern.finditer(text):
             # rent_context already required an explicit rent keyword, so trust it.
             # The keyword-less patterns must screen out non-rent cost figures
@@ -812,13 +922,14 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
             if pattern is not rent_context:
                 # Basis-bearing figures already carry an explicit lease basis, so a
                 # trailing opex/tax labels a different figure — screen only the lead.
-                check_after = pattern not in (dollar_rate_basis, dollar_less_basis)
+                check_after = pattern not in basis_patterns
                 if _figure_is_non_rent(text, match.start(), match.end(), check_after=check_after):
                     continue
-            value = float(match.group(1))
+            # Cents figures are expressed in cents/SF; convert to dollars/SF.
+            value = float(match.group(1)) / 100.0 if pattern is cents_basis else float(match.group(1))
             unit_context = text[max(0, match.start() - 40): min(len(text), match.end() + 50)]
             is_monthly = bool(monthly_unit.search(unit_context)) and not bool(annual_unit.search(unit_context))
-            if pattern in (dollar_rate_basis, dollar_less_basis) and not is_monthly:
+            if pattern in basis_patterns and not is_monthly:
                 # A bare per-SF basis rate under ~$3 is a monthly figure (e.g.
                 # "$0.82 NNN" -> $9.84/yr); annual industrial rates are far higher.
                 is_monthly = value < 3.0
@@ -880,6 +991,90 @@ def _augment_proposal_with_deterministic_extractions(
 
     proposal.setdefault("updates", []).append(deterministic_update)
     return proposal
+
+
+# OPEX stated on an explicitly MONTHLY basis, e.g. "opex $0.21/SF/mo".
+_OPEX_MONTHLY_RE = re.compile(
+    r"(?:opex|ops\s*ex|op\s*ex|operating\s+expenses?|cam|n\.?n\.?n\.?)\b[^\d$]{0,20}\$?\s*"
+    r"([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
+    r"(?:/\s*sf|per\s+sf|psf|/\s*sq\.?\s*ft)?\s*/?\s*(?:mo|mos|month|monthly)\b",
+    re.IGNORECASE,
+)
+
+# Broker states there is NO separate opex figure (gross / all-in / no pass-through).
+_NO_SEPARATE_OPEX_RE = re.compile(
+    r"\bno\s+(?:separate\s+)?(?:opex|op\s*ex|operating\s+expenses?|cam)\b"
+    r"|\bno\s+(?:separate\s+)?(?:opex\s+|cam\s+)?pass[\s-]?through\b"
+    r"|\ball[\s-]?in\b[^.]{0,40}?\bno\s+separate\b",
+    re.IGNORECASE,
+)
+
+
+def _augment_proposal_opex_basis(
+    proposal: dict,
+    rowvals: List[str],
+    header: List[str],
+    effective_config: dict,
+    conversation: List[dict],
+) -> dict:
+    """Keep the Ops Ex update consistent with the rent basis and un-fabricated.
+
+    Two deterministic guards on the model's Ops Ex proposal:
+      * BASIS: when the broker states opex on a MONTHLY basis ('$0.21/SF/mo'),
+        annualize the Ops Ex update (x12) so rent and opex never land on mixed
+        bases (annual-rent + monthly-opex).
+      * FABRICATION: when the broker states there is NO separate opex figure
+        (gross / all-in / no pass-through), strip a fabricated zero/blank Ops Ex
+        update the model invented. A real opex number is never touched.
+    """
+    if not proposal:
+        return proposal
+
+    updates = proposal.get("updates") or []
+    if not updates:
+        return proposal
+
+    mappings = (effective_config or {}).get("mappings", {})
+    opex_col = mappings.get("ops_ex_sf") or _find_header_name(header, "Ops Ex /SF")
+    if not opex_col or not _find_header_name(header, opex_col):
+        return proposal
+
+    opex_update = _proposal_update_for_column(proposal, opex_col)
+    if opex_update is None:
+        return proposal
+
+    text = _latest_inbound_text(conversation) or ""
+    current = str(opex_update.get("value") or "").strip()
+
+    # FABRICATION guard — drop a fabricated zero/blank opex on a gross/all-in quote.
+    if _NO_SEPARATE_OPEX_RE.search(text):
+        try:
+            is_zeroish = current == "" or float(current) == 0.0
+        except ValueError:
+            is_zeroish = False
+        if is_zeroish:
+            proposal["updates"] = [u for u in updates if u is not opex_update]
+            return proposal
+
+    # BASIS guard — annualize a monthly opex figure to match the annual rent basis.
+    monthly_match = _OPEX_MONTHLY_RE.search(text)
+    if monthly_match:
+        try:
+            monthly_val = float(monthly_match.group(1))
+            current_val = float(current) if current else None
+        except ValueError:
+            return proposal
+        annual_str = f"{monthly_val * 12:.2f}"
+        # Only rewrite when the update is still carrying the monthly figure.
+        if current_val is not None and abs(current_val - monthly_val) < 1e-9 and current != annual_str:
+            opex_update["value"] = annual_str
+            opex_update["reason"] = (
+                "Deterministic basis normalization: opex stated monthly, "
+                "annualized to match the rent basis."
+            )
+
+    return proposal
+
 
 def _filter_config_by_extraction_fields(column_config: dict, extraction_fields: List[str]) -> dict:
     """
@@ -1304,6 +1499,13 @@ def apply_proposal_to_sheet(
             # via outbound_safety.find_unresolved_placeholders - never write a
             # literal placeholder into a client sheet cell.
             if find_unresolved_placeholders(new_val):
+                skipped.append({"column": col_name, "reason": "placeholder-value"})
+                continue
+
+            # Reject data placeholders (TBD / N/A / pending / TBC / "To follow" /
+            # "ask landlord"). These are deferrals, not data — writing one verbatim
+            # would overwrite a blank cell with noise that reads as a real spec.
+            if _is_placeholder_data_value(new_val):
                 skipped.append({"column": col_name, "reason": "placeholder-value"})
                 continue
 
@@ -2054,6 +2256,9 @@ OUTPUT ONLY valid JSON in this exact format:
         proposal.setdefault("response_email", None)  # LLM-generated response email
         proposal = _augment_proposal_with_deterministic_extractions(
             proposal, rowvals, header, effective_config, conversation, pdf_manifest=pdf_manifest
+        )
+        proposal = _augment_proposal_opex_basis(
+            proposal, rowvals, header, effective_config, conversation
         )
         proposal = _augment_events_with_deterministic_signals(
             proposal,

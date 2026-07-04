@@ -1008,3 +1008,85 @@ Harness failures (7) are fewer than misread findings (9) because two misreads we
 - The LLM systematically delegates rent to the deterministic layer (it extracted rent in 0 of the 4 cases where the fallback missed, while extracting every other field in the same messages) — so every fallback regex gap is a de-facto total miss. Prompt-side, rent extraction appears de-emphasized by the never-request rendering (FIX-17).
 - Harness scoring for this sweep used explicit tokens and record-level verification; the two harness-PASS misreads (M38, M41) argue the Surface-B deck should include value assertions and full-record snapshots, not signal grammar alone.
 - Salvage artifacts: `cases_broker_available_full_specs.json`, `cases_broker_available_partial_specs.json`, `cases_available_specs_missing.json`, `cases_available_specs_rerun.json`, `results_available_specs{,_salvage,_rerun}.jsonl`, `run_salvage{,_rerun}.log` under the same scratchpad path as the main document's artifacts.
+
+---
+
+## Addendum B: extraction-format sweep
+
+**Date:** 2026-07-04 &nbsp;|&nbsp; **Scope:** EXTRACTION (the `updates` list of `propose_sheet_updates`) on spec **formats** the A′/Addendum-A sweeps did not focus on — clear-height decimalization, dock↔drive-in split, power (amps/volts/phase, Canadian "hydro"), NNN/OPEX/TMI/CAM/gross basis, metric→imperial conversion, dollar-less/psf/monthly rent, partial specs, and old-vs-corrected value conflicts — plus three near-miss controls (a suite number, a phone number, a street number that must **not** become a spec value).
+
+**Method (identical harness to §1):** same `runner.py`, real production entrypoint `ai_processing.propose_sheet_updates(...)` → `client.responses.create` (gpt-5.2), `conversation=` prebuilt, `dry_run=True`, `firestore.Client` mocked pre-import with the zero-recorded-calls assertion after every case (it never fired — only egress was `api.openai.com`; zero sends/drafts/Graph/Firestore/Sheets touches; repo untouched, nothing committed). Every anomaly was rerun live once; both reproduced identically (2/2). Layer attribution used the A′ fingerprints — a bare `{type, reason}` event with no `notes`/`question` = deterministic injector — cross-checked against `_looks_like_requirements_mismatch_nonviable` as a pure function offline.
+
+### B.1 Coverage
+
+- **23 designed cases + 2 verification reruns = 25 live gpt-5.2 calls**, zero safety violations.
+- **Extraction verdict: 23/23 correct on the extracted VALUES** — this is the headline. Every format converted or mapped correctly: `21'6"`→**21.5**, `22 ft 9 in`→**22.75**; `8.5 m`→**27.9 ft**, `9.1 m`→**29.86 ft**, `2,320 sq m`→**24,972 SF** (model does metric conversion unprompted — the prompt never asks for it); dock/drive-in split correct in all 4 cases incl. "8 loading positions total — 6 docks + 2 drive-ins" (never wrote 8 to either column); power fused cleanly (`1,600A 480V 3-phase`, `600V 800 amps 3-phase` from "hydro", `2000 amps`, `800A 208V/120V`); rent basis mapped correctly for NNN (8.50 + opex 3.25), Canadian **TMI**→Ops Ex 4.50, **CAM**→Ops Ex 2.10, gross 15.00; dollar-less `8.75 psf net`→8.75; monthly `$1.10/SF/month`→**13.20/yr**; both value conflicts resolved to the corrected figure (rent 8.75 over stale 9.50; SF 38,500 net over 40,000 gross); partial-spec case wrote **only** Total SF and fabricated nothing.
+- **All three near-miss extraction controls HELD:** Suite **240**→Ceiling Ht correctly 18 (not 240); phone **410-555-0200**→Power correctly 400A with **zero digit leakage** into any spec column (the `410/555/0200` substrings appear only inside a `call_requested.question` field, never in `updates`); street number **100 Dock Street**→Docks correctly 4 (not 100).
+- The sweep surfaced **no extraction-value defects**, but two spurious **EVENTS** fired as byproducts of the spec-format phrasings and are reported below. Both are cross-layer (one deterministic, one LLM) and both reproduced 2/2. Results: `/private/tmp/claude-501/-Users-baylorharrison-Documents-GitHub-nosync-second-brain/eca2dad5-5a1d-48de-8fa3-f7bbb145e1b1/scratchpad/aprime/results_surface_b.jsonl` (+ `results_surface_b_rerun.jsonl`); cases `cases_surface_b_extraction.json`.
+
+### B.2 Misreads — full evidence (verbatim), M47–M49
+
+#### M47 — clear-height "under joist" → deterministic property_unavailable — HIGH
+
+*Kind:* variant (clear-height decimalization axis) &nbsp;|&nbsp; *Layer:* **deterministic** (augmenter regex) &nbsp;|&nbsp; *Case:* `sb-ch-decimal-ftin-words`
+
+**Phrasing (as sent to the live model):**
+
+> Clear height is 22 ft 9 in under joist. Everything else on the flyer is current.
+
+**Expected:** Ceiling Ht = 22.75 and **no event** — a benign clear-height spec reply on a live listing.
+
+**Actual:** Ceiling Ht = **22.75** (correct) **but** `events = [{"type": "property_unavailable", "reason": "requirements_mismatch"}]` — a bare `{type, reason}` shape (deterministic injector fingerprint; no `notes`/`question`). Reproduced identically 2/2 live.
+
+**Severity:** HIGH
+
+**Analysis:** Root cause is the `height_mismatch` branch of `_looks_like_requirements_mismatch_nonviable` (ai_processing.py ~322-327): `height_term [^.]{0,45}? below_term` where `below_term = (?:below|under|beneath|less than|short of)`. "Clear height is 22 ft 9 in **under** joist" matches because **"under joist"** is standard CRE phrasing for *where* clear height is measured (under the bar joists / roof structure), not a below-spec comparison. The regex has no anchor requiring a spec/number to follow `under`, so any measurement descriptor fires it. Confirmed offline as a pure function: `_looks_like_requirements_mismatch_nonviable("Clear height is 22 ft 9 in under joist…") → True`, and the sibling **"24' clearance under the sprinkler heads" → True** (a second natural false positive), while the same sentence without "under" → False and a genuine "clear height is below what your client needs" → True (correct). Downstream this injects `property_unavailable:requirements_mismatch` and terminalizes a spec-complete, actively-marketed listing; per the augmenter's conflicting-event cleanup it would also strip a co-emitted `tour_requested`/etc. 100% reproducible because it is regex, not model, behavior. This is the same subject-blind class as A′ M06 (office-heavy) but on the clear-height pattern, which the format sweep is the first to exercise. **Fix candidate:** require a numeric/spec comparison after `below_term` (e.g. `under 24'`, `below the 28 ft they need`) and exclude structural-reference nouns (`joist`, `deck`, `sprinkler`, `bar joist`, `steel`); regression test M47 (assert no event, Ceiling Ht 22.75).
+
+#### M48 — phone-preference line → LLM call_requested — LOW
+
+*Kind:* nearmiss control (phone-digit-not-a-spec) &nbsp;|&nbsp; *Layer:* **llm** &nbsp;|&nbsp; *Case:* `sb-nearmiss-phone-digits`
+
+**Phrasing (as sent to the live model):**
+
+> Best to reach me at 410-555-0200. Building has 400A service, 22' clear, 30,000 SF.
+
+**Expected:** Power = 400A; extraction control holds (no phone digit in any spec); **no** call_requested — the broker is stating a contact preference, not requesting a call.
+
+**Actual:** Extraction perfect (Power 400A, Ceiling Ht 22, Total SF 30000, **zero phone-digit contamination**), but `events = [{"type": "call_requested", "reason": "", "question": "Best to reach me at 410-555-0200."}]`. Reproduced identically 2/2 live.
+
+**Severity:** LOW
+
+**Analysis:** The **extraction** near-miss control (the point of the case) passed cleanly — no `410/555/0200` reached any `updates` cell. The residual defect is an LLM event over-fire: gpt-5.2 reads "Best to reach me at <phone>" as a call request (`call_requested`) when it is a passive contact-preference statement accompanying a full spec drop. Downstream this forces `response_email = null` (call_requested routes to the user) and raises a spurious call-request card on a message the automation could have auto-answered by acknowledging the specs — a stall, not a wrong write. `reason` is also empty (off the documented enum, same class as A′ M18/M33 reason-hygiene). Note the harness footgun the A′ doc warns about is visible here: the raw `stopIf` substrings `410/555/0200` "tripped" only because they appear in the `call_requested.question` echo, **not** in any extracted value — record-level inspection (done here) is required, signal grammar alone would mis-grade this as an extraction leak. **Fix candidate:** prompt rule that a phone number offered as a contact preference alongside specs is not `call_requested` absent an explicit ask ("can you call me?"); regression test M48 (assert no call_requested, Power 400A).
+
+#### M49 — gross lease → fabricated Ops Ex "0" — LOW
+
+*Kind:* variant (gross basis axis) &nbsp;|&nbsp; *Layer:* **llm** &nbsp;|&nbsp; *Case:* `sb-gross-basis`
+
+**Phrasing (as sent to the live model):**
+
+> This one is quoted at $15/SF gross - all in, no separate opex pass-through. 35,000 SF.
+
+**Expected:** Rent/SF /Yr = 15; **no** Ops Ex value (the broker stated no number — a gross lease bakes opex into the rate).
+
+**Actual:** Rent/SF /Yr = 15.00 (correct, via deterministic fallback) **plus** `Ops Ex /SF = "0"` (conf 0.80, reason "gross rent is all-in with no separate opex pass-through"). Reproduced 2/2 live.
+
+**Severity:** LOW
+
+**Analysis:** Borderline — defensible but worth flagging. The model synthesizes a numeric `0` for a field the broker never quantified. It is arguably correct (tenant pays $0 additional opex on a gross lease, and if downstream `Gross Rent = Rent + Ops Ex` then 15+0 = 15 stays right), which is why this is LOW not MED. The risk is semantic: a written `0` opex is indistinguishable downstream from a genuinely-measured $0.00 and overwrites the "unknown/blank" state, and it violates the prompt's own "SKIP that field rather than guessing" instruction for values not explicitly stated. If any consumer treats blank-vs-0 differently (e.g. "opex still outstanding" vs "opex confirmed zero") this mis-signals completeness. **Fix candidate (optional):** on a `gross` basis, record the basis in `notes` (already done — "gross (all-in)") and leave Ops Ex blank rather than writing 0; regression test M49 (assert Ops Ex blank, notes contains gross).
+
+### B.3 Fix plan additions (same files as §5)
+
+**File — `ai_processing.py` deterministic non-viable detector (`_looks_like_requirements_mismatch_nonviable`, height branch ~322-327):**
+
+- **NEW FIX-22 (HIGH).** Anchor the `height_mismatch` regex to an actual below-spec **comparison** (a number/spec must follow `below|under|beneath|less than|short of`) and exclude structural-reference objects (`joist`, `bar joist`, `deck`, `steel`, `sprinkler[s]`, `haunch`). Today "clear height 22 ft 9 in **under joist**" and "clearance **under the sprinkler heads**" both inject `property_unavailable:requirements_mismatch` on live, spec-complete listings (M47, 2/2, offline pure-function proof). Same subject-blind class as FIX-06 (office-heavy). **Regression test: M47** (assert no event; Ceiling Ht 22.75).
+
+**File — `ai_processing.py` prompt (EVENT_RULES):**
+
+- **NEW FIX-23 (LOW).** `call_requested` must require an explicit request to talk ("can you call me", "give me a ring", "let's hop on a call") — a phone number offered as a contact **preference** alongside specs ("best to reach me at <phone>") is not a call request (M48, 2/2). **Regression test: M48.**
+- **NEW FIX-24 (LOW, optional).** On a `gross`/all-in basis with no stated opex figure, leave Ops Ex blank and record the basis in `notes` rather than fabricating `Ops Ex = 0` (M49). **Regression test: M49.**
+
+### B.4 Residual notes for this sweep
+
+- **Extraction quality is the strong point of this surface.** Across 12 distinct number-format axes (decimal feet-inches, metric length + area, fused power triples, five rent bases, monthly annualization, dollar-less/psf, old-vs-corrected conflicts, parenthetical dock decomposition) the model produced the correct VALUE every time, and all three digit-decoy controls held. The deterministic rent fallback (0.92 conf) fired correctly on the control/gross/metric/whole-number cases and its lowercase `rent/sf /yr` column name reproduced (case-sensitivity already verified safe by A′ apply-side; not re-run here).
+- Both findings are EVENTS, not extraction values — consistent with A′'s core thesis that the deterministic augmenter and quoted/idiom-blind matching (not the model's number parsing) are the wrong-write sources. M47 in particular extends the A′ M06 subject-blindness pattern onto the clear-height branch, which only a decimalization-format sweep would exercise.
+- Per instructions nothing was fixed and nothing was committed; the repo/worktree is untouched.
