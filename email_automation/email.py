@@ -844,6 +844,13 @@ def _graph_recipient(address: str, name: Optional[str] = None) -> Dict[str, Any]
     return {"emailAddress": email_address}
 
 
+# Last operator (sender) mailbox this process has filtered reply-all audiences
+# for. SiteSift runs per-mailbox, so once we've seen the operator address we can
+# still strip it from a reply-all audience even if a caller forgets to thread
+# user_email through — preventing the mailbox from reply-all'ing itself.
+_LAST_KNOWN_OPERATOR_EMAIL: Optional[str] = None
+
+
 def _filter_reply_all_draft_recipients(
     user_id: str,
     draft: Dict[str, Any],
@@ -858,9 +865,20 @@ def _filter_reply_all_draft_recipients(
     lets Graph preserve thread semantics while SiteSift still honors opt-outs,
     blocked contacts, duplicate prevention, and the operator's own address.
     """
-    from .processing import is_contact_opted_out
+    from .processing import is_contact_opted_out, _mailbox_identity_without_plus
 
+    global _LAST_KNOWN_OPERATOR_EMAIL
     operator = _normalize_email(user_email)
+    if operator:
+        # Remember the operator so a later caller that omits user_email still
+        # gets the self-send guard.
+        _LAST_KNOWN_OPERATOR_EMAIL = operator
+    elif _LAST_KNOWN_OPERATOR_EMAIL:
+        operator = _LAST_KNOWN_OPERATOR_EMAIL
+    # Compare on the plus-alias-stripped mailbox identity so an operator alias
+    # (e.g. agent+campaign1@sitesift.com) is recognized as the operator's own
+    # mailbox and removed — otherwise reply-all would deliver back to us.
+    operator_identity = _mailbox_identity_without_plus(operator) if operator else None
     seen = set()
     payload = {"toRecipients": [], "ccRecipients": []}
     skipped = {
@@ -877,7 +895,7 @@ def _filter_reply_all_draft_recipients(
             if not normalized:
                 skipped["invalid"].append(raw_address)
                 continue
-            if operator and normalized == operator:
+            if operator_identity and _mailbox_identity_without_plus(normalized) == operator_identity:
                 skipped["operator"].append(normalized)
                 continue
             if normalized in seen:
@@ -887,6 +905,10 @@ def _filter_reply_all_draft_recipients(
                 skipped["invalid"].append(normalized)
                 continue
 
+            # Fail closed: if the opt-out lookup errors we must NOT keep the
+            # recipient. Let the error propagate so the whole reply-all filter
+            # aborts (callers delete the draft and require manual review)
+            # rather than risk emailing an opted-out / blocked contact.
             optout_record = is_contact_opted_out(user_id, normalized)
             if optout_record:
                 skipped["optedOut"].append({
@@ -1390,9 +1412,29 @@ NAME_PLACEHOLDER_RE = re.compile(
 )
 
 
+# Company-name suffix/keyword tokens. If a "name" column value carries any of
+# these, it's an organization, not a person — do not fabricate a human
+# first-name greeting ("Hi Acme,"); fall back to a neutral greeting instead.
+_COMPANY_NAME_TOKENS = frozenset({
+    "llc", "inc", "corp", "co", "company", "realty", "group",
+    "partners", "llp", "advisors", "associates", "properties",
+    "capital", "holdings", "ltd",
+})
+
+
+def _looks_like_company_name(candidate: str) -> bool:
+    for token in (candidate or "").split():
+        cleaned = re.sub(r"[^a-z]", "", token.lower())
+        if cleaned in _COMPANY_NAME_TOKENS:
+            return True
+    return False
+
+
 def _safe_greeting_first_name(contact_name: Optional[str]) -> Optional[str]:
     candidate = (contact_name or "").strip()
     if not candidate or "@" in candidate or "[" in candidate or "]" in candidate:
+        return None
+    if _looks_like_company_name(candidate):
         return None
     first = candidate.split()[0].strip(" ,;:()[]{}")
     if not first or not re.fullmatch(r"[A-Za-z][A-Za-z.'-]{0,63}", first):

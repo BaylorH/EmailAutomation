@@ -277,7 +277,7 @@ def _followup_terminal_block_reason(
 
     if (thread_data or {}).get("hasInboundReply"):
         return "the broker has already replied"
-    if status in {"stopped", "completed", "archived", "action_needed"}:
+    if status in {"stopped", "completed", "archived", "action_needed", "paused"}:
         return f"the thread is {status}"
     if followup_status in {"paused", "needs_review", "max_reached", "complete", "completed", "stopped"}:
         return f"follow-up tracking is {followup_status}"

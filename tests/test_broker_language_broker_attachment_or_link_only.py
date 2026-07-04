@@ -260,27 +260,182 @@ class TestFailedPdfExtractionNotSilentlyComplete(unittest.TestCase):
 
 
 class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
-    """Composite pin on the actual mark-processed gate. Extraction-failure paths
-    above raise NOTHING, so process_inbox_message finishes with error=None and
-    _should_mark_processed_after_error(None) -> True -> processed.
+    """Pins the REAL mark-processed gate connection, end to end through
+    process_inbox_message:
 
-    There is no deterministic error class that an extraction failure maps to, so
-    the gate cannot protect the broker's data. This documents the missing guard."""
+      file_handling surfaces an extraction failure (failed PDF extraction /
+      broken-protected broker link)  ->  process_inbox_message must carry a
+      non-None retryable error (RetryableProcessingError)  ->
+      _should_mark_processed_after_error(error) is False  ->  the caller leaves
+      the message UNPROCESSED (that exact caller decision is pinned by
+      tests/test_processing_retryability.py::
+      test_scan_records_unexpected_processing_crash_without_marking_processed).
+
+    Historically the failure paths raised NOTHING, error stayed None, the gate
+    returned True and the broker's attachment/link payload was silently lost."""
+
+    USER_ID = "user-extraction-gate"
+    THREAD_ID = "thread-extraction-gate"
+
+    def _drive_real_process_inbox_message(self, *, body, has_attachments, fh_patches):
+        """Run the REAL process_inbox_message (and the REAL file_handling
+        manifest builders) with only external boundaries faked. Returns the
+        exception it raised, or None if it completed silently."""
+        from tests.test_compound_nonviable_processing import (
+            FakeDocumentRef,
+            FakeFirestore,
+        )
+
+        thread_ref = FakeDocumentRef({
+            "status": "active",
+            "clientId": "client-1",
+            "email": ["broker@example.test"],
+        })
+        client_ref = FakeDocumentRef({"criteria": "Industrial search"})
+
+        msg = {
+            "id": "msg-extraction-gate",
+            "subject": "RE: 4402 Rex Rd",
+            "from": {"emailAddress": {"address": "broker@example.test", "name": "Dana"}},
+            "toRecipients": [{"emailAddress": {"address": "me@ourdomain.test"}}],
+            "internetMessageId": "<extraction-gate@example.test>",
+            "conversationId": "conv-extraction-gate",
+            "receivedDateTime": "2026-07-01T15:00:00Z",
+            "bodyPreview": body[:200],
+            "hasAttachments": has_attachments,
+            "internetMessageHeaders": [
+                {"name": "In-Reply-To", "value": "<our-outbound@example.test>"},
+            ],
+        }
+        header = ["Property Address", "City", "Leasing Contact", "Email", "Total SF"]
+        rowvals = ["4402 Rex Rd", "Houston", "Dana", "broker@example.test", ""]
+
+        full_body_response = mock.MagicMock()
+        full_body_response.json.return_value = {
+            "body": {"content": body, "contentType": "Text"},
+            "hasAttachments": has_attachments,
+        }
+        me_response = mock.MagicMock(status_code=200)
+        me_response.json.return_value = {"mail": "me@ourdomain.test"}
+
+        send_reply = mock.MagicMock(return_value=True)
+
+        patchers = [
+            mock.patch.object(proc, "_fs", FakeFirestore(thread_ref, client_ref)),
+            mock.patch.object(proc, "exponential_backoff_request", return_value=full_body_response),
+            mock.patch.object(proc.requests, "get", return_value=me_response),
+            mock.patch.object(proc, "lookup_thread_by_message_id", return_value=self.THREAD_ID),
+            mock.patch.object(proc, "lookup_thread_by_conversation_id", return_value=None),
+            mock.patch.object(proc, "get_thread_status", return_value=proc.THREAD_STATUS["active"]),
+            mock.patch.object(proc, "save_message", return_value=True),
+            mock.patch.object(proc, "index_message_id", return_value=True),
+            mock.patch.object(proc, "dump_thread_from_firestore"),
+            mock.patch("email_automation.followup.cancel_followup_on_response"),
+            mock.patch.object(
+                proc,
+                "fetch_and_log_sheet_for_thread",
+                return_value=("client-1", "sheet-1", header, 3, rowvals, None, []),
+            ),
+            mock.patch.object(
+                proc,
+                "_resolve_reply_identity",
+                return_value={
+                    "recipient_email": "broker@example.test",
+                    "contact_name": "Dana",
+                    "original_email": "broker@example.test",
+                    "source": "test",
+                },
+            ),
+            mock.patch.object(proc, "write_message_order_test"),
+            mock.patch.object(proc, "fetch_url_as_text", return_value=None),
+            # If the extraction failure is NOT surfaced, processing continues to
+            # the proposal; skip_response makes that continuation terminate
+            # cleanly with error=None (the historical silent-loss outcome).
+            mock.patch.object(proc, "propose_sheet_updates", return_value={"skip_response": True}),
+            mock.patch.object(proc, "_sheets_client", return_value=mock.MagicMock()),
+            mock.patch.object(proc, "_get_first_tab_title", return_value="Sheet1"),
+            mock.patch.object(proc, "check_missing_required_fields", return_value=[]),
+            mock.patch.object(proc, "send_reply_in_thread", side_effect=send_reply),
+        ] + list(fh_patches)
+
+        raised = None
+        with contextlib_nested(patchers):
+            try:
+                proc.process_inbox_message(
+                    self.USER_ID, {"Authorization": "Bearer fake"}, msg
+                )
+            except Exception as e:  # noqa: BLE001 - the raised type IS the assertion target
+                raised = e
+        return raised, send_reply
 
     def test_extraction_failure_should_not_map_to_processed(self):
-        # Reproduce the error value process_inbox_message would carry after the
-        # link-download failure silently returned [] (no exception).
-        error_after_silent_link_failure = None  # nothing raised by the extraction layer
-        marks_processed = proc._should_mark_processed_after_error(
-            error_after_silent_link_failure)
-        # CORRECT behavior: an extraction failure must NOT mark the message
-        # processed. Because the failure never surfaces as an exception, the gate
-        # returns True -> RED (documents the missing RetryableProcessingError path).
+        # A broker attachment whose text extraction AND OpenAI-upload fallback
+        # both fail: the REAL fetch_and_process_pdfs surfaces it as a
+        # failure entry (method='failed_extraction', extraction_failed=True).
+        attachment = {"name": "OfferingMemo.pdf", "bytes": b"%PDF-1.4 xxx"}
+        failed_result = {"text": "", "images": [], "method": "failed",
+                         "file_id": None, "id": None, "filename": "OfferingMemo.pdf"}
+        fh_patches = [
+            mock.patch.object(fh, "fetch_pdf_attachments", return_value=[attachment]),
+            mock.patch.object(fh, "process_pdf_for_ai", return_value=dict(failed_result)),
+            mock.patch.object(fh, "upload_pdf_to_drive", return_value="https://drive/link"),
+            mock.patch.object(fh, "_attach_pdf_property_preview", return_value=None),
+        ]
+
+        error, send_reply = self._drive_real_process_inbox_message(
+            body="Hi, please see the attached offering memo for the full specs.",
+            has_attachments=True,
+            fh_patches=fh_patches,
+        )
+
+        # CORRECT behavior: the surfaced extraction failure must become a
+        # non-None retryable error out of process_inbox_message...
+        self.assertIsNotNone(
+            error,
+            "FALSE NEGATIVE: total PDF extraction failure raised nothing, so the "
+            "caller sees error=None, marks the message processed, and the "
+            "broker's attachment payload is lost forever.")
+        self.assertIsInstance(
+            error, proc.RetryableProcessingError,
+            f"extraction failure must surface as RetryableProcessingError, got: {error!r}")
+        self.assertIn("OfferingMemo.pdf", str(error))
+        # ...so the mark-processed gate keeps the message UNPROCESSED.
         self.assertFalse(
-            marks_processed,
-            "FALSE NEGATIVE: extraction failure does not surface as an error, so "
-            "_should_mark_processed_after_error(None)=True marks the message "
-            "processed — the broker's attachment/link payload is lost forever.")
+            proc._should_mark_processed_after_error(error),
+            "the surfaced extraction error must keep the message unprocessed")
+        # And no auto-reply may be sent off a message whose payload was lost.
+        send_reply.assert_not_called()
+
+    def test_broken_broker_link_download_failure_keeps_message_unprocessed(self):
+        # A broker link-only message whose download fails (403 protected Drive
+        # file / dead link): the REAL fetch_and_process_linked_assets surfaces
+        # it as a failure entry (method='failed', download_failed=True).
+        fh_patches = [
+            mock.patch.object(fh, "fetch_pdf_attachments", return_value=[]),
+            mock.patch.object(
+                fh, "_download_linked_asset",
+                side_effect=ValueError("403 Forbidden (protected Drive file)")),
+        ]
+
+        error, send_reply = self._drive_real_process_inbox_message(
+            body=("All details are in this Dropbox link. "
+                  "https://www.dropbox.com/s/ab12/flyer.pdf?dl=0"),
+            has_attachments=False,
+            fh_patches=fh_patches,
+        )
+
+        self.assertIsNotNone(
+            error,
+            "FALSE NEGATIVE: broken/protected broker link raised nothing, so the "
+            "caller sees error=None, marks the message processed, and the "
+            "broker's link payload is lost forever.")
+        self.assertIsInstance(
+            error, proc.RetryableProcessingError,
+            f"link download failure must surface as RetryableProcessingError, got: {error!r}")
+        self.assertFalse(
+            proc._should_mark_processed_after_error(error),
+            "the surfaced link-download error must keep the message unprocessed")
+        send_reply.assert_not_called()
 
     def test_genuine_retryable_error_is_respected_control(self):
         # Control: when an error DOES surface, the gate correctly keeps it unprocessed.

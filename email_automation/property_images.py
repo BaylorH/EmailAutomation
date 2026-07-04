@@ -17,6 +17,24 @@ BLOCKED_LISTING_DOMAINS = (
     "costar.com",
     "loopnet.com",
 )
+# Common CRE file-share hosts. Broker links on these hosts carry no direct file
+# extension and are not Drive/Dropbox *direct* files, so none of the extension /
+# drive-id branches below match them. A link-ONLY broker email on one of these
+# hosts is real broker payload ("everything's in this SharePoint/Box/WeTransfer
+# link"). Returning None silently drops that payload and lets the pipeline mark
+# the message processed with the broker's data lost. We cannot resolve the
+# underlying file deterministically, so we FLAG the link for manual review
+# instead of dropping it — fail closed / stay visible.
+FILE_SHARE_HOSTS = (
+    "sharepoint.com",
+    "onedrive.live.com",
+    "onedrive.com",
+    "1drv.ms",
+    "box.com",
+    "boxcloud.com",
+    "wetransfer.com",
+    "we.tl",
+)
 DIRECT_IMAGE_EXTENSIONS = (
     ".png",
     ".jpg",
@@ -33,6 +51,135 @@ SAFE_DIRECT_IMAGE_HOSTS = (
     "dropbox.com",
     "dropboxusercontent.com",
 )
+
+# --- Wrong-property address guard -------------------------------------------
+# A forwarded flyer for a DIFFERENT address must not silently become the row's
+# flyer/preview source (its preview would populate property_image_url on the
+# current row). Deterministic address pattern: street-number token + 1..3
+# street-name tokens + street-suffix token (e.g. "123-Main-St", "4402 Rex Rd",
+# "1419 Atlantis Drive").
+STREET_SUFFIX_TOKENS = frozenset((
+    "st", "street", "ave", "avenue", "av", "rd", "road", "blvd", "boulevard",
+    "dr", "drive", "ln", "lane", "ct", "court", "way", "pl", "place",
+    "hwy", "highway", "fwy", "freeway", "pkwy", "parkway", "ter", "terrace",
+    "cir", "circle", "sq", "square", "trl", "trail", "loop", "plaza", "pike",
+    "row", "aly", "alley", "bnd", "bend", "xing", "crossing",
+))
+# Property-agnostic tokens that legitimately ride along with an address in a
+# broker filename ("4402 Rex Rd Flyer.pdf"). Anything alphabetic OUTSIDE this
+# vocabulary next to an address is a potentially property-identifying claim
+# (another city / cross street / marker) that we cannot verify without target
+# context — fail closed in that case.
+ADDRESS_NEUTRAL_TOKENS = frozenset((
+    # document descriptors
+    "flyer", "flyers", "brochure", "brochures", "om", "offering", "memorandum",
+    "floorplan", "floorplans", "floor", "plan", "plans", "site", "sitemap",
+    "survey", "marketing", "package", "packet", "pkg", "deck", "listing",
+    "lease", "sublease", "sale", "photos", "photo", "pics", "images", "image",
+    "info", "details", "detail", "spec", "specs", "sheet", "onepager",
+    "one", "pager", "final", "updated", "revised", "new", "draft", "copy",
+    # intra-property qualifiers (same property, not a different one)
+    "suite", "ste", "unit", "bldg", "building", "space",
+    # file extensions
+    "pdf", "jpg", "jpeg", "png", "webp", "gif",
+))
+
+
+def _guard_tokens(text: str) -> List[str]:
+    return [t for t in re.split(r"[^a-z0-9]+", _clean(text).lower()) if t]
+
+
+def _address_claims_in_tokens(tokens: List[str]):
+    """Scan one filename / path segment for street-address claims.
+
+    Returns (claims, has_unverified_extra) where each claim is
+    (street_number, street_name_tokens) and has_unverified_extra is True when
+    the segment also carries alphabetic tokens that are neither part of the
+    address nor in the neutral vocabulary (an unverifiable property claim).
+    """
+    claims = []
+    consumed = set()
+    i = 0
+    n = len(tokens)
+    while i < n:
+        token = tokens[i]
+        if token.isdigit() and 1 <= len(token) <= 6:
+            for j in range(i + 1, min(i + 5, n)):
+                lookahead = tokens[j]
+                if lookahead.isdigit():
+                    break
+                if lookahead in STREET_SUFFIX_TOKENS and j > i + 1:
+                    claims.append((token, tuple(tokens[i + 1:j])))
+                    consumed.update(range(i, j + 1))
+                    i = j
+                    break
+        i += 1
+    has_unverified_extra = bool(claims) and any(
+        k not in consumed
+        and not tokens[k].isdigit()
+        and tokens[k] not in ADDRESS_NEUTRAL_TOKENS
+        for k in range(n)
+    )
+    return claims, has_unverified_extra
+
+
+def _collect_address_claims(source_url: str, filename_hint: str):
+    """Address claims from the filename hint and each URL path segment."""
+    segments = []
+    hint = _clean(filename_hint)
+    if hint:
+        segments.append(hint)
+    try:
+        path = urlparse(source_url).path
+    except Exception:
+        path = ""
+    segments.extend(part for part in path.split("/") if part)
+
+    claims = []
+    unverified_extra = False
+    for segment in segments:
+        segment_claims, segment_extra = _address_claims_in_tokens(
+            _guard_tokens(segment))
+        if segment_claims:
+            claims.extend(segment_claims)
+            unverified_extra = unverified_extra or segment_extra
+    return claims, unverified_extra
+
+
+def _claim_matches_target(claim, target_tokens) -> bool:
+    street_number, street_names = claim
+    if street_number not in target_tokens:
+        return False
+    return all(name in target_tokens for name in street_names)
+
+
+def _fails_property_address_guard(
+    source_url: str,
+    filename_hint: str,
+    target_property_hint: str,
+) -> bool:
+    """True when the link must NOT become a download candidate (fail closed).
+
+    - Target hint provided: any address claim in the filename/URL must match
+      the target's street number + street-name tokens; a clearly different
+      address is rejected.
+    - No target hint: an address-bearing name that ALSO carries extra
+      non-neutral identifying tokens is an unverifiable property claim and is
+      rejected. A plain address-plus-descriptor name (e.g. "4402 Rex Rd
+      Flyer.pdf") stays allowed — production does not always have target
+      context at this boundary, and dropping every address-bearing flyer
+      would silently lose correct-property payloads.
+    """
+    claims, unverified_extra = _collect_address_claims(source_url, filename_hint)
+    if not claims:
+        return False
+    target = _clean(target_property_hint)
+    if target:
+        target_tokens = set(_guard_tokens(target))
+        return not any(
+            _claim_matches_target(claim, target_tokens) for claim in claims
+        )
+    return unverified_extra
 
 
 def _clean(value: Any) -> str:
@@ -104,6 +251,35 @@ def is_blocked_listing_url(url: str) -> bool:
     return any(host == domain or host.endswith(f".{domain}") for domain in BLOCKED_LISTING_DOMAINS)
 
 
+def _clean_host(url: str) -> str:
+    """Robust host extraction. ``_host`` uses ``str.lstrip('www.')`` which strips
+    a *character set* and mangles hosts like ``we.tl`` -> ``e.tl``; use a proper
+    prefix strip here so short file-share hosts are matched correctly."""
+    try:
+        netloc = urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc
+
+
+def _is_file_share_host(url: str) -> bool:
+    host = _clean_host(url)
+    return any(_host_matches(host, domain) for domain in FILE_SHARE_HOSTS)
+
+
+def _is_drive_folder_url(url: str) -> bool:
+    """A Google Drive *folder* link (…/drive/folders/…) is not a single file, so
+    ``_drive_file_id`` returns None and it would otherwise be silently dropped."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = _clean_host(url)
+    return host.endswith("drive.google.com") and "/drive/folders/" in parsed.path
+
+
 def _drive_file_id(url: str) -> Optional[str]:
     parsed = urlparse(url)
     match = re.search(r"/file/d/([^/]+)", parsed.path)
@@ -123,9 +299,20 @@ def _dropbox_download_url(url: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(params)))
 
 
-def build_download_candidate(url: str, filename_hint: str = "") -> Optional[Dict[str, Any]]:
+def build_download_candidate(
+    url: str,
+    filename_hint: str = "",
+    target_property_hint: str = "",
+) -> Optional[Dict[str, Any]]:
     source_url = _clean(url)
     if not source_url or is_blocked_listing_url(source_url):
+        return None
+
+    # Wrong-property guard (deterministic): a flyer whose filename/URL names a
+    # street address that does not verifiably belong to the target property
+    # must not become the row's flyer/preview source — its preview would
+    # populate property_image_url on the wrong row. Fail closed.
+    if _fails_property_address_guard(source_url, filename_hint, target_property_hint):
         return None
 
     file_name = _clean(filename_hint) or "broker attachment"
@@ -180,6 +367,22 @@ def build_download_candidate(url: str, filename_hint: str = "") -> Optional[Dict
             "sourceType": "public_pdf",
             "sourceLabel": f"Broker flyer: {file_name}",
             "sourceUrl": source_url,
+        }
+
+    # Common CRE file-share hosts (SharePoint / OneDrive / 1drv.ms / Box /
+    # WeTransfer) and Google Drive *folder* links carry no direct file extension,
+    # so none of the branches above matched. This is almost always real broker
+    # payload the broker clearly intends as the message contents. We cannot
+    # resolve the underlying file deterministically, but returning None here would
+    # silently drop it and let the message be marked processed. FLAG it for manual
+    # review instead so it stays visible (no downloadUrl -> callers surface it
+    # rather than attempting a doomed download).
+    if _is_file_share_host(source_url) or _is_drive_folder_url(source_url):
+        return {
+            "sourceType": "broker_file_share_link",
+            "sourceLabel": f"Broker file-share link (needs manual review): {file_name}",
+            "sourceUrl": source_url,
+            "requiresManualReview": True,
         }
 
     return None

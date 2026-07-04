@@ -115,6 +115,9 @@ def _looks_like_requirements_mismatch_nonviable(text: str) -> bool:
             latest_text,
         )
         or re.search(r"\bnot\s+(?:a\s+|the\s+)?(?:good\s+|right\s+)?fit\s+for\s+(?:your|the)\s+client\b", latest_text)
+        # Casual / apostrophe-less non-fit phrasings: "not the right fit",
+        # "isnt the right fit", "not a good fit" (no trailing "for the client").
+        or re.search(r"\b(?:isn[’']?t|is\s+not|not)\s+(?:a\s+|the\s+)?(?:good|right)\s+fit\b", latest_text)
         or re.search(r"\bwon[’']?t\s+work\s+for\s+(?:them|you|your\s+client|the\s+client)\b", latest_text)
         or re.search(r"\bfails?\s+(?:to\s+meet\s+)?(?:your\s+|the\s+)?client(?:['’]?s)?\s+(?:warehouse\s+)?(?:requirements?|needs?|specs?)\b", latest_text)
         or re.search(r"\b(?:does\s+not|doesn[’']?t)\s+(?:meet|satisfy|fit)\s+(?:your\s+|the\s+)?client", latest_text)
@@ -231,18 +234,39 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
     if not latest_text:
         return proposal
 
+    # "availab(?:le|e)" tolerates the common single-char typo "availabe".
     unavailable_patterns = [
-        ("no_longer_available", r"\bno\s+longer\s+available\b"),
+        ("no_longer_available", r"\bno\s+longer\s+availab(?:le|e)\b"),
         ("signed_loi", r"\bsigned\s+(?:an?\s+)?(?:loi|letter\s+of\s+intent)\b"),
         ("signed_lease", r"\bsigned\s+(?:a\s+)?lease\b"),
         ("no_longer_represented", r"\bno\s+longer\s+represent(?:s|ed|ing)?\s+(?:this\s+|the\s+)?property\b"),
         ("no_space_available", r"\b(?:no|not\s+any|do(?:es)?\s+not\s+have\s+any)\s+space\s+available\b"),
         ("no_availability", r"\bno\s+availability\b"),
         ("fully_leased", r"\bfully\s+leased\b"),
+        # Terminal signals aligned with processing.PROPERTY_UNAVAILABLE_KEYWORDS.
+        ("just_leased", r"\bjust\s+leased\b"),
+        ("already_leased", r"\balready\s+leased\b"),
+        ("been_leased", r"\bbeen\s+leased\b"),
+        ("taken_off_market", r"\btaken\s+off\s+(?:the\s+)?market\b"),
+        ("off_market", r"\boff\s+(?:the\s+)?market\b"),
+        ("under_contract", r"\bunder\s+contract\b"),
+        ("accepted_an_offer", r"\baccepted\s+an?\s+offer\b"),
+        # Bare "leased" is terminal too, but a message that leases one suite while
+        # offering an alternate one is NOT non-viable — the alternate-viable guard
+        # below keeps that near-miss from firing.
+        ("leased", r"\bleased\b"),
     ]
 
+    # Near-miss guard: "one suite is leased but an alternate suite remains viable"
+    # must not terminalize the row. Only suppresses when both an alternate-space
+    # reference AND a still-viable/available signal are present.
+    alternate_remains_viable = bool(
+        re.search(r"\b(?:alternate|another|different|other)\s+(?:suite|space|unit|option|property|listing)\b", latest_text)
+        and re.search(r"\b(?:remains?|still|is|are)\s+(?:viable|available|open|active)\b", latest_text)
+    )
+
     property_unavailable_reason = None
-    if not looks_like_tour_only_unavailable(latest_text_raw):
+    if not looks_like_tour_only_unavailable(latest_text_raw) and not alternate_remains_viable:
         if _looks_like_requirements_mismatch_nonviable(latest_text):
             property_unavailable_reason = "requirements_mismatch"
         else:
@@ -525,6 +549,14 @@ def _build_row_snapshot(header: List[str], rowvals: List[str]) -> dict:
     return snapshot
 
 
+# Free-text placeholder cell values that a broker (or the model) may drop into a
+# required column while the real number is still outstanding. These are NOT data —
+# they must not satisfy the completion guard, or a row closes on non-answers.
+_PLACEHOLDER_CELL_VALUES = {
+    "tbd", "tbc", "pending", "n/a", "na", "?", "to follow", "ask landlord",
+}
+
+
 def check_missing_required_fields(rowvals: List[str], header: List[str], column_config: dict = None) -> List[str]:
     """
     Check which required fields are missing from the row.
@@ -544,7 +576,10 @@ def check_missing_required_fields(rowvals: List[str], header: List[str], column_
             key = field.strip().lower()
             if key in idx_map:
                 i = idx_map[key] - 1  # 0-based
-                if i >= len(rowvals) or not (rowvals[i] or "").strip():
+                cell = (rowvals[i] or "").strip() if i < len(rowvals) else ""
+                # A placeholder ('TBD', 'pending', '?', 'ask landlord', ...) is not a
+                # real spec value — treat it as missing so the row cannot close on it.
+                if i >= len(rowvals) or not cell or cell.lower() in _PLACEHOLDER_CELL_VALUES:
                     missing.append(field)
             else:
                 missing.append(field)  # Column doesn't exist

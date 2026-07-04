@@ -80,6 +80,58 @@ def _should_mark_processed_after_error(error: Optional[Exception]) -> bool:
     return error is None
 
 
+# Manifest entries surfaced by file_handling as extraction failures rather than
+# usable results (see fetch_and_process_pdfs / fetch_and_process_linked_assets):
+#   - "failed_extraction" + extraction_failed: PDF text extraction AND the
+#     OpenAI upload fallback both failed for an attachment.
+#   - "failed" + download_failed: a broker-supplied link could not be
+#     downloaded (dead link, 403 protected Drive file, ...).
+#   - "manual_review_required" + requires_manual_review: a broker file-share
+#     link (SharePoint/OneDrive/Box/WeTransfer/Drive folder) that cannot be
+#     auto-downloaded and needs an operator.
+_EXTRACTION_FAILURE_METHODS = ("failed", "failed_extraction", "manual_review_required")
+
+
+def _extraction_failure_entries(manifest: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Return the manifest entries that represent surfaced extraction failures."""
+    failures: List[Dict[str, Any]] = []
+    for entry in manifest or []:
+        if not isinstance(entry, dict):
+            continue
+        if (
+            entry.get("extraction_failed")
+            or entry.get("download_failed")
+            or entry.get("requires_manual_review")
+            or (entry.get("method") or "") in _EXTRACTION_FAILURE_METHODS
+        ):
+            failures.append(entry)
+    return failures
+
+
+def _raise_on_extraction_failures(manifest: Optional[List[Dict[str, Any]]]) -> None:
+    """Convert surfaced extraction failures into a retryable processing error.
+
+    SAFETY: an extraction failure that surfaces as *nothing* leaves error=None,
+    so the caller's _should_mark_processed_after_error(None) gate marks the
+    message processed and the broker's attachment/link payload is silently lost
+    with no retry and no operator visibility. Raising RetryableProcessingError
+    keeps the message unprocessed (retried by the next scan, then visible in
+    processingFailures for manual review after max attempts).
+    """
+    failures = _extraction_failure_entries(manifest)
+    if not failures:
+        return
+    details = "; ".join(
+        f"{entry.get('name') or entry.get('source_url') or 'unknown asset'} "
+        f"[{entry.get('method') or 'failed'}]: {entry.get('error') or 'extraction failed'}"
+        for entry in failures
+    )
+    raise RetryableProcessingError(
+        f"Broker asset extraction failed for {len(failures)} asset(s); "
+        f"leaving message unprocessed for retry/manual review: {details}"
+    )
+
+
 def _queue_response_retry_or_reconciliation(
     user_id: str,
     thread_id: str,
@@ -1798,6 +1850,94 @@ def _filter_requested_tour_times(
     ]
 
 
+# A single clock token (e.g. "10 AM", "10:00 AM", "2pm", "noon"). Used to pull the
+# specific time out of a reject / propose construction so we can tell the REJECTED
+# slot apart from the PROPOSED alternate.
+_TOUR_CLOCK_TOKEN = r"\d{1,2}(?::\d{2})?\s*(?:am|pm)|noon"
+
+# Constructions where the captured time is the one the broker is REJECTING.
+# Broadened / typo-tolerant on purpose (fail closed: better to treat a slot as
+# rejected than to auto-confirm a time the broker just refused).
+_REJECTED_TOUR_TIME_PATTERNS = [
+    # "10 AM does not/doesn't/won't/will not/no longer work(s)" (time BEFORE the negation)
+    re.compile(
+        rf"({_TOUR_CLOCK_TOKEN})(?:\s+\w+){{0,4}}?\s+"
+        r"(?:does\s+not|does\s*n[’']?t|do\s*n[’']?t|will\s+not|wo\s*n[’']?t|no\s+longer)"
+        r"\s+works?\b",
+        re.IGNORECASE,
+    ),
+    # "can't/cannot do 10 AM" (time AFTER the negation)
+    re.compile(rf"\b(?:can[’']?t|cannot|can\s+not)\s+do\s+({_TOUR_CLOCK_TOKEN})", re.IGNORECASE),
+    # "not available at 10 AM" / "unavailable at 10 AM"
+    re.compile(rf"\b(?:not\s+available|unavailable)\s+(?:at\s+)?({_TOUR_CLOCK_TOKEN})", re.IGNORECASE),
+    # "2 PM instead of 10 AM" -> 10 AM is the rejected one
+    re.compile(rf"\binstead\s+of\s+({_TOUR_CLOCK_TOKEN})", re.IGNORECASE),
+    # "2 PM works better than the 10 AM" -> 10 AM is the rejected one
+    re.compile(rf"\bthan\s+(?:the\s+)?({_TOUR_CLOCK_TOKEN})", re.IGNORECASE),
+]
+
+# Constructions where the captured time is the PROPOSED alternate (the offer).
+_PROPOSED_TOUR_TIME_PATTERNS = [
+    # "2 PM instead" (but NOT "instead of 10 AM", which rejects a slot)
+    re.compile(rf"({_TOUR_CLOCK_TOKEN})\s+instead\b(?!\s+of)", re.IGNORECASE),
+    # "can you do 2 PM" / "how about 2 PM" / "let's do 11 AM"
+    re.compile(rf"\b(?:do|about)\s+({_TOUR_CLOCK_TOKEN})", re.IGNORECASE),
+]
+
+
+def _tour_time_minutes_from_patterns(patterns: List[Any], text: str) -> set:
+    found = set()
+    for pattern in patterns:
+        for match in pattern.finditer(str(text or "")):
+            minutes = _tour_time_minutes(match.group(1))
+            if minutes is not None:
+                found.add(minutes)
+    return found
+
+
+def _reorder_alternate_tour_times(
+    times: List[str],
+    text: str = "",
+    thread_data: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Return extracted tour times with the PROPOSED alternate first and any
+    explicitly-REJECTED time dropped.
+
+    The raw extractor returns times in appearance order, so ``times[0]`` can be the
+    slot the broker just rejected ("10 AM does not work, do 2 PM instead"). The
+    schedule pipeline evaluates/confirms ``alternateTimes[0]``, so we must never let
+    a rejected time land there. We drop the stored invite time (the broker is
+    replacing it) plus any time tied to a rejection construction, and float the
+    proposed offer to the front. An explicitly-proposed time is never treated as
+    rejected (fail closed toward the broker's actual offer)."""
+    invite = (thread_data or {}).get("tourInvite") or {}
+    stored = {
+        minutes
+        for minutes in (
+            _tour_time_minutes(invite.get("arrivalTime")),
+            _tour_time_minutes(invite.get("departureTime")),
+        )
+        if minutes is not None
+    }
+    text_rejected = _tour_time_minutes_from_patterns(_REJECTED_TOUR_TIME_PATTERNS, text)
+    proposed = _tour_time_minutes_from_patterns(_PROPOSED_TOUR_TIME_PATTERNS, text)
+    # An explicit rejection construction ("can't do 10 AM") is authoritative even
+    # when the same span also trips the "do <time>" offer pattern — reject wins.
+    # The stored invite time is only a soft reject: a broker who re-proposes it
+    # should still have it honored, so the offer overrides the stored slot there.
+    rejected = text_rejected | (stored - proposed)
+
+    kept = [t for t in times if _tour_time_minutes(t) not in rejected]
+    if not kept:
+        # Everything read as rejected: prefer the proposed offers if we found any,
+        # otherwise fall back to the original list rather than silently drop intent.
+        kept = [t for t in times if _tour_time_minutes(t) in proposed] or list(times)
+
+    proposed_first = [t for t in kept if _tour_time_minutes(t) in proposed]
+    rest = [t for t in kept if _tour_time_minutes(t) not in proposed]
+    return proposed_first + rest
+
+
 def _build_tour_reply_hold_suggested_email(
     contact_name: str = "",
     recipient_email: str = "",
@@ -1921,8 +2061,9 @@ def _classify_tour_invite_reply(
         }
 
     negative_time_signal = bool(re.search(
-        r"\b(?:does\s+not\s+work|doesn[’']t\s+work|won[’']t\s+work|can't\s+do|cannot\s+do|"
-        r"not\s+available|unavailable|need\s+to\s+reschedule|instead|works\s+better)\b",
+        r"\b(?:does\s+not\s+work|does\s*n[’']?t\s+work|do\s*n[’']?t\s+work|will\s+not\s+work|"
+        r"wo\s*n[’']?t\s+work|no\s+longer\s+works?|can[’']?t\s+do|cannot\s+do|"
+        r"not\s+available|unavailable|need\s+to\s+reschedule|inste[a]?d|works\s+better)\b",
         text,
     ))
     declined_signal = bool(re.search(
@@ -1932,7 +2073,9 @@ def _classify_tour_invite_reply(
     ))
     tour_unavailable_signal = looks_like_tour_only_unavailable(clean_text)
     confirmation_signal = bool(re.search(
-        r"\b(?:that\s+(?:time|slot)\s+works?|works\s+for\s+(?:us|me|my\s+team|our\s+team|the\s+team|[\w#&'./-]+)|confirmed|confirming|"
+        r"\b(?:that\s+(?:time|slot)\s+works?|works\s+for\s+(?:us|me|my\s+team|our\s+team|the\s+team|[\w#&'./-]+)|"
+        r"confirmed\b(?!\s+(?:stop|stops|tour|tours|slot|slots|showing|showings|appointment|appointments|"
+        r"meeting|meetings|property|properties|visit|visits))|confirming|"
         r"see\s+you\s+(?:then|there)|we\s+are\s+confirmed|we're\s+confirmed|sounds\s+good)\b",
         text,
     ))
@@ -1970,8 +2113,8 @@ def _classify_tour_invite_reply(
             "suggestedEmail": _build_tour_reply_hold_suggested_email(contact_name, recipient_email, tour_date=tour_date),
         }
 
-    if tour_invite_context and (negative_time_signal or "instead" in text) and alternate_times:
-        alternate_times = _filter_requested_tour_times(alternate_times, thread_data)
+    if tour_invite_context and (negative_time_signal or "inste" in text) and alternate_times:
+        alternate_times = _reorder_alternate_tour_times(alternate_times, clean_text, thread_data)
         suggested_email = _build_tour_reply_hold_suggested_email(contact_name, recipient_email, alternate_times, tour_date=tour_date)
         if schedule_decision:
             suggested_email = build_schedule_aware_tour_reply(
@@ -3395,7 +3538,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 else:
                     flyer_links.append(link)
                     print(f"   📄 Categorized linked asset as flyer: {filename}")
-        
+
+        # SAFETY GATE: extraction failures surfaced by file_handling (failed PDF
+        # extraction, broken/protected broker links, manual-review file-share
+        # links) must keep this message UNPROCESSED. Continuing silently leaves
+        # error=None at the caller, the message gets marked processed, and the
+        # broker's attachment/link payload is lost with no retry or visibility.
+        _raise_on_extraction_failures(pdf_manifest)
+
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)
 
