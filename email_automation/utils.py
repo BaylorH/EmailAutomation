@@ -585,6 +585,31 @@ def _clean_signature_value(value: Any) -> str:
     return str(value or "").strip()
 
 
+# Unresolved template placeholders that a frontend/mail-merge layer failed to
+# substitute (e.g. "[NAME]", "[COMPANY]", "[FIRST_NAME]", "{{name}}"). These must
+# never survive into an outbound signature — a literal "[NAME]" in a broker's
+# inbox reads as broken automation and leaks that the identity was never resolved.
+# Only alpha-led bracketed tokens are treated as placeholders so real bracketed
+# content like a suite label "[200]" is left untouched.
+_SIGNATURE_PLACEHOLDER_TOKEN_RE = re.compile(
+    r"\[[A-Za-z][^\]\n]{0,60}\]|\{\{[^}\n]{0,60}\}\}"
+)
+
+
+def _strip_unresolved_signature_placeholders(value: str) -> str:
+    """Remove unresolved template placeholder tokens from a signature field value.
+
+    Returns the value with placeholder tokens stripped and internal whitespace
+    collapsed. A field that was *only* a placeholder collapses to "" so it is
+    dropped from the rendered signature entirely (blocking, not emitting, the
+    unresolved token before the send surface).
+    """
+    if not value:
+        return value
+    cleaned = _SIGNATURE_PLACEHOLDER_TOKEN_RE.sub("", value)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
 def _normalize_signature_url(value: Any) -> str:
     url = _clean_signature_value(value)
     if not url:
@@ -677,17 +702,23 @@ def _professional_fields_from_user_data(user_data: Dict[str, Any]) -> Dict[str, 
 def build_professional_signature_html(fields: Dict[str, Any] = None) -> str:
     """Render the same structured professional signature the frontend previews."""
     fields = fields or {}
+
+    def _field(key):
+        # Strip unresolved template placeholders ("[NAME]", "{{company}}") so an
+        # un-substituted mail-merge token can never reach the send surface.
+        return _strip_unresolved_signature_placeholders(_clean_signature_value(fields.get(key)))
+
     values = {
-        "name": _clean_signature_value(fields.get("name")),
-        "title": _clean_signature_value(fields.get("title")),
-        "team": _clean_signature_value(fields.get("team")),
-        "licenseLine": _clean_signature_value(fields.get("licenseLine")),
-        "phone": _clean_signature_value(fields.get("phone")),
-        "email": _clean_signature_value(fields.get("email")),
-        "company": _clean_signature_value(fields.get("company")),
-        "website": _clean_signature_value(fields.get("website")),
-        "location": _clean_signature_value(fields.get("location")),
-        "linkedinUrl": _clean_signature_value(fields.get("linkedinUrl")),
+        "name": _field("name"),
+        "title": _field("title"),
+        "team": _field("team"),
+        "licenseLine": _field("licenseLine"),
+        "phone": _field("phone"),
+        "email": _field("email"),
+        "company": _field("company"),
+        "website": _field("website"),
+        "location": _field("location"),
+        "linkedinUrl": _field("linkedinUrl"),
         "logoDataUrl": _safe_signature_data_url(fields.get("logoDataUrl")),
     }
 

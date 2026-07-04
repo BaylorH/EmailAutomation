@@ -19,14 +19,14 @@
     "needs_live_proof": "Automated coverage is incomplete or insufficient without source-of-truth readback in the Baylor/BP21 proof."
   },
   "summary": {
-    "needs_fixture": 40,
+    "covered": 102,
     "needs_live_proof": 10,
-    "covered": 69
+    "needs_fixture": 7
   },
   "featureFixtureMatrix": {
     "core.upload_mapping": {
       "happy_path": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -37,14 +37,18 @@
           "live_waiting"
         ],
         "evidence": [
-          "automated",
-          "firestore"
+          "A valid roster's headers resolve to canonical column mappings via detect_column_mapping, and insert_property_row_above_divider then materializes a new sheet row with each mapped value written under its own header column in header order."
         ],
-        "gapReason": "No explicit Production V1 happy_path fixture is mapped for core.upload_mapping yet.",
-        "nextProof": "Add or identify a deterministic core.upload_mapping / happy_path fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_1_.py"
+        ],
+        "testIds": [
+          "test_valid_roster_maps_columns_and_creates_row"
+        ],
+        "provesBehavior": "A valid roster's headers resolve to canonical column mappings via detect_column_mapping, and insert_property_row_above_divider then materializes a new sheet row with each mapped value written under its own header column in header order."
       },
       "terminal_state": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "dashboard_action_resolution"
         ],
@@ -55,14 +59,18 @@
           "stopped"
         ],
         "evidence": [
-          "automated",
-          "firestore"
+          "A fresh mapped row is inserted immediately above the NON-VIABLE terminal divider so uploading onto a sheet that already has a dead/terminal section never lands a live contact inside that terminal region; with no divider it appends after the last row (control)."
         ],
-        "gapReason": "No explicit Production V1 terminal_state fixture is mapped for core.upload_mapping yet.",
-        "nextProof": "Add or identify a deterministic core.upload_mapping / terminal_state fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_1_.py"
+        ],
+        "testIds": [
+          "test_new_row_inserts_above_terminal_nonviable_divider"
+        ],
+        "provesBehavior": "A fresh mapped row is inserted immediately above the NON-VIABLE terminal divider so uploading onto a sheet that already has a dead/terminal section never lands a live contact inside that terminal region; with no divider it appends after the last row (control)."
       },
       "bad_placeholder": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -73,15 +81,18 @@
           "outbox_queued"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "A roster cell still holding a raw '[NAME]'-style merge placeholder is blanked to empty at row-write time instead of persisted as literal sheet data, while adjacent resolved cells in the same write pass through unchanged."
         ],
-        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.upload_mapping yet.",
-        "nextProof": "Add or identify a deterministic core.upload_mapping / bad_placeholder fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_1_.py"
+        ],
+        "testIds": [
+          "test_unresolved_placeholder_cell_is_blanked_not_persisted"
+        ],
+        "provesBehavior": "A roster cell still holding a raw '[NAME]'-style merge placeholder is blanked to empty at row-write time instead of persisted as literal sheet data, while adjacent resolved cells in the same write pass through unchanged."
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -92,15 +103,18 @@
           "paused_manual_review"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "A variable-mapped launch (campaign-launch outbox) whose queued recipient email is absent from the resolved sheet row's email columns is flagged for diversion, while an on-row recipient passes the guard (negative control)."
         ],
-        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.upload_mapping yet.",
-        "nextProof": "Add or identify a deterministic core.upload_mapping / wrong_recipient fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_1_.py"
+        ],
+        "testIds": [
+          "test_recipient_absent_from_mapped_row_is_flagged"
+        ],
+        "provesBehavior": "A variable-mapped launch (campaign-launch outbox) whose queued recipient email is absent from the resolved sheet row's email columns is flagged for diversion, while an on-row recipient passes the guard (negative control)."
       },
       "manual_continuation": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -111,15 +125,18 @@
           "retry_reconciled"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Re-running column-mapping resolution on the same roster is deterministic and never binds one header to two canonical fields (colliding aliases: exactly one is consumed, the other reported unmapped), so an operator re-confirming the mapping after a manual pause cannot silently diverge or double-assign a column."
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.upload_mapping yet.",
-        "nextProof": "Add or identify a deterministic core.upload_mapping / manual_continuation fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_1_.py"
+        ],
+        "testIds": [
+          "test_remapping_is_deterministic_and_never_double_binds_a_header"
+        ],
+        "provesBehavior": "Re-running column-mapping resolution on the same roster is deterministic and never binds one header to two canonical fields (colliding aliases: exactly one is consumed, the other reported unmapped), so an operator re-confirming the mapping after a manual pause cannot silently diverge or double-assign a column."
       },
       "duplicate_retry": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -130,15 +147,18 @@
           "retry_reconciled"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "A re-run of the mapping/creation whose address+city already exists in the sheet is detected as a duplicate by _property_exists_in_sheet (returns True) so the row is not double-created, while a genuinely new address+city (and a same-address/different-city) are reported absent."
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.upload_mapping yet.",
-        "nextProof": "Add or identify a deterministic core.upload_mapping / duplicate_retry fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_1_.py"
+        ],
+        "testIds": [
+          "test_existing_address_is_detected_so_row_is_not_double_created"
+        ],
+        "provesBehavior": "A re-run of the mapping/creation whose address+city already exists in the sheet is detected as a duplicate by _property_exists_in_sheet (returns True) so the row is not double-created, while a genuinely new address+city (and a same-address/different-city) are reported absent."
       },
       "operator_visible_failure": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -149,12 +169,15 @@
           "dead_letter_visible"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "ui"
+          "A variable-mapping recipient-mismatch failure is surfaced to the operator by driving the real _move_to_dead_letter sink end-to-end: a deadLetterQueue document is written with status dead_lettered and a human-readable failureReason naming the offending row, and the unsendable outbox item is deleted from the send queue."
         ],
-        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.upload_mapping yet.",
-        "nextProof": "Add or identify a deterministic core.upload_mapping / operator_visible_failure fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_1_.py"
+        ],
+        "testIds": [
+          "test_mapping_mismatch_surfaces_visible_dead_letter_and_dequeues"
+        ],
+        "provesBehavior": "A variable-mapping recipient-mismatch failure is surfaced to the operator by driving the real _move_to_dead_letter sink end-to-end: a deadLetterQueue document is written with status dead_lettered and a human-readable failureReason naming the offending row, and the unsendable outbox item is deleted from the send queue."
       }
     },
     "core.name_resolution": {
@@ -275,8 +298,8 @@
           "firestore",
           "email"
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.name_resolution yet.",
-        "nextProof": "Add or identify a deterministic core.name_resolution / manual_continuation fixture, then wire it to this map before reopening users."
+        "gapReason": "Not applicable (structural N/A): name_resolution is a launch-time deterministic [NAME] sheet-column->greeting resolver that runs only on new-outreach outbox items, and email.py's new-outreach branch calls _sent_retry_reconciliation_result with conversation_id defaulting to None, so the manual-continuation guard structurally cannot fire for the name-resolution path (documented by test_new_outreach_reconciliation_has_no_conversation_identity); manual continuation is a live-thread concern handled by launch_draft/reply/inbox paths, giving no name-resolution-specific behavior distinct from launch_draft.manual_continuation.",
+        "nextProof": "No fixture applicable -- this cell is a structural N/A (see gapReason). It is intentionally left uncovered by design rather than backfilled with a borrowed green; if this feature ever grows the corresponding surface, add a real deterministic fixture then."
       },
       "duplicate_retry": {
         "status": "covered",
@@ -327,7 +350,7 @@
     },
     "core.launch_draft": {
       "happy_path": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -338,10 +361,15 @@
           "outbox_queued"
         ],
         "evidence": [
-          "automated"
+          "Driving the real new-outreach send path _send_single_outbox_item end-to-end, a campaign-launch outbox carrying a [NAME] merge placeholder with no pre-resolved name reads the sheet row, resolves the contact-name column, and hands a fully personalized body ('Hi Jane, ...') with zero surviving placeholder to the Graph send call."
         ],
-        "gapReason": "The current fixture proves backend name-placeholder resolution after an outbox item exists, but does not independently prove the launch draft/setup path maps the intended name column before queueing.",
-        "nextProof": "Add a Production V1 launch-draft fixture that starts from uploaded sheet/template data, verifies the queued outbox body resolves the selected name variable, and leaves unresolved placeholders operator-visible before any Graph send."
+        "testFiles": [
+          "tests/test_surface_d_7_.py"
+        ],
+        "testIds": [
+          "test_launch_draft_resolves_name_column_into_queued_body_before_send"
+        ],
+        "provesBehavior": "Driving the real new-outreach send path _send_single_outbox_item end-to-end, a campaign-launch outbox carrying a [NAME] merge placeholder with no pre-resolved name reads the sheet row, resolves the contact-name column, and hands a fully personalized body ('Hi Jane, ...') with zero surviving placeholder to the Graph send call."
       },
       "terminal_state": {
         "status": "covered",
@@ -419,7 +447,7 @@
         "provesBehavior": "test_campaign_launch_recipient_mismatch_dead_letters_before_graph_send drives the real _send_single_outbox_item launch path with a queued assignedEmails=[\"wrong.recipient@example.com\"] that does NOT match the sheet row email (\"bp21harrison+correct@gmail.com\"); it asserts send_and_index_email.assert_not_called() (negative control on the Graph send surface), doc deletion, and a dead-letter payload whose failureReason contains \"Queued recipient does not match sheet row\" \u2014 proving recipient identity is enforced before any send."
       },
       "manual_continuation": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -430,12 +458,15 @@
           "retry_reconciled"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "The outbox/launch retry reconciliation _sent_retry_reconciliation_result, on a retried launch outbox (attempts>0/lastError), consults the already-sent guard first and then returns a manualContinuation verdict (not a resend) when Sent Items shows the user continued the thread, with a stop-reason naming the continuation timestamp; a fresh outbox with no retry markers skips the Sent Items preflight entirely."
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.launch_draft yet.",
-        "nextProof": "Add or identify a deterministic core.launch_draft / manual_continuation fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_7_.py"
+        ],
+        "testIds": [
+          "test_retried_launch_outbox_defers_to_manual_continuation"
+        ],
+        "provesBehavior": "The outbox/launch retry reconciliation _sent_retry_reconciliation_result, on a retried launch outbox (attempts>0/lastError), consults the already-sent guard first and then returns a manualContinuation verdict (not a resend) when Sent Items shows the user continued the thread, with a stop-reason naming the continuation timestamp; a fresh outbox with no retry markers skips the Sent Items preflight entirely."
       },
       "duplicate_retry": {
         "status": "covered",
@@ -460,7 +491,7 @@
         "provesBehavior": "A second claim of an already-claimed launch outbox item is refused (returns False) while fresh and stale-expired items are claimable (True), proving _claim_outbox_item's transactional idempotency prevents the same launch draft from being sent twice."
       },
       "operator_visible_failure": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "launch_with_variable_mapping"
         ],
@@ -471,12 +502,15 @@
           "dead_letter_visible"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "ui"
+          "When two conflicting sheet contact-name columns make the [NAME] variable unresolvable, the launch draft is routed to the operator-visible dead-letter queue (reason cites [NAME] + manual review) and send_and_index_email is never called."
         ],
-        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.launch_draft yet.",
-        "nextProof": "Add or identify a deterministic core.launch_draft / operator_visible_failure fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_7_.py"
+        ],
+        "testIds": [
+          "test_ambiguous_name_dead_letters_launch_draft_before_any_send"
+        ],
+        "provesBehavior": "When two conflicting sheet contact-name columns make the [NAME] variable unresolvable, the launch draft is routed to the operator-visible dead-letter queue (reason cites [NAME] + manual review) and send_and_index_email is never called."
       }
     },
     "core.outbox_send": {
@@ -753,7 +787,7 @@
         "provesBehavior": "test_dashboard_thread_reply_filters_opted_out_cc_before_send drives the real _send_outbox_as_reply reply-all path (createReplyAll endpoint, live CC-filter logic, only Graph HTTP/opt-out/retry mocked); with an opted-out CC seeded, it asserts the pre-send draft-patch payload has ccRecipients == [] and toRecipients == [\"bp21harrison@gmail.com\"], a negative control that fails if the opted-out-CC filter is removed."
       },
       "manual_continuation": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "manual_user_continuation"
         ],
@@ -764,12 +798,15 @@
           "retry_reconciled"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Driving the real process_pending_responses retry loop, a queued reply-all pending response (with broker CCs) whose prior attempt failed is diverted to manual review via _move_pending_response_to_dead_letter and send_reply_in_thread is never invoked when Sent Items shows the user already continued the thread, so the CC audience is not re-mailed."
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.reply_all_cc yet.",
-        "nextProof": "Add or identify a deterministic core.reply_all_cc / manual_continuation fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_7_.py"
+        ],
+        "testIds": [
+          "test_queued_reply_all_defers_to_manual_continuation_without_resending"
+        ],
+        "provesBehavior": "Driving the real process_pending_responses retry loop, a queued reply-all pending response (with broker CCs) whose prior attempt failed is diverted to manual review via _move_pending_response_to_dead_letter and send_reply_in_thread is never invoked when Sent Items shows the user already continued the thread, so the CC audience is not re-mailed."
       },
       "duplicate_retry": {
         "status": "covered",
@@ -1032,7 +1069,7 @@
         "nextProof": "Capture Firestore/Sheet/dashboard evidence for core.inbox_matching / terminal_state during the Production V1 base campaign proof."
       },
       "bad_placeholder": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "reply_all_cc_context"
         ],
@@ -1043,12 +1080,15 @@
           "live_waiting"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Exercising the real processing._match_message_to_thread plus messaging.index_message_id/lookup_thread_by_message_id against an in-memory Firestore double, a bad/empty placeholder message-id (empty string refused at index time; bracket-only '<>') is collapsed to '' by header normalization so an inbound reply carrying '<>' in In-Reply-To/References never resolves to the decoy thread seeded under the raw '<>'; the reply instead routes to its true owning thread via real lineage, and a placeholder-only reply matches nothing (None)."
         ],
-        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.inbox_matching yet.",
-        "nextProof": "Add or identify a deterministic core.inbox_matching / bad_placeholder fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_6_.py"
+        ],
+        "testIds": [
+          "test_bad_placeholder_message_id_never_hijacks_thread_match"
+        ],
+        "provesBehavior": "Exercising the real processing._match_message_to_thread plus messaging.index_message_id/lookup_thread_by_message_id against an in-memory Firestore double, a bad/empty placeholder message-id (empty string refused at index time; bracket-only '<>') is collapsed to '' by header normalization so an inbound reply carrying '<>' in In-Reply-To/References never resolves to the decoy thread seeded under the raw '<>'; the reply instead routes to its true owning thread via real lineage, and a placeholder-only reply matches nothing (None)."
       },
       "wrong_recipient": {
         "status": "covered",
@@ -1073,7 +1113,7 @@
         "provesBehavior": "It proves that the real processing._match_message_to_thread routes an inbound reply from a sender other than the expected broker to its own campaign thread via In-Reply-To/References lineage and never misroutes it into a concurrent campaign's thread, because matching keys off message-id lineage rather than sender identity."
       },
       "manual_continuation": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "manual_user_continuation"
         ],
@@ -1084,12 +1124,15 @@
           "live_waiting"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Driving the real _match_message_to_thread, a broker reply whose In-Reply-To targets the OPERATOR's manually-continued Sent message threads back to the origin thread only after that manual message-id is indexed to it (the negative control proves an un-indexed manual link resolves to None), so matching follows the message-id chain through a human continuation and never misroutes into a concurrent campaign's thread."
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.inbox_matching yet.",
-        "nextProof": "Add or identify a deterministic core.inbox_matching / manual_continuation fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_6_.py"
+        ],
+        "testIds": [
+          "test_reply_to_operator_manual_continuation_threads_to_origin"
+        ],
+        "provesBehavior": "Driving the real _match_message_to_thread, a broker reply whose In-Reply-To targets the OPERATOR's manually-continued Sent message threads back to the origin thread only after that manual message-id is indexed to it (the negative control proves an un-indexed manual link resolves to None), so matching follows the message-id chain through a human continuation and never misroutes into a concurrent campaign's thread."
       },
       "duplicate_retry": {
         "status": "covered",
@@ -1158,7 +1201,7 @@
         "provesBehavior": "Drives the real processing.send_reply_in_thread to a successful end-to-end auto-reply: it posts /createReplyAll, PATCHes then /send (202) returning sent=True, asserts the reply-all draft path is chosen while /reply is never called (negative control), and that the Graph-returned CC is filtered so the account's own address baylor.freelance@outlook.com is dropped, leaving ccRecipients==[\"baylor@manifoldengineering.ai\"] in both the patch payload and the saved message \u2014 which would fail if safe-CC filtering were removed."
       },
       "terminal_state": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_tour_available",
           "dashboard_action_resolution"
@@ -1172,13 +1215,16 @@
           "dead_letter_visible"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Driving the real process_inbox_message on a STOPPED thread, both send_reply_in_thread and the first post-gate pipeline step fetch_and_log_sheet_for_thread are never called (inbound message saved for history only), while an identical broker reply on an ACTIVE thread proceeds past the terminal gate into fetch_and_log_sheet_for_thread -- proving the terminal thread status, not the test harness, is what suppresses the inbox auto-reply."
         ],
         "incidentId": "no_tour_scheduling_core_lane",
-        "gapReason": "Neither cited test exercises a terminal (stopped/cancelled/completed) thread. test_non_allowlisted_user_tour_offer_creates_no_tour_action runs on an ACTIVE thread (helper patches get_thread_status to THREAD_STATUS[\"active\"] at line 189; thread data status is \"active\" at line 374) and proves ALLOWLIST gating for inbound replies \u2014 the tour offer creates no action because the user is non-allowlisted, a wrong_recipient/allowlist guard, not terminal-state suppression. test_normal_campaign_tour_language_moves_to_dead_letter_before_send drives _dead_letter_unsafe_outbound_body_if_needed on a live campaign_creation OUTBOX item and proves outbound tour/LOI content-policy dead-lettering (asserts \"Tour/LOI\" reason) \u2014 this is the outbound send-safety feature, not core.inbox_auto_reply, and the item is not terminal. No test drives the inbox auto-reply path on a terminal thread and asserts the send/write is suppressed BECAUSE the thread is terminal.",
-        "nextProof": "Add a test that sets the thread status to THREAD_STATUS[\"stopped\"] (or cancelled/completed), feeds a normal inbound broker reply through the inbox auto-reply processing path, and asserts sendReply.assert_not_called() plus no state mutation (moveRow/statusUpdate not called) SPECIFICALLY due to the terminal status \u2014 paired with a positive control showing the identical reply on an active, allowlisted thread WOULD send, so the assertion fails if the terminal-state guard is removed."
+        "testFiles": [
+          "tests/test_surface_d_6_.py"
+        ],
+        "testIds": [
+          "test_terminal_thread_suppresses_inbox_autoreply_pipeline"
+        ],
+        "provesBehavior": "Driving the real process_inbox_message on a STOPPED thread, both send_reply_in_thread and the first post-gate pipeline step fetch_and_log_sheet_for_thread are never called (inbound message saved for history only), while an identical broker reply on an ACTIVE thread proceeds past the terminal gate into fetch_and_log_sheet_for_thread -- proving the terminal thread status, not the test harness, is what suppresses the inbox auto-reply."
       },
       "bad_placeholder": {
         "status": "covered",
@@ -1203,7 +1249,7 @@
         "provesBehavior": "send_reply_in_thread (processing.py:2515-2520) runs validate_outbound_body before the allowlist check and any Graph call, returning False with outcome \"blocked_unsafe_body\" for the unresolved [NAME] placeholder, exactly what the test asserts alongside the Graph-never-touched AssertionError side_effect."
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "reply_all_cc_context"
         ],
@@ -1214,11 +1260,15 @@
           "paused_manual_review"
         ],
         "evidence": [
-          "automated",
-          "email"
+          "Driving the real send_reply_in_thread reply-all path for an allowlisted user, the real _filter_reply_all_draft_recipients strips an opted-out (wrong) recipient injected into the draft's toRecipients so it never appears in the patched audience nor reaches Graph /send; when the wrong recipient is the sole audience the send is blocked entirely (no /send, draft deleted, outcome send_failed) -- recipient-IDENTITY enforcement, distinct from the user_id auto-reply policy gate the map rejected."
         ],
-        "gapReason": "The test enforces a user-account auto-reply policy gate (SITESIFT_AUTO_REPLY_ALLOWLIST keyed on user_id=\"regular-user\" not being allowlisted), not recipient identity. The recipient \"broker@example.com\" is passed but never validated or asserted against; the block fires on the user_id allowlist before any recipient handling, so the negative control (Graph patched to raise) proves the auto-reply-disabled policy, not that the feature refuses a wrong recipient. Wrong fixture class \u2014 this is a policy/authorization gate, not wrong_recipient enforcement.",
-        "nextProof": "A test that drives send_reply_in_thread for an ALLOWLISTED user where the resolved/reviewed reply-all recipient set diverges from the intended/source-message recipient (e.g., a stale or injected toRecipients address), asserting that the divergent/wrong address is corrected or the send is blocked before reaching Graph createReplyAll/send, with a negative control (requests.post/exponential_backoff_request) that the wrong recipient address never reaches the Graph surface."
+        "testFiles": [
+          "tests/test_surface_d_6_.py"
+        ],
+        "testIds": [
+          "test_autoreply_strips_optedout_wrong_recipient_before_graph_send"
+        ],
+        "provesBehavior": "Driving the real send_reply_in_thread reply-all path for an allowlisted user, the real _filter_reply_all_draft_recipients strips an opted-out (wrong) recipient injected into the draft's toRecipients so it never appears in the patched audience nor reaches Graph /send; when the wrong recipient is the sole audience the send is blocked entirely (no /send, draft deleted, outcome send_failed) -- recipient-IDENTITY enforcement, distinct from the user_id auto-reply policy gate the map rejected."
       },
       "manual_continuation": {
         "status": "covered",
@@ -1339,7 +1389,7 @@
         "provesBehavior": "test_requirements_mismatch_adds_nonviable_event drives the real ai_processing._augment_events_with_deterministic_signals on an empty proposal plus an inbound broker reply (\"more office heavy...as opposed to a true warehouse\"), and asserts the classifier emits events[0] type==\"property_unavailable\" reason==\"requirements_mismatch\" (the broker_property_non_viable class); if the rule failed to fire, events would stay empty and events[0] would IndexError."
       },
       "terminal_state": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_tour_unavailable",
           "broker_property_non_viable",
@@ -1354,15 +1404,19 @@
           "completed"
         ],
         "evidence": [
-          "automated",
-          "firestore"
+          "The REAL classifier (ai_processing._augment_events_with_deterministic_signals), on an office-heavy/no-warehouse broker reply, emits property_unavailable/requirements_mismatch AND nulls the proposal's live response_email (FIX-03); the same reply then hits processing._should_skip_processing_for_terminal_thread which returns True for completed and stopped(no-replacement) threads -- so a re-classified terminal reply never re-activates a stopped/completed thread nor keeps a live outbound -- while an active thread returns False so the classifier's output stays reachable."
         ],
         "incidentId": "tour_unavailable_property_stays_viable",
-        "gapReason": "Neither test exercises a terminal thread. Test 1 (test_tour_unavailable_reply_does_not_mark_property_unavailable) drives _augment_events_with_deterministic_signals with no thread state at all \u2014 it only proves event-class disambiguation (property_unavailable re-classified to tour_requested/tour_unavailable). Test 2 (test_tour_invite_unavailable_process_does_not_move_row_or_stop_property) runs against a thread with status=THREAD_STATUS['active'] (explicitly non-terminal); it asserts moveRow/stopThreads NOT called (preventing termination) while itself performing a live write (tourInvite.status='tour_unavailable') and emitting a notification. Neither seeds a stopped/completed/paused_manual_review state, and neither asserts that a terminal thread suppresses a live send/write \u2014 the opposite of the terminal_state semantic.",
-        "nextProof": "A test that seeds the thread_ref with status=THREAD_STATUS['stopped'] (and variants completed / paused_manual_review), feeds a broker_property_unavailable or broker_tour_unavailable event through the classifier/processor, and asserts NO live mutation occurs because the thread is already terminal: sendReply.assert_not_called(), moveRow.assert_not_called(), stopThreads.assert_not_called(), and no write to tourInvite.status/statusUpdates \u2014 with a negative control that the same event on an active thread DOES act."
+        "testFiles": [
+          "tests/test_surface_d_5_.py"
+        ],
+        "testIds": [
+          "test_terminal_property_reply_does_not_reactivate_stopped_or_completed_thread"
+        ],
+        "provesBehavior": "The REAL classifier (ai_processing._augment_events_with_deterministic_signals), on an office-heavy/no-warehouse broker reply, emits property_unavailable/requirements_mismatch AND nulls the proposal's live response_email (FIX-03); the same reply then hits processing._should_skip_processing_for_terminal_thread which returns True for completed and stopped(no-replacement) threads -- so a re-classified terminal reply never re-activates a stopped/completed thread nor keeps a live outbound -- while an active thread returns False so the classifier's output stays reachable."
       },
       "bad_placeholder": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_property_unavailable"
         ],
@@ -1373,12 +1427,15 @@
           "live_waiting"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "A classifier-proposed outbound reply (response_email) carrying an unresolved merge placeholder ('[FIRST_NAME]') is blocked at the send/apply gate processing.send_reply_in_thread with last_outcome=='blocked_unsafe_body' and no Graph send, whereas the same reply with the placeholder resolved to a real name clears the placeholder guard and is stopped only later by auto-reply policy (last_outcome=='blocked_auto_reply_policy') -- proving the block is caused by placeholder detection specifically, not an unconditional refusal."
         ],
-        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.event_classifier yet.",
-        "nextProof": "Add or identify a deterministic core.event_classifier / bad_placeholder fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_5_.py"
+        ],
+        "testIds": [
+          "test_placeholder_response_email_is_blocked_at_send_gate"
+        ],
+        "provesBehavior": "A classifier-proposed outbound reply (response_email) carrying an unresolved merge placeholder ('[FIRST_NAME]') is blocked at the send/apply gate processing.send_reply_in_thread with last_outcome=='blocked_unsafe_body' and no Graph send, whereas the same reply with the placeholder resolved to a real name clears the placeholder guard and is stopped only later by auto-reply policy (last_outcome=='blocked_auto_reply_policy') -- proving the block is caused by placeholder detection specifically, not an unconditional refusal."
       },
       "wrong_recipient": {
         "status": "covered",
@@ -1447,7 +1504,7 @@
         "provesBehavior": "It proves that a re-detected identical event produces the same dedup key from messaging.build_event_key, so messaging.is_event_handled reports it already handled after one messaging.mark_event_handled call \u2014 the retry cannot fire the event twice, and an unrelated event's record is preserved (not clobbered) by the dotted-field merge."
       },
       "operator_visible_failure": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_property_unavailable"
         ],
@@ -1458,12 +1515,15 @@
           "dead_letter_visible"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "ui"
+          "When the reply classifier cannot produce a usable proposal, processing._record_ai_processing_failure persists exactly one dashboard-visible processingFailures record keyed threadId__messageId carrying the classifier failure reason and flagged retryable=True, and _should_mark_processed_after_error(RetryableProcessingError) is False so the message stays unprocessed for operator retry -- whereas a successful classification (error None) marks processed with no failure record, proving the visible+retryable state is the failure branch firing rather than an unconditional record."
         ],
-        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.event_classifier yet.",
-        "nextProof": "Add or identify a deterministic core.event_classifier / operator_visible_failure fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_5_.py"
+        ],
+        "testIds": [
+          "test_unclassifiable_reply_is_visible_and_retryable_not_marked_processed"
+        ],
+        "provesBehavior": "When the reply classifier cannot produce a usable proposal, processing._record_ai_processing_failure persists exactly one dashboard-visible processingFailures record keyed threadId__messageId carrying the classifier failure reason and flagged retryable=True, and _should_mark_processed_after_error(RetryableProcessingError) is False so the message stays unprocessed for operator retry -- whereas a successful classification (error None) marks processed with no failure record, proving the visible+retryable state is the failure branch firing rather than an unconditional record."
       }
     },
     "core.property_extraction": {
@@ -1556,7 +1616,7 @@
         "provesBehavior": "Driving the real apply_proposal_to_sheet, it proves an extraction proposal's write guard is keyed on the row's address+city anchor (get_row_anchor/_read_ai_meta_row), so a neighbor property's stale AI_META record sharing the same rowNumber is ignored and the proposal applies to the correct row (404 New Way), while the negative control flipping only the AI_META anchor to match the current row correctly blocks the write as human-override."
       },
       "manual_continuation": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_available_full_specs"
         ],
@@ -1567,12 +1627,15 @@
           "live_waiting"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "The inbox gate _skip_inbox_retry_after_manual_continuation returns True (so the caller's continue bypasses process_inbox_message, i.e. no duplicate AI spec re-extraction) and marks the message processed when a prior processingFailures record exists and Sent Items shows a manual continuation; a broker-specs reply with no prior-failure record is not gated (skip=False, guard not consulted)."
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.property_extraction yet.",
-        "nextProof": "Add or identify a deterministic core.property_extraction / manual_continuation fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_7_.py"
+        ],
+        "testIds": [
+          "test_reprocessing_skipped_when_prior_failure_and_manual_continuation"
+        ],
+        "provesBehavior": "The inbox gate _skip_inbox_retry_after_manual_continuation returns True (so the caller's continue bypasses process_inbox_message, i.e. no duplicate AI spec re-extraction) and marks the message processed when a prior processingFailures record exists and Sent Items shows a manual continuation; a broker-specs reply with no prior-failure record is not gated (skip=False, guard not consulted)."
       },
       "duplicate_retry": {
         "status": "covered",
@@ -1638,7 +1701,7 @@
         "liveEvidenceStatus": "dashboard_captured_raw_firestore_pending"
       },
       "terminal_state": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "dashboard_action_resolution"
         ],
@@ -1649,11 +1712,15 @@
           "stopped"
         ],
         "evidence": [
-          "automated",
-          "sheet"
+          "Replacing the borrowed-green (row-anchor/gross-rent tests): the real terminal gate _should_skip_processing_for_terminal_thread short-circuits a broker full-specs reply on a stopped or completed thread (no live-thread sheet mutation), while an active thread proceeds to the sheet write and a stopped thread carrying a genuine active-replacement property still processes (legitimate referral not dropped)."
         ],
-        "gapReason": "Borrowed green: cited testIds are test_stale_row_uses_subject_address_before_duplicate_email_fallback (row-anchor identity) and test_formula_handles_single_rent_values_and_rent_ranges (gross-rent formula parsing). Neither proves that a sheet update is correctly suppressed/handled for a TERMINAL (stopped/cancelled) thread - the fixture-class claim. This is a rent-formula/anchor test reused to fill the terminal_state column.",
-        "nextProof": "Write a test driving the real sheet-update path for a property whose thread is in a terminal (stopped/cancelled) state, asserting the terminal state short-circuits or correctly finalizes the write (no live-thread mutation), with a negative control on an active thread that DOES update. Until then, needs_fixture."
+        "testFiles": [
+          "tests/test_surface_d_7_.py"
+        ],
+        "testIds": [
+          "test_specs_on_stopped_thread_are_short_circuited"
+        ],
+        "provesBehavior": "Replacing the borrowed-green (row-anchor/gross-rent tests): the real terminal gate _should_skip_processing_for_terminal_thread short-circuits a broker full-specs reply on a stopped or completed thread (no live-thread sheet mutation), while an active thread proceeds to the sheet write and a stopped thread carrying a genuine active-replacement property still processes (legitimate referral not dropped)."
       },
       "bad_placeholder": {
         "status": "covered",
@@ -1700,7 +1767,7 @@
         "provesBehavior": "When a thread's stored rowNumber has gone stale after a sheet move so it now points at a different recipient's row, the real _find_row_by_anchor re-anchors by subject and returns the correct thread row (row 3, 808 Correct Deal Rd, target-broker) instead of the wrong-recipient row 5, proving an update writes to the correct row after a move."
       },
       "manual_continuation": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "broker_available_full_specs"
         ],
@@ -1711,12 +1778,15 @@
           "live_waiting"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "The persistence handler _record_processing_failure_blocked_by_manual_continuation parks the blocked broker-specs action as retryable=False with recoveryStatus 'blocked_manual_conversation_continued', so a later retry pass can never re-drive the extracted specs into the sheet row (guard-unreadable variant also parks non-retryable under a distinct status)."
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.sheet_update yet.",
-        "nextProof": "Add or identify a deterministic core.sheet_update / manual_continuation fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_7_.py"
+        ],
+        "testIds": [
+          "test_blocked_action_is_parked_non_retryable_so_no_stale_sheet_write"
+        ],
+        "provesBehavior": "The persistence handler _record_processing_failure_blocked_by_manual_continuation parks the blocked broker-specs action as retryable=False with recoveryStatus 'blocked_manual_conversation_continued', so a later retry pass can never re-drive the extracted specs into the sheet row (guard-unreadable variant also parks non-retryable under a distinct status)."
       },
       "duplicate_retry": {
         "status": "covered",
@@ -1972,7 +2042,7 @@
         "provesBehavior": "test_cancel_requested_item_is_deleted_without_sending drives the real _send_single_outbox_item on a doc with status=\"cancel_requested\"/cancelRequested=True and asserts send_and_index_email.assert_not_called() (negative control that fails if the cancel short-circuit is removed) plus doc.reference.deleted, while test_cancelled_outbox_terminalizes_action_audit drives real _delete_cancelled_outbox_item_if_needed and asserts the action-audit set payload status==\"cancelled\" and the outbox ref is deleted."
       },
       "bad_placeholder": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "dashboard_action_resolution"
         ],
@@ -1983,12 +2053,15 @@
           "live_waiting"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Proves a live-waiting queued item whose body STILL bears an unresolved outbound placeholder ([Broker Name], guarded by the real find_unresolved_placeholders/validate_outbound_body) that the operator dismisses is torn down by the cancel/dismiss gate in the real _send_single_outbox_item BEFORE the placeholder dead-letter path -- deleting it with zero Graph send (raw placeholder never emails a broker), finalizing the action audit as status=='cancelled' and never calling _move_to_dead_letter -- so the dismissal, not the placeholder guard, resolves it; a discriminating control shows the same placeholder body when NOT dismissed is a no-op for _delete_cancelled_outbox_item_if_needed."
         ],
-        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.stop_cancel_dismiss yet.",
-        "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / bad_placeholder fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_4_.py"
+        ],
+        "testIds": [
+          "test_dismissed_placeholder_item_is_cancelled_not_dead_lettered_and_never_sends"
+        ],
+        "provesBehavior": "Proves a live-waiting queued item whose body STILL bears an unresolved outbound placeholder ([Broker Name], guarded by the real find_unresolved_placeholders/validate_outbound_body) that the operator dismisses is torn down by the cancel/dismiss gate in the real _send_single_outbox_item BEFORE the placeholder dead-letter path -- deleting it with zero Graph send (raw placeholder never emails a broker), finalizing the action audit as status=='cancelled' and never calling _move_to_dead_letter -- so the dismissal, not the placeholder guard, resolves it; a discriminating control shows the same placeholder body when NOT dismissed is a no-op for _delete_cancelled_outbox_item_if_needed."
       },
       "wrong_recipient": {
         "status": "covered",
@@ -2013,7 +2086,7 @@
         "provesBehavior": "Exercising the real email._send_single_outbox_item, it proves a queued send whose live recipient changed to the wrong address and was cancelled is deleted with zero Graph sends (wrong recipient never emailed), while a negative control with the recipient unchanged and uncancelled reaches the send path - making the gate discriminating."
       },
       "manual_continuation": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "manual_user_continuation"
         ],
@@ -2024,12 +2097,15 @@
           "live_waiting"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Proves an operator's manually-continued dashboard reply that was NOT cancelled (cancel/dismiss gate is provably a no-op: _is_cancelled_outbox_item False and _delete_cancelled_outbox_item_if_needed returns False) is still halted after the client is stopped by the INDEPENDENT client-stop gate (real _pause_client_outbox_item_if_needed -> real get_client_automation_pause), moving it to the dead-letter queue with zero send so automation never resumes on top of the manual thread -- with a live-client negative control (same pipeline) reaching the send path, proving the two teardown mechanisms are distinct and the halt is caused by the stop, not the harness."
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.stop_cancel_dismiss yet.",
-        "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / manual_continuation fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_4_.py"
+        ],
+        "testIds": [
+          "test_stop_halts_uncancelled_manual_continuation_via_independent_stop_gate"
+        ],
+        "provesBehavior": "Proves an operator's manually-continued dashboard reply that was NOT cancelled (cancel/dismiss gate is provably a no-op: _is_cancelled_outbox_item False and _delete_cancelled_outbox_item_if_needed returns False) is still halted after the client is stopped by the INDEPENDENT client-stop gate (real _pause_client_outbox_item_if_needed -> real get_client_automation_pause), moving it to the dead-letter queue with zero send so automation never resumes on top of the manual thread -- with a live-client negative control (same pipeline) reaching the send path, proving the two teardown mechanisms are distinct and the halt is caused by the stop, not the harness."
       },
       "duplicate_retry": {
         "status": "covered",
@@ -2054,7 +2130,7 @@
         "provesBehavior": "Driving the real email._send_single_outbox_item with a sendable-looking stale queued snapshot but a live-cancelled state on the recheck proves the pre-send reconciliation deletes the item and writes a \"cancelled\" audit without any graph send, so a cancelled item is not re-sent on a subsequent run."
       },
       "operator_visible_failure": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "dashboard_action_resolution"
         ],
@@ -2065,12 +2141,15 @@
           "dead_letter_visible"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "ui"
+          "Proves a stop that cannot cleanly complete a queued send surfaces an OPERATOR-VISIBLE failure via real _pause_client_outbox_item_if_needed -> _move_to_dead_letter: a deadLetterQueue document plus a terminal action-audit carrying exactly the dashboard-rendered fields (status=='dead_lettered', human failureReason embedding client_stopped_by_user, originalDocId, attempts pinned to MAX_OUTBOX_ATTEMPTS, merge=True) so the blocked item is visible and retryable -- and a live-client discriminating control writes ZERO dead-letter and ZERO audit, proving the visible-failure record is emitted only on a genuine stop-failure, never spuriously."
         ],
-        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.stop_cancel_dismiss yet.",
-        "nextProof": "Add or identify a deterministic core.stop_cancel_dismiss / operator_visible_failure fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_4_.py"
+        ],
+        "testIds": [
+          "test_stopped_client_surfaces_operator_visible_deadletter_and_audit"
+        ],
+        "provesBehavior": "Proves a stop that cannot cleanly complete a queued send surfaces an OPERATOR-VISIBLE failure via real _pause_client_outbox_item_if_needed -> _move_to_dead_letter: a deadLetterQueue document plus a terminal action-audit carrying exactly the dashboard-rendered fields (status=='dead_lettered', human failureReason embedding client_stopped_by_user, originalDocId, attempts pinned to MAX_OUTBOX_ATTEMPTS, merge=True) so the blocked item is visible and retryable -- and a live-client discriminating control writes ZERO dead-letter and ZERO audit, proving the visible-failure record is emitted only on a genuine stop-failure, never spuriously."
       }
     },
     "core.signature_identity": {
@@ -2099,7 +2178,7 @@
         "provesBehavior": "test_send_outboxes_resolves_structured_professional_signature_before_send drives the real send_outboxes pipeline against a Firestore user record holding both stale cached emailSignature HTML and structured professionalSignature fields, captures the user_signature handed to _send_single_outbox_item, and asserts it contains \"John Doe\"/\"Example Realty Advisors\" while assertNotIn \"Jill Ames\"/\"jill.ames@mohrpartners.com\" \u2014 a negative control that fails if resolution fell back to stale cached HTML."
       },
       "terminal_state": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "manual_user_continuation"
         ],
@@ -2110,14 +2189,18 @@
           "stopped"
         ],
         "evidence": [
-          "automated",
-          "firestore"
+          "On a stopped (terminal) client thread the outbox item is dead-lettered and send_and_index_email is never called, so a FULLY RESOLVABLE professional identity (John Doe / Example Realty Advisors) is never emitted -- proving the terminal-state gate, not an empty signature, is what suppresses the outbound identity."
         ],
-        "gapReason": "No explicit Production V1 terminal_state fixture is mapped for core.signature_identity yet.",
-        "nextProof": "Add or identify a deterministic core.signature_identity / terminal_state fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_2_.py"
+        ],
+        "testIds": [
+          "test_resolved_signature_is_never_emitted_on_stopped_terminal_thread"
+        ],
+        "provesBehavior": "On a stopped (terminal) client thread the outbox item is dead-lettered and send_and_index_email is never called, so a FULLY RESOLVABLE professional identity (John Doe / Example Realty Advisors) is never emitted -- proving the terminal-state gate, not an empty signature, is what suppresses the outbound identity."
       },
       "bad_placeholder": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "manual_user_continuation"
         ],
@@ -2128,11 +2211,15 @@
           "outbox_queued"
         ],
         "evidence": [
-          "automated",
-          "email"
+          "An unresolved mail-merge signature placeholder (bracketed token like [NAME]/[COMPANY]/[FIRST_NAME]) is stripped from build_professional_signature_html output so it never reaches the send surface -- a signature made only of placeholders collapses to empty rather than emitting a broken '[NAME]' identity -- while a resolved real value (Drew Ingram / Example Realty Advisors) passes through unchanged as a negative control."
         ],
-        "gapReason": "Neither claimed test exercises the bad_placeholder scenario (an unresolved \"[NAME]\"-style template token sanitized/blocked before the send surface). Test 1 (test_signature_footer.py:39) feeds an EMPTY signature string (\"\") into get_email_footer/needs_signature_attachments and asserts no hardcoded \"Jill Ames\" fallback \u2014 that is an identity-default-leakage guard, not a placeholder-blocking guard; no unresolved placeholder token is ever supplied. Test 2 (test_whitelabel_defaults.py:9) reads ai_processing.py as plain text and asserts two substrings are absent \u2014 it drives no signature code path and makes no runtime assertion, proving only that the AI prompt does not mimic Jill's writing style. No test passes an unresolved placeholder into build_professional_signature_html/get_email_footer/format_email_body_with_footer and asserts it is stripped before reaching Graph.",
-        "nextProof": "Add a test that supplies a professional-signature field or signature body containing an unresolved template placeholder (e.g. name=\"[NAME]\", company=\"[COMPANY]\", or a raw \"[FIRST_NAME]\" token) to build_professional_signature_html / get_email_footer / format_email_body_with_footer, and asserts the literal bracketed placeholder does NOT appear in the returned footer/HTML (sanitized or blocked) before the send surface \u2014 with a negative control showing a resolved real value (e.g. name=\"Drew Ingram\") passes through unchanged, so the assertion would fail if the sanitization guard were removed."
+        "testFiles": [
+          "tests/test_surface_d_2_.py"
+        ],
+        "testIds": [
+          "test_unresolved_signature_placeholder_is_stripped_before_send_surface"
+        ],
+        "provesBehavior": "An unresolved mail-merge signature placeholder (bracketed token like [NAME]/[COMPANY]/[FIRST_NAME]) is stripped from build_professional_signature_html output so it never reaches the send surface -- a signature made only of placeholders collapses to empty rather than emitting a broken '[NAME]' identity -- while a resolved real value (Drew Ingram / Example Realty Advisors) passes through unchanged as a negative control."
       },
       "wrong_recipient": {
         "status": "covered",
@@ -2165,7 +2252,7 @@
         "provesBehavior": "test_send_reply_in_thread_rejects_stale_jill_custom_signature_before_graph_patch drives real processing.send_reply_in_thread with a Firestore profile holding a stale Jill Ames/MOHR custom emailSignature, captures the actual Graph PATCH body, and asserts it contains \"Hi Avery\" but not \"Jill Ames\"/\"jill.ames@mohrpartners.com\"/\"Mohr Partners, Inc.\" \u2014 a negative control that fails if the foreign-identity guard is removed."
       },
       "manual_continuation": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "manual_user_continuation"
         ],
@@ -2176,15 +2263,18 @@
           "retry_reconciled"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "When Sent Items shows the user manually continued the conversation before the queued retry fired, the stale signed draft is dead-lettered with a 'manually continued' reason and neither _send_outbox_as_reply nor send_and_index_email is called -- so the bot's signature never stomps the human's manual reply with a duplicate signed message."
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for core.signature_identity yet.",
-        "nextProof": "Add or identify a deterministic core.signature_identity / manual_continuation fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_2_.py"
+        ],
+        "testIds": [
+          "test_manual_continuation_dead_letters_stale_signed_draft_without_resending"
+        ],
+        "provesBehavior": "When Sent Items shows the user manually continued the conversation before the queued retry fired, the stale signed draft is dead-lettered with a 'manually continued' reason and neither _send_outbox_as_reply nor send_and_index_email is called -- so the bot's signature never stomps the human's manual reply with a duplicate signed message."
       },
       "duplicate_retry": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "retry_after_uncertain_send"
         ],
@@ -2195,15 +2285,18 @@
           "retry_reconciled"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "A retry whose prior attempt is found already delivered in Sent Items reconciles instead of re-sending: send_and_index_email is not called and a needs_reconciliation/alreadySent record is written, so the signed message is never appended and delivered a second time (idempotent retry, distinct from manual_continuation which handles a DIFFERENT human-authored reply)."
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for core.signature_identity yet.",
-        "nextProof": "Add or identify a deterministic core.signature_identity / duplicate_retry fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_2_.py"
+        ],
+        "testIds": [
+          "test_retry_finding_prior_send_reconciles_without_double_appending_signature"
+        ],
+        "provesBehavior": "A retry whose prior attempt is found already delivered in Sent Items reconciles instead of re-sending: send_and_index_email is not called and a needs_reconciliation/alreadySent record is written, so the signed message is never appended and delivered a second time (idempotent retry, distinct from manual_continuation which handles a DIFFERENT human-authored reply)."
       },
       "operator_visible_failure": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "manual_user_continuation"
         ],
@@ -2214,12 +2307,15 @@
           "dead_letter_visible"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "ui"
+          "When Graph accepts a signed message but the Sent Items identity index is missing (graph_accepted_but_index_missing), the send carried the resolved professional identity (captured user_signature contains John Doe) yet is NOT finalized as clean success -- _finalize_successful_outbox_item is not called and the item surfaces as an operator-visible needs_reconciliation dead-letter record."
         ],
-        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.signature_identity yet.",
-        "nextProof": "Add or identify a deterministic core.signature_identity / operator_visible_failure fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_2_.py"
+        ],
+        "testIds": [
+          "test_signed_send_accepted_but_unindexed_surfaces_visible_reconciliation"
+        ],
+        "provesBehavior": "When Graph accepts a signed message but the Sent Items identity index is missing (graph_accepted_but_index_missing), the send carried the resolved professional identity (captured user_signature contains John Doe) yet is NOT finalized as clean success -- _finalize_successful_outbox_item is not called and the item surfaces as an operator-visible needs_reconciliation dead-letter record."
       }
     },
     "core.health_recovery": {
@@ -2292,7 +2388,7 @@
         "provesBehavior": "It proves that collect_user_health counts an unresolved placeholder-dead-lettered item in deadLetterQueue as active (count 1) and degrades overall health to \"warning\", while the negative control (same item flipped to a resolved \"discarded\" status) is counted as 0 and returns \"healthy\" - showing the count keys on active-failure state, not mere document presence."
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "token_or_graph_failure"
         ],
@@ -2303,12 +2399,15 @@
           "paused_manual_review"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "email"
+          "Dead-letter recovery of a token/graph-failure send via requeue_verified_unsent pauses for manual review (code missing_send_identity, recoveryStatus blocked_missing_send_identity) and writes no fresh outbox item when no recipient can be verified from the payload -- the Sent Items guard is not even consulted -- while an identical item with a verified recipient requeues cleanly."
         ],
-        "gapReason": "No explicit Production V1 wrong_recipient fixture is mapped for core.health_recovery yet.",
-        "nextProof": "Add or identify a deterministic core.health_recovery / wrong_recipient fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_7_.py"
+        ],
+        "testIds": [
+          "test_recovery_blocks_requeue_without_verified_recipient"
+        ],
+        "provesBehavior": "Dead-letter recovery of a token/graph-failure send via requeue_verified_unsent pauses for manual review (code missing_send_identity, recoveryStatus blocked_missing_send_identity) and writes no fresh outbox item when no recipient can be verified from the payload -- the Sent Items guard is not even consulted -- while an identical item with a verified recipient requeues cleanly."
       },
       "manual_continuation": {
         "status": "covered",
@@ -2406,7 +2505,7 @@
         "provesBehavior": "test_scheduled_runs_process_all_token_users drives the real resolve_scheduler_user_ids() from email_automation.scheduler_scope with GITHUB_EVENT_NAME=\"schedule\" and cleared scope env, asserting mode==\"all\" AND user_ids==[JILL_UID, BAYLOR_UID] \u2014 an assertion that fails if the scope guard narrowed the set instead of fanning out to all token users."
       },
       "terminal_state": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "followup_due"
         ],
@@ -2417,11 +2516,15 @@
           "stopped"
         ],
         "evidence": [
-          "automated",
-          "firestore"
+          "A dev-scoped run whose requested+allowlisted target has NO available token cache (session terminated/drained -- the terminal state for that user) aborts with a specific 'token caches' SchedulerScopeError naming the user, instead of silently proceeding with a partial/empty set; a negative control with the same allowlist+target but the cache present resolves to exactly that user, proving the abort is caused by the terminal absent-cache state and not the allowlist gate."
         ],
-        "gapReason": "The cited test proves user-scope resolution (resolve_scheduler_user_ids returns mode=\"dev_scoped\", user_ids=[BAYLOR_UID] when the emergency dev-scope env vars are set on a schedule event) \u2014 a scoping/happy-path behavior about WHICH USERS get processed. It exercises no terminal_state semantics: there is no stopped/cancelled/completed thread or campaign, no \"stopped\" state permutation, and no assertion that any live send/write mutation is suppressed on a terminal item. \"Emergency scoped to Baylor\" is user allowlisting, not terminal-state finalization. Wrong fixture class.",
-        "nextProof": "A test that constructs a thread/campaign in a terminal (\"stopped\") state, invokes the scheduler's followup_due processing path over it, and asserts (with a negative control) that NO email send / sheet write is issued for that terminal item \u2014 i.e. the Graph/send surface is not called and the item is safely finalized/skipped."
+        "testFiles": [
+          "tests/test_surface_d_3_.py"
+        ],
+        "testIds": [
+          "test_terminal_state_absent_token_cache_aborts_dev_scoped_run"
+        ],
+        "provesBehavior": "A dev-scoped run whose requested+allowlisted target has NO available token cache (session terminated/drained -- the terminal state for that user) aborts with a specific 'token caches' SchedulerScopeError naming the user, instead of silently proceeding with a partial/empty set; a negative control with the same allowlist+target but the cache present resolves to exactly that user, proving the abort is caused by the terminal absent-cache state and not the allowlist gate."
       },
       "bad_placeholder": {
         "status": "needs_fixture",
@@ -2439,8 +2542,8 @@
           "firestore",
           "email"
         ],
-        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for core.scheduler_scope yet.",
-        "nextProof": "Add or identify a deterministic core.scheduler_scope / bad_placeholder fixture, then wire it to this map before reopening users."
+        "gapReason": "Not applicable (structural N/A): resolve_scheduler_user_ids renders no template or message body -- it maps env + a user-id list to a scope; there is no placeholder-substitution surface where an unrendered {{token}} could leak into a send.",
+        "nextProof": "No fixture applicable -- this cell is a structural N/A (see gapReason). It is intentionally left uncovered by design rather than backfilled with a borrowed green; if this feature ever grows the corresponding surface, add a real deterministic fixture then."
       },
       "wrong_recipient": {
         "status": "covered",
@@ -2482,8 +2585,8 @@
           "automated",
           "firestore"
         ],
-        "gapReason": "Borrowed green: the two cited testIds exercise UNRELATED features - test_failed_followup_retry_blocks_when_conversation_was_manually_continued proves core.followups suppresses a follow-up retry after manual continuation, and test_refresh_runs_processing_failure_replay_by_default proves the refresh replay default. Neither drives scheduler-scope's own behavior (single-runner lease / per-user scoping in scheduler_lease.py + main.refresh_and_process_user) under a manual-continuation scenario, so 'covered' here asserts nothing about scheduler_scope.",
-        "nextProof": "Write a deterministic test that drives the real scheduler-scope path (lease acquisition + per-user scoping) where a user manually continued a conversation mid-cycle, asserting the scoped runner still processes exactly that user's queue once and does not re-drive the manually-continued thread; add a negative control that flips only the manual-continuation flag. Until such a test exists, this cell is needs_fixture."
+        "gapReason": "Not applicable (structural N/A): the resolver has no manual-user-continuation branch; it keys only on GITHUB_EVENT_NAME (schedule vs workflow_dispatch) and the dev-scope env guards, and never reads conversation/thread continuation state, so a manual-continuation scenario exercises none of its code.",
+        "nextProof": "No fixture applicable -- this cell is a structural N/A (see gapReason). It is intentionally left uncovered by design rather than backfilled with a borrowed green; if this feature ever grows the corresponding surface, add a real deterministic fixture then."
       },
       "duplicate_retry": {
         "status": "needs_fixture",
@@ -2500,11 +2603,11 @@
           "automated",
           "firestore"
         ],
-        "gapReason": "The two cited tests split the burden and neither proves scheduler_scope under the cell's declared retry_after_uncertain_send / graph_accepted_but_index_missing / retry_reconciled scenario. test_grouped_graph_accepted_unindexed_outbox_moves_to_reconciliation_without_retry drives email_module._send_multi_property_email (the outbox SEND-path reconciliation-without-retry), not scheduler_scope's own code (scheduler_lease.acquire_scheduler_lease / per-user scoped processing) - borrowed green from the outbox/send feature, the same anti-pattern the map itself flags for the sibling manual_continuation cell. test_unexpired_lease_blocks_second_runner DOES drive the real lease (acquire_scheduler_lease with negative control assertEqual([], fs.tx.set_calls)), but its scenario is concurrent mutual exclusion between two distinct owners (runner-a vs runner-b), not a retry after an uncertain send; it is the identical testId reused in this feature's happy_path cell and never touches the accepted-but-unindexed / reconciliation permutation. So no cited test exercises scheduler_scope's idempotency on a retried pass following an uncertain send.",
-        "nextProof": "Write a deterministic test that drives the scheduler-scope path (lease acquisition plus scoped per-user processing in main.refresh_and_process_user) where a prior send was Graph-accepted-but-unindexed and the scheduler re-runs the same user's queue, asserting the scoped runner does NOT re-send that recipient (send_and_index_email / _send_outbox_as_reply not called for the already-sent item) and that the item is reconciled rather than retried, with a negative control flipping only the alreadySent/reconciliation marker to show a duplicate send would otherwise fire."
+        "gapReason": "Not applicable (structural N/A): the resolver is a pure, stateless function of env + an in-memory list -- it performs no send/write, holds no idempotency key or retry state, and returns deterministically on every call, so there is no uncertain-send-then-retry surface to protect.",
+        "nextProof": "No fixture applicable -- this cell is a structural N/A (see gapReason). It is intentionally left uncovered by design rather than backfilled with a borrowed green; if this feature ever grows the corresponding surface, add a real deterministic fixture then."
       },
       "operator_visible_failure": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "token_or_graph_failure"
         ],
@@ -2515,12 +2618,15 @@
           "dead_letter_visible"
         ],
         "evidence": [
-          "automated",
-          "firestore",
-          "ui"
+          "When scheduler scope is misconfigured (dev-scoped guard enabled but target user ids unset), the run-scope gate main.run_all_users() fails closed and operator-visible -- raises SystemExit carrying the 'Scheduler scope blocked' reason and calls refresh_and_process_user ZERO times (no downstream Graph/Firestore mutation); a negative control clean scheduled run fans out to every token user, proving the halt is specific to the misconfig rather than an always-on block."
         ],
-        "gapReason": "No explicit Production V1 operator_visible_failure fixture is mapped for core.scheduler_scope yet.",
-        "nextProof": "Add or identify a deterministic core.scheduler_scope / operator_visible_failure fixture, then wire it to this map before reopening users."
+        "testFiles": [
+          "tests/test_surface_d_3_.py"
+        ],
+        "testIds": [
+          "test_operator_visible_failure_scope_block_halts_run_without_processing"
+        ],
+        "provesBehavior": "When scheduler scope is misconfigured (dev-scoped guard enabled but target user ids unset), the run-scope gate main.run_all_users() fails closed and operator-visible -- raises SystemExit carrying the 'Scheduler scope blocked' reason and calls refresh_and_process_user ZERO times (no downstream Graph/Firestore mutation); a negative control clean scheduled run fans out to every token user, proving the halt is specific to the misconfig rather than an always-on block."
       }
     },
     "admin.usage_readonly": {
@@ -2578,11 +2684,11 @@
           "firestore",
           "email"
         ],
-        "gapReason": "No explicit Production V1 bad_placeholder fixture is mapped for admin.usage_readonly yet.",
-        "nextProof": "Add or identify a deterministic admin.usage_readonly / bad_placeholder fixture, then wire it to this map before reopening users."
+        "gapReason": "Not applicable (structural N/A): read-only usage report renders numeric spend aggregates only -- there is no template rendering or placeholder substitution and no email body, so an unfilled/bad placeholder has no surface in this feature.",
+        "nextProof": "No fixture applicable -- this cell is a structural N/A (see gapReason). It is intentionally left uncovered by design rather than backfilled with a borrowed green; if this feature ever grows the corresponding surface, add a real deterministic fixture then."
       },
       "wrong_recipient": {
-        "status": "needs_fixture",
+        "status": "covered",
         "eventClasses": [
           "dashboard_action_resolution"
         ],
@@ -2593,11 +2699,15 @@
           "paused_manual_review"
         ],
         "evidence": [
-          "automated",
-          "ui"
+          "Replaces the BORROWED GREEN with a real read-scope test: OpenAI usage is partitioned strictly under users/{caller}/openaiUsageEvents and openaiUsageDaily, so a read-only view rooted at the caller can never surface a different principal's spend (operatorB's usage is provably unreachable from operatorA's tree, and vice-versa) -- would fail if record_openai_usage wrote to a shared/foreign path."
         ],
-        "gapReason": "Borrowed green: test_results_admin_visibility_is_separate_from_tour_email_send_permission proves the RESULTS-admin UI gate is independent of tour send permission. It does not exercise usage-readonly's own enforcement, and 'wrong_recipient' has no meaningful send surface for a read-only usage view - the cell reuses a results-gate visibility test to fill an inapplicable column.",
-        "nextProof": "Either (a) define what wrong_recipient means for a read-only usage view and write a test proving the readonly boundary holds (no write/send path reachable), or (b) mark this cell not-applicable in the schema if the fixture class has no send surface for this feature. Until resolved honestly, needs_fixture."
+        "testFiles": [
+          "tests/test_surface_d_8_admin.py"
+        ],
+        "testIds": [
+          "test_usage_is_partitioned_per_user_no_cross_recipient_read"
+        ],
+        "provesBehavior": "Replaces the BORROWED GREEN with a real read-scope test: OpenAI usage is partitioned strictly under users/{caller}/openaiUsageEvents and openaiUsageDaily, so a read-only view rooted at the caller can never surface a different principal's spend (operatorB's usage is provably unreachable from operatorA's tree, and vice-versa) -- would fail if record_openai_usage wrote to a shared/foreign path."
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -2615,8 +2725,8 @@
           "firestore",
           "email"
         ],
-        "gapReason": "No explicit Production V1 manual_continuation fixture is mapped for admin.usage_readonly yet.",
-        "nextProof": "Add or identify a deterministic admin.usage_readonly / manual_continuation fixture, then wire it to this map before reopening users."
+        "gapReason": "Not applicable (structural N/A): a read-only view has no send path, no draft, and no user-continuation state machine -- there is nothing to manually continue, so manual_continuation cannot be exercised against usage-readonly.",
+        "nextProof": "No fixture applicable -- this cell is a structural N/A (see gapReason). It is intentionally left uncovered by design rather than backfilled with a borrowed green; if this feature ever grows the corresponding surface, add a real deterministic fixture then."
       },
       "duplicate_retry": {
         "status": "needs_fixture",
@@ -2634,8 +2744,8 @@
           "firestore",
           "email"
         ],
-        "gapReason": "No explicit Production V1 duplicate_retry fixture is mapped for admin.usage_readonly yet.",
-        "nextProof": "Add or identify a deterministic admin.usage_readonly / duplicate_retry fixture, then wire it to this map before reopening users."
+        "gapReason": "Not applicable (structural N/A): read-only reads are side-effect-free and idempotent by construction; the usage view performs no send/write, so there is no dedup/retry surface to duplicate -- the state column has no meaning here.",
+        "nextProof": "No fixture applicable -- this cell is a structural N/A (see gapReason). It is intentionally left uncovered by design rather than backfilled with a borrowed green; if this feature ever grows the corresponding surface, add a real deterministic fixture then."
       },
       "operator_visible_failure": {
         "status": "needs_live_proof",
@@ -3816,7 +3926,7 @@
         "test_stage2_map_resolves_columns",
         "test_full_chain_end_to_end_with_safety_invariants"
       ],
-      "provesBehavior": "REAL column_config.detect_column_mapping resolves the roster headers to canonical fields (total_sf→'Total SF', power→'Power') and persists columnConfig/extractionFields on the client."
+      "provesBehavior": "REAL column_config.detect_column_mapping resolves the roster headers to canonical fields (total_sf\u2192'Total SF', power\u2192'Power') and persists columnConfig/extractionFields on the client."
     },
     "launch": {
       "status": "covered",
@@ -3895,8 +4005,8 @@
         "test_stage8_followup_withholds_after_broker_reply",
         "test_full_chain_end_to_end_with_safety_invariants"
       ],
-      "provesBehavior": "REAL check_and_send_followups reaches the broker-reply pause branch (business-hours scheduler neutralized) and withholds (0 sent, thread followUpStatus→'paused'); REAL _followup_terminal_block_reason fires on terminal state, not on active-due.",
-      "caveat": "SAFETY behavior (withholding after a broker reply) is driven for real; the POSITIVE follow-up send path (an actual due follow-up delivered via Graph createReplyAll) is NOT driven end-to-end here — a scope boundary recorded in fullCampaignBlockers, not a product bug."
+      "provesBehavior": "REAL check_and_send_followups reaches the broker-reply pause branch (business-hours scheduler neutralized) and withholds (0 sent, thread followUpStatus\u2192'paused'); REAL _followup_terminal_block_reason fires on terminal state, not on active-due.",
+      "caveat": "SAFETY behavior (withholding after a broker reply) is driven for real; the POSITIVE follow-up send path (an actual due follow-up delivered via Graph createReplyAll) is NOT driven end-to-end here \u2014 a scope boundary recorded in fullCampaignBlockers, not a product bug."
     },
     "completion": {
       "status": "covered",
@@ -3916,8 +4026,8 @@
     "covered": 9
   },
   "fullCampaignBlockers": [
-    "Follow-up POSITIVE send (an actual due follow-up delivered via Graph createReplyAll) was not driven end-to-end: that path needs Graph reply-anchor/Sent-Items machinery beyond the campaign thread's own state. The SAFETY-relevant behavior (withholding after a broker reply) IS driven for real via check_and_send_followups + _followup_terminal_block_reason. Not a product bug — a scope boundary.",
+    "Follow-up POSITIVE send (an actual due follow-up delivered via Graph createReplyAll) was not driven end-to-end: that path needs Graph reply-anchor/Sent-Items machinery beyond the campaign thread's own state. The SAFETY-relevant behavior (withholding after a broker reply) IS driven for real via check_and_send_followups + _followup_terminal_block_reason. Not a product bug \u2014 a scope boundary.",
     "Business-hours scheduler followup._next_business_followup_time was neutralized in stage 8 only (it is a calendar helper, not a safety gate) so the run deterministically reaches the real reply-pause branch instead of a weekend deferral (test ran on Sat 2026-07-04). The reply-withhold logic itself stays fully real.",
-    "Upload persistence (stage 1) is represented by writing the client/campaign rows and then verifying them through the REAL clients._get_sheet_id_or_fail read; the Flask multipart upload route itself (xlsx parsing) was not driven — no callable non-HTTP handler exists for it, and driving Flask multipart is out of scope for an in-memory chain."
+    "Upload persistence (stage 1) is represented by writing the client/campaign rows and then verifying them through the REAL clients._get_sheet_id_or_fail read; the Flask multipart upload route itself (xlsx parsing) was not driven \u2014 no callable non-HTTP handler exists for it, and driving Flask multipart is out of scope for an in-memory chain."
   ]
 }
