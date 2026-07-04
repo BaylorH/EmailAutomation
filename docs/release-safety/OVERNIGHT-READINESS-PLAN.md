@@ -1,3 +1,60 @@
+# ⟢ MORNING VERDICT (2026-07-04) — CONDITIONAL GO
+
+**Bottom line: NO-GO for an unattended, all-users reopen tonight. GO for a staged, allowlisted reopen once Baylor runs the one remaining live checkpoint and the three named pre-reopen items close.** The core mandate — proving Core Campaign Automation *cannot* send placeholders, wrong recipients, accidental tour language, stale retries, bad auto-replies, hidden failures, bad reply-all, bad row anchors, or unsafe scheduler behavior — is met **with evidence** on the deterministic + real-AI + integration + full-campaign lanes. What is *not* yet proven is anything that can only be proven against live production (the BP21 golden campaign, real Graph/GCP timing), plus one auth-service defect and one observability follow-on. Those are the gate to a real reopen, and they are Baylor's call.
+
+**Users back on? NO tonight (unattended). YES for a staged allowlisted pilot after: (1) the live BP21↔BP21 golden campaign passes; (2) the auth-service MSAL shared-cache identity-mixing fix lands; (3) the swallowed-per-item send-failure observability follow-on lands.** Full reopen only after the pilot is clean.
+
+## 10-gate scorecard — final
+| # | Gate | Verdict | Evidence |
+|---|------|---------|----------|
+| 1 | Rubric green on Base-V1 (no borrowed greens) | 🟢 **GREEN (base) / caveat** | `featureFixtureMatrix` 102 covered / **7 needs_fixture (all structural N/A, honest gapReason) / 10 needs_live_proof**; 0 genuine coverage debt on the base independent lane. Borrowed greens purged; enforcement forbids duplicate provesBehavior (12/12 green). **Caveat:** `featureStressMatrix` = 101 needs_fixture (the stress-class × feature dimension — `rate_limit_429`, `concurrent_runner`, `malformed_data`, `retry_storm`…) is the largest remaining coverage gap, deliberately NOT faked overnight. |
+| 2 | 3 lanes real+passing (independent + integrated + full-campaign) | 🟢 **GREEN** | Independent: 102 covered. Integrated: 8 combination stress decks as real chained tests + `crossFeatureMatrix` 3 covered. Full-campaign: **9/9 lanes** driven end-to-end (Surface F, adversarially confirmed genuine). |
+| 3 | Scheduler migrated to Firebase, lease intact | 🟡 **GREEN (dev-proven) / 1 live gate** | WS-B Cloud Run Job: fail-closed scope (Job+Service+unknown-runtime), globally-unique lease owner, `timeout 2400 < TTL 2700`, startup env gate, SIGTERM→exit 143 (interrupted run no longer masked as success). **Live gate:** real GCP SIGTERM grace timing + atexit upload needs a deploy (forbidden here). PR #17, 451 tests. |
+| 4 | Send-path invariants hold adversarially | 🟢 **STRONG GREEN** | Surface A (20/20 broker-language events), A′ (46 live-OpenAI misreads fixed), E (identity-leak false-negative fixed), D (signature-HTML placeholder leak fixed), B (placeholder-value sheet writes blocked). No phrasing tried broke a guard. |
+| 5 | Golden campaign passes e2e, no code change mid-pass | 🟡 **GREEN (in-memory) / live pending** | Surface F chained e2e on an in-memory Firestore double + faked Graph/Sheets, 11 tests, no code change mid-pass. **The live BP21↔BP21 golden campaign is the LAST checkpoint — left for Baylor.** |
+| 6 | Safety rails live | 🟢 **GREEN** | Reply-safety (validated at all 4 send entrypoints), daily send cap (fail-closed), kill-switch/dry-run outbound-mode lever, dead-letter reason+alert. PR #18. |
+| 7 | Next-version isolated (Results/Tour/PDF/Map out of Base build) | 🟡 **GREEN (pending review)** | WS-C flag + tree-shake landed on `codex/ws-c-results-isolation-20260702` (prior session); not re-verified tonight. |
+| 8 | Staging env | 🟡 **PARTIAL** | In-memory Firestore harness stood up (Surface F) — the substitute for the JRE-blocked Firebase Emulator. No live staging project (needs Baylor: project + secrets). |
+| 9 | Observability (health can't lie) | 🟢 **GREEN (was FAILING) / 1 residual** | Gate 9 was **failing** — health reported healthy while Graph send was fully broken AND while queue counts were unreadable. Both fail-closed now (PR #18). **Residual:** the swallowed-per-item send-failure class (sendMail 403 while reads succeed) needs the send drivers to return per-run op-states; the main.py consumer rail is wired to escalate the instant they do. |
+| 10 | Rollback + runbook | 🟢 **GREEN** | `SAFETY-RAILS-AND-ROLLBACK-RUNBOOK.md` (rail operation + reopen/fast-halt) + `deploy/README.md` scheduler cutover/rollback. |
+
+## Bugs found AND fixed this run (ledger)
+- **Surface A — broker-language (54):** 20/20 event suites green across 3 passes. Fail-closed Sent-Items continuation guard, paused-thread follow-up block, plus-alias operator drop, company-name greeting guard, rejected-tour-time never confirmed, extraction failures raise `RetryableProcessingError`, deterministic wrong-property flyer guard.
+- **Surface A′ — real-AI classification (46 misreads, 30 HIGH):** live gpt-5.2, 271 cases / 303 calls, zero sends. 43 fixes: target-grounded terminal detection, quote-trap retention guards, TI-credit-as-rent, cross-property rent write, wrong-person greeting, mixed-basis opex. Deferred (documented): M26/M36 covered by prompt rules only.
+- **Surface B — extraction (7, 6 fixed):** placeholder-VALUE sheet writes, mixed-basis opex, fabricated gross-basis opex, 'under joist' clear-height misfire, cents-per-SF + total-annual-over-area rent extraction.
+- **Surface C — dashboard/callables:** backend — every mutating dashboard/debug/admin/device-flow route made verified-token + caller-scoped + input-bounded (cross-tenant disclosure, destructive cross-tenant cleanup, MSAL identity confusion, session-uid cache-wipe). Frontend — **anonymous permanent `deleteSheet`**, anonymous arbitrary-sheet-write `acceptNewProperty`, MSAL mailbox-binding forgery, sheet IDOR, audit-trail spoofing, OpenAI-cost input caps.
+- **Surface E — combination decks (4):** confidential client-identity leak false-negative (apposition/representation naming), non-viable-lead-stays-alive gate ordering, 2× row-anchor prefix-leniency (completed sibling absorbing a partial property's reply after a sheet sort).
+- **Surface D — state permutations (1 HIGH):** `build_professional_signature_html` leaked unresolved `[NAME]`/`[COMPANY]` tokens into the outbound signature HTML — a placeholder-to-broker-inbox path; now stripped.
+- **Surface G — scheduler (2):** fail-open scope default (bare container / Cloud Run Service could process every live user), non-unique lease owner (concurrent double-run). Both caught by the run's own adversarial verify.
+- **Surface H — observability (2):** the two "health can lie" paths (send blindness, unreadable-queue sentinel).
+- **CodeRabbit triage:** SIGTERM exit-0 masking interrupted runs (#17), follow-up resume-timing unit bug (#16), article-led identity-leak regex gaps + `@odata.nextLink` SSRF host check (#18), `checkRevoked` on onRequest + MSAL-flow staleness reject (#6), and 6 more on #15 (terminal detection masked by size/price token, alternate-tour reorder, ambiguous 2-letter state codes in the flyer guard, column-config `None` hint, fail-loud import).
+
+## Tests / builds
+- Rubric branch full suite: **861 tests OK** (1 skip). Backend-contract: 754. Scheduler: 451. Safety-rails: 791. Frontend callables: 117. All `git diff --check` clean, `py_compile`/`node --check` clean, no secrets staged (`.env`/`service-account.json` remain gitignored).
+
+## Branches / commits / PRs (all draft, none merged)
+- `codex/prod-v1-rubric-integrity-20260702` @ `48637aa` → **PR #15** (A, A′, B, D, E, F, rubric)
+- `codex/backend-contract-hardening-20260703` @ `bccc42c` → **PR #16** (Surface C backend)
+- `codex/surface-c-callables-20260704` @ `919bf2a` → **PR #6** (email-admin-ui, Surface C frontend)
+- `codex/ws-b-cloudrun-scaffold-20260702` @ `aa7fa83` → **PR #17** (Surface G scheduler)
+- `codex/safety-rails-observability-20260704` @ `96e9759` → **PR #18** (Surface H rails + observability)
+
+## CodeRabbit status
+All 5 PRs received a full CodeRabbit review (no Critical findings; ~30 Major, mostly quick-wins + test-hygiene). **Every Major was adversarially triaged and either fixed (TDD), verified already-fixed by a later commit, or dispositioned as a false-positive/heavy-lift with a written reason — posted as PR comments.** Because the PRs are drafts, CodeRabbit skips re-review of the post-triage commits; a fresh pass runs automatically when Baylor marks a PR ready-for-review.
+
+## What is still unsafe / residual risk (what a live prod run could still surface)
+1. **No live proof.** Everything is against faked Graph/Sheets/Firestore + in-memory doubles. The BP21↔BP21 golden campaign (real send, real inbox, real sheet, real scheduler tick) has NOT run — it is the final checkpoint and is Baylor's to run.
+2. **Auth-service MSAL shared-cache identity-mixing (Major, deferred to its own PR).** `auth_service.py` serializes the whole-process MSAL cache under the current uid and `get_accounts()[0]` can pick the wrong identity — a real mailbox-confusion risk on the *login* path. Must land before reopen.
+3. **Swallowed-per-item send-failure observability (gate 9 residual).** A `sendMail` 403 while reads succeed is not yet reflected in health; the consumer rail is wired but the send drivers must return op-states.
+4. **Scheduler live SIGTERM/atexit timing (gate 3).** Only a real Cloud Run execution can prove the token-cache upload finishes within the grace window.
+5. **Stress-matrix coverage (gate 1 caveat).** 101 `featureStressMatrix` cells (rate-limit / concurrency / malformed-data / retry-storm) are not yet fixtured.
+6. **Classifier nondeterminism.** A′ confirmations are 2-sample; sub-50% intermittent misreads on *passed* cases are invisible. Code-level fixes (preferred, model-independent) mitigate; prompt-level fixes need re-sweeping on any model bump.
+
+## Next exact gate
+**Baylor runs the live BP21↔BP21 golden campaign** (frontend Start scoped to BP21 → deployed scoped scheduler → Firestore/Sheets/Graph readback) with the preflight in the run brief. If it is clean, and the auth-service identity-mixing fix + the send-failure observability follow-on land, proceed to a **staged allowlisted pilot** (kill-switch armed, daily cap low, dead-letter alerting watched), then a full reopen only after the pilot is clean.
+
+---
+
 # Overnight production-readiness run — plan + live scorecard (2026-07-03 → 04)
 
 **Goal:** by morning, an evidence-based verdict on bringing users back to production — every event, every dashboard interaction, and the messy ways brokers actually write, pressure-tested against the REAL logic, bugs found AND fixed, rubric gaps closed, scheduler advanced. Push to branches as progress lands.
