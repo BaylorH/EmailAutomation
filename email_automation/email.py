@@ -1556,10 +1556,40 @@ def _property_address_from_thread_context(thread_context: Optional[Dict[str, Any
     return None
 
 
+_CANCELLED_OUTBOX_STATUSES = {
+    "cancel_requested",
+    "cancelled",
+    "canceled",
+    # optimistic in-progress cancel states set by the UI on click
+    "cancelling",
+    "canceling",
+}
+
+
+def _flag_is_truthy(value: Any) -> bool:
+    """Truthy-check a loosely-typed flag WITHOUT an identity match.
+
+    Dashboard/Firestore-REST/form-encoded writes can land a cancel flag as a
+    real bool, an int (1/0), or a string ("true"/"false"). `is True` misses all
+    but the native bool, so we coerce string/int forms explicitly.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y", "t"}
+    return False
+
+
 def _is_cancelled_outbox_item(data: Dict[str, Any]) -> bool:
     """True when the dashboard has requested cancellation before the worker sends."""
-    status = (data.get("status") or "").strip().lower()
-    return data.get("cancelRequested") is True or status in {"cancel_requested", "cancelled", "canceled"}
+    # Normalize delimiter variants ("cancel-requested" -> "cancel_requested")
+    # so differently-formatted dashboard/REST writes still register as cancels.
+    status = re.sub(r"[\s-]+", "_", (data.get("status") or "").strip().lower())
+    if _flag_is_truthy(data.get("cancelRequested")):
+        return True
+    return status in _CANCELLED_OUTBOX_STATUSES
 
 
 def _delete_cancelled_outbox_item_if_needed(

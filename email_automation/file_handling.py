@@ -207,36 +207,42 @@ def process_pdf_for_ai(content: bytes, filename: str = "document.pdf") -> Dict[s
 
 
 def fetch_pdf_attachments(headers: Dict[str, str], graph_msg_id: str) -> List[Dict[str, Any]]:
-    """Fetch PDF attachments from current message only."""
-    try:
-        base = "https://graph.microsoft.com/v1.0"
-        
-        # Get attachments
-        resp = requests.get(
-            f"{base}/me/messages/{graph_msg_id}/attachments",
-            headers=headers,
-            timeout=30
-        )
-        resp.raise_for_status()
-        
-        attachments = resp.json().get("value", [])
-        pdf_attachments = []
-        
-        for attachment in attachments:
-            if attachment.get("contentType", "").lower() == "application/pdf":
-                name = attachment.get("name", "document.pdf")
-                content_bytes = base64.b64decode(attachment.get("contentBytes", ""))
-                pdf_attachments.append({
-                    "name": name,
-                    "bytes": content_bytes
-                })
-        
-        print(f"📎 Found {len(pdf_attachments)} PDF attachment(s)")
-        return pdf_attachments
-        
-    except Exception as e:
-        print(f"❌ Failed to fetch PDF attachments: {e}")
-        return []
+    """Fetch PDF attachments from current message only.
+
+    Fails CLOSED on Graph/network failure: a 401/403/5xx or network error while
+    downloading attachments is surfaced by raising ``requests.exceptions.
+    RequestException`` so the caller can distinguish a real download failure
+    from a message that genuinely has no attachments. Swallowing the failure and
+    returning ``[]`` would be indistinguishable from the clean no-attachments
+    case, causing the message to be marked fully processed with the attachment
+    silently dropped. Only a healthy 200 response with no PDF attachments
+    returns ``[]``.
+    """
+    base = "https://graph.microsoft.com/v1.0"
+
+    # Download the attachment list. A Graph/network failure MUST propagate;
+    # do not collapse it into an empty list.
+    resp = requests.get(
+        f"{base}/me/messages/{graph_msg_id}/attachments",
+        headers=headers,
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    attachments = resp.json().get("value", [])
+    pdf_attachments = []
+
+    for attachment in attachments:
+        if attachment.get("contentType", "").lower() == "application/pdf":
+            name = attachment.get("name", "document.pdf")
+            content_bytes = base64.b64decode(attachment.get("contentBytes", ""))
+            pdf_attachments.append({
+                "name": name,
+                "bytes": content_bytes
+            })
+
+    print(f"📎 Found {len(pdf_attachments)} PDF attachment(s)")
+    return pdf_attachments
 
 def ensure_drive_folder():
     """Ensure Drive folder exists and return folder ID."""

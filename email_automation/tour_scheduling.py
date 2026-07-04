@@ -53,38 +53,56 @@ def format_tour_date_label(value) -> str:
     return text
 
 
+# A tours/showings subject: the nouns plus the verb "show" ("cannot show it").
+_TOUR_NOUN = r"(?:tours?|showings?|walk[-\s]?throughs?|walkthroughs?)"
+_TOUR_SUBJECT = rf"(?:{_TOUR_NOUN}|show(?:ing|n|s|ed)?)"
+
+# Negations that scope a *tours-only* restriction. Bare "no" ("no tours"),
+# contractions ("won't"/"aren't"/"isn't"/"can't"), and the verb-first forms all
+# count — brokers phrase the same restriction many ways.
+_TOUR_NEGATION = (
+    r"(?:no\s+longer|not\s+able|not|no|unavailable|cannot|can\s*not|can't|cant|"
+    r"won't|wont|will\s+not|aren't|arent|isn't|isnt|couldn't|couldnt|unable)"
+)
+
+# Post-subject phrases that read as "tours are off" ("suspended", contraction+available).
+_TOUR_UNAVAIL_PHRASE = (
+    r"(?:no\s+longer\s+available|not\s+available|unavailable|cancelled|canceled|"
+    r"not\s+being\s+offered|suspended|aren't\s+available|arent\s+available|"
+    r"isn't\s+available|isnt\s+available|won't\s+be\s+available)"
+)
+
+# Property-level terminal signals: if any of these appear the message is about the
+# PROPERTY being gone, not merely tours — must never be treated as tours-only.
+_PROPERTY_TERMINAL_RE = (
+    r"\b(?:fully\s+leased|has\s+been\s+leased|already\s+leased|signed\s+(?:an?\s+)?loi|"
+    r"signed\s+(?:a\s+)?lease|off[-\s]?market|under\s+contract|no\s+space\s+available)\b"
+)
+
+
 def looks_like_tour_only_unavailable(text: str = "") -> bool:
     latest = str(text or "").strip().lower()
     if not latest:
         return False
 
-    if re.search(
-        r"\b(?:fully\s+leased|has\s+been\s+leased|already\s+leased|signed\s+(?:an?\s+)?loi|"
-        r"signed\s+(?:a\s+)?lease|off[-\s]?market|under\s+contract|no\s+space\s+available)\b",
-        latest,
-    ):
+    if re.search(_PROPERTY_TERMINAL_RE, latest):
         return False
 
-    tour_context = r"(?:tours?|showings?|walk[-\s]?throughs?|walkthroughs?)"
     return bool(
+        # negation ... <tour subject>: "no tours", "can't show it", "won't ... a tour"
         re.search(
-            rf"\b(?:no\s+longer|not|unavailable|cannot|can't|not\s+able|unable)\b"
-            rf".{{0,80}}\b(?:for\s+)?{tour_context}\b",
+            rf"\b{_TOUR_NEGATION}\b.{{0,80}}\b(?:for\s+|to\s+)?{_TOUR_SUBJECT}\b",
             latest,
         )
+        # <tour subject> ... off: "tours aren't available", "tours ... suspended"
         or re.search(
-            rf"\b{tour_context}\b.{{0,60}}\b(?:no\s+longer\s+available|not\s+available|"
-            r"unavailable|cancelled|canceled|not\s+being\s+offered)\b",
+            rf"\b{_TOUR_SUBJECT}\b.{{0,60}}\b{_TOUR_UNAVAIL_PHRASE}\b",
             latest,
         )
-        or re.search(
-            rf"\bno\s+{tour_context}\s+availability\b",
-            latest,
-        )
-        or re.search(
-            rf"\bno\s+availability\s+for\s+{tour_context}\b",
-            latest,
-        )
+        # "no tour(s) availability"
+        or re.search(rf"\bno\s+{_TOUR_NOUN}\s+availability\b", latest)
+        # "no availability to show" / "no availability for tours"
+        or re.search(rf"\bno\s+availability\s+(?:for|to)\s+{_TOUR_SUBJECT}\b", latest)
     )
 
 

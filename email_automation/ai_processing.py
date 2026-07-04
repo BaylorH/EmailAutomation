@@ -58,48 +58,113 @@ def _row_value_for_column(rowvals: List[str], header: List[str], column_name: st
     return rowvals[idx] if idx < len(rowvals) else ""
 
 
+def _strip_quoted_history(text: str) -> str:
+    """Return only the newest message body, dropping quoted reply history.
+
+    Broker replies routinely quote the prior thread ('> On Jul 1 I wrote: ...' or
+    an 'On Mon, Broker wrote:' attribution line followed by '>'-prefixed lines).
+    Pattern guards must judge only the NEW message, otherwise a fresh positive
+    reply that quotes an old rejection re-triggers non-viable/unavailable events.
+    """
+    if not text:
+        return ""
+    kept: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            break
+        if re.match(r"^on\b.*\bwrote\s*:", stripped, re.IGNORECASE):
+            break
+        if re.match(r"^-{2,}\s*original message\s*-{2,}", stripped, re.IGNORECASE):
+            break
+        kept.append(line)
+    result = "\n".join(kept).strip()
+    # If the message was entirely quoted, fall back to the raw text so a genuinely
+    # new-but-unusually-formatted reply is not lost.
+    return result or text.strip()
+
+
 def _latest_inbound_text(conversation: List[dict]) -> str:
     for message in reversed(conversation or []):
         if (message.get("direction") or "").lower() == "inbound":
-            return message.get("content") or message.get("body") or message.get("preview") or ""
+            raw = message.get("content") or message.get("body") or message.get("preview") or ""
+            return _strip_quoted_history(raw)
     return ""
 
 
 def _looks_like_requirements_mismatch_nonviable(text: str) -> bool:
-    """Detect broker replies saying the property fails the client's physical requirements."""
-    latest_text = (text or "").lower()
+    """Detect broker replies saying the property fails the client's physical
+    requirements (office-heavy, not a true warehouse, no drive-in / grade-level
+    access, clear/ceiling height below spec, warehouse requirement unmet).
+
+    A single clear physical non-fit reason is enough to flag the property
+    non-viable; two independent mismatches are not required. Quoted reply history
+    is stripped first so an old rejection re-quoted under a new positive reply
+    does not fire.
+    """
+    latest_text = _strip_quoted_history(text or "").lower()
     if not latest_text:
         return False
 
+    # --- explicit "not a (good/right) fit for the client" style rejections ---
     fit_rejection = bool(
         re.search(
-            r"\b(?:this\s+)?(?:space|property|building|suite)?\s*"
-            r"(?:wouldn[’']t|would\s+not|won[’']t|will\s+not|isn[’']t|is\s+not|"
-            r"doesn[’']t|does\s+not)\s+(?:be\s+)?(?:a\s+)?(?:good\s+)?fit\b",
+            r"\b(?:won[’']?t|wont|would\s*n[’']?t|will\s+not|is\s+not|isn[’']?t|"
+            r"are\s+not|aren[’']?t|does\s+not|doesn[’']?t)\s+(?:be\s+)?(?:a\s+|the\s+)?"
+            r"(?:good\s+|right\s+)?fit\b",
             latest_text,
         )
-        or re.search(r"\bnot\s+(?:a\s+)?(?:good\s+)?fit\s+for\s+(?:your|the)\s+client\b", latest_text)
-        or re.search(r"\bnot\s+(?:the\s+)?right\s+fit\s+for\s+(?:your|the)\s+client\b", latest_text)
-        or re.search(r"\bfails?\s+(?:your\s+|the\s+)?client(?:'s)?\s+requirements\b", latest_text)
-        or re.search(r"\bdoes\s+not\s+(?:meet|satisfy)\s+(?:your\s+|the\s+)?client(?:'s)?\s+requirements\b", latest_text)
-        or re.search(r"\bdoesn[’']t\s+(?:meet|satisfy)\s+(?:your\s+|the\s+)?client(?:'s)?\s+requirements\b", latest_text)
+        or re.search(r"\bnot\s+(?:a\s+|the\s+)?(?:good\s+|right\s+)?fit\s+for\s+(?:your|the)\s+client\b", latest_text)
+        or re.search(r"\bwon[’']?t\s+work\s+for\s+(?:them|you|your\s+client|the\s+client)\b", latest_text)
+        or re.search(r"\bfails?\s+(?:to\s+meet\s+)?(?:your\s+|the\s+)?client(?:['’]?s)?\s+(?:warehouse\s+)?(?:requirements?|needs?|specs?)\b", latest_text)
+        or re.search(r"\b(?:does\s+not|doesn[’']?t)\s+(?:meet|satisfy|fit)\s+(?:your\s+|the\s+)?client", latest_text)
     )
-    property_context = bool(re.search(r"\b(?:space|property|building|suite|warehouse|client)\b", latest_text))
-    physical_mismatches = [
-        re.search(r"\b(?:too|more|mostly|primarily)\s+office[-\s]?heavy\b", latest_text),
-        re.search(r"\b(?:too|more|mostly|primarily)\s+office\b", latest_text),
-        re.search(r"\boffice[-\s]?heavy\s+as\s+opposed\s+to\s+(?:a\s+)?(?:true\s+)?warehouse\b", latest_text),
-        re.search(r"\bnot\s+(?:a\s+)?true\s+warehouse\b", latest_text),
-        re.search(r"\blacks?\s+(?:enough\s+|sufficient\s+)?(?:warehouse|industrial|industrial\s+warehouse)\s+(?:space|area)?\b", latest_text),
-        re.search(r"\b(?:no|without|lacks?|doesn[’']t\s+have|does\s+not\s+have)\s+(?:any\s+)?(?:drive[-\s]?in|grade[-\s]?level)\s+(?:doors?|space|access)?\b", latest_text),
-        re.search(r"\bnot\s+(?:enough|sufficient)\s+(?:warehouse|industrial|drive[-\s]?in)\b", latest_text),
-    ]
-    mismatch_count = sum(1 for match in physical_mismatches if match)
 
-    return bool(
-        (fit_rejection and (property_context or mismatch_count > 0))
-        or mismatch_count >= 2
+    # --- property is too office-oriented for an industrial/warehouse requirement ---
+    office_mismatch = bool(
+        re.search(r"\boffice[-\s]?heavy\b", latest_text)
+        or re.search(r"\b(?:too|more|mostly|primarily|all)\s+office\b", latest_text)
+        or re.search(r"\boffice\s+fit[-\s]?out\b", latest_text)
+        or re.search(r"\boffice\s+(?:use\s+)?only\b", latest_text)
     )
+
+    # --- warehouse / industrial space is missing or insufficient ---
+    warehouse_mismatch = bool(
+        re.search(r"\bnot\s+(?:a\s+)?(?:true|real|proper|actual)\s+warehouse\b", latest_text)
+        or re.search(r"\bno\s+(?:true|real|proper)\s+warehouse\b", latest_text)
+        or re.search(r"\bnot\s+(?:a\s+)?warehouse\b", latest_text)
+        or re.search(r"\bno\s+(?:proper\s+|real\s+|true\s+)?warehouse\s+to\s+speak\s+of\b", latest_text)
+        or re.search(r"\blacks?\s+(?:enough\s+|sufficient\s+)?(?:warehouse|industrial)\s+(?:space|area)?\b", latest_text)
+        or re.search(r"\bnot\s+(?:enough|sufficient)\s+(?:warehouse|industrial)\b", latest_text)
+        or re.search(r"\bwarehouse\s+(?:requirement|requirements|spec|specs|need|needs)\s+(?:remains?\s+|still\s+)?(?:unmet|not\s+met|isn[’']?t\s+met)\b", latest_text)
+    )
+
+    # --- required drive-in / grade-level / dock access is absent ---
+    negation = (
+        r"(?:no|without|lacks?|has\s+no|have\s+no|do\s+not\s+have|does\s+not\s+have|"
+        r"don[’']?t\s+have|doesn[’']?t\s+have)"
+    )
+    access_mismatch = bool(
+        re.search(
+            negation
+            + r"\s+(?:any\s+)?(?:drive[-\s]?in|grade[-\s]?level|dock)"
+            r"(?:\s+(?:doors?|access|space|loading))?\b",
+            latest_text,
+        )
+    )
+
+    # --- clear / ceiling height below the client's spec ---
+    height_term = r"(?:clear\s+height|ceiling\s+height|ceiling\s+clearance|clear\s+ceiling|clearance)"
+    below_term = r"(?:below|under|beneath|less\s+than|short\s+of)"
+    height_mismatch = bool(
+        re.search(height_term + r"[^.]{0,45}?\b" + below_term + r"\b", latest_text)
+    )
+
+    physical_mismatch = (
+        office_mismatch or warehouse_mismatch or access_mismatch or height_mismatch
+    )
+
+    return bool(fit_rejection or physical_mismatch)
 
 
 def _looks_like_tour_slot_reply(conversation: List[dict], latest_text: str) -> bool:
@@ -231,34 +296,97 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
     return proposal
 
 
+# Cost figures that live in a "$X/SF" shape but are NOT the asking rent. If one of
+# these labels sits immediately adjacent to a matched figure the figure is skipped
+# so we never invent an asking rate from a TI allowance, tax, parking, or opex line.
+_NON_RENT_COST_MARKERS = (
+    "ti allowance",
+    "t.i. allowance",
+    "tenant improvement",
+    "improvement allowance",
+    "buildout",
+    "build-out",
+    "build out",
+    "parking",
+    "tax",
+    "cam",
+    "opex",
+    "ops ex",
+    "operating expense",
+    "insurance",
+    "utilities",
+)
+
+
+def _figure_is_non_rent(text: str, start: int, end: int) -> bool:
+    """True if a non-rent cost label (TI/taxes/parking/opex/...) binds to this figure.
+
+    Only the text immediately adjacent to the figure is inspected — bounded by the
+    previous/next figure or clause delimiter — so a genuine rate that merely sits
+    near an unrelated opex line ('$0.82 NNN, $0.21 opex') is not falsely dropped.
+    """
+    lowered = text.lower()
+
+    before = lowered[:start]
+    cut = max(before.rfind("$"), before.rfind(","), before.rfind(";"), before.rfind("."))
+    before_segment = before[cut + 1:] if cut >= 0 else before
+
+    after = lowered[end:]
+    stops = [pos for pos in (after.find("$"), after.find(","), after.find(";"), after.find(".")) if pos >= 0]
+    after_segment = after[: min(stops)] if stops else after
+
+    adjacent = f"{before_segment} {after_segment}"
+    return any(marker in adjacent for marker in _NON_RENT_COST_MARKERS)
+
+
 def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
-    """Best-effort deterministic fallback for common asking-rent phrases."""
+    """Best-effort deterministic fallback for common asking-rent phrases.
+
+    Captures a broker-stated asking rate expressed either with an explicit /SF
+    token or with a bare rate basis suffix ('$9.75 gross', '$0.82 NNN'). Never
+    treats a non-rent $/SF figure (TI allowance, taxes, parking, opex, buildout)
+    as the asking rent.
+    """
     if not text:
         return None
 
+    # Rent stated with a leading rent keyword, e.g. "asking $9.75/SF/yr".
     rent_context = re.compile(
         r"(?:asking|base\s+rent|rent|rate)[^\d$]{0,24}\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
         r"(?:/|\s+per\s+)?\s*(?:sf|sq\.?\s*ft|square\s*foot)(?:\s*/?\s*(?:yr|year|annum))?",
         re.IGNORECASE,
     )
+    # Any "$X/SF" figure (rent keyword optional); non-rent labels are filtered below.
     dollar_per_sf = re.compile(
         r"\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*(?:/|\s+per\s+)\s*"
         r"(?:sf|sq\.?\s*ft|square\s*foot)(?:\s*/?\s*(?:yr|year|annum))?",
         re.IGNORECASE,
     )
+    # Bare rate with a lease-basis suffix but no /SF token, e.g. "$9.75 gross".
+    dollar_rate_basis = re.compile(
+        r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
+        r"(?:gross|nnn|net|modified\s+gross|full\s+service|fsg|ig|industrial\s+gross|mg)\b",
+        re.IGNORECASE,
+    )
     monthly_unit = re.compile(r"(?:/|\bper\s+)(?:mo|mos|month|monthly)\b|\bmonthly\b", re.IGNORECASE)
     annual_unit = re.compile(r"(?:/|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
 
-    for pattern in (rent_context, dollar_per_sf):
+    for pattern in (rent_context, dollar_per_sf, dollar_rate_basis):
         for match in pattern.finditer(text):
+            # rent_context already required an explicit rent keyword, so trust it.
+            # The keyword-less patterns must screen out non-rent cost figures
+            # (TI allowance, taxes, parking, opex, buildout) sitting in a $/SF shape.
+            if pattern is not rent_context and _figure_is_non_rent(text, match.start(), match.end()):
+                continue
             value = float(match.group(1))
             unit_context = text[max(0, match.start() - 40): min(len(text), match.end() + 50)]
             is_monthly = bool(monthly_unit.search(unit_context)) and not bool(annual_unit.search(unit_context))
+            if pattern is dollar_rate_basis and not is_monthly:
+                # A bare per-SF basis rate under ~$3 is a monthly figure (e.g.
+                # "$0.82 NNN" -> $9.84/yr); annual industrial rates are far higher.
+                is_monthly = value < 3.0
             annual_value = value * 12 if is_monthly else value
             if annual_value < 1:
-                continue
-            context = text[max(0, match.start() - 30): match.start()].lower()
-            if any(marker in context for marker in ("nnn", "cam", "ops", "opex", "operating expense")):
                 continue
             return f"{annual_value:.2f}"
 

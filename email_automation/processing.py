@@ -2320,23 +2320,47 @@ def is_contact_opted_out(user_id: str, email: str) -> Optional[Dict]:
     """
     Check if a contact has opted out of communications.
     Returns the opt-out record if found, None otherwise.
+
+    Safety posture is FAIL CLOSED: every send path reads a None return as
+    "safe to send". If the backing store cannot be read we therefore return a
+    non-None sentinel record (never None) so a transient Firestore error can
+    never re-open a send to a contact who may have opted out. This matches the
+    fail-closed handling the follow-up sender already wraps around this call.
+
+    An opt-out is stored under the exact address hash, but a broker reached via
+    a plus alias (broker+leasing@x.com) is the SAME mailbox as the bare address
+    (broker@x.com), so we also probe the plus-stripped mailbox identity.
     """
     try:
         import hashlib
 
-        email_lower = email.lower().strip()
-        email_hash = hashlib.sha256(email_lower.encode('utf-8')).hexdigest()[:16]
+        email_lower = str(email or "").lower().strip()
 
-        optout_ref = _fs.collection("users").document(user_id).collection("optedOutContacts").document(email_hash)
-        doc = optout_ref.get()
+        # Probe the exact address first, then the plus-alias-stripped mailbox
+        # identity so an opted-out mailbox reached via a plus alias is caught.
+        candidates: List[str] = []
+        for candidate in (email_lower, _mailbox_identity_without_plus(email_lower)):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
 
-        if doc.exists:
-            return doc.to_dict()
+        optout_collection = (
+            _fs.collection("users").document(user_id).collection("optedOutContacts")
+        )
+        for candidate in candidates:
+            email_hash = hashlib.sha256(candidate.encode('utf-8')).hexdigest()[:16]
+            doc = optout_collection.document(email_hash).get()
+            if doc.exists:
+                return doc.to_dict()
         return None
 
     except Exception as e:
         print(f"⚠️ Failed to check opt-out status for {email}: {e}")
-        return None
+        # FAIL CLOSED: a lookup error must never read as "not opted out".
+        return {
+            "reason": "lookup_error",
+            "failClosed": True,
+            "email": str(email or "").lower().strip(),
+        }
 
 
 def _build_greeting(contact_name: Optional[str]) -> str:
