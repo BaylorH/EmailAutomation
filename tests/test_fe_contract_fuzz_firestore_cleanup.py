@@ -259,28 +259,40 @@ class FirestoreCleanupFuzz(unittest.TestCase):
         self.assert_no_server_error(r)
         self.assertEqual(ctrl.deleted, [])
 
-    def test_path_traversal_user_id_no_crash(self):
-        r, ctrl = self._post({"user_id": "../../etc/passwd",
-                              "clear_dead_letter": True})
+    def _assert_foreign_uid_deletes_nothing(self, malicious_uid):
+        """A malicious user_id that differs from the verified caller ("u1") must
+        be refused by the ownership gate (403) and NEVER reach the delete loop.
+
+        The store is seeded with a deletable dead-letter doc UNDER the malicious
+        uid and clear_dead_letter=True is set, so if the caller==user_id
+        ownership check ever regressed to trust the body uid, the loop would
+        delete that doc and this assertion would catch it. On a DESTRUCTIVE
+        endpoint "didn't crash" is not enough — "didn't delete" is the property."""
+        store = {malicious_uid: {"deadLetterQueue": [{"id": "d1"}]}}
+        r, ctrl = self._post(
+            {"user_id": malicious_uid, "clear_dead_letter": True}, store=store,
+        )
         self.assert_no_server_error(r)
+        self.assertEqual(r.status_code, 403, r.get_json())
+        self.assertEqual(
+            ctrl.deleted, [],
+            f"foreign user_id {malicious_uid!r} reached the delete loop",
+        )
+
+    def test_path_traversal_user_id_no_crash(self):
+        self._assert_foreign_uid_deletes_nothing("../../etc/passwd")
 
     def test_file_scheme_user_id_no_crash(self):
-        r, ctrl = self._post({"user_id": "file:///etc/shadow",
-                              "clear_dead_letter": True})
-        self.assert_no_server_error(r)
+        self._assert_foreign_uid_deletes_nothing("file:///etc/shadow")
 
     def test_placeholder_injection_user_id(self):
-        r, ctrl = self._post({"user_id": "[NAME]/[BROKER]",
-                              "clear_dead_letter": True})
-        self.assert_no_server_error(r)
+        self._assert_foreign_uid_deletes_nothing("[NAME]/[BROKER]")
 
     def test_script_tag_user_id(self):
-        r, ctrl = self._post({"user_id": "<script>alert(1)</script>"})
-        self.assert_no_server_error(r)
+        self._assert_foreign_uid_deletes_nothing("<script>alert(1)</script>")
 
     def test_unicode_newline_user_id(self):
-        r, ctrl = self._post({"user_id": "u\n1\t☃\U0001F4A9"})
-        self.assert_no_server_error(r)
+        self._assert_foreign_uid_deletes_nothing("u\n1\t☃\U0001F4A9")
 
     def test_extra_unexpected_fields_ignored(self):
         r, ctrl = self._post({"user_id": "u1", "bogus": 1, "drop_table": True,
@@ -315,22 +327,30 @@ class FirestoreCleanupFuzz(unittest.TestCase):
     # BUG-PINNING mutations (assert CORRECT behavior -> currently RED)
     # =====================================================================
     def test_bug_string_thread_days_500(self):
-        # BUG A: clear_old_threads sent as a string (realistic from a number
-        # input) hits `"30" > 0` -> TypeError -> outer except -> HTTP 500 that
-        # leaks the raw Python error. Should be a 400 fail-closed.
+        # clear_old_threads sent as a string (realistic from a number input)
+        # previously hit `"30" > 0` -> TypeError -> HTTP 500 leaking the raw
+        # Python error. HARDENED contract: a non-int thread-days is coerced to
+        # "don't clear" (0) — a clean 200 no-op, never a 500 and never a
+        # deletion. Pin the exact status so a regression to 500 (crash) or a
+        # silent deletion is caught.
         r, ctrl = self._post({"clear_old_threads": "30", "user_id": "u1"})
         self.assert_no_server_error(r)
+        self.assertEqual(r.status_code, 200, r.get_json())
         self.assertEqual(ctrl.deleted, [])
 
     def test_bug_array_thread_days_500(self):
-        # BUG A (same class): array where int expected -> TypeError -> 500 leak.
+        # Same class (array where int expected): coerced to a 200 no-op.
         r, ctrl = self._post({"clear_old_threads": [30], "user_id": "u1"})
         self.assert_no_server_error(r)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(ctrl.deleted, [])
 
     def test_bug_object_thread_days_500(self):
-        # BUG A (same class): object where int expected -> TypeError -> 500 leak.
+        # Same class (object where int expected): coerced to a 200 no-op.
         r, ctrl = self._post({"clear_old_threads": {"days": 30}, "user_id": "u1"})
         self.assert_no_server_error(r)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(ctrl.deleted, [])
 
     def test_bug_nonjson_body_500(self):
         # BUG B: non-JSON content-type -> request.get_json() raises 415 INSIDE
@@ -371,7 +391,9 @@ class FirestoreCleanupFuzz(unittest.TestCase):
         }
         r, ctrl = self._post({"user_id": "", "clear_dead_letter": True},
                              store=store, users=("u1", "u2"))
-        # Correct: blank user_id is invalid -> nothing deleted across all users.
+        # Correct: blank user_id is invalid -> rejected 400 fail-closed, nothing
+        # deleted across all users (never fanned out via list_user_ids()).
+        self.assertEqual(r.status_code, 400, r.get_json())
         self.assertEqual(
             ctrl.deleted, [],
             "blank user_id fanned a destructive op out across ALL users",

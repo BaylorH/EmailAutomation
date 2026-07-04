@@ -116,6 +116,20 @@ class ClearOptoutContractFuzz(unittest.TestCase):
         optout_ref.delete.assert_not_called()
         self.assert_no_send_to_disallowed()
 
+    def assert_scoped_to_token_uid(self, fs, body_uid, token_uid="u1"):
+        """Prove the users/{uid} document was resolved with the VERIFIED token
+        uid, and that the untrusted body uid never reached the Firestore path.
+        This is the actual IDOR guarantee — a passing HTTP status alone does not
+        prove the body uid was discarded."""
+        users_doc = fs.collection.return_value.document
+        users_doc.assert_any_call(token_uid)
+        for call in users_doc.call_args_list:
+            arg = call.args[0] if call.args else None
+            self.assertNotEqual(
+                arg, body_uid,
+                f"body-supplied uid {body_uid!r} reached the Firestore path",
+            )
+
     # ---- happy path -------------------------------------------------------
 
     def test_happy_path(self):
@@ -132,6 +146,10 @@ class ClearOptoutContractFuzz(unittest.TestCase):
         optout_ref.delete.assert_called_once()
         self.assertIn("previousRecord", body)
         self.assert_no_send_to_disallowed()
+        # The security guarantee: identity came from the verified token ("u1"),
+        # NOT the body-supplied uid — so the Firestore path was scoped to the
+        # token uid. Body uid must never reach `.document(...)`.
+        self.assert_scoped_to_token_uid(fs, body_uid=VALID_UID)
 
     def test_happy_path_email_normalized_before_hash(self):
         # Upper-case + surrounding whitespace must resolve to the same record.
@@ -323,6 +341,22 @@ class ClearOptoutContractFuzz(unittest.TestCase):
         # 5xx and (record absent) must not delete.
         self.assertLess(resp.status_code, 500)
         optout_ref.delete.assert_not_called()
+        # Critically: the malicious body uid must never have reached Firestore —
+        # the path stayed scoped to the verified token uid ("u1").
+        self.assert_scoped_to_token_uid(fs, body_uid="../../../users/victim")
+
+    def test_foreign_body_uid_deletes_only_within_token_uid(self):
+        """Happy-path delete with a foreign body uid: the delete must happen
+        under the TOKEN uid's collection, never the attacker-supplied one."""
+        fs, optout_ref = build_fs(exists=True)
+        with patch("email_automation.clients._fs", fs):
+            resp = self.client.post(
+                "/api/clear-optout",
+                json={"uid": "victim-tenant-uid", "email": VALID_EMAIL},
+            )
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        optout_ref.delete.assert_called_once()
+        self.assert_scoped_to_token_uid(fs, body_uid="victim-tenant-uid")
 
     # ---- extra fields / malformed body ------------------------------------
 

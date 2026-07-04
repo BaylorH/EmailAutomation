@@ -147,6 +147,45 @@ class DeclinePropertyFuzz(unittest.TestCase):
         self.assert_no_send()
 
     # =========================================================================
+    # OWNERSHIP GUARD (IDOR) — the core security fix of this destructive route.
+    # The default setUp pins _get_client_config to the SAME sheet the payloads
+    # post ("s1"), so the mismatch 403 branch is never exercised there. These
+    # cases override the resolved sheet so the guard is actually reached.
+    # =========================================================================
+    def test_foreign_sheetid_rejected_403_no_delete(self):
+        # The token uid's client authorises a DIFFERENT sheet than the body
+        # sheetId -> refuse 403 BEFORE any destructive deleteDimension.
+        with patch("email_automation.clients._get_client_config",
+                   return_value=("victim-sheet", None, None)):
+            r = self.post(self.valid(rowNumber=2, sheetId="s1"))
+        self.assertEqual(r.status_code, 403, r.get_json())
+        self.assertIs((r.get_json() or {}).get("success"), False)
+        self.assert_not_deleted()
+        self.assert_no_send()
+
+    def test_body_uid_cannot_redirect_to_foreign_sheet(self):
+        # A caller naming another tenant's uid + that tenant's sheetId must be
+        # refused: identity/authorisation come from the TOKEN uid's client
+        # (resolved sheet "s1"), so a foreign sheetId never matches.
+        with patch("email_automation.clients._get_client_config",
+                   return_value=("s1", None, None)):
+            r = self.post(self.valid(uid="victim-uid", sheetId="victim-sheet",
+                                     rowNumber=3))
+        self.assertEqual(r.status_code, 403, r.get_json())
+        self.assert_not_deleted()
+        self.assert_no_send()
+
+    def test_client_config_lookup_failure_is_403_no_delete(self):
+        # If the token uid's client can't be resolved (unauthorised/unknown
+        # client), fail closed 403 — never fall through to a delete.
+        with patch("email_automation.clients._get_client_config",
+                   side_effect=Exception("no such client")):
+            r = self.post(self.valid(rowNumber=4))
+        self.assertEqual(r.status_code, 403, r.get_json())
+        self.assert_not_deleted()
+        self.assert_no_send()
+
+    # =========================================================================
     # ROBUST (current behavior is correct) — expected GREEN
     # =========================================================================
     def test_missing_each_required_field(self):

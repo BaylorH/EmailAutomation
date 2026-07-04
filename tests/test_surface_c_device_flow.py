@@ -42,10 +42,10 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
-os.environ.setdefault(
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
-)
+# firebase_admin is fully mocked in this suite (verify_id_token is patched and
+# upload_token is a MagicMock), so no real service-account credentials are
+# needed. Honor GOOGLE_APPLICATION_CREDENTIALS if the environment provides one,
+# but never pin a maintainer-specific absolute path in a committed test.
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)

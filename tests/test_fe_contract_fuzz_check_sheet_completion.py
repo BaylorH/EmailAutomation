@@ -199,6 +199,19 @@ class CheckSheetCompletionFuzz(unittest.TestCase):
             self.assertTrue(400 <= resp.status_code < 500,
                             f"[{label}] expected 4xx, got {resp.status_code}")
 
+    def _assert_foreign_sheetid_refused(self, resp, body, fake, label):
+        """A body sheetId that does not match the server-resolved sheet is the
+        IDOR case this route exists to block: it must be refused 403 and must
+        NEVER reach the Sheets boundary (no cross-tenant read)."""
+        self.assertEqual(resp.status_code, 403,
+                         f"[{label}] foreign sheetId not refused 403: {body}")
+        self.assertIsInstance(body, dict)
+        self.assertIs(body.get("success"), False)
+        self.assertEqual(fake.calls, [],
+                         f"[{label}] foreign sheetId reached the Sheets boundary")
+        self._assert_read_only(fake)
+        self._assert_no_send()
+
     # ----------------------------------------------------------------------- #
     # HAPPY PATH
     # ----------------------------------------------------------------------- #
@@ -232,66 +245,92 @@ class CheckSheetCompletionFuzz(unittest.TestCase):
     # ----------------------------------------------------------------------- #
     # REQUIRED-FIELD / EMPTY-VALUE MUTATIONS  (expected robust -> should pass)
     # ----------------------------------------------------------------------- #
-    def test_missing_sheetId(self):
+    def test_missing_clientId(self):
+        # clientId is the REQUIRED field — the sheet is resolved server-side from
+        # it, so omitting it fails closed at 400 before any sheet access. (This
+        # was previously named test_missing_sheetId, but sheetId is optional; the
+        # thing that must be present is clientId.)
         fake = FakeSheets()
         resp, body = self._post(fake, json={})
         self.assertEqual(resp.status_code, 400, body)
         self.assertEqual(body["success"], False)
+        self.assertIn("clientId", str(body.get("error", "")))
         # never touched the sheet boundary
         self.assertEqual(fake.calls, [])
         self._assert_no_send()
 
-    def test_null_sheetId(self):
-        fake = FakeSheets()
-        resp, body = self._post(fake, json={"sheetId": None})
-        self.assertEqual(resp.status_code, 400, body)
-        self.assertEqual(body["success"], False)
-        self.assertEqual(fake.calls, [])
+    def test_omitted_sheetId_resolves_server_side(self):
+        # sheetId is OPTIONAL: with a valid clientId and no sheetId, the handler
+        # uses the SERVER-RESOLVED sheet and succeeds.
+        fake = FakeSheets(rows=[list(COMPLETE_ROW)])
+        resp, body = self._post(fake, json={"clientId": "c1"})
+        self.assertEqual(resp.status_code, 200, body)
+        self.assertEqual(body["success"], True)
+        self.assertIn(("spreadsheets.get", self.RESOLVED_SHEET), fake.calls)
 
-    def test_empty_string_sheetId(self):
-        fake = FakeSheets()
-        resp, body = self._post(fake, json={"sheetId": ""})
-        self.assertEqual(resp.status_code, 400, body)
-        self.assertEqual(body["success"], False)
-        self.assertEqual(fake.calls, [])
+    def test_null_sheetId_treated_as_omitted(self):
+        # A null sheetId is "not provided" -> mismatch guard skipped -> the
+        # server-resolved sheet is used (200), never a foreign sheet.
+        fake = FakeSheets(rows=[list(COMPLETE_ROW)])
+        resp, body = self._post(fake, json={"clientId": "c1", "sheetId": None})
+        self.assertEqual(resp.status_code, 200, body)
+        self.assertEqual(body["success"], True)
+        self.assertIn(("spreadsheets.get", self.RESOLVED_SHEET), fake.calls)
+
+    def test_matching_sheetId_is_allowed(self):
+        # A body sheetId that EQUALS the server-resolved sheet passes the guard.
+        fake = FakeSheets(rows=[list(COMPLETE_ROW)])
+        resp, body = self._post(
+            fake, json={"clientId": "c1", "sheetId": self.RESOLVED_SHEET}
+        )
+        self.assertEqual(resp.status_code, 200, body)
+        self.assertEqual(body["success"], True)
 
     # ----------------------------------------------------------------------- #
-    # WRONG-TYPE sheetId values  (truthy non-strings)
-    # A robust handler should reject non-string ids with a clean 4xx rather
-    # than forward them to the Sheets API. Current handler forwards them.
+    # IDOR GUARD — the core security fix of this route.
+    # A FOREIGN body sheetId (paired with a valid clientId, so the mismatch
+    # guard is actually reached) must be refused 403 and must never touch the
+    # Sheets boundary. Previously every case below omitted clientId and
+    # short-circuited on "Missing clientId", so the mismatch branch — the actual
+    # cross-tenant exfiltration fix — was never exercised.
     # ----------------------------------------------------------------------- #
+    def test_foreign_sheetId_is_refused_403(self):
+        fake = FakeSheets(rows=[list(COMPLETE_ROW)])
+        resp, body = self._post(
+            fake, json={"clientId": "c1", "sheetId": "some-other-tenants-sheet"}
+        )
+        self._assert_foreign_sheetid_refused(resp, body, fake, "foreign-sheetId")
+
+    def test_empty_string_sheetId_is_refused(self):
+        # "" is a supplied, non-matching sheetId (not an omission) -> refused.
+        fake = FakeSheets()
+        resp, body = self._post(fake, json={"clientId": "c1", "sheetId": ""})
+        self._assert_foreign_sheetid_refused(resp, body, fake, "empty-sheetId")
+
     def test_sheetId_wrong_type_int(self):
         fake = FakeSheets()
-        resp, body = self._post(fake, json={"sheetId": 123456})
-        self._assert_robust(resp, body, fake, "sheetId=int")
+        resp, body = self._post(fake, json={"clientId": "c1", "sheetId": 123456})
+        self._assert_foreign_sheetid_refused(resp, body, fake, "sheetId=int")
 
     def test_sheetId_wrong_type_array(self):
         fake = FakeSheets()
-        resp, body = self._post(fake, json={"sheetId": ["a", "b"]})
-        self._assert_robust(resp, body, fake, "sheetId=array")
+        resp, body = self._post(fake, json={"clientId": "c1", "sheetId": ["a", "b"]})
+        self._assert_foreign_sheetid_refused(resp, body, fake, "sheetId=array")
 
     def test_sheetId_wrong_type_object(self):
         fake = FakeSheets()
-        resp, body = self._post(fake, json={"sheetId": {"nested": "obj"}})
-        self._assert_robust(resp, body, fake, "sheetId=object")
+        resp, body = self._post(fake, json={"clientId": "c1", "sheetId": {"nested": "obj"}})
+        self._assert_foreign_sheetid_refused(resp, body, fake, "sheetId=object")
 
     def test_sheetId_wrong_type_bool(self):
         fake = FakeSheets()
-        resp, body = self._post(fake, json={"sheetId": True})
-        self._assert_robust(resp, body, fake, "sheetId=bool")
+        resp, body = self._post(fake, json={"clientId": "c1", "sheetId": True})
+        self._assert_foreign_sheetid_refused(resp, body, fake, "sheetId=bool")
 
-    # ----------------------------------------------------------------------- #
-    # OVERSIZED + INJECTION-ISH sheetId strings.
-    # These are valid strings; the read-only route forwards them to the faked
-    # Sheets client, which returns normally -> 200 success is acceptable, and
-    # crucially there must be NO write and NO send.
-    # ----------------------------------------------------------------------- #
     def test_sheetId_oversized_10kb(self):
         fake = FakeSheets()
-        resp, body = self._post(fake, json={"sheetId": "A" * 10240})
-        self.assertNotEqual(resp.status_code, 500, body)
-        self._assert_read_only(fake)
-        self._assert_no_send()
+        resp, body = self._post(fake, json={"clientId": "c1", "sheetId": "A" * 10240})
+        self._assert_foreign_sheetid_refused(resp, body, fake, "sheetId=10kb")
 
     def test_sheetId_injection_values(self):
         payloads = [
@@ -305,11 +344,10 @@ class CheckSheetCompletionFuzz(unittest.TestCase):
         ]
         for val in payloads:
             fake = FakeSheets()
-            resp, body = self._post(fake, json={"sheetId": val})
-            self.assertNotEqual(resp.status_code, 500,
-                                f"injection sheetId {val!r} -> 500: {body}")
-            self._assert_read_only(fake)
-            self._assert_no_send()
+            resp, body = self._post(fake, json={"clientId": "c1", "sheetId": val})
+            # Each is a foreign sheetId paired with a valid clientId -> the
+            # mismatch guard refuses it 403 before any Sheets access.
+            self._assert_foreign_sheetid_refused(resp, body, fake, f"injection={val!r}")
 
     # ----------------------------------------------------------------------- #
     # UNEXPECTED EXTRA FIELDS — must be ignored, still succeeds.

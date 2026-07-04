@@ -256,5 +256,76 @@ class MidFlightWaitClampTests(unittest.TestCase):
         self.assertEqual(scheduled.isoformat(), "2026-06-22T18:00:00+00:00")
 
 
+class FakeInboundTimestamp:
+    """Mimics a Firestore timestamp exposing .timestamp()."""
+
+    def __init__(self, dt):
+        self._dt = dt
+
+    def timestamp(self):
+        return self._dt.timestamp()
+
+
+class ResumeFollowupWaitTests(unittest.TestCase):
+    """resume_followup_if_silent must honour the step's unit-aware wait delta.
+
+    _followup_wait_delta() already returns a unit-correct timedelta. The resume
+    path must reuse that delta (capped at 1 day) instead of reinterpreting the
+    raw scalar as days — otherwise a 30-minute or 2-hour step is silently
+    stretched into a full 1-day delay on resume.
+    """
+
+    def _resume(self, followups, current_index=0):
+        old_inbound = MONDAY_NOW - timedelta(days=10)  # well past the 3-day silence gate
+        thread_ref = FakeThreadRef({
+            "followUpStatus": "paused",
+            "lastInboundAt": FakeInboundTimestamp(old_inbound),
+            "followUpConfig": {
+                "enabled": True,
+                "currentFollowUpIndex": current_index,
+                "followUps": followups,
+            },
+        })
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)), \
+             patch.object(followup, "datetime", _fixed_datetime(MONDAY_NOW)):
+            result = followup.resume_followup_if_silent("uid-1", "thread-1")
+        return result, thread_ref
+
+    def test_minutes_step_resumes_after_minutes_not_a_day(self):
+        result, thread_ref = self._resume(
+            [{"waitTime": 30, "waitUnit": "minutes", "message": "ping"}]
+        )
+        self.assertTrue(result)
+        scheduled = thread_ref.updates[-1]["followUpConfig.nextFollowUpAt"]
+        self.assertEqual(scheduled, MONDAY_NOW + timedelta(minutes=30))
+
+    def test_hours_step_resumes_after_hours_not_a_day(self):
+        result, thread_ref = self._resume(
+            [{"waitTime": 2, "waitUnit": "hours", "message": "ping"}]
+        )
+        self.assertTrue(result)
+        scheduled = thread_ref.updates[-1]["followUpConfig.nextFollowUpAt"]
+        self.assertEqual(scheduled, MONDAY_NOW + timedelta(hours=2))
+
+    def test_multiday_step_is_capped_at_one_day(self):
+        result, thread_ref = self._resume(
+            [{"waitTime": 5, "waitUnit": "days", "message": "ping"}]
+        )
+        self.assertTrue(result)
+        scheduled = thread_ref.updates[-1]["followUpConfig.nextFollowUpAt"]
+        self.assertEqual(scheduled, MONDAY_NOW + timedelta(days=1))
+
+    def test_poisoned_negative_wait_falls_back_and_stays_capped(self):
+        # Negative stored waitTime -> _followup_wait_delta falls back to the
+        # default (1 day here), which is then capped at 1 day. Never immediate.
+        result, thread_ref = self._resume(
+            [{"waitTime": -99, "waitUnit": "minutes", "message": "ping"}]
+        )
+        self.assertTrue(result)
+        scheduled = thread_ref.updates[-1]["followUpConfig.nextFollowUpAt"]
+        self.assertGreater(scheduled, MONDAY_NOW)
+        self.assertLessEqual(scheduled, MONDAY_NOW + timedelta(days=1))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -123,6 +123,20 @@ class ListOptoutsFuzzBase(unittest.TestCase):
                 f"response leaked internal error text ({needle!r}): {body[:200]}",
             )
 
+    def assert_scoped_to_token_uid(self, fake_fs, body_uid, token_uid="u1"):
+        """Prove the users/{uid} document was resolved with the VERIFIED token
+        uid, and that the untrusted body uid never reached the Firestore path.
+        A 200 with the right doc count does not, on its own, prove the body uid
+        was discarded — this route's entire security value is that it does."""
+        users_doc = fake_fs.collection.return_value.document
+        users_doc.assert_any_call(token_uid)
+        for call in users_doc.call_args_list:
+            arg = call.args[0] if call.args else None
+            self.assertNotEqual(
+                arg, body_uid,
+                f"body-supplied uid {body_uid!r} reached the Firestore path",
+            )
+
     def post(self, **kw):
         return self.client.post("/api/list-optouts", **kw)
 
@@ -145,6 +159,21 @@ class HappyPath(ListOptoutsFuzzBase):
         self.assertEqual(body["optouts"][0]["email"], "a@x.com")
         self.assert_no_send()
         self.assert_no_fs_write(fake_fs)
+        # The IDOR guarantee: the list was scoped to the verified token uid
+        # ("u1"), NOT the body-supplied "user123".
+        self.assert_scoped_to_token_uid(fake_fs, body_uid="user123")
+
+    def test_foreign_body_uid_lists_only_token_uid(self):
+        """A caller passing another tenant's uid must still only ever read their
+        own (token uid's) opt-out collection — the body uid is ignored."""
+        docs = [make_fake_doc("id1", {"email": "a@x.com", "reason": "unsub", "optedOutAt": "t1"})]
+        fake_fs = make_fake_fs(docs)
+        with patch("email_automation.clients._fs", fake_fs):
+            r = self.post(json={"uid": "victim-tenant-uid"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()["success"])
+        self.assert_scoped_to_token_uid(fake_fs, body_uid="victim-tenant-uid")
+        self.assert_no_send()
 
     def test_happy_path_empty(self):
         fake_fs = make_fake_fs([])

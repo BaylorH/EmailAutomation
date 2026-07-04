@@ -41,7 +41,7 @@ Handlers do no request-shape/type validation and wrap everything in `except Exce
   - expected: 400 rejecting the non-string sheetId
   - actual: HTTP 200 {"success": true, "isComplete": true, "completionPercentage": 100.0, ...} — a fabricated success on a non-string id (would be a 500 leak against the real Sheets API)
 
-### `/api/clear` — 3 bugs · 20 mutations · test `/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/tests/test_fe_contract_fuzz_clear.py`
+### `/api/clear` — 3 bugs · 20 mutations · test `tests/test_fe_contract_fuzz_clear.py`
 - **[HIGH]** Path traversal / arbitrary file deletion via unsanitised session uid. api_clear builds `user_dir = f"msal_caches/{uid}"` and passes it to os.makedirs() and os.remove(), where uid comes from session['uid'] which the `/` index route (app.py:208) sets verbatim from `request.args.get('uid')` with no validation. A uid of '../../../../tmp/evil-clear-target' escapes the msal_caches sandbox, so the handler will mkdir and DELETE msal_token_cache.bin at an attacker-chosen absolute location.
   - input: `POST /api/clear body {} ; attacker first primes the session via GET /?uid=../../../../tmp/evil-clear-target (uid is the only user-controlled value that reaches `
   - expected: Handler rejects or neutralises traversal (e.g. validates uid against ^[A-Za-z0-9_-]+$ or resolves+confirms the path stays under msal_caches) so os.makedirs/os.remove can only ever act inside msal_cach
@@ -87,7 +87,7 @@ Handlers do no request-shape/type validation and wrap everything in `except Exce
   - expected: A blank/empty user_id on a destructive endpoint should be rejected (400), not expanded to all users.
   - actual: Handler fell back to list_user_ids() and deleted deadLetterQueue docs for every user (u1 and u2 in the fake) — a blank field became a delete-everything.
 
-### `/api/trigger-scheduler` — 2 bugs · 34 mutations · test `/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/tests/test_fe_contract_fuzz_trigger_scheduler.py`
+### `/api/trigger-scheduler` — 2 bugs · 34 mutations · test `tests/test_fe_contract_fuzz_trigger_scheduler.py`
 - **[HIGH]** The route is documented as a 'dev-scoped guard' and can send real email to arbitrary third-party recipients (run_scheduler -> refresh_and_process_user for every user), but it enforces NO authentication. It reads Authorization / X-API-Key headers and then ignores them (code comment: 'we'll allow any request'). Any anonymous POST triggers a full scheduler run -> real Mail.Send.
   - input: `POST /api/trigger-scheduler  Content-Type: application/json  (empty body, no headers) -- the exact real frontend payload`
   - expected: An unauthenticated caller to a send-capable trigger is refused (401/403) and no send fires

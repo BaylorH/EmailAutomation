@@ -1274,14 +1274,16 @@ def resume_followup_if_silent(user_id: str, thread_id: str, silence_threshold_da
         if current_index >= len(followups):
             return False
 
-        # Calculate next follow-up time (immediate or short delay).
-        # Clamp untrusted stored waitTime first (negative/non-numeric values
-        # would otherwise slip past the 1-day resume cap), then cap at 1 day.
+        # Calculate next follow-up time (short delay). Use the unit-aware delta
+        # from _followup_wait_delta (which also clamps untrusted stored
+        # waitTime: negative/non-numeric -> default), then cap the delta itself
+        # at 1 day so a minute/hour step keeps its unit instead of being
+        # reinterpreted as days.
         next_followup = followups[current_index]
-        _delta, sanitized_wait, _unit = _followup_wait_delta(next_followup, default_wait=1)
-        wait_time = min(sanitized_wait, 1)  # Cap at 1 day for resumed
+        delta, _wait, _unit = _followup_wait_delta(next_followup, default_wait=1)
+        delta = min(delta, timedelta(days=1))  # Cap at 1 day for resumed
 
-        next_followup_at = now + timedelta(days=wait_time)
+        next_followup_at = now + delta
 
         thread_ref.update({
             "followUpStatus": "waiting",

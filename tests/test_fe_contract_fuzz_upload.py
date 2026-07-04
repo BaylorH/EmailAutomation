@@ -202,6 +202,34 @@ class UploadFuzz(unittest.TestCase):
         )
         self.assertNotEqual(r.status_code, 500)
 
+    def test_malicious_session_uid_ignored_when_token_uid_safe(self):
+        # The previous test drives BOTH the token uid and session["uid"] with the
+        # same malicious value, so it can't distinguish "session was ignored"
+        # from "the token-uid charset check alone rejected it". Here the TOKEN
+        # uid is safe ("web_user") and ONLY session["uid"] is attacker-controlled
+        # (as it would be via GET /?uid=../x). If the handler still consulted the
+        # session, os.makedirs would escape msal_caches/. It must not.
+        sentinel = "fuzz_session_only_" + uuid.uuid4().hex[:8]
+        escaped_dir = os.path.join(REPO, sentinel)  # sibling of msal_caches, OUTSIDE it
+        self._cleanup_paths.append(escaped_dir)
+        self.assertFalse(os.path.exists(escaped_dir))
+
+        self.verify_mock.return_value = {"uid": "web_user"}  # safe, verified identity
+        with self.client.session_transaction() as sess:
+            sess["uid"] = "../" + sentinel  # attacker-controlled session value
+        r = self.client.post("/api/upload", json={}, headers=self.AUTH)
+
+        self.assertFalse(
+            os.path.isdir(escaped_dir),
+            "SESSION IDENTITY LEAK: a malicious session['uid'] influenced the "
+            "filesystem path even though the verified token uid was safe.",
+        )
+        self.assertNotEqual(r.status_code, 500)
+        # The Firebase boundary, if it fired at all, must never carry the
+        # session-derived escape path as its identity.
+        for _, kwargs in self.upload_mock.call_args_list:
+            self.assertNotIn("../" + sentinel, str(kwargs.get("user_id", "")))
+
     # ---- BUG 2: raw internal exception text leaked to the client -------------
     def test_upload_exception_is_not_leaked_to_client(self):
         uid = "fuzz_leak_" + uuid.uuid4().hex[:8]
