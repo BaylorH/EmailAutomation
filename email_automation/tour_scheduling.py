@@ -55,7 +55,11 @@ def format_tour_date_label(value) -> str:
 
 # A tours/showings subject: the nouns plus the verb "show" ("cannot show it").
 _TOUR_NOUN = r"(?:tours?|showings?|walk[-\s]?throughs?|walkthroughs?)"
-_TOUR_SUBJECT = rf"(?:{_TOUR_NOUN}|show(?:ing|n|s|ed)?)"
+# Slot-scoped nouns (A′ FIX-06 / M20): brokers say a *slot/window/time/appointment*
+# "is no longer available" to decline one tour time — that is tour-scoped, never a
+# property terminal. Treat them as tour subjects so the guard reads them correctly.
+_TOUR_SLOT_NOUN = r"(?:time\s*slots?|slots?|windows?|times?|appointments?)"
+_TOUR_SUBJECT = rf"(?:{_TOUR_NOUN}|{_TOUR_SLOT_NOUN}|show(?:ing|n|s|ed)?)"
 
 # Negations that scope a *tours-only* restriction. Bare "no" ("no tours"),
 # contractions ("won't"/"aren't"/"isn't"/"can't"), and the verb-first forms all
@@ -72,12 +76,74 @@ _TOUR_UNAVAIL_PHRASE = (
     r"isn't\s+available|isnt\s+available|won't\s+be\s+available)"
 )
 
-# Property-level terminal signals: if any of these appear the message is about the
-# PROPERTY being gone, not merely tours — must never be treated as tours-only.
-_PROPERTY_TERMINAL_RE = (
-    r"\b(?:fully\s+leased|has\s+been\s+leased|already\s+leased|signed\s+(?:an?\s+)?loi|"
-    r"signed\s+(?:a\s+)?lease|off[-\s]?market|under\s+contract|no\s+space\s+available)\b"
+# Property-level terminal signals: if any of these appear (and they are NOT scoped
+# to a tour/slot) the message is about the PROPERTY being gone, not merely tours —
+# it must never be treated as tours-only.
+#
+# CodeRabbit PR#15: this list previously drifted behind ai_processing's terminal
+# taxonomy (e.g. "no longer available", bare "leased", "no availability" were
+# missing), so a dead-property reply that also mentioned tours slipped through as
+# tour-only and skipped the property_unavailable path. We now bind to the ONE
+# canonical list — ai_processing._UNAVAILABLE_PATTERNS — imported lazily to dodge
+# the tour_scheduling <-> ai_processing circular import at module load. The literal
+# fallback below is used only if that import is unavailable (keeps this guard
+# importable standalone); keep it in sync with the canonical list.
+_PROPERTY_TERMINAL_FALLBACK = [
+    r"\bno\s+longer\s+availab(?:le|e)\b",
+    r"\bsigned\s+(?:an?\s+)?(?:loi|letter\s+of\s+intent)\b",
+    r"\bsigned\s+(?:a\s+)?lease\b",
+    r"\bno\s+longer\s+represent(?:s|ed|ing)?\s+(?:this\s+|the\s+)?property\b",
+    r"\b(?:no|not\s+any|do(?:es)?\s+not\s+have\s+any)\s+space\s+available\b",
+    r"\bno\s+availability\b",
+    r"\bfully\s+leased\b",
+    r"\bjust\s+leased\b",
+    r"\balready\s+leased\b",
+    r"\bbeen\s+leased\b",
+    r"\btaken\s+off\s+(?:the\s+)?market\b",
+    r"\boff\s+(?:the\s+)?market\b",
+    r"\bunder\s+contract\b",
+    r"\baccepted\s+an?\s+offer\b",
+    r"\bleased\b",
+]
+
+# A terminal phrase is *tour-scoped* (not a property terminal) when a tour/slot
+# subject is its grammatical subject just before it ("that window is no longer
+# available", "tours are cancelled") OR the availability is scoped to touring just
+# after it ("available for tours", "availability to show"). Both readings keep the
+# property alive, so they must not trip the property early-out (M20, and the
+# existing 'no longer available for tours' near-miss).
+_TOUR_SCOPE_PRE_RE = re.compile(rf"{_TOUR_SUBJECT}\b[^.!?]{{0,18}}$")
+_TOUR_SCOPE_POST_RE = re.compile(
+    rf"^\s*[,;-]*\s*(?:for|to)\s+(?:a\s+|any\s+|the\s+|another\s+)?{_TOUR_SUBJECT}\b"
 )
+
+
+def _canonical_terminal_patterns() -> List[str]:
+    """The single canonical property-terminal regex list (CodeRabbit PR#15).
+
+    Imported lazily from ai_processing so the two surfaces never drift; falls back
+    to the literal copy above if ai_processing can't be imported."""
+    try:
+        from .ai_processing import _UNAVAILABLE_PATTERNS
+        return [pattern for _reason, pattern in _UNAVAILABLE_PATTERNS]
+    except Exception:
+        return _PROPERTY_TERMINAL_FALLBACK
+
+
+def _terminal_is_tour_scoped(latest: str, start: int, end: int) -> bool:
+    pre = latest[max(0, start - 22):start]
+    post = latest[end:end + 26]
+    return bool(_TOUR_SCOPE_PRE_RE.search(pre) or _TOUR_SCOPE_POST_RE.match(post))
+
+
+def _has_property_scoped_terminal(latest: str) -> bool:
+    """True when a canonical terminal phrase appears that is NOT scoped to a tour
+    or slot — i.e. the PROPERTY itself is gone."""
+    for pattern in _canonical_terminal_patterns():
+        for match in re.finditer(pattern, latest):
+            if not _terminal_is_tour_scoped(latest, match.start(), match.end()):
+                return True
+    return False
 
 
 def looks_like_tour_only_unavailable(text: str = "") -> bool:
@@ -85,7 +151,7 @@ def looks_like_tour_only_unavailable(text: str = "") -> bool:
     if not latest:
         return False
 
-    if re.search(_PROPERTY_TERMINAL_RE, latest):
+    if _has_property_scoped_terminal(latest):
         return False
 
     return bool(

@@ -77,11 +77,165 @@ def _strip_quoted_history(text: str) -> str:
             break
         if re.match(r"^-{2,}\s*original message\s*-{2,}", stripped, re.IGNORECASE):
             break
+        # Gmail/Outlook/Apple forwarded-message dividers. Their absence let a
+        # forwarded PM note about a DIFFERENT property be scanned as live text and
+        # terminalize the target row (A′ finding M25, a verbatim catalog trigger).
+        if re.match(r"^-{2,}\s*forwarded message\s*-{2,}", stripped, re.IGNORECASE):
+            break
+        if re.match(r"^begin\s+forwarded\s+message\s*:?", stripped, re.IGNORECASE):
+            break
         kept.append(line)
     result = "\n".join(kept).strip()
     # If the message was entirely quoted, fall back to the raw text so a genuinely
     # new-but-unusually-formatted reply is not lost.
     return result or text.strip()
+
+
+_HONORIFICS = {"dr", "mr", "mrs", "ms", "prof", "sir", "madam", "mx"}
+# Tokens that signal a company / org name rather than a person, so a greeting must
+# fall back to neutral rather than "Hi <Company>," (A′ misread M31).
+_COMPANY_TOKENS = {
+    "international", "inc", "inc.", "llc", "l.l.c.", "corp", "corp.", "corporation",
+    "company", "co", "co.", "group", "realty", "associates", "partners", "properties",
+    "commercial", "industrial", "advisors", "advisory", "capital", "holdings",
+    "cbre", "colliers", "jll", "cushman", "wakefield", "savills", "newmark",
+}
+
+
+def _resolve_greeting_first_name(
+    contact_name: Optional[str],
+    sender_email: Optional[str] = None,
+    sender_signature_name: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve a usable, human first name for greetings (A′ FIX-13 / FIX-14).
+
+    - Strips honorifics ("Dr. Angela ..." -> "Angela").
+    - Returns None (=> neutral greeting) for company names ("Colliers International").
+    - Reconciles the mapped name against the LIVE sender (from-address local part or
+      signature). On disagreement it returns None so the model greets neutrally
+      rather than dead-naming the stale mapped person into a different inbox.
+    """
+    raw = str(contact_name or "").strip()
+    if not raw or "@" in raw:
+        return None
+
+    tokens = [t for t in re.split(r"\s+", raw) if t]
+    lowered_tokens = [t.lower().strip(".,") for t in tokens]
+
+    # Company name -> neutral greeting.
+    if any(tok in _COMPANY_TOKENS for tok in lowered_tokens):
+        return None
+
+    # Strip leading honorifics.
+    name_tokens = list(tokens)
+    while name_tokens and name_tokens[0].lower().strip(".,") in _HONORIFICS:
+        name_tokens.pop(0)
+    if not name_tokens:
+        return None
+
+    first = name_tokens[0].strip(".,")
+    if not first or not re.search(r"[a-zA-Z]", first):
+        return None
+
+    # Reconcile against the live sender identity.
+    sender_local = str(sender_email or "").split("@", 1)[0]
+    sig = str(sender_signature_name or "")
+    compact_first = re.sub(r"[^a-z]", "", first.lower())
+    compact_local = re.sub(r"[^a-z]", "", sender_local.lower())
+    compact_sig = re.sub(r"[^a-z]", "", sig.lower())
+    if sender_local or sig:
+        agrees = False
+        if compact_first and compact_local and (
+            compact_first in compact_local or compact_local.startswith(compact_first[:4] or compact_first)
+        ):
+            agrees = True
+        if compact_first and compact_sig and compact_first in compact_sig:
+            agrees = True
+        # Also agree when the mapped LAST name shows up in the sender identity.
+        for tok in name_tokens[1:]:
+            c = re.sub(r"[^a-z]", "", tok.lower())
+            if c and (c in compact_local or c in compact_sig):
+                agrees = True
+                break
+        if not agrees:
+            return None
+
+    return first
+
+
+def _raw_latest_inbound(conversation: List[dict]) -> str:
+    """Return the UNstripped body of the newest inbound message (quotes intact)."""
+    for message in reversed(conversation or []):
+        if (message.get("direction") or "").lower() == "inbound":
+            return message.get("content") or message.get("body") or message.get("preview") or ""
+    return ""
+
+
+def _quoted_region(raw_text: str) -> str:
+    """Return only the QUOTED portion of a message body (reply history).
+
+    A line is quoted when it is '>'-prefixed, OR it sits below a standalone
+    forwarded/original-message divider (Outlook/Gmail bottom-quote convention
+    where the original is appended verbatim without '>' prefixes). An inline
+    '> On ... wrote:' attribution does NOT swallow bottom-posted new text — only
+    the '>'-prefixed lines themselves are treated as quoted, so a broker who
+    types fresh content below an inline quote is not misread as quoting.
+    """
+    if not raw_text:
+        return ""
+    quoted: List[str] = []
+    after_divider = False
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if after_divider:
+            quoted.append(line)
+            continue
+        if stripped.startswith(">"):
+            quoted.append(line)
+            continue
+        if re.match(r"^-{2,}\s*original message\s*-{2,}", stripped, re.IGNORECASE) or \
+           re.match(r"^-{2,}\s*forwarded message\s*-{2,}", stripped, re.IGNORECASE) or \
+           re.match(r"^begin\s+forwarded\s+message\s*:?", stripped, re.IGNORECASE):
+            after_divider = True
+            continue
+    return "\n".join(quoted)
+
+
+def _norm_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _significant_words(text: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9']{4,}", (text or "").lower())}
+
+
+def _event_evidence_only_in_quote(event: dict, newest_text: str, quoted_region: str) -> bool:
+    """True when the event's supporting text (notes/question) lives ONLY in the
+    quoted reply history and NOT in the newest human-authored segment.
+
+    This is the belt to FIX-08's suspender: even if the model reads a quoted
+    rejection/opt-out/referral as live signal, we strip the event when its own
+    evidence is quote-exclusive (A′ misreads M02, M05, M09, M16, M17, M21, M27).
+    """
+    quoted_norm = _norm_ws(quoted_region)
+    newest_norm = _norm_ws(newest_text)
+    if not quoted_norm:
+        return False
+
+    question = _norm_ws(event.get("question"))
+    if question and len(question) >= 12 and question in quoted_norm and question not in newest_norm:
+        return True
+
+    candidate = " ".join(
+        str(event.get(field) or "") for field in ("question", "notes", "address")
+    )
+    words = _significant_words(candidate)
+    if not words:
+        return False
+    quoted_words = _significant_words(quoted_region)
+    newest_words = _significant_words(newest_text)
+    quote_exclusive = {w for w in words if w in quoted_words and w not in newest_words}
+    return len(quote_exclusive) >= 2
 
 
 def _latest_inbound_text(conversation: List[dict]) -> str:
@@ -124,8 +278,17 @@ def _looks_like_requirements_mismatch_nonviable(text: str) -> bool:
     )
 
     # --- property is too office-oriented for an industrial/warehouse requirement ---
+    # Negation-aware: "NOT office-heavy -- it's true warehouse throughout" is a
+    # POSITIVE pitch, not a mismatch (A′ misread M06). A negator immediately
+    # before the descriptor flips the meaning, so those must not fire.
+    office_heavy_positive = False
+    for match in re.finditer(r"\boffice[-\s]?heavy\b", latest_text):
+        pre = latest_text[max(0, match.start() - 12): match.start()]
+        if not re.search(r"\b(?:not|isn'?t|aren'?t|no)\s*$", pre):
+            office_heavy_positive = True
+            break
     office_mismatch = bool(
-        re.search(r"\boffice[-\s]?heavy\b", latest_text)
+        office_heavy_positive
         or re.search(r"\b(?:too|more|mostly|primarily|all)\s+office\b", latest_text)
         or re.search(r"\boffice\s+fit[-\s]?out\b", latest_text)
         or re.search(r"\boffice\s+(?:use\s+)?only\b", latest_text)
@@ -186,15 +349,29 @@ def _looks_like_tour_slot_reply(conversation: List[dict], latest_text: str) -> b
     if not tour_context:
         return False
 
-    reply_signal = re.search(
-        r"\b(?:that\s+time|that\s+slot|the\s+slot|requested\s+time|works?|confirmed|"
+    # Strong, unambiguous scheduling-reply signals (self-sufficient).
+    strong_reply_signal = re.search(
+        r"\b(?:that\s+time|that\s+slot|the\s+slot|requested\s+time|confirmed|"
         r"does\s+not\s+work|doesn[’']t\s+work|can't\s+do|cannot\s+do|won[’']t\s+work|"
-        r"could\s+do|available\s+(?:at|around|after|before)|instead|works\s+better|"
-        r"see\s+you|no\s+longer\s+available)\b",
+        r"could\s+do|available\s+(?:at|around|after|before)|works\s+better|"
+        r"reschedule|see\s+you|no\s+longer\s+available)\b",
         latest,
     )
     time_signal = re.search(r"\b(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)|morning|afternoon|noon)\b", latest)
-    return bool(reply_signal or time_signal)
+    day_signal = re.search(
+        r"\b(?:mon|tue|tues|wed|weds|thu|thur|thurs|fri|sat|sun)(?:day|nesday|rsday|urday)?\b"
+        r"|\b(?:today|tomorrow|tonight|next\s+week|this\s+week)\b",
+        latest,
+    )
+    # Bare "works" / "instead" is only a scheduling reply when a concrete
+    # time or day anchors it — otherwise the idiom "the works" or "works for the
+    # client" falsely stripped a correct non-viable classification (A′ misread M04).
+    weak_reply_signal = re.search(r"\b(?:works?|instead)\b", latest)
+    return bool(
+        strong_reply_signal
+        or time_signal
+        or (weak_reply_signal and (time_signal or day_signal))
+    )
 
 
 def _has_tour_scheduling_context(conversation: List[dict]) -> bool:
@@ -223,8 +400,201 @@ def _has_tour_scheduling_context(conversation: List[dict]) -> bool:
     )
 
 
-def _augment_events_with_deterministic_signals(proposal: dict, conversation: List[dict]) -> dict:
-    """Add high-confidence event signals from broker phrases the model can miss."""
+# Canonical deterministic terminal-signal list. Each entry is (reason, regex).
+# This is the single source of truth the tour_scheduling terminal list is aligned
+# to; keep it in sync with processing.PROPERTY_UNAVAILABLE_KEYWORDS.
+# "availab(?:le|e)" tolerates the common single-char typo "availabe".
+_UNAVAILABLE_PATTERNS = [
+    ("no_longer_available", r"\bno\s+longer\s+availab(?:le|e)\b"),
+    ("signed_loi", r"\bsigned\s+(?:an?\s+)?(?:loi|letter\s+of\s+intent)\b"),
+    ("signed_lease", r"\bsigned\s+(?:a\s+)?lease\b"),
+    ("no_longer_represented", r"\bno\s+longer\s+represent(?:s|ed|ing)?\s+(?:this\s+|the\s+)?property\b"),
+    ("no_space_available", r"\b(?:no|not\s+any|do(?:es)?\s+not\s+have\s+any)\s+space\s+available\b"),
+    ("no_availability", r"\bno\s+availability\b"),
+    ("fully_leased", r"\bfully\s+leased\b"),
+    ("just_leased", r"\bjust\s+leased\b"),
+    ("already_leased", r"\balready\s+leased\b"),
+    ("been_leased", r"\bbeen\s+leased\b"),
+    ("taken_off_market", r"\btaken\s+off\s+(?:the\s+)?market\b"),
+    ("off_market", r"\boff\s+(?:the\s+)?market\b"),
+    ("under_contract", r"\bunder\s+contract\b"),
+    ("accepted_an_offer", r"\baccepted\s+an?\s+offer\b"),
+    # Bare "leased" is terminal too, but only when bound to the TARGET property and
+    # not to an ancillary asset ("trailer lot is leased separately") or a comps
+    # reference ("what recently leased along the corridor").
+    ("leased", r"\bleased\b"),
+]
+
+# Positive-viability signals: an explicit statement that the TARGET listing is
+# alive. When present, an ambiguous terminal phrase (another building leased, a
+# comps reference, an ancillary lease, a slot conflict) must NOT terminalize the
+# row (A′ misreads M01, M03, M19, M20, M24).
+_VIABILITY_RE = re.compile(
+    r"\b(?:still\s+available|remains?\s+available|remains?\s+viable|remains?\s+active|"
+    r"remains?\s+open|still\s+active|still\s+on\s+the\s+market|still\s+viable|"
+    r"nothing\s+has\s+changed|shows?\s+(?:really\s+)?well|"
+    r"(?:is|are)\s+totally\s+fine|totally\s+fine|"
+    r"very\s+much\s+(?:still\s+)?available)\b",
+    re.IGNORECASE,
+)
+
+# Ancillary / non-target subjects a lease reference may bind to. A lease about one
+# of these (or a tour slot/window) is not the property going away (M15, M19, M20).
+_ANCILLARY_SUBJECT_RE = re.compile(
+    r"\b(?:trailer\s+lot|parking\s+lot|trailer\s+storage|trailer|parking|"
+    r"outparcel|out-?lot|yard|corridor|window|slot|appointment)\b",
+    re.IGNORECASE,
+)
+
+# new_property notes that self-contradict the referral (the model's own notes admit
+# the property is not on the market / not a fit / not the target) — reject those
+# events post-hoc (A′ misreads M11, M12, M24, M25, M29).
+_NEW_PROP_CONTRADICTION_RE = re.compile(
+    r"not\s+available|not\s+on\s+offer|isn'?t\s+on\s+offer|not\s+a\s+fit|"
+    r"not\s+the\s+target|already\s+leased|fully\s+leased|just\s+leased|"
+    r"has\s+been\s+leased|off\s+market|off\s+the\s+market|not\s+what\s+you'?re\s+after|"
+    r"won'?t\s+waste|keep\s+it\s+quiet|not\s+on\s+the\s+market|"
+    r"relocat|build-?to-?suit|separate\s+client",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_out_of_office(text: str) -> bool:
+    """A temporary-absence auto/hand-typed reply (OOO with return + assistant) is
+    NOT a wrong_contact redirect (A′ misread M08)."""
+    blob = (text or "").lower()
+    return bool(
+        re.search(
+            r"\b(?:out\s+of\s+(?:the\s+)?office|automatic\s+reply|auto[-\s]?reply|"
+            r"on\s+vacation|away\s+from\s+(?:my\s+)?(?:email|desk)|"
+            r"for\s+urgent\s+matters|limited\s+access\s+to\s+email)\b",
+            blob,
+        )
+        and re.search(
+            r"\b(?:until|back\s+(?:on|in)|returning\s+on|return\s+on|"
+            r"back\s+in\s+the\s+office)\b",
+            blob,
+        )
+    )
+
+
+def _detect_target_terminal_reason(latest_text: str, target_anchor: Optional[str]) -> Optional[str]:
+    """Return a terminal reason ONLY when a terminal phrase binds to the TARGET
+    property — negation-aware and target-grounded (A′ FIX-01, CodeRabbit PR#15).
+
+    A terminal phrase is ignored when it is negated, bound to an ancillary asset /
+    tour slot, or attributed to a DIFFERENT named address than the target. A bare
+    terminal (no address in its sentence) is deferred when the message elsewhere
+    asserts the target remains viable.
+    """
+    text = (latest_text or "").lower()
+    target_numbers = set(re.findall(r"\b(\d{3,6})\b", (target_anchor or "").lower()))
+    has_global_viability = bool(_VIABILITY_RE.search(text))
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+
+    for sentence in sentences:
+        for reason, pattern in _UNAVAILABLE_PATTERNS:
+            match = re.search(pattern, sentence)
+            if not match:
+                continue
+            pre = sentence[max(0, match.start() - 14): match.start()]
+            if re.search(r"\b(?:not|isn'?t|aren'?t|no)\s*$", pre):
+                continue  # negated terminal
+            if _ANCILLARY_SUBJECT_RE.search(sentence) or re.search(r"\bleased\s+separately\b", sentence):
+                continue  # lease bound to an ancillary asset / tour slot
+            sentence_numbers = set(re.findall(r"\b(\d{3,6})\b", sentence))
+            if target_numbers and (target_numbers & sentence_numbers):
+                return reason  # terminal explicitly about the TARGET address
+            if sentence_numbers and target_numbers and not (target_numbers & sentence_numbers):
+                continue  # terminal about a competing named address
+            if sentence_numbers and not target_numbers:
+                if has_global_viability:
+                    continue
+                return reason
+            # Bare terminal (no address in this sentence): defer to a viability claim.
+            if has_global_viability:
+                continue
+            return reason
+    return None
+
+
+def _apply_event_retention_guards(
+    events: List[dict],
+    *,
+    newest_text: str,
+    quoted_region: str,
+    alternate_remains_viable: bool,
+    sender_email: Optional[str],
+    sender_name: Optional[str],
+    contact_name: Optional[str],
+) -> List[dict]:
+    """Symmetric RETENTION guards for LLM-emitted events (A′ FIX-04, FIX-09, FIX-10).
+
+    The deterministic layer historically gated only INJECTION; nothing removed a
+    wrong LLM event. These guards strip events whose evidence is quote-only, whose
+    subject is a third party, or which self-contradict.
+    """
+    def _norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+    sender_email_norm = (sender_email or "").strip().lower()
+    identities = {_norm(sender_name), _norm(contact_name)}
+    identities.discard("")
+
+    kept: List[dict] = []
+    for event in events:
+        etype = (event or {}).get("type")
+
+        # (a) evidence lives only in the stripped-away quoted history
+        if etype in {
+            "property_unavailable", "tour_requested", "contact_optout",
+            "wrong_contact", "needs_user_input", "new_property",
+        } and _event_evidence_only_in_quote(event, newest_text, quoted_region):
+            continue
+
+        # (b) LLM property_unavailable while the alternate/listing remains viable
+        if etype == "property_unavailable" and alternate_remains_viable:
+            continue
+
+        # (c) wrong_contact redirect loop: suggestedContact/email == sender or row contact
+        if etype == "wrong_contact":
+            suggested = _norm(event.get("suggestedContact"))
+            suggested_email = (event.get("suggestedEmail") or "").strip().lower()
+            if suggested and suggested in identities:
+                continue
+            if suggested_email and sender_email_norm and suggested_email == sender_email_norm:
+                continue
+            # temporary-absence (OOO) is not a redirect
+            if _looks_like_out_of_office(newest_text):
+                continue
+
+        # (d) contact_optout attributed to a named third party (not the sender)
+        if etype == "contact_optout":
+            opt_email = (event.get("email") or event.get("suggestedEmail") or "").strip().lower()
+            opt_name = _norm(event.get("contactName"))
+            if opt_email and sender_email_norm and opt_email != sender_email_norm:
+                continue
+            if opt_name and identities and opt_name not in identities:
+                continue
+
+        # (e) new_property whose own notes self-contradict the referral
+        if etype == "new_property" and _NEW_PROP_CONTRADICTION_RE.search(str(event.get("notes") or "")):
+            continue
+
+        kept.append(event)
+    return kept
+
+
+def _augment_events_with_deterministic_signals(
+    proposal: dict,
+    conversation: List[dict],
+    target_anchor: Optional[str] = None,
+    sender_email: Optional[str] = None,
+    sender_name: Optional[str] = None,
+    contact_name: Optional[str] = None,
+) -> dict:
+    """Add high-confidence event signals from broker phrases the model can miss,
+    and strip wrong LLM-emitted events (retention guards)."""
     if not proposal:
         return proposal
 
@@ -234,46 +604,40 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
     if not latest_text:
         return proposal
 
-    # "availab(?:le|e)" tolerates the common single-char typo "availabe".
-    unavailable_patterns = [
-        ("no_longer_available", r"\bno\s+longer\s+availab(?:le|e)\b"),
-        ("signed_loi", r"\bsigned\s+(?:an?\s+)?(?:loi|letter\s+of\s+intent)\b"),
-        ("signed_lease", r"\bsigned\s+(?:a\s+)?lease\b"),
-        ("no_longer_represented", r"\bno\s+longer\s+represent(?:s|ed|ing)?\s+(?:this\s+|the\s+)?property\b"),
-        ("no_space_available", r"\b(?:no|not\s+any|do(?:es)?\s+not\s+have\s+any)\s+space\s+available\b"),
-        ("no_availability", r"\bno\s+availability\b"),
-        ("fully_leased", r"\bfully\s+leased\b"),
-        # Terminal signals aligned with processing.PROPERTY_UNAVAILABLE_KEYWORDS.
-        ("just_leased", r"\bjust\s+leased\b"),
-        ("already_leased", r"\balready\s+leased\b"),
-        ("been_leased", r"\bbeen\s+leased\b"),
-        ("taken_off_market", r"\btaken\s+off\s+(?:the\s+)?market\b"),
-        ("off_market", r"\boff\s+(?:the\s+)?market\b"),
-        ("under_contract", r"\bunder\s+contract\b"),
-        ("accepted_an_offer", r"\baccepted\s+an?\s+offer\b"),
-        # Bare "leased" is terminal too, but a message that leases one suite while
-        # offering an alternate one is NOT non-viable — the alternate-viable guard
-        # below keeps that near-miss from firing.
-        ("leased", r"\bleased\b"),
-    ]
+    raw_latest = _raw_latest_inbound(conversation)
+    quoted_region = _quoted_region(raw_latest)
 
     # Near-miss guard: "one suite is leased but an alternate suite remains viable"
-    # must not terminalize the row. Only suppresses when both an alternate-space
-    # reference AND a still-viable/available signal are present.
-    alternate_remains_viable = bool(
-        re.search(r"\b(?:alternate|another|different|other)\s+(?:suite|space|unit|option|property|listing)\b", latest_text)
-        and re.search(r"\b(?:remains?|still|is|are)\s+(?:viable|available|open|active)\b", latest_text)
+    # must not terminalize the row. CodeRabbit PR#15: the alternate-reference and the
+    # still-viable signal must live in the SAME sentence/clause — otherwise a separate
+    # "we have another suite that is still available" would mask a terminal signal on
+    # the current listing. Used for the LLM-PU RETENTION guard (M01); injection relies
+    # instead on target-grounded detection so an explicit TARGET terminal still fires.
+    _alt_ref = re.compile(r"\b(?:alternate|another|different|other)\s+(?:suite|space|unit|option|property|listing)\b")
+    _alt_viable = re.compile(r"\b(?:remains?|still|is|are)\s+(?:viable|available|open|active)\b")
+    alternate_remains_viable = any(
+        _alt_ref.search(sentence) and _alt_viable.search(sentence)
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", latest_text)
     )
 
+    # ---- Retention guards run first (on the LLM's own events) -----------------
+    events = _apply_event_retention_guards(
+        events,
+        newest_text=latest_text_raw,
+        quoted_region=quoted_region,
+        alternate_remains_viable=alternate_remains_viable,
+        sender_email=sender_email,
+        sender_name=sender_name,
+        contact_name=contact_name,
+    )
+    proposal["events"] = events
+
     property_unavailable_reason = None
-    if not looks_like_tour_only_unavailable(latest_text_raw) and not alternate_remains_viable:
+    if not looks_like_tour_only_unavailable(latest_text_raw):
         if _looks_like_requirements_mismatch_nonviable(latest_text):
             property_unavailable_reason = "requirements_mismatch"
         else:
-            for reason, pattern in unavailable_patterns:
-                if re.search(pattern, latest_text):
-                    property_unavailable_reason = reason
-                    break
+            property_unavailable_reason = _detect_target_terminal_reason(latest_text, target_anchor)
 
     if property_unavailable_reason:
         has_replacement_property = any((event or {}).get("type") == "new_property" for event in events)
@@ -291,6 +655,9 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
                 "reason": property_unavailable_reason,
             })
         proposal["events"] = retained_events
+        # FIX-03: a genuine terminal injection must not leave a live response_email
+        # (row marked dead while the outbound keeps chatting with the broker).
+        proposal["response_email"] = None
         return proposal
 
     tour_reply_reason = None
@@ -301,20 +668,34 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
         tour_reply_reason = "tour_slot_reply"
 
     if tour_reply_reason:
+        # FIX-02: never delete an LLM property_unavailable carrying a substantive
+        # (requirements-fit) reason — the tour-slot idiom must not erase a correct
+        # non-viable classification.
+        def _is_substantive_pu(event: dict) -> bool:
+            return (
+                (event or {}).get("type") == "property_unavailable"
+                and str((event or {}).get("reason") or "").strip() == "requirements_mismatch"
+            )
+
+        existing_tour = [e for e in events if (e or {}).get("type") == "tour_requested"]
         proposal["events"] = [
             event for event in events
-            if (event or {}).get("type") != "property_unavailable"
+            if (event or {}).get("type") != "property_unavailable" or _is_substantive_pu(event)
         ]
-        if not any((event or {}).get("type") == "tour_requested" for event in proposal["events"]):
+        if existing_tour:
+            # FIX-05: repair a model-emitted tour_requested carrying a wrong reason
+            # instead of only appending-when-absent (A′ misread M18).
+            if tour_reply_reason == "tour_unavailable":
+                for event in proposal["events"]:
+                    if (event or {}).get("type") == "tour_requested":
+                        event["reason"] = "tour_unavailable"
+        else:
             proposal["events"].append({
                 "type": "tour_requested",
                 "reason": tour_reply_reason,
                 "question": latest_text_raw[:500],
                 "suggestedEmail": "",
             })
-        return proposal
-
-    if any((event or {}).get("type") == "property_unavailable" for event in events):
         return proposal
 
     return proposal
@@ -326,6 +707,10 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
 _NON_RENT_COST_MARKERS = (
     "ti allowance",
     "t.i. allowance",
+    # A "$X/SF TI credit" (or bare "$X TI") is a concession, not the asking rent
+    # (A′ misread M13 wrote a $2/SF TI credit into the rent column).
+    "ti credit",
+    "t.i. credit",
     "tenant improvement",
     "improvement allowance",
     "buildout",
@@ -341,13 +726,21 @@ _NON_RENT_COST_MARKERS = (
     "utilities",
 )
 
+# Bare "TI" / "T.I." token immediately bound to a figure (word-boundary matched so
+# it never fires inside words like "notification" or "estimated").
+_BARE_TI_RE = re.compile(r"\bt\.?\s?i\.?\b", re.IGNORECASE)
 
-def _figure_is_non_rent(text: str, start: int, end: int) -> bool:
+
+def _figure_is_non_rent(text: str, start: int, end: int, check_after: bool = True) -> bool:
     """True if a non-rent cost label (TI/taxes/parking/opex/...) binds to this figure.
 
     Only the text immediately adjacent to the figure is inspected — bounded by the
     previous/next figure or clause delimiter — so a genuine rate that merely sits
     near an unrelated opex line ('$0.82 NNN, $0.21 opex') is not falsely dropped.
+
+    When ``check_after`` is False the trailing segment is ignored — used for figures
+    that already carry an explicit lease basis (e.g. "8.75 nnn opex 2.10"), where a
+    trailing opex/tax labels a SEPARATE figure, not this rent.
     """
     lowered = text.lower()
 
@@ -355,12 +748,16 @@ def _figure_is_non_rent(text: str, start: int, end: int) -> bool:
     cut = max(before.rfind("$"), before.rfind(","), before.rfind(";"), before.rfind("."))
     before_segment = before[cut + 1:] if cut >= 0 else before
 
-    after = lowered[end:]
-    stops = [pos for pos in (after.find("$"), after.find(","), after.find(";"), after.find(".")) if pos >= 0]
-    after_segment = after[: min(stops)] if stops else after
+    after_segment = ""
+    if check_after:
+        after = lowered[end:]
+        stops = [pos for pos in (after.find("$"), after.find(","), after.find(";"), after.find(".")) if pos >= 0]
+        after_segment = after[: min(stops)] if stops else after
 
     adjacent = f"{before_segment} {after_segment}"
-    return any(marker in adjacent for marker in _NON_RENT_COST_MARKERS)
+    if any(marker in adjacent for marker in _NON_RENT_COST_MARKERS):
+        return True
+    return bool(_BARE_TI_RE.search(adjacent))
 
 
 def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
@@ -381,9 +778,11 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
         re.IGNORECASE,
     )
     # Any "$X/SF" figure (rent keyword optional); non-rent labels are filtered below.
+    # "psf" is the fused per-square-foot token brokers use (A′ FIX-16).
     dollar_per_sf = re.compile(
-        r"\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*(?:/|\s+per\s+)\s*"
-        r"(?:sf|sq\.?\s*ft|square\s*foot)(?:\s*/?\s*(?:yr|year|annum))?",
+        r"\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
+        r"(?:(?:/\s*|\s+per\s+)(?:sf|sq\.?\s*ft|square\s*foot)|psf)"
+        r"(?:\s*/?\s*(?:yr|year|annum))?",
         re.IGNORECASE,
     )
     # Bare rate with a lease-basis suffix but no /SF token, e.g. "$9.75 gross".
@@ -392,20 +791,34 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
         r"(?:gross|nnn|net|modified\s+gross|full\s+service|fsg|ig|industrial\s+gross|mg)\b",
         re.IGNORECASE,
     )
+    # Dollar-SIGN-LESS rate with an explicit lease basis, e.g. "8.75 nnn",
+    # "8.75 a foot nnn" (A′ misread M33 — terse broker shorthand). A decimal is
+    # required to keep this conservative; an optional psf/per-foot token may sit
+    # between the figure and the basis word.
+    dollar_less_basis = re.compile(
+        r"(?<![$\d])([0-9]{1,2}\.[0-9]{2})\s*"
+        r"(?:p\.?s\.?f\.?|per\s+(?:sq\.?\s*)?f(?:oo)?t|a\s+(?:sq\.?\s*)?f(?:oo)?t|/\s*sf|per\s+sf)?\s*"
+        r"(?:gross|nnn|net|modified\s+gross|full\s+service|fsg|ig|industrial\s+gross|mg)\b",
+        re.IGNORECASE,
+    )
     monthly_unit = re.compile(r"(?:/|\bper\s+)(?:mo|mos|month|monthly)\b|\bmonthly\b", re.IGNORECASE)
     annual_unit = re.compile(r"(?:/|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
 
-    for pattern in (rent_context, dollar_per_sf, dollar_rate_basis):
+    for pattern in (rent_context, dollar_per_sf, dollar_rate_basis, dollar_less_basis):
         for match in pattern.finditer(text):
             # rent_context already required an explicit rent keyword, so trust it.
             # The keyword-less patterns must screen out non-rent cost figures
-            # (TI allowance, taxes, parking, opex, buildout) sitting in a $/SF shape.
-            if pattern is not rent_context and _figure_is_non_rent(text, match.start(), match.end()):
-                continue
+            # (TI allowance/credit, taxes, parking, opex, buildout) in a $/SF shape.
+            if pattern is not rent_context:
+                # Basis-bearing figures already carry an explicit lease basis, so a
+                # trailing opex/tax labels a different figure — screen only the lead.
+                check_after = pattern not in (dollar_rate_basis, dollar_less_basis)
+                if _figure_is_non_rent(text, match.start(), match.end(), check_after=check_after):
+                    continue
             value = float(match.group(1))
             unit_context = text[max(0, match.start() - 40): min(len(text), match.end() + 50)]
             is_monthly = bool(monthly_unit.search(unit_context)) and not bool(annual_unit.search(unit_context))
-            if pattern is dollar_rate_basis and not is_monthly:
+            if pattern in (dollar_rate_basis, dollar_less_basis) and not is_monthly:
                 # A bare per-SF basis rate under ~$3 is a monthly figure (e.g.
                 # "$0.82 NNN" -> $9.84/yr); annual industrial rates are far higher.
                 is_monthly = value < 3.0
@@ -423,6 +836,7 @@ def _augment_proposal_with_deterministic_extractions(
     header: List[str],
     effective_config: dict,
     conversation: List[dict],
+    pdf_manifest: List[dict] = None,
 ) -> dict:
     """Add high-confidence values from simple broker text patterns the LLM missed."""
     if not proposal:
@@ -438,6 +852,13 @@ def _augment_proposal_with_deterministic_extractions(
 
     rent_value = _extract_rent_sf_yr_from_text(_latest_inbound_text(conversation))
     if not rent_value:
+        # FIX-16 (M35): the accept-new-property path passes rent only inside the
+        # PDF manifest text (the inbound body is a synthetic stub), so scan those.
+        for pdf in (pdf_manifest or []):
+            rent_value = _extract_rent_sf_yr_from_text(pdf.get("text") or "")
+            if rent_value:
+                break
+    if not rent_value:
         return proposal
 
     deterministic_update = {
@@ -446,6 +867,10 @@ def _augment_proposal_with_deterministic_extractions(
         "confidence": 0.92,
         "reason": "Deterministic fallback parsed asking rent per SF per year from the latest broker message.",
     }
+    # FIX-15: the TI-credit / rent-context guards above ensure the parsed value is
+    # the asking rent, so correcting a monthly-misread LLM figure is safe; but the
+    # deterministic parse is only trusted to REPLACE a differing LLM value, never to
+    # invent one when the model already agreed.
     existing_update = _proposal_update_for_column(proposal, rent_col)
     if existing_update:
         if str(existing_update.get("value") or "").strip() != rent_value:
@@ -1089,6 +1514,8 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • Treat requirements-fit failures as non-viable when the broker says the space/property is not a good fit because it is office-heavy, not a true warehouse, lacks drive-in/grade-level access, lacks required industrial use, or otherwise fails the requested physical requirements.
   • DO NOT emit property_unavailable when the broker says only tours/showings are unavailable. "The space is no longer available for tours" means tour scheduling cannot continue, not that the property/listing is unavailable.
   • Do NOT use this for vague relationship refusals like "we are not a fit to work together" unless the property itself is being ruled out.
+  • ALWAYS populate a non-empty "reason" so downstream has an evidence trail: use "requirements_mismatch" for a physical non-fit, otherwise a short terminal reason such as "leased", "off_market", "under_contract", "signed_lease", or "no_longer_available".
+  • The terminal signal must be about the TARGET PROPERTY. A different building being leased ("we just closed 9 Center Drive"), a comps reference ("what recently leased along the corridor"), or an ancillary asset ("the trailer lot is leased separately") does NOT make the target unavailable.
 
 - "new_property": Emit when the LAST HUMAN message suggests or mentions a DIFFERENT property than the TARGET PROPERTY.
   • Look for phrases like: "we have another", "different location", "alternative property", "other space available"
@@ -1108,6 +1535,13 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
     - If only first name is available, use just the first name
     - Extract their email as "email" field
   • The contactName is CRITICAL for personalized outreach - extract the full name when available, first name if that's all you have
+  • REFERRAL-TRIGGERED, NOT MENTION-TRIGGERED: only emit new_property when the other property is actually being OFFERED TO US as a live lead and is plausibly in scope. A second address alone is NOT enough. DO NOT emit new_property for a property that is:
+    - described as leased / closed / off-market / not available ("that one's fully leased", "we just closed on it")
+    - withdrawn by the broker in the same breath ("won't waste your time with it", "not what you're after")
+    - explicitly not-on-offer or confidential ("ignore the chatter about X", "isn't on offer", "keep it quiet")
+    - a tenant's own relocation / build-to-suit destination (where the incumbent is GOING, not a space on the market)
+    - sourced only from a PDF/attachment rather than the LAST HUMAN message text
+  • If your own notes for the event would say it is "not available", "not on offer", "not a fit", or "not the target", DO NOT emit the event at all.
 
 - "call_requested": Only when someone explicitly asks for a call/phone conversation. Use this event (NOT needs_user_input) for phone call requests.
 
@@ -1150,12 +1584,13 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • For these phrases: Check if required fields are missing and generate a response_email asking for them
   • Do NOT emit needs_user_input for these - they are invitations to continue the conversation
 
-  Include "reason" field explaining WHY user input is needed:
+  Include "reason" field explaining WHY user input is needed (use ONLY these values — never invent "scheduling", "", or other off-enum strings):
   • "client_question" - broker asking about client's requirements (e.g., "what size does your client need?", "what's your budget?")
   • "negotiation" - price or term negotiation
-  • "confidential" - asking for client identity/info
+  • "confidential" - asking for CLIENT IDENTITY specifically (who is your client / what company). Do NOT use "confidential" for benign tour logistics such as attendee names for a building gate/visitor list — that is not a client-identity question.
   • "legal_contract" - contract/LOI/lease questions
   • "unclear" - message is confusing or unclear
+  • A request to reschedule or set up a PHONE CALL is call_requested, NOT needs_user_input.
 
 - "contact_optout": Emit when the contact explicitly indicates they don't want further communication.
   • Look for: "not interested", "no thanks", "please stop", "unsubscribe", "remove me from your list",
@@ -1169,6 +1604,11 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
     - "no_tenant_reps" - policy against working with tenant reps
     - "direct_only" - only deals directly with tenants
     - "hostile" - rude or aggressive response
+  • SUBJECT ATTRIBUTION (critical): the opt-out must be asserted BY or ABOUT the person who SENT this message (the row contact). DO NOT emit contact_optout when the opt-out belongs to:
+    - a CC'd third party ("I've cc'd Tom, keep him off your lists — but on the space: still available...") — the sender is still engaged
+    - a quoted/forwarded stranger whose removal request sits only in reply history
+    - a machine/banner notice ("[AUTOMATED NOTICE] X has OPTED OUT") that the human sender explicitly disclaims ("ignore the robo-banner")
+    An opt-out about someone OTHER than the sender must NOT kill this thread; keep the conversation alive.
 
 - "wrong_contact": Emit when the message indicates this person is NOT the right contact for this property.
   • Look for: "I don't handle that property", "wrong person", "contact [name] instead", "no longer with [company]",
@@ -1182,6 +1622,9 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
     - "wrong_person" - never handled this property
     - "forwarded" - forwarding to correct person
     - "left_company" - no longer with the company
+  • DO NOT emit wrong_contact when suggestedContact/suggestedEmail is the SAME person who sent the message or the row Contact Name (a forward-then-introduce hand-off where the sender IS now the right contact — "Alex here, I'm the right contact now" is NOT a redirect).
+  • DO NOT emit wrong_contact for a TEMPORARY ABSENCE: an out-of-office / auto-reply that gives a return date and an assistant "for urgent matters" is not a statement that the sender is the wrong contact — wait for their return, do not swap the sheet contact.
+  • Redirect signals living only in quoted/forwarded reply history are NOT the live message — ignore them.
 
 - "property_issue": CRITICAL - Emit when the broker mentions ANY negative condition, problem, or concern about the property.
   • Physical condition issues: "smells bad", "odor", "mold", "water damage", "roof leak", "foundation issues",
@@ -1390,12 +1833,53 @@ IMPORTANT: The response should feel natural and conversational, not robotic or t
         # Check missing required fields to inform response email generation
         missing_fields = check_missing_required_fields(rowvals, header, effective_config)
         
-        # Build contact name context with explicit first name for AI to use in greetings
+        # Identify the live sender from the newest inbound message (from-address +
+        # signature) so the mapped greeting name can be reconciled against it.
+        latest_inbound_msg = next(
+            (m for m in reversed(conversation or []) if (m.get("direction") or "").lower() == "inbound"),
+            {},
+        ) or {}
+        sender_email = (latest_inbound_msg.get("from") or email or "").strip()
+        sender_display_name = (latest_inbound_msg.get("fromName") or latest_inbound_msg.get("senderName") or "").strip()
+        raw_latest_human = _raw_latest_inbound(conversation)
+        last_human_message = _strip_quoted_history(raw_latest_human)
+
+        # Build contact name context with an ADVISORY first name for greetings.
+        # FIX-13/14: reconcile the mapped name against the live sender, strip
+        # honorifics, and neutralize company names so the model never dead-names a
+        # stale mapped person or greets "Hi Colliers,"/"Hi Dr.,".
         contact_context = ""
         if contact_name:
-            first_name = contact_name.split()[0] if contact_name else None
-            contact_context = f"\nCONTACT NAME: {contact_name}\nFIRST NAME FOR GREETINGS: {first_name} (use this in greetings like 'Hi {first_name},')"
-        
+            greeting_first = _resolve_greeting_first_name(
+                contact_name,
+                sender_email=sender_email,
+                sender_signature_name=sender_display_name or last_human_message,
+            )
+            if greeting_first:
+                contact_context = (
+                    f"\nCONTACT NAME (from the sheet mapping — advisory, may be stale): {contact_name}"
+                    f"\nSUGGESTED GREETING NAME: {greeting_first} (advisory — use 'Hi {greeting_first},' ONLY if it "
+                    f"agrees with the live sender's name/signature; otherwise greet neutrally with 'Hi,')."
+                )
+            else:
+                contact_context = (
+                    f"\nCONTACT NAME (from the sheet mapping — advisory, may be stale): {contact_name}"
+                    "\nGREETING: the mapped name is a company, an honorific, or disagrees with the live "
+                    "sender — greet NEUTRALLY ('Hi,') or use the live sender's own name/signature. "
+                    "Do NOT greet with the mapped name."
+                )
+
+        # FIX-08: give the model the quoted-history-stripped newest segment as the
+        # AUTHORITATIVE last human message for EVENT detection. Quoted/forwarded
+        # history stays in CONVERSATION HISTORY below as context only.
+        last_human_block = ""
+        if last_human_message:
+            last_human_block = (
+                "\nLAST HUMAN MESSAGE (AUTHORITATIVE — detect EVENTS from ONLY this text; "
+                "treat quoted/forwarded reply history in the full thread below as context, not live signal):\n"
+                f"{json.dumps(last_human_message)}\n"
+            )
+
         prompt_parts = [f"""
 You are analyzing a conversation thread to suggest updates to ONE Google Sheet row, detect key events, and generate an appropriate response email.
 
@@ -1416,8 +1900,8 @@ CURRENT ROW VALUES (row {rownum}):
 
 MISSING REQUIRED FIELDS (if any):
 {json.dumps(missing_fields)}
-
-CONVERSATION HISTORY (latest last):
+{last_human_block}
+CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded history):
 {json.dumps(conversation, indent=2)}
 """.rstrip()]
 
@@ -1569,9 +2053,16 @@ OUTPUT ONLY valid JSON in this exact format:
         proposal.setdefault("events", [])
         proposal.setdefault("response_email", None)  # LLM-generated response email
         proposal = _augment_proposal_with_deterministic_extractions(
-            proposal, rowvals, header, effective_config, conversation
+            proposal, rowvals, header, effective_config, conversation, pdf_manifest=pdf_manifest
         )
-        proposal = _augment_events_with_deterministic_signals(proposal, conversation)
+        proposal = _augment_events_with_deterministic_signals(
+            proposal,
+            conversation,
+            target_anchor=target_anchor,
+            sender_email=sender_email,
+            sender_name=sender_display_name,
+            contact_name=contact_name,
+        )
         proposal = sanitize_new_property_referral_response(
             proposal,
             original_contact_email=email,

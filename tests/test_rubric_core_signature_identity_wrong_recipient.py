@@ -1,4 +1,6 @@
-import os; os.environ.setdefault("E2E_TEST_MODE", "true")
+import os
+
+os.environ.setdefault("E2E_TEST_MODE", "true")
 
 import unittest
 

@@ -756,6 +756,38 @@ def _image_link_to_png_preview(content: bytes) -> Optional[bytes]:
         return None
 
 
+def _linked_asset_stub_entry(
+    *,
+    name: str,
+    source_url: str,
+    method: str,
+    source_type: str,
+    error: str,
+    **flags: Any,
+) -> Dict[str, Any]:
+    """Build a non-content manifest entry (manual-review or failed-download).
+
+    These entries carry no extracted text/images/drive_link — they exist only
+    to keep an un-resolvable broker link VISIBLE downstream rather than letting
+    it be silently dropped (a dropped link is indistinguishable from 'no
+    assets' and would let the message be marked processed with payload lost).
+    Callers pass the distinguishing flag(s) (e.g. requires_manual_review=True
+    or download_failed=True) as keyword arguments.
+    """
+    entry: Dict[str, Any] = {
+        "name": name,
+        "text": "",
+        "images": [],
+        "method": method,
+        "source_url": source_url,
+        "source_type": source_type,
+        "drive_link": None,
+        "error": error,
+    }
+    entry.update(flags)
+    return entry
+
+
 def fetch_and_process_linked_assets(
     urls: List[str],
     max_assets: int = 3,
@@ -785,12 +817,32 @@ def fetch_and_process_linked_assets(
         seen_urls.add(source_url)
 
         filename_hint = _filename_from_asset_url(source_url, fallback="")
+        manual_review_reasons: List[str] = []
         candidate = build_download_candidate(
             source_url,
             filename_hint=filename_hint,
             target_property_hint=target_property_hint,
+            manual_review_reasons=manual_review_reasons,
         )
         if not candidate:
+            # None with a recorded reason == an address-bearing link we could
+            # not verify without target context. Do NOT silently drop it (a
+            # dropped link is indistinguishable from 'no assets' and lets the
+            # message be marked processed with the broker's payload lost) —
+            # surface it as a manual-review entry. A None with NO reason is a
+            # confident drop (blocked/unsupported host or a hint-confirmed
+            # wrong-property flyer) and stays dropped.
+            if manual_review_reasons:
+                name = _filename_from_asset_url(source_url, filename_hint or "broker flyer.pdf")
+                print(f"⚠️ Broker link needs manual review (unverifiable property address, no target context): {source_url}")
+                processed.append(_linked_asset_stub_entry(
+                    name=name,
+                    source_url=source_url,
+                    method="manual_review_required",
+                    source_type="broker_unverified_property_link",
+                    error=manual_review_reasons[0],
+                    requires_manual_review=True,
+                ))
             continue
 
         name = _filename_from_asset_url(candidate.get("sourceUrl") or source_url, filename_hint or "broker flyer.pdf")
@@ -804,17 +856,14 @@ def fetch_and_process_linked_assets(
         # be marked processed with the broker's data lost.
         if candidate.get("requiresManualReview") or not candidate.get("downloadUrl"):
             print(f"⚠️ Broker file-share link needs manual review (not auto-downloadable): {source_url}")
-            processed.append({
-                "name": name,
-                "text": "",
-                "images": [],
-                "method": "manual_review_required",
-                "source_url": source_url,
-                "source_type": candidate.get("sourceType") or "broker_file_share_link",
-                "drive_link": None,
-                "requires_manual_review": True,
-                "error": "Broker file-share link could not be auto-downloaded; needs manual review",
-            })
+            processed.append(_linked_asset_stub_entry(
+                name=name,
+                source_url=source_url,
+                method="manual_review_required",
+                source_type=candidate.get("sourceType") or "broker_file_share_link",
+                error="Broker file-share link could not be auto-downloaded; needs manual review",
+                requires_manual_review=True,
+            ))
             continue
 
         try:
@@ -826,17 +875,14 @@ def fetch_and_process_linked_assets(
             # no error and mark the message processed — the broker's payload is lost
             # with no retry/visibility. Surface a distinguishable failure entry.
             print(f"⚠️ Failed to download linked property asset {source_url}: {e}")
-            processed.append({
-                "name": name,
-                "text": "",
-                "images": [],
-                "method": "failed",
-                "source_url": source_url,
-                "source_type": candidate.get("sourceType") or "",
-                "drive_link": None,
-                "download_failed": True,
-                "error": str(e),
-            })
+            processed.append(_linked_asset_stub_entry(
+                name=name,
+                source_url=source_url,
+                method="failed",
+                source_type=candidate.get("sourceType") or "",
+                error=str(e),
+                download_failed=True,
+            ))
             continue
 
         source_type = candidate.get("sourceType") or ""

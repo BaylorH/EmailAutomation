@@ -4,7 +4,7 @@ os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault("SITESIFT_AUTO_REPLY_ALLOWLIST", "*")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json"),
 )
 
 import unittest

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json"),
 )
 
 from email_automation import processing

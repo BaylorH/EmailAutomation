@@ -3,7 +3,7 @@ import os
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json"),
 )
 
 import unittest
@@ -132,11 +132,16 @@ class StopCancelDismissWrongRecipientTest(unittest.TestCase):
                     {"Authorization": "Bearer token"},
                     {"doc": doc, "data": queued},
                 )
-            except Exception:
-                # Downstream success bookkeeping is patched to no-op; any residual
-                # error after the gate decision is irrelevant to what we assert
-                # (whether the send path was entered / the item was reconciled).
-                pass
+            except Exception as exc:
+                # Downstream success bookkeeping is patched to no-op, so the gate
+                # decision (send blocked vs. send path entered) is fully exercised
+                # without any residual error. A bare ``except Exception: pass`` here
+                # would silently swallow a real regression in _send_single_outbox_item;
+                # instead fail loudly with context so unexpected errors surface.
+                self.fail(
+                    "_send_single_outbox_item raised unexpectedly after the gate "
+                    f"decision: {type(exc).__name__}: {exc}"
+                )
 
         return doc, fake_fs, get_reply_sender, send_outbox_as_reply, send_and_index_email
 

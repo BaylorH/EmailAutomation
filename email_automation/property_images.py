@@ -84,6 +84,41 @@ ADDRESS_NEUTRAL_TOKENS = frozenset((
     "pdf", "jpg", "jpeg", "png", "webp", "gif",
 ))
 
+# Geographic qualifiers that merely LOCATE the one street address in a filename
+# ("4402 Rex Rd Webster TX Flyer.pdf") rather than assert a second, competing
+# property. Without target context the earlier heuristic treated the city/state
+# as unverifiable extra identifying tokens and dropped a perfectly valid
+# same-property flyer (CodeRabbit PR#15 regression). US state abbreviations +
+# full names + compass directionals are recognized as geographic; the token
+# immediately preceding a state token is treated as its city (the "City, ST"
+# convention). A genuinely-different property still differs in its STREET
+# address (captured as its own claim / non-geographic token), so relaxing the
+# geographic tail does not weaken the wrong-property guard.
+_US_STATE_ABBREVIATIONS = frozenset((
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id",
+    "il", "in", "ia", "ks", "ky", "la", "me", "md", "ma", "mi", "mn", "ms",
+    "mo", "mt", "ne", "nv", "nh", "nj", "nm", "ny", "nc", "nd", "oh", "ok",
+    "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv",
+    "wi", "wy", "dc",
+))
+_US_STATE_NAMES = frozenset((
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+    "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+    "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana", "maine",
+    "maryland", "massachusetts", "michigan", "minnesota", "mississippi",
+    "missouri", "montana", "nebraska", "nevada", "ohio", "oklahoma", "oregon",
+    "pennsylvania", "tennessee", "texas", "utah", "vermont", "virginia",
+    "washington", "wisconsin", "wyoming",
+))
+_COMPASS_DIRECTIONALS = frozenset((
+    "n", "s", "e", "w", "ne", "nw", "se", "sw",
+    "north", "south", "east", "west",
+    "northeast", "northwest", "southeast", "southwest",
+))
+GEOGRAPHIC_QUALIFIER_TOKENS = (
+    _US_STATE_ABBREVIATIONS | _US_STATE_NAMES | _COMPASS_DIRECTIONALS
+)
+
 
 def _guard_tokens(text: str) -> List[str]:
     return [t for t in re.split(r"[^a-z0-9]+", _clean(text).lower()) if t]
@@ -114,8 +149,21 @@ def _address_claims_in_tokens(tokens: List[str]):
                     i = j
                     break
         i += 1
+    # Geographic qualifiers (state abbrev/name, compass directional) and the
+    # city token that conventionally precedes a state ("City, ST") merely locate
+    # the one street address; they are not a competing property claim.
+    geographic = set()
+    for k, token in enumerate(tokens):
+        is_state = token in _US_STATE_ABBREVIATIONS or token in _US_STATE_NAMES
+        if token in GEOGRAPHIC_QUALIFIER_TOKENS:
+            geographic.add(k)
+        if is_state and k - 1 >= 0 and not tokens[k - 1].isdigit():
+            # The immediately-preceding non-numeric token is the city name.
+            geographic.add(k - 1)
+
     has_unverified_extra = bool(claims) and any(
         k not in consumed
+        and k not in geographic
         and not tokens[k].isdigit()
         and tokens[k] not in ADDRESS_NEUTRAL_TOKENS
         for k in range(n)
@@ -153,33 +201,44 @@ def _claim_matches_target(claim, target_tokens) -> bool:
     return all(name in target_tokens for name in street_names)
 
 
-def _fails_property_address_guard(
+# Verdicts from the property-address guard.
+GUARD_OK = "ok"
+GUARD_REJECT_WRONG_PROPERTY = "reject_wrong_property"
+GUARD_MANUAL_REVIEW = "manual_review"
+
+
+def _property_address_guard_verdict(
     source_url: str,
     filename_hint: str,
     target_property_hint: str,
-) -> bool:
-    """True when the link must NOT become a download candidate (fail closed).
+) -> str:
+    """Classify a link/filename against the wrong-property address guard.
 
-    - Target hint provided: any address claim in the filename/URL must match
-      the target's street number + street-name tokens; a clearly different
-      address is rejected.
-    - No target hint: an address-bearing name that ALSO carries extra
-      non-neutral identifying tokens is an unverifiable property claim and is
-      rejected. A plain address-plus-descriptor name (e.g. "4402 Rex Rd
-      Flyer.pdf") stays allowed — production does not always have target
-      context at this boundary, and dropping every address-bearing flyer
-      would silently lose correct-property payloads.
+    - ``GUARD_OK`` — safe to build a download candidate.
+    - ``GUARD_REJECT_WRONG_PROPERTY`` — a target hint IS present and the
+      filename/URL names a clearly different street address. We are confident
+      it is the wrong property: hard reject (drop).
+    - ``GUARD_MANUAL_REVIEW`` — NO target hint and the address-bearing name
+      also carries a non-neutral, non-geographic identifying token we cannot
+      verify. We are NOT confident it is wrong, so it must be surfaced for
+      manual review rather than silently dropped (no-silent-drop contract).
+
+    A plain address-plus-descriptor name (e.g. "4402 Rex Rd Flyer.pdf") or one
+    whose only extra tokens are geographic qualifiers ("Webster, TX") stays
+    ``GUARD_OK`` — production does not always have target context at this
+    boundary, and dropping every address-bearing flyer would silently lose
+    correct-property payloads.
     """
     claims, unverified_extra = _collect_address_claims(source_url, filename_hint)
     if not claims:
-        return False
+        return GUARD_OK
     target = _clean(target_property_hint)
     if target:
         target_tokens = set(_guard_tokens(target))
-        return not any(
-            _claim_matches_target(claim, target_tokens) for claim in claims
-        )
-    return unverified_extra
+        if any(_claim_matches_target(claim, target_tokens) for claim in claims):
+            return GUARD_OK
+        return GUARD_REJECT_WRONG_PROPERTY
+    return GUARD_MANUAL_REVIEW if unverified_extra else GUARD_OK
 
 
 def _clean(value: Any) -> str:
@@ -303,6 +362,7 @@ def build_download_candidate(
     url: str,
     filename_hint: str = "",
     target_property_hint: str = "",
+    manual_review_reasons: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     source_url = _clean(url)
     if not source_url or is_blocked_listing_url(source_url):
@@ -311,8 +371,23 @@ def build_download_candidate(
     # Wrong-property guard (deterministic): a flyer whose filename/URL names a
     # street address that does not verifiably belong to the target property
     # must not become the row's flyer/preview source — its preview would
-    # populate property_image_url on the wrong row. Fail closed.
-    if _fails_property_address_guard(source_url, filename_hint, target_property_hint):
+    # populate property_image_url on the wrong row.
+    #   - Confident wrong property (hint present, address differs) -> hard drop.
+    #   - Unverifiable (no hint, non-geographic extra token) -> return None but
+    #     record a manual-review reason via ``manual_review_reasons`` so the
+    #     caller can surface the link instead of silently losing the payload.
+    verdict = _property_address_guard_verdict(
+        source_url, filename_hint, target_property_hint
+    )
+    if verdict == GUARD_REJECT_WRONG_PROPERTY:
+        return None
+    if verdict == GUARD_MANUAL_REVIEW:
+        if manual_review_reasons is not None:
+            manual_review_reasons.append(
+                "Address-bearing broker link could not be verified against a "
+                "target property (no target context available); needs manual "
+                f"review: {_clean(filename_hint) or source_url}"
+            )
         return None
 
     file_name = _clean(filename_hint) or "broker attachment"

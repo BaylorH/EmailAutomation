@@ -3092,6 +3092,40 @@ def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email:
         print(f"❌ No sheet row found with email = {counterparty_email}")
         return client_id, sheet_id, header, None, None, column_config, extraction_fields
 
+# Common auto-reply subject markers across locales. Defense-in-depth backstop
+# (FIX-18) for RFC-3834 header detection: localized out-of-office replies that
+# lack the standard headers must still be skipped so temporary-absence messages
+# never reach the classifier as real broker data.
+AUTO_REPLY_SUBJECT_MARKERS = [
+    # English
+    "out of office", "automatic reply", "auto-reply", "auto reply",
+    "autoreply", "away from office", "on vacation", "ooo:",
+    # German
+    "automatische antwort", "abwesenheitsnotiz",
+    # French
+    "réponse automatique", "reponse automatique", "absence du bureau",
+    # Spanish
+    "respuesta automática", "respuesta automatica",
+    "ausencia temporal", "fuera de la oficina",
+    # Italian
+    "risposta automatica", "fuori sede", "assente dall'ufficio",
+    # Portuguese
+    "resposta automática", "resposta automatica", "ausência temporária",
+    # Dutch
+    "automatisch antwoord", "afwezigheidsassistent",
+]
+
+
+def _is_auto_reply_subject(subject: Optional[str]) -> bool:
+    """Return True if the subject line matches a known auto-reply/OOO marker.
+
+    Pure function so the localized-subject guard is deterministically testable
+    without a live Graph/model call (FIX-18 / M08 variant).
+    """
+    subject_lower = (subject or "").lower()
+    return any(marker in subject_lower for marker in AUTO_REPLY_SUBJECT_MARKERS)
+
+
 def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, Any]):
     """ENHANCED: Process a single inbox message with full pipeline including events."""
     msg_id = msg.get("id")
@@ -3177,13 +3211,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             is_auto_reply = True
 
     # Also check subject line for common auto-reply patterns
-    subject_lower = subject.lower()
-    auto_reply_subjects = [
-        "out of office", "automatic reply", "auto-reply", "auto reply",
-        "autoreply", "away from office", "on vacation", "ooo:",
-        "automatische antwort", "réponse automatique"  # German, French
-    ]
-    if any(pattern in subject_lower for pattern in auto_reply_subjects):
+    if _is_auto_reply_subject(subject):
         is_auto_reply = True
 
     # SAFETY: Skip auto-replies to prevent processing OOO messages as real data

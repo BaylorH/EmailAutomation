@@ -74,6 +74,18 @@ def kept_addresses(result):
 
 
 class BrokerWrongContactReplyAllSafety(unittest.TestCase):
+    def setUp(self):
+        # Isolation: _filter_reply_all_draft_recipients caches the operator in a
+        # module global (email_mod._LAST_KNOWN_OPERATOR_EMAIL). Left over from a
+        # prior test it makes cross-test coupling silently mask real failures.
+        # Reset it before every test so each case stands on its own, and restore
+        # it after so the wider suite is unaffected.
+        self._saved_operator = email_mod._LAST_KNOWN_OPERATOR_EMAIL
+        email_mod._LAST_KNOWN_OPERATOR_EMAIL = None
+
+    def tearDown(self):
+        email_mod._LAST_KNOWN_OPERATOR_EMAIL = self._saved_operator
+
     # ------------------------------------------------------------------ #
     # REAL-THREAT GROUP A: safe teammate cc MUST be KEPT (stopIf #2)
     # Each broker phrasing implies a reply-all audience with a legit teammate
@@ -291,6 +303,11 @@ class BrokerWrongContactReplyAllSafety(unittest.TestCase):
     # ------------------------------------------------------------------ #
 
     def test_operator_dropped_even_when_user_email_not_passed(self):
+        # Seed the fallback explicitly (mirrors an earlier call that DID thread
+        # user_email through and cached the operator). This test must stand on
+        # its own — it must not depend on another test having run first to set
+        # email_mod._LAST_KNOWN_OPERATOR_EMAIL. setUp() clears it; we set it here.
+        email_mod._LAST_KNOWN_OPERATOR_EMAIL = email_mod._normalize_email(OPERATOR)
         draft = {
             "toRecipients": [graph_recipient("broker@brokerage.com")],
             "ccRecipients": [graph_recipient(OPERATOR)],

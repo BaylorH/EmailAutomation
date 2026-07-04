@@ -19,7 +19,10 @@ PLACEHOLDER_HINT_RE = re.compile(
 DOUBLE_CURLY_PLACEHOLDER_RE = re.compile(r"\{\{+\s*([^{}\n]{1,80}?)\s*\}\}+")
 SINGLE_CURLY_PLACEHOLDER_RE = re.compile(r"(?<!\{)\{\s*([^{}\n]{1,80}?)\s*\}(?!\})")
 ANGLE_PLACEHOLDER_RE = re.compile(r"<<\s*([^<>\n]{1,80}?)\s*>>")
-PERCENT_PLACEHOLDER_RE = re.compile(r"%\s*([A-Za-z][A-Za-z0-9 _]{0,79}?)\s*%")
+# A percent merge field is a single token (%First%, %FIELD%, %First_Name%). The
+# captured span must not contain spaces, or rent-escalation prose spanning two
+# percent signs ("3% annual property increase and a 5% fee") would false-trigger.
+PERCENT_PLACEHOLDER_RE = re.compile(r"%\s*([A-Za-z][A-Za-z0-9_]{0,79}?)\s*%")
 DOLLAR_BRACE_PLACEHOLDER_RE = re.compile(r"\$\{\s*([^{}\n]{1,80}?)\s*\}")
 
 # Split camelCase merge names (FirstName -> "First Name") so the placeholder-hint
@@ -119,7 +122,12 @@ APPROVAL_BUDGET_RE = re.compile(
     r"\bpre[-\s]?approved\b|"
     r"\bfully\s+approved\b|"
     r"\bapproved\s+(?:budget|the\s+budget|this\s+lease|the\s+lease|a\s+lease|"
-    r"lease|terms|financing|to\s+spend|by)\b|"
+    r"lease|terms|financing|to\s+spend)\b|"
+    # Passive "approved by" ONLY when it is a completed assertion (been/was/were/
+    # is/are/already approved by ...). Conditional/future forms use the bare
+    # infinitive "be approved by" (would need to be approved by our board) and
+    # must NOT fire -- that is routine broker phrasing, not a fabricated approval.
+    r"\b(?:been|was|were|is|are|already)\s+approved\s+by\b|"
     r"\bapproved\s+budget\b|"
     r"\bboard\s+has\s+(?:already\s+)?approved\b|"
     r"\bhas\s+(?:already\s+)?approved\s+(?:this|the)\b|"
@@ -140,17 +148,30 @@ class OutboundBodyValidation:
     reason: Optional[str] = None
 
 
-def _looks_like_placeholder_token(inner: str) -> bool:
-    """True when the text inside a merge delimiter looks like a merge field."""
+def _looks_like_placeholder_token(inner: str, *, bracketed: bool = False) -> bool:
+    """True when the text inside a merge delimiter looks like a merge field.
+
+    ``bracketed`` marks a square-bracket source. Square brackets routinely carry
+    legitimate acronyms in broker prose ([TBD], [ASAP], [FYI], [N/A]), so a bare
+    all-caps run is NOT sufficient there -- only placeholder vocabulary or a
+    structural merge-token shape (underscore-joined field name) counts. The other
+    merge syntaxes (%FIELD%, <<X>>, {{X}}, ${X}) never appear in prose, so any
+    all-caps token in those is still treated as a real placeholder.
+    """
     inner = (inner or "").strip()
     if not inner:
         return False
-    if inner.isupper():
-        return True
-    if " " not in inner and PLACEHOLDER_HINT_RE.search(inner):
-        return True
     normalized = _CAMEL_SPLIT_RE.sub(" ", inner).replace("_", " ")
-    return bool(PLACEHOLDER_HINT_RE.search(normalized))
+    if PLACEHOLDER_HINT_RE.search(normalized):
+        return True
+    if inner.isupper():
+        if not bracketed:
+            return True
+        # Bracketed all-caps: only a merge-field shape (underscore-joined token)
+        # counts; bare acronyms like [TBD] / [ASAP] / [FYI] / [N/A] pass through.
+        if "_" in inner and re.fullmatch(r"[A-Z0-9_]+", inner):
+            return True
+    return False
 
 
 def find_unresolved_placeholders(body: Optional[str]) -> List[str]:
@@ -175,7 +196,7 @@ def find_unresolved_placeholders(body: Optional[str]) -> List[str]:
         if token.lower() in SAFE_BRACKET_TOKENS:
             continue
         inner = token[1:-1].strip()
-        if inner and _looks_like_placeholder_token(inner):
+        if inner and _looks_like_placeholder_token(inner, bracketed=True):
             _add(token)
 
     for regex in _NON_BRACKET_PLACEHOLDER_RES:
