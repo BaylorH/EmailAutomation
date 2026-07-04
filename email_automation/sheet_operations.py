@@ -653,7 +653,16 @@ def _resolve_true_anchor_row(
         return positional_row
 
     # Positional number is unreliable (bulk range collapsed interior gaps).
-    # Walk rows individually and return the row that actually holds the anchor.
+    # Walk rows individually to recover the TRUE absolute number of the match.
+    #
+    # The caller already identified the match as the match_ordinal-th non-empty
+    # data row, so we must return the row AT that ordinal — NOT the first row
+    # that happens to satisfy the anchor. Returning the first anchor-match would
+    # stop on a shorter-named sibling the same broker owns (e.g. a "22 Oak Ave"
+    # row that token-PREFIXES the reply's "22 Oak Ave North") sitting at an
+    # earlier ordinal, writing the update onto the wrong (often completed)
+    # property. We count to the ordinal, then confirm that row still holds the
+    # anchor before trusting it.
     seen = 0
     row_num = 3
     # The match is the match_ordinal-th non-empty data row; allow a generous
@@ -663,8 +672,10 @@ def _resolve_true_anchor_row(
         padded = _read_single_row(sheets, spreadsheet_id, tab_title, header, row_num)
         if padded is not None:
             seen += 1
-            if _row_matches_subject_anchor(header, padded, addr, city):
-                return row_num
+            if seen == match_ordinal:
+                if _row_matches_subject_anchor(header, padded, addr, city):
+                    return row_num
+                break
         row_num += 1
 
     # Per-row reads are unavailable in this environment; trust the positional
@@ -769,7 +780,17 @@ def _find_row_by_anchor(uid: str, thread_id: str, sheets, spreadsheet_id: str, t
                        header: List[str], fallback_email: str):
     try:
         def _stored_row_matches_subject(row_values: List[str], addr: str, city: str) -> bool:
-            return _row_matches_subject_anchor(header, row_values, addr, city)
+            # Trust a STORED rowNumber only on an EXACT address match. A stored
+            # number can be stale after a broker sort/insert, and a single-row
+            # check sees that row in isolation — it cannot know an exact match
+            # lives elsewhere. Accepting a token-PREFIX here lets a shorter-named
+            # sibling that the same broker owns (e.g. stored row now holds
+            # "22 Oak Ave", a prefix of the reply's "22 Oak Ave North") absorb
+            # the update after a sort. A prefix-only match must instead fall
+            # through to the exact-preferring full-sheet scan below, which will
+            # find the real "22 Oak Ave North" row (and still accept a legit
+            # prefix — subject appended a region/run tag — when no exact exists).
+            return _row_matches_subject_anchor(header, row_values, addr, city, accept=("exact",))
 
         # 1) Prefer explicit stored rowNumber (unchanged)
         thread_doc = _fs.collection("users").document(uid).collection("threads").document(thread_id).get()

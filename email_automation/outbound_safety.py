@@ -116,6 +116,48 @@ CREDIT_DISCLOSURE_RE = re.compile(
     r"(?:rating\s+|profile\s+|strength\s+)?(?:is|are)\b)"
 )
 
+# Words that can legitimately follow an identity noun (or a representation verb)
+# in a system-generated reply and are Capitalised without being a client name:
+# pronouns, determiners, conjunctions, sentence-lead verbs, and the safe-deferral
+# vocabulary. A capitalised token in this set is NOT treated as a disclosed name,
+# so a safe deferral ("check with my client Before ...", "our client Is reviewing")
+# is never falsely flagged.
+_IDENTITY_NAME_STOP = (
+    r"(?!(?:Not|No|None|Confidential|Undisclosed|Unknown|Pending|Tbd|TBD|"
+    r"Available|Still|Ready|Happy|Yes|Thanks|Thank|Sorry|Sure|Our|Ours|We|Us|"
+    r"An?|The|On|In|At|Of|For|Before|After|Once|When|While|If|So|And|But|Or|"
+    r"Who|Whom|Whose|Will|Would|Is|Are|Was|Were|Has|Have|Had|Can|Could|Should|"
+    r"May|Might|Please|Let|Looking|Actively|Currently|Growing|Great|Strong|"
+    r"Regarding|Re|I|They|Their|Them|You|Your|He|She|It|Its|This|That|These|"
+    r"Those|My|Mine|His|Her|Hers)\b)"
+)
+
+# Appositive / possessive naming WITHOUT a copula: "our client Acme Logistics",
+# "the tenant, Northstar Robotics,", "Client Northstar loves it". This is the
+# natural way an auto-reply names the client while discussing shared specs -- the
+# copula IDENTITY_DISCLOSURE_RE ("client IS Acme") does not cover it. The gap
+# between the noun and the name may only be a possessive, a comma/dash, and an
+# optional article -- never a sentence break -- so cross-sentence prose does not
+# stitch an unrelated proper noun onto an identity noun.
+IDENTITY_APPOSITION_RE = re.compile(
+    r"(?i:\b" + _IDENTITY_NOUN + r"\b)"
+    r"(?:'s)?"
+    r"\s*[,–-]?\s*"
+    r"(?:the\s+|a\s+|an\s+)?"
+    + _IDENTITY_NAME_STOP +
+    r"[A-Z][A-Za-z0-9&.'\-]+(?:\s+[A-Z][A-Za-z0-9&.'\-]+){0,3}"
+)
+
+# Bare representation naming the party without the "we ..." lead the copula-style
+# REPRESENTATION_DISCLOSURE_RE requires: "Representing Acme Logistics, ...",
+# "acting for Northstar", "on behalf of Delta Manufacturing Corp".
+REPRESENTATION_BARE_RE = re.compile(
+    r"(?i:\b(?:representing|acting\s+for|on\s+behalf\s+of)\b)\s+"
+    r"(?:the\s+|a\s+|an\s+)?"
+    + _IDENTITY_NAME_STOP +
+    r"[A-Z][A-Za-z0-9&.'\-]+"
+)
+
 # --- Fabricated approval / budget / financing details ---------------------
 APPROVAL_BUDGET_RE = re.compile(
     r"(?i:"
@@ -232,6 +274,10 @@ def contains_confidential_disclosure(body: Optional[str]) -> bool:
     if IDENTITY_DISCLOSURE_RE.search(text):
         return True
     if REPRESENTATION_DISCLOSURE_RE.search(text):
+        return True
+    if IDENTITY_APPOSITION_RE.search(text):
+        return True
+    if REPRESENTATION_BARE_RE.search(text):
         return True
     if CREDIT_DISCLOSURE_RE.search(text):
         return True

@@ -322,7 +322,7 @@
           "test_grouped_campaign_launch_refuses_ambiguous_sheet_contact_name_before_graph_send"
         ],
         "incidentId": "karsen_name_placeholder_ambiguous_source",
-        "provesBehavior": "Both tests drive the real launch path (_send_single_outbox_item and _send_multi_property_email) which calls _resolve_campaign_launch_contact_name_result_from_sheet → _contact_name_resolution_from_campaign_row; FakeSheetsClient supplies two distinct safe contact-name columns forcing the ambiguity branch, and with a [NAME] body the discriminating assertions send_and_index_email.assert_not_called() plus failureReason containing \"[NAME]\" and \"Ambiguous sheet contact/name source\" would fail if the guard silently resolved a name and sent."
+        "provesBehavior": "Both tests drive the real launch path (_send_single_outbox_item and _send_multi_property_email) which calls _resolve_campaign_launch_contact_name_result_from_sheet \u2192 _contact_name_resolution_from_campaign_row; FakeSheetsClient supplies two distinct safe contact-name columns forcing the ambiguity branch, and with a [NAME] body the discriminating assertions send_and_index_email.assert_not_called() plus failureReason containing \"[NAME]\" and \"Ambiguous sheet contact/name source\" would fail if the guard silently resolved a name and sent."
       }
     },
     "core.launch_draft": {
@@ -378,7 +378,7 @@
           "dead_letter_visible"
         ],
         "evidence": [
-          "The guard (email.py:482, gated at pre-send call sites 2532/2848/3034) returns True and routes the \"[NAME]\" body to _move_to_dead_letter with a reason naming the placeholder, matching the outbox_queued→dead_letter_visible permutation for launch_with_variable_mapping."
+          "The guard (email.py:482, gated at pre-send call sites 2532/2848/3034) returns True and routes the \"[NAME]\" body to _move_to_dead_letter with a reason naming the placeholder, matching the outbox_queued\u2192dead_letter_visible permutation for launch_with_variable_mapping."
         ],
         "testFiles": [
           "tests/test_outbox_safety.py",
@@ -389,7 +389,7 @@
           "test_send_reply_blocks_placeholder_before_graph_request"
         ],
         "incidentId": "karsen_raw_name_message",
-        "provesBehavior": "test_unresolved_name_placeholder_outbox_item_moves_to_dead_letter_before_send drives the real pre-send guard _dead_letter_unsafe_outbound_body_if_needed with an outbox script containing \"[NAME]\" and asserts blocked is True, _move_to_dead_letter fires exactly once, and its reason arg contains \"[NAME]\" — which would fail if the placeholder validator did not flag the unresolved token before send."
+        "provesBehavior": "test_unresolved_name_placeholder_outbox_item_moves_to_dead_letter_before_send drives the real pre-send guard _dead_letter_unsafe_outbound_body_if_needed with an outbox script containing \"[NAME]\" and asserts blocked is True, _move_to_dead_letter fires exactly once, and its reason arg contains \"[NAME]\" \u2014 which would fail if the placeholder validator did not flag the unresolved token before send."
       },
       "wrong_recipient": {
         "status": "covered",
@@ -416,7 +416,7 @@
         ],
         "incidentId": "wrong_recipient_launch_recipient_mismatch",
         "notes": "Initial campaign launch has no reply-all audience; reply-all CC preservation is covered separately under core.reply_all_cc / wrong_recipient. This fixture proves row-recipient mismatch, missing/invalid row metadata, and Sheets lookup failure dead-letter before Graph send.",
-        "provesBehavior": "test_campaign_launch_recipient_mismatch_dead_letters_before_graph_send drives the real _send_single_outbox_item launch path with a queued assignedEmails=[\"wrong.recipient@example.com\"] that does NOT match the sheet row email (\"bp21harrison+correct@gmail.com\"); it asserts send_and_index_email.assert_not_called() (negative control on the Graph send surface), doc deletion, and a dead-letter payload whose failureReason contains \"Queued recipient does not match sheet row\" — proving recipient identity is enforced before any send."
+        "provesBehavior": "test_campaign_launch_recipient_mismatch_dead_letters_before_graph_send drives the real _send_single_outbox_item launch path with a queued assignedEmails=[\"wrong.recipient@example.com\"] that does NOT match the sheet row email (\"bp21harrison+correct@gmail.com\"); it asserts send_and_index_email.assert_not_called() (negative control on the Graph send surface), doc deletion, and a dead-letter payload whose failureReason contains \"Queued recipient does not match sheet row\" \u2014 proving recipient identity is enforced before any send."
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -492,7 +492,7 @@
           "live_waiting"
         ],
         "evidence": [
-          "Under a dashboard (manual_user_continuation) send, the finalizer deletes the outbox doc, writes the actionAudit status=\"sent\", deletes the notification, and resumes the thread to active/waiting — each asserted explicitly against a FakeFirestore capturing the real set/delete calls."
+          "Under a dashboard (manual_user_continuation) send, the finalizer deletes the outbox doc, writes the actionAudit status=\"sent\", deletes the notification, and resumes the thread to active/waiting \u2014 each asserted explicitly against a FakeFirestore capturing the real set/delete calls."
         ],
         "testFiles": [
           "tests/test_action_audit_backend.py",
@@ -547,7 +547,7 @@
         "testIds": [
           "test_unresolved_name_placeholder_outbox_item_moves_to_dead_letter_before_send"
         ],
-        "provesBehavior": "It drives the real send-path guard _dead_letter_unsafe_outbound_body_if_needed with a script containing the unresolved placeholder \"[NAME]\", and asserts blocked=True, _move_to_dead_letter called exactly once, and the dead-letter reason contains \"[NAME]\" — all of which would fail if the placeholder validation guard were removed."
+        "provesBehavior": "It drives the real send-path guard _dead_letter_unsafe_outbound_body_if_needed with a script containing the unresolved placeholder \"[NAME]\", and asserts blocked=True, _move_to_dead_letter called exactly once, and the dead-letter reason contains \"[NAME]\" \u2014 all of which would fail if the placeholder validation guard were removed."
       },
       "wrong_recipient": {
         "status": "covered",
@@ -576,7 +576,7 @@
         ],
         "incidentId": "wrong_recipient_safety_block",
         "notes": "The generic outbox sender now fails closed for campaign-launch row-recipient mismatch, missing/invalid row metadata, Sheets lookup failure, and grouped send row-anchor refresh drift before Graph. It also reuses stable sheet metadata within a batch while fetching each target row fresh. Manual reply/reply-all recipient risk remains covered by core.manual_reply and core.reply_all_cc cells.",
-        "provesBehavior": "test_campaign_launch_recipient_mismatch_dead_letters_before_graph_send drives the real _send_single_outbox_item with queued recipient wrong.recipient@example.com against a sheet row resolving to bp21harrison+correct@gmail.com, and asserts the negative control send_and_index_email.assert_not_called() plus a dead_lettered payload reading \"Queued recipient does not match sheet row\" — failing if the email.py:473 recipient guard were removed; the grouped test proves the same guard on _send_multi_property_email."
+        "provesBehavior": "test_campaign_launch_recipient_mismatch_dead_letters_before_graph_send drives the real _send_single_outbox_item with queued recipient wrong.recipient@example.com against a sheet row resolving to bp21harrison+correct@gmail.com, and asserts the negative control send_and_index_email.assert_not_called() plus a dead_lettered payload reading \"Queued recipient does not match sheet row\" \u2014 failing if the email.py:473 recipient guard were removed; the grouped test proves the same guard on _send_multi_property_email."
       },
       "manual_continuation": {
         "status": "covered",
@@ -631,7 +631,7 @@
           "test_retry_with_matching_sent_item_moves_to_reconciliation_without_resending"
         ],
         "incidentId": "graph_accepted_index_missing",
-        "provesBehavior": "Both tests drive the real email_module._send_single_outbox_item; test_retry_with_matching_sent_item asserts send_and_index_email.assert_not_called() when find_matching_sent_message_for_retry returns a prior Graph send (attempts=1 after a read-timeout), and test_graph_accepted_unindexed asserts doc.reference.set_calls==[] (no re-queue/retry) when Graph accepted but indexing failed — each would fail if the no-resend dedup guard were removed, and both route the item to needs_reconciliation with alreadySent=True instead of resending."
+        "provesBehavior": "Both tests drive the real email_module._send_single_outbox_item; test_retry_with_matching_sent_item asserts send_and_index_email.assert_not_called() when find_matching_sent_message_for_retry returns a prior Graph send (attempts=1 after a read-timeout), and test_graph_accepted_unindexed asserts doc.reference.set_calls==[] (no re-queue/retry) when Graph accepted but indexing failed \u2014 each would fail if the no-resend dedup guard were removed, and both route the item to needs_reconciliation with alreadySent=True instead of resending."
       },
       "operator_visible_failure": {
         "status": "covered",
@@ -805,7 +805,7 @@
           "dead_letter_visible"
         ],
         "evidence": [
-          "test_dashboard_thread_reply_deletes_created_draft_when_all_recipients_filtered drives email_module._send_outbox_as_reply where an opted-out CC leaves zero safe recipients, asserting result[\"sent\"] False, result[\"error\"]==\"Reply-all draft has no safe recipients after filtering\", and draft reply-draft-1 is deleted — matching production followup.py:789-792 and email.py:1244, so the reply-all CC filter fails closed with a visible error and cleans up the orphaned draft."
+          "test_dashboard_thread_reply_deletes_created_draft_when_all_recipients_filtered drives email_module._send_outbox_as_reply where an opted-out CC leaves zero safe recipients, asserting result[\"sent\"] False, result[\"error\"]==\"Reply-all draft has no safe recipients after filtering\", and draft reply-draft-1 is deleted \u2014 matching production followup.py:789-792 and email.py:1244, so the reply-all CC filter fails closed with a visible error and cleans up the orphaned draft."
         ],
         "testFiles": [
           "tests/test_followup_terminal_state.py",
@@ -815,7 +815,7 @@
           "test_followup_reply_all_filter_failure_deletes_draft_and_fails_closed",
           "test_dashboard_thread_reply_deletes_created_draft_when_all_recipients_filtered"
         ],
-        "provesBehavior": "test_followup_reply_all_filter_failure_deletes_draft_and_fails_closed drives real followup._send_followup_email: after createReplyAll returns draft reply-draft-1, is_contact_opted_out raises during CC filtering, and the test asserts the draft is DELETEd (url ends /reply-draft-1), result False, last_error contains \"Could not filter reply-all recipients\", guard_failed_closed True; fake_post raises AssertionError if any send is attempted post-failure — a negative control proving no silent send."
+        "provesBehavior": "test_followup_reply_all_filter_failure_deletes_draft_and_fails_closed drives real followup._send_followup_email: after createReplyAll returns draft reply-draft-1, is_contact_opted_out raises during CC filtering, and the test asserts the draft is DELETEd (url ends /reply-draft-1), result False, last_error contains \"Could not filter reply-all recipients\", guard_failed_closed True; fake_post raises AssertionError if any send is attempted post-failure \u2014 a negative control proving no silent send."
       }
     },
     "core.manual_reply": {
@@ -841,7 +841,7 @@
         "testIds": [
           "test_dashboard_manual_reply_success_records_audit_after_graph_reply"
         ],
-        "provesBehavior": "Driving the real email_module._send_single_outbox_item on a source=\"dashboard_manual_reply\" outbox doc with the Graph send stubbed to succeed, the test asserts _send_outbox_as_reply and _save_outbox_reply_message each fire once, the doc is deleted, and the audit record persisted (set_calls[-2]) carries status==\"sent\" plus the Graph reply's sentMessageId \"graph-reply-message-1\" and internetMessageId — metadata that only lands if the manual reply records its audit AFTER the Graph reply — with the final thread write flipping to active/waiting."
+        "provesBehavior": "Driving the real email_module._send_single_outbox_item on a source=\"dashboard_manual_reply\" outbox doc with the Graph send stubbed to succeed, the test asserts _send_outbox_as_reply and _save_outbox_reply_message each fire once, the doc is deleted, and the audit record persisted (set_calls[-2]) carries status==\"sent\" plus the Graph reply's sentMessageId \"graph-reply-message-1\" and internetMessageId \u2014 metadata that only lands if the manual reply records its audit AFTER the Graph reply \u2014 with the final thread write flipping to active/waiting."
       },
       "terminal_state": {
         "status": "covered",
@@ -939,7 +939,7 @@
         "testIds": [
           "test_dashboard_manual_reply_retry_blocks_when_user_manually_continued"
         ],
-        "provesBehavior": "It drives the real email_module._send_single_outbox_item on a source=dashboard_manual_reply doc (attempts=1 retry) where find_sent_conversation_continuation_for_retry returns a manual_continuation object, then asserts send_outbox_as_reply.assert_not_called() (the discriminating negative control) plus dead-letter failureReason containing \"manually continued\" — proving the automated reply defers rather than double-acting on a human continuation."
+        "provesBehavior": "It drives the real email_module._send_single_outbox_item on a source=dashboard_manual_reply doc (attempts=1 retry) where find_sent_conversation_continuation_for_retry returns a manual_continuation object, then asserts send_outbox_as_reply.assert_not_called() (the discriminating negative control) plus dead-letter failureReason containing \"manually continued\" \u2014 proving the automated reply defers rather than double-acting on a human continuation."
       },
       "duplicate_retry": {
         "status": "covered",
@@ -979,7 +979,7 @@
           "dead_letter_visible"
         ],
         "evidence": [
-          "On a Graph 500 send failure the manual-reply item is not deleted and its notification is not decremented; instead the outbox doc is set to status \"retrying\" with attempts=1, processingBy=None, lastError containing \"Graph 500\", and a matching audit record (status \"retrying\", outboxId, lastError) is written — a visible dead-letter/retry signal rather than a silent drop."
+          "On a Graph 500 send failure the manual-reply item is not deleted and its notification is not decremented; instead the outbox doc is set to status \"retrying\" with attempts=1, processingBy=None, lastError containing \"Graph 500\", and a matching audit record (status \"retrying\", outboxId, lastError) is written \u2014 a visible dead-letter/retry signal rather than a silent drop."
         ],
         "testFiles": [
           "tests/test_outbox_safety.py"
@@ -987,7 +987,7 @@
         "testIds": [
           "test_dashboard_manual_reply_failure_remains_visible_for_operator_retry"
         ],
-        "provesBehavior": "On a Graph 500 send failure the manual-reply item is not deleted and its notification is not decremented; instead the outbox doc is set to status \"retrying\" with attempts=1, processingBy=None, lastError containing \"Graph 500\", and a matching audit record (status \"retrying\", outboxId, lastError) is written — a visible dead-letter/retry signal rather than a silent drop."
+        "provesBehavior": "On a Graph 500 send failure the manual-reply item is not deleted and its notification is not decremented; instead the outbox doc is set to status \"retrying\" with attempts=1, processingBy=None, lastError containing \"Graph 500\", and a matching audit record (status \"retrying\", outboxId, lastError) is written \u2014 a visible dead-letter/retry signal rather than a silent drop."
       }
     },
     "core.inbox_matching": {
@@ -1103,7 +1103,7 @@
           "retry_reconciled"
         ],
         "evidence": [
-          "Exercising the real messaging.has_processed/mark_processed (only Firestore _fs is faked), it proves the same inbound message reports unprocessed then processed after one mark, and reprocessing it writes exactly one processed-marker doc — so a retry is idempotent and cannot double-act, while a different message id remains unaffected."
+          "Exercising the real messaging.has_processed/mark_processed (only Firestore _fs is faked), it proves the same inbound message reports unprocessed then processed after one mark, and reprocessing it writes exactly one processed-marker doc \u2014 so a retry is idempotent and cannot double-act, while a different message id remains unaffected."
         ],
         "testFiles": [
           "tests/test_rubric_core_inbox_matching_duplicate_retry.py"
@@ -1111,7 +1111,7 @@
         "testIds": [
           "test_duplicate_inbound_message_marks_processed_once_and_is_idempotent"
         ],
-        "provesBehavior": "Exercising the real messaging.has_processed/mark_processed (only Firestore _fs is faked), it proves the same inbound message reports unprocessed then processed after one mark, and reprocessing it writes exactly one processed-marker doc — so a retry is idempotent and cannot double-act, while a different message id remains unaffected."
+        "provesBehavior": "Exercising the real messaging.has_processed/mark_processed (only Firestore _fs is faked), it proves the same inbound message reports unprocessed then processed after one mark, and reprocessing it writes exactly one processed-marker doc \u2014 so a retry is idempotent and cannot double-act, while a different message id remains unaffected."
       },
       "operator_visible_failure": {
         "status": "needs_live_proof",
@@ -1155,7 +1155,7 @@
         "testIds": [
           "test_auto_thread_reply_preserves_safe_cc_with_reply_all_draft"
         ],
-        "provesBehavior": "Drives the real processing.send_reply_in_thread to a successful end-to-end auto-reply: it posts /createReplyAll, PATCHes then /send (202) returning sent=True, asserts the reply-all draft path is chosen while /reply is never called (negative control), and that the Graph-returned CC is filtered so the account's own address baylor.freelance@outlook.com is dropped, leaving ccRecipients==[\"baylor@manifoldengineering.ai\"] in both the patch payload and the saved message — which would fail if safe-CC filtering were removed."
+        "provesBehavior": "Drives the real processing.send_reply_in_thread to a successful end-to-end auto-reply: it posts /createReplyAll, PATCHes then /send (202) returning sent=True, asserts the reply-all draft path is chosen while /reply is never called (negative control), and that the Graph-returned CC is filtered so the account's own address baylor.freelance@outlook.com is dropped, leaving ccRecipients==[\"baylor@manifoldengineering.ai\"] in both the patch payload and the saved message \u2014 which would fail if safe-CC filtering were removed."
       },
       "terminal_state": {
         "status": "needs_fixture",
@@ -1177,8 +1177,8 @@
           "email"
         ],
         "incidentId": "no_tour_scheduling_core_lane",
-        "gapReason": "Neither cited test exercises a terminal (stopped/cancelled/completed) thread. test_non_allowlisted_user_tour_offer_creates_no_tour_action runs on an ACTIVE thread (helper patches get_thread_status to THREAD_STATUS[\"active\"] at line 189; thread data status is \"active\" at line 374) and proves ALLOWLIST gating for inbound replies — the tour offer creates no action because the user is non-allowlisted, a wrong_recipient/allowlist guard, not terminal-state suppression. test_normal_campaign_tour_language_moves_to_dead_letter_before_send drives _dead_letter_unsafe_outbound_body_if_needed on a live campaign_creation OUTBOX item and proves outbound tour/LOI content-policy dead-lettering (asserts \"Tour/LOI\" reason) — this is the outbound send-safety feature, not core.inbox_auto_reply, and the item is not terminal. No test drives the inbox auto-reply path on a terminal thread and asserts the send/write is suppressed BECAUSE the thread is terminal.",
-        "nextProof": "Add a test that sets the thread status to THREAD_STATUS[\"stopped\"] (or cancelled/completed), feeds a normal inbound broker reply through the inbox auto-reply processing path, and asserts sendReply.assert_not_called() plus no state mutation (moveRow/statusUpdate not called) SPECIFICALLY due to the terminal status — paired with a positive control showing the identical reply on an active, allowlisted thread WOULD send, so the assertion fails if the terminal-state guard is removed."
+        "gapReason": "Neither cited test exercises a terminal (stopped/cancelled/completed) thread. test_non_allowlisted_user_tour_offer_creates_no_tour_action runs on an ACTIVE thread (helper patches get_thread_status to THREAD_STATUS[\"active\"] at line 189; thread data status is \"active\" at line 374) and proves ALLOWLIST gating for inbound replies \u2014 the tour offer creates no action because the user is non-allowlisted, a wrong_recipient/allowlist guard, not terminal-state suppression. test_normal_campaign_tour_language_moves_to_dead_letter_before_send drives _dead_letter_unsafe_outbound_body_if_needed on a live campaign_creation OUTBOX item and proves outbound tour/LOI content-policy dead-lettering (asserts \"Tour/LOI\" reason) \u2014 this is the outbound send-safety feature, not core.inbox_auto_reply, and the item is not terminal. No test drives the inbox auto-reply path on a terminal thread and asserts the send/write is suppressed BECAUSE the thread is terminal.",
+        "nextProof": "Add a test that sets the thread status to THREAD_STATUS[\"stopped\"] (or cancelled/completed), feeds a normal inbound broker reply through the inbox auto-reply processing path, and asserts sendReply.assert_not_called() plus no state mutation (moveRow/statusUpdate not called) SPECIFICALLY due to the terminal status \u2014 paired with a positive control showing the identical reply on an active, allowlisted thread WOULD send, so the assertion fails if the terminal-state guard is removed."
       },
       "bad_placeholder": {
         "status": "covered",
@@ -1217,7 +1217,7 @@
           "automated",
           "email"
         ],
-        "gapReason": "The test enforces a user-account auto-reply policy gate (SITESIFT_AUTO_REPLY_ALLOWLIST keyed on user_id=\"regular-user\" not being allowlisted), not recipient identity. The recipient \"broker@example.com\" is passed but never validated or asserted against; the block fires on the user_id allowlist before any recipient handling, so the negative control (Graph patched to raise) proves the auto-reply-disabled policy, not that the feature refuses a wrong recipient. Wrong fixture class — this is a policy/authorization gate, not wrong_recipient enforcement.",
+        "gapReason": "The test enforces a user-account auto-reply policy gate (SITESIFT_AUTO_REPLY_ALLOWLIST keyed on user_id=\"regular-user\" not being allowlisted), not recipient identity. The recipient \"broker@example.com\" is passed but never validated or asserted against; the block fires on the user_id allowlist before any recipient handling, so the negative control (Graph patched to raise) proves the auto-reply-disabled policy, not that the feature refuses a wrong recipient. Wrong fixture class \u2014 this is a policy/authorization gate, not wrong_recipient enforcement.",
         "nextProof": "A test that drives send_reply_in_thread for an ALLOWLISTED user where the resolved/reviewed reply-all recipient set diverges from the intended/source-message recipient (e.g., a stale or injected toRecipients address), asserting that the divergent/wrong address is corrected or the send is blocked before reaching Graph createReplyAll/send, with a negative control (requests.post/exponential_backoff_request) that the wrong recipient address never reaches the Graph surface."
       },
       "manual_continuation": {
@@ -1243,7 +1243,7 @@
           "test_retry_blocks_when_conversation_was_manually_continued",
           "test_scan_skips_inbox_retry_when_user_manually_continued_conversation"
         ],
-        "provesBehavior": "test_scan_skips_inbox_retry_when_user_manually_continued_conversation drives the real scan_inbox_against_index; with a Sent-Items manual continuation present it asserts process_inbox_message is never called (no re-auto-reply), the continuation guard ran with the correct conversation_id/sent_after, the block is recorded, and skipped==1 — the pending-responses twin uses send_reply_in_thread raising AssertionError as its negative control."
+        "provesBehavior": "test_scan_skips_inbox_retry_when_user_manually_continued_conversation drives the real scan_inbox_against_index; with a Sent-Items manual continuation present it asserts process_inbox_message is never called (no re-auto-reply), the continuation guard ran with the correct conversation_id/sent_after, the block is recorded, and skipped==1 \u2014 the pending-responses twin uses send_reply_in_thread raising AssertionError as its negative control."
       },
       "duplicate_retry": {
         "status": "covered",
@@ -1358,8 +1358,8 @@
           "firestore"
         ],
         "incidentId": "tour_unavailable_property_stays_viable",
-        "gapReason": "Neither test exercises a terminal thread. Test 1 (test_tour_unavailable_reply_does_not_mark_property_unavailable) drives _augment_events_with_deterministic_signals with no thread state at all — it only proves event-class disambiguation (property_unavailable re-classified to tour_requested/tour_unavailable). Test 2 (test_tour_invite_unavailable_process_does_not_move_row_or_stop_property) runs against a thread with status=THREAD_STATUS['active'] (explicitly non-terminal); it asserts moveRow/stopThreads NOT called (preventing termination) while itself performing a live write (tourInvite.status='tour_unavailable') and emitting a notification. Neither seeds a stopped/completed/paused_manual_review state, and neither asserts that a terminal thread suppresses a live send/write — the opposite of the terminal_state semantic.",
-        "nextProof": "A test that seeds the thread_ref with status=THREAD_STATUS['stopped'] (and variants completed / paused_manual_review), feeds a broker_property_unavailable or broker_tour_unavailable event through the classifier/processor, and asserts NO live mutation occurs because the thread is already terminal: sendReply.assert_not_called(), moveRow.assert_not_called(), stopThreads.assert_not_called(), and no write to tourInvite.status/statusUpdates — with a negative control that the same event on an active thread DOES act."
+        "gapReason": "Neither test exercises a terminal thread. Test 1 (test_tour_unavailable_reply_does_not_mark_property_unavailable) drives _augment_events_with_deterministic_signals with no thread state at all \u2014 it only proves event-class disambiguation (property_unavailable re-classified to tour_requested/tour_unavailable). Test 2 (test_tour_invite_unavailable_process_does_not_move_row_or_stop_property) runs against a thread with status=THREAD_STATUS['active'] (explicitly non-terminal); it asserts moveRow/stopThreads NOT called (preventing termination) while itself performing a live write (tourInvite.status='tour_unavailable') and emitting a notification. Neither seeds a stopped/completed/paused_manual_review state, and neither asserts that a terminal thread suppresses a live send/write \u2014 the opposite of the terminal_state semantic.",
+        "nextProof": "A test that seeds the thread_ref with status=THREAD_STATUS['stopped'] (and variants completed / paused_manual_review), feeds a broker_property_unavailable or broker_tour_unavailable event through the classifier/processor, and asserts NO live mutation occurs because the thread is already terminal: sendReply.assert_not_called(), moveRow.assert_not_called(), stopThreads.assert_not_called(), and no write to tourInvite.status/statusUpdates \u2014 with a negative control that the same event on an active thread DOES act."
       },
       "bad_placeholder": {
         "status": "needs_fixture",
@@ -1436,7 +1436,7 @@
           "retry_reconciled"
         ],
         "evidence": [
-          "It proves that a re-detected identical event produces the same dedup key from messaging.build_event_key, so messaging.is_event_handled reports it already handled after one messaging.mark_event_handled call — the retry cannot fire the event twice, and an unrelated event's record is preserved (not clobbered) by the dotted-field merge."
+          "It proves that a re-detected identical event produces the same dedup key from messaging.build_event_key, so messaging.is_event_handled reports it already handled after one messaging.mark_event_handled call \u2014 the retry cannot fire the event twice, and an unrelated event's record is preserved (not clobbered) by the dotted-field merge."
         ],
         "testFiles": [
           "tests/test_rubric_core_event_classifier_duplicate_retry.py"
@@ -1444,7 +1444,7 @@
         "testIds": [
           "test_same_event_is_not_handled_twice_across_retry"
         ],
-        "provesBehavior": "It proves that a re-detected identical event produces the same dedup key from messaging.build_event_key, so messaging.is_event_handled reports it already handled after one messaging.mark_event_handled call — the retry cannot fire the event twice, and an unrelated event's record is preserved (not clobbered) by the dotted-field merge."
+        "provesBehavior": "It proves that a re-detected identical event produces the same dedup key from messaging.build_event_key, so messaging.is_event_handled reports it already handled after one messaging.mark_event_handled call \u2014 the retry cannot fire the event twice, and an unrelated event's record is preserved (not clobbered) by the dotted-field merge."
       },
       "operator_visible_failure": {
         "status": "needs_fixture",
@@ -1782,7 +1782,7 @@
           "test_weekday_followup_window_is_unchanged",
           "test_auto_response_reschedules_paused_active_thread"
         ],
-        "provesBehavior": "test_auto_response_reschedules_paused_active_thread drives the real followup.schedule_followup_after_auto_response against a paused/active thread that has an inbound reply, and asserts the reschedule succeeds (result True) while flipping followUpStatus paused->waiting, clearing hasInboundReply to False, nulling followUpConfig.pausedAt, and writing a fresh followUpConfig.nextFollowUpAt — assertions that fail if the resume/reschedule logic were removed."
+        "provesBehavior": "test_auto_response_reschedules_paused_active_thread drives the real followup.schedule_followup_after_auto_response against a paused/active thread that has an inbound reply, and asserts the reschedule succeeds (result True) while flipping followUpStatus paused->waiting, clearing hasInboundReply to False, nulling followUpConfig.pausedAt, and writing a fresh followUpConfig.nextFollowUpAt \u2014 assertions that fail if the resume/reschedule logic were removed."
       },
       "terminal_state": {
         "status": "covered",
@@ -1852,7 +1852,7 @@
           "test_followup_blocks_opted_out_recipient_before_graph_send",
           "test_followup_preserves_safe_ccs_with_reply_all_draft"
         ],
-        "provesBehavior": "Both tests drive the real followup._send_followup_email: blocks_opted_out_recipient patches is_contact_opted_out to a reason and asserts post.assert_not_called() plus guard_failed_closed (negative control — no Graph send reaches the opted-out recipient); preserves_safe_ccs asserts _filter_reply_all_draft_recipients strips the operator address so ccRecipients is exactly [\"assistant@example.com\"] in both the PATCH payload and the saved followup, dropping baylor.freelance@outlook.com before send."
+        "provesBehavior": "Both tests drive the real followup._send_followup_email: blocks_opted_out_recipient patches is_contact_opted_out to a reason and asserts post.assert_not_called() plus guard_failed_closed (negative control \u2014 no Graph send reaches the opted-out recipient); preserves_safe_ccs asserts _filter_reply_all_draft_recipients strips the operator address so ccRecipients is exactly [\"assistant@example.com\"] in both the PATCH payload and the saved followup, dropping baylor.freelance@outlook.com before send."
       },
       "manual_continuation": {
         "status": "covered",
@@ -1875,7 +1875,7 @@
           "test_failed_followup_retry_blocks_when_conversation_was_manually_continued"
         ],
         "incidentId": "manual_sent_items_suppresses_followup",
-        "provesBehavior": "It drives the real followup._send_followup_email retry path with find_matching_sent_message_for_retry returning None and find_sent_conversation_continuation_for_retry (invoked at followup.py line 678) returning a continuation, then asserts result is False, post.assert_not_called(), guard_failed_closed True, and error containing \"manually continued\" — proving the followup suppresses its send when Sent Items shows the user manually continued the thread."
+        "provesBehavior": "It drives the real followup._send_followup_email retry path with find_matching_sent_message_for_retry returning None and find_sent_conversation_continuation_for_retry (invoked at followup.py line 678) returning a continuation, then asserts result is False, post.assert_not_called(), guard_failed_closed True, and error containing \"manually continued\" \u2014 proving the followup suppresses its send when Sent Items shows the user manually continued the thread."
       },
       "duplicate_retry": {
         "status": "covered",
@@ -1898,7 +1898,7 @@
           "test_failed_followup_retry_uses_sent_items_match_without_resending",
           "test_failed_followup_retry_blocks_when_sent_items_lookup_fails"
         ],
-        "provesBehavior": "On a retry after an uncertain send (followup_config carries lastSendError \"Read timed out after Graph accepted send\"), the real followup._send_followup_email consults find_matching_sent_message_for_retry; when a Sent Items match is returned it reconciles via _save_followup_message (called once) and clears lastSendError to None WITHOUT resending, proven by the discriminating negative control post.assert_not_called() plus result True — and the sibling test proves it fails closed (result False, no post, guard_failed_closed) when the dedup lookup raises SentMailGuardLookupError."
+        "provesBehavior": "On a retry after an uncertain send (followup_config carries lastSendError \"Read timed out after Graph accepted send\"), the real followup._send_followup_email consults find_matching_sent_message_for_retry; when a Sent Items match is returned it reconciles via _save_followup_message (called once) and clears lastSendError to None WITHOUT resending, proven by the discriminating negative control post.assert_not_called() plus result True \u2014 and the sibling test proves it fails closed (result False, no post, guard_failed_closed) when the dedup lookup raises SentMailGuardLookupError."
       },
       "operator_visible_failure": {
         "status": "covered",
@@ -1959,7 +1959,7 @@
           "stopped"
         ],
         "evidence": [
-          "For a cancel_requested outbox item the automation performs zero Graph send (send_and_index_email never called), deletes the outbox doc, and finalizes the linked action audit to status \"cancelled\" — proving terminal-state suppression with no live send/write mutation."
+          "For a cancel_requested outbox item the automation performs zero Graph send (send_and_index_email never called), deletes the outbox doc, and finalizes the linked action audit to status \"cancelled\" \u2014 proving terminal-state suppression with no live send/write mutation."
         ],
         "testFiles": [
           "tests/test_action_audit_backend.py",
@@ -2096,7 +2096,7 @@
           "test_professional_mode_uses_user_signature_when_present",
           "test_send_outboxes_resolves_structured_professional_signature_before_send"
         ],
-        "provesBehavior": "test_send_outboxes_resolves_structured_professional_signature_before_send drives the real send_outboxes pipeline against a Firestore user record holding both stale cached emailSignature HTML and structured professionalSignature fields, captures the user_signature handed to _send_single_outbox_item, and asserts it contains \"John Doe\"/\"Example Realty Advisors\" while assertNotIn \"Jill Ames\"/\"jill.ames@mohrpartners.com\" — a negative control that fails if resolution fell back to stale cached HTML."
+        "provesBehavior": "test_send_outboxes_resolves_structured_professional_signature_before_send drives the real send_outboxes pipeline against a Firestore user record holding both stale cached emailSignature HTML and structured professionalSignature fields, captures the user_signature handed to _send_single_outbox_item, and asserts it contains \"John Doe\"/\"Example Realty Advisors\" while assertNotIn \"Jill Ames\"/\"jill.ames@mohrpartners.com\" \u2014 a negative control that fails if resolution fell back to stale cached HTML."
       },
       "terminal_state": {
         "status": "needs_fixture",
@@ -2131,8 +2131,8 @@
           "automated",
           "email"
         ],
-        "gapReason": "Neither claimed test exercises the bad_placeholder scenario (an unresolved \"[NAME]\"-style template token sanitized/blocked before the send surface). Test 1 (test_signature_footer.py:39) feeds an EMPTY signature string (\"\") into get_email_footer/needs_signature_attachments and asserts no hardcoded \"Jill Ames\" fallback — that is an identity-default-leakage guard, not a placeholder-blocking guard; no unresolved placeholder token is ever supplied. Test 2 (test_whitelabel_defaults.py:9) reads ai_processing.py as plain text and asserts two substrings are absent — it drives no signature code path and makes no runtime assertion, proving only that the AI prompt does not mimic Jill's writing style. No test passes an unresolved placeholder into build_professional_signature_html/get_email_footer/format_email_body_with_footer and asserts it is stripped before reaching Graph.",
-        "nextProof": "Add a test that supplies a professional-signature field or signature body containing an unresolved template placeholder (e.g. name=\"[NAME]\", company=\"[COMPANY]\", or a raw \"[FIRST_NAME]\" token) to build_professional_signature_html / get_email_footer / format_email_body_with_footer, and asserts the literal bracketed placeholder does NOT appear in the returned footer/HTML (sanitized or blocked) before the send surface — with a negative control showing a resolved real value (e.g. name=\"Drew Ingram\") passes through unchanged, so the assertion would fail if the sanitization guard were removed."
+        "gapReason": "Neither claimed test exercises the bad_placeholder scenario (an unresolved \"[NAME]\"-style template token sanitized/blocked before the send surface). Test 1 (test_signature_footer.py:39) feeds an EMPTY signature string (\"\") into get_email_footer/needs_signature_attachments and asserts no hardcoded \"Jill Ames\" fallback \u2014 that is an identity-default-leakage guard, not a placeholder-blocking guard; no unresolved placeholder token is ever supplied. Test 2 (test_whitelabel_defaults.py:9) reads ai_processing.py as plain text and asserts two substrings are absent \u2014 it drives no signature code path and makes no runtime assertion, proving only that the AI prompt does not mimic Jill's writing style. No test passes an unresolved placeholder into build_professional_signature_html/get_email_footer/format_email_body_with_footer and asserts it is stripped before reaching Graph.",
+        "nextProof": "Add a test that supplies a professional-signature field or signature body containing an unresolved template placeholder (e.g. name=\"[NAME]\", company=\"[COMPANY]\", or a raw \"[FIRST_NAME]\" token) to build_professional_signature_html / get_email_footer / format_email_body_with_footer, and asserts the literal bracketed placeholder does NOT appear in the returned footer/HTML (sanitized or blocked) before the send surface \u2014 with a negative control showing a resolved real value (e.g. name=\"Drew Ingram\") passes through unchanged, so the assertion would fail if the sanitization guard were removed."
       },
       "wrong_recipient": {
         "status": "covered",
@@ -2162,7 +2162,7 @@
           "test_send_outboxes_resolves_structured_professional_signature_before_send",
           "test_cached_jill_mohr_signature_is_not_leaked_to_unrelated_sender"
         ],
-        "provesBehavior": "test_send_reply_in_thread_rejects_stale_jill_custom_signature_before_graph_patch drives real processing.send_reply_in_thread with a Firestore profile holding a stale Jill Ames/MOHR custom emailSignature, captures the actual Graph PATCH body, and asserts it contains \"Hi Avery\" but not \"Jill Ames\"/\"jill.ames@mohrpartners.com\"/\"Mohr Partners, Inc.\" — a negative control that fails if the foreign-identity guard is removed."
+        "provesBehavior": "test_send_reply_in_thread_rejects_stale_jill_custom_signature_before_graph_patch drives real processing.send_reply_in_thread with a Firestore profile holding a stale Jill Ames/MOHR custom emailSignature, captures the actual Graph PATCH body, and asserts it contains \"Hi Avery\" but not \"Jill Ames\"/\"jill.ames@mohrpartners.com\"/\"Mohr Partners, Inc.\" \u2014 a negative control that fails if the foreign-identity guard is removed."
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -2330,7 +2330,7 @@
         "testIds": [
           "test_requeue_refuses_manual_continuation_without_sent_items_lookup"
         ],
-        "provesBehavior": "Drives the real resolve_dead_letter_item on a dead-letter whose failureReason says the user \"manually continued this conversation\"; asserts code==\"blocked_manual_continuation\", that the requeue writes no outbox item (add_calls==[]), and the negative control sent_guard.assert_not_called() proving the manual-continuation guard (_is_manual_continuation_dead_letter, line 218) short-circuits before the Sent-Items lookup — the recovery defers instead of double-acting."
+        "provesBehavior": "Drives the real resolve_dead_letter_item on a dead-letter whose failureReason says the user \"manually continued this conversation\"; asserts code==\"blocked_manual_continuation\", that the requeue writes no outbox item (add_calls==[]), and the negative control sent_guard.assert_not_called() proving the manual-continuation guard (_is_manual_continuation_dead_letter, line 218) short-circuits before the Sent-Items lookup \u2014 the recovery defers instead of double-acting."
       },
       "duplicate_retry": {
         "status": "covered",
@@ -2344,7 +2344,7 @@
           "retry_reconciled"
         ],
         "evidence": [
-          "On a retry where a matching sent message already exists, the recovery path writes zero new outbox documents (add_calls empty) and instead records an idempotent reconciliation, versus the sibling test where match=None does populate add_calls — the negative control proving the dedup guard gates the duplicate."
+          "On a retry where a matching sent message already exists, the recovery path writes zero new outbox documents (add_calls empty) and instead records an idempotent reconciliation, versus the sibling test where match=None does populate add_calls \u2014 the negative control proving the dedup guard gates the duplicate."
         ],
         "testFiles": [
           "tests/test_dead_letter_recovery.py"
@@ -2366,7 +2366,7 @@
           "dead_letter_visible"
         ],
         "evidence": [
-          "On a token/Graph failure both functions fail closed and emit a visible signal — no new outbox add (no resend) plus recoveryStatus=\"blocked_guard_unreadable\" on the dead-letter doc, and health status=\"error\" with the specific token error surfaced — assertions that would fail if the guard/escalation were removed."
+          "On a token/Graph failure both functions fail closed and emit a visible signal \u2014 no new outbox add (no resend) plus recoveryStatus=\"blocked_guard_unreadable\" on the dead-letter doc, and health status=\"error\" with the specific token error surfaced \u2014 assertions that would fail if the guard/escalation were removed."
         ],
         "testFiles": [
           "tests/test_dead_letter_recovery.py",
@@ -2403,7 +2403,7 @@
           "test_scheduled_runs_process_all_token_users",
           "test_unexpired_lease_blocks_second_runner"
         ],
-        "provesBehavior": "test_scheduled_runs_process_all_token_users drives the real resolve_scheduler_user_ids() from email_automation.scheduler_scope with GITHUB_EVENT_NAME=\"schedule\" and cleared scope env, asserting mode==\"all\" AND user_ids==[JILL_UID, BAYLOR_UID] — an assertion that fails if the scope guard narrowed the set instead of fanning out to all token users."
+        "provesBehavior": "test_scheduled_runs_process_all_token_users drives the real resolve_scheduler_user_ids() from email_automation.scheduler_scope with GITHUB_EVENT_NAME=\"schedule\" and cleared scope env, asserting mode==\"all\" AND user_ids==[JILL_UID, BAYLOR_UID] \u2014 an assertion that fails if the scope guard narrowed the set instead of fanning out to all token users."
       },
       "terminal_state": {
         "status": "needs_fixture",
@@ -2420,8 +2420,8 @@
           "automated",
           "firestore"
         ],
-        "gapReason": "The cited test proves user-scope resolution (resolve_scheduler_user_ids returns mode=\"dev_scoped\", user_ids=[BAYLOR_UID] when the emergency dev-scope env vars are set on a schedule event) — a scoping/happy-path behavior about WHICH USERS get processed. It exercises no terminal_state semantics: there is no stopped/cancelled/completed thread or campaign, no \"stopped\" state permutation, and no assertion that any live send/write mutation is suppressed on a terminal item. \"Emergency scoped to Baylor\" is user allowlisting, not terminal-state finalization. Wrong fixture class.",
-        "nextProof": "A test that constructs a thread/campaign in a terminal (\"stopped\") state, invokes the scheduler's followup_due processing path over it, and asserts (with a negative control) that NO email send / sheet write is issued for that terminal item — i.e. the Graph/send surface is not called and the item is safely finalized/skipped."
+        "gapReason": "The cited test proves user-scope resolution (resolve_scheduler_user_ids returns mode=\"dev_scoped\", user_ids=[BAYLOR_UID] when the emergency dev-scope env vars are set on a schedule event) \u2014 a scoping/happy-path behavior about WHICH USERS get processed. It exercises no terminal_state semantics: there is no stopped/cancelled/completed thread or campaign, no \"stopped\" state permutation, and no assertion that any live send/write mutation is suppressed on a terminal item. \"Emergency scoped to Baylor\" is user allowlisting, not terminal-state finalization. Wrong fixture class.",
+        "nextProof": "A test that constructs a thread/campaign in a terminal (\"stopped\") state, invokes the scheduler's followup_due processing path over it, and asserts (with a negative control) that NO email send / sheet write is issued for that terminal item \u2014 i.e. the Graph/send surface is not called and the item is safely finalized/skipped."
       },
       "bad_placeholder": {
         "status": "needs_fixture",
@@ -2465,7 +2465,7 @@
           "test_manual_dispatch_rejects_jill_even_if_requested"
         ],
         "incidentId": "normal_users_scope_denied",
-        "provesBehavior": "Driving the real resolve_scheduler_user_ids gate, test_manual_dispatch_rejects_jill_even_if_requested sets dev-scoped with TARGET=JILL (allowlist defaults to Baylor) and passes [JILL, BAYLOR], asserting assertRaisesRegex(SchedulerScopeError, \"not allowed\") — a negative control on the disallowed-user check (source lines 56-60) that fails if the identity allowlist guard is removed, proving the scheduler refuses to process the wrong user before any per-user send."
+        "provesBehavior": "Driving the real resolve_scheduler_user_ids gate, test_manual_dispatch_rejects_jill_even_if_requested sets dev-scoped with TARGET=JILL (allowlist defaults to Baylor) and passes [JILL, BAYLOR], asserting assertRaisesRegex(SchedulerScopeError, \"not allowed\") \u2014 a negative control on the disallowed-user check (source lines 56-60) that fails if the identity allowlist guard is removed, proving the scheduler refuses to process the wrong user before any per-user send."
       },
       "manual_continuation": {
         "status": "needs_fixture",
@@ -3388,9 +3388,17 @@
         "alias/plus-address reply"
       ],
       "inBaseV1Scope": true,
-      "status": "needs_fixture",
-      "gapReason": "Cross-feature group 'reply_all_privacy_boundary' (core.reply_all_cc, core.manual_reply, core.inbox_auto_reply, core.followups) has no executable integration test yet - its interaction invariant is asserted only in prose (breakThisBy), not driven end-to-end.",
-      "nextProof": "Add an integration test that composes core.reply_all_cc, core.manual_reply, core.inbox_auto_reply, core.followups in one scenario (break vectors: broker adds teammate on Cc; blocked contact remains in Cc; wrong-contact redirects with a new email) and asserts the interaction invariant holds."
+      "status": "covered",
+      "testFiles": [
+        "tests/test_crossfeature_reply_all_privacy_boundary.py"
+      ],
+      "testIds": [
+        "test_manual_continuation_suppresses_duplicate_reply_all_send",
+        "test_reply_all_send_strips_operator_and_optout_from_cc_audience",
+        "test_boundary_holds_on_both_axes_from_one_audience",
+        "test_guard_does_not_suppress_on_a_different_conversation"
+      ],
+      "provesBehavior": "Integration test composes the two REAL units of the reply-all Cc privacy boundary in the exact order the outbox reply path runs them (email.py _process_single_outbox_item ~2930-2968): the real manual-continuation guard sent_mail_guard.find_sent_conversation_continuation_for_retry (via _sent_retry_reconciliation_result) runs first, and only its no-continuation branch reaches the real reply-all audience filter email._filter_reply_all_draft_recipients (via _send_outbox_as_reply). Driving faked Graph transport + faked Firestore, it proves the SAME privacy-laden Cc audience yields opposite correct outcomes depending only on the manual-continuation signal: when Sent Items shows a human already continued the thread, the guard fires and ZERO reply-all send occurs (no PATCH, no /send POST - a manually-continued thread is never resurrected into a duplicate); when there is no continuation, exactly one reply-all send fires but the wire audience has the operator's own mailbox AND its plus-alias stripped (no self-send/operator leak), the opted-out contact reached via a plus-alias stripped (no blocked-contact echo), and the duplicate broker collapsed, while the legitimate lead and external Cc are preserved - so the boundary holds on both the duplicate-resurrection axis and the audience-privacy axis at once, not on one feature while silently missing on the other."
     },
     "property_status_taxonomy": {
       "features": [
@@ -3410,7 +3418,7 @@
       ],
       "inBaseV1Scope": false,
       "status": "needs_fixture",
-      "gapReason": "Cross-feature group 'property_status_taxonomy' spans features outside the Base-V1 send core (results.summary_pdf, results.packet_pdf, tour.reply_handling); it belongs to the next-gen/infra rubric, so no Base-V1 integration test drives it yet.",
+      "gapReason": "Intentionally isolated from Base-V1 tonight: 'property_status_taxonomy' spans next-gen Results surfaces (results.summary_pdf, results.packet_pdf) and the Tour reply lane (tour.reply_handling) that are fenced out of the Base-V1 send core, so tonight's reopen ships no Base-V1 integration test for it - the Results/Tour rendering of property status is deferred to the next-gen lane stand-up.",
       "nextProof": "When the next-gen/infra lanes are stood up, add an integration test that exercises 'property_status_taxonomy' end-to-end across core.event_classifier, core.property_extraction, core.sheet_update, results.summary_pdf, results.packet_pdf, tour.reply_handling and wire its testId here."
     },
     "dev_lane_containment": {
@@ -3430,7 +3438,7 @@
       ],
       "inBaseV1Scope": false,
       "status": "needs_fixture",
-      "gapReason": "Cross-feature group 'dev_lane_containment' spans features outside the Base-V1 send core (results.launcher, results.saved_rebuild, tour.planner_preview, tour.invite_queue, infra.shared_entitlements, infra.firestore_lane_rules); it belongs to the next-gen/infra rubric, so no Base-V1 integration test drives it yet.",
+      "gapReason": "Intentionally isolated from Base-V1 tonight: 'dev_lane_containment' guards the next-gen Results launcher/saved-rebuild and Tour planner-preview/invite-queue dev lanes plus their infra entitlement and Firestore lane rules - Results/Tour surfaces deliberately fenced out of the Base-V1 send core, so tonight's reopen carries no Base-V1 integration test and the containment invariant is proven only when those next-gen lanes are stood up.",
       "nextProof": "When the next-gen/infra lanes are stood up, add an integration test that exercises 'dev_lane_containment' end-to-end across results.launcher, results.saved_rebuild, tour.planner_preview, tour.invite_queue, infra.shared_entitlements, infra.firestore_lane_rules and wire its testId here."
     },
     "operator_lifecycle_admin_visibility": {
@@ -3449,7 +3457,7 @@
       ],
       "inBaseV1Scope": false,
       "status": "needs_fixture",
-      "gapReason": "Cross-feature group 'operator_lifecycle_admin_visibility' spans features outside the Base-V1 send core (infra.observability); it belongs to the next-gen/infra rubric, so no Base-V1 integration test drives it yet.",
+      "gapReason": "Intentionally isolated from Base-V1 tonight: 'operator_lifecycle_admin_visibility' crosses the read-only admin usage surface and infra.observability plane that ride alongside the next-gen Results/Tour/Map lanes, not the Base-V1 send core; those admin/observability surfaces are held back from tonight's reopen, so no Base-V1 e2e drives the stop-plus-admin-visibility interaction (the core stop/cancel leg alone is already covered under core.stop_cancel_dismiss).",
       "nextProof": "When the next-gen/infra lanes are stood up, add an integration test that exercises 'operator_lifecycle_admin_visibility' end-to-end across core.stop_cancel_dismiss, admin.usage_readonly, core.health_recovery, core.scheduler_scope, infra.observability and wire its testId here."
     },
     "map_route_cost_surface": {
@@ -3469,7 +3477,7 @@
       ],
       "inBaseV1Scope": false,
       "status": "needs_fixture",
-      "gapReason": "Cross-feature group 'map_route_cost_surface' spans features outside the Base-V1 send core (results.map_geocode, tour.route_timing, tour.alternate_time, infra.observability); it belongs to the next-gen/infra rubric, so no Base-V1 integration test drives it yet.",
+      "gapReason": "Intentionally isolated from Base-V1 tonight: 'map_route_cost_surface' is a pure next-gen Map/Tour surface - results.map_geocode geocoding, tour.route_timing/tour.alternate_time routing, and their admin cost/observability readout - none of which exist in the Base-V1 send core, so tonight's reopen fences off the Results/Tour/Map plane entirely and no Base-V1 integration test drives it.",
       "nextProof": "When the next-gen/infra lanes are stood up, add an integration test that exercises 'map_route_cost_surface' end-to-end across results.map_geocode, tour.route_timing, tour.alternate_time, admin.usage_readonly, infra.observability and wire its testId here."
     },
     "firebase_worker_execution_plane": {
@@ -3489,14 +3497,300 @@
       ],
       "inBaseV1Scope": false,
       "status": "needs_fixture",
-      "gapReason": "Cross-feature group 'firebase_worker_execution_plane' spans features outside the Base-V1 send core (infra.cloud_scheduler, infra.cloud_tasks, infra.firestore_lane_rules, infra.observability); it belongs to the next-gen/infra rubric, so no Base-V1 integration test drives it yet.",
+      "gapReason": "Intentionally isolated from Base-V1 tonight: 'firebase_worker_execution_plane' models the next-gen infra worker plane (Cloud Scheduler, Cloud Tasks, Firestore lane rules, observability) that sits beneath the Results/Tour/Map migration rather than the Base-V1 send core, so it stays a fenced-off gap for tonight's reopen with no Base-V1 e2e - the current single-process scheduler scope is already exercised under core.scheduler_scope.",
       "nextProof": "When the next-gen/infra lanes are stood up, add an integration test that exercises 'firebase_worker_execution_plane' end-to-end across core.scheduler_scope, infra.cloud_scheduler, infra.cloud_tasks, infra.firestore_lane_rules, infra.observability and wire its testId here."
     }
   },
   "crossFeatureSummary": {
-    "covered": 2,
-    "needs_fixture": 6
+    "covered": 3,
+    "needs_fixture": 5
   },
+  "combinationDeckMatrix": {
+    "karsen_launch_placeholder_and_tour_leak": {
+      "playbooks": [
+        "manual_reply_before_retry",
+        "graph_accepted_but_index_missing",
+        "tour_unavailable_but_property_viable"
+      ],
+      "eventClasses": [
+        "launch_with_variable_mapping",
+        "broker_tour_available",
+        "retry_after_uncertain_send"
+      ],
+      "variantsToCross": [
+        "missing-name plus tour wording in uploaded template",
+        "normal-user entitlement plus scheduler retry",
+        "manual user reply before worker retry"
+      ],
+      "mustProve": [
+        "no tour scheduling email leaves Production V1 core lane",
+        "raw name placeholder blocks before Graph",
+        "manual continuation suppresses retry"
+      ],
+      "inBaseV1Scope": true,
+      "status": "covered",
+      "testFiles": [
+        "tests/test_combo_karsen_launch_placeholder_and_tour_leak.py"
+      ],
+      "testIds": [
+        "test_only_the_clean_viable_reply_sends_across_the_whole_deck",
+        "test_tours_only_reply_keeps_property_viable_terminal_classification",
+        "test_negative_control_clean_only_queue_sends_and_no_dead_letter"
+      ],
+      "provesBehavior": "Integration test drives the REAL retry send handler pending_responses.process_pending_responses over ONE mixed Karsen-launch pending-response queue - routing through the REAL Sent Items reconciliation guards (sent_mail_guard.find_matching_sent_message_for_retry and find_sent_conversation_continuation_for_retry, exercised via a faked Microsoft Graph /SentItems boundary) and the REAL outbound validator (outbound_safety.validate_outbound_body) - and proves that with placeholder-block, tour/LOI-scheduling-block, already-sent (Graph-accepted-but-index-missing) reconciliation, and manual-continuation suppression ALL firing on the same queue, EXACTLY the one clean viable reply reaches a real send and it carries its OWN thread/recipient/msg anchor (not a sibling's), while every unsafe / already-continued / already-sent sibling is diverted to manual review with zero second send; in parallel the pure classifier ai_processing._augment_events_with_deterministic_signals keeps a tours-only-unavailable Karsen broker reply viable (scrubs a mislabeled property_unavailable/terminal event and re-emits tour_requested) so a live listing is never stopped by a tour restriction."
+    },
+    "jill_nonviable_vs_unavailable": {
+      "playbooks": [
+        "tour_unavailable_but_property_viable",
+        "partial_specs_plus_pdf_plus_followup",
+        "subject_drift_split_thread"
+      ],
+      "eventClasses": [
+        "broker_property_non_viable",
+        "broker_property_unavailable",
+        "broker_tour_unavailable",
+        "broker_available_partial_specs"
+      ],
+      "variantsToCross": [
+        "office-heavy non-fit",
+        "space unavailable",
+        "tour unavailable but property viable",
+        "quoted old positive reply under new negative reply"
+      ],
+      "mustProve": [
+        "classifier keeps these states distinct",
+        "sheet/results display the right reason",
+        "follow-up only happens for missing information"
+      ],
+      "inBaseV1Scope": true,
+      "status": "covered",
+      "testFiles": [
+        "tests/test_combo_jill_nonviable_vs_unavailable.py"
+      ],
+      "testIds": [
+        "test_three_states_stay_pairwise_distinct",
+        "test_tour_decline_does_not_mask_a_genuine_nonfit",
+        "test_quoted_positive_history_does_not_mask_new_terminal",
+        "test_partial_specs_write_right_row_and_followup_only_missing"
+      ],
+      "provesBehavior": "Integration test drives the REAL classifier end-to-end through ai_processing.propose_sheet_updates (faking only the OpenAI boundary + Sheets service; dry_run, conversation passed inline so no Graph/Firestore) across the deck's four \"gone-looking\" broker states and proves they stay pairwise distinct: a tour-only decline yields tour_requested(tour_unavailable) and never terminalizes the row; an explicit leased/off-market terminal yields property_unavailable with a terminal reason (not requirements_mismatch) and kills the live response_email; a physical non-fit yields property_unavailable(requirements_mismatch); a fresh \"no longer available\" fires even when a stale \"still available\" is quoted below it; and - the deck's core cross-feature interaction - a single reply that BOTH declines a tour AND rules the property out as office-heavy resolves to non-viable (requirements_mismatch) with no lingering tour_requested/response_email, while the sheet leg writes only the broker-provided partial specs to the correct row-7 anchor and the follow-up gate reports only genuinely-missing required fields (never re-asking a filled field, never closing on a 'TBD' placeholder)."
+    },
+    "reply_all_with_redirect_and_blocked_contact": {
+      "playbooks": [
+        "wrong_contact_plus_new_property",
+        "reply_all_cc_plus_blocked_contact",
+        "opt_out_after_prior_interest"
+      ],
+      "eventClasses": [
+        "broker_wrong_contact",
+        "broker_new_property_referral",
+        "broker_opt_out",
+        "reply_all_cc_context"
+      ],
+      "variantsToCross": [
+        "safe teammate copied",
+        "blocked recipient copied",
+        "new property referral in same reply",
+        "redirected contact outside original thread"
+      ],
+      "mustProve": [
+        "safe CCs are preserved",
+        "blocked contacts are filtered",
+        "new contact/property needs explicit approval before send"
+      ],
+      "inBaseV1Scope": true,
+      "status": "covered",
+      "testFiles": [
+        "tests/test_combo_reply_all_with_redirect_and_blocked_contact.py"
+      ],
+      "testIds": [
+        "test_reply_all_preserves_safe_cc_filters_blocked_and_never_leaks_redirect_target",
+        "test_blocked_contact_via_plus_alias_is_still_filtered",
+        "test_same_contact_is_preserved_when_not_opted_out"
+      ],
+      "provesBehavior": "Integration test drives the REAL reply-all send handler email.py::_send_outbox_as_reply end-to-end (createReplyAll -> hydrate -> patch -> /send -> SentItems identity) against a faked Graph HTTP boundary and a faked Firestore opt-out store, running the real _filter_reply_all_draft_recipients and real processing.is_contact_opted_out (with plus-alias mailbox-identity probing) unmodified; it composes all three deck playbooks in one message - a reply-all copying a wrong-contact broker, a safe teammate, an opted-out-after-prior-interest broker (also via a plus-alias), and the operator's own mailbox, with a body redirecting to a brand-new off-thread contact/property - and asserts on the exact recipient bytes reaching /send that the safe teammate CC is preserved, the blocked/opted-out contact and the operator mailbox are stripped, the never-on-thread redirect contact is never fabricated into recipients (explicit-approval invariant), and the reply-all patches+sends exactly once; a discriminating negative control proves the same address survives when no opt-out record exists, so the blocked-filter greens cannot be borrowed from an always-drop."
+    },
+    "same_broker_multi_property_split_subject": {
+      "playbooks": [
+        "same_broker_multiple_properties",
+        "subject_drift_split_thread",
+        "row_move_during_pending_action"
+      ],
+      "eventClasses": [
+        "broker_available_full_specs",
+        "broker_available_partial_specs",
+        "sheet_row_moved",
+        "reply_all_cc_context"
+      ],
+      "variantsToCross": [
+        "same broker replies about two addresses",
+        "broker changes subject line",
+        "sheet row sort happens before processing",
+        "one property complete and one partial"
+      ],
+      "mustProve": [
+        "only intended row updates",
+        "split thread is linked only when safe",
+        "completed row does not receive follow-up for partial row"
+      ],
+      "inBaseV1Scope": true,
+      "status": "covered",
+      "testFiles": [
+        "tests/test_combo_same_broker_multi_property_split_subject.py"
+      ],
+      "testIds": [
+        "test_subject_anchors_to_named_property_only_not_sibling",
+        "test_row_move_reanchors_partial_reply_off_completed_sibling",
+        "test_completed_thread_blocks_followup_while_partial_stays_eligible",
+        "test_completed_sibling_untouched_across_both_guards"
+      ],
+      "provesBehavior": "Integration test drives the two REAL production handlers - the reply->row matcher sheet_operations._find_row_by_anchor (processing.py:3085) and the follow-up terminal guard followup._followup_terminal_block_reason (followup.py:721) - through a single broker inbox that owns a COMPLETED \"22 Oak Ave\" row and a PARTIAL \"22 Oak Ave North\" row, faking only Firestore/Sheets, and proves across the chained same_broker_multiple_properties x subject_drift_split_thread x row_move_during_pending_action interaction that: (1) a reply anchors only to the property its visible subject names, never the sibling or both; (2) an ambiguous broker email alone refuses to resolve any row (fail closed); (3) an unparseable split-thread subject stays unlinked; (4) after a sheet sort collapses interior gaps and leaves the partial thread's stored rowNumber pointing at the completed prefix-sibling, the update re-anchors by durable anchor to the partial's true row and never onto the completed row; and (5) the completed property's thread is independently blocked from emitting the partial row's follow-up while the partial thread stays eligible - so under one broker/multiple properties no wrong-row or completed-sibling-absorption write and no cross-property follow-up can occur, and the test FAILS (returns the completed row 4 instead of the partial row 6) if either prefix-leniency fix is reverted."
+    },
+    "attachment_only_with_ai_failure": {
+      "playbooks": [
+        "partial_specs_plus_pdf_plus_followup",
+        "graph_accepted_but_index_missing",
+        "row_move_during_pending_action"
+      ],
+      "eventClasses": [
+        "broker_attachment_or_link_only",
+        "token_or_graph_failure",
+        "broker_available_partial_specs"
+      ],
+      "variantsToCross": [
+        "PDF flyer only",
+        "protected Drive link",
+        "image-heavy PDF",
+        "attachment download/token failure"
+      ],
+      "mustProve": [
+        "source metadata is saved",
+        "failure remains visible and retryable",
+        "message is not marked processed until extraction commits"
+      ],
+      "inBaseV1Scope": true,
+      "status": "covered",
+      "testFiles": [
+        "tests/test_combo_attachment_only_with_ai_failure.py"
+      ],
+      "testIds": [
+        "test_attachment_extraction_failure_keeps_message_unprocessed_and_retryable",
+        "test_retry_reconciles_sent_items_instead_of_double_sending",
+        "test_row_move_resolves_to_true_anchor_not_stale_row"
+      ],
+      "provesBehavior": "Integration test drives three REAL handlers across the attachment-only-with-AI-failure chain and proves the safety invariants hold at each hand-off: (1) fetch_and_process_linked_assets on a protected file-share flyer (broker_attachment_or_link_only + token_or_graph_failure) produces a manual-review manifest entry that STILL carries source_url (source metadata saved), and processing._raise_on_extraction_failures raises RetryableProcessingError so _should_mark_processed_after_error is False - the message stays unprocessed and retryable, never marked processed until extraction commits (negative control: a committed-extraction manifest does not raise and the None-error path DOES mark processed); (2) retry_processing_failures reconciles a graph-accepted-but-unindexed Sent Items continuation and refuses to re-process - skipped=1, process_inbox_message and mark_processed never called (no duplicate send), doc flagged blocked_manual_conversation_continued with recoverySentMessageId (negative control: with no continuation it re-processes, retried=1); (3) sheet_operations._find_row_by_anchor lands the pending write on the row that ACTUALLY holds '16 Jupiter Ln' (row 7) after a broker sort pushed a decoy into the stale stored row 5, and keeps row 5 when the property never moved - so a row move during a pending action can never write the wrong row."
+    },
+    "stop_cancel_during_claim": {
+      "playbooks": [
+        "manual_reply_before_retry",
+        "graph_accepted_but_index_missing",
+        "row_move_during_pending_action"
+      ],
+      "eventClasses": [
+        "dashboard_action_resolution",
+        "retry_after_uncertain_send",
+        "followup_due"
+      ],
+      "variantsToCross": [
+        "cancel before worker claim",
+        "cancel after claim before send",
+        "stop while follow-up due",
+        "dismiss action while retry exists"
+      ],
+      "mustProve": [
+        "cancel/stop blocks Graph send",
+        "actionAudit terminal state is visible",
+        "no stale follow-up is generated"
+      ],
+      "inBaseV1Scope": true,
+      "status": "covered",
+      "testFiles": [
+        "tests/test_combo_stop_cancel_during_claim.py"
+      ],
+      "testIds": [
+        "test_cancel_before_worker_claim_blocks_send_and_terminalizes",
+        "test_cancel_after_claim_before_send_is_caught_on_presend_recheck",
+        "test_manual_continuation_before_retry_suppresses_duplicate_send",
+        "test_clean_reply_sends_on_durable_row_anchor"
+      ],
+      "provesBehavior": "Integration test drives the REAL outbox sender email.py::_send_single_outbox_item through seven interleavings of the dashboard stop/cancel/dismiss lifecycle crossed with retry_after_uncertain_send and followup_due (cancel-before-worker-claim, cancel-after-claim caught on the pre-send recheck, cancel-wins-over-a-pending-retry, stop-client-while-a-follow-up-is-due, manual-continuation-before-retry, prior-Graph-accepted-send reconciled, and an unresolved [NAME] placeholder body) with only the Firestore/Graph/Sheets boundaries faked and zero live sends, and proves that on EVERY interleaving the Graph send is suppressed (_send_outbox_as_reply and send_and_index_email are never called), a visible terminal actionAudit state is written (cancelled / dead_lettered / needs_reconciliation, never 'sent'), no stale follow-up is scheduled (schedule_followup_for_thread never fires), and no duplicate send occurs after a manual continuation - while a clean control item on the SAME code path DOES send and finalizes against its durable rowNumber anchor with no email->row sheet lookup (row-move safe), so the whole guard chain is proven to be a live block rather than a vacuous one."
+    },
+    "confidential_question_with_partial_specs": {
+      "playbooks": [
+        "confidential_question_plus_partial_specs",
+        "partial_specs_plus_pdf_plus_followup",
+        "subject_drift_split_thread"
+      ],
+      "eventClasses": [
+        "broker_confidential_question",
+        "broker_available_partial_specs",
+        "broker_attachment_or_link_only"
+      ],
+      "variantsToCross": [
+        "broker asks tenant identity before specs",
+        "broker gives partial specs and asks client use",
+        "quoted client name appears in old thread history",
+        "attachment contains usable facts"
+      ],
+      "mustProve": [
+        "client identity is not revealed",
+        "usable specs still update with evidence",
+        "unsafe question becomes operator-visible"
+      ],
+      "inBaseV1Scope": true,
+      "status": "covered",
+      "testFiles": [
+        "tests/test_combo_confidential_question_with_partial_specs.py"
+      ],
+      "testIds": [
+        "test_row_stays_viable_and_confidential_question_is_operator_visible",
+        "test_usable_spec_updates_with_evidence_from_newest_not_quoted",
+        "test_send_guard_blocks_identity_leak_while_acknowledging_specs",
+        "test_confidential_name_is_contained_across_all_three_surfaces"
+      ],
+      "provesBehavior": "Drives ONE broker reply that simultaneously shares partial specs (12,500 SF @ $11.50 NNN), asks a confidential identity question, and carries the client name plus a stale $8.00 rate in quoted old-thread history through the three real handlers that touch it - _augment_events_with_deterministic_signals keeps the row VIABLE (no property_unavailable/tour) while preserving the model-emitted needs_user_input:confidential escalation (operator-visible) and stripping events grounded only in quoted history; _augment_proposal_with_deterministic_extractions + apply_proposal_to_sheet extract the asking rent from the NEWEST message (11.50, not the stale quoted 8.00), write it WITH an evidence reason at the correct row anchor, and never let the client name enter a cell; and outbound_safety.validate_outbound_body blocks identity leaks in apposition/possessive/bare-representation form while allowing a safe deferral - proving client identity is contained on the classification, sheet, and send channels at once while usable specs still update with evidence and the unsafe question stays operator-visible."
+    },
+    "health_visibility_after_hidden_failure": {
+      "playbooks": [
+        "graph_accepted_but_index_missing",
+        "manual_reply_before_retry",
+        "row_move_during_pending_action"
+      ],
+      "eventClasses": [
+        "token_or_graph_failure",
+        "retry_after_uncertain_send",
+        "manual_user_continuation",
+        "dashboard_action_resolution"
+      ],
+      "variantsToCross": [
+        "Graph send accepted but actionAudit fails",
+        "pending response reaches max attempts",
+        "user manually continues failed thread",
+        "operator opens dashboard after scheduler run"
+      ],
+      "mustProve": [
+        "health/recovery views show failure",
+        "retry guard checks Sent Items before sending",
+        "operator can cancel or recover without double-send"
+      ],
+      "inBaseV1Scope": true,
+      "status": "covered",
+      "testFiles": [
+        "tests/test_combo_health_visibility_after_hidden_failure.py"
+      ],
+      "testIds": [
+        "test_hidden_failure_is_surfaced_in_health_view",
+        "test_retry_guard_reads_sent_items_before_resending",
+        "test_manual_continuation_suppresses_autonomous_retry",
+        "test_operator_recovery_never_double_sends"
+      ],
+      "provesBehavior": "Integration test drives the real handlers through one broker conversation across the deck's three chained playbooks (graph_accepted_but_index_missing -> manual_reply_before_retry -> row_move_during_pending_action): a Graph-accepted-but-index-missing send recorded by email._record_outbox_reconciliation is shown to roll up through system_health.collect_user_health as an active-deadLetterQueue warning (the hidden failure is made visible, with a healthy/zero negative control); the retry path email._sent_retry_reconciliation_result is shown to read Sent Items BEFORE re-sending and return either an already-sent identity or a manualContinuation signal (never a second send), staying silent when the conversation is clean or the continuation lives in a different conversation; the durable rowNumber anchor guard email._dead_letter_campaign_recipient_row_mismatch_if_needed dead-letters a wrong-recipient send after the sheet rows move while passing an unmoved row; and dead_letter_recovery.resolve_dead_letter_item refuses to requeue an already-sent or manually-continued dead-letter (no double send) yet still requeues a genuinely-unsent one with the Sent Items preflight flag and clears the health warning on operator discard - so the same uncertain send is surfaced, reconciled, suppressed, and operator-resolved without ever double-sending or leaking to the wrong row."
+    }
+  },
+  "combinationDeckSummary": {
+    "covered": 8
+  },
+  "combinationDeckSource": "docs/release-safety/feature-gradebook.json#combinationStressDecks",
   "fullCampaignLanes": {
     "upload": {
       "status": "needs_fixture",

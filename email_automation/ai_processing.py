@@ -677,12 +677,23 @@ def _augment_events_with_deterministic_signals(
     )
     proposal["events"] = events
 
+    # A physical non-fit (office-heavy / not-a-warehouse / no drive-in / below-spec
+    # clear height) is a statement about the PROPERTY itself, not about touring, so
+    # it must be detected even when the SAME reply ALSO declines a tour. Otherwise a
+    # broker who writes "we can't tour right now AND it's too office-heavy for your
+    # client" is read as merely tour-unavailable and the genuinely non-viable row is
+    # kept alive with a live tour response_email (combination deck
+    # jill_nonviable_vs_unavailable). requirements_mismatch is high-precision and
+    # quoted-history-stripped, so promoting it ahead of the tour-only short-circuit
+    # does not terminalize a viable row. Terminal (leased / off-market / no-longer-
+    # available) detection STAYS gated behind the tour-only check, because
+    # "no longer available for tours" is a legitimately tour-scoped phrase that
+    # looks_like_tour_only_unavailable owns.
     property_unavailable_reason = None
-    if not looks_like_tour_only_unavailable(latest_text_raw):
-        if _looks_like_requirements_mismatch_nonviable(latest_text):
-            property_unavailable_reason = "requirements_mismatch"
-        else:
-            property_unavailable_reason = _detect_target_terminal_reason(latest_text, target_anchor)
+    if _looks_like_requirements_mismatch_nonviable(latest_text):
+        property_unavailable_reason = "requirements_mismatch"
+    elif not looks_like_tour_only_unavailable(latest_text_raw):
+        property_unavailable_reason = _detect_target_terminal_reason(latest_text, target_anchor)
 
     if property_unavailable_reason:
         has_replacement_property = any((event or {}).get("type") == "new_property" for event in events)
