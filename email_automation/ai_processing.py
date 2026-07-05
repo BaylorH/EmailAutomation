@@ -596,6 +596,54 @@ def _append_ai_meta(
     except Exception as e:
         print(f"⚠️ Failed to append AI_META record: {e}")
 
+def _normalize_comment_bullet(bullet: str) -> str:
+    """Normalize a bullet fact for dedup comparison: lowercase, collapse
+    whitespace, drop a trailing stray CR and surrounding punctuation. Two
+    bullets that normalize equal are treated as the same fact."""
+    b = (bullet or "").replace("\r", " ").strip().strip(".;,").lower()
+    return re.sub(r"\s+", " ", b)
+
+
+def _merge_comment_bullets(existing_comments: str, notes: str) -> str:
+    """Append `notes` to `existing_comments` as ' • '-joined bullets WITHOUT
+    re-adding a fact that is already present. Preserves the original order and
+    the first-seen surface form of each bullet; timestamped/dated append lines
+    (e.g. "[06/09/2026] Property marked unavailable ...") are always kept since
+    they are event-specific, not repeatable spec facts.
+
+    Fixes the real MOHR sheet defect where every reply re-appended the same
+    facts, producing "NNN • ... • NNN • ... • NNN" and
+    "100% HVAC • available now • available now" noise; Jill's ideal cell is a
+    clean, de-duplicated fact list.
+    """
+    existing_comments = (existing_comments or "").strip()
+    notes = (notes or "").strip()
+    if not existing_comments:
+        return notes
+    if not notes:
+        return existing_comments
+
+    def _is_dated(bullet: str) -> bool:
+        return bool(re.match(r"\s*\[[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}\]", bullet or ""))
+
+    seen = set()
+    ordered = []
+    for chunk in (existing_comments, notes):
+        for raw in chunk.split(" • "):
+            raw = raw.strip()
+            if not raw:
+                continue
+            key = _normalize_comment_bullet(raw)
+            if _is_dated(raw):
+                ordered.append(raw)  # event lines always kept
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(raw)
+    return " • ".join(ordered)
+
+
 def _append_notes_to_comments(sheets, spreadsheet_id: str, tab_title: str, header: List[str], rownum: int, notes: str):
     """
     Append notes to the comments field.
@@ -625,12 +673,10 @@ def _append_notes_to_comments(sheets, spreadsheet_id: str, tab_title: str, heade
         if existing_resp.get("values") and len(existing_resp["values"]) > 0:
             existing_comments = (existing_resp["values"][0][0] or "").strip()
 
-        # Combine existing and new notes
-        if existing_comments:
-            # Append with separator if there's existing content
-            combined = f"{existing_comments} • {notes}"
-        else:
-            combined = notes
+        # Combine existing and new notes, de-duplicating bullet facts so the
+        # cell doesn't accumulate "NNN • ... • NNN • ... • NNN" or
+        # "100% HVAC • available now • available now" on every reply/update.
+        combined = _merge_comment_bullets(existing_comments, notes)
 
         # Update the comments cell
         _execute_with_retry(
