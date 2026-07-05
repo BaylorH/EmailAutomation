@@ -154,6 +154,49 @@ def _has_tour_scheduling_context(conversation: List[dict]) -> bool:
     )
 
 
+_REDIRECT_PHRASE_RE = re.compile(
+    r"\b(?:my\s+colleague|loop\s+(?:\w+\s+)?in\b|reach\s+out\s+to|"
+    r"actually\s+handles?|handles?\s+(?:the|our|all|that)\b|"
+    r"is\s+the\s+(?:right|better)\s+(?:person|contact)|"
+    r"will\s+be\s+your\s+(?:point\s+of\s+)?contact|"
+    r"redirect(?:ing)?\s+you\s+to|forward(?:ing)?\s+(?:you|this)\s+to|"
+    r"you\s+(?:should|may\s+want\s+to|can)\s+(?:loop\s+in|contact|reach\s+out\s+to))\b",
+    re.IGNORECASE,
+)
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+
+def _latest_inbound_sender(conversation: List[dict]) -> str:
+    for msg in reversed(conversation or []):
+        if (msg or {}).get("direction") == "inbound":
+            return str((msg or {}).get("from") or "").lower()
+    return ""
+
+
+def _detect_colleague_redirect(latest_text_raw: str, sender_email: str):
+    """High-precision deterministic detector for a broker handing the thread to a
+    DIFFERENT person ("my colleague Dana (dana@x.com) actually handles the south
+    submarket, loop her in"). Requires BOTH a redirect phrase AND a distinct
+    third-party email so it does not false-fire on a broker mentioning their own
+    name. Returns {suggestedContact, suggestedEmail} or None.
+
+    The LLM classifier drops this intermittently (nondeterministic wrong_contact),
+    which lets a multi-intent reply auto-respond and silently lose the redirect;
+    this guard forces the wrong_contact escalation deterministically.
+    """
+    text = latest_text_raw or ""
+    if not _REDIRECT_PHRASE_RE.search(text):
+        return None
+    sender = (sender_email or "").lower()
+    for email in _EMAIL_RE.findall(text):
+        el = email.lower()
+        if el == sender:
+            continue
+        name_m = re.search(r"colleague[,\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", text)
+        return {"suggestedContact": name_m.group(1) if name_m else "", "suggestedEmail": email}
+    return None
+
+
 def _augment_events_with_deterministic_signals(proposal: dict, conversation: List[dict]) -> dict:
     """Add high-confidence event signals from broker phrases the model can miss."""
     if not proposal:
@@ -164,6 +207,22 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
     latest_text = latest_text_raw.lower()
     if not latest_text:
         return proposal
+
+    # Colleague/third-party redirect → force wrong_contact + escalate (no auto-reply).
+    # Runs BEFORE the property_unavailable early-return so it survives a multi-intent
+    # reply ("just leased, but try 4400 Referral Way, and loop in my colleague Dana").
+    redirect = _detect_colleague_redirect(latest_text_raw, _latest_inbound_sender(conversation))
+    if redirect and not any((e or {}).get("type") == "wrong_contact" for e in events):
+        events.append({
+            "type": "wrong_contact",
+            "reason": "colleague_redirect",
+            "suggestedContact": redirect.get("suggestedContact", ""),
+            "suggestedEmail": redirect.get("suggestedEmail", ""),
+        })
+    # A wrong_contact redirect must escalate to the operator, never auto-commit to
+    # looping in an unapproved third party.
+    if any((e or {}).get("type") == "wrong_contact" for e in events):
+        proposal["response_email"] = None
 
     unavailable_patterns = [
         ("no_longer_available", r"\bno\s+longer\s+available\b"),
