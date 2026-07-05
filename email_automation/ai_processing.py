@@ -165,6 +165,22 @@ _REDIRECT_PHRASE_RE = re.compile(
 )
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
+# A broker asking for a phone conversation (LIVE break: call_lets_hop). Matches the
+# same intent surface as the classifier's call_requested signals but tolerates the
+# "hop on a quick call" filler the quote-signal list misses. Used only over the
+# broker's FRESH message so quoted prior-thread call asks never re-fire.
+_CALL_REQUEST_RE = re.compile(
+    r"\bcall\s+me\b|\bgive\s+me\s+a\s+call\b|\bcall\s+you\b|\bphone\s+call\b"
+    r"|\bhop\s+on\s+a(?:\s+\w+){0,3}\s+call\b|\bcan\s+(?:you|we)\s+(?:call|talk)\b"
+    r"|\bcall\s+me\s+at\b|\breach\s+me\s+at\b|\bschedule\s+a\s+call\b"
+    r"|\blet'?s\s+(?:talk|chat|call)\b|\blet'?s\s+hop\s+on\b|\bset\s+up\s+a\s+call\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_call_request(text: str) -> bool:
+    return bool(text and _CALL_REQUEST_RE.search(text))
+
 _OUT_OF_OFFICE_RE = re.compile(
     r"\bout\s+of\s+(?:the\s+)?office\b"
     r"|\booo\b"
@@ -285,14 +301,50 @@ def _looks_like_engaged_alternative_request(text: str) -> bool:
 # split the fresh top-of-message from the quoted tail so guards can reason about
 # what the broker actually just said.
 _QUOTE_LINE_RE = re.compile(r"^\s*>+")
+# Standard client attribution: "On <date>, <name> wrote:" ending the line.
 _QUOTE_ATTRIBUTION_RE = re.compile(r"^\s*On\b.*\bwrote:\s*$", re.IGNORECASE)
+# Broader attribution: "On <date/time> ... wrote[:] <maybe trailing text>". Gmail /
+# Apple / Outlook variants where "wrote" is NOT at line end ("...wrote the
+# following:", or the quote text glued onto the same line). Gated on a date/time
+# token between "On" and "wrote" so casual prose ("On our call I wrote up ...")
+# is not mistaken for a quote marker.
+_QUOTE_ATTRIBUTION_DATED_RE = re.compile(
+    r"^\s*On\b.*?"
+    r"(?:\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)"
+    r"|\b(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)"
+    r"|\b\d{1,2}[/\-]\d{1,2}"
+    r"|\b20\d{2}\b"
+    r"|\b\d{1,2}:\d{2}\b"
+    r"|\b[ap]\.?m\.?\b)"
+    r".*\bwrote\b",
+    re.IGNORECASE,
+)
 _QUOTE_FWD_MARKER_RE = re.compile(
     r"^\s*(?:-{2,}\s*(?:original\s+message|forwarded\s+message)\s*-{2,}"
     r"|begin\s+forwarded\s+message:"
     r"|_{5,})\s*$",
     re.IGNORECASE,
 )
+# Single forwarded header line carrying a bracketed <email> — matches on its own.
 _QUOTE_FWD_HEADER_RE = re.compile(r"^\s*From:\s+.*<[^>]+@[^>]+>", re.IGNORECASE)
+# Outlook block-header fields. A bare "From:" line (no <email>) only marks a quote
+# when it opens a contiguous Outlook header block (From: + Sent:/Date: + To:/Cc:/
+# Subject:), so a prose line like "From: my perspective ..." is never split.
+_OUTLOOK_FROM_RE = re.compile(r"^\s*From:\s+\S", re.IGNORECASE)
+_OUTLOOK_SENT_RE = re.compile(r"^\s*(?:Sent|Date):\s+\S", re.IGNORECASE)
+_OUTLOOK_RECIP_RE = re.compile(r"^\s*(?:To|Cc|Subject):\s+\S", re.IGNORECASE)
+
+
+def _is_outlook_forward_header(lines, idx: int) -> bool:
+    """True when ``lines[idx]`` is the ``From:`` line opening an Outlook-style
+    forwarded header block — a bare From: (no <email>) followed within a few lines
+    by a Sent:/Date: line and a To:/Cc:/Subject: line."""
+    if not _OUTLOOK_FROM_RE.match(lines[idx]):
+        return False
+    window = lines[idx + 1: idx + 5]
+    has_sent = any(_OUTLOOK_SENT_RE.match(l) for l in window)
+    has_recip = any(_OUTLOOK_RECIP_RE.match(l) for l in window)
+    return has_sent and has_recip
 
 
 def _split_fresh_and_quoted(text: str):
@@ -308,8 +360,10 @@ def _split_fresh_and_quoted(text: str):
     for idx, line in enumerate(lines):
         if (_QUOTE_LINE_RE.match(line)
                 or _QUOTE_ATTRIBUTION_RE.match(line)
+                or _QUOTE_ATTRIBUTION_DATED_RE.match(line)
                 or _QUOTE_FWD_MARKER_RE.match(line)
-                or _QUOTE_FWD_HEADER_RE.match(line)):
+                or _QUOTE_FWD_HEADER_RE.match(line)
+                or _is_outlook_forward_header(lines, idx)):
             return "\n".join(lines[:idx]), "\n".join(lines[idx:])
     return text, ""
 
@@ -481,6 +535,18 @@ def _augment_events_with_deterministic_signals(proposal: dict, conversation: Lis
     if any((e or {}).get("type") == "wrong_contact" for e in events):
         proposal["response_email"] = None
 
+    # Call request → escalate to operator, never auto-send (LIVE break: call_lets_hop).
+    # A broker asking to "hop on a call" must reach a human whether or not a phone
+    # number is included; the prompt intermittently drafts an auto-reply asking for a
+    # number/time instead of escalating. Deterministically fire call_requested from the
+    # fresh text (so it holds even when the model mislabels) and suppress any drafted
+    # response_email so a live call ask always notifies the operator, model-independently.
+    if _looks_like_call_request(latest_text):
+        if not any((e or {}).get("type") == "call_requested" for e in events):
+            events.append({"type": "call_requested", "reason": "call_request_phrase"})
+    if any((e or {}).get("type") == "call_requested" for e in events):
+        proposal["response_email"] = None
+
     unavailable_patterns = [
         ("no_longer_available", r"\bno\s+longer\s+available\b"),
         ("signed_loi", r"\bsigned\s+(?:an?\s+)?(?:loi|letter\s+of\s+intent)\b"),
@@ -577,8 +643,15 @@ _RENT_RANGE_RE = re.compile(
 # Standalone OpEx/NNN/CAM figure in either order.
 _OPS_EX_RE = re.compile(
     r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*(?:/?\s*(?:psf|sf|sq\.?\s*ft))?\s*(?:in\s+)?"
-    r"(?:opex|op\s*ex|nnn|cam|operating\s+expense)"
-    r"|(?:opex|op\s*ex|nnn|cam|operating\s+expense)\s*[:\-]?\s*"
+    # tmi = Canadian Taxes/Maintenance/Insurance, the CA equivalent of NNN/CAM OpEx.
+    r"(?:opex|op\s*ex|nnn|cam|tmi|operating\s+expense)"
+    # keyword-first: allow a short linking clause ("is", "charges are", "of",
+    # "runs", "estimated at") between the keyword and the figure so
+    # "OpEx is $16/SF" and "NNN charges are $7.25/SF/yr" parse. The gap forbids
+    # digits/$/newlines so an unrelated later rent figure can't be captured.
+    r"|(?:opex|op\s*ex|nnn|cam|tmi|operating\s+expense)"
+    r"(?:[^\d$\n]{0,18}?\b(?:is|are|of|at|runs?|estimated|approx(?:imately)?|about|around)\b)?"
+    r"\s*[:\-=~]?\s*"
     r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)",
     re.IGNORECASE,
 )
@@ -591,6 +664,25 @@ _MONTHLY_UNIT_RE = re.compile(r"(?:/\s*|\bper\s+)(?:mo|mos|month)\b|\bmonthly\b|
 _ANNUAL_UNIT_RE = re.compile(r"(?:/\s*|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
 _HYPOTHETICAL_RENT_RE = re.compile(
     r"would(?:'ve| have)?\s+(?:have\s+)?been|would\s+be\b|could\s+have\s+been|might\s+have\s+been",
+    re.IGNORECASE,
+)
+# Current asking rate that supersedes a stale prior quote on the same line:
+# "we had quoted $22/SF but it is now $26/SF", "current asking is $26/SF".
+# A recency marker immediately (<=25 non-figure chars) preceding a $/SF figure
+# marks the CURRENT asking rent, which must win over an earlier superseded quote.
+_CURRENT_ASKING_RE = re.compile(
+    r"(?:\bnow\b|\bcurrently\b|\bcurrent\s+asking\b|\bincreased\s+to\b|\braised\s+to\b"
+    r"|\brevised\s+to\b|\bupdated\s+to\b|\bbumped\s+(?:up\s+)?to\b|\bmoved\s+(?:up\s+)?to\b)"
+    r"[^\d$]{0,25}\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
+    r"(?:(?:/|\s+per\s+)?\s*(?:sf|sq\.?\s*ft|square\s*foot)|/?\s*psf)(?:\s*/?\s*(?:yr|year|annum))?",
+    re.IGNORECASE,
+)
+# TI / tenant-improvement allowances and other landlord concessions are NOT the
+# asking rent — a "$30/SF in TI allowance" figure is money the landlord GIVES the
+# tenant, and must never be mined as base rent. The concession word can sit on
+# either side of the figure ("$30/SF TI allowance" or "TI allowance of $30/SF").
+_CONCESSION_MARKER_RE = re.compile(
+    r"\b(?:allowance|concession|abatement|free\s+rent|tenant\s+improvement)\b",
     re.IGNORECASE,
 )
 
@@ -632,7 +724,25 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
         if annual >= 1:
             return f"{annual:.2f}"
 
-    # 3) Generic asking-rent patterns.
+    # 3) Recency / "now" preference — a current asking rate ("...it is now $26/SF")
+    # supersedes a stale prior quote on the same line. The generic loop below is
+    # first-match, so without this the superseded figure wins; scan for the latest
+    # recency-marked figure and prefer it.
+    current = None
+    for cm in _CURRENT_ASKING_RE.finditer(text):
+        value = float(cm.group(1))
+        window = text[max(0, cm.start() - 20): min(len(text), cm.end() + 30)]
+        annual_value = value * 12 if _is_monthly_context(window) else value
+        if annual_value < 1:
+            continue
+        concession_window = text[max(0, cm.start() - 30): min(len(text), cm.end() + 40)]
+        if _CONCESSION_MARKER_RE.search(concession_window):
+            continue
+        current = f"{annual_value:.2f}"
+    if current is not None:
+        return current
+
+    # 4) Generic asking-rent patterns.
     for pattern in (_RENT_CONTEXT_RE, _DOLLAR_PER_SF_RE):
         for match in pattern.finditer(text):
             value = float(match.group(1))
@@ -643,9 +753,23 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
             before = text[max(0, match.start() - 30): match.start()].lower()
             if any(marker in before for marker in ("nnn", "cam", "ops", "opex", "operating expense")):
                 continue
+            # A TI allowance / concession figure is not the asking rent. The
+            # concession word may follow the figure ("$30/SF in TI allowance") or
+            # precede it ("TI allowance of $30/SF"). Keep the check MATCH-LOCAL:
+            # truncate each side at the nearest OTHER $ figure so a concession word
+            # bound to a different figure can't suppress this one. That preserves a
+            # real asking rate quoted alongside a give-back
+            # ("Asking $20/SF with a $25/SF TI allowance." → 20.00).
+            after_ctx = text[match.end(): match.end() + 40].split("$", 1)[0]
+            before_ctx = text[max(0, match.start() - 22): match.start()].rsplit("$", 1)[-1]
+            if _CONCESSION_MARKER_RE.search(after_ctx) or _CONCESSION_MARKER_RE.search(before_ctx):
+                continue
             # Past-tense hypothetical rent ("rent would've been $16/SF") is not a
             # current asking figure.
-            if _HYPOTHETICAL_RENT_RE.search(text[max(0, match.start() - 40): match.start()]):
+            # The conditional phrase ("rent would have been ...") often sits INSIDE
+            # the match span — between the rent keyword and the $ figure — so the
+            # window must reach match.end(), not stop at match.start().
+            if _HYPOTHETICAL_RENT_RE.search(text[max(0, match.start() - 40): match.end()]):
                 continue
             return f"{annual_value:.2f}"
 
@@ -746,17 +870,29 @@ _DRIVE_IN_KW = r"(?:drive[-\s]?in|grade[-\s]?level|drive\s+in\s+door)"
 _DOCK_KW = r"(?:dock|loading\s+dock)"
 
 
+# Spelled-out counts (broker text often says "two docks", not "2 docks").
+_WORD_NUMBER_RE = (
+    r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+    r"thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+)
+# Digits OR spelled-out numbers; \b anchors so "twenty" matches but "twentyish" and
+# substrings inside larger words never do.
+_FEATURE_COUNT_RE = r"\b(?:\d{1,3}|" + _WORD_NUMBER_RE + r")\b"
+
+
 def _has_explicit_feature_count(text: str, keyword_re: str) -> bool:
     """True only when a numeric count sits next to a loading-feature keyword.
 
-    Excludes electrical specs ("3-phase power") so a qualitative phrase like
-    "grade-level loading" never fabricates a door count.
+    Counts may be digits ("2 docks") or spelled out ("two docks") — the broker
+    uses both. Excludes electrical specs ("3-phase power", "three-phase power")
+    so a qualitative phrase like "grade-level loading" never fabricates a count.
     """
     if not text:
         return False
     for m in re.finditer(keyword_re, text, re.IGNORECASE):
         lo, hi = m.start() - 16, m.end() + 16
-        for nm in re.finditer(r"\b\d{1,3}\b", text):
+        for nm in re.finditer(_FEATURE_COUNT_RE, text, re.IGNORECASE):
             if nm.end() < lo or nm.start() > hi:
                 continue
             after = text[nm.end(): nm.end() + 8].lower()
