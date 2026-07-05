@@ -240,5 +240,65 @@ class AiMetaRowIdentityTests(unittest.TestCase):
         self.assertEqual("800A 3-phase", result["rowSnapshotAfter"]["Power"])
 
 
+class PlaceholderValueGuardTests(unittest.TestCase):
+    """apply_proposal_to_sheet must never write junk placeholder values (TBD, N/A)
+    into a cell — including an EMPTY cell. The prior guard only screened placeholders
+    in the *existing* value, so a placeholder *proposed* value slipped into blank
+    cells. Grounded in live breaks E1 (TBD -> empty Power) and E2 (N/A -> empty Docks)."""
+
+    def _apply(self, header, current_row, proposal, rownum=6):
+        fake_sheets = FakeSheets()
+        with patch("email_automation.ai_processing._sheets_client", return_value=fake_sheets), \
+             patch("email_automation.ai_processing._get_first_tab_title", return_value="Sheet1"), \
+             patch("email_automation.sheet_operations._apply_gross_rent_formula_for_row", return_value=False):
+            result = apply_proposal_to_sheet(
+                "uid-1", "client-1", "sheet-1", header, rownum, current_row, proposal,
+            )
+        return result, fake_sheets
+
+    def test_e1_tbd_placeholder_not_written_into_empty_power_cell(self):
+        header = ["Property Address", "City", "Power"]
+        current_row = ["8200 Trade Center Dr", "El Paso", ""]
+        proposal = {"updates": [
+            {"column": "Power", "value": "TBD", "confidence": 0.9,
+             "reason": "Broker did not confirm power service."},
+        ]}
+        result, fake_sheets = self._apply(header, current_row, proposal)
+
+        self.assertEqual([], result["applied"])
+        self.assertEqual("", result["rowSnapshotAfter"]["Power"])
+        self.assertIn("Power", [s.get("column") for s in result["skipped"]])
+        # No sheet write, no AI_META append for a rejected placeholder.
+        self.assertEqual(0, len(fake_sheets.values_api.batch_update_calls))
+        self.assertEqual(0, len(fake_sheets.values_api.append_calls))
+
+    def test_e2_na_placeholder_not_written_into_empty_docks_cell(self):
+        header = ["Property Address", "City", "Docks"]
+        current_row = ["8200 Trade Center Dr", "El Paso", ""]
+        proposal = {"updates": [
+            {"column": "Docks", "value": "N/A", "confidence": 0.9,
+             "reason": "Broker did not confirm dock count."},
+        ]}
+        result, fake_sheets = self._apply(header, current_row, proposal)
+
+        self.assertEqual([], result["applied"])
+        self.assertEqual("", result["rowSnapshotAfter"]["Docks"])
+        self.assertIn("Docks", [s.get("column") for s in result["skipped"]])
+        self.assertEqual(0, len(fake_sheets.values_api.batch_update_calls))
+        self.assertEqual(0, len(fake_sheets.values_api.append_calls))
+
+    def test_real_value_still_written_into_empty_cell(self):
+        # Guardrail: the placeholder screen must NOT block a legitimate value.
+        header = ["Property Address", "City", "Power"]
+        current_row = ["8200 Trade Center Dr", "El Paso", ""]
+        proposal = {"updates": [
+            {"column": "Power", "value": "800A 3-phase", "confidence": 0.9,
+             "reason": "Broker confirmed service."},
+        ]}
+        result, _ = self._apply(header, current_row, proposal)
+        self.assertEqual("800A 3-phase", result["rowSnapshotAfter"]["Power"])
+        self.assertEqual("Power", result["applied"][0]["column"])
+
+
 if __name__ == "__main__":
     unittest.main()

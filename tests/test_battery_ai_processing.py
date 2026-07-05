@@ -11,6 +11,7 @@ Break IDs map to the live-testing report:
 import os
 import sys
 import unittest
+from unittest import mock
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
@@ -639,6 +640,169 @@ class QuotedTailDetectionTests(unittest.TestCase):
             "Sounds good.\nOn Mon, Jun 1, 2026 at 3:00 PM Pierce Demarco <pierce.demarco@freehillco.com> wrote:\n> old text")
         self.assertIn("sounds good", fresh.lower())
         self.assertIn("old text", quoted.lower())
+
+
+# ---------------------------------------------------------------------------
+# E4 — Formula-column write guard (apply_proposal_to_sheet).
+# "Gross Rent" is a computed cell on the sheet: =(Rent/SF + Ops Ex) * SF / 12.
+# The LLM is told (prompt-only) never to propose it, but LIVE testing produced a
+# proposal update {column:'Gross Rent', value:'32.00', confidence:0.99} that the
+# apply loop happily wrote — clobbering the live formula cell ('' -> '32.00').
+# The skip-list in the write loop covered Flyer/Floorplan but had NO formula-column
+# guard. These tests drive the deterministic code guard directly, so behavior is
+# model-independent (no prompt reliance).
+# ---------------------------------------------------------------------------
+class FormulaColumnWriteGuardTests(unittest.TestCase):
+    def test_is_formula_column_matches_gross_rent_aliases(self):
+        for name in ("Gross Rent", "gross rent", "  GROSS RENT  ",
+                     "Monthly Gross Rent", "Total Rent", "All-In Rent"):
+            self.assertTrue(a._is_formula_column(name),
+                            f"{name!r} must be recognized as a formula column")
+
+    def test_is_formula_column_does_not_match_writable_columns(self):
+        for name in ("Rent/SF /Yr", "Ops Ex /SF", "Total SF",
+                     "Property Address", "Comments", ""):
+            self.assertFalse(a._is_formula_column(name),
+                             f"{name!r} must NOT be treated as a formula column")
+
+    def _apply(self, header, rowvals, updates):
+        """Drive apply_proposal_to_sheet against a FAKE sheets client.
+
+        Only the outer plumbing is stubbed (client acquisition, tab title,
+        AI_META ensure/read, batch execution, formula refresh, notes). The write
+        loop and its guards run for real, so what lands in `applied`/`skipped`
+        and in the captured batch payload reflects production logic exactly.
+        """
+        sheets = mock.MagicMock()
+        proposal = {"updates": updates}
+        with mock.patch.object(a, "_sheets_client", return_value=sheets), \
+             mock.patch.object(a, "_get_first_tab_title", return_value="Sheet1"), \
+             mock.patch.object(a, "_ensure_ai_meta_tab", return_value=None), \
+             mock.patch.object(a, "_read_ai_meta_row", return_value=None), \
+             mock.patch.object(a, "_append_ai_meta", return_value=None), \
+             mock.patch.object(a, "_append_notes_to_comments", return_value=None), \
+             mock.patch("email_automation.sheet_operations._apply_gross_rent_formula_for_row",
+                        return_value=False), \
+             mock.patch.object(a, "_execute_with_retry", return_value={}):
+            result = a.apply_proposal_to_sheet(
+                uid="u1", client_id="c1", sheet_id="sheet123",
+                header=header, rownum=4, current_rowvals=rowvals, proposal=proposal)
+
+        # Recover the ranges the batch write targeted (empty if no write happened).
+        ranges = []
+        batch = sheets.spreadsheets.return_value.values.return_value.batchUpdate
+        if batch.call_args is not None:
+            body = batch.call_args.kwargs.get("body", {})
+            ranges = [entry.get("range") for entry in body.get("data", [])]
+        return result, ranges
+
+    def test_e4_gross_rent_proposal_is_skipped_not_written(self):
+        header = ["Property Address", "Rent/SF /Yr", "Ops Ex /SF", "Gross Rent"]
+        rowvals = ["Wilson Bldg", "24.00", "8.00", ""]
+        result, ranges = self._apply(
+            header, rowvals,
+            [{"column": "Gross Rent", "value": "32.00", "confidence": 0.99}])
+        self.assertEqual(result["applied"], [],
+                         "a formula column must never be applied")
+        skipped_cols = {(s.get("column"), s.get("reason")) for s in result["skipped"]}
+        self.assertIn(("Gross Rent", "formula-column"), skipped_cols)
+        self.assertEqual(ranges, [],
+                         f"no batch write should target a formula cell: {ranges}")
+
+    def test_e4_gross_rent_skipped_but_writable_column_still_applied(self):
+        # Mixed proposal: the formula column is dropped, the real spec is kept.
+        header = ["Property Address", "Rent/SF /Yr", "Ops Ex /SF", "Gross Rent"]
+        rowvals = ["Wilson Bldg", "", "8.00", ""]
+        result, ranges = self._apply(
+            header, rowvals,
+            [{"column": "Gross Rent", "value": "32.00", "confidence": 0.99},
+             {"column": "Rent/SF /Yr", "value": "24.00", "confidence": 0.99}])
+        applied_cols = {u["column"] for u in result["applied"]}
+        self.assertEqual(applied_cols, {"Rent/SF /Yr"})
+        skipped = {(s.get("column"), s.get("reason")) for s in result["skipped"]}
+        self.assertIn(("Gross Rent", "formula-column"), skipped)
+        # Rent/SF /Yr is column B → B4; Gross Rent is column D → D4 must be absent.
+        self.assertTrue(any(r.endswith("B4") for r in ranges), ranges)
+        self.assertFalse(any(r.endswith("D4") for r in ranges),
+                         f"formula cell D4 must not be in the batch write: {ranges}")
+
+
+# ---------------------------------------------------------------------------
+# Contact opt-out must be a PURE escalation — no sheet writes to the opted-out
+# row, no auto-reply (LIVE break adv_optout_with_specs). A broker replies
+# "Not interested, remove me. FYI it was going for $18/SF NNN, 12,000 SF." The
+# classifier correctly fires contact_optout and nulls response_email, but the
+# rent / OpEx / SF specs mentioned in the same breath were still proposed as 3
+# sheet writes — silently editing a row the contact just asked us to stop
+# touching. A deterministic guard drops every update (and nulls any drafted
+# auto-reply) whenever a genuine contact_optout survives, model-independently.
+# ---------------------------------------------------------------------------
+class ContactOptoutUpdateSuppressionTests(unittest.TestCase):
+    OPTOUT_BODY = "Not interested, remove me. FYI it was going for $18/SF NNN, 12,000 SF."
+
+    def test_adv_optout_with_specs_strips_all_updates(self):
+        # The break: contact_optout fired, response_email nulled — but 3 spec
+        # writes for the opted-out row leaked through.
+        proposal = {
+            "events": [{"type": "contact_optout", "reason": "not_interested"}],
+            "updates": [
+                {"column": "Rent/SF /Yr", "value": "18.00"},
+                {"column": "Ops Ex /SF", "value": "0.00"},
+                {"column": "Total SF", "value": "12000"},
+            ],
+            "response_email": None,
+        }
+        out = a._suppress_updates_on_contact_optout(proposal)
+        self.assertEqual(out["updates"], [],
+                         "no sheet writes may target a row the contact opted out of")
+
+    def test_optout_nulls_any_drafted_autoreply(self):
+        # Model-independence: even if the LLM drafted an auto-reply on the opt-out,
+        # the guard nulls it so the opt-out is a pure operator escalation.
+        proposal = {
+            "events": [{"type": "contact_optout", "reason": "unsubscribe"}],
+            "updates": [{"column": "Total SF", "value": "12000"}],
+            "response_email": "Sure, here are the specs you asked about.",
+        }
+        out = a._suppress_updates_on_contact_optout(proposal)
+        self.assertIsNone(out["response_email"])
+        self.assertEqual(out["updates"], [])
+
+    def test_break_body_is_genuine_optout_not_engaged_alternative(self):
+        # "remove me" is a real opt-out, NOT a scoped "show me alternatives" — the
+        # engaged-alternative guard must not strip it, so the opt-out survives to
+        # the update-suppression guard.
+        self.assertFalse(a._looks_like_engaged_alternative_request(self.OPTOUT_BODY))
+
+    def test_no_optout_event_is_a_no_op(self):
+        # Control: without a contact_optout event the guard leaves updates and the
+        # drafted reply untouched.
+        proposal = {
+            "events": [{"type": "property_unavailable", "reason": "leased"}],
+            "updates": [{"column": "Total SF", "value": "12000"}],
+            "response_email": "auto-reply body",
+        }
+        out = a._suppress_updates_on_contact_optout(proposal)
+        self.assertEqual(len(out["updates"]), 1)
+        self.assertEqual(out["response_email"], "auto-reply body")
+
+    def test_engaged_alternative_keeps_updates_through_pipeline(self):
+        # Control (model-independent, production order): a scoped "not interested in
+        # that suite, but show me alternatives" reply has its over-fired
+        # contact_optout stripped upstream by the engaged-alternative guard, so the
+        # extracted specs are preserved — the update-suppression guard is a no-op.
+        body = ("I'm not interested in that particular suite, but show me what "
+                "else you have nearby. The one I passed on was 12,000 SF.")
+        proposal = {
+            "events": [{"type": "contact_optout", "reason": "not_interested"}],
+            "updates": [{"column": "Total SF", "value": "12000"}],
+            "response_email": "auto-reply body",
+        }
+        proposal = a._suppress_quote_only_events(proposal, _conv(body))
+        proposal = a._augment_events_with_deterministic_signals(proposal, _conv(body))
+        proposal = a._suppress_updates_on_contact_optout(proposal)
+        self.assertEqual(len(proposal["updates"]), 1,
+                         "an engaged-alternative lead must keep its extracted specs")
 
 
 if __name__ == "__main__":

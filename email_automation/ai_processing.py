@@ -681,8 +681,15 @@ _CURRENT_ASKING_RE = re.compile(
 # asking rent — a "$30/SF in TI allowance" figure is money the landlord GIVES the
 # tenant, and must never be mined as base rent. The concession word can sit on
 # either side of the figure ("$30/SF TI allowance" or "TI allowance of $30/SF").
+# A "credit" is a give-back ONLY when qualified by an improvement word ("TI
+# credit", "improvement credit", "construction credit"). A BARE "credit" in these
+# emails means tenant CREDITWORTHINESS ("strength of credit", "depending on term,
+# credit and additional TI needs") and must NOT suppress a real asking rate — so
+# "credit" is matched only in the qualified alternation, never on its own.
 _CONCESSION_MARKER_RE = re.compile(
-    r"\b(?:allowance|concession|abatement|free\s+rent|tenant\s+improvement)\b",
+    r"\b(?:allowance|concession|abatement|free\s+rent|tenant\s+improvement)\b"
+    r"|\b(?:t\.?i\.?|tenant\s+improvement|improvement|rent|moving|relocation"
+    r"|construction|build[\s-]?out)\s+credit\b",
     re.IGNORECASE,
 )
 
@@ -900,6 +907,28 @@ def _has_explicit_feature_count(text: str, keyword_re: str) -> bool:
                 continue
             return True
     return False
+
+
+def _suppress_updates_on_contact_optout(proposal: dict) -> dict:
+    """A genuine contact opt-out is a PURE escalation — never touch the row.
+
+    LIVE break adv_optout_with_specs: a broker replies "Not interested, remove me.
+    FYI it was going for $18/SF NNN, 12,000 SF." The classifier correctly fires
+    contact_optout and nulls response_email (escalate to the operator), but the
+    rent / OpEx / SF specs mentioned in the same breath were still proposed as
+    sheet writes — silently editing a row the contact just asked us to stop
+    touching. When a contact_optout survives to this point (the engaged-alternative
+    guard has already stripped scoped "show me something else" over-fires upstream,
+    so any remaining opt-out is genuine), drop every proposed update and null any
+    drafted auto-reply so the opt-out escalates cleanly, model-independently.
+    """
+    if not proposal:
+        return proposal
+    events = proposal.get("events") or []
+    if any((e or {}).get("type") == "contact_optout" for e in events):
+        proposal["updates"] = []
+        proposal["response_email"] = None
+    return proposal
 
 
 def _suppress_fabricated_door_counts(
@@ -1427,6 +1456,27 @@ def _append_notes_to_comments(sheets, spreadsheet_id: str, tab_title: str, heade
     except Exception as e:
         print(f"⚠️ Failed to append notes to comments: {e}")
 
+# Formula columns are computed on the sheet (e.g. Gross Rent = (Rent/SF + Ops Ex) * SF / 12)
+# and must NEVER be overwritten by an AI proposal — a raw value clobbers the live formula
+# cell. The LLM is told this in the prompt, but LIVE testing showed it still proposes
+# {column:'Gross Rent', value:'32.00'} occasionally, so this is a deterministic code guard,
+# not a prompt hope. Aliases come from the canonical field registry so the guard stays in
+# sync with column_config; "monthly gross rent" is the header variant the formula builder
+# (sheet_operations._build_gross_rent_formula_for_row) also matches.
+_FORMULA_COLUMN_ALIASES = frozenset(
+    alias.strip().lower()
+    for field in CANONICAL_FIELDS.values()
+    if field.get("is_formula")
+    for alias in ([field.get("label")] + list(field.get("default_aliases") or []))
+    if alias and alias.strip()
+) | {"monthly gross rent"}
+
+
+def _is_formula_column(col_name: str) -> bool:
+    """True if col_name is a formula column that apply must never write (clobbers the cell)."""
+    return (col_name or "").strip().lower() in _FORMULA_COLUMN_ALIASES
+
+
 def apply_proposal_to_sheet(
     uid: str,
     client_id: str,
@@ -1478,6 +1528,12 @@ def apply_proposal_to_sheet(
                 skipped.append({"column": col_name, "reason": "unknown header"})
                 continue
 
+            # Skip formula columns (e.g. Gross Rent) - computed on the sheet; writing a raw
+            # value clobbers the live formula cell. Deterministic code guard, not prompt-only.
+            if _is_formula_column(col_name):
+                skipped.append({"column": col_name, "reason": "formula-column"})
+                continue
+
             # Skip Flyer/Floorplan columns - these are handled directly via Drive upload
             # AI sometimes proposes local file:// paths from PDF metadata which we don't want
             if key in ("flyer / link", "floorplan", "flyer/link", "flyer"):
@@ -1487,6 +1543,18 @@ def apply_proposal_to_sheet(
             # Reject any file:// URLs - these are local paths that shouldn't be in the sheet
             if new_val.startswith("file://"):
                 skipped.append({"column": col_name, "reason": "invalid-local-path"})
+                continue
+
+            # Reject placeholder / junk *proposed* values (TBD, N/A, ...) for ANY cell,
+            # including empty ones. The existing-value screen below only catches
+            # placeholders in the CURRENT cell, so without this a placeholder proposal
+            # would populate a blank spec cell (live breaks E1 TBD->Power, E2 N/A->Docks).
+            _new_clean = new_val.strip().strip(".").lower()
+            _placeholder_values = {
+                "tbd", "tba", "n/a", "na", "?", "unknown", "pending", "none", "-", "--",
+            }
+            if _new_clean in _placeholder_values:
+                skipped.append({"column": col_name, "reason": "placeholder-value", "value": new_val})
                 continue
 
             col_idx = idx_map[key]                     # 1-based
@@ -2190,6 +2258,10 @@ OUTPUT ONLY valid JSON in this exact format:
         # deterministic event augmenter re-evaluates the fresh message.
         proposal = _suppress_quote_only_events(proposal, conversation)
         proposal = _augment_events_with_deterministic_signals(proposal, conversation)
+        # A genuine contact opt-out must never write the opted-out row (LIVE break
+        # adv_optout_with_specs). Runs AFTER the event augmenter so the engaged-
+        # alternative guard has already dropped any scoped over-fired opt-out.
+        proposal = _suppress_updates_on_contact_optout(proposal)
         proposal = sanitize_new_property_referral_response(
             proposal,
             original_contact_email=email,
