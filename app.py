@@ -890,6 +890,73 @@ def api_accept_new_property():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+def _resolve_current_highlight_row(uid, client_id, thread_data):
+    """
+    Re-resolve a paused/escalated thread's CURRENT sheet row before painting or
+    clearing a highlight.
+
+    A paused thread stores the ``rowNumber`` captured when the escalation was
+    raised. If the broker's property row was later marked non-viable, deleted, or
+    re-sorted in the Google Sheet, that stored index is stale — highlighting or
+    clearing it would paint/clear the WRONG row and give the operator false visual
+    state on a different property. The outbox anchors safely by email
+    (``_find_row_by_email``); the stop/resume highlight path historically did not.
+
+    Strategy: re-resolve by the thread's participant email(s) (the same anchor the
+    outbox uses). Returns the CURRENT 1-based row when found, ``None`` when the row
+    no longer exists (skip the highlight rather than paint a stale row), and falls
+    back to the stored ``rowNumber`` only when no email anchor is available or
+    resolution errors out.
+    """
+    stored_row = thread_data.get("rowNumber")
+
+    emails = thread_data.get("email")
+    if isinstance(emails, str):
+        emails = [emails]
+    emails = [e for e in (emails or []) if e]
+    if not client_id or not emails:
+        # No anchor to re-resolve with → best-effort stored row.
+        return stored_row
+
+    try:
+        from email_automation.clients import _get_client_config, _sheets_client
+        from email_automation.sheets import (
+            _find_row_by_email,
+            _get_first_tab_title,
+            _read_header_row2,
+        )
+
+        sheet_id, _, _ = _get_client_config(uid, client_id)
+        if not sheet_id:
+            return stored_row
+
+        sheets = _sheets_client()
+        tab_title = _get_first_tab_title(sheets, sheet_id)
+        header = _read_header_row2(sheets, sheet_id, tab_title)
+
+        for email in emails:
+            rownum, _ = _find_row_by_email(sheets, sheet_id, tab_title, header, email)
+            if rownum:
+                if stored_row and rownum != stored_row:
+                    print(
+                        f"📍 Re-anchored highlight row {stored_row}→{rownum} "
+                        f"(sheet moved) for {email}",
+                        flush=True,
+                    )
+                return rownum
+
+        # Broker email(s) no longer present in the sheet (row removed / non-viable):
+        # do NOT fall back to the stale stored row — skip the highlight entirely.
+        print(
+            "⚠️ Thread row no longer in sheet (removed/non-viable) — skipping highlight",
+            flush=True,
+        )
+        return None
+    except Exception as e:
+        print(f"⚠️ Could not re-resolve current row, using stored rowNumber: {e}", flush=True)
+        return stored_row
+
+
 @app.route("/api/resume-conversation", methods=["POST"])
 def api_resume_conversation():
     """
@@ -952,9 +1019,11 @@ def api_resume_conversation():
         except Exception as e:
             print(f"⚠️ Could not reset follow-up status: {e}", flush=True)
 
-        # Highlight row yellow in Google Sheet
+        # Highlight row yellow in Google Sheet.
+        # Re-resolve the CURRENT row by email so a moved/re-sorted/removed row is
+        # not painted by a stale stored rowNumber (see _resolve_current_highlight_row).
         client_id = client_id or thread_data.get("clientId")
-        row_number = thread_data.get("rowNumber")
+        row_number = _resolve_current_highlight_row(uid, client_id, thread_data)
 
         if client_id and row_number:
             try:
@@ -1035,9 +1104,45 @@ def api_stop_conversation():
         except Exception as e:
             print(f"⚠️ Could not stop follow-ups: {e}", flush=True)
 
-        # Clear row highlight in Google Sheet
+        # Cancel any queued outbox item for this thread. Stopping a paused/escalated
+        # thread must also halt an already-queued send (an AI reply queued just
+        # before escalation, or a resumed reply the operator second-guessed).
+        # The outbox worker's cancel guard keys off cancelRequested/status on the
+        # OUTBOX doc, so we must set them here — updating only the thread doc leaves
+        # the queued send live and the worker still sends it.
+        try:
+            outbox_ref = (
+                _fs.collection("users").document(uid).collection("outbox")
+            )
+            cancelled_count = 0
+            for outbox_doc in outbox_ref.where("threadId", "==", thread_id).stream():
+                outbox_item = outbox_doc.to_dict() or {}
+                status = str(outbox_item.get("status") or "").strip().lower()
+                if outbox_item.get("cancelRequested") is True or status in (
+                    "cancel_requested",
+                    "cancelled",
+                    "canceled",
+                ):
+                    continue  # already cancelled
+                outbox_doc.reference.update({
+                    "cancelRequested": True,
+                    "status": "cancel_requested",
+                    "cancelledAt": SERVER_TIMESTAMP,
+                })
+                cancelled_count += 1
+            if cancelled_count:
+                print(
+                    f"🚫 Cancelled {cancelled_count} queued outbox item(s) for thread {thread_id[:20]}...",
+                    flush=True,
+                )
+        except Exception as e:
+            print(f"⚠️ Could not cancel queued outbox items: {e}", flush=True)
+
+        # Clear row highlight in Google Sheet.
+        # Re-resolve the CURRENT row by email so a moved/re-sorted/removed row is
+        # not cleared by a stale stored rowNumber (see _resolve_current_highlight_row).
         client_id = client_id or thread_data.get("clientId")
-        row_number = thread_data.get("rowNumber")
+        row_number = _resolve_current_highlight_row(uid, client_id, thread_data)
 
         if client_id and row_number:
             try:

@@ -2986,21 +2986,44 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 event_type = event.get("type")
                 
                 if event_type == "call_requested":
-                    # Create action_needed notification
-                    try:
-                        write_notification(
-                            user_id, client_id,
-                            kind="action_needed",
-                            priority="important",
-                            email=from_addr_lower,
-                            thread_id=thread_id,
-                            row_number=rownum,
-                            row_anchor=row_anchor,
-                            meta={"reason": "call_requested", "details": "Call requested in conversation"},
-                            dedupe_key=f"call_requested:{thread_id}"
-                        )
-                    except Exception as e:
-                        print(f"❌ Failed to write notification: {e}")
+                    # Create action_needed notification.
+                    #
+                    # Escalation dedupe must survive the operator's manual
+                    # continuation. When an operator manually replies from the
+                    # dashboard, the outbox worker runs deleteNotificationOnSend
+                    # (which removes the notification doc that ALSO served as the
+                    # dedupe record, since write_notification stores at
+                    # doc_id = sha1(dedupe_key)) and resumeThreadOnSend (which
+                    # flips the thread back to "active"). With the dedupe doc gone
+                    # and the thread active, the next scheduler pass that
+                    # re-classifies the SAME conversation on a later inbound
+                    # message would re-emit call_requested and write_notification
+                    # would no longer find the dedupe doc — re-firing the
+                    # escalation the operator just resolved. Message-id
+                    # idempotency (processedMessages) only covers the inbound
+                    # message, not event re-emission. So keep a persistent
+                    # escalation marker keyed by the dedupe key, independent of
+                    # the deletable notification doc.
+                    call_dedupe_key = f"call_requested:{thread_id}"
+                    escalation_marker = f"escalation:{call_dedupe_key}"
+                    if has_processed(user_id, escalation_marker):
+                        print(f"📋 Escalation already recorded for {call_dedupe_key}; skipping re-emit")
+                    else:
+                        try:
+                            write_notification(
+                                user_id, client_id,
+                                kind="action_needed",
+                                priority="important",
+                                email=from_addr_lower,
+                                thread_id=thread_id,
+                                row_number=rownum,
+                                row_anchor=row_anchor,
+                                meta={"reason": "call_requested", "details": "Call requested in conversation"},
+                                dedupe_key=call_dedupe_key
+                            )
+                            mark_processed(user_id, escalation_marker)
+                        except Exception as e:
+                            print(f"❌ Failed to write notification: {e}")
 
                 elif event_type == "needs_user_input":
                     # Client asked a question or made a request the AI cannot handle
