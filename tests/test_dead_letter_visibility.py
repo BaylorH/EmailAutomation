@@ -217,17 +217,32 @@ class DeadLetterInspectEndpointTests(unittest.TestCase):
     and raise an active alert through the debug endpoint."""
 
     def _run(self, users):
+        # #16 tenant-isolation: the endpoint is @verify_firebase_token and
+        # inspects ONLY the authenticated caller's own subtree (no list_user_ids
+        # fan-out across tenants). Authenticate as the single tenant under test
+        # and attach a Bearer header so the AUTHORISED path is exercised.
         fake_fs = FakeFirestore(users)
+        caller_uid = next(iter(users))
 
         with patch("app.SCHEDULER_AVAILABLE", True), patch.dict(
             os.environ, {"DEAD_LETTER_ALERT_THRESHOLD": "1"}
         ), patch("email_automation.clients._fs", fake_fs), patch(
-            "email_automation.clients.list_user_ids", return_value=list(users.keys())
+            "firebase_admin.auth.verify_id_token", return_value={"uid": caller_uid}
         ):
             with app.app.test_client() as client:
+                client.environ_base["HTTP_AUTHORIZATION"] = "Bearer testtoken"
                 resp = client.get("/api/firestore-inspect")
         self.assertEqual(200, resp.status_code)
         return resp.get_json()
+
+    def test_unauthenticated_request_is_rejected(self):
+        # #16 hardening: the inspect endpoint must fail closed (401) without a
+        # verified Firebase token — it previously dumped every tenant's dead-
+        # letter reasons / outbox subjects to any unauthenticated request.
+        with patch("app.SCHEDULER_AVAILABLE", True):
+            with app.app.test_client() as client:
+                resp = client.get("/api/firestore-inspect")
+        self.assertEqual(401, resp.status_code)
 
     def test_stuck_send_reason_and_alert_surface(self):
         users = {
@@ -286,9 +301,10 @@ class DeadLetterInspectEndpointTests(unittest.TestCase):
         with patch("app.SCHEDULER_AVAILABLE", True), patch.dict(
             os.environ, {"DEAD_LETTER_ALERT_THRESHOLD": "1"}
         ), patch("email_automation.clients._fs", fake_fs), patch(
-            "email_automation.clients.list_user_ids", return_value=["uid-1"]
+            "firebase_admin.auth.verify_id_token", return_value={"uid": "uid-1"}
         ):
             with app.app.test_client() as client:
+                client.environ_base["HTTP_AUTHORIZATION"] = "Bearer testtoken"
                 resp = client.get("/api/firestore-inspect")
         self.assertEqual(200, resp.status_code)
         payload = resp.get_json()

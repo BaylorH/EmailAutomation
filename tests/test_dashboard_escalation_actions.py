@@ -195,11 +195,16 @@ class StopConversationOnEscalatedThreadTests(unittest.TestCase):
         return store
 
     def _stop(self, store):
+        # #16 tenant-isolation: stop-conversation is @verify_firebase_token and
+        # acts strictly under the TOKEN uid (body uid is ignored). Authenticate
+        # as UID so the handler runs against this tenant's own thread/outbox.
         with patch("email_automation.clients._fs", store), \
              patch("email_automation.messaging._fs", store), \
              patch("email_automation.clients._get_client_config", return_value=(None, None, None)), \
+             patch("firebase_admin.auth.verify_id_token", return_value={"uid": UID}), \
              patch("email_automation.sheets.clear_row_highlight", return_value=True):
             with app_module.app.test_client() as client:
+                client.environ_base["HTTP_AUTHORIZATION"] = "Bearer testtoken"
                 return client.post("/api/stop-conversation", json={
                     "uid": UID,
                     "threadId": THREAD_ID,
@@ -756,10 +761,13 @@ class ResumeStopRowAnchorTests(unittest.TestCase):
         def fake_find_row_by_email(_sheets, _sid, _tab, _hdr, email):
             return row_map.get(email, (None, None))
 
+        # #16 tenant-isolation: both handlers are @verify_firebase_token and act
+        # strictly under the TOKEN uid (body uid is ignored). Authenticate as UID.
         with patch("email_automation.clients._fs", store), \
              patch("email_automation.messaging._fs", store), \
              patch("email_automation.clients._get_client_config",
                    return_value=("sheet-123", None, None)), \
+             patch("firebase_admin.auth.verify_id_token", return_value={"uid": UID}), \
              patch("email_automation.clients._sheets_client", return_value=object()), \
              patch("email_automation.sheets._get_first_tab_title", return_value="Sheet1"), \
              patch("email_automation.sheets._read_header_row2",
@@ -771,6 +779,7 @@ class ResumeStopRowAnchorTests(unittest.TestCase):
              patch("email_automation.sheets.clear_row_highlight",
                    side_effect=lambda sid, rn, *a, **k: clear_calls.append((sid, rn)) or True):
             with app_module.app.test_client() as client:
+                client.environ_base["HTTP_AUTHORIZATION"] = "Bearer testtoken"
                 resp = client.post(route, json={
                     "uid": UID,
                     "threadId": "thread-moved-row",
