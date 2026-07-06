@@ -4,8 +4,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
 for candidate_credentials in [
-    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
-    "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json"),
 ]:
     if os.path.exists(candidate_credentials):
         os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", candidate_credentials)

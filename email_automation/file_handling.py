@@ -207,36 +207,42 @@ def process_pdf_for_ai(content: bytes, filename: str = "document.pdf") -> Dict[s
 
 
 def fetch_pdf_attachments(headers: Dict[str, str], graph_msg_id: str) -> List[Dict[str, Any]]:
-    """Fetch PDF attachments from current message only."""
-    try:
-        base = "https://graph.microsoft.com/v1.0"
-        
-        # Get attachments
-        resp = requests.get(
-            f"{base}/me/messages/{graph_msg_id}/attachments",
-            headers=headers,
-            timeout=30
-        )
-        resp.raise_for_status()
-        
-        attachments = resp.json().get("value", [])
-        pdf_attachments = []
-        
-        for attachment in attachments:
-            if attachment.get("contentType", "").lower() == "application/pdf":
-                name = attachment.get("name", "document.pdf")
-                content_bytes = base64.b64decode(attachment.get("contentBytes", ""))
-                pdf_attachments.append({
-                    "name": name,
-                    "bytes": content_bytes
-                })
-        
-        print(f"📎 Found {len(pdf_attachments)} PDF attachment(s)")
-        return pdf_attachments
-        
-    except Exception as e:
-        print(f"❌ Failed to fetch PDF attachments: {e}")
-        return []
+    """Fetch PDF attachments from current message only.
+
+    Fails CLOSED on Graph/network failure: a 401/403/5xx or network error while
+    downloading attachments is surfaced by raising ``requests.exceptions.
+    RequestException`` so the caller can distinguish a real download failure
+    from a message that genuinely has no attachments. Swallowing the failure and
+    returning ``[]`` would be indistinguishable from the clean no-attachments
+    case, causing the message to be marked fully processed with the attachment
+    silently dropped. Only a healthy 200 response with no PDF attachments
+    returns ``[]``.
+    """
+    base = "https://graph.microsoft.com/v1.0"
+
+    # Download the attachment list. A Graph/network failure MUST propagate;
+    # do not collapse it into an empty list.
+    resp = requests.get(
+        f"{base}/me/messages/{graph_msg_id}/attachments",
+        headers=headers,
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    attachments = resp.json().get("value", [])
+    pdf_attachments = []
+
+    for attachment in attachments:
+        if attachment.get("contentType", "").lower() == "application/pdf":
+            name = attachment.get("name", "document.pdf")
+            content_bytes = base64.b64decode(attachment.get("contentBytes", ""))
+            pdf_attachments.append({
+                "name": name,
+                "bytes": content_bytes
+            })
+
+    print(f"📎 Found {len(pdf_attachments)} PDF attachment(s)")
+    return pdf_attachments
 
 def ensure_drive_folder():
     """Ensure Drive folder exists and return folder ID."""
@@ -750,8 +756,50 @@ def _image_link_to_png_preview(content: bytes) -> Optional[bytes]:
         return None
 
 
-def fetch_and_process_linked_assets(urls: List[str], max_assets: int = 3) -> List[Dict[str, Any]]:
-    """Process safe broker-provided PDF/image links into the same manifest shape as attachments."""
+def _linked_asset_stub_entry(
+    *,
+    name: str,
+    source_url: str,
+    method: str,
+    source_type: str,
+    error: str,
+    **flags: bool,
+) -> Dict[str, Any]:
+    """Build a non-content manifest entry (manual-review or failed-download).
+
+    These entries carry no extracted text/images/drive_link — they exist only
+    to keep an un-resolvable broker link VISIBLE downstream rather than letting
+    it be silently dropped (a dropped link is indistinguishable from 'no
+    assets' and would let the message be marked processed with payload lost).
+    Callers pass the distinguishing flag(s) (e.g. requires_manual_review=True
+    or download_failed=True) as keyword arguments.
+    """
+    entry: Dict[str, Any] = {
+        "name": name,
+        "text": "",
+        "images": [],
+        "method": method,
+        "source_url": source_url,
+        "source_type": source_type,
+        "drive_link": None,
+        "error": error,
+    }
+    entry.update(flags)
+    return entry
+
+
+def fetch_and_process_linked_assets(
+    urls: List[str],
+    max_assets: int = 3,
+    target_property_hint: str = "",
+) -> List[Dict[str, Any]]:
+    """Process safe broker-provided PDF/image links into the same manifest shape as attachments.
+
+    ``target_property_hint`` is the current row's property address/context.
+    When provided, links whose filename/URL names a clearly different street
+    address are rejected by build_download_candidate's deterministic guard so
+    a forwarded wrong-property flyer never populates the row.
+    """
     try:
         from .property_images import build_download_candidate
     except Exception as e:
@@ -769,17 +817,72 @@ def fetch_and_process_linked_assets(urls: List[str], max_assets: int = 3) -> Lis
         seen_urls.add(source_url)
 
         filename_hint = _filename_from_asset_url(source_url, fallback="")
-        candidate = build_download_candidate(source_url, filename_hint=filename_hint)
+        manual_review_reasons: List[str] = []
+        candidate = build_download_candidate(
+            source_url,
+            filename_hint=filename_hint,
+            target_property_hint=target_property_hint,
+            manual_review_reasons=manual_review_reasons,
+        )
         if not candidate:
+            # None with a recorded reason == an address-bearing link we could
+            # not verify without target context. Do NOT silently drop it (a
+            # dropped link is indistinguishable from 'no assets' and lets the
+            # message be marked processed with the broker's payload lost) —
+            # surface it as a manual-review entry. A None with NO reason is a
+            # confident drop (blocked/unsupported host or a hint-confirmed
+            # wrong-property flyer) and stays dropped.
+            if manual_review_reasons:
+                name = _filename_from_asset_url(source_url, filename_hint or "broker flyer.pdf")
+                print(f"⚠️ Broker link needs manual review (unverifiable property address, no target context): {source_url}")
+                processed.append(_linked_asset_stub_entry(
+                    name=name,
+                    source_url=source_url,
+                    method="manual_review_required",
+                    source_type="broker_unverified_property_link",
+                    error=manual_review_reasons[0],
+                    requires_manual_review=True,
+                ))
             continue
 
         name = _filename_from_asset_url(candidate.get("sourceUrl") or source_url, filename_hint or "broker flyer.pdf")
         if candidate.get("sourceType") == "direct_image" and not name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
             name = "broker property image.png"
+
+        # File-share links (SharePoint/OneDrive/Box/WeTransfer/Drive folder) cannot
+        # be auto-downloaded to a concrete file. Surface them as a distinguishable
+        # manual-review entry rather than silently dropping the broker's payload —
+        # a dropped link is indistinguishable from 'no assets' and lets the message
+        # be marked processed with the broker's data lost.
+        if candidate.get("requiresManualReview") or not candidate.get("downloadUrl"):
+            print(f"⚠️ Broker file-share link needs manual review (not auto-downloadable): {source_url}")
+            processed.append(_linked_asset_stub_entry(
+                name=name,
+                source_url=source_url,
+                method="manual_review_required",
+                source_type=candidate.get("sourceType") or "broker_file_share_link",
+                error="Broker file-share link could not be auto-downloaded; needs manual review",
+                requires_manual_review=True,
+            ))
+            continue
+
         try:
             content, content_type = _download_linked_asset(candidate["downloadUrl"])
         except Exception as e:
+            # A broken/protected broker link (dead link, 403 protected Drive file)
+            # MUST stay visible. Swallowing it and continuing (returning []) is
+            # indistinguishable from 'no assets' and lets process_inbox_message see
+            # no error and mark the message processed — the broker's payload is lost
+            # with no retry/visibility. Surface a distinguishable failure entry.
             print(f"⚠️ Failed to download linked property asset {source_url}: {e}")
+            processed.append(_linked_asset_stub_entry(
+                name=name,
+                source_url=source_url,
+                method="failed",
+                source_type=candidate.get("sourceType") or "",
+                error=str(e),
+                download_failed=True,
+            ))
             continue
 
         source_type = candidate.get("sourceType") or ""
@@ -888,6 +991,29 @@ def fetch_and_process_pdfs(headers: Dict[str, str], graph_msg_id: str) -> List[D
         print(f"\n📎 Processing PDF: {name} ({len(content)} bytes)")
         result = process_pdf_for_ai(content, name)
         result['name'] = name
+
+        if result.get('method') == 'failed':
+            # Total extraction failure: local text extraction yielded nothing AND
+            # the OpenAI upload fallback failed (no file_id, no text). Handing this
+            # downstream as a normal manifest entry — with a drive_link — would
+            # write a flyer link to the row and let the message be marked processed
+            # though ZERO specs were extracted, hiding a complete extraction
+            # failure. Surface it as a distinguishable failure marker instead (no
+            # drive_link, no property preview) so it is not mistaken for a usable
+            # result.
+            print(f"❌ PDF extraction failed for {name}; surfacing as failure (not a usable manifest entry)")
+            processed.append({
+                "name": name,
+                "text": "",
+                "images": result.get("images") or [],
+                "method": "failed_extraction",
+                "file_id": None,
+                "id": None,
+                "drive_link": None,
+                "extraction_failed": True,
+                "error": "PDF text extraction and OpenAI upload both failed",
+            })
+            continue
 
         # Upload to Drive for archival
         try:

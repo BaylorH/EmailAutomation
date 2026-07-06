@@ -28,6 +28,42 @@ class SignatureFooterTests(unittest.TestCase):
         self.assertNotIn("Jill Ames", footer)
         self.assertNotIn("jill.ames@mohrpartners.com", footer)
 
+    def test_footer_strips_unresolved_placeholders_from_custom_signature(self):
+        footer = get_email_footer(
+            "[NAME]\nBroker at {{company}}\nCall 555-1234",
+            "custom",
+        )
+        self.assertNotIn("[NAME]", footer)
+        self.assertNotIn("{{company}}", footer)
+        # Real content and line breaks survive the strip.
+        self.assertIn("Broker at", footer)
+        self.assertIn("Call 555-1234", footer)
+        self.assertIn("<br>", footer)
+
+    def test_footer_drops_placeholder_only_lines_instead_of_blank_rows(self):
+        # A line that was ONLY a placeholder must not survive as an empty <br>
+        # row; real lines and their breaks are preserved.
+        footer = get_email_footer(
+            "Jane Doe\n[TITLE]\nAcme Realty",
+            "custom",
+        )
+        self.assertNotIn("[TITLE]", footer)
+        self.assertIn("Jane Doe", footer)
+        self.assertIn("Acme Realty", footer)
+        # Exactly one break between the two surviving lines — the placeholder-only
+        # middle line was dropped, not rendered blank.
+        self.assertEqual(footer.count("<br>"), 1)
+
+    def test_footer_strips_unresolved_placeholders_from_professional_signature(self):
+        footer = get_email_footer(
+            "Jane Doe\n[TITLE] at Acme\n{{phone}}",
+            "professional",
+        )
+        self.assertNotIn("[TITLE]", footer)
+        self.assertNotIn("{{phone}}", footer)
+        self.assertIn("Jane Doe", footer)
+        self.assertIn("at Acme", footer)
+
     def test_professional_mode_with_user_signature_does_not_need_mohr_attachments(self):
         self.assertFalse(
             needs_signature_attachments(

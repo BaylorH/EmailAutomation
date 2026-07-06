@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import requests
 import time
@@ -6,7 +7,7 @@ import uuid
 import logging
 from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
-from google.cloud.firestore import SERVER_TIMESTAMP
+from google.cloud.firestore import SERVER_TIMESTAMP, Increment
 from .utils import (
     GRAPH_SEND_MAX_RETRIES,
     exponential_backoff_request,
@@ -56,6 +57,220 @@ CAMPAIGN_LAUNCH_ACTION_TYPES = {"campaign_creation", "campaign_launch"}
 
 # Unique worker ID for this process
 WORKER_ID = str(uuid.uuid4())[:8]
+
+
+# --- Rail 3: global outbound kill switch -----------------------------------
+# A single fail-closed lever an operator can flip (env var, no code deploy) to
+# halt or downgrade ALL outbound Graph sends the instant a bad-template or
+# wrong-recipient blast is discovered. Scoped levers (per-client pause, per-user
+# auto-reply allowlists, scheduler_scope dev-scoping) do NOT cover outbox
+# outreach or follow-ups; this gate does, at the send call itself.
+OUTBOUND_MODE_ENV = "SITESIFT_OUTBOUND_MODE"
+OUTBOUND_MODE_LIVE = "live"
+OUTBOUND_MODE_DRY_RUN = "dry_run"
+OUTBOUND_MODE_PAUSED = "paused"
+_VALID_OUTBOUND_MODES = {
+    OUTBOUND_MODE_LIVE,
+    OUTBOUND_MODE_DRY_RUN,
+    OUTBOUND_MODE_PAUSED,
+}
+
+
+def resolve_outbound_mode() -> str:
+    """Resolve the global outbound send mode. Fail closed on anything unclear.
+
+    Reads ``SITESIFT_OUTBOUND_MODE`` once per send. Recognized values:
+
+    - ``live`` (or unset / empty): normal sending. Absence preserves existing
+      behavior so the default deployment and the test suite are unaffected.
+    - ``dry_run``: skip every Graph send; leave the item queued.
+    - ``paused``: skip every Graph send; leave the item queued.
+
+    Any unrecognized / malformed value fails **closed** to ``paused`` so a typo
+    ("off", "true", "Live!", "stop") can never silently keep blasting outbound.
+    """
+    raw = os.environ.get(OUTBOUND_MODE_ENV)
+    if raw is None or not raw.strip():
+        return OUTBOUND_MODE_LIVE
+    normalized = raw.strip().lower()
+    if normalized in _VALID_OUTBOUND_MODES:
+        return normalized
+    print(
+        f"🛑 Unrecognized {OUTBOUND_MODE_ENV}={raw!r}; failing closed to "
+        f"'{OUTBOUND_MODE_PAUSED}' (no outbound will be sent)"
+    )
+    return OUTBOUND_MODE_PAUSED
+
+
+def outbound_sending_enabled() -> bool:
+    """True only when the global kill switch resolves to ``live``."""
+    return resolve_outbound_mode() == OUTBOUND_MODE_LIVE
+
+
+def _kill_switch_suppressed(mode: str, *, context: str) -> None:
+    """Emit the suppression audit line for a blocked outbound send."""
+    reason = f"suppressed_by_kill_switch (SITESIFT_OUTBOUND_MODE={mode})"
+    print(f"🛑 {reason}: skipping Graph send for {context}")
+    logger.warning(
+        "outbound.suppressed_by_kill_switch",
+        extra={"outbound_mode": mode, "context": context},
+    )
+
+# ---------------------------------------------------------------------------
+# Rail 2 — aggregate daily send cap (fail-closed, off-by-default-SAFE)
+# ---------------------------------------------------------------------------
+# Per-item retry caps (MAX_OUTBOX_ATTEMPTS, etc.) bound a single item's storm;
+# they do NOT bound total volume. A runaway producer (frontend bug mass-creating
+# outbox docs, a bulk re-queue, a reprocessing loop) can drain unbounded real
+# broker emails before anyone notices. This rail keeps a per-day counter and
+# stops draining once the ceiling is hit, retaining the queue for the next cycle.
+#
+# Off-by-default-SAFE: an UNSET env var keeps the rail ON at a conservative
+# built-in ceiling (absence of config must NOT silently disable it). Only an
+# explicit operator opt-out ("0" / "off" / "none" / "disabled" / "false")
+# turns it off. Fail-closed: if the shared counter cannot be read or the
+# increment cannot be recorded, draining STOPS and the queue is retained.
+DEFAULT_DAILY_SEND_CAP = 500
+SEND_COUNTERS_COLLECTION = "sendCounters"
+SEND_CAP_HEALTH_COLLECTION = "systemHealth"
+SEND_CAP_HEALTH_DOC_ID = "emailAutomation"
+GLOBAL_SEND_COUNTER_PREFIX = "global"
+DAILY_CAP_REACHED_REASON = "daily_cap_reached"
+DAILY_CAP_COUNTER_UNAVAILABLE_REASON = "daily_send_cap_counter_unavailable"
+_DAILY_CAP_DISABLED_TOKENS = {"", "0", "off", "none", "disabled", "false", "no"}
+
+
+def _resolve_send_cap(env_var: str, default: Optional[int]) -> Optional[int]:
+    """Resolve a daily send ceiling from an env var.
+
+    Returns the integer cap, or None when the rail is disabled for that scope.
+    An unset var falls back to ``default`` (for the per-user cap this is a
+    non-None conservative ceiling, so absence of config keeps the rail ON).
+    An unparseable value is treated as "keep the default" — never as a silent
+    disable — so a typo cannot open the floodgates.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return default
+    token = raw.strip().lower()
+    if token in _DAILY_CAP_DISABLED_TOKENS:
+        return None
+    try:
+        cap = int(token)
+    except (TypeError, ValueError):
+        return default
+    if cap <= 0:
+        return None
+    return cap
+
+
+def _resolve_daily_send_cap() -> Optional[int]:
+    """Per-user daily ceiling. Unset env keeps the rail ON at the default."""
+    return _resolve_send_cap("SITESIFT_DAILY_SEND_CAP", DEFAULT_DAILY_SEND_CAP)
+
+
+def _resolve_global_daily_send_cap() -> Optional[int]:
+    """Optional fleet-wide ceiling. Unset = disabled (this scope is opt-in)."""
+    return _resolve_send_cap("SITESIFT_GLOBAL_DAILY_SEND_CAP", None)
+
+
+def _send_counter_day_key(now: Optional[datetime] = None) -> str:
+    return (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+
+
+def _snapshot_count(snapshot) -> int:
+    if snapshot is None:
+        return 0
+    if hasattr(snapshot, "exists") and not snapshot.exists:
+        return 0
+    data = snapshot.to_dict() if hasattr(snapshot, "to_dict") else None
+    try:
+        return int((data or {}).get("count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _read_daily_send_count(fs, user_id: str, day_key: str) -> int:
+    """Read today's per-user send count. Raises on store failure (fail-closed)."""
+    snapshot = (
+        fs.collection("users").document(user_id)
+        .collection(SEND_COUNTERS_COLLECTION).document(day_key)
+        .get()
+    )
+    return _snapshot_count(snapshot)
+
+
+def _increment_daily_send_count(fs, user_id: str, day_key: str, amount: int) -> None:
+    """Atomically add ``amount`` to today's per-user counter. Raises on failure."""
+    if amount <= 0:
+        return
+    (
+        fs.collection("users").document(user_id)
+        .collection(SEND_COUNTERS_COLLECTION).document(day_key)
+        .set(
+            {"count": Increment(amount), "day": day_key, "updatedAt": SERVER_TIMESTAMP},
+            merge=True,
+        )
+    )
+
+
+def _read_global_send_count(fs, day_key: str) -> int:
+    snapshot = (
+        fs.collection(SEND_COUNTERS_COLLECTION)
+        .document(f"{GLOBAL_SEND_COUNTER_PREFIX}-{day_key}")
+        .get()
+    )
+    return _snapshot_count(snapshot)
+
+
+def _increment_global_send_count(fs, day_key: str, amount: int) -> None:
+    if amount <= 0:
+        return
+    (
+        fs.collection(SEND_COUNTERS_COLLECTION)
+        .document(f"{GLOBAL_SEND_COUNTER_PREFIX}-{day_key}")
+        .set(
+            {"count": Increment(amount), "day": day_key, "updatedAt": SERVER_TIMESTAMP},
+            merge=True,
+        )
+    )
+
+
+def _record_send_cap_health(
+    fs,
+    user_id: str,
+    *,
+    status: str,
+    reason: str,
+    cap: Optional[int],
+    count: Optional[int],
+    day_key: str,
+    scope: str = "user",
+) -> None:
+    """Record cap state on systemHealth so a stalled queue is observable.
+
+    Best-effort: a health-write failure must never crash the send path (the
+    send decision has already been made fail-closed by the caller).
+    """
+    try:
+        payload = {
+            "sendCap": {
+                "status": status,
+                "reason": reason,
+                "cap": cap,
+                "count": count,
+                "day": day_key,
+                "scope": scope,
+                "updatedAt": SERVER_TIMESTAMP,
+            }
+        }
+        (
+            fs.collection("users").document(user_id)
+            .collection(SEND_CAP_HEALTH_COLLECTION).document(SEND_CAP_HEALTH_DOC_ID)
+            .set(payload, merge=True)
+        )
+    except Exception as exc:  # noqa: BLE001 - observability must not break sends
+        print(f"   ⚠️ Could not record send-cap health ({reason}): {exc}")
 
 
 def _fresh_graph_headers(
@@ -518,6 +733,81 @@ def _dead_letter_unresolved_name_placeholder_if_needed(
     return True
 
 
+# Thread statuses that may still receive dashboard replies. Anything else
+# (stopped/completed/closed/unknown) is terminal for the send pipeline.
+OPEN_THREAD_STATUSES = {"active", "paused"}
+
+
+def _validate_outbox_thread_reply_target(user_id: str, data: dict) -> Dict[str, Any]:
+    """Re-validate the client-supplied thread binding on a dashboard thread reply.
+
+    The outbox document is written entirely client-side (InlineReplyComposer),
+    so threadId, replyToMessageId and clientId arrive unvalidated. Before any
+    Graph send the pipeline must confirm that:
+      - the thread exists under this user,
+      - the thread belongs to the same client as the outbox item,
+      - the thread is still open (active/paused, never stopped/completed),
+      - replyToMessageId is a message actually recorded under that thread
+        (doc id match, or sourceMessage.graphMessageId for messages keyed by
+        internetMessageId).
+
+    Fail-closed: lookup failures return ok=False so the item is dead-lettered
+    for manual review instead of sending with unverified context.
+    """
+    from .clients import _fs
+
+    thread_id = str(data.get("threadId") or "").strip()
+    reply_to_msg_id = str(data.get("replyToMessageId") or "").strip()
+    client_id = str(data.get("clientId") or "").strip()
+
+    if not thread_id or not reply_to_msg_id:
+        return {"ok": False, "reason": "thread_reply_missing_identifiers", "thread": None}
+
+    try:
+        thread_ref = (
+            _fs.collection("users").document(user_id)
+            .collection("threads").document(thread_id)
+        )
+        snapshot = thread_ref.get()
+    except Exception as e:
+        return {"ok": False, "reason": f"thread_lookup_failed: {e}", "thread": None}
+
+    if not getattr(snapshot, "exists", False):
+        return {"ok": False, "reason": "thread_not_found", "thread": None}
+
+    thread = snapshot.to_dict() or {}
+
+    thread_client_id = str(thread.get("clientId") or "").strip()
+    if thread_client_id and thread_client_id != client_id:
+        return {"ok": False, "reason": "thread_client_mismatch", "thread": None}
+
+    status = str(thread.get("status") or "active").strip().lower()
+    if status not in OPEN_THREAD_STATUSES:
+        return {"ok": False, "reason": f"thread_no_longer_open (status={status})", "thread": None}
+
+    recorded = False
+    try:
+        message_doc = thread_ref.collection("messages").document(reply_to_msg_id).get()
+        recorded = bool(getattr(message_doc, "exists", False))
+    except Exception:
+        recorded = False
+    if not recorded:
+        try:
+            matches = list(
+                thread_ref.collection("messages")
+                .where("sourceMessage.graphMessageId", "==", reply_to_msg_id)
+                .limit(1)
+                .stream()
+            )
+            recorded = bool(matches)
+        except Exception as e:
+            return {"ok": False, "reason": f"reply_target_lookup_failed: {e}", "thread": None}
+    if not recorded:
+        return {"ok": False, "reason": "reply_target_not_in_thread", "thread": None}
+
+    return {"ok": True, "reason": None, "thread": thread, "status": status}
+
+
 def _mark_tour_invite_thread_sent(
     user_id: str,
     data: Dict[str, Any],
@@ -844,6 +1134,13 @@ def _graph_recipient(address: str, name: Optional[str] = None) -> Dict[str, Any]
     return {"emailAddress": email_address}
 
 
+# Last operator (sender) mailbox this process has filtered reply-all audiences
+# for. SiteSift runs per-mailbox, so once we've seen the operator address we can
+# still strip it from a reply-all audience even if a caller forgets to thread
+# user_email through — preventing the mailbox from reply-all'ing itself.
+_LAST_KNOWN_OPERATOR_EMAIL: Optional[str] = None
+
+
 def _filter_reply_all_draft_recipients(
     user_id: str,
     draft: Dict[str, Any],
@@ -858,9 +1155,20 @@ def _filter_reply_all_draft_recipients(
     lets Graph preserve thread semantics while SiteSift still honors opt-outs,
     blocked contacts, duplicate prevention, and the operator's own address.
     """
-    from .processing import is_contact_opted_out
+    from .processing import is_contact_opted_out, _mailbox_identity_without_plus
 
+    global _LAST_KNOWN_OPERATOR_EMAIL
     operator = _normalize_email(user_email)
+    if operator:
+        # Remember the operator so a later caller that omits user_email still
+        # gets the self-send guard.
+        _LAST_KNOWN_OPERATOR_EMAIL = operator
+    elif _LAST_KNOWN_OPERATOR_EMAIL:
+        operator = _LAST_KNOWN_OPERATOR_EMAIL
+    # Compare on the plus-alias-stripped mailbox identity so an operator alias
+    # (e.g. agent+campaign1@sitesift.com) is recognized as the operator's own
+    # mailbox and removed — otherwise reply-all would deliver back to us.
+    operator_identity = _mailbox_identity_without_plus(operator) if operator else None
     seen = set()
     payload = {"toRecipients": [], "ccRecipients": []}
     skipped = {
@@ -877,7 +1185,7 @@ def _filter_reply_all_draft_recipients(
             if not normalized:
                 skipped["invalid"].append(raw_address)
                 continue
-            if operator and normalized == operator:
+            if operator_identity and _mailbox_identity_without_plus(normalized) == operator_identity:
                 skipped["operator"].append(normalized)
                 continue
             if normalized in seen:
@@ -887,6 +1195,10 @@ def _filter_reply_all_draft_recipients(
                 skipped["invalid"].append(normalized)
                 continue
 
+            # Fail closed: if the opt-out lookup errors we must NOT keep the
+            # recipient. Let the error propagate so the whole reply-all filter
+            # aborts (callers delete the draft and require manual review)
+            # rather than risk emailing an opted-out / blocked contact.
             optout_record = is_contact_opted_out(user_id, normalized)
             if optout_record:
                 skipped["optedOut"].append({
@@ -1157,6 +1469,20 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
     """
     from .utils import get_signature_attachments, needs_signature_attachments, format_email_body_with_footer
 
+    # RAIL 3 (kill switch): gate before touching Graph (even the metadata read).
+    outbound_mode = resolve_outbound_mode()
+    if outbound_mode != OUTBOUND_MODE_LIVE:
+        _kill_switch_suppressed(
+            outbound_mode,
+            context=f"_send_outbox_as_reply thread {thread_id}",
+        )
+        return {
+            "sent": False,
+            "error": f"suppressed_by_kill_switch (SITESIFT_OUTBOUND_MODE={outbound_mode})",
+            "suppressedByKillSwitch": True,
+            "outboundMode": outbound_mode,
+        }
+
     base = "https://graph.microsoft.com/v1.0"
     source_metadata = _fetch_graph_message_metadata(headers, reply_to_msg_id, base)
 
@@ -1390,9 +1716,29 @@ NAME_PLACEHOLDER_RE = re.compile(
 )
 
 
+# Company-name suffix/keyword tokens. If a "name" column value carries any of
+# these, it's an organization, not a person — do not fabricate a human
+# first-name greeting ("Hi Acme,"); fall back to a neutral greeting instead.
+_COMPANY_NAME_TOKENS = frozenset({
+    "llc", "inc", "corp", "co", "company", "realty", "group",
+    "partners", "llp", "advisors", "associates", "properties",
+    "capital", "holdings", "ltd",
+})
+
+
+def _looks_like_company_name(candidate: str) -> bool:
+    for token in (candidate or "").split():
+        cleaned = re.sub(r"[^a-z]", "", token.lower())
+        if cleaned in _COMPANY_NAME_TOKENS:
+            return True
+    return False
+
+
 def _safe_greeting_first_name(contact_name: Optional[str]) -> Optional[str]:
     candidate = (contact_name or "").strip()
     if not candidate or "@" in candidate or "[" in candidate or "]" in candidate:
+        return None
+    if _looks_like_company_name(candidate):
         return None
     first = candidate.split()[0].strip(" ,;:()[]{}")
     if not first or not re.fullmatch(r"[A-Za-z][A-Za-z.'-]{0,63}", first):
@@ -1556,10 +1902,40 @@ def _property_address_from_thread_context(thread_context: Optional[Dict[str, Any
     return None
 
 
+_CANCELLED_OUTBOX_STATUSES = {
+    "cancel_requested",
+    "cancelled",
+    "canceled",
+    # optimistic in-progress cancel states set by the UI on click
+    "cancelling",
+    "canceling",
+}
+
+
+def _flag_is_truthy(value: Any) -> bool:
+    """Truthy-check a loosely-typed flag WITHOUT an identity match.
+
+    Dashboard/Firestore-REST/form-encoded writes can land a cancel flag as a
+    real bool, an int (1/0), or a string ("true"/"false"). `is True` misses all
+    but the native bool, so we coerce string/int forms explicitly.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y", "t"}
+    return False
+
+
 def _is_cancelled_outbox_item(data: Dict[str, Any]) -> bool:
     """True when the dashboard has requested cancellation before the worker sends."""
-    status = (data.get("status") or "").strip().lower()
-    return data.get("cancelRequested") is True or status in {"cancel_requested", "cancelled", "canceled"}
+    # Normalize delimiter variants ("cancel-requested" -> "cancel_requested")
+    # so differently-formatted dashboard/REST writes still register as cancels.
+    status = re.sub(r"[\s-]+", "_", (data.get("status") or "").strip().lower())
+    if _flag_is_truthy(data.get("cancelRequested")):
+        return True
+    return status in _CANCELLED_OUTBOX_STATUSES
 
 
 def _delete_cancelled_outbox_item_if_needed(
@@ -1669,18 +2045,40 @@ def _finalize_successful_outbox_item(
 
     thread_id = data.get("threadId")
     if data.get("resumeThreadOnSend") and thread_id:
+        # resumeThreadOnSend and threadId are client-supplied (InlineReplyComposer),
+        # so re-check the thread's current state before flipping it active:
+        # never resurrect a terminal (stopped/completed) thread and never touch a
+        # thread that belongs to a different client. Fail closed on any doubt.
         try:
-            (
+            thread_ref = (
                 _fs.collection("users").document(user_id)
                 .collection("threads").document(thread_id)
-                .set({
+            )
+            resume_block_reason = None
+            snapshot = thread_ref.get()
+            if not getattr(snapshot, "exists", False):
+                resume_block_reason = "thread_not_found"
+            else:
+                thread = snapshot.to_dict() or {}
+                thread_client_id = str(thread.get("clientId") or "").strip()
+                status = str(thread.get("status") or "active").strip().lower()
+                if thread_client_id and thread_client_id != (client_id or ""):
+                    resume_block_reason = "thread_client_mismatch"
+                elif status not in OPEN_THREAD_STATUSES:
+                    resume_block_reason = f"thread_no_longer_open (status={status})"
+            if resume_block_reason:
+                print(
+                    f"   ⏭️ Skipped thread resume for {thread_id[:20]}... after send: "
+                    f"{resume_block_reason}"
+                )
+            else:
+                thread_ref.set({
                     "status": "active",
                     "followUpStatus": "waiting",
                     "lastOperatorReplySentAt": SERVER_TIMESTAMP,
                     "updatedAt": SERVER_TIMESTAMP,
                 }, merge=True)
-            )
-            print(f"   ▶️ Resumed thread {thread_id[:20]}... after dashboard send")
+                print(f"   ▶️ Resumed thread {thread_id[:20]}... after dashboard send")
         except Exception as e:
             print(f"   ⚠️ Could not resume thread {thread_id[:20]}... after send: {e}")
 
@@ -1770,6 +2168,21 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
     SAFETY: All recipient emails are validated before sending to prevent sending to malformed addresses.
     SAFETY: Opted-out contacts are filtered out before sending.
     """
+    # RAIL 3 (kill switch): resolved once per send, checked before any Graph
+    # call. Fail closed — anything but "live" skips the send entirely.
+    outbound_mode = resolve_outbound_mode()
+    if outbound_mode != OUTBOUND_MODE_LIVE:
+        _kill_switch_suppressed(
+            outbound_mode,
+            context=f"send_and_index_email to {len(recipients or [])} recipient(s)",
+        )
+        return {
+            "sent": [],
+            "errors": {"_all": f"suppressed_by_kill_switch (SITESIFT_OUTBOUND_MODE={outbound_mode})"},
+            "suppressedByKillSwitch": True,
+            "outboundMode": outbound_mode,
+        }
+
     if not recipients:
         return {"sent": [], "errors": {"_all": "No recipients"}}
 
@@ -2270,11 +2683,38 @@ def _manual_continuation_retry_reason(prior_send: Dict[str, Any]) -> str:
     )
 
 
+def _outbox_send_operation_state(
+    status: str,
+    doc_id: Optional[str] = None,
+    recipient: Optional[str] = None,
+    error: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Build a Graph operation-state for an outbox send outcome (GO-condition #3).
+
+    Shape matches what ``main._combine_graph_operation_states`` consumes: a dict
+    carrying a ``status`` in {"healthy", "error", "unknown"} plus optional context.
+    """
+    state: Dict[str, Any] = {"status": status, "operation": "outbox_send"}
+    if doc_id:
+        state["docId"] = doc_id
+    if recipient:
+        state["recipient"] = recipient
+    if error is not None:
+        state["error"] = str(error)[:1500]
+    return state
+
+
+def _record_operation_state(operation_states, state) -> None:
+    """Append an op-state to the accumulator when one is being collected."""
+    if operation_states is not None:
+        operation_states.append(state)
+
+
 def send_outboxes(
     user_id: str,
     headers: Dict[str, str],
     headers_provider: Optional[Callable[[], Dict[str, str]]] = None,
-):
+) -> List[Dict[str, Any]]:
     """
     Process outbox items: read script content (generated by frontend LLM), append footer, and send.
 
@@ -2286,9 +2726,15 @@ def send_outboxes(
     5. Email is sent and indexed for reply tracking
 
     Items are retried up to MAX_OUTBOX_ATTEMPTS times, then moved to dead-letter queue.
+
+    Returns a list of Graph operation-states (GO-condition #3): one per item that
+    reached a send outcome, so a swallowed per-item Graph send failure now
+    escalates the health rail via ``main._combine_graph_operation_states``.
     """
     from .clients import _fs
     from collections import defaultdict
+
+    operation_states: List[Dict[str, Any]] = []
 
     # Fetch user's email signature settings
     user_doc = _fs.collection("users").document(user_id).get()
@@ -2309,7 +2755,7 @@ def send_outboxes(
 
     if not docs:
         print("📭 Outbox empty")
-        return
+        return operation_states
 
     print(f"📬 Found {len(docs)} outbox item(s)")
 
@@ -2338,6 +2784,12 @@ def send_outboxes(
                 'email': email
             })
 
+    # Rail 2: aggregate daily send cap (fail-closed, off-by-default-SAFE).
+    # Resolved once per drain; enforced per accepted send below.
+    daily_cap = _resolve_daily_send_cap()
+    global_cap = _resolve_global_daily_send_cap()
+    cap_day_key = _send_counter_day_key()
+
     # Process each unique recipient
     recipients_list = list(email_groups.items())
     for idx, (recipient_email, items) in enumerate(recipients_list):
@@ -2357,6 +2809,65 @@ def send_outboxes(
         if not valid_items:
             continue
 
+        # --- Rail 2: verify we are UNDER the ceiling before sending ---------
+        # Re-read the shared counter each iteration so a fleet-wide blast (many
+        # workers / processes) is bounded, not just a single drain. If the
+        # counter cannot be read we STOP draining and retain the queue — a
+        # transient store blip must never open the floodgates (fail-closed).
+        send_count = len(valid_items)
+        if daily_cap is not None:
+            try:
+                current = _read_daily_send_count(_fs, user_id, cap_day_key)
+            except Exception as exc:  # noqa: BLE001 - fail closed on read error
+                print(
+                    f"🛑 Daily send-cap counter unavailable for {user_id} — "
+                    f"retaining outbox (fail-closed): {exc}"
+                )
+                _record_send_cap_health(
+                    _fs, user_id, status="error",
+                    reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
+                    cap=daily_cap, count=None, day_key=cap_day_key,
+                )
+                return operation_states
+            if current >= daily_cap:
+                print(
+                    f"🛑 Daily send cap reached for {user_id} "
+                    f"({current}/{daily_cap}) — retaining outbox for next cycle."
+                )
+                _record_send_cap_health(
+                    _fs, user_id, status="warning",
+                    reason=DAILY_CAP_REACHED_REASON,
+                    cap=daily_cap, count=current, day_key=cap_day_key,
+                )
+                return operation_states
+
+        if global_cap is not None:
+            try:
+                current_global = _read_global_send_count(_fs, cap_day_key)
+            except Exception as exc:  # noqa: BLE001 - fail closed on read error
+                print(
+                    "🛑 Global send-cap counter unavailable — "
+                    f"retaining outbox (fail-closed): {exc}"
+                )
+                _record_send_cap_health(
+                    _fs, user_id, status="error",
+                    reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
+                    cap=global_cap, count=None, day_key=cap_day_key, scope="global",
+                )
+                return operation_states
+            if current_global >= global_cap:
+                print(
+                    "🛑 Global daily send cap reached "
+                    f"({current_global}/{global_cap}) — retaining outbox for next cycle."
+                )
+                _record_send_cap_health(
+                    _fs, user_id, status="warning",
+                    reason=DAILY_CAP_REACHED_REASON,
+                    cap=global_cap, count=current_global, day_key=cap_day_key,
+                    scope="global",
+                )
+                return operation_states
+
         # Check if multiple properties for same broker
         if len(valid_items) > 1:
             print(f"🔗 Detected {len(valid_items)} properties for same broker: {recipient_email}")
@@ -2369,6 +2880,7 @@ def send_outboxes(
                 signature_mode,
                 user_email,
                 headers_provider=headers_provider,
+                operation_states=operation_states,
             )
         else:
             # Single property - send normally
@@ -2381,12 +2893,37 @@ def send_outboxes(
                 signature_mode,
                 user_email,
                 headers_provider=headers_provider,
+                operation_states=operation_states,
             )
+
+        # --- Rail 2: record the sends we just made -------------------------
+        # If we cannot persist the increment we can no longer trust the ceiling
+        # for subsequent recipients, so we halt the drain (fail-closed).
+        if daily_cap is not None or global_cap is not None:
+            try:
+                if daily_cap is not None:
+                    _increment_daily_send_count(_fs, user_id, cap_day_key, send_count)
+                if global_cap is not None:
+                    _increment_global_send_count(_fs, cap_day_key, send_count)
+            except Exception as exc:  # noqa: BLE001 - fail closed on write error
+                print(
+                    f"🛑 Could not record daily send count for {user_id} — "
+                    f"halting further drains (fail-closed): {exc}"
+                )
+                _record_send_cap_health(
+                    _fs, user_id, status="error",
+                    reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
+                    cap=daily_cap if daily_cap is not None else global_cap,
+                    count=None, day_key=cap_day_key,
+                )
+                return operation_states
 
         # 2-minute delay between ALL emails to avoid spam detection
         if idx < len(recipients_list) - 1:
-            print(f"  ⏳ Waiting 2 minutes before next recipient to avoid spam detection...")
+            print("  ⏳ Waiting 2 minutes before next recipient to avoid spam detection...")
             time.sleep(120)
+
+    return operation_states
 
 
 def _send_multi_property_email(
@@ -2398,6 +2935,7 @@ def _send_multi_property_email(
     signature_mode: str = None,
     user_email: str = None,
     headers_provider: Optional[Callable[[], Dict[str, str]]] = None,
+    operation_states: Optional[list] = None,
 ):
     """
     Send SEPARATE emails for multiple properties to the same broker.
@@ -2602,6 +3140,12 @@ def _send_multi_property_email(
                     send_result=res,
                 )
                 print(f"  ✅ Sent and deleted outbox item for {prop['name']}")
+                _record_operation_state(
+                    operation_states,
+                    _outbox_send_operation_state(
+                        "healthy", doc_id=item['doc'].id, recipient=recipient_email
+                    ),
+                )
             elif not res.get("sent") and res.get("opted_out") and _all_send_errors_are_opt_out(res.get("errors", {})):
                 _terminalize_outbox_action_audit(
                     user_id,
@@ -2628,6 +3172,13 @@ def _send_multi_property_email(
                         delete_original=True,
                     )
                     print(f"  ⚠️ Moved grouped item to reconciliation; Graph accepted send but indexing failed")
+                    # Graph accepted the send (indexing pending) -> not a send failure.
+                    _record_operation_state(
+                        operation_states,
+                        _outbox_send_operation_state(
+                            "healthy", doc_id=item['doc'].id, recipient=recipient_email
+                        ),
+                    )
                     continue
 
                 if new_attempts >= MAX_OUTBOX_ATTEMPTS:
@@ -2654,6 +3205,13 @@ def _send_multi_property_email(
                         error_msg,
                     )
                 print(f"  ⚠️ Kept item with error; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
+                # Swallowed per-item Graph send failure -> surface to the health rail.
+                _record_operation_state(
+                    operation_states,
+                    _outbox_send_operation_state(
+                        "error", doc_id=item['doc'].id, recipient=recipient_email, error=error_msg
+                    ),
+                )
 
         except Exception as e:
             new_attempts = attempts + 1
@@ -2683,6 +3241,12 @@ def _send_multi_property_email(
                     error_msg,
                 )
             print(f"  💥 Error: {e}; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
+            _record_operation_state(
+                operation_states,
+                _outbox_send_operation_state(
+                    "error", doc_id=item['doc'].id, recipient=recipient_email, error=error_msg
+                ),
+            )
 
         # 2-minute delay between emails to same recipient to avoid spam flags
         if idx < len(properties) - 1:
@@ -2698,6 +3262,7 @@ def _send_single_outbox_item(
     signature_mode: str = None,
     user_email: str = None,
     headers_provider: Optional[Callable[[], Dict[str, str]]] = None,
+    operation_states: Optional[list] = None,
 ):
     """
     Send a single outbox item with smart script selection based on contact history.
@@ -2711,6 +3276,17 @@ def _send_single_outbox_item(
     """
     d = item['doc']
     data = item['data']
+
+    # RAIL 3 (kill switch): gate the outbox driver before claiming or sending.
+    # Fail closed — anything but "live" leaves the item queued and untouched
+    # (no claim, no delete, no Graph call) so it resumes cleanly once re-enabled.
+    outbound_mode = resolve_outbound_mode()
+    if outbound_mode != OUTBOUND_MODE_LIVE:
+        _kill_switch_suppressed(
+            outbound_mode,
+            context=f"outbox item {getattr(d, 'id', 'unknown')} (left queued)",
+        )
+        return
 
     if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id):
         return
@@ -2768,6 +3344,34 @@ def _send_single_outbox_item(
 
     # Threading support: check if this is a reply to an existing thread
     is_thread_reply = bool(thread_id and reply_to_msg_id)
+
+    # SECURITY: threadId/replyToMessageId/clientId on the outbox doc are
+    # client-supplied. Before ANY send (including Graph metadata preflights),
+    # re-validate the binding against the server-side thread state. Fail closed
+    # to dead-letter so a stale or crafted outbox item can neither reply into
+    # a stopped/foreign thread nor silently convert into a new indexed send.
+    if is_thread_reply:
+        thread_reply_target = _validate_outbox_thread_reply_target(user_id, data)
+        if not thread_reply_target.get("ok"):
+            reason = thread_reply_target.get("reason") or "thread_reply_validation_failed"
+            _move_to_dead_letter(
+                user_id,
+                d.reference,
+                data,
+                f"Thread reply failed pre-send validation: {reason}; "
+                "manual review required before sending",
+            )
+            print(f"   🛑 Blocked thread reply outbox item {d.id}: {reason}")
+            return
+        # Re-resolve the sheet anchor from the confirmed thread, not the
+        # unvalidated client payload.
+        validated_thread = thread_reply_target.get("thread") or {}
+        try:
+            validated_row_number = int(validated_thread.get("rowNumber") or 0)
+        except (TypeError, ValueError):
+            validated_row_number = 0
+        if validated_row_number:
+            row_number = validated_row_number
 
     # Get scripts array (new format) or build from legacy fields
     email_scripts = data.get("emailScripts")
@@ -3097,6 +3701,9 @@ def _send_single_outbox_item(
             send_result={**send_identity, "sent": final_sent},
         )
         print(f"🗑️ Deleted outbox item {d.id}")
+        _record_operation_state(
+            operation_states, _outbox_send_operation_state("healthy", doc_id=d.id)
+        )
     elif not all_sent and _all_send_errors_are_opt_out(all_errors):
         _terminalize_outbox_action_audit(
             user_id,
@@ -3147,6 +3754,10 @@ def _send_single_outbox_item(
                 delete_original=True,
             )
             print(f"⚠️ Moved outbox item {d.id} to reconciliation; Graph accepted send but indexing failed")
+            # Graph accepted the send (indexing pending) -> not a send failure.
+            _record_operation_state(
+                operation_states, _outbox_send_operation_state("healthy", doc_id=d.id)
+            )
             return
 
         partial_send_retry = bool(accepted_set and remaining_recipients and remaining_recipients != emails)
@@ -3190,6 +3801,11 @@ def _send_single_outbox_item(
                 extra=audit_retry_extra,
             )
             print(f"⚠️ Kept item {d.id} with error; attempts={new_attempts}/{MAX_OUTBOX_ATTEMPTS}")
+
+        # Swallowed per-item Graph send failure -> surface to the health rail.
+        _record_operation_state(
+            operation_states, _outbox_send_operation_state("error", doc_id=d.id, error=error_msg)
+        )
 
 
 def _extract_property_from_script(script: str) -> str:

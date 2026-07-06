@@ -1,0 +1,58 @@
+# .dockerignore — the Dockerfile does `COPY . .`, and .gitignore does NOT
+# filter the docker build context. Without this file a local `docker build`
+# would bake credentials and dev cruft from the working checkout into the
+# pushed image. Pinned by tests/test_ws_b_dockerignore_contract.py — keep the
+# two in sync.
+
+# --- Credentials / secrets (must never enter an image layer) ---
+service-account*.json
+*credentials*.json
+.env*
+*.pem
+*.key
+run_production.sh
+
+# --- Local token caches (per-user MSAL/OAuth state) ---
+msal_token_cache.bin
+token_cache.bin
+
+# --- VCS / CI ---
+.git
+.github
+.gitignore
+
+# --- Tests and test data (not needed at runtime) ---
+tests/
+test_pdfs/
+E2E_TEST_PLAN.md
+E2E_TEST_RUN_SHEET.md
+test_results.json
+
+# --- Dev/deploy scaffolding (image is built FROM these, never contains them) ---
+Dockerfile
+.dockerignore
+deploy/
+docs/
+scripts/
+AGENTS.md
+CLAUDE.md
+AI_IMPROVEMENTS_TODO.md
+*.md
+
+# --- Python / editor / OS cruft ---
+__pycache__
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+env/
+ENV/
+.idea/
+.vscode/
+.DS_Store
+*.log
+logs/
+
+# --- Local data artifacts ---
+*.xlsx
+sig.png

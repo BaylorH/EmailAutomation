@@ -74,6 +74,13 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
                         if cell["status"] == "covered":
                             self.assertTrue(cell.get("testFiles"))
                             self.assertTrue(cell.get("testIds"))
+                            self.assertTrue(
+                                cell.get("provesBehavior"),
+                                f"{feature_id}/{fixture_class} is 'covered' but does not state "
+                                f"provesBehavior - a covered cell must name what its test proves "
+                                f"about THIS feature under THIS fixture class (borrowed/assert-nothing "
+                                f"greens cannot honestly produce this).",
+                            )
                             for test_file in cell["testFiles"]:
                                 self.assertTrue(
                                     (REPO_ROOT / test_file).exists(),
@@ -92,6 +99,262 @@ class ProductionV1FixtureMapTests(unittest.TestCase):
                         else:
                             self.assertTrue(cell.get("gapReason"))
                             self.assertTrue(cell.get("nextProof"))
+
+    def test_covered_cells_state_distinct_proves_behavior(self):
+        """A covered cell must make a DISTINCT claim about what its test proves.
+
+        Two covered cells sharing an identical provesBehavior means one test is
+        being reused to satisfy an unrelated cell (a borrowed green). A test that
+        genuinely proves a specific feature x fixture-class cannot honestly carry
+        the same claim as a different cell.
+        """
+        fixture_map = _read_json(FIXTURE_MAP_PATH)
+        seen: dict[str, str] = {}
+        for feature_id, cells in fixture_map["featureFixtureMatrix"].items():
+            for fixture_class, cell in cells.items():
+                if cell.get("status") != "covered":
+                    continue
+                proves = " ".join((cell.get("provesBehavior") or "").split()).lower()
+                with self.subTest(feature=feature_id, fixture_class=fixture_class):
+                    self.assertTrue(
+                        proves,
+                        f"{feature_id}/{fixture_class} covered cell has no provesBehavior.",
+                    )
+                    self.assertNotIn(
+                        proves,
+                        seen,
+                        f"{feature_id}/{fixture_class} shares an identical provesBehavior "
+                        f"with {seen.get(proves)} - a borrowed/assert-nothing green.",
+                    )
+                seen[proves] = f"{feature_id}/{fixture_class}"
+
+    def test_gap_cells_state_distinct_gap_reasons(self):
+        """Templated boilerplate gap reasons are banned.
+
+        Each uncovered cell must name its own specific missing proof; identical
+        gapReasons signal copy-pasted placeholders that hide what is actually
+        unproven.
+        """
+        fixture_map = _read_json(FIXTURE_MAP_PATH)
+        seen: dict[str, str] = {}
+        for feature_id, cells in fixture_map["featureFixtureMatrix"].items():
+            for fixture_class, cell in cells.items():
+                if cell.get("status") == "covered":
+                    continue
+                reason = " ".join((cell.get("gapReason") or "").split()).lower()
+                with self.subTest(feature=feature_id, fixture_class=fixture_class):
+                    self.assertTrue(
+                        reason,
+                        f"{feature_id}/{fixture_class} gap cell has no gapReason.",
+                    )
+                    self.assertNotIn(
+                        reason,
+                        seen,
+                        f"{feature_id}/{fixture_class} shares an identical gapReason with "
+                        f"{seen.get(reason)} - templated boilerplate is banned.",
+                    )
+                seen[reason] = f"{feature_id}/{fixture_class}"
+
+    def test_stress_matrix_covers_every_feature_and_stress_class(self):
+        """The additive stress lane widens coverage into adversarial operating
+        conditions (429/throttle, concurrency, malformed data, partial-batch
+        failure, retry storm, near-miss negatives) WITHOUT weakening the base
+        seven-class send-risk contract. Every Production V1 feature must name
+        every stress class - covered with a real test + provesBehavior, or an
+        honestly-named gap. Distinct provesBehavior / gapReason are enforced so a
+        stress cell cannot be a borrowed green or templated boilerplate.
+        """
+        gradebook = _read_json(GRADEBOOK_PATH)
+        fixture_map = _read_json(FIXTURE_MAP_PATH)
+        suite = gradebook["releaseSuites"]["production_v1_base_campaign"]
+        required_features = set(suite["featureIds"])
+        valid_statuses = set(fixture_map["statusLegend"])
+        stress_classes = fixture_map.get("stressFixtureClasses")
+        matrix = fixture_map.get("featureStressMatrix")
+
+        self.assertTrue(stress_classes, "Fixture map must declare stressFixtureClasses.")
+        self.assertTrue(matrix, "Fixture map must declare featureStressMatrix.")
+        self.assertEqual(
+            required_features,
+            set(matrix),
+            "Every Production V1 feature must appear in the stress matrix.",
+        )
+
+        proves_seen: dict[str, str] = {}
+        gap_seen: dict[str, str] = {}
+        counts: Counter = Counter()
+        for feature_id, cells in matrix.items():
+            with self.subTest(feature=feature_id):
+                self.assertEqual(
+                    set(stress_classes),
+                    set(cells),
+                    f"{feature_id} must name every stress class, including uncovered gaps.",
+                )
+            for stress_class, cell in cells.items():
+                with self.subTest(feature=feature_id, stress_class=stress_class):
+                    self.assertIn(cell.get("status"), valid_statuses)
+                    self.assertTrue(cell.get("stressScenario"))
+                    counts[cell["status"]] += 1
+                    if cell["status"] == "covered":
+                        self.assertTrue(cell.get("testFiles"))
+                        self.assertTrue(cell.get("testIds"))
+                        proves = " ".join((cell.get("provesBehavior") or "").split()).lower()
+                        self.assertTrue(
+                            proves,
+                            f"{feature_id}/{stress_class} covered stress cell needs provesBehavior.",
+                        )
+                        self.assertNotIn(
+                            proves,
+                            proves_seen,
+                            f"{feature_id}/{stress_class} shares provesBehavior with "
+                            f"{proves_seen.get(proves)} - borrowed stress green.",
+                        )
+                        proves_seen[proves] = f"{feature_id}/{stress_class}"
+                        test_corpus = "\n".join(
+                            (REPO_ROOT / test_file).read_text(errors="ignore")
+                            for test_file in cell["testFiles"]
+                        )
+                        for test_id in cell["testIds"]:
+                            self.assertRegex(
+                                test_corpus,
+                                rf"def\s+{re.escape(test_id)}\s*\(",
+                                f"{feature_id}/{stress_class} references missing testId {test_id}.",
+                            )
+                    else:
+                        self.assertTrue(cell.get("nextProof"))
+                        reason = " ".join((cell.get("gapReason") or "").split()).lower()
+                        self.assertTrue(reason, f"{feature_id}/{stress_class} gap needs gapReason.")
+                        self.assertNotIn(
+                            reason,
+                            gap_seen,
+                            f"{feature_id}/{stress_class} shares gapReason with "
+                            f"{gap_seen.get(reason)} - templated stress boilerplate.",
+                        )
+                        gap_seen[reason] = f"{feature_id}/{stress_class}"
+
+        self.assertEqual(
+            dict(counts),
+            fixture_map.get("stressSummary"),
+            "stressSummary must match the stress-matrix cell counts.",
+        )
+
+    def test_cross_feature_matrix_models_every_interaction_group(self):
+        """The integrated lane: every gradebook featureInteractionMatrix group
+        must be modeled as a crossFeatureMatrix cell - covered by a real
+        integration test (def-exists + distinct provesBehavior) or an honestly
+        named gap (distinct gapReason + nextProof). This turns the interaction
+        groups from prose into enforced coverage.
+        """
+        gradebook = _read_json(GRADEBOOK_PATH)
+        fixture_map = _read_json(FIXTURE_MAP_PATH)
+        interaction_groups = set(gradebook["featureInteractionMatrix"])
+        matrix = fixture_map.get("crossFeatureMatrix")
+        valid_statuses = set(fixture_map["statusLegend"])
+
+        self.assertTrue(matrix, "Fixture map must declare crossFeatureMatrix.")
+        self.assertEqual(
+            interaction_groups,
+            set(matrix),
+            "Every featureInteractionMatrix group must be modeled as a cross-feature cell.",
+        )
+
+        proves_seen: dict[str, str] = {}
+        gap_seen: dict[str, str] = {}
+        counts: Counter = Counter()
+        for group_id, cell in matrix.items():
+            with self.subTest(group=group_id):
+                self.assertIn(cell.get("status"), valid_statuses)
+                self.assertTrue(cell.get("features"))
+                self.assertTrue(cell.get("breakThisBy"))
+                counts[cell["status"]] += 1
+                if cell["status"] == "covered":
+                    self.assertTrue(cell.get("testFiles"))
+                    self.assertTrue(cell.get("testIds"))
+                    proves = " ".join((cell.get("provesBehavior") or "").split()).lower()
+                    self.assertTrue(proves, f"{group_id} covered cross-feature cell needs provesBehavior.")
+                    self.assertNotIn(proves, proves_seen, f"{group_id} shares provesBehavior with {proves_seen.get(proves)}.")
+                    proves_seen[proves] = group_id
+                    test_corpus = "\n".join(
+                        (REPO_ROOT / tf).read_text(errors="ignore") for tf in cell["testFiles"]
+                    )
+                    for test_id in cell["testIds"]:
+                        self.assertRegex(
+                            test_corpus,
+                            rf"def\s+{re.escape(test_id)}\s*\(",
+                            f"{group_id} references missing integration testId {test_id}.",
+                        )
+                else:
+                    self.assertTrue(cell.get("nextProof"))
+                    reason = " ".join((cell.get("gapReason") or "").split()).lower()
+                    self.assertTrue(reason, f"{group_id} gap needs gapReason.")
+                    self.assertNotIn(reason, gap_seen, f"{group_id} shares gapReason with {gap_seen.get(reason)}.")
+                    gap_seen[reason] = group_id
+
+        self.assertEqual(
+            dict(counts),
+            fixture_map.get("crossFeatureSummary"),
+            "crossFeatureSummary must match the cross-feature cell counts.",
+        )
+
+    def test_full_campaign_lanes_model_every_stage(self):
+        """The full-campaign lane: the nine end-to-end stages (upload -> map ->
+        launch -> send -> reply -> classify -> sheet -> followup -> completion)
+        must each be modeled - covered by a chained e2e testId (def-exists +
+        distinct provesBehavior) or an honestly named gap (distinct gapReason +
+        nextProof). Blockers (e.g. the missing JRE for the Firebase emulator)
+        must be recorded, not hidden behind a fabricated green.
+        """
+        fixture_map = _read_json(FIXTURE_MAP_PATH)
+        lanes = fixture_map.get("fullCampaignLanes")
+        valid_statuses = set(fixture_map["statusLegend"])
+        required_stages = {
+            "upload", "map", "launch", "send", "reply",
+            "classify", "sheet", "followup", "completion",
+        }
+
+        self.assertTrue(lanes, "Fixture map must declare fullCampaignLanes.")
+        self.assertEqual(required_stages, set(lanes), "Every campaign stage must be modeled.")
+        self.assertTrue(
+            fixture_map.get("fullCampaignBlockers"),
+            "Full-campaign lane must record its environmental blockers honestly.",
+        )
+
+        proves_seen: dict[str, str] = {}
+        gap_seen: dict[str, str] = {}
+        counts: Counter = Counter()
+        for stage, cell in lanes.items():
+            with self.subTest(stage=stage):
+                self.assertIn(cell.get("status"), valid_statuses)
+                self.assertTrue(cell.get("stageDescription"))
+                counts[cell["status"]] += 1
+                if cell["status"] == "covered":
+                    self.assertTrue(cell.get("testFiles"))
+                    self.assertTrue(cell.get("testIds"))
+                    proves = " ".join((cell.get("provesBehavior") or "").split()).lower()
+                    self.assertTrue(proves, f"{stage} covered stage needs provesBehavior.")
+                    self.assertNotIn(proves, proves_seen, f"{stage} shares provesBehavior with {proves_seen.get(proves)}.")
+                    proves_seen[proves] = stage
+                    test_corpus = "\n".join(
+                        (REPO_ROOT / tf).read_text(errors="ignore") for tf in cell["testFiles"]
+                    )
+                    for test_id in cell["testIds"]:
+                        self.assertRegex(
+                            test_corpus,
+                            rf"def\s+{re.escape(test_id)}\s*\(",
+                            f"{stage} references missing e2e testId {test_id}.",
+                        )
+                else:
+                    self.assertTrue(cell.get("nextProof"))
+                    reason = " ".join((cell.get("gapReason") or "").split()).lower()
+                    self.assertTrue(reason, f"{stage} gap needs gapReason.")
+                    self.assertNotIn(reason, gap_seen, f"{stage} shares gapReason with {gap_seen.get(reason)}.")
+                    gap_seen[reason] = stage
+
+        self.assertEqual(
+            dict(counts),
+            fixture_map.get("fullCampaignSummary"),
+            "fullCampaignSummary must match the lane cell counts.",
+        )
 
     def test_fixture_map_covers_required_events_and_combinations(self):
         gradebook = _read_json(GRADEBOOK_PATH)

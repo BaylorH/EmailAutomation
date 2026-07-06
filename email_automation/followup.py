@@ -46,6 +46,84 @@ SYNTHETIC_OUTBOUND_SOURCES = {"dashboard_outbox_reply", "followup_scheduler"}
 DEFAULT_FOLLOWUP_BUSINESS_TIMEZONE = "America/New_York"
 FOLLOWUP_BUSINESS_START_HOUR = 9
 
+# Bounds for client-written followUpConfig. The dashboard writes this config
+# onto client/outbox docs directly, so the backend must not trust it:
+# waitTime must be a positive number within the per-unit max (~90 days) and
+# the followUps sequence is capped. Out-of-range config is rejected fail-closed
+# (disabled + needs_review), never scheduled.
+FOLLOWUP_MAX_STEPS = 10
+FOLLOWUP_WAIT_UNIT_MAX = {
+    "minutes": 129600,  # 90 days
+    "hours": 2160,      # 90 days
+    "days": 90,
+}
+FOLLOWUP_INVALID_CONFIG_REASON = "followup_config_invalid"
+
+
+def _validate_followup_steps(followups) -> Optional[str]:
+    """Validate a client-supplied followUps sequence.
+
+    Returns None when valid, otherwise a human-readable rejection reason.
+    Steps may omit waitTime/waitUnit (module defaults apply), but any value
+    present must be in bounds.
+    """
+    if not isinstance(followups, list):
+        return f"followUps must be a list, got {type(followups).__name__}"
+    if len(followups) > FOLLOWUP_MAX_STEPS:
+        return f"followUps has {len(followups)} steps (max {FOLLOWUP_MAX_STEPS})"
+    for index, step in enumerate(followups):
+        if not isinstance(step, dict):
+            return f"followUps[{index}] must be an object, got {type(step).__name__}"
+        wait_unit = step.get("waitUnit", "days")
+        if wait_unit not in FOLLOWUP_WAIT_UNIT_MAX:
+            return (
+                f"followUps[{index}].waitUnit {wait_unit!r} is not one of "
+                f"{sorted(FOLLOWUP_WAIT_UNIT_MAX)}"
+            )
+        wait_time = step.get("waitTime")
+        if wait_time is None:
+            continue  # module defaults are safe
+        if isinstance(wait_time, bool) or not isinstance(wait_time, (int, float)):
+            return (
+                f"followUps[{index}].waitTime must be a number, "
+                f"got {type(wait_time).__name__}"
+            )
+        if not wait_time > 0:  # also rejects NaN
+            return f"followUps[{index}].waitTime must be positive, got {wait_time}"
+        if wait_time > FOLLOWUP_WAIT_UNIT_MAX[wait_unit]:
+            return (
+                f"followUps[{index}].waitTime {wait_time} {wait_unit} exceeds "
+                f"max {FOLLOWUP_WAIT_UNIT_MAX[wait_unit]}"
+            )
+    return None
+
+
+def _followup_wait_delta(step: Dict, default_wait: float):
+    """Compute a clamped wait delta for one follow-up step.
+
+    Defense in depth for configs already stored on thread docs (writable
+    straight to Firestore by the dashboard): non-numeric / non-positive
+    waitTime falls back to default_wait, and the result is capped at the
+    per-unit max so a poisoned doc can never schedule an immediate or
+    absurdly distant follow-up.
+
+    Returns (delta, wait_time, wait_unit).
+    """
+    wait_unit = step.get("waitUnit", "days")
+    if wait_unit not in FOLLOWUP_WAIT_UNIT_MAX:
+        wait_unit = "days"
+    wait_time = step.get("waitTime", default_wait)
+    if isinstance(wait_time, bool) or not isinstance(wait_time, (int, float)) or not wait_time > 0:
+        wait_time = default_wait
+    wait_time = min(wait_time, FOLLOWUP_WAIT_UNIT_MAX[wait_unit])
+    if wait_unit == "minutes":
+        delta = timedelta(minutes=wait_time)
+    elif wait_unit == "hours":
+        delta = timedelta(hours=wait_time)
+    else:
+        delta = timedelta(days=wait_time)
+    return delta, wait_time, wait_unit
+
 
 def _followup_business_timezone(followup_config: Optional[Dict[str, Any]] = None):
     timezone_name = (
@@ -277,7 +355,7 @@ def _followup_terminal_block_reason(
 
     if (thread_data or {}).get("hasInboundReply"):
         return "the broker has already replied"
-    if status in {"stopped", "completed", "archived", "action_needed"}:
+    if status in {"stopped", "completed", "archived", "action_needed", "paused"}:
         return f"the thread is {status}"
     if followup_status in {"paused", "needs_review", "max_reached", "complete", "completed", "stopped"}:
         return f"follow-up tracking is {followup_status}"
@@ -297,13 +375,32 @@ def _followup_terminal_block_reason(
     return None
 
 
-def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
+def _followup_operation_state(
+    status: str,
+    thread_id: Optional[str] = None,
+    error: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Build a Graph operation-state for a follow-up send outcome.
+
+    Shape matches ``main._combine_graph_operation_states`` (GO-condition #3).
+    """
+    state: Dict[str, Any] = {"status": status, "operation": "followup_send"}
+    if thread_id:
+        state["threadId"] = thread_id
+    if error is not None:
+        state["error"] = str(error)[:1500]
+    return state
+
+
+def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
     """
     Main entry point: scan threads needing follow-ups and send them.
 
     Called from main.py every 30 minutes.
 
-    Returns: Number of follow-ups sent
+    Returns a list of Graph operation-states (GO-condition #3): one per follow-up
+    that reached a send outcome, so a swallowed per-item Graph send failure now
+    escalates the health rail via ``main._combine_graph_operation_states``.
     """
     print(f"\n{'='*60}")
     print("FOLLOW-UP CHECK")
@@ -311,6 +408,7 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
 
     now = datetime.now(timezone.utc)
     followups_sent = 0
+    operation_states: List[Dict[str, Any]] = []
 
     # Query threads with active follow-up tracking
     threads_ref = _fs.collection("users").document(user_id).collection("threads")
@@ -322,11 +420,11 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
         waiting_threads = list(query.stream())
     except Exception as e:
         print(f"   Error querying follow-up threads: {e}")
-        return 0
+        return operation_states
 
     if not waiting_threads:
         print("   No threads waiting for follow-up")
-        return 0
+        return operation_states
 
     print(f"   Found {len(waiting_threads)} threads with follow-up tracking")
     total_threads = len(waiting_threads)
@@ -421,6 +519,9 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
 
         if success:
             followups_sent += 1
+            operation_states.append(
+                _followup_operation_state("healthy", thread_id=thread_id)
+            )
 
             # Schedule next follow-up if there are more
             _schedule_next_followup(
@@ -446,9 +547,18 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
                 current_index=current_index,
                 fail_closed=getattr(_send_followup_email, "guard_failed_closed", False),
             )
+            # Swallowed per-item Graph send failure -> surface to the health rail.
+            operation_states.append(
+                _followup_operation_state(
+                    "error",
+                    thread_id=thread_id,
+                    error=getattr(_send_followup_email, "last_error", None)
+                    or "follow-up send failed",
+                )
+            )
 
     print(f"\n   Sent {followups_sent} follow-up email(s)")
-    return followups_sent
+    return operation_states
 
 
 def _send_followup_email(
@@ -935,17 +1045,9 @@ def _schedule_next_followup(
         _mark_followup_complete(user_id, thread_id, "max_reached")
         return
 
-    # Calculate next follow-up time
+    # Calculate next follow-up time (clamped: stored config is untrusted)
     next_followup = followups[next_index]
-    wait_time = next_followup.get("waitTime", 3)
-    wait_unit = next_followup.get("waitUnit", "days")
-
-    if wait_unit == "minutes":
-        delta = timedelta(minutes=wait_time)
-    elif wait_unit == "hours":
-        delta = timedelta(hours=wait_time)
-    else:
-        delta = timedelta(days=wait_time)
+    delta, wait_time, wait_unit = _followup_wait_delta(next_followup, default_wait=3)
 
     next_followup_at = _next_business_followup_time(
         datetime.now(timezone.utc) + delta,
@@ -990,15 +1092,8 @@ def schedule_followup_after_auto_response(user_id: str, thread_id: str) -> bool:
             return False
 
         next_followup = followups[current_index]
-        wait_time = next_followup.get("waitTime", 3)
-        wait_unit = next_followup.get("waitUnit", "days")
-
-        if wait_unit == "minutes":
-            delta = timedelta(minutes=wait_time)
-        elif wait_unit == "hours":
-            delta = timedelta(hours=wait_time)
-        else:
-            delta = timedelta(days=wait_time)
+        # Clamped: stored config is untrusted (dashboard writes to Firestore)
+        delta, wait_time, wait_unit = _followup_wait_delta(next_followup, default_wait=3)
 
         next_followup_at = _next_business_followup_time(
             datetime.now(timezone.utc) + delta,
@@ -1073,17 +1168,31 @@ def schedule_followup_for_thread(
     if not followups:
         return
 
+    # Client-written config is untrusted: reject out-of-range waits or an
+    # oversized sequence fail-closed (disabled + flagged for review) so the
+    # scheduler can never fire an immediate or unbounded auto-send sequence.
+    invalid_reason = _validate_followup_steps(followups)
+    if invalid_reason:
+        print(
+            f"   🛑 Rejecting follow-up config for thread {thread_id[:20]}...: "
+            f"{invalid_reason}"
+        )
+        _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
+            "followUpConfig": {
+                "enabled": False,
+                "invalidReason": invalid_reason,
+                "rejectedAt": SERVER_TIMESTAMP,
+            },
+            "followUpStatus": "needs_review",
+            "status": "action_needed",
+            "statusReason": FOLLOWUP_INVALID_CONFIG_REASON,
+            "updatedAt": SERVER_TIMESTAMP,
+        })
+        return
+
     # Calculate first follow-up time
     first_followup = followups[0]
-    wait_time = first_followup.get("waitTime", 5)
-    wait_unit = first_followup.get("waitUnit", "days")
-
-    if wait_unit == "minutes":
-        delta = timedelta(minutes=wait_time)
-    elif wait_unit == "hours":
-        delta = timedelta(hours=wait_time)
-    else:
-        delta = timedelta(days=wait_time)
+    delta, wait_time, wait_unit = _followup_wait_delta(first_followup, default_wait=5)
 
     next_followup_at = _next_business_followup_time(
         datetime.now(timezone.utc) + delta,
@@ -1197,11 +1306,16 @@ def resume_followup_if_silent(user_id: str, thread_id: str, silence_threshold_da
         if current_index >= len(followups):
             return False
 
-        # Calculate next follow-up time (immediate or short delay)
+        # Calculate next follow-up time (short delay). Use the unit-aware delta
+        # from _followup_wait_delta (which also clamps untrusted stored
+        # waitTime: negative/non-numeric -> default), then cap the delta itself
+        # at 1 day so a minute/hour step keeps its unit instead of being
+        # reinterpreted as days.
         next_followup = followups[current_index]
-        wait_time = min(next_followup.get("waitTime", 1), 1)  # Cap at 1 day for resumed
+        delta, _wait, _unit = _followup_wait_delta(next_followup, default_wait=1)
+        delta = min(delta, timedelta(days=1))  # Cap at 1 day for resumed
 
-        next_followup_at = now + timedelta(days=wait_time)
+        next_followup_at = now + delta
 
         thread_ref.update({
             "followUpStatus": "waiting",

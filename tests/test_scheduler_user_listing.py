@@ -9,7 +9,7 @@ os.environ.setdefault("FIREBASE_API_KEY", "test-firebase-api-key")
 os.environ.setdefault("OPENAI_API_KEY", "test-openai-api-key")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json"),
 )
 
 from email_automation import clients

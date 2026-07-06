@@ -5,7 +5,7 @@ from unittest.mock import patch
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub/EmailAutomation/service-account.json",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json"),
 )
 
 from email_automation import email as email_module
@@ -61,7 +61,8 @@ class FakeFirestoreNode:
         return FakeFirestoreNode(self.root, self.path + ["document", "auto-id"])
 
     def get(self):
-        return FakeSnapshot({}, exists=False)
+        key = "/".join(self.path[1::2])
+        return self.root.snapshots.get(key, FakeSnapshot({}, exists=False))
 
 
 class FakeFirestore:
@@ -69,9 +70,26 @@ class FakeFirestore:
         self.deleted_paths = []
         self.set_calls = []
         self.add_calls = []
+        # "users/uid-1/threads/thread-1" -> FakeSnapshot; consulted by node.get()
+        self.snapshots = {}
 
     def collection(self, name):
         return FakeFirestoreNode(self, ["collection", name])
+
+
+def _seed_open_thread(fake_fs, user_id="uid-1", thread_id="thread-1",
+                      client_id="client-1", status="paused", row_number=20,
+                      message_id="graph-message-1"):
+    """Seed a server-side thread + recorded reply-target message so the
+    client-supplied thread binding on outbox docs passes pre-send validation."""
+    fake_fs.snapshots[f"users/{user_id}/threads/{thread_id}"] = FakeSnapshot({
+        "clientId": client_id,
+        "status": status,
+        "rowNumber": row_number,
+    })
+    fake_fs.snapshots[
+        f"users/{user_id}/threads/{thread_id}/messages/{message_id}"
+    ] = FakeSnapshot({"direction": "inbound"})
 
 
 class FakeSnapshot:
@@ -94,38 +112,120 @@ class FakeOutboxCollection:
         return self.docs
 
 
+from google.cloud.firestore import Increment as _Increment
+
+
+class FakeCounterDocRef:
+    """Backed by a shared dict so atomic increments persist across the loop."""
+
+    def __init__(self, store, key, raise_on_get=False):
+        self.store = store
+        self.key = key
+        self.raise_on_get = raise_on_get
+
+    def get(self):
+        if self.raise_on_get:
+            raise RuntimeError("firestore sendCounters read failed")
+        exists = self.key in self.store
+        return FakeSnapshot({"count": self.store.get(self.key, 0)}, exists=exists)
+
+    def set(self, data, merge=False):
+        val = data.get("count")
+        cur = self.store.get(self.key, 0)
+        if isinstance(val, _Increment):
+            self.store[self.key] = cur + val.value
+        elif val is not None:
+            self.store[self.key] = val
+
+
+class FakeCounterCollection:
+    def __init__(self, store, raise_on_get=False):
+        self.store = store
+        self.raise_on_get = raise_on_get
+
+    def document(self, key):
+        return FakeCounterDocRef(self.store, key, raise_on_get=self.raise_on_get)
+
+
+class FakeHealthDocRef:
+    def __init__(self, sink):
+        self.sink = sink
+
+    def set(self, data, merge=False):
+        self.sink.append((data, merge))
+
+
+class FakeHealthCollection:
+    def __init__(self, sink):
+        self.sink = sink
+
+    def document(self, _doc_id):
+        return FakeHealthDocRef(self.sink)
+
+
 class FakeUserNode:
-    def __init__(self, docs, user_data=None):
+    def __init__(self, docs, user_data=None, counter_store=None, health_sink=None,
+                 counter_raise_on_get=False):
         self.docs = docs
         self.user_data = user_data or {"email": "baylor.freelance@outlook.com"}
+        self.counter_store = counter_store if counter_store is not None else {}
+        self.health_sink = health_sink if health_sink is not None else []
+        self.counter_raise_on_get = counter_raise_on_get
 
     def get(self):
         return FakeSnapshot(self.user_data)
 
     def collection(self, name):
-        if name != "outbox":
-            raise AssertionError(f"Unexpected user collection: {name}")
-        return FakeOutboxCollection(self.docs)
+        if name == "outbox":
+            return FakeOutboxCollection(self.docs)
+        if name == "sendCounters":
+            return FakeCounterCollection(
+                self.counter_store, raise_on_get=self.counter_raise_on_get
+            )
+        if name == "systemHealth":
+            return FakeHealthCollection(self.health_sink)
+        raise AssertionError(f"Unexpected user collection: {name}")
 
 
 class FakeUsersCollection:
-    def __init__(self, docs, user_data=None):
+    def __init__(self, docs, user_data=None, counter_store=None, health_sink=None,
+                 counter_raise_on_get=False):
         self.docs = docs
         self.user_data = user_data
+        # Shared mutable state so every users/<uid> lookup sees the same counter.
+        self.counter_store = counter_store if counter_store is not None else {}
+        self.health_sink = health_sink if health_sink is not None else []
+        self.counter_raise_on_get = counter_raise_on_get
 
     def document(self, _user_id):
-        return FakeUserNode(self.docs, self.user_data)
+        return FakeUserNode(
+            self.docs,
+            self.user_data,
+            counter_store=self.counter_store,
+            health_sink=self.health_sink,
+            counter_raise_on_get=self.counter_raise_on_get,
+        )
 
 
 class FakeFirestoreWithOutbox:
-    def __init__(self, docs, user_data=None):
+    def __init__(self, docs, user_data=None, counter_store=None, health_sink=None,
+                 counter_raise_on_get=False):
         self.docs = docs
         self.user_data = user_data
+        self.counter_store = counter_store if counter_store is not None else {}
+        self.health_sink = health_sink if health_sink is not None else []
+        self.counter_raise_on_get = counter_raise_on_get
 
     def collection(self, name):
         if name != "users":
             raise AssertionError(f"Unexpected root collection: {name}")
-        return FakeUsersCollection(self.docs, self.user_data)
+        return FakeUsersCollection(
+            self.docs,
+            self.user_data,
+            counter_store=self.counter_store,
+            health_sink=self.health_sink,
+            counter_raise_on_get=self.counter_raise_on_get,
+        )
 
 
 class FakeSheetsRequest:
@@ -1043,6 +1143,7 @@ class OutboxSafetyTests(unittest.TestCase):
     def test_successful_dashboard_outbox_finalizes_notification_and_thread_after_send(self):
         outbox_ref = FakeDocRef()
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "delete_notification_and_decrement_counters") as delete_notification:
@@ -1124,6 +1225,7 @@ class OutboxSafetyTests(unittest.TestCase):
     def test_dashboard_manual_reply_success_records_audit_after_graph_reply(self):
         doc = self._dashboard_manual_reply_doc()
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
@@ -1166,6 +1268,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "ccEmails": ["baylor@manifoldengineering.ai"],
         })
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
@@ -1214,6 +1317,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "assignedEmails": ["bp21harrison+reviewed@gmail.com"],
         })
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
@@ -1248,6 +1352,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "script": "Hi [NAME],\n\nCan you share details?\n\nThanks",
         })
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
@@ -1277,6 +1382,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "lastSendAttemptAt": "2026-06-26T12:00:00Z",
         })
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
         sent_match = {
             "id": "sent-dashboard-reply-1",
             "internetMessageId": "<sent-dashboard-reply-1@example.com>",
@@ -1320,6 +1426,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "lastSendAttemptAt": "2026-06-26T12:00:00Z",
         })
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
         manual_continuation = {
             "id": "manual-sent-1",
             "internetMessageId": "<manual-sent-1@example.com>",
@@ -1355,6 +1462,7 @@ class OutboxSafetyTests(unittest.TestCase):
     def test_dashboard_manual_reply_failure_remains_visible_for_operator_retry(self):
         doc = self._dashboard_manual_reply_doc(doc_id="outbox-dashboard-retry")
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
@@ -1535,6 +1643,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "actionAuditId": "audit-recovered",
         }, doc_id="outbox-recovered")
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
         manual_continuation = {
             "id": "manual-sent-1",
             "internetMessageId": "<manual-sent-1@example.com>",
@@ -1580,6 +1689,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "actionAuditId": "audit-thread-retry",
         }, doc_id="outbox-thread-retry")
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
         sent_match = {
             "id": "sent-reply-1",
             "internetMessageId": "<sent-reply-1@example.com>",
@@ -1623,6 +1733,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "actionAuditId": "audit-thread-retry",
         }, doc_id="outbox-thread-retry")
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
         manual_continuation = {
             "id": "manual-sent-1",
             "internetMessageId": "<manual-sent-1@example.com>",
@@ -2005,6 +2116,155 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(audit_payload["status"], "needs_reconciliation")
         self.assertTrue(audit_payload["alreadySent"])
         self.assertEqual(audit_payload["sentRecipients"], [recipient])
+
+
+class DailySendCapTests(unittest.TestCase):
+    """Rail 2 — aggregate daily send cap (fail-closed, off-by-default-SAFE)."""
+
+    def _two_recipient_docs(self):
+        return [
+            FakeDoc({
+                "assignedEmails": ["bp21harrison+one@gmail.com"],
+                "script": "Hi Avery",
+                "clientId": "client-1",
+                "subject": "100 Cap Way",
+                "rowNumber": 3,
+            }, doc_id="outbox-1"),
+            FakeDoc({
+                "assignedEmails": ["bp21harrison+two@gmail.com"],
+                "script": "Hi Blake",
+                "clientId": "client-1",
+                "subject": "200 Cap Way",
+                "rowNumber": 4,
+            }, doc_id="outbox-2"),
+        ]
+
+    def test_send_is_suppressed_and_queue_retained_when_daily_cap_reached(self):
+        """The cap+1 send must be blocked and the outbox retained, not drained."""
+        docs = self._two_recipient_docs()
+        day_key = email_module._send_counter_day_key()
+        health_sink = []
+        fake_fs = FakeFirestoreWithOutbox(
+            docs,
+            counter_store={day_key: 1},  # already at the cap
+            health_sink=health_sink,
+        )
+        sends = []
+
+        def record_single_send(_uid, _headers, item, *_a, **_k):
+            sends.append(item)
+
+        with patch.dict(os.environ, {"SITESIFT_DAILY_SEND_CAP": "1"}), \
+             patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_send_single_outbox_item", side_effect=record_single_send), \
+             patch.object(email_module, "_send_multi_property_email", side_effect=record_single_send), \
+             patch.object(email_module.time, "sleep", return_value=None) as sleep:
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+
+        self.assertEqual(sends, [], "cap-reached: no email may be sent")
+        self.assertFalse(docs[0].reference.deleted, "queue must be retained")
+        self.assertFalse(docs[1].reference.deleted, "queue must be retained")
+        sleep.assert_not_called()
+        self.assertEqual(fake_fs.counter_store[day_key], 1, "counter must not advance")
+        reasons = [p.get("sendCap", {}).get("reason") for p, _m in health_sink]
+        self.assertIn(email_module.DAILY_CAP_REACHED_REASON, reasons)
+        statuses = [p.get("sendCap", {}).get("status") for p, _m in health_sink]
+        self.assertIn("warning", statuses)
+
+    def test_sends_proceed_under_cap_and_counter_increments(self):
+        docs = self._two_recipient_docs()
+        day_key = email_module._send_counter_day_key()
+        fake_fs = FakeFirestoreWithOutbox(docs, counter_store={})
+        sends = []
+
+        def record_single_send(_uid, _headers, item, *_a, **_k):
+            sends.append(item)
+
+        with patch.dict(os.environ, {"SITESIFT_DAILY_SEND_CAP": "5"}), \
+             patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_send_single_outbox_item", side_effect=record_single_send), \
+             patch.object(email_module.time, "sleep", return_value=None):
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+
+        self.assertEqual(len(sends), 2, "both under-cap recipients should send")
+        self.assertEqual(fake_fs.counter_store[day_key], 2, "counter must reflect 2 sends")
+
+    def test_partial_drain_stops_exactly_at_cap(self):
+        """First send allowed, counter hits cap, second recipient is retained."""
+        docs = self._two_recipient_docs()
+        day_key = email_module._send_counter_day_key()
+        fake_fs = FakeFirestoreWithOutbox(docs, counter_store={})
+        sends = []
+
+        def record_single_send(_uid, _headers, item, *_a, **_k):
+            sends.append(item)
+
+        with patch.dict(os.environ, {"SITESIFT_DAILY_SEND_CAP": "1"}), \
+             patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_send_single_outbox_item", side_effect=record_single_send), \
+             patch.object(email_module.time, "sleep", return_value=None):
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+
+        self.assertEqual(len(sends), 1, "exactly one send before hitting the cap")
+        self.assertEqual(fake_fs.counter_store[day_key], 1)
+        self.assertFalse(docs[1].reference.deleted, "second recipient must be retained")
+
+    def test_fails_closed_when_counter_unreadable(self):
+        """If the shared counter cannot be read, draining STOPS (fail-closed)."""
+        docs = self._two_recipient_docs()
+        health_sink = []
+        fake_fs = FakeFirestoreWithOutbox(
+            docs, counter_store={}, health_sink=health_sink, counter_raise_on_get=True
+        )
+        sends = []
+
+        def record_single_send(_uid, _headers, item, *_a, **_k):
+            sends.append(item)
+
+        with patch.dict(os.environ, {"SITESIFT_DAILY_SEND_CAP": "500"}), \
+             patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_send_single_outbox_item", side_effect=record_single_send), \
+             patch.object(email_module.time, "sleep", return_value=None):
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+
+        self.assertEqual(sends, [], "unreadable counter must block all sends")
+        reasons = [p.get("sendCap", {}).get("reason") for p, _m in health_sink]
+        self.assertIn(email_module.DAILY_CAP_COUNTER_UNAVAILABLE_REASON, reasons)
+
+    def test_explicit_zero_disables_rail_and_never_touches_counter(self):
+        """Explicit opt-out ('0') sends unbounded and does not read the counter."""
+        docs = self._two_recipient_docs()
+        day_key = email_module._send_counter_day_key()
+        # Counter preset absurdly high; if the rail read it, sends would stop.
+        fake_fs = FakeFirestoreWithOutbox(
+            docs, counter_store={day_key: 10_000}, counter_raise_on_get=True
+        )
+        sends = []
+
+        def record_single_send(_uid, _headers, item, *_a, **_k):
+            sends.append(item)
+
+        with patch.dict(os.environ, {"SITESIFT_DAILY_SEND_CAP": "0"}), \
+             patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_send_single_outbox_item", side_effect=record_single_send), \
+             patch.object(email_module.time, "sleep", return_value=None):
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+
+        self.assertEqual(len(sends), 2, "explicit disable must send unbounded")
+
+    def test_unset_env_keeps_rail_on_at_default_ceiling(self):
+        """Absence of config must NOT silently disable the rail."""
+        self.assertEqual(email_module._resolve_daily_send_cap(),
+                         email_module.DEFAULT_DAILY_SEND_CAP)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SITESIFT_DAILY_SEND_CAP", None)
+            self.assertEqual(email_module._resolve_daily_send_cap(),
+                             email_module.DEFAULT_DAILY_SEND_CAP)
+
+    def test_unparseable_cap_falls_back_to_default_not_disabled(self):
+        with patch.dict(os.environ, {"SITESIFT_DAILY_SEND_CAP": "banana"}):
+            self.assertEqual(email_module._resolve_daily_send_cap(),
+                             email_module.DEFAULT_DAILY_SEND_CAP)
 
 
 if __name__ == "__main__":

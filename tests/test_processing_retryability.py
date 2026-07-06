@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json"),
 )
 
 from email_automation import processing
@@ -186,6 +186,10 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             "messageId": "message-1",
             "retryable": True,
             "processingAttempts": 1,
+            # Production always writes a timezone-aware creation timestamp; the
+            # sent-mail continuation guard now fails CLOSED on an absent/unusable
+            # sent_after, so the fixture must carry a realistic one.
+            "createdAt": datetime.now(timezone.utc) - timedelta(minutes=30),
         }
         failures_collection = MagicMock()
         failures_collection.limit.return_value.stream.return_value = [failure_doc]
@@ -202,6 +206,7 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         with patch.object(processing, "_fs", fake_fs), \
              patch.object(processing, "has_processed", return_value=False), \
              patch.object(processing, "exponential_backoff_request", return_value=graph_response), \
+             patch.object(processing, "find_sent_conversation_continuation_for_retry", return_value=None), \
              patch.object(processing, "process_inbox_message") as process_message, \
              patch.object(processing, "mark_processed") as mark_processed:
             result = processing.retry_processing_failures("uid-1", {"Authorization": "Bearer fake"})

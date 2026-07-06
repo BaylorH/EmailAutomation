@@ -6,7 +6,7 @@ Similar to outbox retry, but for responses that fail to send after processing.
 """
 
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from google.cloud.firestore import SERVER_TIMESTAMP
 
 from .sent_mail_guard import (
@@ -171,22 +171,43 @@ def get_pending_responses(user_id: str) -> list:
     return valid
 
 
-def process_pending_responses(user_id: str, headers: Dict[str, str]) -> int:
+def _pending_response_operation_state(
+    status: str,
+    recipient: Optional[str] = None,
+    error: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Build a Graph operation-state for a pending-response send outcome.
+
+    Shape matches ``main._combine_graph_operation_states`` (GO-condition #3).
+    """
+    state: Dict[str, Any] = {"status": status, "operation": "pending_response_send"}
+    if recipient:
+        state["recipient"] = recipient
+    if error is not None:
+        state["error"] = str(error)[:1500]
+    return state
+
+
+def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
     """
     Retry sending all pending responses.
 
-    Returns the number of successfully sent responses.
+    Returns a list of Graph operation-states (GO-condition #3): one per pending
+    response that reached a send outcome, so a swallowed per-item Graph send
+    failure now escalates the health rail via
+    ``main._combine_graph_operation_states``.
     """
     from .processing import send_reply_in_thread
+
+    operation_states: List[Dict[str, Any]] = []
 
     pending = get_pending_responses(user_id)
 
     if not pending:
-        return 0
+        return operation_states
 
     print(f"\n📬 Found {len(pending)} pending response(s) to retry")
 
-    success_count = 0
     for item in pending:
         doc = item["doc"]
         data = item["data"]
@@ -283,7 +304,9 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> int:
             if sent:
                 print(f"    ✅ Successfully sent pending response!")
                 doc.reference.delete()
-                success_count += 1
+                operation_states.append(
+                    _pending_response_operation_state("healthy", recipient=recipient)
+                )
             else:
                 failure_reason = (
                     getattr(send_reply_in_thread, "last_error", None)
@@ -315,6 +338,12 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> int:
                     "updatedAt": SERVER_TIMESTAMP,
                 })
                 print(f"    ❌ Still failing, will retry later")
+                # Swallowed per-item Graph send failure -> surface to the health rail.
+                operation_states.append(
+                    _pending_response_operation_state(
+                        "error", recipient=recipient, error=failure_reason
+                    )
+                )
 
         except Exception as e:
             error_msg = str(e)
@@ -324,8 +353,13 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> int:
                 "updatedAt": SERVER_TIMESTAMP,
             })
             print(f"    ❌ Error: {error_msg[:50]}...")
+            operation_states.append(
+                _pending_response_operation_state(
+                    "error", recipient=recipient, error=error_msg
+                )
+            )
 
-    return success_count
+    return operation_states
 
 
 def clear_pending_response(user_id: str, thread_id: str) -> bool:

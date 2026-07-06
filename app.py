@@ -2,8 +2,10 @@ import os
 import sys
 import subprocess
 import json
+import re
+from functools import wraps
 from datetime import datetime
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, g
 from flask_cors import CORS
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
@@ -16,6 +18,24 @@ from email_automation.app_config import (
 )
 import threading
 import time
+
+# Firebase Admin SDK — used to verify frontend-issued Firebase ID tokens on the
+# mutating / send-capable /api/* routes. Import is defensive so the module still
+# loads in environments where firebase_admin isn't installed; the auth decorator
+# below fails closed (401) if verification is unavailable.
+try:
+    import firebase_admin
+    from firebase_admin import auth as firebase_auth
+
+    if not firebase_admin._apps:
+        try:
+            firebase_admin.initialize_app()
+        except Exception as _fb_init_err:  # pragma: no cover - env dependent
+            print(f"⚠️ firebase_admin.initialize_app() deferred: {_fb_init_err}")
+except Exception as _fb_import_err:  # pragma: no cover - env dependent
+    firebase_admin = None
+    firebase_auth = None
+    print(f"⚠️ firebase_admin unavailable: {_fb_import_err}")
 
 # Constants for basic Flask app functionality (same as before)
 AUTHORITY = "https://login.microsoftonline.com/common"
@@ -122,6 +142,98 @@ AUTHORITY        = "https://login.microsoftonline.com/common"
 SCOPES           = ["Mail.ReadWrite", "Mail.Send"]
 CACHE_FILE       = "msal_token_cache.bin"
 
+# ---------------------------------------------------------------------------
+# Request-hardening helpers (shared by every /api/* POST handler)
+# ---------------------------------------------------------------------------
+
+# Strict charset for any identifier that is interpolated into a filesystem path
+# or a Firebase storage object path. Rejects path separators, "..", null bytes,
+# and any other traversal / injection vector.
+_UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+# Generic, non-revealing client-facing error text. Internal detail is logged
+# server-side only — never echoed to the client.
+_GENERIC_BAD_REQUEST = "Invalid request"
+_GENERIC_SERVER_ERROR = "Internal server error"
+
+
+def _safe_uid(value):
+    """Return the value iff it is a path-safe identifier string, else None."""
+    if isinstance(value, str) and _UID_RE.match(value):
+        return value
+    return None
+
+
+def _is_nonempty_str(value):
+    """True for a non-empty (after strip) string; False for every other type."""
+    return isinstance(value, str) and value.strip() != ""
+
+
+def _require_json_object():
+    """
+    Safely parse the request body as a JSON object.
+
+    Returns (data, None) on success, or (None, (response, status)) on failure.
+    Fails closed with a clean 400 and a GENERIC message (never raw werkzeug /
+    Python internals) when the content-type isn't JSON, the body is malformed,
+    or the decoded value is not a dict (None/str/int/list/bool).
+    """
+    if not request.is_json:
+        return None, (jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return None, (jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400)
+    return data, None
+
+
+def verify_firebase_token(f=None, *, check_revoked=False):
+    """
+    Decorator: require a valid Firebase ID token on a mutating/send-capable route.
+
+    Reads `Authorization: Bearer <token>`, verifies it with the Firebase Admin
+    SDK, and stashes the verified uid on `g.firebase_uid`. Any missing / malformed
+    / unverifiable token fails closed with 401. The verified uid is the ONLY
+    trusted source of identity — handlers must ignore body/session uid.
+
+    Usable bare (``@verify_firebase_token``) or parameterized
+    (``@verify_firebase_token(check_revoked=True)``). When ``check_revoked`` is
+    True the token is additionally checked against Firebase for revocation /
+    disabled-user state — reserved for destructive routes where a stale-but-
+    unexpired token from a revoked operator must not act. It costs one extra
+    Admin round-trip, so the default stays False for high-volume routes.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            auth_header = request.headers.get("Authorization", "") or ""
+            if not auth_header.startswith("Bearer "):
+                return jsonify({"success": False, "error": "Authentication required"}), 401
+            token = auth_header[len("Bearer "):].strip()
+            if not token:
+                return jsonify({"success": False, "error": "Authentication required"}), 401
+            if firebase_auth is None:
+                print("❌ Firebase auth unavailable; rejecting authenticated request", flush=True)
+                return jsonify({"success": False, "error": "Authentication unavailable"}), 401
+            try:
+                decoded = firebase_auth.verify_id_token(token, check_revoked=check_revoked)
+            except Exception as e:
+                print(f"⚠️ Firebase token verification failed: {type(e).__name__}", flush=True)
+                return jsonify({"success": False, "error": "Invalid authentication token"}), 401
+            uid = decoded.get("uid") if isinstance(decoded, dict) else None
+            if not _is_nonempty_str(uid):
+                return jsonify({"success": False, "error": "Invalid authentication token"}), 401
+            g.firebase_uid = uid
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    # Bare usage: @verify_firebase_token
+    if f is not None:
+        return decorator(f)
+    # Parameterized usage: @verify_firebase_token(check_revoked=True)
+    return decorator
+
+
 # Get the base URL for redirect URI
 def get_base_url():
     return FRONTEND_EMAIL_ACCESS_URL
@@ -209,7 +321,12 @@ def run_scheduler():
 
 @app.route("/")
 def index():
-    uid = request.args.get("uid", "web_user")
+    # Sanitise the caller-supplied uid before it ever reaches the session (and,
+    # from there, filesystem / Firebase object paths). Anything that isn't a
+    # strict path-safe identifier falls back to the default rather than being
+    # trusted verbatim (previously a `?uid=../../..` set the session uid raw).
+    raw_uid = request.args.get("uid", "web_user")
+    uid = _safe_uid(raw_uid) or "web_user"
     session["uid"] = uid
     print(f"[INDEX] Setting UID in session: {uid}")
     status = check_token_status()
@@ -516,40 +633,56 @@ def api_status():
     return jsonify(check_token_status())
 
 @app.route("/api/upload", methods=["POST"])
+@verify_firebase_token
 def api_upload():
+    # Identity comes ONLY from the verified Firebase token, and is re-validated
+    # against the strict charset before touching the filesystem / Firebase path.
+    uid = _safe_uid(g.get("firebase_uid"))
+    if uid is None:
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
     try:
-        uid = session.get("uid", "web_user") 
         print(f"[UPLOAD] Upload requested for UID: {uid}")
-        
-        user_dir = f"msal_caches/{uid}" 
-        cache_file = f"{user_dir}/msal_token_cache.bin" 
+
+        user_dir = f"msal_caches/{uid}"
+        cache_file = f"{user_dir}/msal_token_cache.bin"
         os.makedirs(user_dir, exist_ok=True)
         if not os.path.exists(cache_file):
-            return jsonify({"error": "No token cache file found"})
-        
-        upload_token(FIREBASE_API_KEY, input_file=cache_file, user_id=session.get("uid", "web_user"))
+            return jsonify({"success": False, "error": "No token cache file found"}), 404
+
+        upload_token(FIREBASE_API_KEY, input_file=cache_file, user_id=uid)
         return jsonify({"success": True, "message": "Token uploaded to Firebase"})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        print(f"❌ Upload failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Upload failed"}), 500
 
 @app.route("/api/clear", methods=["POST"])
+@verify_firebase_token
 def api_clear():
+    # Scope to the verified caller's own token cache. Trusting session["uid"]
+    # (set via GET /?uid=) let an unauthenticated caller wipe another user's
+    # MSAL cache; the Firebase-verified uid is the only trustworthy identity.
+    uid = _safe_uid(g.get("firebase_uid"))
+    if uid is None:
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
     try:
-        uid = session.get("uid", "web_user") 
-        user_dir = f"msal_caches/{uid}" 
-        cache_file = f"{user_dir}/msal_token_cache.bin" 
+        user_dir = f"msal_caches/{uid}"
+        cache_file = f"{user_dir}/msal_token_cache.bin"
         os.makedirs(user_dir, exist_ok=True)
         if os.path.exists(cache_file):
             os.remove(cache_file)
         return jsonify({"success": True, "message": "Token cache cleared"})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        print(f"❌ Clear failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Failed to clear token cache"}), 500
 
 @app.route("/api/refresh", methods=["POST"])
+@verify_firebase_token
 def api_refresh():
+    uid = _safe_uid(g.get("firebase_uid"))
+    if uid is None:
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
     try:
-        uid = session.get("uid", "web_user") 
-        user_dir = f"msal_caches/{uid}" 
+        user_dir = f"msal_caches/{uid}"
         cache_file = f"{user_dir}/msal_token_cache.bin" 
         os.makedirs(user_dir, exist_ok=True)
         cache = SerializableTokenCache()
@@ -565,65 +698,72 @@ def api_refresh():
         
         accounts = app_obj.get_accounts()
         if not accounts:
-            return jsonify({"error": "No accounts found"})
-        
+            # Fail-closed: an unauthenticated MSAL state is a client error, not a 200.
+            return jsonify({"success": False, "error": "No accounts found"}), 401
+
         result = app_obj.acquire_token_silent(
-            SCOPES, 
-            account=accounts[0], 
+            SCOPES,
+            account=accounts[0],
             force_refresh=True
         )
-        
+
         if result and "access_token" in result:
             with open(cache_file, "w") as f:
                 f.write(cache.serialize())
             return jsonify({"success": True, "message": "Token refreshed successfully"})
         else:
-            return jsonify({"error": f"Failed to refresh token: {result.get('error_description', 'Unknown error')}"})
-    
+            # result may be None (silent refresh not possible -> interaction
+            # required) or a dict carrying an MSAL error. Either way this is a
+            # clean re-auth signal, never a leaked internal AttributeError.
+            return jsonify({"success": False, "error": "Re-authentication required"}), 401
+
     except Exception as e:
-        return jsonify({"error": str(e)})
+        # Upstream (MSAL / filesystem) failure. Fail closed with a generic 5xx
+        # (502) — never the raw exception text, never a fail-open 200.
+        print(f"❌ Token refresh failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Token refresh failed"}), 502
 
 # Global variable to track scheduler status
 scheduler_status = {"running": False, "last_run": None, "last_result": None}
+# Request-level mutex so two back-to-back triggers can't both pass the
+# "already running" guard before either worker thread flips the flag (TOCTOU).
+_scheduler_lock = threading.Lock()
 
 @app.route("/api/trigger-scheduler", methods=["POST"])
+@verify_firebase_token(check_revoked=True)
 def api_trigger_scheduler():
     """
     API endpoint to manually trigger the email scheduler.
     This runs the same logic as the GitHub Actions workflow.
+
+    Send-capable (real Microsoft Graph Mail.Send) -> requires a verified Firebase
+    ID token (@verify_firebase_token) AND the dev-scope availability guard below.
     """
     global scheduler_status
-    
-    # Check if scheduler functionality is available
+
+    # Check if scheduler functionality is available (dev-scope guard).
     if not SCHEDULER_AVAILABLE:
         return jsonify({
             "success": False,
             "error": "Scheduler functionality not available - missing required environment variables or dependencies"
         }), 503
-    
-    # Check if scheduler is already running
-    if scheduler_status["running"]:
-        return jsonify({
-            "success": False, 
-            "error": "Scheduler is already running",
-            "status": scheduler_status
-        }), 409
-    
-    # Optional: Add basic authentication
-    auth_header = request.headers.get('Authorization')
-    api_key = request.headers.get('X-API-Key')
-    
-    # You can add your own API key validation here
-    # For now, we'll allow any request, but you should add security
-    
+
+    # Atomically claim the run so concurrent/rapid triggers can't double-start.
+    with _scheduler_lock:
+        if scheduler_status["running"]:
+            return jsonify({
+                "success": False,
+                "error": "Scheduler is already running",
+                "status": scheduler_status
+            }), 409
+        scheduler_status["running"] = True
+        scheduler_status["last_run"] = datetime.now().isoformat()
+
     def run_scheduler_async():
         """Run scheduler in background thread"""
         global scheduler_status
         import sys
         try:
-            scheduler_status["running"] = True
-            scheduler_status["last_run"] = datetime.now().isoformat()
-
             print("🚀 Manual scheduler trigger initiated", flush=True)
             result = run_scheduler()
 
@@ -638,12 +778,18 @@ def api_trigger_scheduler():
             scheduler_status["running"] = False
             print(f"💥 Manual scheduler failed: {e}", flush=True)
             sys.stdout.flush()
-    
-    # Start scheduler in background thread
+
+    # Start scheduler in background thread. If starting the thread fails, release
+    # the claimed run so the endpoint isn't wedged in a permanent "running" state.
     thread = threading.Thread(target=run_scheduler_async)
     thread.daemon = True
-    thread.start()
-    
+    try:
+        thread.start()
+    except Exception as e:
+        scheduler_status["running"] = False
+        print(f"💥 Failed to start scheduler thread: {e}", flush=True)
+        return jsonify({"success": False, "error": "Failed to start scheduler"}), 500
+
     return jsonify({
         "success": True,
         "message": "Scheduler started successfully",
@@ -653,46 +799,75 @@ def api_trigger_scheduler():
 
 @app.route("/api/scheduler-status", methods=["GET"])
 def api_scheduler_status():
-    """Get the current status of the scheduler"""
+    """Get the current status of the scheduler.
+
+    This endpoint is polled unauthenticated by the dashboard, so it must NOT
+    disclose server configuration. Previously it returned which environment
+    variables were set (FIREBASE/AZURE/OPENAI presence flags) and the RAW
+    IMPORT_ERROR string — a recon aid. Those internals are stripped here; only
+    a boolean `has_import_error` is surfaced.
+    """
     global scheduler_status
-    
-    # Debug information
-    env_vars = {
-        "FIREBASE_API_KEY": "✅" if os.getenv("FIREBASE_API_KEY") else "❌",
-        "AZURE_API_APP_ID": "✅" if os.getenv("AZURE_API_APP_ID") else "❌", 
-        "OPENAI_API_KEY": "✅" if os.getenv("OPENAI_API_KEY") else "❌",
-        "AZURE_API_CLIENT_SECRET": "✅" if os.getenv("AZURE_API_CLIENT_SECRET") else "❌",
-        "AZURE_CLIENT_SECRET": "✅" if os.getenv("AZURE_CLIENT_SECRET") else "❌"
-    }
-    
+
     return jsonify({
         **scheduler_status,
         "scheduler_available": SCHEDULER_AVAILABLE,
-        "debug_env_vars": env_vars,
-        "import_error": globals().get('IMPORT_ERROR', 'No import error recorded')
+        "has_import_error": bool(globals().get('IMPORT_ERROR')),
     })
 
 @app.route("/api/decline-property", methods=["POST"])
+@verify_firebase_token
 def api_decline_property():
     """
     Delete a property row from a Google Sheet when user declines a new property suggestion.
     Expects JSON body: { uid, clientId, rowNumber, sheetId }
+
+    Issues a DESTRUCTIVE deleteDimension against a Google Sheet, so identity
+    comes ONLY from the verified Firebase ID token (@verify_firebase_token). The
+    body-supplied uid/sheetId are untrusted: the target sheetId must be the exact
+    sheet registered on the TOKEN uid's client. This closes the IDOR of deleting
+    rows out of an arbitrary tenant's sheet by guessing its spreadsheet id.
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+        # The verified token uid is the ONLY trusted identity; never authorize a
+        # destructive sheet write off a body-supplied uid.
+        token_uid = _safe_uid(g.get("firebase_uid"))
+        if token_uid is None:
+            return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
 
         uid = data.get("uid")
         client_id = data.get("clientId")
         row_number = data.get("rowNumber")
         sheet_id = data.get("sheetId")
 
-        if not all([uid, client_id, row_number, sheet_id]):
-            return jsonify({"success": False, "error": "Missing required fields: uid, clientId, rowNumber, sheetId"}), 400
+        # uid / clientId / sheetId must be non-empty strings.
+        if not all(_is_nonempty_str(v) for v in (uid, client_id, sheet_id)):
+            return jsonify({"success": False, "error": "Missing required fields: uid, clientId, sheetId"}), 400
+
+        # rowNumber must be a POSITIVE INTEGER — validated BEFORE the destructive
+        # deleteDimension. bool is a subclass of int, so reject it explicitly;
+        # floats, strings, and non-positive values are rejected too.
+        if isinstance(row_number, bool) or not isinstance(row_number, int) or row_number < 1:
+            return jsonify({"success": False, "error": "rowNumber must be a positive integer"}), 400
+
+        # === Ownership guard ===============================================
+        # Resolve the authoritative sheetId for THIS (token) user's client and
+        # refuse any body sheetId that doesn't match — fail closed BEFORE any
+        # sheet read/write. A body uid naming a different tenant, or a foreign
+        # sheetId, never reaches the destructive delete.
+        from email_automation.clients import _sheets_client, _get_client_config
+        try:
+            authorized_sheet_id, _, _ = _get_client_config(token_uid, client_id)
+        except Exception:
+            return jsonify({"success": False, "error": "Not authorized for this client"}), 403
+        if not _is_nonempty_str(authorized_sheet_id) or sheet_id != authorized_sheet_id:
+            return jsonify({"success": False, "error": "sheetId does not match this client"}), 403
+        # ===================================================================
 
         # Import sheets client
-        from email_automation.clients import _sheets_client
         from email_automation.sheets import _first_sheet_props
 
         sheets = _sheets_client()
@@ -726,30 +901,58 @@ def api_decline_property():
         })
 
     except Exception as e:
-        print(f"❌ Failed to decline property: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"❌ Failed to decline property: {type(e).__name__}: {e}")
+        return jsonify({"success": False, "error": "Failed to decline property"}), 500
 
 
 @app.route("/api/accept-new-property", methods=["POST"])
+@verify_firebase_token
 def api_accept_new_property():
     """
     Accept a new property suggestion - creates the row in the sheet.
     Called when user clicks 'Accept' on a pending_approval notification.
     Expects JSON body: { uid, clientId, notificationId, propertyData }
     propertyData: { address, city, link, notes, leasingCompany, leasingContact, brokerEmail, sheetId, tabTitle }
+
+    Writes rows into a client-owned Google Sheet and can spend OpenAI on PDF
+    extraction, so identity comes ONLY from the verified Firebase ID token
+    (@verify_firebase_token). The body-supplied uid/clientId/notificationId/
+    sheetId are all untrusted: we require the notification to exist under the
+    TOKEN uid's client, and we require the target sheetId to be the exact sheet
+    that notification was raised for. This closes the IDOR (writing into an
+    arbitrary tenant's sheet) and row-anchor corruption (retargeting the row at
+    a different property than the operator reviewed).
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+        # The verified token uid is the ONLY trusted identity; never build a
+        # Firestore path from a body-supplied uid.
+        token_uid = _safe_uid(g.get("firebase_uid"))
+        if token_uid is None:
+            return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
 
         uid = data.get("uid")
         client_id = data.get("clientId")
         notification_id = data.get("notificationId")
         property_data = data.get("propertyData", {})
 
-        if not all([uid, client_id, notification_id]):
+        if not all(_is_nonempty_str(v) for v in (uid, client_id, notification_id)):
             return jsonify({"success": False, "error": "Missing required fields: uid, clientId, notificationId"}), 400
+
+        # A body uid that names a different tenant than the verified token is a
+        # spoof attempt -> fail closed before any Firestore/Sheets work.
+        if uid != token_uid:
+            return jsonify({"success": False, "error": "Not authorized for this account"}), 403
+
+        # From here on the verified token uid is authoritative.
+        uid = token_uid
+
+        # propertyData must be an object (absent -> {} which then fails on the
+        # required sheetId/address checks below). null / str / int / list -> 400.
+        if not isinstance(property_data, dict):
+            return jsonify({"success": False, "error": "propertyData must be an object"}), 400
 
         # Extract property data
         address = property_data.get("address", "")
@@ -769,6 +972,32 @@ def api_accept_new_property():
 
         if not address:
             return jsonify({"success": False, "error": "Missing address in propertyData"}), 400
+
+        # === Ownership / row-anchor guard ===================================
+        # The notification must exist under THIS (token) user's client, and the
+        # target sheetId must be the exact sheet the notification was raised for.
+        # Anything else is an IDOR / row-anchor-corruption attempt -> fail closed
+        # BEFORE any sheet write or OpenAI spend.
+        from email_automation.clients import _fs
+        try:
+            notif_snapshot = (
+                _fs.collection("users").document(uid)
+                .collection("clients").document(client_id)
+                .collection("notifications").document(notification_id).get()
+            )
+        except Exception as e:
+            print(f"❌ accept-new-property notification lookup failed: {type(e).__name__}: {e}")
+            return jsonify({"success": False, "error": "Failed to accept new property"}), 502
+
+        if not getattr(notif_snapshot, "exists", False):
+            return jsonify({"success": False, "error": "Not authorized for this notification"}), 403
+
+        notif_data = notif_snapshot.to_dict() or {}
+        notif_meta = notif_data.get("meta") or {}
+        expected_sheet_id = notif_meta.get("sheetId") or notif_data.get("sheetId")
+        if not _is_nonempty_str(expected_sheet_id) or sheet_id != expected_sheet_id:
+            return jsonify({"success": False, "error": "sheetId does not match the notification"}), 403
+        # ===================================================================
 
         # Import required modules
         from email_automation.clients import _sheets_client
@@ -884,13 +1113,81 @@ def api_accept_new_property():
         })
 
     except Exception as e:
-        print(f"❌ Failed to accept new property: {e}")
+        print(f"❌ Failed to accept new property: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Failed to accept new property"}), 500
+
+
+def _resolve_current_highlight_row(uid, client_id, thread_data):
+    """
+    Re-resolve a paused/escalated thread's CURRENT sheet row before painting or
+    clearing a highlight.
+
+    A paused thread stores the ``rowNumber`` captured when the escalation was
+    raised. If the broker's property row was later marked non-viable, deleted, or
+    re-sorted in the Google Sheet, that stored index is stale — highlighting or
+    clearing it would paint/clear the WRONG row and give the operator false visual
+    state on a different property. The outbox anchors safely by email
+    (``_find_row_by_email``); the stop/resume highlight path historically did not.
+
+    Strategy: re-resolve by the thread's participant email(s) (the same anchor the
+    outbox uses). Returns the CURRENT 1-based row when found, ``None`` when the row
+    no longer exists (skip the highlight rather than paint a stale row), and falls
+    back to the stored ``rowNumber`` only when no email anchor is available or
+    resolution errors out.
+    """
+    stored_row = thread_data.get("rowNumber")
+
+    emails = thread_data.get("email")
+    if isinstance(emails, str):
+        emails = [emails]
+    emails = [e for e in (emails or []) if e]
+    if not client_id or not emails:
+        # No anchor to re-resolve with → best-effort stored row.
+        return stored_row
+
+    try:
+        from email_automation.clients import _get_client_config, _sheets_client
+        from email_automation.sheets import (
+            _find_row_by_email,
+            _get_first_tab_title,
+            _read_header_row2,
+        )
+
+        sheet_id, _, _ = _get_client_config(uid, client_id)
+        if not sheet_id:
+            return stored_row
+
+        sheets = _sheets_client()
+        tab_title = _get_first_tab_title(sheets, sheet_id)
+        header = _read_header_row2(sheets, sheet_id, tab_title)
+
+        for email in emails:
+            rownum, _ = _find_row_by_email(sheets, sheet_id, tab_title, header, email)
+            if rownum:
+                if stored_row and rownum != stored_row:
+                    print(
+                        f"📍 Re-anchored highlight row {stored_row}→{rownum} "
+                        f"(sheet moved) for {email}",
+                        flush=True,
+                    )
+                return rownum
+
+        # Broker email(s) no longer present in the sheet (row removed / non-viable):
+        # do NOT fall back to the stale stored row — skip the highlight entirely.
+        print(
+            "⚠️ Thread row no longer in sheet (removed/non-viable) — skipping highlight",
+            flush=True,
+        )
+        return None
+    except Exception as e:
+        print(f"⚠️ Could not re-resolve current row, using stored rowNumber: {e}", flush=True)
+        return stored_row
 
 
 @app.route("/api/resume-conversation", methods=["POST"])
+@verify_firebase_token
 def api_resume_conversation():
     """
     Resume monitoring a paused conversation thread.
@@ -900,18 +1197,39 @@ def api_resume_conversation():
     - Resets follow-up status to 'waiting'
 
     Expects JSON body: { uid, threadId, clientId? }
+
+    Mutates a live conversation thread, so identity comes ONLY from the verified
+    Firebase ID token (@verify_firebase_token). The body-supplied uid is ignored
+    for the Firestore path; the thread is loaded strictly under the TOKEN uid, so
+    a caller can only ever resume their OWN threads. If a clientId is supplied it
+    must match the thread's clientId. This closes the cross-tenant thread hijack.
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json(silent=True) or request.form.to_dict() or request.args.to_dict()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+        # Identity is the verified token uid ONLY; the body uid is untrusted.
+        token_uid = _safe_uid(g.get("firebase_uid"))
+        if token_uid is None:
+            return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
 
         uid = data.get("uid") or data.get("userId") or data.get("user_id")
         thread_id = data.get("threadId") or data.get("thread_id")
         client_id = data.get("clientId") or data.get("client_id")  # Optional, used to find sheet
 
-        if not uid or not thread_id:
+        # threadId must be a non-empty string with no path separators (it is
+        # interpolated directly into a Firestore document path). The body uid is
+        # ignored for identity, but a well-formed uid is still required by the
+        # request contract (reject malformed values such as embedded newlines).
+        if not _is_nonempty_str(uid) or not _is_nonempty_str(thread_id):
             return jsonify({"success": False, "error": "Missing required fields: uid, threadId"}), 400
+        if _safe_uid(uid) is None or "/" in thread_id:
+            return jsonify({"success": False, "error": "Invalid uid or threadId"}), 400
+        if client_id is not None and not isinstance(client_id, str):
+            return jsonify({"success": False, "error": "Invalid clientId"}), 400
+
+        # From here on the verified token uid is authoritative — ignore body uid.
+        uid = token_uid
 
         from email_automation.clients import _fs, _get_client_config
         from email_automation.messaging import update_thread_status, THREAD_STATUS
@@ -925,7 +1243,13 @@ def api_resume_conversation():
         if not thread_doc.exists:
             return jsonify({"success": False, "error": "Thread not found"}), 404
 
-        thread_data = thread_doc.to_dict()
+        thread_data = thread_doc.to_dict() or {}
+
+        # Ownership guard: if the caller named a client, it must be THIS thread's
+        # client — refuse a mismatched clientId rather than acting on it.
+        if _is_nonempty_str(client_id) and thread_data.get("clientId") != client_id:
+            return jsonify({"success": False, "error": "Not authorized for this thread"}), 403
+
         current_status = thread_data.get("status", "")
 
         # Only resume if currently paused
@@ -952,9 +1276,11 @@ def api_resume_conversation():
         except Exception as e:
             print(f"⚠️ Could not reset follow-up status: {e}", flush=True)
 
-        # Highlight row yellow in Google Sheet
+        # Highlight row yellow in Google Sheet.
+        # Re-resolve the CURRENT row by email so a moved/re-sorted/removed row is
+        # not painted by a stale stored rowNumber (see _resolve_current_highlight_row).
         client_id = client_id or thread_data.get("clientId")
-        row_number = thread_data.get("rowNumber")
+        row_number = _resolve_current_highlight_row(uid, client_id, thread_data)
 
         if client_id and row_number:
             try:
@@ -975,13 +1301,14 @@ def api_resume_conversation():
         })
 
     except Exception as e:
-        print(f"❌ Failed to resume conversation: {e}", flush=True)
+        print(f"❌ Failed to resume conversation: {type(e).__name__}: {e}", flush=True)
         import traceback
         traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Failed to resume conversation"}), 500
 
 
 @app.route("/api/stop-conversation", methods=["POST"])
+@verify_firebase_token
 def api_stop_conversation():
     """
     Stop monitoring a conversation thread.
@@ -990,18 +1317,40 @@ def api_stop_conversation():
     - Clears row highlight in Google Sheet
 
     Expects JSON body: { uid, threadId, clientId? }
+
+    Force-sets a live thread to stopped and wipes its follow-up scheduling, so
+    identity comes ONLY from the verified Firebase ID token
+    (@verify_firebase_token). The body-supplied uid is ignored for the Firestore
+    path; the thread is loaded strictly under the TOKEN uid, so a caller can only
+    ever stop their OWN threads. If a clientId is supplied it must match the
+    thread's clientId. This closes the cross-tenant thread-kill attack.
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+        # Identity is the verified token uid ONLY; the body uid is untrusted.
+        token_uid = _safe_uid(g.get("firebase_uid"))
+        if token_uid is None:
+            return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
 
         uid = data.get("uid")
         thread_id = data.get("threadId")
         client_id = data.get("clientId")  # Optional, used to find sheet
 
-        if not uid or not thread_id:
+        # threadId must be a non-empty string with no path separators (it is
+        # interpolated directly into a Firestore document path). The body uid is
+        # ignored for identity, but a well-formed uid is still required by the
+        # request contract (reject malformed values such as embedded newlines).
+        if not _is_nonempty_str(uid) or not _is_nonempty_str(thread_id):
             return jsonify({"success": False, "error": "Missing required fields: uid, threadId"}), 400
+        if _safe_uid(uid) is None or "/" in thread_id:
+            return jsonify({"success": False, "error": "Invalid uid or threadId"}), 400
+        if client_id is not None and not isinstance(client_id, str):
+            return jsonify({"success": False, "error": "Invalid clientId"}), 400
+
+        # From here on the verified token uid is authoritative — ignore body uid.
+        uid = token_uid
 
         from email_automation.clients import _fs, _get_client_config
         from email_automation.messaging import update_thread_status, THREAD_STATUS
@@ -1015,7 +1364,12 @@ def api_stop_conversation():
         if not thread_doc.exists:
             return jsonify({"success": False, "error": "Thread not found"}), 404
 
-        thread_data = thread_doc.to_dict()
+        thread_data = thread_doc.to_dict() or {}
+
+        # Ownership guard: if the caller named a client, it must be THIS thread's
+        # client — refuse a mismatched clientId rather than acting on it.
+        if _is_nonempty_str(client_id) and thread_data.get("clientId") != client_id:
+            return jsonify({"success": False, "error": "Not authorized for this thread"}), 403
 
         # Update thread status to stopped
         if not update_thread_status(uid, thread_id, THREAD_STATUS["stopped"], "user_requested"):
@@ -1035,9 +1389,45 @@ def api_stop_conversation():
         except Exception as e:
             print(f"⚠️ Could not stop follow-ups: {e}", flush=True)
 
-        # Clear row highlight in Google Sheet
+        # Cancel any queued outbox item for this thread. Stopping a paused/escalated
+        # thread must also halt an already-queued send (an AI reply queued just
+        # before escalation, or a resumed reply the operator second-guessed).
+        # The outbox worker's cancel guard keys off cancelRequested/status on the
+        # OUTBOX doc, so we must set them here — updating only the thread doc leaves
+        # the queued send live and the worker still sends it.
+        try:
+            outbox_ref = (
+                _fs.collection("users").document(uid).collection("outbox")
+            )
+            cancelled_count = 0
+            for outbox_doc in outbox_ref.where("threadId", "==", thread_id).stream():
+                outbox_item = outbox_doc.to_dict() or {}
+                status = str(outbox_item.get("status") or "").strip().lower()
+                if outbox_item.get("cancelRequested") is True or status in (
+                    "cancel_requested",
+                    "cancelled",
+                    "canceled",
+                ):
+                    continue  # already cancelled
+                outbox_doc.reference.update({
+                    "cancelRequested": True,
+                    "status": "cancel_requested",
+                    "cancelledAt": SERVER_TIMESTAMP,
+                })
+                cancelled_count += 1
+            if cancelled_count:
+                print(
+                    f"🚫 Cancelled {cancelled_count} queued outbox item(s) for thread {thread_id[:20]}...",
+                    flush=True,
+                )
+        except Exception as e:
+            print(f"⚠️ Could not cancel queued outbox items: {e}", flush=True)
+
+        # Clear row highlight in Google Sheet.
+        # Re-resolve the CURRENT row by email so a moved/re-sorted/removed row is
+        # not cleared by a stale stored rowNumber (see _resolve_current_highlight_row).
         client_id = client_id or thread_data.get("clientId")
-        row_number = thread_data.get("rowNumber")
+        row_number = _resolve_current_highlight_row(uid, client_id, thread_data)
 
         if client_id and row_number:
             try:
@@ -1058,28 +1448,182 @@ def api_stop_conversation():
         })
 
     except Exception as e:
-        print(f"❌ Failed to stop conversation: {e}", flush=True)
+        print(f"❌ Failed to stop conversation: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": "Failed to stop conversation"}), 500
+
+
+@app.route("/api/dismiss-notification", methods=["POST"])
+def api_dismiss_notification():
+    """Dismiss an action_needed escalation the operator has decided needs no reply.
+
+    A bare frontend delete of the notification silently DROPS the escalation:
+    the alert disappears but the thread stays 'paused' forever (no follow-ups,
+    no reply, no record) — invisible and unresolvable. This route terminalizes
+    the escalation instead:
+      - deletes the notification via the counter-safe backend helper
+      - moves the paused thread to 'stopped' (reason 'user_dismissed_escalation')
+      - writes a terminal actionAudit record (status='dismissed')
+      - cancels any queued outbox send and clears the sheet row highlight
+
+    Expects JSON: { uid, notificationId, clientId,
+                    threadId?, notificationClientId?, actionAuditId? }
+    (clientId is the notification's parent client; notificationClientId is an
+    accepted alias.)
+    """
+    try:
+        data = request.get_json(silent=True) or request.form.to_dict() or request.args.to_dict()
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        uid = data.get("uid") or data.get("userId") or data.get("user_id")
+        notification_id = data.get("notificationId") or data.get("notification_id")
+        notif_client_id = (
+            data.get("notificationClientId")
+            or data.get("clientId")
+            or data.get("client_id")
+        )
+        thread_id = data.get("threadId") or data.get("thread_id")
+        action_audit_id = data.get("actionAuditId")
+
+        if not uid or not notification_id or not notif_client_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required fields: uid, notificationId, clientId",
+            }), 400
+
+        from email_automation.clients import _fs, _get_client_config
+        from email_automation.messaging import update_thread_status, THREAD_STATUS
+        from email_automation.notifications import delete_notification_and_decrement_counters
+        from email_automation.email import _update_action_audit
+        from email_automation.sheets import clear_row_highlight
+        from google.cloud.firestore import SERVER_TIMESTAMP
+
+        thread_data = {}
+        if thread_id:
+            thread_ref = _fs.collection("users").document(uid).collection("threads").document(thread_id)
+            thread_doc = thread_ref.get()
+            if thread_doc.exists:
+                thread_data = thread_doc.to_dict() or {}
+
+        # 1) Delete the notification (counter-safe) so the alert clears exactly
+        #    like the bare frontend path, but through the backend helper that
+        #    keeps the client rollup counters in sync.
+        try:
+            delete_notification_and_decrement_counters(uid, notif_client_id, notification_id)
+        except Exception as e:
+            print(f"⚠️ Could not delete notification {notification_id}: {e}", flush=True)
+
+        # 2) Terminalize the thread so it is not left stuck in 'paused'. Dismiss
+        #    (unlike reply, which resumes to 'active') means the operator handled
+        #    it out of band — stop monitoring rather than resume.
+        new_status = thread_data.get("status")
+        if thread_id and thread_data.get("status") == THREAD_STATUS["paused"]:
+            if update_thread_status(uid, thread_id, THREAD_STATUS["stopped"], "user_dismissed_escalation"):
+                new_status = THREAD_STATUS["stopped"]
+            try:
+                _fs.collection("users").document(uid).collection("threads").document(thread_id).update({
+                    "followUpStatus": "stopped",
+                    "followUpConfig.stoppedAt": SERVER_TIMESTAMP,
+                    "followUpConfig.processingBy": None,
+                    "followUpConfig.processingAt": None,
+                    "nextFollowUpAt": None,
+                    "updatedAt": SERVER_TIMESTAMP,
+                })
+            except Exception as e:
+                print(f"⚠️ Could not stop follow-ups on dismiss: {e}", flush=True)
+
+            # Cancel any queued outbox send for this thread (an AI reply queued
+            # just before escalation must not fire after the operator dismissed).
+            try:
+                outbox_ref = _fs.collection("users").document(uid).collection("outbox")
+                for outbox_doc in outbox_ref.where("threadId", "==", thread_id).stream():
+                    item = outbox_doc.to_dict() or {}
+                    status = str(item.get("status") or "").strip().lower()
+                    if item.get("cancelRequested") is True or status in (
+                        "cancel_requested", "cancelled", "canceled",
+                    ):
+                        continue
+                    outbox_doc.reference.update({
+                        "cancelRequested": True,
+                        "status": "cancel_requested",
+                        "cancelledAt": SERVER_TIMESTAMP,
+                    })
+            except Exception as e:
+                print(f"⚠️ Could not cancel queued outbox items on dismiss: {e}", flush=True)
+
+            # Clear the sheet row highlight (re-resolve the CURRENT row).
+            client_id = thread_data.get("clientId") or notif_client_id
+            row_number = _resolve_current_highlight_row(uid, client_id, thread_data)
+            if client_id and row_number:
+                try:
+                    sheet_id, _, _ = _get_client_config(uid, client_id)
+                    if sheet_id:
+                        clear_row_highlight(sheet_id, row_number)
+                except Exception as e:
+                    print(f"⚠️ Could not clear row highlight on dismiss: {e}", flush=True)
+
+        # 3) Write a terminal actionAudit record so the dismissal is never a
+        #    silent drop — it always leaves a durable trail.
+        _update_action_audit(uid, action_audit_id, {
+            "status": "dismissed",
+            "clientId": notif_client_id,
+            "notificationId": notification_id,
+            "threadId": thread_id,
+            "reason": (thread_data.get("statusReason") or data.get("reason")),
+            "dismissedAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+        })
+
+        print(f"🗑️ Dismissed notification {notification_id} (thread {str(thread_id)[:20]})", flush=True)
+        return jsonify({
+            "success": True,
+            "message": "Escalation dismissed",
+            "notificationId": notification_id,
+            "threadId": thread_id,
+            "newStatus": new_status,
+        })
+
+    except Exception as e:
+        print(f"❌ Failed to dismiss notification: {e}", flush=True)
         import traceback
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/clear-optout", methods=["POST"])
+@verify_firebase_token
 def api_clear_optout():
     """
     Clear an opt-out record for a contact, allowing emails to be sent again.
     Expects JSON body: { uid, email }
+
+    Deletes a compliance record (an opt-out) that gates whether the platform may
+    email a contact again, so identity comes ONLY from the verified Firebase ID
+    token (@verify_firebase_token). The body-supplied uid is ignored for the
+    Firestore path — a caller can only ever clear opt-outs under their OWN uid,
+    never re-enable email to another tenant's opted-out contacts.
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+        # Identity is the verified token uid ONLY; the body uid is untrusted.
+        token_uid = _safe_uid(g.get("firebase_uid"))
+        if token_uid is None:
+            return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
 
         uid = data.get("uid")
         email = data.get("email")
 
-        if not uid or not email:
+        # Both must be non-empty strings — a non-string email would blow up on
+        # .lower()/.strip(); a non-string uid would corrupt the Firestore path.
+        if not _is_nonempty_str(uid) or not _is_nonempty_str(email):
             return jsonify({"success": False, "error": "Missing required fields: uid, email"}), 400
+
+        # From here on the verified token uid is authoritative — ignore body uid.
+        uid = token_uid
 
         import hashlib
         from email_automation.clients import _fs
@@ -1115,24 +1659,37 @@ def api_clear_optout():
         })
 
     except Exception as e:
-        print(f"❌ Failed to clear opt-out: {e}", flush=True)
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"❌ Failed to clear opt-out: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Failed to clear opt-out"}), 500
 
 
 @app.route("/api/list-optouts", methods=["POST"])
+@verify_firebase_token
 def api_list_optouts():
     """
     List all opted-out contacts for a user.
     Expects JSON body: { uid }
+
+    Discloses a tenant's opted-out contact list (emails + reasons), so identity
+    comes ONLY from the verified Firebase ID token (@verify_firebase_token). The
+    body-supplied uid is ignored for the Firestore path — a caller can only ever
+    list opt-outs under their OWN uid, never enumerate another tenant's contacts.
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+        # Identity is the verified token uid ONLY; the body uid is untrusted.
+        token_uid = _safe_uid(g.get("firebase_uid"))
+        if token_uid is None:
+            return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
 
         uid = data.get("uid")
-        if not uid:
+        if not _is_nonempty_str(uid):
             return jsonify({"success": False, "error": "Missing required field: uid"}), 400
+
+        # From here on the verified token uid is authoritative — ignore body uid.
+        uid = token_uid
 
         from email_automation.clients import _fs
 
@@ -1159,28 +1716,55 @@ def api_list_optouts():
         })
 
     except Exception as e:
-        print(f"❌ Failed to list opt-outs: {e}", flush=True)
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"❌ Failed to list opt-outs: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Failed to list opt-outs"}), 500
 
 
 @app.route("/api/check-sheet-completion", methods=["POST"])
+@verify_firebase_token
 def api_check_sheet_completion():
     """
     Check if all rows in a sheet have all required fields filled.
     Returns completion status and details.
+
+    Reads a Google Sheet and returns per-row property addresses + missing-field
+    detail, so identity comes ONLY from the verified Firebase ID token
+    (@verify_firebase_token). The sheet is NOT taken from the request: the caller
+    supplies a clientId and the sheetId is resolved server-side from the TOKEN
+    uid's client doc. Any body-supplied sheetId that doesn't match the resolved
+    one is refused. This closes the IDOR that let an unauthenticated caller
+    exfiltrate an arbitrary tenant's sheet by guessing its spreadsheet id.
+
+    Expects JSON body: { clientId, sheetId? }
     """
+    data, err = _require_json_object()
+    if err:
+        return err
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+        # Identity is the verified token uid ONLY.
+        token_uid = _safe_uid(g.get("firebase_uid"))
+        if token_uid is None:
+            return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
 
-        sheet_id = data.get("sheetId")
-        if not sheet_id:
-            return jsonify({"success": False, "error": "Missing sheetId"}), 400
+        client_id = data.get("clientId")
+        if not _is_nonempty_str(client_id):
+            return jsonify({"success": False, "error": "Missing clientId"}), 400
 
-        from email_automation.clients import _sheets_client
+        from email_automation.clients import _sheets_client, _get_client_config
         from email_automation.sheets import _get_first_tab_title, _read_header_row2, _header_index_map
         from email_automation.app_config import REQUIRED_FIELDS_FOR_CLOSE
+
+        # Resolve the sheet server-side from the authenticated user's client —
+        # never trust a client-supplied sheetId. Refuse a foreign sheetId.
+        try:
+            sheet_id, _, _ = _get_client_config(token_uid, client_id)
+        except Exception:
+            return jsonify({"success": False, "error": "Not authorized for this client"}), 403
+        if not _is_nonempty_str(sheet_id):
+            return jsonify({"success": False, "error": "Not authorized for this client"}), 403
+        body_sheet_id = data.get("sheetId")
+        if body_sheet_id is not None and body_sheet_id != sheet_id:
+            return jsonify({"success": False, "error": "sheetId does not match this client"}), 403
 
         sheets = _sheets_client()
         tab_title = _get_first_tab_title(sheets, sheet_id)
@@ -1243,30 +1827,34 @@ def api_check_sheet_completion():
         })
 
     except Exception as e:
-        print(f"❌ Failed to check sheet completion: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"❌ Failed to check sheet completion: {type(e).__name__}: {e}")
+        return jsonify({"success": False, "error": "Failed to check sheet completion"}), 500
 
 
 @app.route("/api/debug-inbox", methods=["GET"])
+@verify_firebase_token
 def api_debug_inbox():
-    """Debug endpoint to check inbox status and email processing"""
+    """Debug endpoint to check inbox status and email processing.
+
+    Scoped to the AUTHENTICATED caller's own mailbox only — previously this
+    returned list_user_ids()[0]'s live inbox (subjects/senders/recipients/ids)
+    to any unauthenticated request (cross-tenant PII disclosure).
+    """
     if not SCHEDULER_AVAILABLE:
         return jsonify({"error": "Scheduler functionality not available"}), 503
-    
+
+    # Identity comes ONLY from the verified token; the caller can only ever see
+    # their OWN inbox, never an arbitrary first-user's mail.
+    user_id = _safe_uid(g.get("firebase_uid"))
+    if user_id is None:
+        return jsonify({"error": _GENERIC_BAD_REQUEST}), 400
+
     try:
-        from email_automation.clients import list_user_ids
         from firebase_helpers import download_token
         from msal import ConfidentialClientApplication, SerializableTokenCache
         import requests
         from datetime import datetime, timedelta, timezone
-        
-        # Get first user for debugging
-        user_ids = list_user_ids()
-        if not user_ids:
-            return jsonify({"error": "No users found"}), 404
-        
-        user_id = user_ids[0]
-        
+
         # Download token and setup client
         download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
         cache = SerializableTokenCache()
@@ -1366,26 +1954,28 @@ def api_debug_inbox():
         return jsonify({"error": f"Debug failed: {str(e)}"}), 500
 
 @app.route("/api/debug-thread-matching", methods=["GET"])
+@verify_firebase_token
 def api_debug_thread_matching():
-    """Debug endpoint to check thread matching for specific conversation"""
+    """Debug endpoint to check thread matching for specific conversation.
+
+    Scoped to the AUTHENTICATED caller's own mailbox + sheets only — previously
+    it disclosed list_user_ids()[0]'s live inbox message and matched Google
+    Sheet row contents to any unauthenticated request.
+    """
     if not SCHEDULER_AVAILABLE:
         return jsonify({"error": "Scheduler functionality not available"}), 503
-    
+
+    user_id = _safe_uid(g.get("firebase_uid"))
+    if user_id is None:
+        return jsonify({"error": _GENERIC_BAD_REQUEST}), 400
+
     try:
-        from email_automation.clients import list_user_ids
         from email_automation.messaging import lookup_thread_by_conversation_id
         from firebase_helpers import download_token
         from msal import ConfidentialClientApplication, SerializableTokenCache
         import requests
         from datetime import datetime, timedelta, timezone
-        
-        # Get first user for debugging
-        user_ids = list_user_ids()
-        if not user_ids:
-            return jsonify({"error": "No users found"}), 404
-        
-        user_id = user_ids[0]
-        
+
         # Download token and setup client
         download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
         cache = SerializableTokenCache()
@@ -1492,12 +2082,16 @@ def api_debug_thread_matching():
 
 
 @app.route("/api/console-logs", methods=["GET"])
+@verify_firebase_token
 def api_console_logs():
     """Read browser console logs forwarded from frontend to Firestore.
 
+    Scoped to the AUTHENTICATED caller's own logs. Any query `user_id` is
+    IGNORED — previously an unauthenticated caller could read (and with
+    clear=true permanently delete) an arbitrary victim's console log entries.
+
     Query params:
-        user_id: (optional) specific user ID, defaults to first user
-        limit: (optional) max logs to return, defaults to 50
+        limit: (optional) max logs to return, defaults to 50 (capped at 500)
         level: (optional) filter by level (error, warn, log)
         since: (optional) ISO timestamp to get logs after
         clear: (optional) if 'true', delete logs after reading
@@ -1505,20 +2099,28 @@ def api_console_logs():
     from google.cloud import firestore
     from datetime import datetime
 
+    # Identity is the verified token uid only; ignore any attacker-supplied
+    # ?user_id.
+    user_id = _safe_uid(g.get("firebase_uid"))
+    if user_id is None:
+        return jsonify({"error": _GENERIC_BAD_REQUEST, "logs": []}), 400
+
     try:
-        user_id = request.args.get("user_id")
-        limit = int(request.args.get("limit", 50))
+        # `limit` is attacker-controlled: parse defensively (non-numeric ->
+        # default, never a 500) and cap it so a huge value can't be used to
+        # exhaust reads / responses.
+        _raw_limit = request.args.get("limit", "50")
+        try:
+            limit = int(_raw_limit)
+        except (TypeError, ValueError):
+            limit = 50
+        if limit < 1:
+            limit = 1
+        if limit > 500:
+            limit = 500
         level_filter = request.args.get("level")
         since = request.args.get("since")
         clear = request.args.get("clear", "false").lower() == "true"
-
-        # If no user_id provided, try to get from available users
-        if not user_id:
-            from email_automation.clients import list_user_ids
-            user_ids = list_user_ids()
-            if not user_ids:
-                return jsonify({"error": "No users found", "logs": []}), 404
-            user_id = user_ids[0]
 
         # Get Firestore client
         fs = firestore.Client()
@@ -1574,21 +2176,25 @@ def api_console_logs():
 
 
 @app.route("/api/console-logs/clear", methods=["POST"])
+@verify_firebase_token
 def api_console_logs_clear():
-    """Clear all console logs for a user."""
+    """Clear all console logs for the AUTHENTICATED caller.
+
+    Any body `user_id` is IGNORED — previously an unauthenticated POST could
+    wipe an arbitrary victim's entire consoleLogs collection.
+    """
     from google.cloud import firestore
 
+    # Fail closed on a non-object body rather than silently defaulting.
+    data, err = _require_json_object()
+    if err:
+        return err
+
+    user_id = _safe_uid(g.get("firebase_uid"))
+    if user_id is None:
+        return jsonify({"error": _GENERIC_BAD_REQUEST}), 400
+
     try:
-        data = request.get_json() or {}
-        user_id = data.get("user_id")
-
-        if not user_id:
-            from email_automation.clients import list_user_ids
-            user_ids = list_user_ids()
-            if not user_ids:
-                return jsonify({"error": "No users found"}), 404
-            user_id = user_ids[0]
-
         fs = firestore.Client()
         logs_ref = fs.collection("users").document(user_id).collection("consoleLogs")
 
@@ -1655,11 +2261,16 @@ def auth_callback():
 
     try:
         # CRITICAL: Get UID from state parameter (this is how it survives the redirect)
-        uid = request.args.get("state", "web_user")
+        # Sanitise it through the strict path-safe charset BEFORE it is ever
+        # interpolated into a filesystem path (msal_caches/<uid>/...). A crafted
+        # state like "../../etc/x" would otherwise traverse out of msal_caches
+        # on os.makedirs / token write. Fall back to the default on failure,
+        # matching the "/" handler.
+        uid = _safe_uid(request.args.get("state", "web_user")) or "web_user"
         print(f"[CALLBACK] Received UID from state parameter: {uid}")
-        
+
         # Update session with the recovered UID
-        session["uid"] = uid 
+        session["uid"] = uid
         
         # Setup paths for this specific user
         user_dir = f"msal_caches/{uid}" 
@@ -2157,20 +2768,119 @@ def auth_callback():
         """, error=str(e), uid=uid)
 
 
+# ---------------------------------------------------------------------------
+# Rail 4 — Dead-letter visibility
+#
+# Dead-letters store the human-readable failure under `failureReason` /
+# `lastError` (email.py:2213-2266, pending_responses.py:32); the legacy `reason`
+# key is a last-resort fallback. Reading `reason` alone rendered every item
+# blank, so an operator saw the stuck item but not why it failed.
+#
+# The queue also had no active alert: systemHealth tops out at "warning" on
+# backlog, so a growing pile of stuck/misdirected sends read as routine depth.
+# The inspect view now raises an error-severity alert when active dead-letter
+# items are present. Fail-closed: the threshold defaults to 1 and can never be
+# configured below 1, and a read failure forces the alert rather than reporting
+# all-clear.
+# ---------------------------------------------------------------------------
+
+_DEAD_LETTER_REASON_KEYS = ("failureReason", "lastError", "reason")
+
+
+def _dead_letter_reason(data):
+    """Human-readable failure reason for a dead-letter / pending doc.
+
+    Falls back across every key a dead-letter may store the message under so
+    the debug view never renders blank when a reason exists.
+    """
+    for key in _DEAD_LETTER_REASON_KEYS:
+        value = (data or {}).get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _dead_letter_alert_threshold():
+    """Active dead-letter count at/above which the inspect view alerts.
+
+    Defaults to 1 (any active item pages). Clamped to a minimum of 1 so an
+    absent, zero, negative, or corrupt env value can NEVER silently disable the
+    rail — the SAFE behavior is the default.
+    """
+    raw = os.environ.get("DEAD_LETTER_ALERT_THRESHOLD")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 1
+    return value if value >= 1 else 1
+
+
+def _dead_letter_alert(active_count, needs_reconciliation_count, threshold=None, read_error=False):
+    """Build an operator alert for the dead-letter / reconciliation backlog.
+
+    Returns an error-severity alert dict when the queue could not be read
+    (fail-closed) or when active items reach the threshold; otherwise ``None``.
+    """
+    if threshold is None:
+        threshold = _dead_letter_alert_threshold()
+
+    if read_error:
+        return {
+            "severity": "error",
+            "activeDeadLetters": active_count,
+            "needsReconciliation": needs_reconciliation_count,
+            "threshold": threshold,
+            "readError": True,
+            "message": (
+                "Dead-letter queue could not be read — visibility degraded; "
+                "treat as needing operator attention."
+            ),
+        }
+
+    if active_count > 0 and active_count >= threshold:
+        return {
+            "severity": "error",
+            "activeDeadLetters": active_count,
+            "needsReconciliation": needs_reconciliation_count,
+            "threshold": threshold,
+            "readError": False,
+            "message": (
+                f"{active_count} active dead-letter item(s) require operator "
+                f"attention ({needs_reconciliation_count} awaiting reconciliation)."
+            ),
+        }
+    return None
+
+
 @app.route("/api/firestore-inspect", methods=["GET"])
+@verify_firebase_token
 def api_firestore_inspect():
     """
     Inspect Firestore database structure and count documents.
-    Useful for understanding what data exists and what can be cleaned up.
+
+    Restricted to the AUTHENTICATED caller's OWN account only — previously this
+    iterated list_user_ids() and dumped every tenant's client names, outbox
+    subjects and dead-letter reasons to any unauthenticated request.
     """
     if not SCHEDULER_AVAILABLE:
         return jsonify({"success": False, "error": "Scheduler not available"}), 503
 
+    caller_uid = _safe_uid(g.get("firebase_uid"))
+    if caller_uid is None:
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
+
     try:
-        from email_automation.clients import _fs, list_user_ids
+        from email_automation.clients import _fs
+        from email_automation.system_health import _is_resolved_dead_letter
 
         result = {"users": {}}
-        users = list_user_ids()
+        # Only ever inspect the caller's own subtree.
+        users = [caller_uid]
+
+        # Rail 4 aggregates across all users.
+        total_active_dead_letters = 0
+        total_needs_reconciliation = 0
+        dead_letter_read_error = False
 
         for uid in users:
             user_data = {"collections": {}}
@@ -2200,13 +2910,37 @@ def api_firestore_inspect():
                         if coll_name == "outbox":
                             coll_data["items"] = [{"id": d.id, "subject": d.to_dict().get("subject", "")[:50]} for d in docs]
                         elif coll_name == "deadLetterQueue":
-                            coll_data["items"] = [{"id": d.id, "reason": d.to_dict().get("reason", "")[:80]} for d in docs]
+                            dl_items = []
+                            active_count = 0
+                            needs_recon_count = 0
+                            for d in docs:
+                                dd = d.to_dict() or {}
+                                status = str(dd.get("status") or "").strip().lower()
+                                resolved = _is_resolved_dead_letter(dd)
+                                if not resolved:
+                                    active_count += 1
+                                if status == "needs_reconciliation":
+                                    needs_recon_count += 1
+                                dl_items.append({
+                                    "id": d.id,
+                                    "reason": _dead_letter_reason(dd)[:200],
+                                    "status": dd.get("status", ""),
+                                    "resolved": resolved,
+                                })
+                            coll_data["items"] = dl_items
+                            coll_data["activeCount"] = active_count
+                            coll_data["needsReconciliation"] = needs_recon_count
+                            total_active_dead_letters += active_count
+                            total_needs_reconciliation += needs_recon_count
                         elif coll_name == "clients":
                             coll_data["items"] = [{"id": d.id, "name": d.to_dict().get("name", "")} for d in docs]
 
                         user_data["collections"][coll_name] = coll_data
                 except Exception as e:
                     user_data["collections"][coll_name] = {"error": str(e)}
+                    # Fail-closed: a queue we could not read must NOT read as all-clear.
+                    if coll_name == "deadLetterQueue":
+                        dead_letter_read_error = True
 
             # Count notifications across all clients
             try:
@@ -2227,6 +2961,12 @@ def api_firestore_inspect():
 
             result["users"][uid] = user_data
 
+        result["alert"] = _dead_letter_alert(
+            total_active_dead_letters,
+            total_needs_reconciliation,
+            read_error=dead_letter_read_error,
+        )
+
         return jsonify({"success": True, "data": result})
 
     except Exception as e:
@@ -2234,6 +2974,7 @@ def api_firestore_inspect():
 
 
 @app.route("/api/firestore-cleanup", methods=["POST"])
+@verify_firebase_token(check_revoked=True)
 def api_firestore_cleanup():
     """
     Clean up stale Firestore data.
@@ -2242,7 +2983,7 @@ def api_firestore_cleanup():
     - clear_processed_messages: bool - Clear processed messages log
     - clear_sheet_change_log: bool - Clear sheet change log (older than 30 days)
     - clear_old_threads: int - Clear threads older than N days (0 = don't clear)
-    - user_id: str - Specific user ID (optional, defaults to all users)
+    - user_id: str - Specific user ID (must equal the verified caller)
     """
     if not _destructive_admin_routes_enabled():
         return jsonify({"success": False, "error": "Destructive admin route disabled"}), 403
@@ -2250,18 +2991,39 @@ def api_firestore_cleanup():
     if not SCHEDULER_AVAILABLE:
         return jsonify({"success": False, "error": "Scheduler not available"}), 503
 
+    data, err = _require_json_object()
+    if err:
+        return err
+
+    # Destructive flags must be STRICT booleans — a string like "false"/"0"/"off"
+    # (or any non-empty string) must NEVER trigger a deletion. Only real `true`.
+    clear_dead_letter = data.get("clear_dead_letter", False) is True
+    clear_processed = data.get("clear_processed_messages", False) is True
+    clear_changelog = data.get("clear_sheet_change_log", False) is True
+
+    # clear_old_threads must be a real (non-bool) positive int; any other type
+    # (str/list/dict/bool) is treated as "don't clear" rather than crashing.
+    _raw_days = data.get("clear_old_threads", 0)
+    clear_old_threads_days = _raw_days if (type(_raw_days) is int and _raw_days > 0) else 0
+
+    # A blank / missing / non-string user_id must be REJECTED — never silently
+    # fanned out across every account by falling back to list_user_ids().
+    target_user = data.get("user_id")
+    if not _is_nonempty_str(target_user):
+        return jsonify({"success": False, "error": "user_id is required"}), 400
+
+    # A destructive cleanup may only target the verified caller's own data — a
+    # signed-in user must not be able to wipe another tenant's queues/threads by
+    # naming their uid in the body.
+    caller_uid = _safe_uid(g.get("firebase_uid"))
+    if caller_uid is None or target_user != caller_uid:
+        return jsonify({"success": False, "error": "Forbidden"}), 403
+
     try:
         from email_automation.clients import _fs, list_user_ids
         from datetime import datetime, timedelta
 
-        data = request.get_json() or {}
-        clear_dead_letter = data.get("clear_dead_letter", False)
-        clear_processed = data.get("clear_processed_messages", False)
-        clear_changelog = data.get("clear_sheet_change_log", False)
-        clear_old_threads_days = data.get("clear_old_threads", 0)
-        target_user = data.get("user_id")
-
-        users = [target_user] if target_user else list_user_ids()
+        users = [target_user]
         results = {}
 
         for uid in users:
@@ -2347,16 +3109,25 @@ def api_firestore_cleanup():
         return jsonify({"success": True, "results": results})
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"❌ Firestore cleanup failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Firestore cleanup failed"}), 500
 
 
 @app.route("/api/clear-outlook-emails", methods=["POST"])
+@verify_firebase_token(check_revoked=True)
 def api_clear_outlook_emails():
     """
     Clear campaign-related emails from Outlook (SentItems and optionally Inbox).
+
+    Destructive real-mail deletion: gated by BOTH the admin env flag AND a
+    verified Firebase token, and scoped to the AUTHENTICATED caller's own
+    mailbox (body `user_id` is ignored). Previously a single admin-flag-on
+    environment allowed an unauthenticated POST to delete real Outlook messages
+    from an arbitrary victim's mailbox, with an unvalidated `keywords` that let
+    a bare string over-match (`'a' in subject`).
+
     Accepts JSON body with options:
-    - user_id: str - User ID to clear emails for
-    - keywords: list[str] - Subject keywords to match (e.g., ["Commerce", "Industrial"])
+    - keywords: list[str] - Subject keywords to match (e.g., ["Commerce"])
     - clear_inbox: bool - Also clear from Inbox (default False)
     - clear_sent: bool - Clear from SentItems (default True)
     """
@@ -2366,19 +3137,36 @@ def api_clear_outlook_emails():
     if not SCHEDULER_AVAILABLE:
         return jsonify({"success": False, "error": "Scheduler not available"}), 503
 
+    data, err = _require_json_object()
+    if err:
+        return err
+
+    # Identity is the verified token uid only — a caller can only clear their
+    # OWN mailbox, never an arbitrary victim's.
+    user_id = _safe_uid(g.get("firebase_uid"))
+    if user_id is None:
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
+
+    # keywords must be a list of non-empty strings, bounded in length. A bare
+    # string ("a") would make `kw in subject` iterate characters (over-broad,
+    # deletes almost everything); a non-iterable would raise -> 500.
+    _DEFAULT_KEYWORDS = ["Logistics", "Commerce", "Industrial", "Warehouse", "Distribution", "Storage"]
+    if "keywords" not in data:
+        keywords = _DEFAULT_KEYWORDS
+    else:
+        keywords = data.get("keywords")
+        if not isinstance(keywords, list) or len(keywords) > 100:
+            return jsonify({"success": False, "error": "keywords must be a list of up to 100 strings"}), 400
+        if not all(_is_nonempty_str(kw) for kw in keywords):
+            return jsonify({"success": False, "error": "keywords must be non-empty strings"}), 400
+
+    clear_inbox = data.get("clear_inbox", False) is True
+    clear_sent = data.get("clear_sent", True) is True
+
     try:
         import requests
         from firebase_helpers import download_token
         from msal import ConfidentialClientApplication, SerializableTokenCache
-
-        data = request.get_json() or {}
-        user_id = data.get("user_id")
-        keywords = data.get("keywords", ["Logistics", "Commerce", "Industrial", "Warehouse", "Distribution", "Storage"])
-        clear_inbox = data.get("clear_inbox", False)
-        clear_sent = data.get("clear_sent", True)
-
-        if not user_id:
-            return jsonify({"success": False, "error": "user_id required"}), 400
 
         # Download and setup token
         download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
@@ -2436,7 +3224,8 @@ def api_clear_outlook_emails():
         })
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"❌ Clear Outlook emails failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"success": False, "error": "Failed to clear Outlook emails"}), 500
 
 
 if __name__ == "__main__":

@@ -1,12 +1,16 @@
 import atexit
 import json
 import os
+import signal
+import sys
+import traceback
 from datetime import datetime
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token
 from email_automation.clients import list_user_ids, decode_token_payload, _fs
 from email_automation.email import send_outboxes
 from email_automation.processing import (
+    _graph_operation_error_state,
     reconcile_stale_processing_failures,
     retry_processing_failures,
     scan_inbox_against_index,
@@ -123,6 +127,73 @@ def auto_cleanup_firestore(user_id: str):
 
     except Exception as e:
         print(f"⚠️ Auto-cleanup error for {user_id}: {e}")
+
+
+SEND_HEALTH_ESCALATION_ENV = "SITESIFT_SEND_HEALTH_ESCALATION"
+
+
+def _send_health_escalation_enabled() -> bool:
+    """Fail-closed default: SEND-path failures must reach graph health.
+
+    Rail 5 ("Health cannot lie") gap: the send drivers historically returned
+    None, so a broken Graph send left graph_state healthy while receive scans
+    succeeded — a silent outreach outage showed green. This rail makes the send
+    path contribute a graph operation state so `_overall_status` can escalate.
+
+    The rail is ON by default. Absence of the env var keeps it ON — the SAFE,
+    fail-closed behavior. Set SITESIFT_SEND_HEALTH_ESCALATION=0/false/no/off
+    ONLY as an explicit rollback escape hatch to restore the legacy behavior
+    (send outages invisible to graph health, exceptions propagating).
+    """
+    value = os.getenv(SEND_HEALTH_ESCALATION_ENV, "").strip().lower()
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _extend_operation_states(operation_states, result):
+    """Fold a function's returned Graph operation-state(s) into the run accumulator.
+
+    Accepts a single op-state dict, a list/tuple of op-state dicts, or anything
+    else (None / legacy int returns / patched mocks) which is ignored. This keeps
+    the wiring robust as send_outboxes / process_pending_responses /
+    check_and_send_followups migrate from scalar returns to op-state lists (#20).
+    """
+    if isinstance(result, dict):
+        operation_states.append(result)
+    elif isinstance(result, (list, tuple)):
+        operation_states.extend(item for item in result if isinstance(item, dict))
+    return operation_states
+
+
+def _run_graph_send_operation(operation, func, *args, **kwargs):
+    """Run a SEND-path driver, surfacing its outcome as graph operation state(s).
+
+    Returns ``(result, states)`` where ``states`` is a list of graph operation-state
+    dicts (possibly empty).
+
+    Fail-closed (#18 safety rail): with the rail enabled (default) an exception is
+    converted to an error state instead of aborting the whole health record, and is
+    NOT re-raised — so receive-scan detail collected in the same run is preserved
+    while graph_state still escalates to error. With the rail disabled the legacy
+    behavior is restored exactly (return passed through, nothing consumed, exceptions
+    propagate to the caller's outer handler).
+
+    The driver's own return value is folded via ``_extend_operation_states`` (#20), so
+    BOTH a single op-state dict and a list of per-item op-states are consumed.
+    """
+    if not _send_health_escalation_enabled():
+        return func(*args, **kwargs), []
+    try:
+        result = func(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001 - deliberately broad: any send failure is a health signal
+        # Capture the traceback so a genuine code bug (not just a Graph HTTP
+        # error) stays diagnosable — fail-closed must not also erase the stack.
+        print(f"❌ Graph send operation '{operation}' failed: {e}\n{traceback.format_exc()}")
+        return None, [_graph_operation_error_state(operation, e)]
+    states = []
+    _extend_operation_states(states, result)
+    return result, states
 
 
 def _combine_graph_operation_states(operation_states):
@@ -250,17 +321,26 @@ def refresh_and_process_user(user_id: str):
         )
         return
 
-    # Process outbound emails (now with indexing)
-    send_outboxes(user_id, headers, headers_provider=get_graph_headers)
-
     graph_operation_states = []
-    
+
+    # Process outbound emails (now with indexing). Rail 5 (#18) feeds the send path
+    # into graph health with fail-closed exception handling; #20 returns per-item send
+    # failures as op-states so a swallowed failure also escalates the health rail.
+    _, send_states = _run_graph_send_operation(
+        "outbox_send",
+        send_outboxes,
+        user_id,
+        headers,
+        headers_provider=get_graph_headers,
+    )
+    graph_operation_states.extend(send_states)
+
     # Scan for client replies (inbox - catch all replies, not just unread)
-    print(f"\n🔍 Scanning inbox for client replies...")
+    print("\n🔍 Scanning inbox for client replies...")
     graph_operation_states.append(
         scan_inbox_against_index(user_id, get_graph_headers(), only_unread=False, top=50)
     )
-    
+
     # Scan for Jill's manual replies (SentItems - catch manual replies we didn't index)
     print(f"\n📤 Scanning SentItems for manual replies...")
     graph_operation_states.append(
@@ -276,11 +356,23 @@ def refresh_and_process_user(user_id: str):
     else:
         print("ℹ️ Stored processing failure replay disabled; failures remain visible for review")
 
-    # Retry any pending responses that failed to send previously
-    process_pending_responses(user_id, get_graph_headers())
+    # Retry any pending responses that failed to send previously (send path).
+    _, pending_states = _run_graph_send_operation(
+        "pending_responses_send",
+        process_pending_responses,
+        user_id,
+        get_graph_headers(),
+    )
+    graph_operation_states.extend(pending_states)
 
-    # Check and send follow-up emails for threads without responses
-    check_and_send_followups(user_id, get_graph_headers())
+    # Check and send follow-up emails for threads without responses (send path).
+    _, followup_states = _run_graph_send_operation(
+        "followup_send",
+        check_and_send_followups,
+        user_id,
+        get_graph_headers(),
+    )
+    graph_operation_states.extend(followup_states)
 
     # Auto-cleanup Firestore if collections are getting large (stay within free tier)
     auto_cleanup_firestore(user_id)
@@ -318,5 +410,66 @@ def run_all_users():
             )
 
 
+EXPECTED_AZURE_APP_ID_PREFIX = "54cec"
+
+
+def _validate_startup_env():
+    """Hard pre-run gate, parity with the legacy GHA 'Validate CLIENT_ID
+    prefix' step (.github/workflows/email.yml): refuse to start when
+    AZURE_API_APP_ID is missing or does not carry the expected app prefix
+    (wrong tenant / wrong app registration). Runs BEFORE lease acquisition so
+    a misconfigured runtime can never touch Firestore or any user.
+
+    The in-run appid check at get_graph_headers is a soft warning only; this
+    is the fail-closed version. Skipped under E2E_TEST_MODE (mock env), same
+    as app_config's import-time missing-env validation.
+    """
+    if os.getenv("E2E_TEST_MODE") == "true":
+        print("ℹ️ E2E_TEST_MODE: skipping AZURE_API_APP_ID startup gate")
+        return
+
+    app_id = os.getenv("AZURE_API_APP_ID", "")
+    if not app_id.startswith(EXPECTED_AZURE_APP_ID_PREFIX):
+        problem = "missing" if not app_id else f"unexpected ('{app_id[:8]}…')"
+        raise SystemExit(
+            f"🚫 Startup gate: AZURE_API_APP_ID is {problem}; expected prefix "
+            f"'{EXPECTED_AZURE_APP_ID_PREFIX}'. Refusing to run before lease "
+            f"acquisition."
+        )
+    print("✅ Startup gate: AZURE_API_APP_ID prefix OK")
+
+
+def _install_sigterm_atexit_bridge() -> None:
+    """Make atexit handlers (e.g. the token-cache upload registered in
+    refresh_and_process_user) survive container shutdown.
+
+    Under GitHub Actions the process ends naturally, so atexit fires. Under a
+    Cloud Run Job the platform sends SIGTERM before the container is stopped;
+    Python's default SIGTERM disposition terminates the process WITHOUT running
+    atexit handlers, which would drop a pending token-cache upload. Translating
+    SIGTERM into ``sys.exit`` raises SystemExit, which unwinds normally and lets
+    atexit-registered handlers run before exit.
+
+    The exit status is non-zero (143 = 128 + SIGTERM), NOT 0: a Cloud Run task
+    is marked succeeded only when the container exits 0, so exiting 0 on a
+    timeout/cancel would mask an interrupted run (possibly stopped mid-send or
+    mid-write) as a success — and release the lease as if the work had
+    completed, letting the next execution repeat partial work. A non-zero exit
+    marks the interrupted run failed (triggering retry/alerting) while still
+    unwinding through atexit and run_with_scheduler_lease's ``finally`` so the
+    token-cache upload runs and the lease is released.
+    """
+    def _handle_sigterm(signum, frame) -> None:  # noqa: ARG001 (signal API)
+        print(
+            "🛑 Received SIGTERM; exiting 143 (non-zero) so atexit handlers run "
+            "and the interrupted run is marked failed, not silently succeeded"
+        )
+        sys.exit(128 + signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
 if __name__ == "__main__":
+    _validate_startup_env()
+    _install_sigterm_atexit_bridge()
     run_with_scheduler_lease(run_all_users)

@@ -80,6 +80,58 @@ def _should_mark_processed_after_error(error: Optional[Exception]) -> bool:
     return error is None
 
 
+# Manifest entries surfaced by file_handling as extraction failures rather than
+# usable results (see fetch_and_process_pdfs / fetch_and_process_linked_assets):
+#   - "failed_extraction" + extraction_failed: PDF text extraction AND the
+#     OpenAI upload fallback both failed for an attachment.
+#   - "failed" + download_failed: a broker-supplied link could not be
+#     downloaded (dead link, 403 protected Drive file, ...).
+#   - "manual_review_required" + requires_manual_review: a broker file-share
+#     link (SharePoint/OneDrive/Box/WeTransfer/Drive folder) that cannot be
+#     auto-downloaded and needs an operator.
+_EXTRACTION_FAILURE_METHODS = ("failed", "failed_extraction", "manual_review_required")
+
+
+def _extraction_failure_entries(manifest: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Return the manifest entries that represent surfaced extraction failures."""
+    failures: List[Dict[str, Any]] = []
+    for entry in manifest or []:
+        if not isinstance(entry, dict):
+            continue
+        if (
+            entry.get("extraction_failed")
+            or entry.get("download_failed")
+            or entry.get("requires_manual_review")
+            or (entry.get("method") or "") in _EXTRACTION_FAILURE_METHODS
+        ):
+            failures.append(entry)
+    return failures
+
+
+def _raise_on_extraction_failures(manifest: Optional[List[Dict[str, Any]]]) -> None:
+    """Convert surfaced extraction failures into a retryable processing error.
+
+    SAFETY: an extraction failure that surfaces as *nothing* leaves error=None,
+    so the caller's _should_mark_processed_after_error(None) gate marks the
+    message processed and the broker's attachment/link payload is silently lost
+    with no retry and no operator visibility. Raising RetryableProcessingError
+    keeps the message unprocessed (retried by the next scan, then visible in
+    processingFailures for manual review after max attempts).
+    """
+    failures = _extraction_failure_entries(manifest)
+    if not failures:
+        return
+    details = "; ".join(
+        f"{entry.get('name') or entry.get('source_url') or 'unknown asset'} "
+        f"[{entry.get('method') or 'failed'}]: {entry.get('error') or 'extraction failed'}"
+        for entry in failures
+    )
+    raise RetryableProcessingError(
+        f"Broker asset extraction failed for {len(failures)} asset(s); "
+        f"leaving message unprocessed for retry/manual review: {details}"
+    )
+
+
 def _queue_response_retry_or_reconciliation(
     user_id: str,
     thread_id: str,
@@ -1360,6 +1412,76 @@ def _clear_thread_action_notifications(
         return 0
 
 
+def _resume_paused_thread_after_manual_continuation(
+    user_id: str,
+    headers: Dict[str, str],
+    thread_id: str,
+    thread_data: Dict[str, Any],
+    msg: Dict[str, Any],
+) -> bool:
+    """Handle an operator's out-of-band manual reply on a paused/escalated thread.
+
+    When the operator replies to an escalated thread directly from Outlook (a
+    Sent-Items continuation) instead of using the dashboard, the escalation's
+    open ``action_needed`` notification and the ``paused`` thread status become
+    stale — the thread would otherwise stay paused forever. On the next scan we
+    detect the operator's manual continuation (a Sent-Items message in the same
+    conversation sent after the thread was paused) and, when found:
+
+    (a) clear the stale open ``action_needed`` notification for the thread, and
+    (b) resume (unpause) the thread so processing continues normally.
+
+    Returns True when the thread was resumed. Conservative on failure: if the
+    Sent Items guard is unreadable we leave the escalation visible.
+    """
+    if (thread_data or {}).get("status") != THREAD_STATUS["paused"]:
+        return False
+
+    conversation_id = msg.get("conversationId")
+    if not conversation_id:
+        return False
+
+    # Anchor on when the thread was paused/escalated — the operator's manual
+    # continuation would have been sent after that point.
+    paused_after = _timestamp_to_utc(
+        (thread_data or {}).get("statusUpdatedAt")
+        or (thread_data or {}).get("updatedAt")
+    )
+    if not paused_after:
+        return False
+
+    try:
+        manual_continuation = find_sent_conversation_continuation_for_retry(
+            headers,
+            conversation_id=conversation_id,
+            sent_after=paused_after,
+        )
+    except SentMailGuardLookupError as e:
+        # Sent Items unreadable: stay conservative and leave the escalation visible.
+        print(
+            f"⚠️ Could not verify operator manual continuation for paused thread "
+            f"{thread_id[:20]}...: {e}"
+        )
+        return False
+
+    if not manual_continuation:
+        return False
+
+    client_id = (thread_data or {}).get("clientId")
+    _clear_thread_action_notifications(user_id, client_id, thread_id)
+    update_thread_status(
+        user_id,
+        thread_id,
+        THREAD_STATUS["active"],
+        "manual_continuation_resumed",
+    )
+    print(
+        f"▶️ Resumed paused thread {thread_id[:20]}... after operator manually "
+        "continued the conversation out-of-band; cleared stale action notification"
+    )
+    return True
+
+
 TERMINAL_THREAD_STATUSES = {THREAD_STATUS["completed"], THREAD_STATUS["stopped"]}
 NON_PENDING_OUTBOX_STATUSES = {
     "cancel_requested",
@@ -1798,6 +1920,97 @@ def _filter_requested_tour_times(
     ]
 
 
+# A single clock token (e.g. "10 AM", "10:00 AM", "2pm", "noon"). Used to pull the
+# specific time out of a reject / propose construction so we can tell the REJECTED
+# slot apart from the PROPOSED alternate.
+_TOUR_CLOCK_TOKEN = r"\d{1,2}(?::\d{2})?\s*(?:am|pm)|noon"
+
+# Constructions where the captured time is the one the broker is REJECTING.
+# Broadened / typo-tolerant on purpose (fail closed: better to treat a slot as
+# rejected than to auto-confirm a time the broker just refused).
+_REJECTED_TOUR_TIME_PATTERNS = [
+    # "10 AM does not/doesn't/won't/will not/no longer work(s)" (time BEFORE the negation)
+    re.compile(
+        rf"({_TOUR_CLOCK_TOKEN})(?:\s+\w+){{0,4}}?\s+"
+        r"(?:does\s+not|does\s*n[’']?t|do\s*n[’']?t|will\s+not|wo\s*n[’']?t|no\s+longer)"
+        r"\s+works?\b",
+        re.IGNORECASE,
+    ),
+    # "can't/cannot do 10 AM" (time AFTER the negation)
+    re.compile(rf"\b(?:can[’']?t|cannot|can\s+not)\s+do\s+({_TOUR_CLOCK_TOKEN})", re.IGNORECASE),
+    # "not available at 10 AM" / "unavailable at 10 AM"
+    re.compile(rf"\b(?:not\s+available|unavailable)\s+(?:at\s+)?({_TOUR_CLOCK_TOKEN})", re.IGNORECASE),
+    # "2 PM instead of 10 AM" -> 10 AM is the rejected one
+    re.compile(rf"\binstead\s+of\s+({_TOUR_CLOCK_TOKEN})", re.IGNORECASE),
+    # "2 PM works better than the 10 AM" -> 10 AM is the rejected one
+    re.compile(rf"\bthan\s+(?:the\s+)?({_TOUR_CLOCK_TOKEN})", re.IGNORECASE),
+]
+
+# Constructions where the captured time is the PROPOSED alternate (the offer).
+_PROPOSED_TOUR_TIME_PATTERNS = [
+    # "2 PM instead" (but NOT "instead of 10 AM", which rejects a slot)
+    re.compile(rf"({_TOUR_CLOCK_TOKEN})\s+instead\b(?!\s+of)", re.IGNORECASE),
+    # "can you do 2 PM" / "how about 2 PM" / "let's do 11 AM"
+    re.compile(rf"\b(?:do|about)\s+({_TOUR_CLOCK_TOKEN})", re.IGNORECASE),
+]
+
+
+def _tour_time_minutes_from_patterns(patterns: List[Any], text: str) -> set:
+    found = set()
+    for pattern in patterns:
+        for match in pattern.finditer(str(text or "")):
+            minutes = _tour_time_minutes(match.group(1))
+            if minutes is not None:
+                found.add(minutes)
+    return found
+
+
+def _reorder_alternate_tour_times(
+    times: List[str],
+    text: str = "",
+    thread_data: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Return extracted tour times with the PROPOSED alternate first and any
+    explicitly-REJECTED time dropped.
+
+    The raw extractor returns times in appearance order, so ``times[0]`` can be the
+    slot the broker just rejected ("10 AM does not work, do 2 PM instead"). The
+    schedule pipeline evaluates/confirms ``alternateTimes[0]``, so we must never let
+    a rejected time land there. We drop the stored invite time (the broker is
+    replacing it) plus any time tied to a rejection construction, and float the
+    proposed offer to the front. An explicitly-proposed time is never treated as
+    rejected (fail closed toward the broker's actual offer)."""
+    invite = (thread_data or {}).get("tourInvite") or {}
+    stored = {
+        minutes
+        for minutes in (
+            _tour_time_minutes(invite.get("arrivalTime")),
+            _tour_time_minutes(invite.get("departureTime")),
+        )
+        if minutes is not None
+    }
+    text_rejected = _tour_time_minutes_from_patterns(_REJECTED_TOUR_TIME_PATTERNS, text)
+    proposed = _tour_time_minutes_from_patterns(_PROPOSED_TOUR_TIME_PATTERNS, text)
+    # An explicit rejection construction ("can't do 10 AM") is authoritative even
+    # when the same span also trips the "do <time>" offer pattern — reject wins.
+    # The stored invite time is only a soft reject: a broker who re-proposes it
+    # should still have it honored, so the offer overrides the stored slot there.
+    rejected = text_rejected | (stored - proposed)
+
+    kept = [t for t in times if _tour_time_minutes(t) not in rejected]
+    if not kept:
+        # Everything read as rejected: keep only explicitly-proposed offers. When
+        # none was proposed we return [] (below) rather than restoring the original
+        # REJECTED order — the schedule pipeline skips evaluation on empty
+        # alternateTimes, so a refused slot never reaches alternateTimes[0]
+        # (CodeRabbit PR#15).
+        kept = [t for t in times if _tour_time_minutes(t) in proposed]
+
+    proposed_first = [t for t in kept if _tour_time_minutes(t) in proposed]
+    rest = [t for t in kept if _tour_time_minutes(t) not in proposed]
+    return proposed_first + rest
+
+
 def _build_tour_reply_hold_suggested_email(
     contact_name: str = "",
     recipient_email: str = "",
@@ -1921,8 +2134,9 @@ def _classify_tour_invite_reply(
         }
 
     negative_time_signal = bool(re.search(
-        r"\b(?:does\s+not\s+work|doesn[’']t\s+work|won[’']t\s+work|can't\s+do|cannot\s+do|"
-        r"not\s+available|unavailable|need\s+to\s+reschedule|instead|works\s+better)\b",
+        r"\b(?:does\s+not\s+work|does\s*n[’']?t\s+work|do\s*n[’']?t\s+work|will\s+not\s+work|"
+        r"wo\s*n[’']?t\s+work|no\s+longer\s+works?|can[’']?t\s+do|cannot\s+do|"
+        r"not\s+available|unavailable|need\s+to\s+reschedule|inste[a]?d|works\s+better)\b",
         text,
     ))
     declined_signal = bool(re.search(
@@ -1932,7 +2146,9 @@ def _classify_tour_invite_reply(
     ))
     tour_unavailable_signal = looks_like_tour_only_unavailable(clean_text)
     confirmation_signal = bool(re.search(
-        r"\b(?:that\s+(?:time|slot)\s+works?|works\s+for\s+(?:us|me|my\s+team|our\s+team|the\s+team|[\w#&'./-]+)|confirmed|confirming|"
+        r"\b(?:that\s+(?:time|slot)\s+works?|works\s+for\s+(?:us|me|my\s+team|our\s+team|the\s+team|[\w#&'./-]+)|"
+        r"confirmed\b(?!\s+(?:stop|stops|tour|tours|slot|slots|showing|showings|appointment|appointments|"
+        r"meeting|meetings|property|properties|visit|visits))|confirming|"
         r"see\s+you\s+(?:then|there)|we\s+are\s+confirmed|we're\s+confirmed|sounds\s+good)\b",
         text,
     ))
@@ -1970,8 +2186,8 @@ def _classify_tour_invite_reply(
             "suggestedEmail": _build_tour_reply_hold_suggested_email(contact_name, recipient_email, tour_date=tour_date),
         }
 
-    if tour_invite_context and (negative_time_signal or "instead" in text) and alternate_times:
-        alternate_times = _filter_requested_tour_times(alternate_times, thread_data)
+    if tour_invite_context and (negative_time_signal or "inste" in text) and alternate_times:
+        alternate_times = _reorder_alternate_tour_times(alternate_times, clean_text, thread_data)
         suggested_email = _build_tour_reply_hold_suggested_email(contact_name, recipient_email, alternate_times, tour_date=tour_date)
         if schedule_decision:
             suggested_email = build_schedule_aware_tour_reply(
@@ -1980,12 +2196,17 @@ def _classify_tour_invite_reply(
                 thread_data,
                 schedule_decision,
             )
+        details = (
+            f"Broker said the requested tour slot does not work and offered {', '.join(alternate_times)}."
+            if alternate_times
+            else "Broker said the requested tour slot does not work but did not offer a usable alternate."
+        )
         return {
             "outcome": "alternate_requested",
             "needsOperatorAction": True,
             "canCloseThread": False,
             "alternateTimes": alternate_times,
-            "details": f"Broker said the requested tour slot does not work and offered {', '.join(alternate_times)}.",
+            "details": details,
             "tourDate": tour_date,
             "scheduleDecision": schedule_decision,
             "suggestedEmail": suggested_email,
@@ -2235,6 +2456,30 @@ def _should_skip_event_after_original_row_terminalized(
     return event_type not in EVENTS_ALLOWED_AFTER_ORIGINAL_ROW_NONVIABLE
 
 
+# Events whose handlers move the THREAD to a terminal state (stopped/completed).
+# They must process AFTER informational events: a crash mid-loop after one of
+# these has terminalized the thread strands every remaining event forever —
+# the retry re-scans the message, hits the terminal-thread guard, and saves it
+# "for history only" (LIVE break 900 Alt Suggest St: the run died between
+# property_unavailable and new_property; the suggested replacement property was
+# permanently lost with no operator notification).
+_TERMINALIZING_EVENT_TYPES = ("contact_optout", "property_unavailable", "close_conversation")
+
+
+def _order_events_for_processing(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Stable-order proposal events so terminalizing events run LAST.
+
+    Also makes the final thread state deterministic when the LLM emits a
+    multi-intent list in arbitrary order (e.g. [contact_optout, wrong_contact]
+    previously ended 'paused'; terminal-last always ends 'stopped').
+    """
+    if not events:
+        return events
+    informational = [e for e in events if (e or {}).get("type") not in _TERMINALIZING_EVENT_TYPES]
+    terminalizing = [e for e in events if (e or {}).get("type") in _TERMINALIZING_EVENT_TYPES]
+    return informational + terminalizing
+
+
 def _property_exists_in_sheet(
     sheets,
     sheet_id: str,
@@ -2320,23 +2565,47 @@ def is_contact_opted_out(user_id: str, email: str) -> Optional[Dict]:
     """
     Check if a contact has opted out of communications.
     Returns the opt-out record if found, None otherwise.
+
+    Safety posture is FAIL CLOSED: every send path reads a None return as
+    "safe to send". If the backing store cannot be read we therefore return a
+    non-None sentinel record (never None) so a transient Firestore error can
+    never re-open a send to a contact who may have opted out. This matches the
+    fail-closed handling the follow-up sender already wraps around this call.
+
+    An opt-out is stored under the exact address hash, but a broker reached via
+    a plus alias (broker+leasing@x.com) is the SAME mailbox as the bare address
+    (broker@x.com), so we also probe the plus-stripped mailbox identity.
     """
     try:
         import hashlib
 
-        email_lower = email.lower().strip()
-        email_hash = hashlib.sha256(email_lower.encode('utf-8')).hexdigest()[:16]
+        email_lower = str(email or "").lower().strip()
 
-        optout_ref = _fs.collection("users").document(user_id).collection("optedOutContacts").document(email_hash)
-        doc = optout_ref.get()
+        # Probe the exact address first, then the plus-alias-stripped mailbox
+        # identity so an opted-out mailbox reached via a plus alias is caught.
+        candidates: List[str] = []
+        for candidate in (email_lower, _mailbox_identity_without_plus(email_lower)):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
 
-        if doc.exists:
-            return doc.to_dict()
+        optout_collection = (
+            _fs.collection("users").document(user_id).collection("optedOutContacts")
+        )
+        for candidate in candidates:
+            email_hash = hashlib.sha256(candidate.encode('utf-8')).hexdigest()[:16]
+            doc = optout_collection.document(email_hash).get()
+            if doc.exists:
+                return doc.to_dict()
         return None
 
     except Exception as e:
         print(f"⚠️ Failed to check opt-out status for {email}: {e}")
-        return None
+        # FAIL CLOSED: a lookup error must never read as "not opted out".
+        return {
+            "reason": "lookup_error",
+            "failClosed": True,
+            "email": str(email or "").lower().strip(),
+        }
 
 
 def _build_greeting(contact_name: Optional[str]) -> str:
@@ -2482,7 +2751,7 @@ def _automatic_inbox_replies_allowed(user_id: str) -> bool:
             return True
         allowed = {
             value.strip()
-            for value in re.split(r"[,\\s]+", raw_allowlist)
+            for value in re.split(r"[,\s]+", raw_allowlist)
             if value.strip()
         }
     return str(user_id or "").strip() in allowed
@@ -2925,6 +3194,40 @@ def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email:
         print(f"❌ No sheet row found with email = {counterparty_email}")
         return client_id, sheet_id, header, None, None, column_config, extraction_fields
 
+# Common auto-reply subject markers across locales. Defense-in-depth backstop
+# (FIX-18) for RFC-3834 header detection: localized out-of-office replies that
+# lack the standard headers must still be skipped so temporary-absence messages
+# never reach the classifier as real broker data.
+AUTO_REPLY_SUBJECT_MARKERS = [
+    # English
+    "out of office", "automatic reply", "auto-reply", "auto reply",
+    "autoreply", "away from office", "on vacation", "ooo:",
+    # German
+    "automatische antwort", "abwesenheitsnotiz",
+    # French
+    "réponse automatique", "reponse automatique", "absence du bureau",
+    # Spanish
+    "respuesta automática", "respuesta automatica",
+    "ausencia temporal", "fuera de la oficina",
+    # Italian
+    "risposta automatica", "fuori sede", "assente dall'ufficio",
+    # Portuguese
+    "resposta automática", "resposta automatica", "ausência temporária",
+    # Dutch
+    "automatisch antwoord", "afwezigheidsassistent",
+]
+
+
+def _is_auto_reply_subject(subject: Optional[str]) -> bool:
+    """Return True if the subject line matches a known auto-reply/OOO marker.
+
+    Pure function so the localized-subject guard is deterministically testable
+    without a live Graph/model call (FIX-18 / M08 variant).
+    """
+    subject_lower = (subject or "").lower()
+    return any(marker in subject_lower for marker in AUTO_REPLY_SUBJECT_MARKERS)
+
+
 def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, Any]):
     """ENHANCED: Process a single inbox message with full pipeline including events."""
     msg_id = msg.get("id")
@@ -3010,13 +3313,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             is_auto_reply = True
 
     # Also check subject line for common auto-reply patterns
-    subject_lower = subject.lower()
-    auto_reply_subjects = [
-        "out of office", "automatic reply", "auto-reply", "auto reply",
-        "autoreply", "away from office", "on vacation", "ooo:",
-        "automatische antwort", "réponse automatique"  # German, French
-    ]
-    if any(pattern in subject_lower for pattern in auto_reply_subjects):
+    if _is_auto_reply_subject(subject):
         is_auto_reply = True
 
     # SAFETY: Skip auto-replies to prevent processing OOO messages as real data
@@ -3131,6 +3428,18 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             f"⏹️ Client automation is paused/stopped for thread {thread_id[:20]}...; "
             "saving inbound message for history only"
         )
+
+    # If the operator manually replied to a paused/escalated thread directly from
+    # Outlook (out-of-band Sent-Items continuation) instead of using the dashboard,
+    # clear the stale open action_needed notification and resume the thread so
+    # processing continues normally rather than staying paused forever.
+    if thread_status == THREAD_STATUS["paused"] and not client_paused:
+        if _resume_paused_thread_after_manual_continuation(
+            user_id, headers, thread_id, thread_data, msg
+        ):
+            thread_data["status"] = THREAD_STATUS["active"]
+            thread_data["statusReason"] = "manual_continuation_resumed"
+            thread_status = THREAD_STATUS["active"]
 
     # Terminal threads keep late replies for history but must not generate new AI work or auto-replies,
     # except when the user approved a same-contact replacement property in this email thread.
@@ -3371,7 +3680,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 else:
                     flyer_links.append(link)
                     print(f"   📄 Categorized linked asset as flyer: {filename}")
-        
+
+        # SAFETY GATE: extraction failures surfaced by file_handling (failed PDF
+        # extraction, broken/protected broker links, manual-review file-share
+        # links) must keep this message UNPROCESSED. Continuing silently leaves
+        # error=None at the caller, the message gets marked processed, and the
+        # broker's attachment/link payload is lost with no retry or visibility.
+        _raise_on_extraction_failures(pdf_manifest)
+
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)
 
@@ -3435,7 +3751,21 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             sheets = _sheets_client()
             row_anchor = get_row_anchor(rowvals, header)
 
-            events = _proposal_events(proposal)
+            events = _order_events_for_processing(_proposal_events(proposal))
+            # Deterministic stale-event skip: with terminalizing events ordered
+            # last, an informational event (tour/call/question) for a row this
+            # SAME proposal is about to kill must still be skipped — precompute
+            # the outcome instead of depending on the LLM's event order.
+            row_will_go_nonviable = any(
+                (e or {}).get("type") == "property_unavailable"
+                and _property_unavailable_event_applies_to_row(
+                    e,
+                    row_anchor=row_anchor,
+                    message_text=_full_text,
+                    unavailable_keywords=PROPERTY_UNAVAILABLE_KEYWORDS,
+                )
+                for e in events
+            )
             print(f"\n{'='*60}")
             print(f"📋 EVENT PROCESSING: {len(events)} event(s) detected by AI")
             print(f"{'='*60}")
@@ -3458,9 +3788,16 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     print(f"   ✅ Already handled, skipping")
                     continue
 
+                # The precomputed flag only gates INFORMATIONAL events — the
+                # terminalizing events themselves (ordered last) must always
+                # process, else property_unavailable would self-skip.
+                _stale_skip_flag = old_row_became_nonviable or (
+                    row_will_go_nonviable
+                    and event_type not in _TERMINALIZING_EVENT_TYPES
+                )
                 if _should_skip_event_after_original_row_terminalized(
                     event_type,
-                    old_row_became_nonviable=old_row_became_nonviable,
+                    old_row_became_nonviable=_stale_skip_flag,
                 ):
                     print(
                         "   ℹ️ Skipping stale original-row event after non-viable move; "
@@ -3506,17 +3843,24 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         # Update thread status to paused - waiting for user to handle call
                         update_thread_status(user_id, thread_id, THREAD_STATUS["paused"], "call_requested")
 
-                        # If phone number is provided, skip email response (just notification)
-                        # If no phone number, we'll send a brief response asking for it
+                        # A call request ALWAYS escalates to the operator — never auto-reply,
+                        # whether or not a phone number was included. LIVE break: a broker who
+                        # asked to "talk over the phone" (no number) fell through to the
+                        # phone-number-ask AND the missing-fields auto-reply paths below,
+                        # talking over the human handoff (only an incidental reply-all filter
+                        # stopped delivery). Suppress the response unconditionally so the
+                        # operator handles the call; this matches the deterministic guard that
+                        # already nulls response_email for call_requested.
+                        proposal["skip_response"] = True
                         if phone_number:
                             print(f"📞 Phone number found - skipping email response, notification only")
-                            # Mark that we should skip the normal email response
-                            proposal["skip_response"] = True
-                            # Highlight blue - row needs user attention (paused)
-                            try:
-                                highlight_row(sheet_id, rownum, ROW_HIGHLIGHT_BLUE)
-                            except Exception as e:
-                                print(f"⚠️ Could not highlight row: {e}")
+                        else:
+                            print(f"📞 No phone number - escalating to operator, skipping email response")
+                        # Highlight blue - row needs user attention (paused)
+                        try:
+                            highlight_row(sheet_id, rownum, ROW_HIGHLIGHT_BLUE)
+                        except Exception as e:
+                            print(f"⚠️ Could not highlight row: {e}")
                     except Exception as e:
                         print(f"❌ Failed to write call_requested notification: {e}")
 

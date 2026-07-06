@@ -3,6 +3,7 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs, _sheets_client
 from .sheets import _get_first_tab_title, _read_header_row2, _header_index_map, _first_sheet_props, _execute_with_retry, _col_letter
 from .utils import _subject_to_address_city
+from .outbound_safety import find_unresolved_placeholders
 
 
 def sync_thread_row_numbers_after_move(
@@ -489,6 +490,11 @@ def insert_property_row_above_divider(sheets, sheet_id: str, tab_title: str, val
         for col_name in header:
             key = col_name.strip().lower()
             value = values_by_header.get(key, "")
+            # Never write an unresolved template placeholder (e.g. "[NAME]") into
+            # a client sheet cell - sanitize to empty, mirroring the outbound-email
+            # placeholder guard (outbound_safety.find_unresolved_placeholders).
+            if value and find_unresolved_placeholders(str(value)):
+                value = ""
             row_values.append(value)
         
         # Insert the row - FIXED: Use sheet_id for both internal ID lookup and API calls
@@ -557,19 +563,48 @@ def _row_address_city(header: List[str], row_values: List[str]) -> tuple[str, st
     return row_addr, row_city
 
 
-def _row_matches_subject_anchor(header: List[str], row_values: List[str], addr: str, city: str) -> bool:
+def _anchor_addr_relation(want_addr: str, got_addr: str) -> Optional[str]:
+    """Relate a subject address (want) to a sheet-row address (got).
+
+    Returns "exact" when they are identical, "prefix" when the sheet address is
+    the leading WHOLE-TOKEN run of the subject address (the subject appended a
+    run/campaign tag or region token after the real address), else None.
+
+    The prefix test is deliberately token-boundary only — a raw substring test
+    would let a shorter decoy like "10 Main St" match a longer real "110 Main
+    St" (the "10" sits inside "110"), landing the update on the wrong property.
+    """
+    if not want_addr or not got_addr:
+        return None
+    if want_addr == got_addr:
+        return "exact"
+    want_tokens = want_addr.split()
+    got_tokens = got_addr.split()
+    if 0 < len(got_tokens) < len(want_tokens) and want_tokens[:len(got_tokens)] == got_tokens:
+        return "prefix"
+    return None
+
+
+def _row_matches_subject_anchor(
+    header: List[str],
+    row_values: List[str],
+    addr: str,
+    city: str,
+    accept: tuple = ("exact", "prefix"),
+) -> bool:
+    # An empty / unparseable subject address gives us nothing to confirm the
+    # row's identity. Fail CLOSED: never trust a stale stored row (or claim a
+    # subject match) on the strength of a blank address — that would blindly
+    # write broker data onto whatever property now sits at the old row number.
     if not addr:
-        return True
+        return False
 
     row_addr, row_city = _row_address_city(header, row_values)
     want_addr = _norm_row_anchor_text(addr)
     got_addr = _norm_row_anchor_text(row_addr)
-    if not got_addr:
-        return False
 
-    # Test/proof subjects can append run tags after the address. Accept either
-    # containment direction so the real sheet address still wins over email.
-    if want_addr != got_addr and want_addr not in got_addr and got_addr not in want_addr:
+    relation = _anchor_addr_relation(want_addr, got_addr)
+    if relation not in accept:
         return False
 
     want_city = _norm_row_anchor_text(city)
@@ -578,6 +613,74 @@ def _row_matches_subject_anchor(header: List[str], row_values: List[str], addr: 
         return False
 
     return True
+
+
+def _row_is_nonempty(row: List[str]) -> bool:
+    return any((cell or "").strip() for cell in row)
+
+
+def _read_single_row(sheets, spreadsheet_id: str, tab_title: str, header: List[str], row_num: int):
+    """Read one sheet row by its absolute number; returns padded values or None if blank."""
+    resp = _execute_with_retry(
+        sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab_title}!{row_num}:{row_num}"
+        ),
+        "read_single_row"
+    )
+    vals = resp.get("values", [])
+    row = vals[0] if vals else []
+    if not _row_is_nonempty(row):
+        return None
+    return row + [""] * (max(0, len(header) - len(row)))
+
+
+def _resolve_true_anchor_row(
+    sheets, spreadsheet_id: str, tab_title: str, header: List[str],
+    addr: str, city: str, positional_row: int, match_ordinal: int,
+) -> int:
+    """Resolve the AUTHORITATIVE sheet row number for an anchored match.
+
+    A bulk A2:ZZZ scan gives a positional row number that is correct when the
+    sheet has no interior gaps. But after a broker sort/insert the sheet can
+    have gaps that a collapsed bulk range hides, which would misattribute the
+    match to the wrong row number. So we first confirm the positional row with a
+    single direct read; only if that read does NOT hold the matched property do
+    we recover the true number by counting non-empty rows individually.
+    """
+    confirm = _read_single_row(sheets, spreadsheet_id, tab_title, header, positional_row)
+    if confirm is not None and _row_matches_subject_anchor(header, confirm, addr, city):
+        return positional_row
+
+    # Positional number is unreliable (bulk range collapsed interior gaps).
+    # Walk rows individually to recover the TRUE absolute number of the match.
+    #
+    # The caller already identified the match as the match_ordinal-th non-empty
+    # data row, so we must return the row AT that ordinal — NOT the first row
+    # that happens to satisfy the anchor. Returning the first anchor-match would
+    # stop on a shorter-named sibling the same broker owns (e.g. a "22 Oak Ave"
+    # row that token-PREFIXES the reply's "22 Oak Ave North") sitting at an
+    # earlier ordinal, writing the update onto the wrong (often completed)
+    # property. We count to the ordinal, then confirm that row still holds the
+    # anchor before trusting it.
+    seen = 0
+    row_num = 3
+    # The match is the match_ordinal-th non-empty data row; allow a generous
+    # window for interior gaps left by a sort before giving up.
+    max_row = 3 + match_ordinal + 1000
+    while seen < match_ordinal and row_num <= max_row:
+        padded = _read_single_row(sheets, spreadsheet_id, tab_title, header, row_num)
+        if padded is not None:
+            seen += 1
+            if seen == match_ordinal:
+                if _row_matches_subject_anchor(header, padded, addr, city):
+                    return row_num
+                break
+        row_num += 1
+
+    # Per-row reads are unavailable in this environment; trust the positional
+    # number from the bulk scan (correct whenever the sheet has no gaps).
+    return positional_row
 
 
 def _find_row_by_subject_anchor(
@@ -601,10 +704,28 @@ def _find_row_by_subject_anchor(
     rows = resp.get("values", [])
     data_rows = rows[1:] if rows else []
 
-    for sheet_rownum, row in enumerate(data_rows, start=3):
+    # Snapshot non-empty rows with both their positional row number and their
+    # ordinal among non-empty rows (needed to recover the TRUE row number if the
+    # bulk range collapsed interior gaps left by a broker sort).
+    candidates = []  # (pos_rownum, ordinal, padded)
+    ordinal = 0
+    for pos_rownum, row in enumerate(data_rows, start=3):
+        if not _row_is_nonempty(row):
+            continue
+        ordinal += 1
         padded = row + [""] * (max(0, len(header) - len(row)))
-        if _row_matches_subject_anchor(header, padded, addr, city):
-            return sheet_rownum, padded
+        candidates.append((pos_rownum, ordinal, padded))
+
+    # Prefer an EXACT address match over a token-prefix match so a shorter row
+    # can never win over the exact property when both are present.
+    for accept in (("exact",), ("prefix",)):
+        for pos_rownum, ord_i, padded in candidates:
+            if _row_matches_subject_anchor(header, padded, addr, city, accept=accept):
+                true_row = _resolve_true_anchor_row(
+                    sheets, spreadsheet_id, tab_title, header,
+                    addr, city, pos_rownum, ord_i,
+                )
+                return true_row, padded
 
     return None, None
 
@@ -659,7 +780,17 @@ def _find_row_by_anchor(uid: str, thread_id: str, sheets, spreadsheet_id: str, t
                        header: List[str], fallback_email: str):
     try:
         def _stored_row_matches_subject(row_values: List[str], addr: str, city: str) -> bool:
-            return _row_matches_subject_anchor(header, row_values, addr, city)
+            # Trust a STORED rowNumber only on an EXACT address match. A stored
+            # number can be stale after a broker sort/insert, and a single-row
+            # check sees that row in isolation — it cannot know an exact match
+            # lives elsewhere. Accepting a token-PREFIX here lets a shorter-named
+            # sibling that the same broker owns (e.g. stored row now holds
+            # "22 Oak Ave", a prefix of the reply's "22 Oak Ave North") absorb
+            # the update after a sort. A prefix-only match must instead fall
+            # through to the exact-preferring full-sheet scan below, which will
+            # find the real "22 Oak Ave North" row (and still accept a legit
+            # prefix — subject appended a region/run tag — when no exact exists).
+            return _row_matches_subject_anchor(header, row_values, addr, city, accept=("exact",))
 
         # 1) Prefer explicit stored rowNumber (unchanged)
         thread_doc = _fs.collection("users").document(uid).collection("threads").document(thread_id).get()

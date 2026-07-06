@@ -562,6 +562,130 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
         self.assertFalse(stale_action.reference.deleted)
         self.assertEqual(2, len(notifications_ref.filters))
 
+    def test_operator_manual_continuation_clears_action_and_resumes_paused_thread(self):
+        thread_data = {
+            "status": processing.THREAD_STATUS["paused"],
+            "statusReason": "needs_user_input:confidential",
+            "statusUpdatedAt": "2026-07-06T10:00:00Z",
+            "clientId": "client-9",
+        }
+        msg = {"conversationId": "conv-123"}
+        continuation = {"id": "sent-1", "conversationId": "conv-123"}
+
+        with patch.object(
+            processing,
+            "find_sent_conversation_continuation_for_retry",
+            return_value=continuation,
+        ) as find_continuation, patch.object(
+            processing, "_clear_thread_action_notifications", return_value=1
+        ) as clear_action, patch.object(
+            processing, "update_thread_status", return_value=True
+        ) as update_status:
+            resumed = processing._resume_paused_thread_after_manual_continuation(
+                "uid-9",
+                {"Authorization": "Bearer x"},
+                "thread-9",
+                thread_data,
+                msg,
+            )
+
+        self.assertTrue(resumed)
+        find_continuation.assert_called_once()
+        _, kwargs = find_continuation.call_args
+        self.assertEqual("conv-123", kwargs.get("conversation_id"))
+        clear_action.assert_called_once_with("uid-9", "client-9", "thread-9")
+        update_status.assert_called_once_with(
+            "uid-9",
+            "thread-9",
+            processing.THREAD_STATUS["active"],
+            "manual_continuation_resumed",
+        )
+
+    def test_no_manual_continuation_leaves_paused_thread_untouched(self):
+        thread_data = {
+            "status": processing.THREAD_STATUS["paused"],
+            "statusUpdatedAt": "2026-07-06T10:00:00Z",
+            "clientId": "client-9",
+        }
+        msg = {"conversationId": "conv-123"}
+
+        with patch.object(
+            processing,
+            "find_sent_conversation_continuation_for_retry",
+            return_value=None,
+        ), patch.object(
+            processing, "_clear_thread_action_notifications", return_value=0
+        ) as clear_action, patch.object(
+            processing, "update_thread_status", return_value=True
+        ) as update_status:
+            resumed = processing._resume_paused_thread_after_manual_continuation(
+                "uid-9",
+                {"Authorization": "Bearer x"},
+                "thread-9",
+                thread_data,
+                msg,
+            )
+
+        self.assertFalse(resumed)
+        clear_action.assert_not_called()
+        update_status.assert_not_called()
+
+    def test_manual_continuation_guard_unreadable_does_not_resume(self):
+        thread_data = {
+            "status": processing.THREAD_STATUS["paused"],
+            "statusUpdatedAt": "2026-07-06T10:00:00Z",
+            "clientId": "client-9",
+        }
+        msg = {"conversationId": "conv-123"}
+
+        with patch.object(
+            processing,
+            "find_sent_conversation_continuation_for_retry",
+            side_effect=processing.SentMailGuardLookupError("Sent Items unreadable"),
+        ), patch.object(
+            processing, "_clear_thread_action_notifications", return_value=0
+        ) as clear_action, patch.object(
+            processing, "update_thread_status", return_value=True
+        ) as update_status:
+            resumed = processing._resume_paused_thread_after_manual_continuation(
+                "uid-9",
+                {"Authorization": "Bearer x"},
+                "thread-9",
+                thread_data,
+                msg,
+            )
+
+        self.assertFalse(resumed)
+        clear_action.assert_not_called()
+        update_status.assert_not_called()
+
+    def test_active_thread_is_not_probed_for_manual_continuation(self):
+        thread_data = {
+            "status": processing.THREAD_STATUS["active"],
+            "clientId": "client-9",
+        }
+        msg = {"conversationId": "conv-123"}
+
+        with patch.object(
+            processing, "find_sent_conversation_continuation_for_retry"
+        ) as find_continuation, patch.object(
+            processing, "_clear_thread_action_notifications", return_value=0
+        ) as clear_action, patch.object(
+            processing, "update_thread_status", return_value=True
+        ) as update_status:
+            resumed = processing._resume_paused_thread_after_manual_continuation(
+                "uid-9",
+                {"Authorization": "Bearer x"},
+                "thread-9",
+                thread_data,
+                msg,
+            )
+
+        self.assertFalse(resumed)
+        find_continuation.assert_not_called()
+        clear_action.assert_not_called()
+        update_status.assert_not_called()
+
     def test_marks_client_completed_when_all_threads_terminal_and_no_current_work(self):
         class FakeDocSnapshot:
             def __init__(self, data=None, exists=True):

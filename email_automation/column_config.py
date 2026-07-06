@@ -523,9 +523,18 @@ def build_column_rules_prompt(column_config: Dict[str, Any]) -> str:
         if field.get("is_formula"):
             lines.append(f'- "{actual_col}": DO NOT WRITE TO THIS COLUMN. It contains a formula.')
         elif canonical in never_request:
-            lines.append(f'- "{actual_col}": {field["description"]}. Accept if provided but NEVER request.')
+            # Render the extraction hints alongside the never-request rule so the
+            # model still knows HOW to recognize/normalize a value it is allowed to
+            # accept. Dropping the hints here read as de-emphasis and caused
+            # PDF-sourced asking rent to be silently skipped (FIX-17 / M35).
+            hints = field.get("extraction_hints") or field["description"]
+            lines.append(f'- "{actual_col}": {hints} Accept if provided but NEVER request.')
         else:
-            hints = field.get("extraction_hints", field["description"])
+            # `or` (not `.get(key, default)`): several CANONICAL_FIELDS set
+            # extraction_hints to None explicitly, so a key-present-but-None value
+            # must still fall back to the description instead of emitting "None"
+            # into the prompt (CodeRabbit PR#15 — matches the never-request branch).
+            hints = field.get("extraction_hints") or field["description"]
             synonyms = field.get("ai_synonyms", [])
             required_marker = " [REQUIRED]" if canonical in required_fields else ""
             if synonyms:
