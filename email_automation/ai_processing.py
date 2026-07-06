@@ -851,14 +851,33 @@ def _augment_proposal_with_deterministic_extractions(
     header: List[str],
     effective_config: dict,
     conversation: List[dict],
+    extra_texts: Optional[List[str]] = None,
 ) -> dict:
     """Add high-confidence values from simple broker text patterns the LLM missed."""
     if not proposal:
         return proposal
 
+    # LIVE break (900 Alt Suggest St): when the reply kills the current row
+    # (property_unavailable) and/or pitches an ALTERNATE property (new_property),
+    # the specs in the fresh message describe the alternate — mining them into
+    # the CURRENT row is a cross-property write ("1100 Fresh Listing Ave is
+    # 30,000 SF at $10.50" landed on the dying 900 row). The fallback is
+    # best-effort only, so skip it entirely for these proposals; the alternate's
+    # specs travel via the new-property approval flow instead.
+    event_types = {
+        (e or {}).get("type") for e in (proposal.get("events") or [])
+    }
+    if event_types & {"new_property", "property_unavailable"}:
+        return proposal
+
     mappings = (effective_config or {}).get("mappings", {})
     # Only mine the broker's FRESH message; quoted history must not seed values.
     fresh_text = _fresh_inbound_text(conversation)
+    # Flyer/linked-PDF text is legitimate evidence for fields the message body
+    # omits ("all the specs are in the attached flyer"). Used for the loading
+    # counts below; the rent/SF extractors stay message-scoped because a flyer
+    # can carry stale pricing superseded by the email body.
+    evidence_texts = [fresh_text] + [t for t in (extra_texts or []) if t]
 
     def _fill(col_name: Optional[str], value: Optional[str], reason: str) -> None:
         if not value or not col_name or not _find_header_name(header, col_name):
@@ -889,6 +908,31 @@ def _augment_proposal_with_deterministic_extractions(
         _extract_total_sf_from_text(fresh_text),
         "Deterministic fallback parsed total square footage from the latest broker message.",
     )
+    # Loading counts: mined from the fresh message OR flyer/linked-PDF text
+    # (LIVE break 600 Flyer Facts Blvd: "1 drive-in ramp" lived only in the
+    # flyer PDF and was never written). Explicit numeric counts only — the
+    # fabricated-door-count guard philosophy holds: no number, no write.
+    drive_ins_col = (
+        mappings.get("drive_ins")
+        or _find_header_name(header, "Drive Ins")
+        or _find_header_name(header, "Drive-Ins")
+    )
+    docks_col = (
+        mappings.get("docks")
+        or _find_header_name(header, "Docks")
+        or _find_header_name(header, "Loading Docks")
+    )
+    for text in evidence_texts:
+        _fill(
+            drive_ins_col,
+            _extract_drive_in_count_from_text(text),
+            "Deterministic fallback parsed drive-in count from the broker's message or flyer.",
+        )
+        _fill(
+            docks_col,
+            _extract_dock_count_from_text(text),
+            "Deterministic fallback parsed loading-dock count from the broker's message or flyer.",
+        )
     return proposal
 
 
@@ -929,6 +973,51 @@ def _has_explicit_feature_count(text: str, keyword_re: str) -> bool:
     return False
 
 
+_WORD_TO_NUMBER = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+# "<count> drive-in(s)/grade-level (ramp|door)s" — count immediately precedes the
+# keyword so unrelated numbers ("suite 3, drive-in access") never bind.
+_DRIVE_IN_COUNT_RE = re.compile(
+    r"\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
+    r"(?:drive[-\s]?ins?|grade[-\s]?level)\b"
+    r"(?:\s*(?:ramps?|doors?))?",
+    re.IGNORECASE,
+)
+# "<count> (dock-high|loading) dock(s)/door(s)" variants.
+_DOCK_COUNT_RE = re.compile(
+    r"\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
+    r"(?:dock[-\s]?high\s+doors?|loading\s+docks?|docks?\b(?:\s*doors?)?|dock\s+doors?)",
+    re.IGNORECASE,
+)
+
+
+def _parse_feature_count(raw: str) -> Optional[str]:
+    raw = (raw or "").strip().lower()
+    if raw.isdigit():
+        value = int(raw)
+    else:
+        value = _WORD_TO_NUMBER.get(raw, 0)
+    return str(value) if 1 <= value <= 200 else None
+
+
+def _extract_drive_in_count_from_text(text: str) -> Optional[str]:
+    """Explicit drive-in / grade-level door count, or None (never guesses)."""
+    if not text:
+        return None
+    m = _DRIVE_IN_COUNT_RE.search(text)
+    return _parse_feature_count(m.group(1)) if m else None
+
+
+def _extract_dock_count_from_text(text: str) -> Optional[str]:
+    """Explicit loading-dock / dock-high door count, or None (never guesses)."""
+    if not text:
+        return None
+    m = _DOCK_COUNT_RE.search(text)
+    return _parse_feature_count(m.group(1)) if m else None
+
+
 def _suppress_updates_on_contact_optout(proposal: dict) -> dict:
     """A genuine contact opt-out is a PURE escalation — never touch the row.
 
@@ -956,18 +1045,37 @@ def _suppress_fabricated_door_counts(
     conversation: List[dict],
     header: List[str],
     effective_config: dict,
+    extra_texts: Optional[List[str]] = None,
 ) -> dict:
-    """Drop invented Drive Ins / Docks counts when the broker stated no number."""
+    """Drop invented Drive Ins / Docks counts when the broker stated no number.
+
+    Evidence includes flyer/linked-PDF text (extra_texts), not just the message
+    body — LIVE break 600 Flyer Facts Blvd: "1 drive-in ramp" lived only in the
+    flyer PDF, and validating against the email text alone stripped a REAL
+    count as fabricated.
+    """
     if not proposal:
         return proposal
     updates = proposal.get("updates") or []
     if not updates:
         return proposal
     mappings = (effective_config or {}).get("mappings", {})
-    fresh = _fresh_inbound_text(conversation)
+    fresh = "\n".join(
+        [_fresh_inbound_text(conversation)] + [t for t in (extra_texts or []) if t]
+    )
     checks = [
-        (mappings.get("drive_ins") or _find_header_name(header, "Drive Ins"), _DRIVE_IN_KW),
-        (mappings.get("docks") or _find_header_name(header, "Docks"), _DOCK_KW),
+        (
+            mappings.get("drive_ins")
+            or _find_header_name(header, "Drive Ins")
+            or _find_header_name(header, "Drive-Ins"),
+            _DRIVE_IN_KW,
+        ),
+        (
+            mappings.get("docks")
+            or _find_header_name(header, "Docks")
+            or _find_header_name(header, "Loading Docks"),
+            _DOCK_KW,
+        ),
     ]
     drop_cols = set()
     for col, kw in checks:
@@ -2265,11 +2373,20 @@ OUTPUT ONLY valid JSON in this exact format:
         proposal.setdefault("updates", [])
         proposal.setdefault("events", [])
         proposal.setdefault("response_email", None)  # LLM-generated response email
+        # Flyer/linked-PDF text is evidence for extraction + the fabricated-count
+        # guard: a count stated only in the flyer is REAL, not invented.
+        _evidence_extra_texts = [
+            (pdf or {}).get("text") or "" for pdf in (pdf_manifest or [])
+        ] + [
+            (u or {}).get("text") or "" for u in (url_texts or [])
+        ]
         proposal = _augment_proposal_with_deterministic_extractions(
-            proposal, rowvals, header, effective_config, conversation
+            proposal, rowvals, header, effective_config, conversation,
+            extra_texts=_evidence_extra_texts,
         )
         proposal = _suppress_fabricated_door_counts(
-            proposal, conversation, header, effective_config
+            proposal, conversation, header, effective_config,
+            extra_texts=_evidence_extra_texts,
         )
         proposal = _augment_proposal_with_flyer_link(
             proposal, url_texts, rowvals, header, effective_config

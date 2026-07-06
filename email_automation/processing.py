@@ -2235,6 +2235,30 @@ def _should_skip_event_after_original_row_terminalized(
     return event_type not in EVENTS_ALLOWED_AFTER_ORIGINAL_ROW_NONVIABLE
 
 
+# Events whose handlers move the THREAD to a terminal state (stopped/completed).
+# They must process AFTER informational events: a crash mid-loop after one of
+# these has terminalized the thread strands every remaining event forever —
+# the retry re-scans the message, hits the terminal-thread guard, and saves it
+# "for history only" (LIVE break 900 Alt Suggest St: the run died between
+# property_unavailable and new_property; the suggested replacement property was
+# permanently lost with no operator notification).
+_TERMINALIZING_EVENT_TYPES = ("contact_optout", "property_unavailable", "close_conversation")
+
+
+def _order_events_for_processing(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Stable-order proposal events so terminalizing events run LAST.
+
+    Also makes the final thread state deterministic when the LLM emits a
+    multi-intent list in arbitrary order (e.g. [contact_optout, wrong_contact]
+    previously ended 'paused'; terminal-last always ends 'stopped').
+    """
+    if not events:
+        return events
+    informational = [e for e in events if (e or {}).get("type") not in _TERMINALIZING_EVENT_TYPES]
+    terminalizing = [e for e in events if (e or {}).get("type") in _TERMINALIZING_EVENT_TYPES]
+    return informational + terminalizing
+
+
 def _property_exists_in_sheet(
     sheets,
     sheet_id: str,
@@ -3435,7 +3459,21 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             sheets = _sheets_client()
             row_anchor = get_row_anchor(rowvals, header)
 
-            events = _proposal_events(proposal)
+            events = _order_events_for_processing(_proposal_events(proposal))
+            # Deterministic stale-event skip: with terminalizing events ordered
+            # last, an informational event (tour/call/question) for a row this
+            # SAME proposal is about to kill must still be skipped — precompute
+            # the outcome instead of depending on the LLM's event order.
+            row_will_go_nonviable = any(
+                (e or {}).get("type") == "property_unavailable"
+                and _property_unavailable_event_applies_to_row(
+                    e,
+                    row_anchor=row_anchor,
+                    message_text=_full_text,
+                    unavailable_keywords=PROPERTY_UNAVAILABLE_KEYWORDS,
+                )
+                for e in events
+            )
             print(f"\n{'='*60}")
             print(f"📋 EVENT PROCESSING: {len(events)} event(s) detected by AI")
             print(f"{'='*60}")
@@ -3458,9 +3496,16 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     print(f"   ✅ Already handled, skipping")
                     continue
 
+                # The precomputed flag only gates INFORMATIONAL events — the
+                # terminalizing events themselves (ordered last) must always
+                # process, else property_unavailable would self-skip.
+                _stale_skip_flag = old_row_became_nonviable or (
+                    row_will_go_nonviable
+                    and event_type not in _TERMINALIZING_EVENT_TYPES
+                )
                 if _should_skip_event_after_original_row_terminalized(
                     event_type,
-                    old_row_became_nonviable=old_row_became_nonviable,
+                    old_row_became_nonviable=_stale_skip_flag,
                 ):
                     print(
                         "   ℹ️ Skipping stale original-row event after non-viable move; "

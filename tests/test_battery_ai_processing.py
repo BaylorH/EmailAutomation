@@ -110,6 +110,91 @@ class RentOpexSfExtractionTests(unittest.TestCase):
         text = "Asking rents are between $20.00 - $22.00/SF NNN."
         self.assertEqual(a._extract_rent_sf_yr_from_text(text), "20.00")
 
+    # --- LIVE break 900 Alt Suggest St: cross-property fallback write --------
+    def _night_hdr_cfg(self):
+        header = ["Property Address", "Total SF", "Rent/SF /Yr", "Ops Ex / SF",
+                  "Drive Ins", "Loading Docks"]
+        cfg = {"mappings": {"rent_sf_yr": "Rent/SF /Yr", "ops_ex_sf": "Ops Ex / SF",
+                            "total_sf": "Total SF"}}
+        return header, cfg
+
+    def test_augmenter_skips_specs_when_new_property_event(self):
+        # "900 under LOI ... but 1100 Fresh Listing Ave is 30,000 SF at $10.50"
+        # — the specs belong to the ALTERNATE; nothing may land on the 900 row.
+        header, cfg = self._night_hdr_cfg()
+        proposal = {"updates": [], "events": [
+            {"type": "property_unavailable", "reason": "under_loi"},
+            {"type": "new_property", "address": "1100 Fresh Listing Ave", "city": "Austin"},
+        ]}
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal, ["900 Alt Suggest St", "", "", "", "", ""], header, cfg,
+            _conv("900 Alt Suggest St went under LOI last week, so it's off the market. "
+                  "But I just listed 1100 Fresh Listing Ave - 30,000 SF at $10.50/SF NNN."))
+        self.assertEqual(out["updates"], [],
+                         "fallback must not write the alternate property's specs to the dying row")
+
+    def test_augmenter_skips_specs_when_property_unavailable_alone(self):
+        header, cfg = self._night_hdr_cfg()
+        proposal = {"updates": [], "events": [{"type": "property_unavailable", "reason": "leased"}]}
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal, ["Prop", "", "", "", "", ""], header, cfg,
+            _conv("It's leased. It was going for $18/SF on 12,000 SF."))
+        self.assertEqual(out["updates"], [])
+
+    # --- LIVE break 600 Flyer Facts Blvd: flyer-only counts -------------------
+    def test_augmenter_fills_drive_ins_and_docks_from_flyer_text(self):
+        header, cfg = self._night_hdr_cfg()
+        proposal = {"updates": [], "events": []}
+        flyer = ("FOR LEASE - 600 Flyer Facts Blvd\n"
+                 "Loading: 2 dock-high doors, 1 drive-in ramp\nPower: 600A, 3-phase")
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal, ["600 Flyer Facts Blvd", "", "", "", "", ""], header, cfg,
+            _conv("All the specs are in the attached flyer."),
+            extra_texts=[flyer])
+        di = a._proposal_update_for_column(out, "Drive Ins")
+        dk = a._proposal_update_for_column(out, "Loading Docks")
+        self.assertIsNotNone(di, "drive-in count stated in the flyer must be written")
+        self.assertEqual(di["value"], "1")
+        self.assertIsNotNone(dk)
+        self.assertEqual(dk["value"], "2")
+
+    def test_augmenter_never_guesses_counts_without_numbers(self):
+        header, cfg = self._night_hdr_cfg()
+        proposal = {"updates": [], "events": []}
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal, ["Prop", "", "", "", "", ""], header, cfg,
+            _conv("The space has grade-level loading and dock access."),
+            extra_texts=["Ample dock-high loading available."])
+        self.assertIsNone(a._proposal_update_for_column(out, "Drive Ins"))
+        self.assertIsNone(a._proposal_update_for_column(out, "Loading Docks"))
+
+    def test_pdf_sourced_drive_in_count_survives_fabricated_guard(self):
+        # The guard validated against the EMAIL text only, so a count stated
+        # only in the flyer PDF was stripped as "fabricated". Flyer text is
+        # legitimate evidence.
+        header, cfg = self._night_hdr_cfg()
+        proposal = {"updates": [
+            {"column": "Drive Ins", "value": "1", "confidence": 0.9, "reason": "PDF flyer"},
+        ], "events": []}
+        out = a._suppress_fabricated_door_counts(
+            proposal, _conv("All the specs are in the attached flyer."), header, cfg,
+            extra_texts=["Loading: 2 dock-high doors, 1 drive-in ramp"])
+        self.assertIsNotNone(a._proposal_update_for_column(out, "Drive Ins"),
+                             "flyer-sourced count must survive the fabricated-count guard")
+
+    def test_fabricated_count_still_dropped_with_loading_docks_header(self):
+        # "Loading Docks" header was previously unguarded (lookup only tried
+        # "Docks"), letting invented counts through on Jill's real header.
+        header, cfg = self._night_hdr_cfg()
+        proposal = {"updates": [
+            {"column": "Loading Docks", "value": "4", "confidence": 0.9, "reason": "?"},
+        ], "events": []}
+        out = a._suppress_fabricated_door_counts(
+            proposal, _conv("The space has dock access."), header, cfg,
+            extra_texts=["Grade-level loading available."])
+        self.assertIsNone(a._proposal_update_for_column(out, "Loading Docks"),
+                          "invented dock count must be dropped even with a 'Loading Docks' header")
+
     def test_r22_hypothetical_leading_it_would_be_returns_none(self):
         # dollar-anchored variant (guard already handled this; regression lock)
         text = "It would be $16/SF NNN if it were a fit."
