@@ -61,7 +61,8 @@ class FakeFirestoreNode:
         return FakeFirestoreNode(self.root, self.path + ["document", "auto-id"])
 
     def get(self):
-        return FakeSnapshot({}, exists=False)
+        key = "/".join(self.path[1::2])
+        return self.root.snapshots.get(key, FakeSnapshot({}, exists=False))
 
 
 class FakeFirestore:
@@ -69,9 +70,26 @@ class FakeFirestore:
         self.deleted_paths = []
         self.set_calls = []
         self.add_calls = []
+        # "users/uid-1/threads/thread-1" -> FakeSnapshot; consulted by node.get()
+        self.snapshots = {}
 
     def collection(self, name):
         return FakeFirestoreNode(self, ["collection", name])
+
+
+def _seed_open_thread(fake_fs, user_id="uid-1", thread_id="thread-1",
+                      client_id="client-1", status="paused", row_number=20,
+                      message_id="graph-message-1"):
+    """Seed a server-side thread + recorded reply-target message so the
+    client-supplied thread binding on outbox docs passes pre-send validation."""
+    fake_fs.snapshots[f"users/{user_id}/threads/{thread_id}"] = FakeSnapshot({
+        "clientId": client_id,
+        "status": status,
+        "rowNumber": row_number,
+    })
+    fake_fs.snapshots[
+        f"users/{user_id}/threads/{thread_id}/messages/{message_id}"
+    ] = FakeSnapshot({"direction": "inbound"})
 
 
 class FakeSnapshot:
@@ -1043,6 +1061,7 @@ class OutboxSafetyTests(unittest.TestCase):
     def test_successful_dashboard_outbox_finalizes_notification_and_thread_after_send(self):
         outbox_ref = FakeDocRef()
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "delete_notification_and_decrement_counters") as delete_notification:
@@ -1124,6 +1143,7 @@ class OutboxSafetyTests(unittest.TestCase):
     def test_dashboard_manual_reply_success_records_audit_after_graph_reply(self):
         doc = self._dashboard_manual_reply_doc()
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
@@ -1166,6 +1186,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "ccEmails": ["baylor@manifoldengineering.ai"],
         })
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
@@ -1214,6 +1235,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "assignedEmails": ["bp21harrison+reviewed@gmail.com"],
         })
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
@@ -1248,6 +1270,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "script": "Hi [NAME],\n\nCan you share details?\n\nThanks",
         })
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
@@ -1277,6 +1300,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "lastSendAttemptAt": "2026-06-26T12:00:00Z",
         })
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
         sent_match = {
             "id": "sent-dashboard-reply-1",
             "internetMessageId": "<sent-dashboard-reply-1@example.com>",
@@ -1320,6 +1344,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "lastSendAttemptAt": "2026-06-26T12:00:00Z",
         })
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
         manual_continuation = {
             "id": "manual-sent-1",
             "internetMessageId": "<manual-sent-1@example.com>",
@@ -1355,6 +1380,7 @@ class OutboxSafetyTests(unittest.TestCase):
     def test_dashboard_manual_reply_failure_remains_visible_for_operator_retry(self):
         doc = self._dashboard_manual_reply_doc(doc_id="outbox-dashboard-retry")
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
@@ -1535,6 +1561,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "actionAuditId": "audit-recovered",
         }, doc_id="outbox-recovered")
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
         manual_continuation = {
             "id": "manual-sent-1",
             "internetMessageId": "<manual-sent-1@example.com>",
@@ -1580,6 +1607,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "actionAuditId": "audit-thread-retry",
         }, doc_id="outbox-thread-retry")
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
         sent_match = {
             "id": "sent-reply-1",
             "internetMessageId": "<sent-reply-1@example.com>",
@@ -1623,6 +1651,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "actionAuditId": "audit-thread-retry",
         }, doc_id="outbox-thread-retry")
         fake_fs = FakeFirestore()
+        _seed_open_thread(fake_fs)
         manual_continuation = {
             "id": "manual-sent-1",
             "internetMessageId": "<manual-sent-1@example.com>",

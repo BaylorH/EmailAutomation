@@ -88,6 +88,9 @@ class FakeFirestoreForThreads:
         return FakeUsersCollection(self.docs)
 
 
+VALID_THREAD_REPLY_TARGET = {"ok": True, "reason": None, "thread": {}, "status": "paused"}
+
+
 class OutboxReplyRecipientRoutingTests(unittest.TestCase):
     def _thread_reply_outbox(self, assigned_email):
         return FakeDoc({
@@ -103,6 +106,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
             "followUpConfig": {"enabled": False},
         })
 
+    @patch.object(email_module, "_validate_outbox_thread_reply_target", return_value=VALID_THREAD_REPLY_TARGET)
     @patch.object(email_module, "_claim_outbox_item", return_value=True)
     @patch.object(email_module, "_get_reply_message_sender", return_value="baylor@manifoldengineering.ai")
     @patch.object(email_module, "_send_outbox_as_reply")
@@ -117,6 +121,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
         send_outbox_as_reply,
         _get_reply_message_sender,
         _claim_outbox_item,
+        _validate_thread_reply_target,
     ):
         doc = self._thread_reply_outbox("casey.test@example.invalid")
 
@@ -179,6 +184,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
 
         self.assertTrue(blocked)
 
+    @patch.object(email_module, "_validate_outbox_thread_reply_target", return_value=VALID_THREAD_REPLY_TARGET)
     @patch.object(email_module, "_claim_outbox_item", return_value=True)
     @patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com")
     @patch.object(email_module, "_send_outbox_as_reply", return_value={
@@ -200,6 +206,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
         send_outbox_as_reply,
         _get_reply_message_sender,
         _claim_outbox_item,
+        _validate_thread_reply_target,
     ):
         doc = self._thread_reply_outbox("bp21harrison@gmail.com")
 
@@ -214,6 +221,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
         save_outbox_reply_message.assert_called_once()
         self.assertTrue(doc.reference.deleted)
 
+    @patch.object(email_module, "_validate_outbox_thread_reply_target", return_value=VALID_THREAD_REPLY_TARGET)
     @patch.object(email_module, "_claim_outbox_item", return_value=True)
     @patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com")
     @patch.object(email_module, "_send_outbox_as_reply", return_value={
@@ -240,6 +248,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
         _send_outbox_as_reply,
         _get_reply_message_sender,
         _claim_outbox_item,
+        _validate_thread_reply_target,
     ):
         doc = self._thread_reply_outbox("bp21harrison@gmail.com")
 
@@ -261,6 +270,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
             ["bp21harrison@gmail.com", "baylor@manifoldengineering.ai"],
         )
 
+    @patch.object(email_module, "_validate_outbox_thread_reply_target", return_value=VALID_THREAD_REPLY_TARGET)
     @patch.object(email_module, "_claim_outbox_item", return_value=True)
     @patch.object(email_module, "_get_reply_message_sender", return_value="bp21harrison@gmail.com")
     @patch.object(email_module, "_send_outbox_as_reply", return_value={"sent": True, "error": None})
@@ -281,6 +291,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
         send_outbox_as_reply,
         _get_reply_message_sender,
         _claim_outbox_item,
+        _validate_thread_reply_target,
     ):
         doc = self._thread_reply_outbox("bp21harrison@gmail.com")
 
@@ -302,6 +313,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
         self.assertEqual(args[5], ["bp21harrison@gmail.com"])
         self.assertTrue(kwargs["delete_original"])
 
+    @patch.object(email_module, "_validate_outbox_thread_reply_target", return_value=VALID_THREAD_REPLY_TARGET)
     @patch.object(email_module, "_claim_outbox_item", return_value=True)
     @patch.object(email_module, "_get_thread_row_number", return_value=9, create=True)
     @patch.object(email_module, "_find_row_by_email", return_value=(3, []))
@@ -327,6 +339,7 @@ class OutboxReplyRecipientRoutingTests(unittest.TestCase):
         _find_row_by_email,
         _get_thread_row_number,
         _claim_outbox_item,
+        _validate_thread_reply_target,
     ):
         doc = self._thread_reply_outbox("bp21harrison@gmail.com")
         data = doc.to_dict()
