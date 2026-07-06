@@ -3194,14 +3194,20 @@ def fetch_and_log_sheet_for_thread(uid: str, thread_id: str, counterparty_email:
         print(f"❌ No sheet row found with email = {counterparty_email}")
         return client_id, sheet_id, header, None, None, column_config, extraction_fields
 
-# Common auto-reply subject markers across locales. Defense-in-depth backstop
-# (FIX-18) for RFC-3834 header detection: localized out-of-office replies that
-# lack the standard headers must still be skipped so temporary-absence messages
-# never reach the classifier as real broker data.
+# Unambiguous auto-reply subject markers across locales. Defense-in-depth
+# backstop (FIX-18) for RFC-3834 header detection: localized out-of-office
+# replies that lack the standard headers must still be skipped so
+# temporary-absence messages never reach the classifier as real broker data.
+#
+# Every phrase here is an auto-responder *system* string — it does not occur in
+# a human broker's freeform subject line — so a subject-only substring match is
+# safe. Ambiguous words that a human broker legitimately writes (e.g. "on
+# vacation", "fuori sede") live in AUTO_REPLY_SUBJECT_AMBIGUOUS_MARKERS below
+# and are only honored when an independent auto-reply signal corroborates them.
 AUTO_REPLY_SUBJECT_MARKERS = [
     # English
     "out of office", "automatic reply", "auto-reply", "auto reply",
-    "autoreply", "away from office", "on vacation", "ooo:",
+    "autoreply", "away from office", "ooo:",
     # German
     "automatische antwort", "abwesenheitsnotiz",
     # French
@@ -3210,22 +3216,76 @@ AUTO_REPLY_SUBJECT_MARKERS = [
     "respuesta automática", "respuesta automatica",
     "ausencia temporal", "fuera de la oficina",
     # Italian
-    "risposta automatica", "fuori sede", "assente dall'ufficio",
+    "risposta automatica", "assente dall'ufficio",
     # Portuguese
     "resposta automática", "resposta automatica", "ausência temporária",
     # Dutch
     "automatisch antwoord", "afwezigheidsassistent",
 ]
 
+# Ambiguous phrases that COLLIDE with legitimate human broker replies.
+# In CRE broker context these frequently appear in real, actionable messages:
+#   - "fuori sede"   → Italian "off-site", often "off-site but AVAILABLE"
+#   - "on vacation"  → "our tenant is on vacation until August, but the space
+#                       is available" is a real reply, not an auto-responder.
+# A bare subject-substring match on these dropped genuine broker replies and
+# stalled the follow-up loop (CodeRabbit false-positive class). They are only
+# treated as auto-reply markers when an INDEPENDENT auto-reply signal
+# (RFC-3834 header, auto-responder sender, etc.) is also present.
+AUTO_REPLY_SUBJECT_AMBIGUOUS_MARKERS = [
+    "on vacation",
+    "fuori sede",
+]
 
-def _is_auto_reply_subject(subject: Optional[str]) -> bool:
-    """Return True if the subject line matches a known auto-reply/OOO marker.
+# Local-part / address fragments that identify a machine auto-responder or
+# bounce sender. A human broker never replies from one of these.
+AUTO_REPLY_SENDER_MARKERS = [
+    "no-reply", "noreply", "no_reply", "donotreply", "do-not-reply",
+    "do_not_reply", "mailer-daemon", "mailer_daemon", "postmaster",
+    "auto-reply", "autoreply", "autorespond", "bounce",
+]
 
-    Pure function so the localized-subject guard is deterministically testable
-    without a live Graph/model call (FIX-18 / M08 variant).
+
+def _is_auto_reply_sender(sender: Optional[str]) -> bool:
+    """Return True if the sender address looks like a machine auto-responder.
+
+    Corroborating signal for the ambiguous subject markers: a genuine broker
+    reply never arrives from a no-reply / mailer-daemon / postmaster address.
+    Pure function for deterministic testing (no live Graph call).
+    """
+    sender_lower = (sender or "").lower()
+    if "@" not in sender_lower:
+        return False
+    return any(marker in sender_lower for marker in AUTO_REPLY_SENDER_MARKERS)
+
+
+def _is_auto_reply_subject(
+    subject: Optional[str], *, has_auto_reply_signal: bool = False
+) -> bool:
+    """Return True if the subject line indicates an auto-reply/OOO message.
+
+    Context-aware (FIX-18 / M08 variant, CodeRabbit over-match fix):
+
+    * Unambiguous auto-responder subject strings (AUTO_REPLY_SUBJECT_MARKERS)
+      match on the subject alone — they never occur in a human broker subject.
+    * Ambiguous phrases (AUTO_REPLY_SUBJECT_AMBIGUOUS_MARKERS) — "on vacation",
+      "fuori sede" — only count when ``has_auto_reply_signal`` is True, i.e.
+      an independent auto-reply signal (RFC-3834 header or auto-responder
+      sender) already corroborates the classification. This prevents a
+      legitimate broker reply whose subject merely *contains* one of these
+      words from being dropped and stalling the follow-up loop.
+
+    Pure function so the guard is deterministically testable without a live
+    Graph/model call.
     """
     subject_lower = (subject or "").lower()
-    return any(marker in subject_lower for marker in AUTO_REPLY_SUBJECT_MARKERS)
+    if any(marker in subject_lower for marker in AUTO_REPLY_SUBJECT_MARKERS):
+        return True
+    if has_auto_reply_signal and any(
+        marker in subject_lower for marker in AUTO_REPLY_SUBJECT_AMBIGUOUS_MARKERS
+    ):
+        return True
+    return False
 
 
 def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, Any]):
@@ -3312,8 +3372,16 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         elif name == "precedence" and value.lower() in ["bulk", "junk", "auto_reply"]:
             is_auto_reply = True
 
-    # Also check subject line for common auto-reply patterns
-    if _is_auto_reply_subject(subject):
+    # Also check subject line for common auto-reply patterns.
+    # Ambiguous subject phrases ("on vacation", "fuori sede") only count when
+    # an independent auto-reply signal corroborates them: the RFC-3834 header
+    # match above, or a machine auto-responder sender address. This keeps the
+    # subject guard from dropping legitimate broker replies that merely contain
+    # those words while still catching real localized auto-responders.
+    auto_reply_signal = is_auto_reply or _is_auto_reply_sender(
+        sender_addr or from_addr
+    )
+    if _is_auto_reply_subject(subject, has_auto_reply_signal=auto_reply_signal):
         is_auto_reply = True
 
     # SAFETY: Skip auto-replies to prevent processing OOO messages as real data
