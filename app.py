@@ -1169,6 +1169,144 @@ def api_stop_conversation():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/dismiss-notification", methods=["POST"])
+def api_dismiss_notification():
+    """Dismiss an action_needed escalation the operator has decided needs no reply.
+
+    A bare frontend delete of the notification silently DROPS the escalation:
+    the alert disappears but the thread stays 'paused' forever (no follow-ups,
+    no reply, no record) — invisible and unresolvable. This route terminalizes
+    the escalation instead:
+      - deletes the notification via the counter-safe backend helper
+      - moves the paused thread to 'stopped' (reason 'user_dismissed_escalation')
+      - writes a terminal actionAudit record (status='dismissed')
+      - cancels any queued outbox send and clears the sheet row highlight
+
+    Expects JSON: { uid, notificationId, clientId,
+                    threadId?, notificationClientId?, actionAuditId? }
+    (clientId is the notification's parent client; notificationClientId is an
+    accepted alias.)
+    """
+    try:
+        data = request.get_json(silent=True) or request.form.to_dict() or request.args.to_dict()
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        uid = data.get("uid") or data.get("userId") or data.get("user_id")
+        notification_id = data.get("notificationId") or data.get("notification_id")
+        notif_client_id = (
+            data.get("notificationClientId")
+            or data.get("clientId")
+            or data.get("client_id")
+        )
+        thread_id = data.get("threadId") or data.get("thread_id")
+        action_audit_id = data.get("actionAuditId")
+
+        if not uid or not notification_id or not notif_client_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing required fields: uid, notificationId, clientId",
+            }), 400
+
+        from email_automation.clients import _fs, _get_client_config
+        from email_automation.messaging import update_thread_status, THREAD_STATUS
+        from email_automation.notifications import delete_notification_and_decrement_counters
+        from email_automation.email import _update_action_audit
+        from email_automation.sheets import clear_row_highlight
+        from google.cloud.firestore import SERVER_TIMESTAMP
+
+        thread_data = {}
+        if thread_id:
+            thread_ref = _fs.collection("users").document(uid).collection("threads").document(thread_id)
+            thread_doc = thread_ref.get()
+            if thread_doc.exists:
+                thread_data = thread_doc.to_dict() or {}
+
+        # 1) Delete the notification (counter-safe) so the alert clears exactly
+        #    like the bare frontend path, but through the backend helper that
+        #    keeps the client rollup counters in sync.
+        try:
+            delete_notification_and_decrement_counters(uid, notif_client_id, notification_id)
+        except Exception as e:
+            print(f"⚠️ Could not delete notification {notification_id}: {e}", flush=True)
+
+        # 2) Terminalize the thread so it is not left stuck in 'paused'. Dismiss
+        #    (unlike reply, which resumes to 'active') means the operator handled
+        #    it out of band — stop monitoring rather than resume.
+        new_status = thread_data.get("status")
+        if thread_id and thread_data.get("status") == THREAD_STATUS["paused"]:
+            if update_thread_status(uid, thread_id, THREAD_STATUS["stopped"], "user_dismissed_escalation"):
+                new_status = THREAD_STATUS["stopped"]
+            try:
+                _fs.collection("users").document(uid).collection("threads").document(thread_id).update({
+                    "followUpStatus": "stopped",
+                    "followUpConfig.stoppedAt": SERVER_TIMESTAMP,
+                    "followUpConfig.processingBy": None,
+                    "followUpConfig.processingAt": None,
+                    "nextFollowUpAt": None,
+                    "updatedAt": SERVER_TIMESTAMP,
+                })
+            except Exception as e:
+                print(f"⚠️ Could not stop follow-ups on dismiss: {e}", flush=True)
+
+            # Cancel any queued outbox send for this thread (an AI reply queued
+            # just before escalation must not fire after the operator dismissed).
+            try:
+                outbox_ref = _fs.collection("users").document(uid).collection("outbox")
+                for outbox_doc in outbox_ref.where("threadId", "==", thread_id).stream():
+                    item = outbox_doc.to_dict() or {}
+                    status = str(item.get("status") or "").strip().lower()
+                    if item.get("cancelRequested") is True or status in (
+                        "cancel_requested", "cancelled", "canceled",
+                    ):
+                        continue
+                    outbox_doc.reference.update({
+                        "cancelRequested": True,
+                        "status": "cancel_requested",
+                        "cancelledAt": SERVER_TIMESTAMP,
+                    })
+            except Exception as e:
+                print(f"⚠️ Could not cancel queued outbox items on dismiss: {e}", flush=True)
+
+            # Clear the sheet row highlight (re-resolve the CURRENT row).
+            client_id = thread_data.get("clientId") or notif_client_id
+            row_number = _resolve_current_highlight_row(uid, client_id, thread_data)
+            if client_id and row_number:
+                try:
+                    sheet_id, _, _ = _get_client_config(uid, client_id)
+                    if sheet_id:
+                        clear_row_highlight(sheet_id, row_number)
+                except Exception as e:
+                    print(f"⚠️ Could not clear row highlight on dismiss: {e}", flush=True)
+
+        # 3) Write a terminal actionAudit record so the dismissal is never a
+        #    silent drop — it always leaves a durable trail.
+        _update_action_audit(uid, action_audit_id, {
+            "status": "dismissed",
+            "clientId": notif_client_id,
+            "notificationId": notification_id,
+            "threadId": thread_id,
+            "reason": (thread_data.get("statusReason") or data.get("reason")),
+            "dismissedAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+        })
+
+        print(f"🗑️ Dismissed notification {notification_id} (thread {str(thread_id)[:20]})", flush=True)
+        return jsonify({
+            "success": True,
+            "message": "Escalation dismissed",
+            "notificationId": notification_id,
+            "threadId": thread_id,
+            "newStatus": new_status,
+        })
+
+    except Exception as e:
+        print(f"❌ Failed to dismiss notification: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/clear-optout", methods=["POST"])
 def api_clear_optout():
     """

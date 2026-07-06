@@ -644,33 +644,56 @@ class DismissEscalationNotificationTests(unittest.TestCase):
         # Notification cleared through the counter-safe backend helper.
         del_notif.assert_called_once_with(DIS_UID, DIS_CLIENT, DIS_NOTIF)
 
-    @unittest.expectedFailure
-    def test_dismiss_leaves_no_audit_or_thread_transition(self):
-        """SAFETY INVARIANT (currently violated): dismissing a needs_user_input
-        notification must leave a terminal actionAudit OR move the thread out of
-        'paused'. A bare dismiss does neither, so the escalation is dropped:
-        notification gone, thread still 'paused', broker question unanswered and
-        now invisible. Expected-failure until a dismiss path (frontend write or
-        backend route) terminalizes the action or transitions the thread."""
+    def _dismiss_via_endpoint(self, store, action_audit_id=None):
+        """Drive the REAL /api/dismiss-notification handler with a faked Firestore.
+        The counter-safe notification delete is mocked (it is exercised by the
+        notifications-module tests); this focuses on the thread + audit invariant."""
+        with patch("email_automation.clients._fs", store), \
+             patch("email_automation.messaging._fs", store), \
+             patch("email_automation.notifications.delete_notification_and_decrement_counters") as del_notif:
+            with app_module.app.test_client() as client:
+                resp = client.post("/api/dismiss-notification", json={
+                    "uid": DIS_UID,
+                    "notificationId": DIS_NOTIF,
+                    "clientId": DIS_CLIENT,
+                    "threadId": DIS_THREAD,
+                    "actionAuditId": action_audit_id,
+                })
+        return resp, del_notif
+
+    @unittest.skipIf(app_module is None, "flask is not installed")
+    def test_dismiss_endpoint_terminalizes_escalation_with_audit(self):
+        """SAFETY INVARIANT (now satisfied by the backend route): dismissing a
+        needs_user_input notification must leave a terminal actionAudit AND move
+        the thread out of 'paused'. The /api/dismiss-notification route clears the
+        notification (counter-safe), stops the thread, and writes a terminal audit
+        — so the escalation is resolved and auditable, never silently dropped."""
         store = self._seed_paused_thread_with_notification()
 
-        self._dismiss_notification(store)
+        resp, del_notif = self._dismiss_via_endpoint(store, action_audit_id="audit-needs-input")
 
-        # Notification is gone from the operator's list...
-        self.assertIsNone(store.data_at(DIS_NOTIF_PATH))
+        self.assertEqual(200, resp.status_code)
+        self.assertTrue(resp.get_json()["success"])
+        # Notification cleared through the counter-safe backend helper, not a raw delete.
+        del_notif.assert_called_once_with(DIS_UID, DIS_CLIENT, DIS_NOTIF)
+        # Thread is no longer stuck in 'paused'.
+        thread = store.data_at(DIS_THREAD_PATH)
+        self.assertEqual(thread["status"], "stopped")
+        self.assertEqual(thread["statusReason"], "user_dismissed_escalation")
+        # Terminal actionAudit written so the dismissal is auditable.
+        audit = store.data_at(DIS_AUDIT_PATH)
+        self.assertIsNotNone(audit, "dismiss must write a terminal actionAudit")
+        self.assertEqual(audit["status"], "dismissed")
+        self.assertEqual(audit["threadId"], DIS_THREAD)
 
-        # ...but was the escalation actually resolved?
-        audit_written = store.data_at(DIS_AUDIT_PATH) is not None or any(
-            "actionAudit" in path for path, *_ in store.set_log
-        )
-        thread_status = (store.data_at(DIS_THREAD_PATH) or {}).get("status")
-        escalation_resolved = audit_written or thread_status != "paused"
-
-        self.assertTrue(
-            escalation_resolved,
-            "dismiss dropped an unresolved escalation: no terminal actionAudit "
-            f"and thread still {thread_status!r}",
-        )
+    @unittest.skipIf(app_module is None, "flask is not installed")
+    def test_dismiss_endpoint_without_audit_id_still_terminalizes_thread(self):
+        """Even when the caller supplies no actionAuditId, the thread must not be
+        left stuck in 'paused' — the status transition alone resolves it."""
+        store = self._seed_paused_thread_with_notification()
+        resp, _ = self._dismiss_via_endpoint(store, action_audit_id=None)
+        self.assertEqual(200, resp.status_code)
+        self.assertEqual(store.data_at(DIS_THREAD_PATH)["status"], "stopped")
 
     def test_dismiss_current_behavior_is_a_silent_drop(self):
         """Characterization (passing): pin the ACTUAL current behavior so the gap
