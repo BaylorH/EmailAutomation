@@ -809,13 +809,34 @@ Best,<br>
 
 
 def _professional_signature_html_belongs_to_sender(signature: str, user_email: str = None) -> bool:
+    """True only if this signature can safely be sent AS the given sender.
+
+    Generic identity check (not a per-name blocklist): a cached signature belongs
+    to the sender if it names the sender's own email, OR carries no other person's
+    email at all. A signature that embeds ANY email other than the sender's is a
+    foreign identity (Jill, Tyneesia, Karsen, or any future user) and must never
+    be reused — this is what prevents cross-account signature leaks generally,
+    not just the one historical Jill/MOHR case.
+    """
     signature = signature or ""
     user_email = _clean_signature_value(user_email).lower()
     if not signature.strip():
         return False
-    if user_email and user_email in signature.lower():
+    sig_lower = signature.lower()
+    if not user_email:
+        # Sender identity unknown — cannot verify ownership here; the send path
+        # always supplies user_email, so enforcement happens there.
         return True
-    if user_email != "jill.ames@mohrpartners.com" and "jill.ames@mohrpartners.com" in signature.lower():
+    # Match whole email tokens only — a bare `user_email in sig_lower` substring
+    # test lets a colleague's superset address (sender "jane@acme.com" vs signature
+    # "mjane@acme.com") pass as owned. Extract every email and fail closed if ANY
+    # is not the sender's; a signature with only the sender's email (or none at
+    # all) belongs to the sender.
+    foreign_emails = {
+        e for e in re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", sig_lower)
+        if e != user_email
+    }
+    if foreign_emails:
         return False
     return True
 
@@ -1050,6 +1071,13 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None, u
 
     if signature_mode == "professional":
         if custom_signature and custom_signature.strip():
+            # FAIL CLOSED: never emit a signature that carries another person's
+            # identity. This is the final send-path gate — regardless of how the
+            # signature was resolved upstream, a foreign-identity signature is
+            # dropped (send none) rather than leaked as the sender.
+            if not _professional_signature_html_belongs_to_sender(custom_signature, user_email):
+                print("⚠️ Dropping professional signature that does not belong to the sender")
+                return ""
             return convert_plain_text_signature_to_html(custom_signature)
         return ""
     else:

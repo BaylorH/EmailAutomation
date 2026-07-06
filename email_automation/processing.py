@@ -1412,6 +1412,76 @@ def _clear_thread_action_notifications(
         return 0
 
 
+def _resume_paused_thread_after_manual_continuation(
+    user_id: str,
+    headers: Dict[str, str],
+    thread_id: str,
+    thread_data: Dict[str, Any],
+    msg: Dict[str, Any],
+) -> bool:
+    """Handle an operator's out-of-band manual reply on a paused/escalated thread.
+
+    When the operator replies to an escalated thread directly from Outlook (a
+    Sent-Items continuation) instead of using the dashboard, the escalation's
+    open ``action_needed`` notification and the ``paused`` thread status become
+    stale — the thread would otherwise stay paused forever. On the next scan we
+    detect the operator's manual continuation (a Sent-Items message in the same
+    conversation sent after the thread was paused) and, when found:
+
+    (a) clear the stale open ``action_needed`` notification for the thread, and
+    (b) resume (unpause) the thread so processing continues normally.
+
+    Returns True when the thread was resumed. Conservative on failure: if the
+    Sent Items guard is unreadable we leave the escalation visible.
+    """
+    if (thread_data or {}).get("status") != THREAD_STATUS["paused"]:
+        return False
+
+    conversation_id = msg.get("conversationId")
+    if not conversation_id:
+        return False
+
+    # Anchor on when the thread was paused/escalated — the operator's manual
+    # continuation would have been sent after that point.
+    paused_after = _timestamp_to_utc(
+        (thread_data or {}).get("statusUpdatedAt")
+        or (thread_data or {}).get("updatedAt")
+    )
+    if not paused_after:
+        return False
+
+    try:
+        manual_continuation = find_sent_conversation_continuation_for_retry(
+            headers,
+            conversation_id=conversation_id,
+            sent_after=paused_after,
+        )
+    except SentMailGuardLookupError as e:
+        # Sent Items unreadable: stay conservative and leave the escalation visible.
+        print(
+            f"⚠️ Could not verify operator manual continuation for paused thread "
+            f"{thread_id[:20]}...: {e}"
+        )
+        return False
+
+    if not manual_continuation:
+        return False
+
+    client_id = (thread_data or {}).get("clientId")
+    _clear_thread_action_notifications(user_id, client_id, thread_id)
+    update_thread_status(
+        user_id,
+        thread_id,
+        THREAD_STATUS["active"],
+        "manual_continuation_resumed",
+    )
+    print(
+        f"▶️ Resumed paused thread {thread_id[:20]}... after operator manually "
+        "continued the conversation out-of-band; cleared stale action notification"
+    )
+    return True
+
+
 TERMINAL_THREAD_STATUSES = {THREAD_STATUS["completed"], THREAD_STATUS["stopped"]}
 NON_PENDING_OUTBOX_STATUSES = {
     "cancel_requested",
@@ -2386,6 +2456,30 @@ def _should_skip_event_after_original_row_terminalized(
     return event_type not in EVENTS_ALLOWED_AFTER_ORIGINAL_ROW_NONVIABLE
 
 
+# Events whose handlers move the THREAD to a terminal state (stopped/completed).
+# They must process AFTER informational events: a crash mid-loop after one of
+# these has terminalized the thread strands every remaining event forever —
+# the retry re-scans the message, hits the terminal-thread guard, and saves it
+# "for history only" (LIVE break 900 Alt Suggest St: the run died between
+# property_unavailable and new_property; the suggested replacement property was
+# permanently lost with no operator notification).
+_TERMINALIZING_EVENT_TYPES = ("contact_optout", "property_unavailable", "close_conversation")
+
+
+def _order_events_for_processing(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Stable-order proposal events so terminalizing events run LAST.
+
+    Also makes the final thread state deterministic when the LLM emits a
+    multi-intent list in arbitrary order (e.g. [contact_optout, wrong_contact]
+    previously ended 'paused'; terminal-last always ends 'stopped').
+    """
+    if not events:
+        return events
+    informational = [e for e in events if (e or {}).get("type") not in _TERMINALIZING_EVENT_TYPES]
+    terminalizing = [e for e in events if (e or {}).get("type") in _TERMINALIZING_EVENT_TYPES]
+    return informational + terminalizing
+
+
 def _property_exists_in_sheet(
     sheets,
     sheet_id: str,
@@ -3335,6 +3429,18 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             "saving inbound message for history only"
         )
 
+    # If the operator manually replied to a paused/escalated thread directly from
+    # Outlook (out-of-band Sent-Items continuation) instead of using the dashboard,
+    # clear the stale open action_needed notification and resume the thread so
+    # processing continues normally rather than staying paused forever.
+    if thread_status == THREAD_STATUS["paused"] and not client_paused:
+        if _resume_paused_thread_after_manual_continuation(
+            user_id, headers, thread_id, thread_data, msg
+        ):
+            thread_data["status"] = THREAD_STATUS["active"]
+            thread_data["statusReason"] = "manual_continuation_resumed"
+            thread_status = THREAD_STATUS["active"]
+
     # Terminal threads keep late replies for history but must not generate new AI work or auto-replies,
     # except when the user approved a same-contact replacement property in this email thread.
     replacement_context = _active_replacement_context(thread_data, _full_text)
@@ -3645,7 +3751,21 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             sheets = _sheets_client()
             row_anchor = get_row_anchor(rowvals, header)
 
-            events = _proposal_events(proposal)
+            events = _order_events_for_processing(_proposal_events(proposal))
+            # Deterministic stale-event skip: with terminalizing events ordered
+            # last, an informational event (tour/call/question) for a row this
+            # SAME proposal is about to kill must still be skipped — precompute
+            # the outcome instead of depending on the LLM's event order.
+            row_will_go_nonviable = any(
+                (e or {}).get("type") == "property_unavailable"
+                and _property_unavailable_event_applies_to_row(
+                    e,
+                    row_anchor=row_anchor,
+                    message_text=_full_text,
+                    unavailable_keywords=PROPERTY_UNAVAILABLE_KEYWORDS,
+                )
+                for e in events
+            )
             print(f"\n{'='*60}")
             print(f"📋 EVENT PROCESSING: {len(events)} event(s) detected by AI")
             print(f"{'='*60}")
@@ -3668,9 +3788,16 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     print(f"   ✅ Already handled, skipping")
                     continue
 
+                # The precomputed flag only gates INFORMATIONAL events — the
+                # terminalizing events themselves (ordered last) must always
+                # process, else property_unavailable would self-skip.
+                _stale_skip_flag = old_row_became_nonviable or (
+                    row_will_go_nonviable
+                    and event_type not in _TERMINALIZING_EVENT_TYPES
+                )
                 if _should_skip_event_after_original_row_terminalized(
                     event_type,
-                    old_row_became_nonviable=old_row_became_nonviable,
+                    old_row_became_nonviable=_stale_skip_flag,
                 ):
                     print(
                         "   ℹ️ Skipping stale original-row event after non-viable move; "
@@ -3716,17 +3843,24 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         # Update thread status to paused - waiting for user to handle call
                         update_thread_status(user_id, thread_id, THREAD_STATUS["paused"], "call_requested")
 
-                        # If phone number is provided, skip email response (just notification)
-                        # If no phone number, we'll send a brief response asking for it
+                        # A call request ALWAYS escalates to the operator — never auto-reply,
+                        # whether or not a phone number was included. LIVE break: a broker who
+                        # asked to "talk over the phone" (no number) fell through to the
+                        # phone-number-ask AND the missing-fields auto-reply paths below,
+                        # talking over the human handoff (only an incidental reply-all filter
+                        # stopped delivery). Suppress the response unconditionally so the
+                        # operator handles the call; this matches the deterministic guard that
+                        # already nulls response_email for call_requested.
+                        proposal["skip_response"] = True
                         if phone_number:
                             print(f"📞 Phone number found - skipping email response, notification only")
-                            # Mark that we should skip the normal email response
-                            proposal["skip_response"] = True
-                            # Highlight blue - row needs user attention (paused)
-                            try:
-                                highlight_row(sheet_id, rownum, ROW_HIGHLIGHT_BLUE)
-                            except Exception as e:
-                                print(f"⚠️ Could not highlight row: {e}")
+                        else:
+                            print(f"📞 No phone number - escalating to operator, skipping email response")
+                        # Highlight blue - row needs user attention (paused)
+                        try:
+                            highlight_row(sheet_id, rownum, ROW_HIGHLIGHT_BLUE)
+                        except Exception as e:
+                            print(f"⚠️ Could not highlight row: {e}")
                     except Exception as e:
                         print(f"❌ Failed to write call_requested notification: {e}")
 

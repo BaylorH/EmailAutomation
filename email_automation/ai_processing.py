@@ -504,10 +504,68 @@ _NEW_PROP_CONTRADICTION_RE = re.compile(
 )
 
 
+_REDIRECT_PHRASE_RE = re.compile(
+    r"\b(?:my\s+colleague|loop\s+(?:\w+\s+)?in\b|reach\s+out\s+to|"
+    r"actually\s+handles?|handles?\s+(?:the|our|all|that)\b|"
+    r"is\s+the\s+(?:right|better)\s+(?:person|contact)|"
+    r"will\s+be\s+your\s+(?:point\s+of\s+)?contact|"
+    r"redirect(?:ing)?\s+you\s+to|forward(?:ing)?\s+(?:you|this)\s+to|"
+    r"you\s+(?:should|may\s+want\s+to|can)\s+(?:loop\s+in|contact|reach\s+out\s+to))\b",
+    re.IGNORECASE,
+)
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+# A broker asking for a phone conversation (LIVE break: call_lets_hop). Matches the
+# same intent surface as the classifier's call_requested signals but tolerates the
+# "hop on a quick call" filler the quote-signal list misses. Used only over the
+# broker's FRESH message so quoted prior-thread call asks never re-fire.
+_CALL_REQUEST_RE = re.compile(
+    r"\bcall\s+me\b|\bgive\s+me\s+a\s+call\b|\bcall\s+you\b|\bphone\s+call\b"
+    r"|\bhop\s+on\s+a(?:\s+\w+){0,3}\s+call\b|\bcan\s+(?:you|we)\s+call\b"
+    r"|\bcall\s+me\s+at\b|\breach\s+me\s+at\b|\bschedule\s+a\s+call\b"
+    r"|\blet'?s\s+call\b|\blet'?s\s+hop\s+on\b|\bset\s+up\s+a\s+call\b"
+    # "talk"/"chat"/"speak" are call requests ONLY with explicit phone context —
+    # a bare "let's chat about the terms" or "can we talk pricing over email" is
+    # an ordinary reply, and forcing call_requested there nulls a valid auto-reply.
+    r"|\b(?:talk|chat|speak|connect)\b[^.!?\n]{0,25}\b(?:on|over|by)\s+(?:the\s+)?phone\b"
+    r"|\bover\s+the\s+phone\b|\bon\s+a\s+quick\s+call\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_call_request(text: str) -> bool:
+    return bool(text and _CALL_REQUEST_RE.search(text))
+
+_OUT_OF_OFFICE_RE = re.compile(
+    r"\bout\s+of\s+(?:the\s+)?office\b"
+    r"|\booo\b"
+    r"|\bauto(?:mated|matic)?[-\s]?reply\b"
+    r"|\bautoreply\b"
+    r"|\bon\s+(?:vacation|holiday|leave|pto|sabbatical)\b"
+    r"|\b(?:parental|maternity|paternity|medical|sick|annual)\s+leave\b"
+    # "limited access" alone is a common property description ("site has limited
+    # access after hours"); only an explicit email-access phrase signals OOO.
+    r"|\blimited\s+email\s+access\b"
+    r"|\blimited\s+access\s+to\s+(?:my\s+)?email\b"
+    r"|\baway\s+from\s+(?:my\s+)?(?:email|office|desk)\b",
+    # NOTE: bare "back in the office" / "returning to the office" were removed —
+    # a live human handoff ("I was traveling, back in the office Monday, in the
+    # meantime contact Dana at dana@x.com") is a genuine wrong_contact, not an
+    # auto-reply. Real OOO banners still match via the strong markers above
+    # (out of office / OOO / automatic reply / on vacation|leave / away from ...).
+    re.IGNORECASE,
+)
+
+
 def _looks_like_out_of_office(text: str) -> bool:
-    """A temporary-absence auto/hand-typed reply (OOO with return + assistant) is
-    NOT a wrong_contact redirect (A′ misread M08)."""
+    """A temporary-absence auto/hand-typed reply (OOO) is NOT a wrong_contact
+    redirect. Combined detector (A′ misread M08 + #19 LIVE breaks E1/E3): fires on
+    either the broad OOO/auto-reply banner set (`_OUT_OF_OFFICE_RE`) OR an OOO phrase
+    paired with an explicit return signal. An auto-reply that lists a backup or
+    assistant address must never be read as an intentional human handoff."""
     blob = (text or "").lower()
+    if _OUT_OF_OFFICE_RE.search(text or ""):
+        return True
     return bool(
         re.search(
             r"\b(?:out\s+of\s+(?:the\s+)?office|automatic\s+reply|auto[-\s]?reply|"
@@ -660,6 +718,280 @@ def _apply_event_retention_guards(
     return kept
 
 
+def _latest_inbound_sender(conversation: List[dict]) -> str:
+    for msg in reversed(conversation or []):
+        if (msg or {}).get("direction") == "inbound":
+            return str((msg or {}).get("from") or "").lower()
+    return ""
+
+
+def _detect_colleague_redirect(latest_text_raw: str, sender_email: str):
+    """High-precision deterministic detector for a broker handing the thread to a
+    DIFFERENT person ("my colleague Dana (dana@x.com) actually handles the south
+    submarket, loop her in"). Requires BOTH a redirect phrase AND a distinct
+    third-party email so it does not false-fire on a broker mentioning their own
+    name. Returns {suggestedContact, suggestedEmail} or None.
+
+    The LLM classifier drops this intermittently (nondeterministic wrong_contact),
+    which lets a multi-intent reply auto-respond and silently lose the redirect;
+    this guard forces the wrong_contact escalation deterministically.
+    """
+    text = latest_text_raw or ""
+    if not _REDIRECT_PHRASE_RE.search(text):
+        return None
+    sender = (sender_email or "").lower()
+    for email in _EMAIL_RE.findall(text):
+        el = email.lower()
+        if el == sender:
+            continue
+        name_m = re.search(r"colleague[,\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", text)
+        return {"suggestedContact": name_m.group(1) if name_m else "", "suggestedEmail": email}
+    return None
+
+
+# --- Engaged-alternative guard (LIVE break B9) ------------------------------
+# A broker who scopes "not interested" to ONE suite while asking to see more
+# ("not interested in that particular suite, but show me what else you have
+# nearby") is an ACTIVE lead, not an opt-out. The LLM intermittently widens the
+# scoped rejection to the whole contact and fires contact_optout, which silently
+# STOPS the thread. These deterministic detectors strip that false opt-out while
+# never touching a genuine opt-out (unsubscribe / stop emailing / remove me).
+_SCOPED_NOT_INTERESTED_RE = re.compile(
+    r"\bnot\s+interested\s+in\s+(?:the\s+|this\s+|that\s+)?"
+    r"(?:particular\s+|specific\s+|current\s+)?"
+    r"(?:suite|space|unit|property|building|listing|option|location|one|deal|place)\b"
+    r"|\b(?:this|that)\s+(?:particular\s+|specific\s+)?"
+    r"(?:suite|space|unit|property|building|listing|option|location|one)\s+"
+    r"(?:doesn[’']t|does\s+not|won[’']t|will\s+not|isn[’']t|is\s+not)\s+"
+    r"(?:work|fit|suit|(?:a\s+)?(?:good\s+)?(?:fit|match)\s+for\s+us|for\s+us|right\s+for\s+us)\b",
+    re.IGNORECASE,
+)
+_ALTERNATIVES_REQUEST_RE = re.compile(
+    r"\b(?:show|send|share)\s+me\s+(?:what\s+else|others?|other\s+\w+|anything\s+else|"
+    r"the\s+others?|different\s+\w+)\b"
+    r"|\bwhat\s+else\s+(?:do\s+)?you\s+(?:have|got|offer)\b"
+    r"|\bother\s+(?:options?|spaces?|suites?|properties|listings?|availabilit\w+)\b"
+    r"|\banything\s+else\s+(?:you\s+have|available|nearby|in\s+the\s+area|around)\b"
+    r"|\b(?:got|have)\s+anything\s+else\b"
+    r"|\bsomething\s+else\b"
+    r"|\b(?:any\s+)?other\s+(?:options?|availabilit\w+)\b",
+    re.IGNORECASE,
+)
+# Hard opt-out phrases: if any of these are present the reply is a genuine
+# opt-out and must NEVER be suppressed, even if it also mentions alternatives.
+_HARD_OPTOUT_RE = re.compile(
+    r"\bunsubscribe\b"
+    r"|\bremove\s+me\b|\btake\s+me\s+off\b"
+    r"|\bstop\s+(?:emailing|contacting|reaching|messaging)\b"
+    r"|\b(?:do\s+not|don[’']t)\s+(?:contact|email|message)\s+me\b"
+    r"|\bno\s+longer\s+interested\b|\bnot\s+interested\s+at\s+all\b"
+    r"|\bopt(?:ing)?\s+out\b|\boff\s+your\s+(?:list|mailing)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_engaged_alternative_request(text: str) -> bool:
+    """True when a broker scopes disinterest to a specific property/suite AND asks
+    to see alternatives — an engaged lead, not a contact opt-out. Returns False
+    for any reply carrying a hard opt-out phrase so genuine opt-outs are preserved.
+    """
+    t = text or ""
+    if not t or _HARD_OPTOUT_RE.search(t):
+        return False
+    return bool(_SCOPED_NOT_INTERESTED_RE.search(t) and _ALTERNATIVES_REQUEST_RE.search(t))
+
+
+# ---- Quoted-history awareness ------------------------------------------------
+# Broker replies frequently carry the entire prior thread quoted below the fresh
+# reply ("> 8200 Trade Center Dr is no longer available", "On Mon ... wrote:",
+# forwarded "From:" blocks). Classifying that quoted history as if it were the
+# broker's CURRENT message kills live deals ("no longer available" from an old
+# quote), redirects to the wrong contact, or schedules stale tours. These helpers
+# split the fresh top-of-message from the quoted tail so guards can reason about
+# what the broker actually just said.
+_QUOTE_LINE_RE = re.compile(r"^\s*>+")
+# Standard client attribution: "On <date>, <name> wrote:" ending the line.
+_QUOTE_ATTRIBUTION_RE = re.compile(r"^\s*On\b.*\bwrote:\s*$", re.IGNORECASE)
+# Broader attribution: "On <date/time> ... wrote[:] <maybe trailing text>". Gmail /
+# Apple / Outlook variants where "wrote" is NOT at line end ("...wrote the
+# following:", or the quote text glued onto the same line). Gated on a date/time
+# token between "On" and "wrote" so casual prose ("On our call I wrote up ...")
+# is not mistaken for a quote marker.
+_QUOTE_ATTRIBUTION_DATED_RE = re.compile(
+    r"^\s*On\b.*?"
+    r"(?:\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)"
+    r"|\b(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)"
+    r"|\b\d{1,2}[/\-]\d{1,2}"
+    r"|\b20\d{2}\b"
+    r"|\b\d{1,2}:\d{2}\b"
+    r"|\b[ap]\.?m\.?\b)"
+    r".*\bwrote\b",
+    re.IGNORECASE,
+)
+_QUOTE_FWD_MARKER_RE = re.compile(
+    r"^\s*(?:-{2,}\s*(?:original\s+message|forwarded\s+message)\s*-{2,}"
+    r"|begin\s+forwarded\s+message:"
+    r"|_{5,})\s*$",
+    re.IGNORECASE,
+)
+# Single forwarded header line carrying a bracketed <email> — matches on its own.
+_QUOTE_FWD_HEADER_RE = re.compile(r"^\s*From:\s+.*<[^>]+@[^>]+>", re.IGNORECASE)
+# Outlook block-header fields. A bare "From:" line (no <email>) only marks a quote
+# when it opens a contiguous Outlook header block (From: + Sent:/Date: + To:/Cc:/
+# Subject:), so a prose line like "From: my perspective ..." is never split.
+_OUTLOOK_FROM_RE = re.compile(r"^\s*From:\s+\S", re.IGNORECASE)
+_OUTLOOK_SENT_RE = re.compile(r"^\s*(?:Sent|Date):\s+\S", re.IGNORECASE)
+_OUTLOOK_RECIP_RE = re.compile(r"^\s*(?:To|Cc|Subject):\s+\S", re.IGNORECASE)
+
+
+def _is_outlook_forward_header(lines, idx: int) -> bool:
+    """True when ``lines[idx]`` is the ``From:`` line opening an Outlook-style
+    forwarded header block — a bare From: (no <email>) followed within a few lines
+    by a Sent:/Date: line and a To:/Cc:/Subject: line."""
+    if not _OUTLOOK_FROM_RE.match(lines[idx]):
+        return False
+    window = lines[idx + 1: idx + 5]
+    has_sent = any(_OUTLOOK_SENT_RE.match(l) for l in window)
+    has_recip = any(_OUTLOOK_RECIP_RE.match(l) for l in window)
+    return has_sent and has_recip
+
+
+def _split_fresh_and_quoted(text: str):
+    """Return (fresh, quoted) for an inbound message body.
+
+    `fresh` is everything above the first quoted-history / forwarded marker;
+    `quoted` is that marker line and everything after it. If no quoted history is
+    found, `quoted` is empty and `fresh` is the whole text.
+    """
+    if not text:
+        return "", ""
+    lines = text.split("\n")
+    for idx, line in enumerate(lines):
+        if (_QUOTE_LINE_RE.match(line)
+                or _QUOTE_ATTRIBUTION_RE.match(line)
+                or _QUOTE_ATTRIBUTION_DATED_RE.match(line)
+                or _QUOTE_FWD_MARKER_RE.match(line)
+                or _QUOTE_FWD_HEADER_RE.match(line)
+                or _is_outlook_forward_header(lines, idx)):
+            return "\n".join(lines[:idx]), "\n".join(lines[idx:])
+    return text, ""
+
+
+def _fresh_inbound_text(conversation: List[dict]) -> str:
+    """Latest inbound text with any quoted prior-thread history stripped off."""
+    fresh, _ = _split_fresh_and_quoted(_latest_inbound_text(conversation))
+    return fresh
+
+
+# Per-event-type text signals used to decide whether an LLM-emitted event was
+# actually triggered by the broker's fresh message or bled in from quoted history.
+_EVENT_QUOTE_SIGNALS = {
+    "property_unavailable": [
+        r"\bno\s+longer\s+available\b", r"\bnot\s+available\b", r"\boff\s+the\s+market\b",
+        r"\bfully\s+leased\b", r"\bhas\s+been\s+leased\b", r"\b(?:is|was|just|now)\s+leased\b",
+        r"\bleased\b", r"\bunder\s+contract\b", r"\bsigned\s+(?:a\s+)?lease\b",
+        r"\bsigned\s+(?:an?\s+)?(?:loi|letter\s+of\s+intent)\b", r"\bno\s+longer\s+represent",
+        r"\bno\s+availability\b", r"\bno\s+space\s+available\b", r"\bno\s+longer\s+on\s+the\s+market\b",
+        r"\btaken\b", r"\bwithdrawn\b",
+    ],
+    "wrong_contact": [
+        r"\bno\s+longer\s+handle", r"\bdon'?t\s+handle\b", r"\bdo\s+not\s+handle\b",
+        r"\bwrong\s+(?:person|contact)\b", r"\bnot\s+the\s+(?:right\s+)?(?:leasing\s+)?(?:agent|contact|person)\b",
+        r"\bplease\s+contact\b", r"\breach\s+out\s+to\b", r"\bno\s+longer\s+with\b",
+        r"\bleft\s+the\s+company\b", r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
+    ],
+    "tour_requested": [
+        r"\bschedule\s+a\s+tour\b", r"\btour\b", r"\bshowing\b", r"\bwalk[-\s]?through\b",
+        r"\bwould\s+you\s+like\s+to\s+(?:see|tour|view|come)\b", r"\bhappy\s+to\s+show\b",
+        r"\bcome\s+(?:by|take\s+a\s+look)\b", r"\bstop\s+by\b", r"\bshow\s+you\s+(?:the|around|it)\b",
+    ],
+    "contact_optout": [
+        r"\bremove\s+me\b", r"\bunsubscribe\b", r"\bnot\s+interested\b", r"\bno\s+thanks\b",
+        r"\bplease\s+stop\b", r"\bstop\s+emailing\b", r"\bopt\s+out\b", r"\btake\s+me\s+off\b",
+        r"\bdo\s+not\s+contact\b", r"\bdon'?t\s+contact\b", r"\bwe\s+do\s+not\s+work\s+with\b",
+        r"\bdon'?t\s+work\s+with\b", r"\bno\s+longer\s+interested\b", r"\bnot\s+taking\s+inquiries\b",
+        r"\btenant\s+rep", r"\bdeal\s+direct\b",
+    ],
+    "call_requested": [
+        r"\bcall\s+me\b", r"\bgive\s+me\s+a\s+call\b", r"\bcall\s+you\b", r"\bphone\s+call\b",
+        r"\bhop\s+on\s+a\s+call\b", r"\bcan\s+(?:you|we)\s+(?:call|talk)\b", r"\bcall\s+me\s+at\b",
+        r"\breach\s+me\s+at\b", r"\bschedule\s+a\s+call\b", r"\blet'?s\s+(?:talk|chat|call)\b",
+    ],
+    "close_conversation": [
+        r"\bgoing\s+exclusive\b", r"\bexclusive\s+with\b", r"\bclose\s+(?:out|the\s+loop|this\s+out)\b",
+        r"\bnot\s+a\s+fit\s+to\s+work\b", r"\bgood\s+luck\s+with\s+your\s+search\b",
+        r"\bwe'?re\s+going\s+(?:exclusive|with)\b", r"\bin\s+negotiations\s+with\b",
+        r"\bsigning\s+next\s+week\b", r"\bdeal\s+pending\b",
+    ],
+    "property_issue": [
+        r"\bsmell", r"\bodor", r"\bmold\b", r"\bwater\s+damage\b", r"\broof\s+(?:leak|damage)\b",
+        r"\bfoundation\b", r"\bstructural\b", r"\bpest", r"\bcontamination\b", r"\basbestos\b",
+        r"\bflood\s+zone\b", r"\benvironmental\b", r"\bphase\s+(?:ii|2)\b", r"\bhazmat\b",
+        r"\bhvac\b", r"\belectrical\s+issue", r"\bplumbing\b", r"\bfire\s+damage\b",
+        r"\bcode\s+violation", r"\bzoning\s+problem", r"\bada\s+non", r"\bneeds\s+repair",
+        r"\bdamage\b", r"\bleak\b",
+    ],
+}
+
+
+def _event_is_quote_only(event: dict, fresh_lower: str, quoted_lower: str) -> bool:
+    """True when an LLM event's supporting signal is present in quoted history but
+    absent from the broker's fresh message — i.e., it bled in from a prior thread.
+
+    Conservative by design: only returns True when the signal can be affirmatively
+    located in the quoted tail AND is missing from the fresh text. If neither
+    region carries a recognizable signal, the event is left untouched.
+    """
+    etype = (event or {}).get("type")
+
+    if etype == "new_property":
+        addr = re.sub(r"\[tbd\]", "", (event.get("address") or "").lower()).strip()
+        if not addr:
+            return False
+        key = " ".join(addr.split()[:2])
+        return bool(key) and key not in fresh_lower and key in quoted_lower
+
+    if etype == "close_conversation":
+        notes = " ".join(str((event or {}).get(k) or "") for k in ("notes", "reason")).lower()
+        # "all required fields gathered" closes are not text-signal driven.
+        if "all_info_gathered" in notes or "all info" in notes:
+            return False
+
+    signals = _EVENT_QUOTE_SIGNALS.get(etype)
+    if not signals:
+        return False
+    fresh_hit = any(re.search(p, fresh_lower) for p in signals)
+    quoted_hit = any(re.search(p, quoted_lower) for p in signals)
+    return quoted_hit and not fresh_hit
+
+
+def _suppress_quote_only_events(proposal: dict, conversation: List[dict]) -> dict:
+    """Drop LLM events whose only trigger lives in quoted prior-thread history.
+
+    The classifier intermittently reads the quoted tail of a reply as the broker's
+    current intent — killing live listings ("no longer available" from an old
+    quote), redirecting to a stale contact, scheduling dead tours, or suppressing a
+    cooperating broker from an old opt-out. This deterministic guard removes those
+    events when their supporting phrase is absent from the fresh message but
+    present in the quoted region.
+    """
+    if not proposal:
+        return proposal
+    events = proposal.get("events") or []
+    if not events:
+        return proposal
+    fresh, quoted = _split_fresh_and_quoted(_latest_inbound_text(conversation))
+    if not quoted.strip():
+        return proposal
+    fresh_lower = fresh.lower()
+    quoted_lower = quoted.lower()
+    proposal["events"] = [
+        event for event in events
+        if not _event_is_quote_only(event, fresh_lower, quoted_lower)
+    ]
+    return proposal
+
+
 def _augment_events_with_deterministic_signals(
     proposal: dict,
     conversation: List[dict],
@@ -674,11 +1006,67 @@ def _augment_events_with_deterministic_signals(
         return proposal
 
     events = proposal.setdefault("events", [])
-    latest_text_raw = _latest_inbound_text(conversation)
+    # Reason only over the broker's FRESH message; quoted prior-thread history must
+    # not deterministically fire property_unavailable / redirect / tour signals.
+    latest_text_raw = _fresh_inbound_text(conversation)
     latest_text = latest_text_raw.lower()
     if not latest_text:
         return proposal
 
+    # Out-of-office / auto-reply guard (LIVE breaks E1/E3): an OOO auto-reply that
+    # lists a backup or assistant address ("for urgent matters, contact X",
+    # "please contact my assistant X") is NOT an intentional human handoff. The LLM
+    # intermittently reads that backup address as a wrong_contact redirect and
+    # escalates the WRONG person. Strip any wrong_contact and do not force a redirect
+    # so the auto-reply is treated as ignore/continue, model-independently.
+    if _looks_like_out_of_office(latest_text_raw):
+        proposal["events"] = [
+            e for e in events if (e or {}).get("type") != "wrong_contact"
+        ]
+        return proposal
+
+    # Engaged-alternative guard (LIVE break B9): a scoped "not interested in that
+    # suite, but show me what else you have" is an active lead, not an opt-out.
+    # Strip any contact_optout the LLM over-fired so the thread is not silently
+    # stopped. Genuine opt-outs (unsubscribe / stop emailing / remove me) are
+    # excluded by _looks_like_engaged_alternative_request and survive untouched.
+    if _looks_like_engaged_alternative_request(latest_text_raw):
+        kept = [e for e in events if (e or {}).get("type") != "contact_optout"]
+        if len(kept) != len(events):
+            proposal["events"] = kept
+            events = proposal["events"]
+
+    # Colleague/third-party redirect → force wrong_contact + escalate (no auto-reply).
+    # Runs BEFORE the property_unavailable early-return so it survives a multi-intent
+    # reply ("just leased, but try 4400 Referral Way, and loop in my colleague Dana").
+    redirect = _detect_colleague_redirect(latest_text_raw, _latest_inbound_sender(conversation))
+    if redirect and not any((e or {}).get("type") == "wrong_contact" for e in events):
+        events.append({
+            "type": "wrong_contact",
+            "reason": "colleague_redirect",
+            "suggestedContact": redirect.get("suggestedContact", ""),
+            "suggestedEmail": redirect.get("suggestedEmail", ""),
+        })
+    # A wrong_contact redirect must escalate to the operator, never auto-commit to
+    # looping in an unapproved third party.
+    if any((e or {}).get("type") == "wrong_contact" for e in events):
+        proposal["response_email"] = None
+
+    # Call request → escalate to operator, never auto-send (LIVE break: call_lets_hop).
+    # A broker asking to "hop on a call" must reach a human whether or not a phone
+    # number is included; the prompt intermittently drafts an auto-reply asking for a
+    # number/time instead of escalating. Deterministically fire call_requested from the
+    # fresh text (so it holds even when the model mislabels) and suppress any drafted
+    # response_email so a live call ask always notifies the operator, model-independently.
+    if _looks_like_call_request(latest_text):
+        if not any((e or {}).get("type") == "call_requested" for e in events):
+            events.append({"type": "call_requested", "reason": "call_request_phrase"})
+    if any((e or {}).get("type") == "call_requested" for e in events):
+        proposal["response_email"] = None
+
+    # HEAD retention/terminal layer reasons over the FULL latest inbound plus its
+    # quoted region. Target-grounded terminal detection (_detect_target_terminal_reason,
+    # below) supersedes the flat unavailable-pattern list #19 used here.
     raw_latest = _raw_latest_inbound(conversation)
     quoted_region = _quoted_region(raw_latest)
 
@@ -866,6 +1254,86 @@ _AREA_SF_RE = re.compile(
     r"(?:sf|sq\.?\s*ft|square\s*f(?:ee|oo)t)\b",
     re.IGNORECASE,
 )
+# $/SF unit vocabulary, incl. the "psf" abbreviation brokers use inline.
+_RENT_CONTEXT_RE = re.compile(
+    r"(?:asking|base\s+rent|rent|rate)[^\d$]{0,24}\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
+    r"(?:(?:/|\s+per\s+)?\s*(?:sf|sq\.?\s*ft|square\s*foot)|/?\s*psf)(?:\s*/?\s*(?:yr|year|annum))?",
+    re.IGNORECASE,
+)
+_DOLLAR_PER_SF_RE = re.compile(
+    r"\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
+    r"(?:(?:/|\s+per\s+)\s*(?:sf|sq\.?\s*ft|square\s*foot)|/?\s*psf)"
+    r"(?:\s*/?\s*(?:yr|year|annum))?",
+    re.IGNORECASE,
+)
+# Combined "base + opex" line: "$24 + $8/sf opex", "$1.25 NNN + $0.34 OPEX".
+# Group 1 is the base rent; group 2 is OpEx/NNN and must never be read as rent.
+_COMBINED_RENT_OPEX_RE = re.compile(
+    r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*(?:/?\s*(?:psf|sf|sq\.?\s*ft))?\s*(?:nnn|net|gross)?"
+    r"\s*\+\s*"
+    r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*(?:/?\s*(?:psf|sf|sq\.?\s*ft))?\s*(?:in\s+)?"
+    r"(?:opex|op\s*ex|nnn|cam|net|operating\s+expense)",
+    re.IGNORECASE,
+)
+# Range: "rates are between $20.00 - $22.00" → low end is a defensible asking rent.
+_RENT_RANGE_RE = re.compile(
+    r"(?:asking|base\s+rent|rents?|rates?|quoted\s+rates?)[^\d$]{0,30}"
+    r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*(?:/?\s*(?:psf|sf))?\s*"
+    r"(?:-|to|–|—)\s*\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)",
+    re.IGNORECASE,
+)
+# Standalone OpEx/NNN/CAM figure in either order.
+_OPS_EX_RE = re.compile(
+    r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*(?:/?\s*(?:psf|sf|sq\.?\s*ft))?\s*(?:in\s+)?"
+    # tmi = Canadian Taxes/Maintenance/Insurance, the CA equivalent of NNN/CAM OpEx.
+    r"(?:opex|op\s*ex|nnn|cam|tmi|operating\s+expense)"
+    # keyword-first: allow a short linking clause ("is", "charges are", "of",
+    # "runs", "estimated at") between the keyword and the figure so
+    # "OpEx is $16/SF" and "NNN charges are $7.25/SF/yr" parse. The gap forbids
+    # digits/$/newlines so an unrelated later rent figure can't be captured.
+    r"|(?:opex|op\s*ex|nnn|cam|tmi|operating\s+expense)"
+    r"(?:[^\d$\n]{0,18}?\b(?:is|are|of|at|runs?|estimated|approx(?:imately)?|about|around)\b)?"
+    r"\s*[:\-=~]?\s*"
+    r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)",
+    re.IGNORECASE,
+)
+# Total SF as an area (thousands-grouped or 4+ digits), not a $/SF rate figure.
+_TOTAL_SF_RE = re.compile(
+    r"(?<![\w$/.])((?:\d{1,3}(?:,\d{3})+)|\d{4,})\s*(?:sf|sq\.?\s*ft|square\s*f(?:ee|oo)t)\b",
+    re.IGNORECASE,
+)
+_MONTHLY_UNIT_RE = re.compile(r"(?:/\s*|\bper\s+)(?:mo|mos|month)\b|\bmonthly\b|\bpsf\s*/?\s*mo(?:nth)?\b", re.IGNORECASE)
+_ANNUAL_UNIT_RE = re.compile(r"(?:/\s*|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
+_HYPOTHETICAL_RENT_RE = re.compile(
+    r"would(?:'ve| have)?\s+(?:have\s+)?been|would\s+be\b|could\s+have\s+been|might\s+have\s+been",
+    re.IGNORECASE,
+)
+# Current asking rate that supersedes a stale prior quote on the same line:
+# "we had quoted $22/SF but it is now $26/SF", "current asking is $26/SF".
+# A recency marker immediately (<=25 non-figure chars) preceding a $/SF figure
+# marks the CURRENT asking rent, which must win over an earlier superseded quote.
+_CURRENT_ASKING_RE = re.compile(
+    r"(?:\bnow\b|\bcurrently\b|\bcurrent\s+asking\b|\bincreased\s+to\b|\braised\s+to\b"
+    r"|\brevised\s+to\b|\bupdated\s+to\b|\bbumped\s+(?:up\s+)?to\b|\bmoved\s+(?:up\s+)?to\b)"
+    r"[^\d$]{0,25}\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
+    r"(?:(?:/|\s+per\s+)?\s*(?:sf|sq\.?\s*ft|square\s*foot)|/?\s*psf)(?:\s*/?\s*(?:yr|year|annum))?",
+    re.IGNORECASE,
+)
+# TI / tenant-improvement allowances and other landlord concessions are NOT the
+# asking rent — a "$30/SF in TI allowance" figure is money the landlord GIVES the
+# tenant, and must never be mined as base rent. The concession word can sit on
+# either side of the figure ("$30/SF TI allowance" or "TI allowance of $30/SF").
+# A "credit" is a give-back ONLY when qualified by an improvement word ("TI
+# credit", "improvement credit", "construction credit"). A BARE "credit" in these
+# emails means tenant CREDITWORTHINESS ("strength of credit", "depending on term,
+# credit and additional TI needs") and must NOT suppress a real asking rate — so
+# "credit" is matched only in the qualified alternation, never on its own.
+_CONCESSION_MARKER_RE = re.compile(
+    r"\b(?:allowance|concession|abatement|free\s+rent|tenant\s+improvement)\b"
+    r"|\b(?:t\.?i\.?|tenant\s+improvement|improvement|rent|moving|relocation"
+    r"|construction|build[\s-]?out)\s+credit\b",
+    re.IGNORECASE,
+)
 
 
 def _extract_total_annual_rent_over_sf(text: str) -> Optional[str]:
@@ -896,23 +1364,74 @@ def _extract_total_annual_rent_over_sf(text: str) -> Optional[str]:
     return f"{per_sf:.2f}"
 
 
+def _is_monthly_context(window: str) -> bool:
+    return bool(_MONTHLY_UNIT_RE.search(window)) and not bool(_ANNUAL_UNIT_RE.search(window))
+
+
 def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     """Best-effort deterministic fallback for common asking-rent phrases.
 
-    Captures a broker-stated asking rate expressed either with an explicit /SF
-    token or with a bare rate basis suffix ('$9.75 gross', '$0.82 NNN'). Never
-    treats a non-rent $/SF figure (TI allowance, taxes, parking, opex, buildout)
-    as the asking rent.
+    Returns annualized $/SF/yr as a 2-decimal string, or None. Captures a
+    broker-stated asking rate expressed with an explicit /SF token, a bare rate
+    basis suffix ('$9.75 gross', '$0.82 NNN'), a combined base+opex line, a range,
+    a stated total-annual-over-area, or a recency-marked "now" figure. Refuses to
+    guess a rent when the broker has ruled the property non-viable on physical
+    requirements or is only floating a past-tense hypothetical, and never treats a
+    non-rent $/SF figure (TI allowance, taxes, parking, opex, NNN, buildout) as the
+    asking rent.
     """
     if not text:
         return None
 
+    # Broker just called the property a non-fit — do not mine a rent from it (#19).
+    if _looks_like_requirements_mismatch_nonviable(text):
+        return None
+
     # A stated total annual rent + area ('$105,000/yr gross on 12,000 SF') is a
-    # rate expressed indirectly — resolve it before the per-SF patterns.
+    # rate expressed indirectly — resolve it before the per-SF patterns (HEAD).
     total_over_area = _extract_total_annual_rent_over_sf(text)
     if total_over_area:
         return total_over_area
 
+    # 1) Combined "base + opex" line — the base rent is the FIRST figure (#19).
+    combined = _COMBINED_RENT_OPEX_RE.search(text)
+    if combined:
+        # Past-tense hypothetical ("rent would have been $24 + $8 opex, but it's
+        # leased now") is not a current asking figure.
+        if not _HYPOTHETICAL_RENT_RE.search(text[max(0, combined.start() - 40): combined.end()]):
+            base = float(combined.group(1))
+            window = text[max(0, combined.start() - 20): min(len(text), combined.end() + 30)]
+            annual = base * 12 if _is_monthly_context(window) else base
+            if annual >= 1:
+                return f"{annual:.2f}"
+
+    # 2) Range — take the low end as a conservative asking rent (#19).
+    rng = _RENT_RANGE_RE.search(text)
+    if rng:
+        if not _HYPOTHETICAL_RENT_RE.search(text[max(0, rng.start() - 40): rng.end()]):
+            low = float(rng.group(1))
+            window = text[max(0, rng.start() - 20): min(len(text), rng.end() + 40)]
+            annual = low * 12 if _is_monthly_context(window) else low
+            if annual >= 1:
+                return f"{annual:.2f}"
+
+    # 3) Recency / "now" preference — a current asking rate ("...it is now $26/SF")
+    # supersedes a stale prior quote on the same line (#19).
+    current = None
+    for cm in _CURRENT_ASKING_RE.finditer(text):
+        value = float(cm.group(1))
+        window = text[max(0, cm.start() - 20): min(len(text), cm.end() + 30)]
+        annual_value = value * 12 if _is_monthly_context(window) else value
+        if annual_value < 1:
+            continue
+        concession_window = text[max(0, cm.start() - 30): min(len(text), cm.end() + 40)]
+        if _CONCESSION_MARKER_RE.search(concession_window):
+            continue
+        current = f"{annual_value:.2f}"
+    if current is not None:
+        return current
+
+    # 4) Generic asking-rent patterns (HEAD pattern set).
     # Rent stated with a leading rent keyword, e.g. "asking $9.75/SF/yr".
     rent_context = re.compile(
         r"(?:asking|base\s+rent|rent|rate)[^\d$]{0,24}\$?\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*"
@@ -977,8 +1496,76 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
             annual_value = value * 12 if is_monthly else value
             if annual_value < 1:
                 continue
+            # #19 concession / opex / hypothetical screens for the keyword-less
+            # generic patterns (the basis patterns already carry an explicit lease
+            # basis and are screened by _figure_is_non_rent above).
+            if pattern not in basis_patterns:
+                before = text[max(0, match.start() - 30): match.start()].lower()
+                if any(marker in before for marker in ("nnn", "cam", "ops", "opex", "operating expense")):
+                    continue
+                # A TI allowance / concession figure is not the asking rent. The
+                # concession word may follow ("$30/SF in TI allowance") or precede it
+                # ("TI allowance of $30/SF"). Match-local: truncate each side at the
+                # nearest OTHER $ figure so a concession bound to a different figure
+                # can't suppress this one ("Asking $20/SF with a $25/SF TI
+                # allowance." → 20.00).
+                after_ctx = text[match.end(): match.end() + 40].split("$", 1)[0]
+                before_ctx = text[max(0, match.start() - 22): match.start()].rsplit("$", 1)[-1]
+                if _CONCESSION_MARKER_RE.search(after_ctx) or _CONCESSION_MARKER_RE.search(before_ctx):
+                    continue
+            # Past-tense hypothetical rent ("rent would've been $16/SF") is not a
+            # current asking figure. The conditional phrase often sits INSIDE the
+            # match span, so the window must reach match.end().
+            if _HYPOTHETICAL_RENT_RE.search(text[max(0, match.start() - 40): match.end()]):
+                continue
             return f"{annual_value:.2f}"
 
+    return None
+
+
+def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
+    """Deterministic OpEx / NNN / CAM per-SF-per-year fallback (annualized)."""
+    if not text:
+        return None
+    if _looks_like_requirements_mismatch_nonviable(text):
+        return None
+
+    # Past-tense hypothetical ("opex would have been $8/sf, but it's leased now")
+    # is not a current figure — mirror the rent extractor's match-local guard on
+    # every return path so a fabricated OpEx is never written to the sheet.
+    combined = _COMBINED_RENT_OPEX_RE.search(text)
+    if combined:
+        if not _HYPOTHETICAL_RENT_RE.search(text[max(0, combined.start() - 40): combined.end()]):
+            opex = float(combined.group(2))
+            window = text[max(0, combined.start() - 10): min(len(text), combined.end() + 30)]
+            annual = opex * 12 if _is_monthly_context(window) else opex
+            if annual >= 0.01:
+                return f"{annual:.2f}"
+
+    m = _OPS_EX_RE.search(text)
+    if m and not _HYPOTHETICAL_RENT_RE.search(text[max(0, m.start() - 40): m.end()]):
+        raw = m.group(1) or m.group(2)
+        if raw is not None:
+            val = float(raw)
+            window = text[max(0, m.start() - 15): min(len(text), m.end() + 25)]
+            annual = val * 12 if _is_monthly_context(window) else val
+            if annual >= 0.01:
+                return f"{annual:.2f}"
+    return None
+
+
+def _extract_total_sf_from_text(text: str) -> Optional[str]:
+    """Deterministic Total SF fallback; tolerates '+/- 9,000 SF' style approximations."""
+    if not text:
+        return None
+    for m in _TOTAL_SF_RE.finditer(text):
+        raw = m.group(1).replace(",", "")
+        try:
+            val = int(raw)
+        except ValueError:
+            continue
+        if val >= 1000:
+            return str(val)
     return None
 
 
@@ -989,48 +1576,98 @@ def _augment_proposal_with_deterministic_extractions(
     effective_config: dict,
     conversation: List[dict],
     pdf_manifest: List[dict] = None,
+    extra_texts: Optional[List[str]] = None,
 ) -> dict:
     """Add high-confidence values from simple broker text patterns the LLM missed."""
     if not proposal:
         return proposal
 
+    # LIVE break (900 Alt Suggest St): when the reply kills the current row
+    # (property_unavailable) and/or pitches an ALTERNATE property (new_property),
+    # the specs in the fresh message describe the alternate — mining them into
+    # the CURRENT row is a cross-property write ("1100 Fresh Listing Ave is
+    # 30,000 SF at $10.50" landed on the dying 900 row). The fallback is
+    # best-effort only, so skip it entirely for these proposals; the alternate's
+    # specs travel via the new-property approval flow instead.
+    event_types = {
+        (e or {}).get("type") for e in (proposal.get("events") or [])
+    }
+    if event_types & {"new_property", "property_unavailable"}:
+        return proposal
+
     mappings = (effective_config or {}).get("mappings", {})
-    rent_col = mappings.get("rent_sf_yr") or _find_header_name(header, "Rent/SF /Yr")
-    if not rent_col or not _find_header_name(header, rent_col):
-        return proposal
+    # Only mine the broker's FRESH message; quoted history must not seed values.
+    fresh_text = _fresh_inbound_text(conversation)
+    # Flyer/linked-PDF text is legitimate evidence for fields the message body
+    # omits ("all the specs are in the attached flyer"). Used for the loading
+    # counts below; the rent/SF extractors stay message-scoped because a flyer
+    # can carry stale pricing superseded by the email body.
+    evidence_texts = [fresh_text] + [t for t in (extra_texts or []) if t]
 
-    if (_row_value_for_column(rowvals, header, rent_col) or "").strip():
-        return proposal
+    def _fill(col_name: Optional[str], value: Optional[str], reason: str) -> None:
+        if not value or not col_name or not _find_header_name(header, col_name):
+            return
+        if (_row_value_for_column(rowvals, header, col_name) or "").strip():
+            return
+        update = {"column": col_name, "value": value, "confidence": 0.92, "reason": reason}
+        existing = _proposal_update_for_column(proposal, col_name)
+        if existing:
+            if str(existing.get("value") or "").strip() != value:
+                existing.clear()
+                existing.update(update)
+            return
+        proposal.setdefault("updates", []).append(update)
 
-    rent_value = _extract_rent_sf_yr_from_text(_latest_inbound_text(conversation))
+    rent_value = _extract_rent_sf_yr_from_text(fresh_text)
     if not rent_value:
-        # FIX-16 (M35): the accept-new-property path passes rent only inside the
-        # PDF manifest text (the inbound body is a synthetic stub), so scan those.
-        for pdf in (pdf_manifest or []):
-            rent_value = _extract_rent_sf_yr_from_text(pdf.get("text") or "")
+        # FIX-16 (M35, HEAD): the accept-new-property path passes rent only inside
+        # the PDF manifest text (the inbound body is a synthetic stub), so scan the
+        # manifest as a LAST resort when the fresh message carries no rent. This does
+        # not prefer stale flyer pricing over an email rate — it only fills the gap.
+        for _pdf in (pdf_manifest or []):
+            rent_value = _extract_rent_sf_yr_from_text((_pdf or {}).get("text") or "")
             if rent_value:
                 break
-    if not rent_value:
-        return proposal
-
-    deterministic_update = {
-        "column": rent_col,
-        "value": rent_value,
-        "confidence": 0.92,
-        "reason": "Deterministic fallback parsed asking rent per SF per year from the latest broker message.",
-    }
-    # FIX-15: the TI-credit / rent-context guards above ensure the parsed value is
-    # the asking rent, so correcting a monthly-misread LLM figure is safe; but the
-    # deterministic parse is only trusted to REPLACE a differing LLM value, never to
-    # invent one when the model already agreed.
-    existing_update = _proposal_update_for_column(proposal, rent_col)
-    if existing_update:
-        if str(existing_update.get("value") or "").strip() != rent_value:
-            existing_update.clear()
-            existing_update.update(deterministic_update)
-        return proposal
-
-    proposal.setdefault("updates", []).append(deterministic_update)
+    _fill(
+        mappings.get("rent_sf_yr") or _find_header_name(header, "Rent/SF /Yr"),
+        rent_value,
+        "Deterministic fallback parsed asking rent per SF per year from the latest broker message.",
+    )
+    _fill(
+        mappings.get("ops_ex_sf") or _find_header_name(header, "Ops Ex /SF"),
+        _extract_ops_ex_sf_from_text(fresh_text),
+        "Deterministic fallback parsed operating expenses per SF per year from the latest broker message.",
+    )
+    _fill(
+        mappings.get("total_sf") or _find_header_name(header, "Total SF"),
+        _extract_total_sf_from_text(fresh_text),
+        "Deterministic fallback parsed total square footage from the latest broker message.",
+    )
+    # Loading counts: mined from the fresh message OR flyer/linked-PDF text
+    # (LIVE break 600 Flyer Facts Blvd: "1 drive-in ramp" lived only in the
+    # flyer PDF and was never written). Explicit numeric counts only — the
+    # fabricated-door-count guard philosophy holds: no number, no write.
+    drive_ins_col = (
+        mappings.get("drive_ins")
+        or _find_header_name(header, "Drive Ins")
+        or _find_header_name(header, "Drive-Ins")
+    )
+    docks_col = (
+        mappings.get("docks")
+        or _find_header_name(header, "Docks")
+        or _find_header_name(header, "Loading Docks")
+    )
+    for text in evidence_texts:
+        _fill(
+            drive_ins_col,
+            _extract_drive_in_count_from_text(text),
+            "Deterministic fallback parsed drive-in count from the broker's message or flyer.",
+        )
+        _fill(
+            docks_col,
+            _extract_dock_count_from_text(text),
+            "Deterministic fallback parsed loading-dock count from the broker's message or flyer.",
+        )
     return proposal
 
 
@@ -1047,6 +1684,62 @@ _NO_SEPARATE_OPEX_RE = re.compile(
     r"\bno\s+(?:separate\s+)?(?:opex|op\s*ex|operating\s+expenses?|cam)\b"
     r"|\bno\s+(?:separate\s+)?(?:opex\s+|cam\s+)?pass[\s-]?through\b"
     r"|\ball[\s-]?in\b[^.]{0,40}?\bno\s+separate\b",
+    re.IGNORECASE,
+)
+
+# ---- Fabricated door-count guard --------------------------------------------
+_DRIVE_IN_KW = r"(?:drive[-\s]?in|grade[-\s]?level|drive\s+in\s+door)"
+_DOCK_KW = r"(?:dock|loading\s+dock)"
+
+
+# Spelled-out counts (broker text often says "two docks", not "2 docks").
+_WORD_NUMBER_RE = (
+    r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+    r"thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+)
+# Digits OR spelled-out numbers; \b anchors so "twenty" matches but "twentyish" and
+# substrings inside larger words never do.
+_FEATURE_COUNT_RE = r"\b(?:\d{1,3}|" + _WORD_NUMBER_RE + r")\b"
+
+
+def _has_explicit_feature_count(text: str, keyword_re: str) -> bool:
+    """True only when a numeric count sits next to a loading-feature keyword.
+
+    Counts may be digits ("2 docks") or spelled out ("two docks") — the broker
+    uses both. Excludes electrical specs ("3-phase power", "three-phase power")
+    so a qualitative phrase like "grade-level loading" never fabricates a count.
+    """
+    if not text:
+        return False
+    for m in re.finditer(keyword_re, text, re.IGNORECASE):
+        lo, hi = m.start() - 16, m.end() + 16
+        for nm in re.finditer(_FEATURE_COUNT_RE, text, re.IGNORECASE):
+            if nm.end() < lo or nm.start() > hi:
+                continue
+            after = text[nm.end(): nm.end() + 8].lower()
+            if re.match(r"\s*-?\s*(?:phase|amp|volt|kv|v\b|a\b|ph\b|%|percent)", after):
+                continue
+            return True
+    return False
+
+
+_WORD_TO_NUMBER = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+# "<count> drive-in(s)/grade-level (ramp|door)s" — count immediately precedes the
+# keyword so unrelated numbers ("suite 3, drive-in access") never bind.
+_DRIVE_IN_COUNT_RE = re.compile(
+    r"\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
+    r"(?:drive[-\s]?ins?|grade[-\s]?level)\b"
+    r"(?:\s*(?:ramps?|doors?))?",
+    re.IGNORECASE,
+)
+# "<count> (dock-high|loading) dock(s)/door(s)" variants.
+_DOCK_COUNT_RE = re.compile(
+    r"\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
+    r"(?:dock[-\s]?high\s+doors?|loading\s+docks?|docks?\b(?:\s*doors?)?|dock\s+doors?)",
     re.IGNORECASE,
 )
 
@@ -1115,6 +1808,207 @@ def _augment_proposal_opex_basis(
             )
 
     return proposal
+
+
+def _parse_feature_count(raw: str) -> Optional[str]:
+    raw = (raw or "").strip().lower()
+    if raw.isdigit():
+        value = int(raw)
+    else:
+        value = _WORD_TO_NUMBER.get(raw, 0)
+    return str(value) if 1 <= value <= 200 else None
+
+
+def _extract_drive_in_count_from_text(text: str) -> Optional[str]:
+    """Explicit drive-in / grade-level door count, or None (never guesses)."""
+    if not text:
+        return None
+    m = _DRIVE_IN_COUNT_RE.search(text)
+    return _parse_feature_count(m.group(1)) if m else None
+
+
+def _extract_dock_count_from_text(text: str) -> Optional[str]:
+    """Explicit loading-dock / dock-high door count, or None (never guesses)."""
+    if not text:
+        return None
+    m = _DOCK_COUNT_RE.search(text)
+    return _parse_feature_count(m.group(1)) if m else None
+
+
+def _suppress_updates_on_contact_optout(proposal: dict) -> dict:
+    """A genuine contact opt-out is a PURE escalation — never touch the row.
+
+    LIVE break adv_optout_with_specs: a broker replies "Not interested, remove me.
+    FYI it was going for $18/SF NNN, 12,000 SF." The classifier correctly fires
+    contact_optout and nulls response_email (escalate to the operator), but the
+    rent / OpEx / SF specs mentioned in the same breath were still proposed as
+    sheet writes — silently editing a row the contact just asked us to stop
+    touching. When a contact_optout survives to this point (the engaged-alternative
+    guard has already stripped scoped "show me something else" over-fires upstream,
+    so any remaining opt-out is genuine), drop every proposed update and null any
+    drafted auto-reply so the opt-out escalates cleanly, model-independently.
+    """
+    if not proposal:
+        return proposal
+    events = proposal.get("events") or []
+    if any((e or {}).get("type") == "contact_optout" for e in events):
+        proposal["updates"] = []
+        proposal["response_email"] = None
+    return proposal
+
+
+def _suppress_fabricated_door_counts(
+    proposal: dict,
+    conversation: List[dict],
+    header: List[str],
+    effective_config: dict,
+    extra_texts: Optional[List[str]] = None,
+) -> dict:
+    """Drop invented Drive Ins / Docks counts when the broker stated no number.
+
+    Evidence includes flyer/linked-PDF text (extra_texts), not just the message
+    body — LIVE break 600 Flyer Facts Blvd: "1 drive-in ramp" lived only in the
+    flyer PDF, and validating against the email text alone stripped a REAL
+    count as fabricated.
+    """
+    if not proposal:
+        return proposal
+    updates = proposal.get("updates") or []
+    if not updates:
+        return proposal
+    mappings = (effective_config or {}).get("mappings", {})
+    fresh = "\n".join(
+        [_fresh_inbound_text(conversation)] + [t for t in (extra_texts or []) if t]
+    )
+    checks = [
+        (
+            mappings.get("drive_ins")
+            or _find_header_name(header, "Drive Ins")
+            or _find_header_name(header, "Drive-Ins"),
+            _DRIVE_IN_KW,
+        ),
+        (
+            mappings.get("docks")
+            or _find_header_name(header, "Docks")
+            or _find_header_name(header, "Loading Docks"),
+            _DOCK_KW,
+        ),
+    ]
+    drop_cols = set()
+    for col, kw in checks:
+        if not col:
+            continue
+        upd = _proposal_update_for_column(proposal, col)
+        if not upd:
+            continue
+        val = str(upd.get("value") or "").strip()
+        if not re.fullmatch(r"\d{1,3}", val):
+            continue  # only guard bare numeric counts
+        if not _has_explicit_feature_count(fresh, kw):
+            drop_cols.add((col or "").strip().lower())
+    if drop_cols:
+        proposal["updates"] = [
+            u for u in updates
+            if (u.get("column") or "").strip().lower() not in drop_cols
+        ]
+    return proposal
+
+
+# ---- Broken/expired flyer-link surfacing ------------------------------------
+_BROKEN_LINK_RE = re.compile(
+    r"\b(?:expired|no\s+longer\s+available|not\s+found|404|has\s+been\s+deleted"
+    r"|link\s+(?:is\s+)?broken|transfer\s+has\s+expired|page\s+not\s+found|access\s+denied)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_broken_link_text(text: str) -> bool:
+    return bool(text) and bool(_BROKEN_LINK_RE.search(text))
+
+
+def _find_flyer_column(header: List[str], mappings: dict) -> Optional[str]:
+    col = (mappings or {}).get("flyer_link")
+    if col and _find_header_name(header, col):
+        return _find_header_name(header, col)
+    for name in ("Flyer / Link", "Flyer/Link", "Flyer", "Link"):
+        found = _find_header_name(header, name)
+        if found:
+            return found
+    return None
+
+
+def _augment_proposal_with_flyer_link(
+    proposal: dict,
+    url_texts: List[dict],
+    rowvals: List[str],
+    header: List[str],
+    effective_config: dict,
+) -> dict:
+    """Surface a broker flyer/transfer link whose fetched content is broken/expired.
+
+    A dead we.tl / WeTransfer / drive link would otherwise vanish silently — the
+    user never learns a flyer was sent. Prefer a Flyer/Link column; else note it.
+    """
+    if not proposal:
+        return proposal
+    broken_urls = []
+    for u in (url_texts or []):
+        url = (u or {}).get("url")
+        if url and _looks_like_broken_link_text((u or {}).get("text") or ""):
+            broken_urls.append(url)
+    if not broken_urls:
+        return proposal
+
+    existing_blob = json.dumps(proposal.get("updates", []) or []) + " " + str(proposal.get("notes") or "")
+    new_urls = [u for u in dict.fromkeys(broken_urls) if u not in existing_blob]
+    if not new_urls:
+        return proposal
+
+    mappings = (effective_config or {}).get("mappings", {})
+    flyer_col = _find_flyer_column(header, mappings)
+    for url in new_urls:
+        if (flyer_col
+                and not (_row_value_for_column(rowvals, header, flyer_col) or "").strip()
+                and not _proposal_update_for_column(proposal, flyer_col)):
+            proposal.setdefault("updates", []).append({
+                "column": flyer_col,
+                "value": url,
+                "confidence": 0.9,
+                "reason": "Deterministic fallback surfaced broker flyer/transfer link (fetched content indicates it may be expired).",
+            })
+        else:
+            frag = f"flyer link (may be expired): {url}"
+            existing_notes = str(proposal.get("notes") or "").strip()
+            proposal["notes"] = f"{existing_notes} • {frag}".strip(" •") if existing_notes else frag
+    return proposal
+
+
+# ---- Prompt content clipping (retain deep field data) -----------------------
+_URL_TEXT_CHAR_LIMIT = 8000
+_PDF_TEXT_CHAR_LIMIT = 16000
+_FIELD_HINT_RE = re.compile(
+    r"(?:\$|\bsf\b|square\s*f|\bdock|drive[-\s]?in|clear|ceiling|amp|volt|nnn|opex|"
+    r"total\s+sf|\bpsf\b|\b\d{3,}\b)",
+    re.IGNORECASE,
+)
+
+
+def _clip_for_prompt(text: str, limit: int) -> str:
+    """Truncate long fetched content but always retain field-bearing lines from
+    beyond the cutoff so a number (Total SF, rent, docks…) is never silently lost.
+    """
+    if not text:
+        return text or ""
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    tail = text[limit:]
+    kept = [ln for ln in tail.splitlines() if _FIELD_HINT_RE.search(ln)]
+    result = head + "\n... [text truncated] ..."
+    extra = "\n".join(kept)[:4000]
+    if extra:
+        result += "\n[additional detail lines retained beyond truncation]\n" + extra
+    return result
 
 
 def _filter_config_by_extraction_fields(column_config: dict, extraction_fields: List[str]) -> dict:
@@ -1218,13 +2112,42 @@ _PLACEHOLDER_CELL_VALUES = {
 }
 
 
+def _normalize_required_col_key(name: str) -> str:
+    """Collapse a column/field name to alnum-only lowercase so spacing/punctuation
+    differences don't matter ('Ops Ex / SF' == 'Ops Ex /SF' == 'opsexsf')."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+# LIVE break (golden campaign): the default REQUIRED_FIELDS_FOR_CLOSE names
+# ('Ops Ex /SF', 'Docks') never matched Jill's real sheet headers
+# ('Ops Ex / SF', 'Loading Docks'), so check_missing_required_fields reported
+# ALREADY-FILLED columns as missing — close_conversation was ignored forever and
+# the row could never reach 'completed' (it looped re-requesting filled fields).
+# Map each required field to the set of header spellings that satisfy it.
+_REQUIRED_FIELD_HEADER_ALIASES = {
+    "docks": {"docks", "loadingdocks", "dockdoors", "dockhighdoors", "loadingdockdoors"},
+    "driveins": {"driveins", "driveindoors", "gradelevel", "gradeleveldoors", "driveindoors"},
+    "opsexsf": {"opsexsf", "opexsf", "opex", "opsex", "nnnsf", "camsf"},
+    "flyerlink": {"flyerlink", "flyer", "link", "flyerbrochure", "brochurelink"},
+    "ceilinght": {"ceilinght", "ceilingheight", "clearheight", "clearht"},
+}
+
+
 def check_missing_required_fields(rowvals: List[str], header: List[str], column_config: dict = None) -> List[str]:
     """
     Check which required fields are missing from the row.
     Uses dynamic column config if provided, otherwise falls back to defaults.
+
+    Header matching is whitespace/punctuation-insensitive and alias-aware so a
+    required field named 'Docks' is satisfied by a 'Loading Docks' column and
+    'Ops Ex /SF' by 'Ops Ex / SF' (see _REQUIRED_FIELD_HEADER_ALIASES).
     """
     try:
-        idx_map = _header_index_map(header)
+        # normalized header key -> (0-based index, raw value getter)
+        norm_headers = {}
+        for i, h in enumerate(header):
+            norm_headers.setdefault(_normalize_required_col_key(h), i)
+
         missing = []
 
         # Get required fields from config or use defaults
@@ -1234,16 +2157,17 @@ def check_missing_required_fields(rowvals: List[str], header: List[str], column_
             required_fields = REQUIRED_FIELDS_FOR_CLOSE
 
         for field in required_fields:
-            key = field.strip().lower()
-            if key in idx_map:
-                i = idx_map[key] - 1  # 0-based
-                cell = (rowvals[i] or "").strip() if i < len(rowvals) else ""
-                # A placeholder ('TBD', 'pending', '?', 'ask landlord', ...) is not a
-                # real spec value — treat it as missing so the row cannot close on it.
-                if i >= len(rowvals) or not cell or cell.lower() in _PLACEHOLDER_CELL_VALUES:
-                    missing.append(field)
-            else:
-                missing.append(field)  # Column doesn't exist
+            fkey = _normalize_required_col_key(field)
+            candidate_keys = {fkey} | _REQUIRED_FIELD_HEADER_ALIASES.get(fkey, set())
+            matched_idx = next((norm_headers[k] for k in candidate_keys if k in norm_headers), None)
+            if matched_idx is None:
+                missing.append(field)  # No column on the sheet satisfies this field
+                continue
+            cell = (rowvals[matched_idx] or "").strip() if matched_idx < len(rowvals) else ""
+            # A placeholder ('TBD', 'pending', '?', 'ask landlord', ...) is not a real
+            # spec value — treat it as missing so the row cannot close on it (HEAD).
+            if matched_idx >= len(rowvals) or not cell or cell.lower() in _PLACEHOLDER_CELL_VALUES:
+                missing.append(field)
 
         return missing
     except Exception as e:
@@ -1421,6 +2345,54 @@ def _append_ai_meta(
     except Exception as e:
         print(f"⚠️ Failed to append AI_META record: {e}")
 
+def _normalize_comment_bullet(bullet: str) -> str:
+    """Normalize a bullet fact for dedup comparison: lowercase, collapse
+    whitespace, drop a trailing stray CR and surrounding punctuation. Two
+    bullets that normalize equal are treated as the same fact."""
+    b = (bullet or "").replace("\r", " ").strip().strip(".;,").lower()
+    return re.sub(r"\s+", " ", b)
+
+
+def _merge_comment_bullets(existing_comments: str, notes: str) -> str:
+    """Append `notes` to `existing_comments` as ' • '-joined bullets WITHOUT
+    re-adding a fact that is already present. Preserves the original order and
+    the first-seen surface form of each bullet; timestamped/dated append lines
+    (e.g. "[06/09/2026] Property marked unavailable ...") are always kept since
+    they are event-specific, not repeatable spec facts.
+
+    Fixes the real MOHR sheet defect where every reply re-appended the same
+    facts, producing "NNN • ... • NNN • ... • NNN" and
+    "100% HVAC • available now • available now" noise; Jill's ideal cell is a
+    clean, de-duplicated fact list.
+    """
+    existing_comments = (existing_comments or "").strip()
+    notes = (notes or "").strip()
+    if not existing_comments:
+        return notes
+    if not notes:
+        return existing_comments
+
+    def _is_dated(bullet: str) -> bool:
+        return bool(re.match(r"\s*\[[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}\]", bullet or ""))
+
+    seen = set()
+    ordered = []
+    for chunk in (existing_comments, notes):
+        for raw in chunk.split(" • "):
+            raw = raw.strip()
+            if not raw:
+                continue
+            key = _normalize_comment_bullet(raw)
+            if _is_dated(raw):
+                ordered.append(raw)  # event lines always kept
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(raw)
+    return " • ".join(ordered)
+
+
 def _append_notes_to_comments(sheets, spreadsheet_id: str, tab_title: str, header: List[str], rownum: int, notes: str):
     """
     Append notes to the comments field.
@@ -1450,12 +2422,10 @@ def _append_notes_to_comments(sheets, spreadsheet_id: str, tab_title: str, heade
         if existing_resp.get("values") and len(existing_resp["values"]) > 0:
             existing_comments = (existing_resp["values"][0][0] or "").strip()
 
-        # Combine existing and new notes
-        if existing_comments:
-            # Append with separator if there's existing content
-            combined = f"{existing_comments} • {notes}"
-        else:
-            combined = notes
+        # Combine existing and new notes, de-duplicating bullet facts so the
+        # cell doesn't accumulate "NNN • ... • NNN • ... • NNN" or
+        # "100% HVAC • available now • available now" on every reply/update.
+        combined = _merge_comment_bullets(existing_comments, notes)
 
         # Update the comments cell
         _execute_with_retry(
@@ -1472,6 +2442,27 @@ def _append_notes_to_comments(sheets, spreadsheet_id: str, tab_title: str, heade
         
     except Exception as e:
         print(f"⚠️ Failed to append notes to comments: {e}")
+
+# Formula columns are computed on the sheet (e.g. Gross Rent = (Rent/SF + Ops Ex) * SF / 12)
+# and must NEVER be overwritten by an AI proposal — a raw value clobbers the live formula
+# cell. The LLM is told this in the prompt, but LIVE testing showed it still proposes
+# {column:'Gross Rent', value:'32.00'} occasionally, so this is a deterministic code guard,
+# not a prompt hope. Aliases come from the canonical field registry so the guard stays in
+# sync with column_config; "monthly gross rent" is the header variant the formula builder
+# (sheet_operations._build_gross_rent_formula_for_row) also matches.
+_FORMULA_COLUMN_ALIASES = frozenset(
+    alias.strip().lower()
+    for field in CANONICAL_FIELDS.values()
+    if field.get("is_formula")
+    for alias in ([field.get("label")] + list(field.get("default_aliases") or []))
+    if alias and alias.strip()
+) | {"monthly gross rent"}
+
+
+def _is_formula_column(col_name: str) -> bool:
+    """True if col_name is a formula column that apply must never write (clobbers the cell)."""
+    return (col_name or "").strip().lower() in _FORMULA_COLUMN_ALIASES
+
 
 def apply_proposal_to_sheet(
     uid: str,
@@ -1524,6 +2515,12 @@ def apply_proposal_to_sheet(
                 skipped.append({"column": col_name, "reason": "unknown header"})
                 continue
 
+            # Skip formula columns (e.g. Gross Rent) - computed on the sheet; writing a raw
+            # value clobbers the live formula cell. Deterministic code guard, not prompt-only.
+            if _is_formula_column(col_name):
+                skipped.append({"column": col_name, "reason": "formula-column"})
+                continue
+
             # Skip Flyer/Floorplan columns - these are handled directly via Drive upload
             # AI sometimes proposes local file:// paths from PDF metadata which we don't want
             if key in ("flyer / link", "floorplan", "flyer/link", "flyer"):
@@ -1536,18 +2533,23 @@ def apply_proposal_to_sheet(
                 continue
 
             # Reject unresolved template placeholders (e.g. "[NAME]", "[BROKER]").
-            # This is the same leak class the outbound-email path already blocks
-            # via outbound_safety.find_unresolved_placeholders - never write a
-            # literal placeholder into a client sheet cell.
+            # Same leak class the outbound-email path blocks via
+            # outbound_safety.find_unresolved_placeholders - never write a literal
+            # placeholder into a client sheet cell (HEAD).
             if find_unresolved_placeholders(new_val):
                 skipped.append({"column": col_name, "reason": "placeholder-value"})
                 continue
 
-            # Reject data placeholders (TBD / N/A / pending / TBC / "To follow" /
-            # "ask landlord"). These are deferrals, not data — writing one verbatim
-            # would overwrite a blank cell with noise that reads as a real spec.
-            if _is_placeholder_data_value(new_val):
-                skipped.append({"column": col_name, "reason": "placeholder-value"})
+            # Reject data placeholders (TBD / TBA / N/A / pending / unknown / none /
+            # "To follow" / "ask landlord" / - ) for ANY cell including empty ones — a
+            # deferral is not a spec value (HEAD _is_placeholder_data_value + #19 live
+            # breaks E1 TBD->Power, E2 N/A->Docks).
+            _new_clean = new_val.strip().strip(".").lower()
+            _placeholder_values = {
+                "tbd", "tba", "n/a", "na", "?", "unknown", "pending", "none", "-", "--",
+            }
+            if _is_placeholder_data_value(new_val) or _new_clean in _placeholder_values:
+                skipped.append({"column": col_name, "reason": "placeholder-value", "value": new_val})
                 continue
 
             col_idx = idx_map[key]                     # 1-based
@@ -1868,6 +2870,11 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • DO NOT emit wrong_contact when suggestedContact/suggestedEmail is the SAME person who sent the message or the row Contact Name (a forward-then-introduce hand-off where the sender IS now the right contact — "Alex here, I'm the right contact now" is NOT a redirect).
   • DO NOT emit wrong_contact for a TEMPORARY ABSENCE: an out-of-office / auto-reply that gives a return date and an assistant "for urgent matters" is not a statement that the sender is the wrong contact — wait for their return, do not swap the sheet contact.
   • Redirect signals living only in quoted/forwarded reply history are NOT the live message — ignore them.
+  • DO NOT emit wrong_contact for an OUT-OF-OFFICE / AUTO-REPLY. An OOO auto-reply
+    (e.g. "I'm out of office until July 10", "OOO: traveling this week") that lists a
+    backup or assistant address ("for urgent matters, contact X", "please contact my
+    assistant X") is NOT a handoff off this property. Do not surface that backup/assistant
+    address as suggestedContact/suggestedEmail. Treat the auto-reply as ignore/continue.
 
 - "property_issue": CRITICAL - Emit when the broker mentions ANY negative condition, problem, or concern about the property.
   • Physical condition issues: "smells bad", "odor", "mold", "water damage", "roof leak", "foundation issues",
@@ -2163,11 +3170,8 @@ CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded his
 
                 prompt_parts.append(f"\n--- PDF: {name} (extraction method: {method}) ---")
                 if text:
-                    # Include extracted text (truncate if too long)
-                    if len(text) > 8000:
-                        prompt_parts.append(text[:8000] + "\n... [text truncated] ...")
-                    else:
-                        prompt_parts.append(text)
+                    # Include extracted text; clip but retain deep field-bearing lines.
+                    prompt_parts.append(_clip_for_prompt(text, _PDF_TEXT_CHAR_LIMIT))
                 else:
                     prompt_parts.append("[No text extracted - see images below if available]")
 
@@ -2176,7 +3180,7 @@ CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded his
             prompt_parts.append("\nURL CONTENT FETCHED:")
             for url_info in url_texts:
                 prompt_parts.append(f"\nURL: {url_info['url']}")
-                prompt_parts.append(f"Content: {url_info['text'][:1000]}...")
+                prompt_parts.append(f"Content: {_clip_for_prompt(url_info.get('text') or '', _URL_TEXT_CHAR_LIMIT)}")
 
         # Output contract
         prompt_parts.append("""
@@ -2300,12 +3304,30 @@ OUTPUT ONLY valid JSON in this exact format:
         proposal.setdefault("updates", [])
         proposal.setdefault("events", [])
         proposal.setdefault("response_email", None)  # LLM-generated response email
+        # Flyer/linked-PDF text is evidence for extraction + the fabricated-count
+        # guard: a count stated only in the flyer is REAL, not invented.
+        _evidence_extra_texts = [
+            (pdf or {}).get("text") or "" for pdf in (pdf_manifest or [])
+        ] + [
+            (u or {}).get("text") or "" for u in (url_texts or [])
+        ]
         proposal = _augment_proposal_with_deterministic_extractions(
-            proposal, rowvals, header, effective_config, conversation, pdf_manifest=pdf_manifest
+            proposal, rowvals, header, effective_config, conversation,
+            pdf_manifest=pdf_manifest, extra_texts=_evidence_extra_texts,
         )
         proposal = _augment_proposal_opex_basis(
             proposal, rowvals, header, effective_config, conversation
         )
+        proposal = _suppress_fabricated_door_counts(
+            proposal, conversation, header, effective_config,
+            extra_texts=_evidence_extra_texts,
+        )
+        proposal = _augment_proposal_with_flyer_link(
+            proposal, url_texts, rowvals, header, effective_config
+        )
+        # Strip events that only fire off quoted prior-thread history BEFORE the
+        # deterministic event augmenter re-evaluates the fresh message.
+        proposal = _suppress_quote_only_events(proposal, conversation)
         proposal = _augment_events_with_deterministic_signals(
             proposal,
             conversation,
@@ -2314,6 +3336,10 @@ OUTPUT ONLY valid JSON in this exact format:
             sender_name=sender_display_name,
             contact_name=contact_name,
         )
+        # A genuine contact opt-out must never write the opted-out row (LIVE break
+        # adv_optout_with_specs). Runs AFTER the event augmenter so the engaged-
+        # alternative guard has already dropped any scoped over-fired opt-out.
+        proposal = _suppress_updates_on_contact_optout(proposal)
         proposal = sanitize_new_property_referral_response(
             proposal,
             original_contact_email=email,
