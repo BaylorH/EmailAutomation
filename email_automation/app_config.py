@@ -12,7 +12,10 @@ TOKEN_CACHE = "msal_token_cache.bin"
 
 # Firebase Config
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY") or ("mock-firebase-key" if E2E_TEST_MODE else None)
-FIREBASE_BUCKET = "email-automation-cache.firebasestorage.app"
+# Storage bucket is env-parameterizable for the Cloud Run Job runtime.
+# Defaults to the historical hardcoded value so behavior is unchanged when
+# FIREBASE_BUCKET is unset (GitHub Actions cron, local runs).
+FIREBASE_BUCKET = os.getenv("FIREBASE_BUCKET", "email-automation-cache.firebasestorage.app")
 FRONTEND_EMAIL_ACCESS_URL = os.getenv(
     "FRONTEND_EMAIL_ACCESS_URL",
     "https://email-automation-cache.web.app/email-access",

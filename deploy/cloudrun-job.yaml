@@ -1,0 +1,115 @@
+# Cloud Run Job definition for the EmailAutomation scheduler worker.
+#
+# SCAFFOLD ONLY — every value in ALL_CAPS_PLACEHOLDER form must be replaced
+# before `gcloud run jobs replace`. No real project IDs, buckets, or secrets
+# are committed here. Secret VALUES live in Secret Manager and are referenced,
+# never inlined.
+#
+# Apply (does NOT run automatically — see deploy/README.md):
+#   gcloud run jobs replace deploy/cloudrun-job.yaml --region REGION
+#
+# Trigger cadence is owned by Cloud Scheduler (see deploy/README.md), matching
+# the old GitHub Actions '*/30 * * * *' cron.
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: email-automation-scheduler
+  labels:
+    app: email-automation
+    component: scheduler
+  annotations:
+    # Roll the image tag / digest here on each deploy.
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    spec:
+      # One task per execution. The Firestore lease is the real single-runner
+      # guard; parallelism 1 keeps it belt-and-suspenders.
+      parallelism: 1
+      taskCount: 1
+      template:
+        spec:
+          # INVARIANT (double-send guard, pinned by
+          # tests/test_ws_b_cloudrun_job_spec.py): timeoutSeconds MUST be <=
+          # the Firestore lease TTL (scheduler_lease.DEFAULT_TTL_SECONDS,
+          # 2700s). A task that outlives its lease holds an EXPIRED lease, so
+          # the next Cloud Scheduler trigger would acquire it and run
+          # concurrently. Legacy GHA avoided this via cancel-in-progress;
+          # Cloud Run has no cancel, so the ceiling stays under the TTL.
+          # 2400s (40m) leaves a 5m buffer under the 45m TTL and is still far
+          # above the pipeline's normal runtime.
+          timeoutSeconds: 2400
+          # Do NOT auto-retry the whole task: a crashed run leaves the lease to
+          # expire (TTL 45m) rather than stacking duplicate runners.
+          maxRetries: 0
+          serviceAccountName: SERVICE_ACCOUNT_PLACEHOLDER@PROJECT_ID_PLACEHOLDER.iam.gserviceaccount.com
+          containers:
+            - name: worker
+              # Push the built image to Artifact Registry and pin by digest.
+              image: REGION-docker.pkg.dev/PROJECT_ID_PLACEHOLDER/AR_REPO_PLACEHOLDER/email-automation:TAG_PLACEHOLDER
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 1Gi
+              env:
+                # --- Storage bucket (now env-parameterized in app_config.py
+                #     and firebase_helpers.py; defaults to the historical value
+                #     when unset, so this line is optional but explicit). ---
+                - name: FIREBASE_BUCKET
+                  value: FIREBASE_BUCKET_PLACEHOLDER.firebasestorage.app
+                # --- Emergency launch-safety scope (mirrors email.yml). Keep
+                #     these until the Baylor/BP21 proof is clean again. ---
+                - name: SITESIFT_DEV_SCOPED_SCHEDULER
+                  value: "1"
+                - name: SITESIFT_SCHEDULER_TARGET_USER_IDS
+                  value: SCHEDULER_TARGET_USER_IDS_PLACEHOLDER
+                - name: SITESIFT_SCHEDULER_ALLOWED_USER_IDS
+                  value: SCHEDULER_ALLOWED_USER_IDS_PLACEHOLDER
+                # --- Non-secret Azure app id (used for the appid prefix check) ---
+                - name: AZURE_API_APP_ID
+                  value: AZURE_API_APP_ID_PLACEHOLDER
+                # --- Secrets: referenced from Secret Manager, never inlined.
+                #     Create each secret, then grant the SA secretAccessor. ---
+                - name: AZURE_API_CLIENT_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: azure-api-client-secret
+                      key: latest
+                - name: FIREBASE_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: firebase-api-key
+                      key: latest
+                - name: OPENAI_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: openai-api-key
+                      key: latest
+                - name: GOOGLE_OAUTH_CLIENT_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: google-oauth-client-id
+                      key: latest
+                - name: GOOGLE_OAUTH_CLIENT_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: google-oauth-client-secret
+                      key: latest
+                - name: GOOGLE_REFRESH_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: google-refresh-token
+                      key: latest
+                # NOTE: GOOGLE_APPLICATION_CREDENTIALS is intentionally absent.
+                # Cloud Run supplies ADC via the job's service account, so
+                # firestore.Client() authenticates with no key file.
+                #
+                # NOTE: three legacy email.yml env vars are intentionally
+                # omitted — unused by main.py's import closure (pinned by
+                # tests/test_ws_b_secret_coverage_contract.py; see
+                # deploy/README.md 'Intentionally omitted legacy env vars'):
+                #   - CLIENT_ID       (only noPopup_signin_emails_to_excel.py,
+                #                      an unused alternate entry point)
+                #   - FIREBASE_SA_KEY (only config.py -> Flask app, not main.py)
+                #   - AZURE_TENANT_ID (only config.py; scheduler AUTHORITY is
+                #                      hardcoded /common in app_config.py)

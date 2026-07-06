@@ -1,6 +1,10 @@
+import os
+
 import requests
 
-FIREBASE_BUCKET = "email-automation-cache.firebasestorage.app"
+# Env-parameterizable for the Cloud Run Job runtime. Defaults to the historical
+# hardcoded bucket so behavior is unchanged when FIREBASE_BUCKET is unset.
+FIREBASE_BUCKET = os.getenv("FIREBASE_BUCKET", "email-automation-cache.firebasestorage.app")
 
 def download_token(api_key: str, output_file="msal_token_cache.bin", user_id="default_user"):
     object_path = f"msal_caches/{user_id}/msal_token_cache.bin"

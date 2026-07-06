@@ -1,6 +1,8 @@
 import atexit
 import json
 import os
+import signal
+import sys
 from datetime import datetime
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token
@@ -318,5 +320,66 @@ def run_all_users():
             )
 
 
+EXPECTED_AZURE_APP_ID_PREFIX = "54cec"
+
+
+def _validate_startup_env():
+    """Hard pre-run gate, parity with the legacy GHA 'Validate CLIENT_ID
+    prefix' step (.github/workflows/email.yml): refuse to start when
+    AZURE_API_APP_ID is missing or does not carry the expected app prefix
+    (wrong tenant / wrong app registration). Runs BEFORE lease acquisition so
+    a misconfigured runtime can never touch Firestore or any user.
+
+    The in-run appid check at get_graph_headers is a soft warning only; this
+    is the fail-closed version. Skipped under E2E_TEST_MODE (mock env), same
+    as app_config's import-time missing-env validation.
+    """
+    if os.getenv("E2E_TEST_MODE") == "true":
+        print("ℹ️ E2E_TEST_MODE: skipping AZURE_API_APP_ID startup gate")
+        return
+
+    app_id = os.getenv("AZURE_API_APP_ID", "")
+    if not app_id.startswith(EXPECTED_AZURE_APP_ID_PREFIX):
+        problem = "missing" if not app_id else f"unexpected ('{app_id[:8]}…')"
+        raise SystemExit(
+            f"🚫 Startup gate: AZURE_API_APP_ID is {problem}; expected prefix "
+            f"'{EXPECTED_AZURE_APP_ID_PREFIX}'. Refusing to run before lease "
+            f"acquisition."
+        )
+    print("✅ Startup gate: AZURE_API_APP_ID prefix OK")
+
+
+def _install_sigterm_atexit_bridge() -> None:
+    """Make atexit handlers (e.g. the token-cache upload registered in
+    refresh_and_process_user) survive container shutdown.
+
+    Under GitHub Actions the process ends naturally, so atexit fires. Under a
+    Cloud Run Job the platform sends SIGTERM before the container is stopped;
+    Python's default SIGTERM disposition terminates the process WITHOUT running
+    atexit handlers, which would drop a pending token-cache upload. Translating
+    SIGTERM into ``sys.exit`` raises SystemExit, which unwinds normally and lets
+    atexit-registered handlers run before exit.
+
+    The exit status is non-zero (143 = 128 + SIGTERM), NOT 0: a Cloud Run task
+    is marked succeeded only when the container exits 0, so exiting 0 on a
+    timeout/cancel would mask an interrupted run (possibly stopped mid-send or
+    mid-write) as a success — and release the lease as if the work had
+    completed, letting the next execution repeat partial work. A non-zero exit
+    marks the interrupted run failed (triggering retry/alerting) while still
+    unwinding through atexit and run_with_scheduler_lease's ``finally`` so the
+    token-cache upload runs and the lease is released.
+    """
+    def _handle_sigterm(signum, frame) -> None:  # noqa: ARG001 (signal API)
+        print(
+            "🛑 Received SIGTERM; exiting 143 (non-zero) so atexit handlers run "
+            "and the interrupted run is marked failed, not silently succeeded"
+        )
+        sys.exit(128 + signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
 if __name__ == "__main__":
+    _validate_startup_env()
+    _install_sigterm_atexit_bridge()
     run_with_scheduler_lease(run_all_users)
