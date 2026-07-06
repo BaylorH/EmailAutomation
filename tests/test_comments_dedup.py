@@ -63,8 +63,18 @@ class MergeCommentBulletsTests(unittest.TestCase):
         out = _merge_comment_bullets("100% HVAC", "100%   hvac")
         self.assertEqual(out, "100% HVAC")
 
+    def test_internal_cr_normalized_for_dedup(self):
+        # A stray CR *inside* a bullet ("available\rnow", where a \r replaced a
+        # space in the live cell) must normalize so the identical fact dedups.
+        # The outer .strip() only removes a *trailing* CR, so a mid-string CR is
+        # what actually exercises _normalize_comment_bullet's \r->space replace.
+        self.assertEqual(_normalize_comment_bullet("available\rnow"), "available now")
+        out = _merge_comment_bullets("available\rnow", "available now")
+        # dedup collapsed the duplicate → a single bullet, no separator added
+        self.assertNotIn("•", out)
+
     def test_trailing_cr_normalized(self):
-        # Real cells carry a stray trailing \r (see row3 "...total space is 7,920SF.r").
+        # Real cells also carry a stray *trailing* \r (row3 "...total space is 7,920SF.r").
         out = _merge_comment_bullets("available now\r", "available now")
         # first-seen surface form kept, no duplicate
         self.assertEqual(out.count("available now"), 1)

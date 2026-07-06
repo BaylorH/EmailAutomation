@@ -10,9 +10,9 @@ into a fresh reply and fired property_unavailable:
         ("...wrote the following:"), so _QUOTE_ATTRIBUTION_RE ($-anchored) missed.
 
 Each test drives _split_fresh_and_quoted / the suppression pipeline directly (no
-live OpenAI), so behavior is model-independent. Phrasing is grounded in real Jill
-broker data (Ryan Wilson / rwilson@ecrtx.com, 311 E Saint Elmo Rd, Austin;
-Pierce Demarco / pierce.demarco@freehillco.com, 3520 Comsouth Dr, Austin).
+live OpenAI), so behavior is model-independent. Fixtures use synthetic broker
+names, emails, and addresses — the regex behavior under test does not depend on
+the data being real, and committing live third-party contact info is a PII risk.
 """
 import os
 import sys
@@ -29,8 +29,8 @@ from email_automation import ai_processing as a  # noqa: E402
 
 
 def _conv(body, direction="inbound"):
-    return [{"direction": direction, "from": "rwilson@ecrtx.com", "to": ["jill@x.com"],
-             "subject": "Re: 311 E Saint Elmo Rd, Austin", "timestamp": "2026-07-05T00:00:00Z",
+    return [{"direction": direction, "from": "broker.demo@example-cre.com", "to": ["operator@example.com"],
+             "subject": "Re: 123 Test Warehouse Way, Austin", "timestamp": "2026-07-05T00:00:00Z",
              "content": body}]
 
 
@@ -47,11 +47,11 @@ class OutlookForwardHeaderTests(unittest.TestCase):
     BODY = (
         "Still available - see the thread below for background.\n"
         "\n"
-        "From: Ryan Wilson\n"
+        "From: Riley Nolan\n"
         "Sent: Monday, June 1, 2026 3:00 PM\n"
         "To: Jill Anderson\n"
-        "Subject: RE: 311 E Saint Elmo Rd, Austin\n"
-        "311 E Saint Elmo Rd is now fully leased and off the market.")
+        "Subject: RE: 123 Test Warehouse Way, Austin\n"
+        "123 Test Warehouse Way is now fully leased and off the market.")
 
     def test_h36_bare_outlook_header_splits_quote(self):
         fresh, quoted = a._split_fresh_and_quoted(self.BODY)
@@ -82,8 +82,8 @@ class OutlookForwardHeaderTests(unittest.TestCase):
 class DatedAttributionTests(unittest.TestCase):
     BODY = (
         "Yes it's available, actively marketing.\n"
-        "On Jun 1, 2026 at 3:00 PM Pierce Demarco wrote the following:\n"
-        "3520 Comsouth Dr is fully leased, no longer on the market.")
+        "On Jun 1, 2026 at 3:00 PM Alex Carver wrote the following:\n"
+        "456 Sample Industrial Blvd is fully leased, no longer on the market.")
 
     def test_h37_attribution_wrote_not_lineend_splits_quote(self):
         fresh, quoted = a._split_fresh_and_quoted(self.BODY)
@@ -105,7 +105,7 @@ class DatedAttributionTests(unittest.TestCase):
     def test_control_strict_wrote_lineend_still_splits(self):
         fresh, quoted = a._split_fresh_and_quoted(
             "Sounds good.\n"
-            "On Mon, Jun 1, 2026 at 3:00 PM Pierce Demarco <pierce.demarco@freehillco.com> wrote:\n"
+            "On Mon, Jun 1, 2026 at 3:00 PM Alex Carver <alex.carver@example-cre.com> wrote:\n"
             "> old quoted text")
         self.assertIn("sounds good", fresh.lower())
         self.assertIn("old quoted text", quoted.lower())

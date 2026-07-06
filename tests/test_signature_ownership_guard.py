@@ -25,6 +25,10 @@ JOHN = "<div>John Doe<br>Principal<br>Example Realty Advisors<br>john@example.co
 JILL = "<div>Jill Ames<br>Senior Associate<br>jill.ames@mohrpartners.com</div>"
 TYNEESIA = "<div>Tyneesia Rogers<br>tyneesia.rogers@mohrpartners.com</div>"
 NO_EMAIL = "<div>John Doe<br>Principal<br>Example Realty Advisors</div>"
+# Colleague whose address is a superset of the sender's (jane@acme.com is a
+# substring of mjane@acme.com). A naive `user_email in sig_lower` substring test
+# would wrongly accept this foreign signature as owned.
+COLLEAGUE_SUPERSET = "<div>Mary Jane<br>Associate<br>mjane@acme.com</div>"
 
 
 class BelongsToSenderTests(unittest.TestCase):
@@ -43,6 +47,13 @@ class BelongsToSenderTests(unittest.TestCase):
 
     def test_empty_signature_rejected(self):
         self.assertFalse(_professional_signature_html_belongs_to_sender("", "john@example.com"))
+
+    def test_colleague_superset_email_rejected(self):
+        # substring-bypass: sender jane@acme.com must NOT own a signature whose
+        # only email is the colleague superset mjane@acme.com.
+        self.assertFalse(
+            _professional_signature_html_belongs_to_sender(COLLEAGUE_SUPERSET, "jane@acme.com")
+        )
 
 
 class GetEmailFooterFailClosedTests(unittest.TestCase):

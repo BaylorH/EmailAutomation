@@ -171,9 +171,14 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 # broker's FRESH message so quoted prior-thread call asks never re-fire.
 _CALL_REQUEST_RE = re.compile(
     r"\bcall\s+me\b|\bgive\s+me\s+a\s+call\b|\bcall\s+you\b|\bphone\s+call\b"
-    r"|\bhop\s+on\s+a(?:\s+\w+){0,3}\s+call\b|\bcan\s+(?:you|we)\s+(?:call|talk)\b"
+    r"|\bhop\s+on\s+a(?:\s+\w+){0,3}\s+call\b|\bcan\s+(?:you|we)\s+call\b"
     r"|\bcall\s+me\s+at\b|\breach\s+me\s+at\b|\bschedule\s+a\s+call\b"
-    r"|\blet'?s\s+(?:talk|chat|call)\b|\blet'?s\s+hop\s+on\b|\bset\s+up\s+a\s+call\b",
+    r"|\blet'?s\s+call\b|\blet'?s\s+hop\s+on\b|\bset\s+up\s+a\s+call\b"
+    # "talk"/"chat"/"speak" are call requests ONLY with explicit phone context —
+    # a bare "let's chat about the terms" or "can we talk pricing over email" is
+    # an ordinary reply, and forcing call_requested there nulls a valid auto-reply.
+    r"|\b(?:talk|chat|speak|connect)\b[^.!?\n]{0,25}\b(?:on|over|by)\s+(?:the\s+)?phone\b"
+    r"|\bover\s+the\s+phone\b|\bon\s+a\s+quick\s+call\b",
     re.IGNORECASE,
 )
 
@@ -188,11 +193,16 @@ _OUT_OF_OFFICE_RE = re.compile(
     r"|\bautoreply\b"
     r"|\bon\s+(?:vacation|holiday|leave|pto|sabbatical)\b"
     r"|\b(?:parental|maternity|paternity|medical|sick|annual)\s+leave\b"
-    r"|\blimited\s+(?:email\s+)?access\b"
+    # "limited access" alone is a common property description ("site has limited
+    # access after hours"); only an explicit email-access phrase signals OOO.
+    r"|\blimited\s+email\s+access\b"
     r"|\blimited\s+access\s+to\s+(?:my\s+)?email\b"
-    r"|\baway\s+from\s+(?:my\s+)?(?:email|office|desk)\b"
-    r"|\bback\s+in\s+the\s+office\b"
-    r"|\breturn(?:ing)?\s+to\s+the\s+office\b",
+    r"|\baway\s+from\s+(?:my\s+)?(?:email|office|desk)\b",
+    # NOTE: bare "back in the office" / "returning to the office" were removed —
+    # a live human handoff ("I was traveling, back in the office Monday, in the
+    # meantime contact Dana at dana@x.com") is a genuine wrong_contact, not an
+    # auto-reply. Real OOO banners still match via the strong markers above
+    # (out of office / OOO / automatic reply / on vacation|leave / away from ...).
     re.IGNORECASE,
 )
 
@@ -716,20 +726,26 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     # 1) Combined "base + opex" line — the base rent is the FIRST figure.
     combined = _COMBINED_RENT_OPEX_RE.search(text)
     if combined:
-        base = float(combined.group(1))
-        window = text[max(0, combined.start() - 20): min(len(text), combined.end() + 30)]
-        annual = base * 12 if _is_monthly_context(window) else base
-        if annual >= 1:
-            return f"{annual:.2f}"
+        # Past-tense hypothetical ("rent would have been $24 + $8 opex, but it's
+        # leased now") is not a current asking figure. The conditional phrase sits
+        # before the $ match, so the guard window reaches from before the start to
+        # the match end (mirrors the generic-branch guard below).
+        if not _HYPOTHETICAL_RENT_RE.search(text[max(0, combined.start() - 40): combined.end()]):
+            base = float(combined.group(1))
+            window = text[max(0, combined.start() - 20): min(len(text), combined.end() + 30)]
+            annual = base * 12 if _is_monthly_context(window) else base
+            if annual >= 1:
+                return f"{annual:.2f}"
 
     # 2) Range — take the low end as a conservative asking rent.
     rng = _RENT_RANGE_RE.search(text)
     if rng:
-        low = float(rng.group(1))
-        window = text[max(0, rng.start() - 20): min(len(text), rng.end() + 40)]
-        annual = low * 12 if _is_monthly_context(window) else low
-        if annual >= 1:
-            return f"{annual:.2f}"
+        if not _HYPOTHETICAL_RENT_RE.search(text[max(0, rng.start() - 40): rng.end()]):
+            low = float(rng.group(1))
+            window = text[max(0, rng.start() - 20): min(len(text), rng.end() + 40)]
+            annual = low * 12 if _is_monthly_context(window) else low
+            if annual >= 1:
+                return f"{annual:.2f}"
 
     # 3) Recency / "now" preference — a current asking rate ("...it is now $26/SF")
     # supersedes a stale prior quote on the same line. The generic loop below is
@@ -790,16 +806,20 @@ def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
     if _looks_like_requirements_mismatch_nonviable(text):
         return None
 
+    # Past-tense hypothetical ("opex would have been $8/sf, but it's leased now")
+    # is not a current figure — mirror the rent extractor's match-local guard on
+    # every return path so a fabricated OpEx is never written to the sheet.
     combined = _COMBINED_RENT_OPEX_RE.search(text)
     if combined:
-        opex = float(combined.group(2))
-        window = text[max(0, combined.start() - 10): min(len(text), combined.end() + 30)]
-        annual = opex * 12 if _is_monthly_context(window) else opex
-        if annual >= 0.01:
-            return f"{annual:.2f}"
+        if not _HYPOTHETICAL_RENT_RE.search(text[max(0, combined.start() - 40): combined.end()]):
+            opex = float(combined.group(2))
+            window = text[max(0, combined.start() - 10): min(len(text), combined.end() + 30)]
+            annual = opex * 12 if _is_monthly_context(window) else opex
+            if annual >= 0.01:
+                return f"{annual:.2f}"
 
     m = _OPS_EX_RE.search(text)
-    if m:
+    if m and not _HYPOTHETICAL_RENT_RE.search(text[max(0, m.start() - 40): m.end()]):
         raw = m.group(1) or m.group(2)
         if raw is not None:
             val = float(raw)

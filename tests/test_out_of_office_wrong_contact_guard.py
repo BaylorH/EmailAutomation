@@ -72,6 +72,29 @@ class DetectOutOfOfficeTests(unittest.TestCase):
         body = "Hi John, it's available - 32,000 SF, $9.25 NNN. Flyer attached. Thanks, Sam"
         self.assertFalse(_looks_like_out_of_office(body))
 
+    def test_limited_access_property_description_is_not_ooo(self):
+        # "limited access" as a PROPERTY description must not read as OOO — else it
+        # strips a genuine wrong_contact riding in the same reply.
+        body = ("The site has limited access after hours. I no longer cover this "
+                "one — please reach out to Dana at dana@example-cre.com.")
+        self.assertFalse(_looks_like_out_of_office(body))
+
+    def test_back_in_office_human_handoff_is_not_ooo(self):
+        # A live human handoff that merely mentions "back in the office" is a real
+        # wrong_contact, not an auto-reply banner.
+        body = ("I was traveling, back in the office Monday. In the meantime please "
+                "contact Dana at dana@example-cre.com for 900 Escalation Ct.")
+        self.assertFalse(_looks_like_out_of_office(body))
+
+    def test_back_in_office_human_handoff_preserves_wrong_contact(self):
+        # End-to-end: the redirect must survive (not be stripped by the OOO guard).
+        body = ("I was traveling, back in the office Monday. In the meantime please "
+                "contact my colleague Dana Reyes (dana@example-cre.com) for that one.")
+        proposal = {"events": [], "response_email": "Hi Sam, will do.", "updates": []}
+        out = _augment_events_with_deterministic_signals(proposal, _conv(body))
+        self.assertIn("wrong_contact", [e.get("type") for e in out["events"]])
+        self.assertIsNone(out["response_email"])
+
 
 class OutOfOfficeStripsWrongContactTests(unittest.TestCase):
     def _bad_llm_proposal(self):

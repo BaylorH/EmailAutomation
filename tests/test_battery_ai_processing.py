@@ -88,6 +88,28 @@ class RentOpexSfExtractionTests(unittest.TestCase):
         text = "Rent would've been $22 psf if the ceilings were taller."
         self.assertIsNone(a._extract_rent_sf_yr_from_text(text))
 
+    def test_r22_hypothetical_combined_rent_opex_writes_neither(self):
+        # Combined "base + opex" branch (branch 1) must honour the hypothetical
+        # guard on BOTH the rent and opex extractors — a past-tense "would have
+        # been $24 + $8 opex" is not a current figure.
+        text = "Rent would have been $24 + $8/sf opex if we'd caught it earlier."
+        self.assertIsNone(a._extract_rent_sf_yr_from_text(text))
+        self.assertIsNone(a._extract_ops_ex_sf_from_text(text))
+
+    def test_r22_hypothetical_range_returns_none(self):
+        # Range branch (branch 2) must honour the hypothetical guard too.
+        text = "Asking rates would have been between $20.00 - $22.00/SF if it fit."
+        self.assertIsNone(a._extract_rent_sf_yr_from_text(text))
+
+    def test_r22_hypothetical_standalone_opex_returns_none(self):
+        text = "OpEx would have been $8/SF but the deal fell through."
+        self.assertIsNone(a._extract_ops_ex_sf_from_text(text))
+
+    def test_range_non_hypothetical_still_extracts_low_end(self):
+        # Regression: a real (non-hypothetical) range must still yield the low end.
+        text = "Asking rents are between $20.00 - $22.00/SF NNN."
+        self.assertEqual(a._extract_rent_sf_yr_from_text(text), "20.00")
+
     def test_r22_hypothetical_leading_it_would_be_returns_none(self):
         # dollar-anchored variant (guard already handled this; regression lock)
         text = "It would be $16/SF NNN if it were a fit."
@@ -511,6 +533,27 @@ class CallRequestEscalationTests(unittest.TestCase):
         self.assertNotIn("call_requested", types)
         self.assertEqual(proposal["response_email"], "auto-reply body")
 
+    def test_talk_pricing_over_email_is_not_a_call_request(self):
+        # "talk" without phone context must NOT force call_requested — else it
+        # nulls a valid auto-reply and pushes an ordinary email to manual review.
+        types, proposal = _event_pipeline(
+            [], "Can we talk pricing over email instead? It's easier on my end.")
+        self.assertNotIn("call_requested", types)
+        self.assertEqual(proposal["response_email"], "auto-reply body")
+
+    def test_lets_chat_about_terms_is_not_a_call_request(self):
+        types, proposal = _event_pipeline(
+            [], "Let's chat about the terms in your reply and go from there.")
+        self.assertNotIn("call_requested", types)
+        self.assertEqual(proposal["response_email"], "auto-reply body")
+
+    def test_talk_over_the_phone_still_escalates(self):
+        # Genuine phone context must still escalate to the operator.
+        types, proposal = _event_pipeline(
+            [], "Happy to talk over the phone if that's easier for you.")
+        self.assertIn("call_requested", types)
+        self.assertIsNone(proposal["response_email"])
+
 
 # ---------------------------------------------------------------------------
 # Link surfacing + prompt truncation
@@ -556,90 +599,6 @@ class FlyerLinkAndTruncationTests(unittest.TestCase):
         text = ("a" * 9000) + "\nTotal SF: 25,000 SF\n" + ("b" * 9000)
         clipped = a._clip_for_prompt(text, 8000)
         self.assertIn("25,000 SF", clipped)
-
-
-# ---------------------------------------------------------------------------
-# Quoted-tail detection edge cases — forwarded Outlook header (bare From:, no
-# angle-bracket email) and Gmail/Apple attribution line whose "wrote" is NOT at
-# line end. Both previously left quoted history glued to the fresh message, so a
-# stale "leased / off the market" signal in the quote bled into a fresh reply and
-# fired property_unavailable. Grounded in real Jill broker phrasing (Ryan Wilson /
-# rwilson@ecrtx.com, 311 E Saint Elmo Rd; Pierce Demarco / 3520 Comsouth Dr).
-# ---------------------------------------------------------------------------
-class QuotedTailDetectionTests(unittest.TestCase):
-    def _pipeline(self, events, body):
-        proposal = {"events": [dict(e) for e in events], "updates": [],
-                    "response_email": "auto-reply body"}
-        proposal = a._suppress_quote_only_events(proposal, _conv(body))
-        proposal = a._augment_events_with_deterministic_signals(proposal, _conv(body))
-        return [e.get("type") for e in proposal["events"]]
-
-    # H36 — forwarded Outlook header with a BARE From: (no <email>) starts the quote
-    def test_h36_bare_outlook_forward_header_splits_quote(self):
-        body = (
-            "Still available - see the thread below for background.\n"
-            "\n"
-            "From: Ryan Wilson\n"
-            "Sent: Monday, June 1, 2026 3:00 PM\n"
-            "To: Jill Anderson\n"
-            "Subject: RE: 311 E Saint Elmo Rd, Austin\n"
-            "311 E Saint Elmo Rd is now fully leased and off the market.")
-        fresh, quoted = a._split_fresh_and_quoted(body)
-        self.assertIn("still available", fresh.lower())
-        self.assertNotIn("fully leased", fresh.lower())
-        self.assertIn("fully leased", quoted.lower())
-
-    def test_h36_bare_outlook_forward_header_suppresses_unavailable(self):
-        body = (
-            "Still available - see the thread below for background.\n"
-            "\n"
-            "From: Ryan Wilson\n"
-            "Sent: Monday, June 1, 2026 3:00 PM\n"
-            "To: Jill Anderson\n"
-            "Subject: RE: 311 E Saint Elmo Rd, Austin\n"
-            "311 E Saint Elmo Rd is now fully leased and off the market.")
-        types = self._pipeline([{"type": "property_unavailable", "reason": "leased"}], body)
-        self.assertNotIn("property_unavailable", types,
-                         f"leased signal lives only in quoted Outlook forward: {types}")
-
-    # H37 — Gmail/Apple attribution whose "wrote" is NOT at line end starts the quote
-    def test_h37_attribution_wrote_not_lineend_splits_quote(self):
-        body = (
-            "Yes it's available, actively marketing.\n"
-            "On Jun 1, 2026 at 3:00 PM Pierce Demarco wrote the following:\n"
-            "3520 Comsouth Dr is fully leased, no longer on the market.")
-        fresh, quoted = a._split_fresh_and_quoted(body)
-        self.assertIn("actively marketing", fresh.lower())
-        self.assertNotIn("fully leased", fresh.lower())
-        self.assertIn("no longer on the market", quoted.lower())
-
-    def test_h37_attribution_wrote_not_lineend_suppresses_unavailable(self):
-        body = (
-            "Yes it's available, actively marketing.\n"
-            "On Jun 1, 2026 at 3:00 PM Pierce Demarco wrote the following:\n"
-            "3520 Comsouth Dr is fully leased, no longer on the market.")
-        types = self._pipeline([{"type": "property_unavailable", "reason": "leased"}], body)
-        self.assertNotIn("property_unavailable", types,
-                         f"leased signal lives only in quoted attribution tail: {types}")
-
-    # controls — do NOT over-split fresh prose that merely resembles a marker
-    def test_control_prose_from_line_not_split(self):
-        # A single "From:" style prose line with no Outlook block must stay fresh.
-        fresh, quoted = a._split_fresh_and_quoted(
-            "From: my perspective the space is still available and marketing.")
-        self.assertEqual(quoted, "")
-
-    def test_control_on_wrote_without_date_not_split(self):
-        # "On ... wrote" with no date/time token is casual prose, not an attribution.
-        fresh, quoted = a._split_fresh_and_quoted(
-            "On our recent call I wrote up the numbers; still available.")
-        self.assertEqual(quoted, "")
-
-    def test_control_strict_wrote_lineend_still_splits(self):
-        fresh, quoted = a._split_fresh_and_quoted(
-            "Sounds good.\nOn Mon, Jun 1, 2026 at 3:00 PM Pierce Demarco <pierce.demarco@freehillco.com> wrote:\n> old text")
-        self.assertIn("sounds good", fresh.lower())
-        self.assertIn("old text", quoted.lower())
 
 
 # ---------------------------------------------------------------------------

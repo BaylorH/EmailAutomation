@@ -267,7 +267,10 @@ class PlaceholderValueGuardTests(unittest.TestCase):
 
         self.assertEqual([], result["applied"])
         self.assertEqual("", result["rowSnapshotAfter"]["Power"])
-        self.assertIn("Power", [s.get("column") for s in result["skipped"]])
+        # Assert it was skipped for the placeholder reason specifically — not some
+        # unrelated skip (formula-column, low-confidence, etc.).
+        power_skip = next(s for s in result["skipped"] if s.get("column") == "Power")
+        self.assertEqual("placeholder-value", power_skip.get("reason"))
         # No sheet write, no AI_META append for a rejected placeholder.
         self.assertEqual(0, len(fake_sheets.values_api.batch_update_calls))
         self.assertEqual(0, len(fake_sheets.values_api.append_calls))
@@ -283,7 +286,8 @@ class PlaceholderValueGuardTests(unittest.TestCase):
 
         self.assertEqual([], result["applied"])
         self.assertEqual("", result["rowSnapshotAfter"]["Docks"])
-        self.assertIn("Docks", [s.get("column") for s in result["skipped"]])
+        docks_skip = next(s for s in result["skipped"] if s.get("column") == "Docks")
+        self.assertEqual("placeholder-value", docks_skip.get("reason"))
         self.assertEqual(0, len(fake_sheets.values_api.batch_update_calls))
         self.assertEqual(0, len(fake_sheets.values_api.append_calls))
 

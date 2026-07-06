@@ -44,6 +44,26 @@ class DetectRedirectTests(unittest.TestCase):
         self.assertEqual(got["suggestedEmail"], "dana@example-cre.com")
         self.assertEqual(got["suggestedContact"], "Dana Reyes")
 
+    def test_redirect_phrase_family_variants_all_fire(self):
+        # The guard must not be tuned to the single "loop her in" phrasing — every
+        # redirect family in _REDIRECT_PHRASE_RE, paired with a distinct third-party
+        # email, must fire so no live phrasing silently loses the escalation.
+        variants = [
+            ("I no longer cover this — please reach out to Dana at dana@broker-a.com going forward.",
+             "dana@broker-a.com"),
+            ("Karen Yu will be your point of contact from here. karen.yu@broker-b.com",
+             "karen.yu@broker-b.com"),
+            ("I'm redirecting you to Priya Shah (priya@broker-c.com) for this one.",
+             "priya@broker-c.com"),
+            ("Marcus actually handles the north submarket — marcus@broker-d.com.",
+             "marcus@broker-d.com"),
+        ]
+        for body, expected_email in variants:
+            with self.subTest(body=body):
+                got = _detect_colleague_redirect(body, BROKER)
+                self.assertIsNotNone(got, f"redirect phrase not detected: {body!r}")
+                self.assertEqual(got["suggestedEmail"], expected_email)
+
     def test_no_redirect_phrase_returns_none(self):
         body = "Hi John, it's available - 32,000 SF, $9.25 NNN. Flyer attached. Thanks, Sam"
         self.assertIsNone(_detect_colleague_redirect(body, BROKER))

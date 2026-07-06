@@ -796,8 +796,11 @@ def _professional_signature_html_belongs_to_sender(signature: str, user_email: s
         # Sender identity unknown — cannot verify ownership here; the send path
         # always supplies user_email, so enforcement happens there.
         return True
-    if user_email in sig_lower:
-        return True
+    # Match whole email tokens only — a bare `user_email in sig_lower` substring
+    # test lets a colleague's superset address (sender "jane@acme.com" vs signature
+    # "mjane@acme.com") pass as owned. Extract every email and fail closed if ANY
+    # is not the sender's; a signature with only the sender's email (or none at
+    # all) belongs to the sender.
     foreign_emails = {
         e for e in re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", sig_lower)
         if e != user_email
