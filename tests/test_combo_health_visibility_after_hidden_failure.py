@@ -313,7 +313,17 @@ class ComboHealthVisibilityAfterHiddenFailure(unittest.TestCase):
     # ================================================================== #
     def test_manual_continuation_suppresses_autonomous_retry(self):
         our_body = "Following up on 404 New Way; are you available for a tour Thursday?"
-        data = {"attempts": 1, "conversationId": CONV, "lastError": "timeout"}
+        # Anchor the retry point deterministically. Without a timestamp key the
+        # continuation guard falls back to now-48h, so the FIXED 2026-07-03 human
+        # reply below silently ages out of the window as the wall-clock advances,
+        # making this a date-drift flake. Pin lastSendAttemptAt just before the
+        # human reply so the guard's client-side sent_after bound is stable.
+        data = {
+            "attempts": 1,
+            "conversationId": CONV,
+            "lastError": "timeout",
+            "lastSendAttemptAt": "2026-07-03T08:00:00Z",
+        }
 
         # A DIFFERENT, newer message in the SAME conversation = the human's manual
         # reply. It does not body-match our stale draft, so the exact-match guard
@@ -407,6 +417,10 @@ class ComboHealthVisibilityAfterHiddenFailure(unittest.TestCase):
             "status": "dead_lettered",
             "failureReason": "Network timeout after send",
             "actionAuditId": "aa-dl",
+            # Anchor the recovery's continuation-guard window deterministically
+            # (before the fixed 2026-07-02/03 Sent Items fixtures) so it does not
+            # age out of the now-48h fallback as the wall-clock advances.
+            "lastSendAttemptAt": "2026-07-02T00:00:00Z",
         }
         payload.update(extra)
         fake_fs.store[("users", self.USER, "deadLetterQueue", dl_id)] = payload
