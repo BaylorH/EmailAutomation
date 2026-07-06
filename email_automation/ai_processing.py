@@ -1286,13 +1286,42 @@ def _build_row_snapshot(header: List[str], rowvals: List[str]) -> dict:
     return snapshot
 
 
+def _normalize_required_col_key(name: str) -> str:
+    """Collapse a column/field name to alnum-only lowercase so spacing/punctuation
+    differences don't matter ('Ops Ex / SF' == 'Ops Ex /SF' == 'opsexsf')."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+# LIVE break (golden campaign): the default REQUIRED_FIELDS_FOR_CLOSE names
+# ('Ops Ex /SF', 'Docks') never matched Jill's real sheet headers
+# ('Ops Ex / SF', 'Loading Docks'), so check_missing_required_fields reported
+# ALREADY-FILLED columns as missing — close_conversation was ignored forever and
+# the row could never reach 'completed' (it looped re-requesting filled fields).
+# Map each required field to the set of header spellings that satisfy it.
+_REQUIRED_FIELD_HEADER_ALIASES = {
+    "docks": {"docks", "loadingdocks", "dockdoors", "dockhighdoors", "loadingdockdoors"},
+    "driveins": {"driveins", "driveindoors", "gradelevel", "gradeleveldoors", "driveindoors"},
+    "opsexsf": {"opsexsf", "opexsf", "opex", "opsex", "nnnsf", "camsf"},
+    "flyerlink": {"flyerlink", "flyer", "link", "flyerbrochure", "brochurelink"},
+    "ceilinght": {"ceilinght", "ceilingheight", "clearheight", "clearht"},
+}
+
+
 def check_missing_required_fields(rowvals: List[str], header: List[str], column_config: dict = None) -> List[str]:
     """
     Check which required fields are missing from the row.
     Uses dynamic column config if provided, otherwise falls back to defaults.
+
+    Header matching is whitespace/punctuation-insensitive and alias-aware so a
+    required field named 'Docks' is satisfied by a 'Loading Docks' column and
+    'Ops Ex /SF' by 'Ops Ex / SF' (see _REQUIRED_FIELD_HEADER_ALIASES).
     """
     try:
-        idx_map = _header_index_map(header)
+        # normalized header key -> (0-based index, raw value getter)
+        norm_headers = {}
+        for i, h in enumerate(header):
+            norm_headers.setdefault(_normalize_required_col_key(h), i)
+
         missing = []
 
         # Get required fields from config or use defaults
@@ -1302,13 +1331,14 @@ def check_missing_required_fields(rowvals: List[str], header: List[str], column_
             required_fields = REQUIRED_FIELDS_FOR_CLOSE
 
         for field in required_fields:
-            key = field.strip().lower()
-            if key in idx_map:
-                i = idx_map[key] - 1  # 0-based
-                if i >= len(rowvals) or not (rowvals[i] or "").strip():
-                    missing.append(field)
-            else:
-                missing.append(field)  # Column doesn't exist
+            fkey = _normalize_required_col_key(field)
+            candidate_keys = {fkey} | _REQUIRED_FIELD_HEADER_ALIASES.get(fkey, set())
+            matched_idx = next((norm_headers[k] for k in candidate_keys if k in norm_headers), None)
+            if matched_idx is None:
+                missing.append(field)  # No column on the sheet satisfies this field
+                continue
+            if matched_idx >= len(rowvals) or not (rowvals[matched_idx] or "").strip():
+                missing.append(field)
 
         return missing
     except Exception as e:

@@ -851,3 +851,35 @@ class ContactOptoutUpdateSuppressionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RequiredFieldHeaderAliasTests(unittest.TestCase):
+    """LIVE break (golden campaign): a row could never reach 'completed' because
+    the missing-required-fields check used default names ('Ops Ex /SF', 'Docks')
+    that didn't match Jill's real headers ('Ops Ex / SF', 'Loading Docks')."""
+    HEADER = ["Property Address", "Total SF", "Rent/SF /Yr", "Ops Ex / SF",
+              "Drive Ins", "Loading Docks", "Ceiling Ht", "Power", "Flyer / Link"]
+
+    def _row(self, **over):
+        base = {"Property Address": "200 Interference Rd", "Total SF": "20000",
+                "Rent/SF /Yr": "12.00", "Ops Ex / SF": "4.00", "Drive Ins": "1",
+                "Loading Docks": "3", "Ceiling Ht": "28", "Power": "1000A",
+                "Flyer / Link": "https://x/flyer.pdf"}
+        base.update(over)
+        return [base.get(h, "") for h in self.HEADER]
+
+    def test_filled_row_with_real_headers_has_no_missing(self):
+        # Ops Ex / SF and Loading Docks ARE filled — must NOT be reported missing.
+        missing = a.check_missing_required_fields(self._row(), self.HEADER)
+        self.assertEqual(missing, [], f"filled row wrongly reported missing: {missing}")
+
+    def test_truly_empty_opex_and_docks_are_reported_missing(self):
+        missing = a.check_missing_required_fields(
+            self._row(**{"Ops Ex / SF": "", "Loading Docks": ""}), self.HEADER)
+        self.assertIn("Ops Ex /SF", missing)
+        self.assertIn("Docks", missing)
+
+    def test_missing_flyer_still_detected(self):
+        missing = a.check_missing_required_fields(
+            self._row(**{"Flyer / Link": ""}), self.HEADER)
+        self.assertIn("Flyer / Link", missing)
