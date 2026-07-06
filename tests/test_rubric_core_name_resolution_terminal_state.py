@@ -31,6 +31,9 @@ class _FakeRef:
 class _FakeDoc:
     def __init__(self, ref):
         self.reference = ref
+        # #20 send-failure observability records item['doc'].id when a send
+        # attempt raises; mirror the ref id so the fake carries a doc id.
+        self.id = ref.id
 
 
 class _ResolverReached(Exception):

@@ -70,6 +70,21 @@ class FakeOutboxCollection:
         return self.docs
 
 
+class FakeSendCounterDoc:
+    """Today's per-user send counter: absent -> count 0 -> under the daily cap."""
+
+    def get(self):
+        return types.SimpleNamespace(exists=False, to_dict=lambda: {})
+
+    def set(self, *args, **kwargs):
+        return None
+
+
+class FakeSendCounterCollection:
+    def document(self, _day_key):
+        return FakeSendCounterDoc()
+
+
 class FakeUserNode:
     def __init__(self, docs):
         self.docs = docs
@@ -78,6 +93,11 @@ class FakeUserNode:
         return types.SimpleNamespace(exists=False, to_dict=lambda: {})
 
     def collection(self, name):
+        # #15/#18 Rail-2 daily send-cap reads a sendCounters collection before
+        # sending; seed it (empty -> count 0 -> under cap) so the cap does not
+        # spuriously fail-closed and retain the outbox in this observability test.
+        if name == email_module.SEND_COUNTERS_COLLECTION:
+            return FakeSendCounterCollection()
         assert name == "outbox", name
         return FakeOutboxCollection(self.docs)
 
