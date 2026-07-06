@@ -191,6 +191,10 @@ def complete_flow():
     uid = _safe_uid(g.get("firebase_uid"))
     if not uid:
         return jsonify({"status": "failed", "error": _GENERIC_BAD_REQUEST}), 400
+    # Enforce the pending-flow TTL here too (#20 544fd72): without a prune, an
+    # expired flow could still be completed if no later /start-device-flow
+    # triggered cleanup.
+    _prune_flows()
     with _flows_lock:
         entry = flows.get(uid)
     if not isinstance(entry, dict) or not isinstance(entry.get("flow"), dict):

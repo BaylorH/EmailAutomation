@@ -130,7 +130,13 @@ class PendingResponsesTests(unittest.TestCase):
         }), patch.object(pending_responses, "find_matching_sent_message_for_retry", return_value=None):
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
-        self.assertEqual([s for s in sent if s.get("status") == "healthy"], [])
+        # A swallowed per-item Graph send failure must surface exactly one
+        # "error" op-state to the health rail (not merely "no healthy state").
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["status"], "error")
+        self.assertEqual(sent[0]["operation"], "pending_response_send")
+        self.assertEqual(sent[0]["recipient"], "bp21harrison@gmail.com")
+        self.assertEqual(sent[0]["error"], "HTTP 429 rate limited after 3 attempts")
         retry_payload = active_doc.reference.update_calls[-1]
         self.assertEqual(retry_payload["attempts"], 2)
         self.assertEqual(retry_payload["lastError"], "HTTP 429 rate limited after 3 attempts")
@@ -157,7 +163,9 @@ class PendingResponsesTests(unittest.TestCase):
         }):
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
-        self.assertEqual([s for s in sent if s.get("status") == "healthy"], [])
+        # Handled outcome (dead-letter / reconciliation): no send was attempted,
+        # so no op-state escalates the health rail. Assert the exact empty shape.
+        self.assertEqual(sent, [])
         self.assertTrue(active_doc.reference.deleted)
         self.assertEqual([], active_doc.reference.update_calls)
         dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
@@ -192,7 +200,9 @@ class PendingResponsesTests(unittest.TestCase):
         }), patch.object(pending_responses, "find_matching_sent_message_for_retry", return_value=None):
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
-        self.assertEqual([s for s in sent if s.get("status") == "healthy"], [])
+        # Handled outcome (dead-letter / reconciliation): no send was attempted,
+        # so no op-state escalates the health rail. Assert the exact empty shape.
+        self.assertEqual(sent, [])
         self.assertEqual([], active_doc.reference.update_calls)
         self.assertTrue(active_doc.reference.deleted)
         dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
@@ -238,7 +248,9 @@ class PendingResponsesTests(unittest.TestCase):
         ) as sent_guard:
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
-        self.assertEqual([s for s in sent if s.get("status") == "healthy"], [])
+        # Handled outcome (dead-letter / reconciliation): no send was attempted,
+        # so no op-state escalates the health rail. Assert the exact empty shape.
+        self.assertEqual(sent, [])
         sent_guard.assert_called_once()
         self.assertEqual(sent_guard.call_args.kwargs["subject"], "0 Gemini Ave, Houston")
         self.assertEqual(sent_guard.call_args.kwargs["conversation_id"], "conv-1")
@@ -293,7 +305,9 @@ class PendingResponsesTests(unittest.TestCase):
         ) as continuation_guard:
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
-        self.assertEqual([s for s in sent if s.get("status") == "healthy"], [])
+        # Handled outcome (dead-letter / reconciliation): no send was attempted,
+        # so no op-state escalates the health rail. Assert the exact empty shape.
+        self.assertEqual(sent, [])
         continuation_guard.assert_called_once()
         self.assertEqual(continuation_guard.call_args.kwargs["conversation_id"], "conv-1")
         self.assertTrue(active_doc.reference.deleted)
@@ -330,7 +344,9 @@ class PendingResponsesTests(unittest.TestCase):
         ):
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
-        self.assertEqual([s for s in sent if s.get("status") == "healthy"], [])
+        # Handled outcome (dead-letter / reconciliation): no send was attempted,
+        # so no op-state escalates the health rail. Assert the exact empty shape.
+        self.assertEqual(sent, [])
         self.assertTrue(active_doc.reference.deleted)
         self.assertEqual([], active_doc.reference.update_calls)
         dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]

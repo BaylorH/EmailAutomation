@@ -2920,7 +2920,7 @@ def send_outboxes(
 
         # 2-minute delay between ALL emails to avoid spam detection
         if idx < len(recipients_list) - 1:
-            print(f"  ⏳ Waiting 2 minutes before next recipient to avoid spam detection...")
+            print("  ⏳ Waiting 2 minutes before next recipient to avoid spam detection...")
             time.sleep(120)
 
     return operation_states

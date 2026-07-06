@@ -16,10 +16,16 @@ def download_token(api_key: str, output_file="msal_token_cache.bin", user_id="de
     else:
         print(f"❌ Download failed for {user_id} ({r.status_code}):", r.text)
 
-def upload_token(api_key: str, input_file="msal_token_cache.bin", user_id="default_user"):
-    with open(input_file, "rb") as f:
-        data = f.read()
-    
+def upload_token(api_key: str, input_file="msal_token_cache.bin", user_id="default_user", cache_content=None):
+    # cache_content lets callers upload an in-memory MSAL cache (str or bytes)
+    # without staging it on disk first. When omitted, fall back to reading the
+    # file at input_file (legacy file-based contract).
+    if cache_content is not None:
+        data = cache_content.encode("utf-8") if isinstance(cache_content, str) else cache_content
+    else:
+        with open(input_file, "rb") as f:
+            data = f.read()
+
     object_path = f"msal_caches/{user_id}/msal_token_cache.bin"
     url = (
         f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_BUCKET}/o?"
