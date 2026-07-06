@@ -18,10 +18,14 @@ import unittest
 from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
-os.environ.setdefault(
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "/Users/baylorharrison/Documents/GitHub.nosync/EmailAutomation/service-account.json",
-)
+# Resolve service-account.json relative to the repo root instead of hardcoding a
+# developer-specific absolute path. setdefault keeps any external/CI override
+# authoritative, and os.path.exists lets this fall through cleanly when the file
+# is absent (e.g. CI without secrets provisioned).
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_candidate_credentials = os.path.join(_repo_root, "service-account.json")
+if os.path.exists(_candidate_credentials):
+    os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", _candidate_credentials)
 
 import main
 from email_automation import email as email_module
@@ -143,6 +147,56 @@ class SendOutboxSendFailureObservabilityTests(unittest.TestCase):
         send.assert_called_once()
         return doc
 
+    def _drive_single_item_send_success(self, operation_states):
+        doc = FakeDoc(
+            {
+                "assignedEmails": ["broker@example.com"],
+                "script": "Hi there,\n\nAny update on the space?\n\nThanks",
+                "clientId": "",
+                "subject": "100 Observability Way",
+                "attempts": 0,
+                "scriptSelectionMode": "exact",
+            },
+            doc_id="outbox-ok",
+        )
+
+        graph_ok_result = {
+            "sent": ["broker@example.com"],
+            "errors": {},
+        }
+
+        with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_current_outbox_data", return_value={}), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_pause_results_outbox_item_if_needed", return_value=False), \
+             patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
+             patch.object(email_module, "_dead_letter_campaign_recipient_row_mismatch_if_needed", return_value=False), \
+             patch.object(email_module, "_dead_letter_unsafe_outbound_body_if_needed", return_value=False), \
+             patch.object(email_module, "_dead_letter_unresolved_name_placeholder_if_needed", return_value=False), \
+             patch.object(email_module, "_should_use_exact_outbox_script", return_value=True), \
+             patch.object(email_module, "_sent_retry_reconciliation_result", return_value={}), \
+             patch.object(email_module, "_mark_outbox_action_audit_retrying"), \
+             patch.object(email_module, "send_and_index_email", return_value=graph_ok_result) as send:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+                operation_states=operation_states,
+            )
+        send.assert_called_once()
+        return doc
+
+    def test_single_outbox_item_send_success_appends_healthy_state(self):
+        states = []
+        self._drive_single_item_send_success(states)
+
+        self.assertEqual(len(states), 1)
+        self.assertEqual(states[0]["status"], "healthy")
+        self.assertEqual(states[0]["operation"], "outbox_send")
+        self.assertNotIn("error", states[0])
+        # Health rail stays green when every item sends cleanly.
+        self.assertEqual(main._combine_graph_operation_states(states)["status"], "healthy")
+
     def test_single_outbox_item_send_failure_appends_error_state(self):
         states = []
         self._drive_single_item_send_failure(states)
@@ -255,6 +309,38 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
         self.assertEqual(error_states[0]["operation"], "pending_response_send")
         self.assertIn("Graph send failed", error_states[0]["error"])
         self.assertEqual(main._combine_graph_operation_states(states)["status"], "error")
+
+    def test_process_pending_responses_returns_healthy_state_on_send_success(self):
+        active_doc = FakeDoc(
+            {
+                "threadId": "thread-1",
+                "msgId": "message-1",
+                "recipient": "broker@example.com",
+                "responseBody": "Hi,\n\nCan you share the flyer?",
+                "clientId": "client-1",
+                "attempts": 0,
+            },
+            doc_id="thread-1",
+        )
+        fake_fs = self._make_fs([active_doc])
+
+        def fake_send_reply_in_thread(**_kwargs):
+            return True
+
+        with patch.dict(sys.modules, {
+            "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
+            "email_automation.processing": types.SimpleNamespace(
+                send_reply_in_thread=fake_send_reply_in_thread,
+            ),
+        }):
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertEqual(len(states), 1)
+        self.assertEqual(states[0]["status"], "healthy")
+        self.assertEqual(states[0]["operation"], "pending_response_send")
+        self.assertEqual(main._combine_graph_operation_states(states)["status"], "healthy")
 
 
 # ---------------------------------------------------------------------------

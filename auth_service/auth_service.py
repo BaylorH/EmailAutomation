@@ -66,6 +66,9 @@ def start_flow():
 @app.route("/complete-device-flow", methods=["POST"])
 def complete_flow():
     uid = request.json["uid"]
+    # Enforce the pending-flow TTL here too: without a prune, an expired flow
+    # could still be completed if no later /start-device-flow triggered cleanup.
+    _prune_expired_flows()
     with _flows_lock:
         entry = flows.get(uid)
     if not entry:

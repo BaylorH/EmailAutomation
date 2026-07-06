@@ -12,7 +12,7 @@ import os
 import sys
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import create_autospec, patch
 
 os.environ.setdefault("API_APP_ID", "test-client-id")
 os.environ.setdefault("FIREBASE_API_KEY", "test-firebase-key")
@@ -48,8 +48,12 @@ def _load_module_with_mocked_msal():
     fake_msal.PublicClientApplication = FakePublicClientApplication
     fake_msal.SerializableTokenCache = FakeCache
 
+    # Autospec against the REAL upload_token so the fake enforces the production
+    # signature — an impossible kwarg (e.g. a removed cache_content) fails the
+    # test instead of being silently accepted by an unconstrained MagicMock.
+    import firebase_helpers as _real_fh
     fake_fh = types.ModuleType("firebase_helpers")
-    fake_fh.upload_token = MagicMock()
+    fake_fh.upload_token = create_autospec(_real_fh.upload_token)
 
     with patch.dict(sys.modules, {"msal": fake_msal, "firebase_helpers": fake_fh}):
         sys.modules.pop("auth_service", None)
@@ -104,6 +108,16 @@ class MsalIdentityIsolationTests(unittest.TestCase):
         resp = self.client.post("/complete-device-flow", json={"uid": "userA"})
         self.assertEqual(resp.status_code, 409)
         self.mod._upload_mock.assert_not_called()
+
+    def test_expired_pending_flow_is_pruned_on_completion(self):
+        self.client.post("/start-device-flow", json={"uid": "userA"})
+        # Age the pending entry past the TTL without any new /start-device-flow.
+        self.mod.flows["userA"]["created"] -= self.mod._PENDING_TTL_SECONDS + 1
+        resp = self.client.post("/complete-device-flow", json={"uid": "userA"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["error"], "no_pending_flow")
+        self.mod._upload_mock.assert_not_called()
+        self.assertNotIn("userA", self.mod.flows)
 
     def test_complete_without_pending_flow_is_rejected(self):
         resp = self.client.post("/complete-device-flow", json={"uid": "ghost"})
