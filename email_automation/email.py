@@ -2828,7 +2828,7 @@ def send_outboxes(
                     reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
                     cap=daily_cap, count=None, day_key=cap_day_key,
                 )
-                return
+                return operation_states
             if current >= daily_cap:
                 print(
                     f"🛑 Daily send cap reached for {user_id} "
@@ -2839,7 +2839,7 @@ def send_outboxes(
                     reason=DAILY_CAP_REACHED_REASON,
                     cap=daily_cap, count=current, day_key=cap_day_key,
                 )
-                return
+                return operation_states
 
         if global_cap is not None:
             try:
@@ -2854,7 +2854,7 @@ def send_outboxes(
                     reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
                     cap=global_cap, count=None, day_key=cap_day_key, scope="global",
                 )
-                return
+                return operation_states
             if current_global >= global_cap:
                 print(
                     "🛑 Global daily send cap reached "
@@ -2866,7 +2866,7 @@ def send_outboxes(
                     cap=global_cap, count=current_global, day_key=cap_day_key,
                     scope="global",
                 )
-                return
+                return operation_states
 
         # Check if multiple properties for same broker
         if len(valid_items) > 1:
@@ -2916,7 +2916,7 @@ def send_outboxes(
                     cap=daily_cap if daily_cap is not None else global_cap,
                     count=None, day_key=cap_day_key,
                 )
-                return
+                return operation_states
 
         # 2-minute delay between ALL emails to avoid spam detection
         if idx < len(recipients_list) - 1:

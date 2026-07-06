@@ -878,8 +878,13 @@ def _split_fresh_and_quoted(text: str):
 
 
 def _fresh_inbound_text(conversation: List[dict]) -> str:
-    """Latest inbound text with any quoted prior-thread history stripped off."""
-    fresh, _ = _split_fresh_and_quoted(_latest_inbound_text(conversation))
+    """Latest inbound text with any quoted prior-thread history stripped off.
+
+    Sources from _raw_latest_inbound (which preserves quoted history) rather than
+    _latest_inbound_text, because #15's _latest_inbound_text already strips quotes —
+    feeding it here would leave _split_fresh_and_quoted nothing to separate (#15×#19).
+    """
+    fresh, _ = _split_fresh_and_quoted(_raw_latest_inbound(conversation))
     return fresh
 
 
@@ -980,7 +985,8 @@ def _suppress_quote_only_events(proposal: dict, conversation: List[dict]) -> dic
     events = proposal.get("events") or []
     if not events:
         return proposal
-    fresh, quoted = _split_fresh_and_quoted(_latest_inbound_text(conversation))
+    # Source raw text (quotes preserved); #15's _latest_inbound_text pre-strips quotes.
+    fresh, quoted = _split_fresh_and_quoted(_raw_latest_inbound(conversation))
     if not quoted.strip():
         return proposal
     fresh_lower = fresh.lower()
@@ -1605,8 +1611,12 @@ def _augment_proposal_with_deterministic_extractions(
     evidence_texts = [fresh_text] + [t for t in (extra_texts or []) if t]
 
     def _fill(col_name: Optional[str], value: Optional[str], reason: str) -> None:
-        if not value or not col_name or not _find_header_name(header, col_name):
+        # Resolve to the canonical sheet header spelling (#15 wrote canonical names;
+        # #19's mapping values may be lowercase, e.g. "total sf" vs header "Total SF").
+        canonical = _find_header_name(header, col_name) if col_name else None
+        if not value or not canonical:
             return
+        col_name = canonical
         if (_row_value_for_column(rowvals, header, col_name) or "").strip():
             return
         update = {"column": col_name, "value": value, "confidence": 0.92, "reason": reason}
