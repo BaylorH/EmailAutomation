@@ -94,6 +94,23 @@ class DeviceFlowBase(unittest.TestCase):
         self.init_mock = self._p_init.start()
         self.acq_mock = self._p_acq.start()
 
+        # #20 identity-isolation: /start-device-flow now builds a fresh per-user MSAL
+        # app + cache via _new_isolated_app() instead of the shared msal_app. Patch it
+        # to a fake whose device-flow calls resolve to the same canned mocks (route
+        # contract unchanged); initiate is routed through init_mock so the auth-gate
+        # assertions (init not called on 401) still hold. /complete-device-flow tests
+        # seed legacy {"flow","ts"} entries, which exercise the shared-msal_app fallback.
+        self.fake_cache = MagicMock(name="isolated_cache")
+        self.fake_cache.serialize.return_value = "{}"
+        self.fake_app = MagicMock(name="isolated_app")
+        self.fake_app.initiate_device_flow = self.init_mock
+        self.fake_app.acquire_token_by_device_flow = self.acq_mock
+        self.fake_app.get_accounts.return_value = [object()]
+        self._p_isolated = patch.object(
+            authmod, "_new_isolated_app", return_value=(self.fake_app, self.fake_cache)
+        )
+        self._p_isolated.start()
+
         # Fake the Firebase "send" boundary. Must only see the authenticated uid.
         self.upload_mock = MagicMock(name="upload_token")
         self._p_upload = patch.object(authmod, "upload_token", self.upload_mock)
@@ -103,6 +120,7 @@ class DeviceFlowBase(unittest.TestCase):
         self._p_verify.stop()
         self._p_init.stop()
         self._p_acq.stop()
+        self._p_isolated.stop()
         self._p_upload.stop()
         authmod.flows.clear()
 

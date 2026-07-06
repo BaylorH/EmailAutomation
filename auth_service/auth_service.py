@@ -1,4 +1,4 @@
-import os, re, time
+import os, re, time, threading
 from functools import wraps
 from flask import Flask, request, jsonify, g
 from msal import PublicClientApplication, SerializableTokenCache
@@ -128,18 +128,41 @@ def _prune_flows(now=None):
             flows.pop(k, None)
 
 
+# ---------------------------------------------------------------------------
+# IDENTITY-ISOLATION (#20, CONDITIONAL-GO blocker #2).
+#
+# A single process-wide token cache + PublicClientApplication shared across every
+# user let one user's uploaded token file carry another user's account (login-path
+# mailbox confusion — mail sent AS THE WRONG USER). Fix: every device flow uses its
+# OWN isolated app + cache; we upload ONLY that user's single-account cache and
+# FAIL CLOSED if the cache resolves to anything other than exactly one account. The
+# module-level msal_app/cache above remain as a legacy fallback for flow entries
+# that predate isolation.
+# ---------------------------------------------------------------------------
+_flows_lock = threading.Lock()
+
+
+def _new_isolated_app():
+    """A fresh single-identity MSAL app + cache — never shared between users."""
+    isolated_cache = SerializableTokenCache()
+    isolated_app = PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=isolated_cache)
+    return isolated_app, isolated_cache
+
+
 @app.route("/start-device-flow", methods=["POST"])
 @verify_firebase_token
 def start_flow():
-    # Body is validated but NOT trusted for identity; uid comes from the token.
+    # Body is validated but NOT trusted for identity; uid comes from the token (#16).
     _data, err = _require_json_object()
     if err:
         return err
     uid = _safe_uid(g.get("firebase_uid"))
     if not uid:
         return jsonify({"status": "failed", "error": _GENERIC_BAD_REQUEST}), 400
+    # #20 identity isolation: a fresh per-user MSAL app + cache, never shared.
+    isolated_app, isolated_cache = _new_isolated_app()
     try:
-        flow = msal_app.initiate_device_flow(scopes=SCOPES)
+        flow = isolated_app.initiate_device_flow(scopes=SCOPES)
     except Exception as e:
         print(f"⚠️ initiate_device_flow failed: {type(e).__name__}", flush=True)
         return jsonify({"status": "failed", "error": _GENERIC_SERVER_ERROR}), 500
@@ -147,7 +170,8 @@ def start_flow():
         print("⚠️ initiate_device_flow returned an unexpected shape", flush=True)
         return jsonify({"status": "failed", "error": _GENERIC_SERVER_ERROR}), 500
     _prune_flows()
-    flows[uid] = {"flow": flow, "ts": time.time()}
+    with _flows_lock:
+        flows[uid] = {"flow": flow, "app": isolated_app, "cache": isolated_cache, "ts": time.time()}
     _prune_flows()
     return jsonify({
         "message": flow["message"],
@@ -160,43 +184,66 @@ def start_flow():
 @app.route("/complete-device-flow", methods=["POST"])
 @verify_firebase_token
 def complete_flow():
-    # Body is validated but NOT trusted for identity; uid comes from the token.
+    # Body is validated but NOT trusted for identity; uid comes from the token (#16).
     _data, err = _require_json_object()
     if err:
         return err
     uid = _safe_uid(g.get("firebase_uid"))
     if not uid:
         return jsonify({"status": "failed", "error": _GENERIC_BAD_REQUEST}), 400
-    entry = flows.get(uid)
+    with _flows_lock:
+        entry = flows.get(uid)
     if not isinstance(entry, dict) or not isinstance(entry.get("flow"), dict):
         # No active flow for this identity — fail closed, do NOT hand None to MSAL.
         return jsonify({"status": "failed", "error": "No active device flow"}), 400
     flow = entry["flow"]
+    # #20 isolation: prefer the per-user isolated app + cache; fall back to the shared
+    # module app/cache only for legacy flow entries that predate isolation.
+    app_ = entry.get("app") or msal_app
+    cache_ = entry.get("cache") or cache
+    isolated = entry.get("app") is not None
     try:
-        result = msal_app.acquire_token_by_device_flow(flow)
+        result = app_.acquire_token_by_device_flow(flow)
     except Exception as e:
         print(f"⚠️ acquire_token_by_device_flow failed: {type(e).__name__}", flush=True)
         return jsonify({"status": "failed", "error": _GENERIC_SERVER_ERROR}), 500
     if not isinstance(result, dict):
         return jsonify({"status": "failed", "error": _GENERIC_SERVER_ERROR}), 500
+
     if "access_token" in result:
+        # #20 fail-closed: a per-user isolated cache must hold EXACTLY one identity.
+        # If it resolved to zero or multiple accounts, refuse to persist rather than
+        # risk uploading a cross-identity token file. Enforced only on the isolated
+        # path (the shared legacy app legitimately accumulates multiple accounts).
+        if isolated:
+            accounts = app_.get_accounts()
+            if len(accounts) != 1:
+                with _flows_lock:
+                    flows.pop(uid, None)
+                return jsonify({
+                    "status": "failed",
+                    "error": f"identity_isolation_violation: expected 1 account, got {len(accounts)}",
+                }), 409
         # The token is bound to the AUTHENTICATED uid, never a body-supplied one.
         upload_token(
-          FIREBASE_API_KEY,
-          input_file=None,
-          cache_content=cache.serialize(),
-          user_id=uid
+            FIREBASE_API_KEY,
+            input_file=None,
+            cache_content=cache_.serialize(),
+            user_id=uid
         )
-        flows.pop(uid, None)
-        return jsonify({"status":"ok"})
+        with _flows_lock:
+            flows.pop(uid, None)
+        return jsonify({"status": "ok"})
+
     if "error_description" in result and "admin" in result["error_description"].lower():
         admin_url = (
-          f"https://login.microsoftonline.com/common/adminconsent?"
-          f"client_id={CLIENT_ID}"
-          f"&redirect_uri=https%3A%2F%2Fyourapp.com%2Foauth-callback"
+            f"https://login.microsoftonline.com/common/adminconsent?"
+            f"client_id={CLIENT_ID}"
+            f"&redirect_uri=https%3A%2F%2Fyourapp.com%2Foauth-callback"
         )
-        return jsonify({"status":"admin_needed","url":admin_url}), 403
-    return jsonify({"status":"failed","error":result.get("error", "authorization_failed")}), 400
+        return jsonify({"status": "admin_needed", "url": admin_url}), 403
+    return jsonify({"status": "failed", "error": result.get("error", "authorization_failed")}), 400
 
-if __name__=="__main__":
-  app.run(port=5001)
+
+if __name__ == "__main__":
+    app.run(port=5001)

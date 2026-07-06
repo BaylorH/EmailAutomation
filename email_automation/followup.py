@@ -375,13 +375,32 @@ def _followup_terminal_block_reason(
     return None
 
 
-def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
+def _followup_operation_state(
+    status: str,
+    thread_id: Optional[str] = None,
+    error: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Build a Graph operation-state for a follow-up send outcome.
+
+    Shape matches ``main._combine_graph_operation_states`` (GO-condition #3).
+    """
+    state: Dict[str, Any] = {"status": status, "operation": "followup_send"}
+    if thread_id:
+        state["threadId"] = thread_id
+    if error is not None:
+        state["error"] = str(error)[:1500]
+    return state
+
+
+def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
     """
     Main entry point: scan threads needing follow-ups and send them.
 
     Called from main.py every 30 minutes.
 
-    Returns: Number of follow-ups sent
+    Returns a list of Graph operation-states (GO-condition #3): one per follow-up
+    that reached a send outcome, so a swallowed per-item Graph send failure now
+    escalates the health rail via ``main._combine_graph_operation_states``.
     """
     print(f"\n{'='*60}")
     print("FOLLOW-UP CHECK")
@@ -389,6 +408,7 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
 
     now = datetime.now(timezone.utc)
     followups_sent = 0
+    operation_states: List[Dict[str, Any]] = []
 
     # Query threads with active follow-up tracking
     threads_ref = _fs.collection("users").document(user_id).collection("threads")
@@ -400,11 +420,11 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
         waiting_threads = list(query.stream())
     except Exception as e:
         print(f"   Error querying follow-up threads: {e}")
-        return 0
+        return operation_states
 
     if not waiting_threads:
         print("   No threads waiting for follow-up")
-        return 0
+        return operation_states
 
     print(f"   Found {len(waiting_threads)} threads with follow-up tracking")
     total_threads = len(waiting_threads)
@@ -499,6 +519,9 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
 
         if success:
             followups_sent += 1
+            operation_states.append(
+                _followup_operation_state("healthy", thread_id=thread_id)
+            )
 
             # Schedule next follow-up if there are more
             _schedule_next_followup(
@@ -524,9 +547,18 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> int:
                 current_index=current_index,
                 fail_closed=getattr(_send_followup_email, "guard_failed_closed", False),
             )
+            # Swallowed per-item Graph send failure -> surface to the health rail.
+            operation_states.append(
+                _followup_operation_state(
+                    "error",
+                    thread_id=thread_id,
+                    error=getattr(_send_followup_email, "last_error", None)
+                    or "follow-up send failed",
+                )
+            )
 
     print(f"\n   Sent {followups_sent} follow-up email(s)")
-    return followups_sent
+    return operation_states
 
 
 def _send_followup_email(
