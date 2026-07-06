@@ -610,6 +610,24 @@ def _strip_unresolved_signature_placeholders(value: str) -> str:
     return re.sub(r"\s{2,}", " ", cleaned).strip()
 
 
+def _strip_signature_placeholders_preserving_lines(value: str) -> str:
+    """Strip unresolved placeholder tokens from a multi-line signature body.
+
+    Unlike ``_strip_unresolved_signature_placeholders`` (which targets single-line
+    structured fields and collapses ALL whitespace), this preserves newlines so a
+    multi-line custom/professional signature keeps its line breaks when rendered to
+    ``<br>``. Only horizontal whitespace left behind by a removed token is
+    collapsed.
+    """
+    if not value:
+        return value
+    cleaned = _SIGNATURE_PLACEHOLDER_TOKEN_RE.sub("", value)
+    # Collapse only spaces/tabs (not newlines) so line structure survives.
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    # Trim trailing horizontal whitespace on each line without dropping blank lines.
+    return "\n".join(line.rstrip() for line in cleaned.split("\n"))
+
+
 def _normalize_signature_url(value: Any) -> str:
     url = _clean_signature_value(value)
     if not url:
@@ -1044,13 +1062,21 @@ def get_email_footer(custom_signature: str = None, signature_mode: str = None, u
 
     if signature_mode == "custom":
         if custom_signature and custom_signature.strip():
-            return convert_plain_text_signature_to_html(custom_signature)
+            # Strip unresolved mail-merge tokens ([NAME], {{company}}, ...) before
+            # the send surface so cached/unsubstituted placeholders never reach a
+            # recipient's inbox (build_professional_signature_html already does this
+            # for structured fields; the footer paths must match).
+            return convert_plain_text_signature_to_html(
+                _strip_signature_placeholders_preserving_lines(custom_signature)
+            )
         # Custom mode but no signature text - return empty
         return ""
 
     if signature_mode == "professional":
         if custom_signature and custom_signature.strip():
-            return convert_plain_text_signature_to_html(custom_signature)
+            return convert_plain_text_signature_to_html(
+                _strip_signature_placeholders_preserving_lines(custom_signature)
+            )
         return ""
     else:
         # Unknown mode - treat as none

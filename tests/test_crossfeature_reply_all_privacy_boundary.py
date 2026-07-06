@@ -225,7 +225,7 @@ class _FakeFirestore:
 # branch, lines ~2930-2968) but calls the real functions so the interaction is
 # exercised, not stubbed.
 # ---------------------------------------------------------------------------
-def _outbox_reply_decision(*, guard_graph, send_graph, fake_fs, data, audience):
+def _outbox_reply_decision(*, guard_graph, send_graph, fake_fs, data):
     """Return ("suppressed", None) or ("sent", res) driving both real units."""
     headers = {"Authorization": "Bearer test"}
     with patch.object(guard_mod, "requests", guard_graph):
@@ -312,7 +312,6 @@ class ReplyAllPrivacyBoundaryCrossFeatureTests(unittest.TestCase):
             send_graph=send_graph,
             fake_fs=self.fake_fs,
             data=self.retry_data,
-            audience=_default_audience(),
         )
 
         self.assertEqual(outcome, "suppressed",
@@ -339,7 +338,6 @@ class ReplyAllPrivacyBoundaryCrossFeatureTests(unittest.TestCase):
             send_graph=send_graph,
             fake_fs=self.fake_fs,
             data=self.retry_data,
-            audience=_default_audience(),
         )
 
         self.assertEqual(outcome, "sent")
@@ -392,7 +390,7 @@ class ReplyAllPrivacyBoundaryCrossFeatureTests(unittest.TestCase):
         s_supp = _FakeGraphForReplyAll(audience)
         outcome_a, _ = _outbox_reply_decision(
             guard_graph=g_supp, send_graph=s_supp,
-            fake_fs=self.fake_fs, data=self.retry_data, audience=audience,
+            fake_fs=self.fake_fs, data=self.retry_data,
         )
 
         # Axis B: no continuation -> sent, but privacy-filtered.
@@ -400,7 +398,7 @@ class ReplyAllPrivacyBoundaryCrossFeatureTests(unittest.TestCase):
         s_send = _FakeGraphForReplyAll(audience)
         outcome_b, res_b = _outbox_reply_decision(
             guard_graph=g_send, send_graph=s_send,
-            fake_fs=self.fake_fs, data=self.retry_data, audience=audience,
+            fake_fs=self.fake_fs, data=self.retry_data,
         )
 
         self.assertEqual((outcome_a, outcome_b), ("suppressed", "sent"))
@@ -436,7 +434,6 @@ class ReplyAllPrivacyBoundaryCrossFeatureTests(unittest.TestCase):
             send_graph=send_graph,
             fake_fs=self.fake_fs,
             data=self.retry_data,
-            audience=_default_audience(),
         )
         self.assertEqual(outcome, "sent",
                          "a send in an unrelated conversation must not suppress this reply")

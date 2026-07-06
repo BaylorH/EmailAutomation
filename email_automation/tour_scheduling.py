@@ -119,6 +119,7 @@ _TOUR_SCOPE_POST_RE = re.compile(
 
 
 _CANONICAL_IMPORT_WARNED = False
+_CANONICAL_PATTERNS_CACHE: Optional[List[str]] = None
 
 
 def _canonical_terminal_patterns() -> List[str]:
@@ -128,11 +129,18 @@ def _canonical_terminal_patterns() -> List[str]:
     to the literal copy above ONLY if that module can't be imported. We catch
     ImportError specifically (not bare Exception) so a genuine bug inside
     ai_processing surfaces loudly instead of silently reintroducing the list drift
-    this bridge exists to eliminate (CodeRabbit PR#15)."""
-    global _CANONICAL_IMPORT_WARNED
+    this bridge exists to eliminate (CodeRabbit PR#15).
+
+    The successful import is memoized (this runs on the hot inbound-email path,
+    multiple times per email); the fallback path is intentionally left uncached so
+    a transient import failure can't permanently pin the drift-prone fallback."""
+    global _CANONICAL_IMPORT_WARNED, _CANONICAL_PATTERNS_CACHE
+    if _CANONICAL_PATTERNS_CACHE is not None:
+        return _CANONICAL_PATTERNS_CACHE
     try:
         from .ai_processing import _UNAVAILABLE_PATTERNS
-        return [pattern for _reason, pattern in _UNAVAILABLE_PATTERNS]
+        _CANONICAL_PATTERNS_CACHE = [pattern for _reason, pattern in _UNAVAILABLE_PATTERNS]
+        return _CANONICAL_PATTERNS_CACHE
     except ImportError as exc:
         if not _CANONICAL_IMPORT_WARNED:
             print(
