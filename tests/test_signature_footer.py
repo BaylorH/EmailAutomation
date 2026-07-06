@@ -40,6 +40,20 @@ class SignatureFooterTests(unittest.TestCase):
         self.assertIn("Call 555-1234", footer)
         self.assertIn("<br>", footer)
 
+    def test_footer_drops_placeholder_only_lines_instead_of_blank_rows(self):
+        # A line that was ONLY a placeholder must not survive as an empty <br>
+        # row; real lines and their breaks are preserved.
+        footer = get_email_footer(
+            "Jane Doe\n[TITLE]\nAcme Realty",
+            "custom",
+        )
+        self.assertNotIn("[TITLE]", footer)
+        self.assertIn("Jane Doe", footer)
+        self.assertIn("Acme Realty", footer)
+        # Exactly one break between the two surviving lines — the placeholder-only
+        # middle line was dropped, not rendered blank.
+        self.assertEqual(footer.count("<br>"), 1)
+
     def test_footer_strips_unresolved_placeholders_from_professional_signature(self):
         footer = get_email_footer(
             "Jane Doe\n[TITLE] at Acme\n{{phone}}",

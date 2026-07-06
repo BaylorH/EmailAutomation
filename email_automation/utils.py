@@ -621,11 +621,19 @@ def _strip_signature_placeholders_preserving_lines(value: str) -> str:
     """
     if not value:
         return value
-    cleaned = _SIGNATURE_PLACEHOLDER_TOKEN_RE.sub("", value)
-    # Collapse only spaces/tabs (not newlines) so line structure survives.
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    # Trim trailing horizontal whitespace on each line without dropping blank lines.
-    return "\n".join(line.rstrip() for line in cleaned.split("\n"))
+    out_lines = []
+    for line in value.split("\n"):
+        stripped = _SIGNATURE_PLACEHOLDER_TOKEN_RE.sub("", line)
+        # Collapse only spaces/tabs (not newlines) so line structure survives.
+        stripped = re.sub(r"[ \t]{2,}", " ", stripped).rstrip()
+        # Drop a line that collapsed to empty ONLY because it was placeholder-only
+        # (had real content before stripping) — otherwise a "[NAME]" line would
+        # render as a blank <br> row. Intentionally-blank lines the user included
+        # for spacing (no content before stripping) are preserved.
+        if not stripped and line.strip():
+            continue
+        out_lines.append(stripped)
+    return "\n".join(out_lines)
 
 
 def _normalize_signature_url(value: Any) -> str:

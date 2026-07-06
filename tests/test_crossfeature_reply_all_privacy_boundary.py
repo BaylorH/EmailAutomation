@@ -396,7 +396,7 @@ class ReplyAllPrivacyBoundaryCrossFeatureTests(unittest.TestCase):
         # Axis B: no continuation -> sent, but privacy-filtered.
         g_send = _FakeGraphForGuard([])
         s_send = _FakeGraphForReplyAll(audience)
-        outcome_b, res_b = _outbox_reply_decision(
+        outcome_b, _res_b = _outbox_reply_decision(
             guard_graph=g_send, send_graph=s_send,
             fake_fs=self.fake_fs, data=self.retry_data,
         )
