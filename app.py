@@ -2511,6 +2511,90 @@ def auth_callback():
         """, error=str(e), uid=uid)
 
 
+# ---------------------------------------------------------------------------
+# Rail 4 — Dead-letter visibility
+#
+# Dead-letters store the human-readable failure under `failureReason` /
+# `lastError` (email.py:2213-2266, pending_responses.py:32); the legacy `reason`
+# key is a last-resort fallback. Reading `reason` alone rendered every item
+# blank, so an operator saw the stuck item but not why it failed.
+#
+# The queue also had no active alert: systemHealth tops out at "warning" on
+# backlog, so a growing pile of stuck/misdirected sends read as routine depth.
+# The inspect view now raises an error-severity alert when active dead-letter
+# items are present. Fail-closed: the threshold defaults to 1 and can never be
+# configured below 1, and a read failure forces the alert rather than reporting
+# all-clear.
+# ---------------------------------------------------------------------------
+
+_DEAD_LETTER_REASON_KEYS = ("failureReason", "lastError", "reason")
+
+
+def _dead_letter_reason(data):
+    """Human-readable failure reason for a dead-letter / pending doc.
+
+    Falls back across every key a dead-letter may store the message under so
+    the debug view never renders blank when a reason exists.
+    """
+    for key in _DEAD_LETTER_REASON_KEYS:
+        value = (data or {}).get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _dead_letter_alert_threshold():
+    """Active dead-letter count at/above which the inspect view alerts.
+
+    Defaults to 1 (any active item pages). Clamped to a minimum of 1 so an
+    absent, zero, negative, or corrupt env value can NEVER silently disable the
+    rail — the SAFE behavior is the default.
+    """
+    raw = os.environ.get("DEAD_LETTER_ALERT_THRESHOLD")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 1
+    return value if value >= 1 else 1
+
+
+def _dead_letter_alert(active_count, needs_reconciliation_count, threshold=None, read_error=False):
+    """Build an operator alert for the dead-letter / reconciliation backlog.
+
+    Returns an error-severity alert dict when the queue could not be read
+    (fail-closed) or when active items reach the threshold; otherwise ``None``.
+    """
+    if threshold is None:
+        threshold = _dead_letter_alert_threshold()
+
+    if read_error:
+        return {
+            "severity": "error",
+            "activeDeadLetters": active_count,
+            "needsReconciliation": needs_reconciliation_count,
+            "threshold": threshold,
+            "readError": True,
+            "message": (
+                "Dead-letter queue could not be read — visibility degraded; "
+                "treat as needing operator attention."
+            ),
+        }
+
+    if active_count > 0 and active_count >= threshold:
+        return {
+            "severity": "error",
+            "activeDeadLetters": active_count,
+            "needsReconciliation": needs_reconciliation_count,
+            "threshold": threshold,
+            "readError": False,
+            "message": (
+                f"{active_count} active dead-letter item(s) require operator "
+                f"attention ({needs_reconciliation_count} awaiting reconciliation)."
+            ),
+        }
+    return None
+
+
 @app.route("/api/firestore-inspect", methods=["GET"])
 @verify_firebase_token
 def api_firestore_inspect():
@@ -2530,10 +2614,16 @@ def api_firestore_inspect():
 
     try:
         from email_automation.clients import _fs
+        from email_automation.system_health import _is_resolved_dead_letter
 
         result = {"users": {}}
         # Only ever inspect the caller's own subtree.
         users = [caller_uid]
+
+        # Rail 4 aggregates across all users.
+        total_active_dead_letters = 0
+        total_needs_reconciliation = 0
+        dead_letter_read_error = False
 
         for uid in users:
             user_data = {"collections": {}}
@@ -2563,13 +2653,37 @@ def api_firestore_inspect():
                         if coll_name == "outbox":
                             coll_data["items"] = [{"id": d.id, "subject": d.to_dict().get("subject", "")[:50]} for d in docs]
                         elif coll_name == "deadLetterQueue":
-                            coll_data["items"] = [{"id": d.id, "reason": d.to_dict().get("reason", "")[:80]} for d in docs]
+                            dl_items = []
+                            active_count = 0
+                            needs_recon_count = 0
+                            for d in docs:
+                                dd = d.to_dict() or {}
+                                status = str(dd.get("status") or "").strip().lower()
+                                resolved = _is_resolved_dead_letter(dd)
+                                if not resolved:
+                                    active_count += 1
+                                if status == "needs_reconciliation":
+                                    needs_recon_count += 1
+                                dl_items.append({
+                                    "id": d.id,
+                                    "reason": _dead_letter_reason(dd)[:200],
+                                    "status": dd.get("status", ""),
+                                    "resolved": resolved,
+                                })
+                            coll_data["items"] = dl_items
+                            coll_data["activeCount"] = active_count
+                            coll_data["needsReconciliation"] = needs_recon_count
+                            total_active_dead_letters += active_count
+                            total_needs_reconciliation += needs_recon_count
                         elif coll_name == "clients":
                             coll_data["items"] = [{"id": d.id, "name": d.to_dict().get("name", "")} for d in docs]
 
                         user_data["collections"][coll_name] = coll_data
                 except Exception as e:
                     user_data["collections"][coll_name] = {"error": str(e)}
+                    # Fail-closed: a queue we could not read must NOT read as all-clear.
+                    if coll_name == "deadLetterQueue":
+                        dead_letter_read_error = True
 
             # Count notifications across all clients
             try:
@@ -2589,6 +2703,12 @@ def api_firestore_inspect():
                 user_data["collections"]["notifications_total"] = {"error": str(e)}
 
             result["users"][uid] = user_data
+
+        result["alert"] = _dead_letter_alert(
+            total_active_dead_letters,
+            total_needs_reconciliation,
+            read_error=dead_letter_read_error,
+        )
 
         return jsonify({"success": True, "data": result})
 

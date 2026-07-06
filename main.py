@@ -3,12 +3,14 @@ import json
 import os
 import signal
 import sys
+import traceback
 from datetime import datetime
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import download_token, upload_token
 from email_automation.clients import list_user_ids, decode_token_payload, _fs
 from email_automation.email import send_outboxes
 from email_automation.processing import (
+    _graph_operation_error_state,
     reconcile_stale_processing_failures,
     retry_processing_failures,
     scan_inbox_against_index,
@@ -125,6 +127,67 @@ def auto_cleanup_firestore(user_id: str):
 
     except Exception as e:
         print(f"⚠️ Auto-cleanup error for {user_id}: {e}")
+
+
+SEND_HEALTH_ESCALATION_ENV = "SITESIFT_SEND_HEALTH_ESCALATION"
+
+
+def _send_health_escalation_enabled() -> bool:
+    """Fail-closed default: SEND-path failures must reach graph health.
+
+    Rail 5 ("Health cannot lie") gap: the send drivers historically returned
+    None, so a broken Graph send left graph_state healthy while receive scans
+    succeeded — a silent outreach outage showed green. This rail makes the send
+    path contribute a graph operation state so `_overall_status` can escalate.
+
+    The rail is ON by default. Absence of the env var keeps it ON — the SAFE,
+    fail-closed behavior. Set SITESIFT_SEND_HEALTH_ESCALATION=0/false/no/off
+    ONLY as an explicit rollback escape hatch to restore the legacy behavior
+    (send outages invisible to graph health, exceptions propagating).
+    """
+    value = os.getenv(SEND_HEALTH_ESCALATION_ENV, "").strip().lower()
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _coerce_graph_operation_state(operation, result):
+    """Coerce a send-path driver's return value into a graph operation state.
+
+    Send drivers historically return None or an int count; only an explicit
+    dict carrying a ``status`` is treated as a health signal. Anything else
+    contributes nothing, so the healthy path never raises a false alarm.
+    """
+    if isinstance(result, dict) and result.get("status"):
+        state = dict(result)
+        state.setdefault("operation", operation)
+        return state
+    return None
+
+
+def _run_graph_send_operation(operation, func, *args, **kwargs):
+    """Run a SEND-path driver, surfacing its outcome as a graph operation state.
+
+    Returns ``(result, state)`` where ``state`` is either a graph operation
+    state dict or ``None`` (nothing to contribute).
+
+    Fail-closed: with the rail enabled (default) an exception is converted to an
+    error state instead of aborting the whole health record, and is NOT
+    re-raised — so receive-scan detail collected in the same run is preserved
+    while graph_state still escalates to error. With the rail disabled the
+    legacy behavior is restored exactly (return passed through, exceptions
+    propagate to the caller's outer handler).
+    """
+    if not _send_health_escalation_enabled():
+        return func(*args, **kwargs), None
+    try:
+        result = func(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001 - deliberately broad: any send failure is a health signal
+        # Capture the traceback so a genuine code bug (not just a Graph HTTP
+        # error) stays diagnosable — fail-closed must not also erase the stack.
+        print(f"❌ Graph send operation '{operation}' failed: {e}\n{traceback.format_exc()}")
+        return None, _graph_operation_error_state(operation, e)
+    return result, _coerce_graph_operation_state(operation, result)
 
 
 def _combine_graph_operation_states(operation_states):
@@ -252,17 +315,26 @@ def refresh_and_process_user(user_id: str):
         )
         return
 
-    # Process outbound emails (now with indexing)
-    send_outboxes(user_id, headers, headers_provider=get_graph_headers)
-
     graph_operation_states = []
-    
+
+    # Process outbound emails (now with indexing). Rail 5: the send path feeds
+    # graph health so a broken Graph send can no longer read as healthy.
+    _, send_state = _run_graph_send_operation(
+        "outbox_send",
+        send_outboxes,
+        user_id,
+        headers,
+        headers_provider=get_graph_headers,
+    )
+    if send_state is not None:
+        graph_operation_states.append(send_state)
+
     # Scan for client replies (inbox - catch all replies, not just unread)
-    print(f"\n🔍 Scanning inbox for client replies...")
+    print("\n🔍 Scanning inbox for client replies...")
     graph_operation_states.append(
         scan_inbox_against_index(user_id, get_graph_headers(), only_unread=False, top=50)
     )
-    
+
     # Scan for Jill's manual replies (SentItems - catch manual replies we didn't index)
     print(f"\n📤 Scanning SentItems for manual replies...")
     graph_operation_states.append(
@@ -278,11 +350,25 @@ def refresh_and_process_user(user_id: str):
     else:
         print("ℹ️ Stored processing failure replay disabled; failures remain visible for review")
 
-    # Retry any pending responses that failed to send previously
-    process_pending_responses(user_id, get_graph_headers())
+    # Retry any pending responses that failed to send previously (send path).
+    _, pending_state = _run_graph_send_operation(
+        "pending_responses_send",
+        process_pending_responses,
+        user_id,
+        get_graph_headers(),
+    )
+    if pending_state is not None:
+        graph_operation_states.append(pending_state)
 
-    # Check and send follow-up emails for threads without responses
-    check_and_send_followups(user_id, get_graph_headers())
+    # Check and send follow-up emails for threads without responses (send path).
+    _, followup_state = _run_graph_send_operation(
+        "followup_send",
+        check_and_send_followups,
+        user_id,
+        get_graph_headers(),
+    )
+    if followup_state is not None:
+        graph_operation_states.append(followup_state)
 
     # Auto-cleanup Firestore if collections are getting large (stay within free tier)
     auto_cleanup_firestore(user_id)

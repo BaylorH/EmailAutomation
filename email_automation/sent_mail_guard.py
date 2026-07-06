@@ -8,6 +8,7 @@ we can stop duplicate sends and surface a reconciliation item instead.
 from datetime import datetime, timedelta, timezone
 import re
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 import requests
 
@@ -16,6 +17,24 @@ from .utils import exponential_backoff_request, strip_html_tags
 
 class SentMailGuardLookupError(Exception):
     """Raised when Sent Items cannot be checked safely before a retry."""
+
+
+def _same_graph_origin(base: str, next_link: str) -> bool:
+    """True when ``next_link`` shares the scheme+host of ``base``.
+
+    Graph pagination links are request-controlled URLs; we reuse the caller's
+    Authorization bearer against them, so the origin must match the base Graph
+    endpoint before we follow (SSRF / token-replay defense-in-depth).
+    """
+    try:
+        base_parts = urlsplit(base)
+        link_parts = urlsplit(next_link)
+    except ValueError:
+        return False
+    return (
+        link_parts.scheme == base_parts.scheme
+        and link_parts.netloc.lower() == base_parts.netloc.lower()
+    )
 
 
 def coerce_utc_datetime(value: Any) -> Optional[datetime]:
@@ -334,10 +353,19 @@ def find_sent_conversation_continuation_for_retry(
                     truncated = True
 
                 next_link = payload.get("@odata.nextLink")
-                if next_link:
+                if next_link and _same_graph_origin(base, next_link):
                     url = next_link
                     request_params = None
                     continue
+                if next_link:
+                    # Defense-in-depth: never replay the Authorization bearer to
+                    # an origin Graph did not vouch for (compromised proxy / future
+                    # refactor that widens `base`). Fail CLOSED on an unexpected
+                    # nextLink host rather than following it with our token.
+                    last_error = RuntimeError(
+                        "Unexpected @odata.nextLink host from Graph API"
+                    )
+                    page_error = True
                 break
 
             if not page_error:

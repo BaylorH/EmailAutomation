@@ -126,7 +126,7 @@ class BrokerTourAvailableGuardQuietOnNearMisses(unittest.TestCase):
         self.assertEqual(
             [], false_positives,
             "FALSE POSITIVE: guard fired on legit core-lane copy, blocking a valid "
-            f"broker email:\n  - " + "\n  - ".join(repr(p) for p in false_positives),
+            "broker email:\n  - " + "\n  - ".join(repr(p) for p in false_positives),
         )
 
     def test_validate_outbound_body_passes_near_misses(self):

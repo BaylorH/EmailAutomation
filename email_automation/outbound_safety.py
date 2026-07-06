@@ -92,20 +92,26 @@ _IDENTITY_NOUN = (
 # Case-insensitive on the noun/verb; the target must be a Capitalised or
 # ALL-CAPS proper noun (kept case-sensitive) so ordinary lowercase prose such as
 # "our client is looking to lease" does not trip it.
+# The leading-article group is case-INSENSITIVE so it swallows an
+# article that is part of the proper noun itself ("The Related Companies",
+# "A Plus Logistics"). The target then falls on the next capitalised token,
+# which the negative lookahead still screens for filler words. Without this,
+# an article-led company name ("... is The Related Companies") slipped through
+# because the lookahead rejected the capitalised "The".
 IDENTITY_DISCLOSURE_RE = re.compile(
     r"(?i:\b" + _IDENTITY_NOUN + r"\b)"
     r"[^.?!\n]{0,60}?"
     r"(?i:\b(?:is|are|is\s+called|are\s+called|will\s+be|would\s+be)\b)\s+"
-    r"(?:the\s+|a\s+|an\s+|our\s+)?"
+    r"(?:(?i:the|a|an|our)\s+)?"
     r"(?!(?:Not|No|None|Confidential|Undisclosed|Unknown|Pending|Tbd|TBD|"
     r"Available|Still|Ready|Happy|Yes|Thanks|Sorry|Sure|Our|We|An?|The|On|"
     r"Before|After|Looking|Actively|Currently)\b)"
     r"[A-Z][A-Za-z0-9&.'\-]+"
 )
-# "we represent Acme", "we act for Northstar".
+# "we represent Acme", "we act for Northstar", "we represent The RMR Group".
 REPRESENTATION_DISCLOSURE_RE = re.compile(
     r"(?i:\bwe\s+(?:represent|are\s+representing|rep|act\s+for)\b)\s+"
-    r"(?:the\s+|a\s+|an\s+)?"
+    r"(?:(?i:the|a|an)\s+)?"
     r"(?!(?:Not|No|None|Confidential|Undisclosed|Unknown|Pending|A|An|The|"
     r"Growing|Great|Strong)\b)"
     r"[A-Z][A-Za-z0-9&.'\-]+"

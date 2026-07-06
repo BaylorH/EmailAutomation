@@ -76,6 +76,13 @@ class FakeFirestore:
         return FakeNode(self, ["collection", name])
 
 
+class _BoomStream:
+    """Iterating this raises, simulating a Firestore read outage mid-stream."""
+
+    def __iter__(self):
+        raise RuntimeError("firestore read failed")
+
+
 class SystemHealthTests(unittest.TestCase):
     def test_collect_user_health_warns_on_backlog_counts(self):
         fs = FakeFirestore({
@@ -144,6 +151,103 @@ class SystemHealthTests(unittest.TestCase):
 
         self.assertEqual("error", payload["status"])
         self.assertEqual("silent_auth_failed", payload["token"]["error"])
+
+    def test_unreadable_queue_count_cannot_report_healthy(self):
+        # Firestore read outage: every queue count fails (-1). Token + graph are
+        # healthy. Health must NOT report healthy — a queue we cannot read may be
+        # hiding an unbounded backlog of stuck / misdirected sends (fail closed).
+        fs = FakeFirestore(
+            {},
+            docs_by_collection={
+                "outbox": _BoomStream(),
+                "deadLetterQueue": _BoomStream(),
+                "pendingResponses": _BoomStream(),
+                "processingFailures": _BoomStream(),
+            },
+        )
+
+        payload = system_health.collect_user_health(
+            "uid-1",
+            fs_client=fs,
+            token_state={"status": "healthy"},
+            graph_state={"status": "healthy"},
+        )
+
+        self.assertEqual(-1, payload["queues"]["outbox"])
+        self.assertNotEqual("healthy", payload["status"])
+        self.assertEqual("error", payload["status"])
+        # Per-queue count-error flags surfaced so the outage is observable.
+        self.assertIn("outbox", payload["countErrors"])
+        self.assertIn("deadLetterQueue", payload["countErrors"])
+
+    def test_partial_count_error_cannot_report_healthy(self):
+        # Only one queue fails to read; the rest are empty. Still must not be healthy.
+        fs = FakeFirestore(
+            {
+                "outbox": 0,
+                "pendingResponses": 0,
+                "processingFailures": 0,
+            },
+            docs_by_collection={
+                "deadLetterQueue": _BoomStream(),
+            },
+        )
+
+        payload = system_health.collect_user_health(
+            "uid-1",
+            fs_client=fs,
+            token_state={"status": "healthy"},
+            graph_state={"status": "healthy"},
+        )
+
+        self.assertEqual(-1, payload["queues"]["deadLetterQueue"])
+        self.assertEqual("error", payload["status"])
+        self.assertEqual(["deadLetterQueue"], payload["countErrors"])
+
+    def test_count_error_severity_env_downgrade_to_warning(self):
+        # Operators may downgrade count-error severity to warning, but never to
+        # healthy. Absence of the env var defaults to the fail-closed (error) path.
+        fs = FakeFirestore(
+            {"outbox": 0, "pendingResponses": 0, "processingFailures": 0},
+            docs_by_collection={"deadLetterQueue": _BoomStream()},
+        )
+        prev = os.environ.get("HEALTH_COUNT_ERROR_SEVERITY")
+        os.environ["HEALTH_COUNT_ERROR_SEVERITY"] = "warning"
+        try:
+            payload = system_health.collect_user_health(
+                "uid-1",
+                fs_client=fs,
+                token_state={"status": "healthy"},
+                graph_state={"status": "healthy"},
+            )
+        finally:
+            if prev is None:
+                os.environ.pop("HEALTH_COUNT_ERROR_SEVERITY", None)
+            else:
+                os.environ["HEALTH_COUNT_ERROR_SEVERITY"] = prev
+
+        self.assertEqual("warning", payload["status"])
+        self.assertEqual(["deadLetterQueue"], payload["countErrors"])
+
+    def test_no_count_error_leaves_healthy_intact(self):
+        # Regression: clean reads with healthy token/graph stay healthy and
+        # surface an empty countErrors list.
+        fs = FakeFirestore({
+            "outbox": 0,
+            "deadLetterQueue": 0,
+            "pendingResponses": 0,
+            "processingFailures": 0,
+        })
+
+        payload = system_health.collect_user_health(
+            "uid-1",
+            fs_client=fs,
+            token_state={"status": "healthy"},
+            graph_state={"status": "healthy"},
+        )
+
+        self.assertEqual("healthy", payload["status"])
+        self.assertEqual([], payload["countErrors"])
 
     def test_write_user_health_replaces_dashboard_snapshot(self):
         fs = FakeFirestore({

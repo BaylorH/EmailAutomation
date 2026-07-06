@@ -2096,7 +2096,12 @@ IMPORTANT: The response should feel natural and conversational, not robotic or t
             greeting_first = _resolve_greeting_first_name(
                 contact_name,
                 sender_email=sender_email,
-                sender_signature_name=sender_display_name or last_human_message,
+                # Use ONLY a real sender name/signature here. Never fall back to
+                # the full inbound body: a raw substring match inside
+                # _resolve_greeting_first_name would spuriously "agree" (e.g. the
+                # mapped first name "Rob" appears inside "problem") and revive a
+                # stale/wrong greeting the FIX-13/14 reconciliation exists to block.
+                sender_signature_name=sender_display_name or None,
             )
             if greeting_first:
                 contact_context = (
@@ -2196,7 +2201,7 @@ OUTPUT ONLY valid JSON in this exact format:
       "contactName": "<for new_property: full name of the new contact if mentioned, e.g., 'Joe Smith' from 'email Joe Smith at joe@email.com'. Use first name only if that's all available>",
       "link": "<for new_property: include URL if mentioned>",
       "notes": "<for new_property: additional context about the property>",
-      "reason": "<for needs_user_input: client_question | scheduling | negotiation | confidential | legal_contract | unclear> OR <for contact_optout: not_interested | unsubscribe | do_not_contact | no_tenant_reps | direct_only | hostile> OR <for wrong_contact: no_longer_handles | wrong_person | forwarded | left_company>",
+      "reason": "<for needs_user_input: client_question | negotiation | confidential | legal_contract | unclear> OR <for contact_optout: not_interested | unsubscribe | do_not_contact | no_tenant_reps | direct_only | hostile> OR <for wrong_contact: no_longer_handles | wrong_person | forwarded | left_company>",
       "question": "<for needs_user_input: the specific question/request that needs user attention>",
       "suggestedContact": "<for wrong_contact: name of correct person to contact>",
       "suggestedEmail": "<for wrong_contact: email of correct person if provided>",

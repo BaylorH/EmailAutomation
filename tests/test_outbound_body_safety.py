@@ -169,5 +169,39 @@ class OutboundBodySafetyTests(unittest.TestCase):
         self.assertTrue(result.is_safe)
 
 
+class OutboundConfidentialArticleLedDisclosureTests(unittest.TestCase):
+    """CodeRabbit PR#18 (outbound_safety.py:95-111): the confidential-disclosure
+    regexes rejected article-led proper nouns ("The Related Companies",
+    "The RMR Group", "A Plus Logistics"), leaving a real false negative in
+    contains_confidential_disclosure() for a common multi-word company pattern."""
+
+    def test_article_led_company_disclosure_is_blocked(self):
+        for body in (
+            "Our client is The Related Companies.",
+            "We represent The RMR Group.",
+            "Our client is A Plus Logistics.",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(
+                    outbound_safety.contains_confidential_disclosure(body),
+                    msg="article-led client-identity disclosure must be blocked",
+                )
+                self.assertFalse(outbound_safety.validate_outbound_body(body).is_safe)
+
+    def test_benign_lowercase_prose_still_passes(self):
+        # Guard must NOT regress into false positives on ordinary phrasing.
+        for body in (
+            "Hi Connor,\n\nOur client is looking to lease industrial space.",
+            "Hi Connor,\n\nWe represent the tenant only, not the landlord.",
+            "Hi Connor,\n\nOur client is currently reviewing the options.",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    outbound_safety.contains_confidential_disclosure(body),
+                    msg="benign lowercase prose must not trip the disclosure guard",
+                )
+                self.assertTrue(outbound_safety.validate_outbound_body(body).is_safe)
+
+
 if __name__ == "__main__":
     unittest.main()

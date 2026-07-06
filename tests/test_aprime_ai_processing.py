@@ -349,6 +349,27 @@ class FIX13_14_Greeting(unittest.TestCase):
             sender_signature_name="Patricia Wong")
         self.assertEqual(got, "Patricia")
 
+    def test_body_not_used_as_signature_fallback(self):
+        # CodeRabbit PR#18 (ai_processing.py:1857): the call site must NOT pass
+        # the full inbound body as sender_signature_name. If it did, the raw
+        # substring match would spuriously "agree" (mapped first name "Rob"
+        # occurs inside "problem"), reviving a stale greeting. With the fixed
+        # call site the signature is None, so a disagreeing sender stays neutral.
+        body = "The problem is bigger than we expected on the north dock."
+        # Hazard being guarded against: feeding the body DOES falsely agree.
+        self.assertEqual(
+            "Rob",
+            _resolve_greeting_first_name(
+                "Rob Fields", sender_email="patricia.wong@keystone.com",
+                sender_signature_name=body),
+        )
+        # Post-fix behavior: no signature -> disagreeing sender -> neutral.
+        self.assertIsNone(
+            _resolve_greeting_first_name(
+                "Rob Fields", sender_email="patricia.wong@keystone.com",
+                sender_signature_name=None),
+        )
+
     def test_m31_company_name_neutral(self):
         self.assertIsNone(_resolve_greeting_first_name("Colliers International"))
 

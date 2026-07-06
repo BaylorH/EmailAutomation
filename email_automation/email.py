@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import requests
 import time
@@ -6,7 +7,7 @@ import uuid
 import logging
 from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
-from google.cloud.firestore import SERVER_TIMESTAMP
+from google.cloud.firestore import SERVER_TIMESTAMP, Increment
 from .utils import (
     GRAPH_SEND_MAX_RETRIES,
     exponential_backoff_request,
@@ -56,6 +57,220 @@ CAMPAIGN_LAUNCH_ACTION_TYPES = {"campaign_creation", "campaign_launch"}
 
 # Unique worker ID for this process
 WORKER_ID = str(uuid.uuid4())[:8]
+
+
+# --- Rail 3: global outbound kill switch -----------------------------------
+# A single fail-closed lever an operator can flip (env var, no code deploy) to
+# halt or downgrade ALL outbound Graph sends the instant a bad-template or
+# wrong-recipient blast is discovered. Scoped levers (per-client pause, per-user
+# auto-reply allowlists, scheduler_scope dev-scoping) do NOT cover outbox
+# outreach or follow-ups; this gate does, at the send call itself.
+OUTBOUND_MODE_ENV = "SITESIFT_OUTBOUND_MODE"
+OUTBOUND_MODE_LIVE = "live"
+OUTBOUND_MODE_DRY_RUN = "dry_run"
+OUTBOUND_MODE_PAUSED = "paused"
+_VALID_OUTBOUND_MODES = {
+    OUTBOUND_MODE_LIVE,
+    OUTBOUND_MODE_DRY_RUN,
+    OUTBOUND_MODE_PAUSED,
+}
+
+
+def resolve_outbound_mode() -> str:
+    """Resolve the global outbound send mode. Fail closed on anything unclear.
+
+    Reads ``SITESIFT_OUTBOUND_MODE`` once per send. Recognized values:
+
+    - ``live`` (or unset / empty): normal sending. Absence preserves existing
+      behavior so the default deployment and the test suite are unaffected.
+    - ``dry_run``: skip every Graph send; leave the item queued.
+    - ``paused``: skip every Graph send; leave the item queued.
+
+    Any unrecognized / malformed value fails **closed** to ``paused`` so a typo
+    ("off", "true", "Live!", "stop") can never silently keep blasting outbound.
+    """
+    raw = os.environ.get(OUTBOUND_MODE_ENV)
+    if raw is None or not raw.strip():
+        return OUTBOUND_MODE_LIVE
+    normalized = raw.strip().lower()
+    if normalized in _VALID_OUTBOUND_MODES:
+        return normalized
+    print(
+        f"🛑 Unrecognized {OUTBOUND_MODE_ENV}={raw!r}; failing closed to "
+        f"'{OUTBOUND_MODE_PAUSED}' (no outbound will be sent)"
+    )
+    return OUTBOUND_MODE_PAUSED
+
+
+def outbound_sending_enabled() -> bool:
+    """True only when the global kill switch resolves to ``live``."""
+    return resolve_outbound_mode() == OUTBOUND_MODE_LIVE
+
+
+def _kill_switch_suppressed(mode: str, *, context: str) -> None:
+    """Emit the suppression audit line for a blocked outbound send."""
+    reason = f"suppressed_by_kill_switch (SITESIFT_OUTBOUND_MODE={mode})"
+    print(f"🛑 {reason}: skipping Graph send for {context}")
+    logger.warning(
+        "outbound.suppressed_by_kill_switch",
+        extra={"outbound_mode": mode, "context": context},
+    )
+
+# ---------------------------------------------------------------------------
+# Rail 2 — aggregate daily send cap (fail-closed, off-by-default-SAFE)
+# ---------------------------------------------------------------------------
+# Per-item retry caps (MAX_OUTBOX_ATTEMPTS, etc.) bound a single item's storm;
+# they do NOT bound total volume. A runaway producer (frontend bug mass-creating
+# outbox docs, a bulk re-queue, a reprocessing loop) can drain unbounded real
+# broker emails before anyone notices. This rail keeps a per-day counter and
+# stops draining once the ceiling is hit, retaining the queue for the next cycle.
+#
+# Off-by-default-SAFE: an UNSET env var keeps the rail ON at a conservative
+# built-in ceiling (absence of config must NOT silently disable it). Only an
+# explicit operator opt-out ("0" / "off" / "none" / "disabled" / "false")
+# turns it off. Fail-closed: if the shared counter cannot be read or the
+# increment cannot be recorded, draining STOPS and the queue is retained.
+DEFAULT_DAILY_SEND_CAP = 500
+SEND_COUNTERS_COLLECTION = "sendCounters"
+SEND_CAP_HEALTH_COLLECTION = "systemHealth"
+SEND_CAP_HEALTH_DOC_ID = "emailAutomation"
+GLOBAL_SEND_COUNTER_PREFIX = "global"
+DAILY_CAP_REACHED_REASON = "daily_cap_reached"
+DAILY_CAP_COUNTER_UNAVAILABLE_REASON = "daily_send_cap_counter_unavailable"
+_DAILY_CAP_DISABLED_TOKENS = {"", "0", "off", "none", "disabled", "false", "no"}
+
+
+def _resolve_send_cap(env_var: str, default: Optional[int]) -> Optional[int]:
+    """Resolve a daily send ceiling from an env var.
+
+    Returns the integer cap, or None when the rail is disabled for that scope.
+    An unset var falls back to ``default`` (for the per-user cap this is a
+    non-None conservative ceiling, so absence of config keeps the rail ON).
+    An unparseable value is treated as "keep the default" — never as a silent
+    disable — so a typo cannot open the floodgates.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return default
+    token = raw.strip().lower()
+    if token in _DAILY_CAP_DISABLED_TOKENS:
+        return None
+    try:
+        cap = int(token)
+    except (TypeError, ValueError):
+        return default
+    if cap <= 0:
+        return None
+    return cap
+
+
+def _resolve_daily_send_cap() -> Optional[int]:
+    """Per-user daily ceiling. Unset env keeps the rail ON at the default."""
+    return _resolve_send_cap("SITESIFT_DAILY_SEND_CAP", DEFAULT_DAILY_SEND_CAP)
+
+
+def _resolve_global_daily_send_cap() -> Optional[int]:
+    """Optional fleet-wide ceiling. Unset = disabled (this scope is opt-in)."""
+    return _resolve_send_cap("SITESIFT_GLOBAL_DAILY_SEND_CAP", None)
+
+
+def _send_counter_day_key(now: Optional[datetime] = None) -> str:
+    return (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+
+
+def _snapshot_count(snapshot) -> int:
+    if snapshot is None:
+        return 0
+    if hasattr(snapshot, "exists") and not snapshot.exists:
+        return 0
+    data = snapshot.to_dict() if hasattr(snapshot, "to_dict") else None
+    try:
+        return int((data or {}).get("count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _read_daily_send_count(fs, user_id: str, day_key: str) -> int:
+    """Read today's per-user send count. Raises on store failure (fail-closed)."""
+    snapshot = (
+        fs.collection("users").document(user_id)
+        .collection(SEND_COUNTERS_COLLECTION).document(day_key)
+        .get()
+    )
+    return _snapshot_count(snapshot)
+
+
+def _increment_daily_send_count(fs, user_id: str, day_key: str, amount: int) -> None:
+    """Atomically add ``amount`` to today's per-user counter. Raises on failure."""
+    if amount <= 0:
+        return
+    (
+        fs.collection("users").document(user_id)
+        .collection(SEND_COUNTERS_COLLECTION).document(day_key)
+        .set(
+            {"count": Increment(amount), "day": day_key, "updatedAt": SERVER_TIMESTAMP},
+            merge=True,
+        )
+    )
+
+
+def _read_global_send_count(fs, day_key: str) -> int:
+    snapshot = (
+        fs.collection(SEND_COUNTERS_COLLECTION)
+        .document(f"{GLOBAL_SEND_COUNTER_PREFIX}-{day_key}")
+        .get()
+    )
+    return _snapshot_count(snapshot)
+
+
+def _increment_global_send_count(fs, day_key: str, amount: int) -> None:
+    if amount <= 0:
+        return
+    (
+        fs.collection(SEND_COUNTERS_COLLECTION)
+        .document(f"{GLOBAL_SEND_COUNTER_PREFIX}-{day_key}")
+        .set(
+            {"count": Increment(amount), "day": day_key, "updatedAt": SERVER_TIMESTAMP},
+            merge=True,
+        )
+    )
+
+
+def _record_send_cap_health(
+    fs,
+    user_id: str,
+    *,
+    status: str,
+    reason: str,
+    cap: Optional[int],
+    count: Optional[int],
+    day_key: str,
+    scope: str = "user",
+) -> None:
+    """Record cap state on systemHealth so a stalled queue is observable.
+
+    Best-effort: a health-write failure must never crash the send path (the
+    send decision has already been made fail-closed by the caller).
+    """
+    try:
+        payload = {
+            "sendCap": {
+                "status": status,
+                "reason": reason,
+                "cap": cap,
+                "count": count,
+                "day": day_key,
+                "scope": scope,
+                "updatedAt": SERVER_TIMESTAMP,
+            }
+        }
+        (
+            fs.collection("users").document(user_id)
+            .collection(SEND_CAP_HEALTH_COLLECTION).document(SEND_CAP_HEALTH_DOC_ID)
+            .set(payload, merge=True)
+        )
+    except Exception as exc:  # noqa: BLE001 - observability must not break sends
+        print(f"   ⚠️ Could not record send-cap health ({reason}): {exc}")
 
 
 def _fresh_graph_headers(
@@ -1254,6 +1469,20 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
     """
     from .utils import get_signature_attachments, needs_signature_attachments, format_email_body_with_footer
 
+    # RAIL 3 (kill switch): gate before touching Graph (even the metadata read).
+    outbound_mode = resolve_outbound_mode()
+    if outbound_mode != OUTBOUND_MODE_LIVE:
+        _kill_switch_suppressed(
+            outbound_mode,
+            context=f"_send_outbox_as_reply thread {thread_id}",
+        )
+        return {
+            "sent": False,
+            "error": f"suppressed_by_kill_switch (SITESIFT_OUTBOUND_MODE={outbound_mode})",
+            "suppressedByKillSwitch": True,
+            "outboundMode": outbound_mode,
+        }
+
     base = "https://graph.microsoft.com/v1.0"
     source_metadata = _fetch_graph_message_metadata(headers, reply_to_msg_id, base)
 
@@ -1939,6 +2168,21 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
     SAFETY: All recipient emails are validated before sending to prevent sending to malformed addresses.
     SAFETY: Opted-out contacts are filtered out before sending.
     """
+    # RAIL 3 (kill switch): resolved once per send, checked before any Graph
+    # call. Fail closed — anything but "live" skips the send entirely.
+    outbound_mode = resolve_outbound_mode()
+    if outbound_mode != OUTBOUND_MODE_LIVE:
+        _kill_switch_suppressed(
+            outbound_mode,
+            context=f"send_and_index_email to {len(recipients or [])} recipient(s)",
+        )
+        return {
+            "sent": [],
+            "errors": {"_all": f"suppressed_by_kill_switch (SITESIFT_OUTBOUND_MODE={outbound_mode})"},
+            "suppressedByKillSwitch": True,
+            "outboundMode": outbound_mode,
+        }
+
     if not recipients:
         return {"sent": [], "errors": {"_all": "No recipients"}}
 
@@ -2507,6 +2751,12 @@ def send_outboxes(
                 'email': email
             })
 
+    # Rail 2: aggregate daily send cap (fail-closed, off-by-default-SAFE).
+    # Resolved once per drain; enforced per accepted send below.
+    daily_cap = _resolve_daily_send_cap()
+    global_cap = _resolve_global_daily_send_cap()
+    cap_day_key = _send_counter_day_key()
+
     # Process each unique recipient
     recipients_list = list(email_groups.items())
     for idx, (recipient_email, items) in enumerate(recipients_list):
@@ -2525,6 +2775,65 @@ def send_outboxes(
 
         if not valid_items:
             continue
+
+        # --- Rail 2: verify we are UNDER the ceiling before sending ---------
+        # Re-read the shared counter each iteration so a fleet-wide blast (many
+        # workers / processes) is bounded, not just a single drain. If the
+        # counter cannot be read we STOP draining and retain the queue — a
+        # transient store blip must never open the floodgates (fail-closed).
+        send_count = len(valid_items)
+        if daily_cap is not None:
+            try:
+                current = _read_daily_send_count(_fs, user_id, cap_day_key)
+            except Exception as exc:  # noqa: BLE001 - fail closed on read error
+                print(
+                    f"🛑 Daily send-cap counter unavailable for {user_id} — "
+                    f"retaining outbox (fail-closed): {exc}"
+                )
+                _record_send_cap_health(
+                    _fs, user_id, status="error",
+                    reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
+                    cap=daily_cap, count=None, day_key=cap_day_key,
+                )
+                return
+            if current >= daily_cap:
+                print(
+                    f"🛑 Daily send cap reached for {user_id} "
+                    f"({current}/{daily_cap}) — retaining outbox for next cycle."
+                )
+                _record_send_cap_health(
+                    _fs, user_id, status="warning",
+                    reason=DAILY_CAP_REACHED_REASON,
+                    cap=daily_cap, count=current, day_key=cap_day_key,
+                )
+                return
+
+        if global_cap is not None:
+            try:
+                current_global = _read_global_send_count(_fs, cap_day_key)
+            except Exception as exc:  # noqa: BLE001 - fail closed on read error
+                print(
+                    "🛑 Global send-cap counter unavailable — "
+                    f"retaining outbox (fail-closed): {exc}"
+                )
+                _record_send_cap_health(
+                    _fs, user_id, status="error",
+                    reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
+                    cap=global_cap, count=None, day_key=cap_day_key, scope="global",
+                )
+                return
+            if current_global >= global_cap:
+                print(
+                    "🛑 Global daily send cap reached "
+                    f"({current_global}/{global_cap}) — retaining outbox for next cycle."
+                )
+                _record_send_cap_health(
+                    _fs, user_id, status="warning",
+                    reason=DAILY_CAP_REACHED_REASON,
+                    cap=global_cap, count=current_global, day_key=cap_day_key,
+                    scope="global",
+                )
+                return
 
         # Check if multiple properties for same broker
         if len(valid_items) > 1:
@@ -2551,6 +2860,28 @@ def send_outboxes(
                 user_email,
                 headers_provider=headers_provider,
             )
+
+        # --- Rail 2: record the sends we just made -------------------------
+        # If we cannot persist the increment we can no longer trust the ceiling
+        # for subsequent recipients, so we halt the drain (fail-closed).
+        if daily_cap is not None or global_cap is not None:
+            try:
+                if daily_cap is not None:
+                    _increment_daily_send_count(_fs, user_id, cap_day_key, send_count)
+                if global_cap is not None:
+                    _increment_global_send_count(_fs, cap_day_key, send_count)
+            except Exception as exc:  # noqa: BLE001 - fail closed on write error
+                print(
+                    f"🛑 Could not record daily send count for {user_id} — "
+                    f"halting further drains (fail-closed): {exc}"
+                )
+                _record_send_cap_health(
+                    _fs, user_id, status="error",
+                    reason=DAILY_CAP_COUNTER_UNAVAILABLE_REASON,
+                    cap=daily_cap if daily_cap is not None else global_cap,
+                    count=None, day_key=cap_day_key,
+                )
+                return
 
         # 2-minute delay between ALL emails to avoid spam detection
         if idx < len(recipients_list) - 1:
@@ -2880,6 +3211,17 @@ def _send_single_outbox_item(
     """
     d = item['doc']
     data = item['data']
+
+    # RAIL 3 (kill switch): gate the outbox driver before claiming or sending.
+    # Fail closed — anything but "live" leaves the item queued and untouched
+    # (no claim, no delete, no Graph call) so it resumes cleanly once re-enabled.
+    outbound_mode = resolve_outbound_mode()
+    if outbound_mode != OUTBOUND_MODE_LIVE:
+        _kill_switch_suppressed(
+            outbound_mode,
+            context=f"outbox item {getattr(d, 'id', 'unknown')} (left queued)",
+        )
+        return
 
     if _delete_cancelled_outbox_item_if_needed(d.reference, data, user_id=user_id):
         return
