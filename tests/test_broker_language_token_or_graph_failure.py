@@ -359,12 +359,28 @@ class TestSchedulerScope(unittest.TestCase):
 
     # --- Near-miss controls -------------------------------------------------
     def test_normal_scheduled_run_stays_all_users(self):
-        # Near-miss: a normal cron run is all-user; one user's missing token
-        # does not collapse the whole run. Scope must return mode=all.
-        with patch.dict("os.environ", self._env(), clear=True):
+        # Near-miss: a normal GitHub Actions scheduled cron run is all-user; one
+        # user's missing token does not collapse the whole run. #17 hardening:
+        # the all-user default only survives in the TRUSTED GitHub Actions
+        # runtime (scope env pinned in a git-reviewed workflow file), so the run
+        # must carry the GitHub Actions markers to keep mode=all.
+        with patch.dict("os.environ", self._env(
+                GITHUB_ACTIONS="true",
+                GITHUB_EVENT_NAME="schedule",
+        ), clear=True):
             scope = resolve_scheduler_user_ids(self.AVAILABLE)
         self.assertEqual(scope.mode, "all")
         self.assertEqual(scope.user_ids, self.AVAILABLE)
+
+    def test_unrecognized_runtime_fails_closed(self):
+        # #17 hardening: outside GitHub Actions / Cloud Run (e.g. a locally-run
+        # image with prod secrets), the scheduler must NOT silently widen to
+        # every live user — it fails closed before any user is touched.
+        with patch.dict("os.environ", self._env(), clear=True):
+            with self.assertRaises(
+                SchedulerScopeError,
+                msg="unrecognized runtime must fail closed, not default to all-users"):
+                resolve_scheduler_user_ids(self.AVAILABLE)
 
     def test_dev_scoped_valid_allowlisted_user_runs_scoped(self):
         # Control: a correctly scoped dev run for an available allowlisted user
