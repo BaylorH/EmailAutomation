@@ -125,6 +125,21 @@ def auto_cleanup_firestore(user_id: str):
         print(f"⚠️ Auto-cleanup error for {user_id}: {e}")
 
 
+def _extend_operation_states(operation_states, result):
+    """Fold a function's returned Graph operation-state(s) into the run accumulator.
+
+    Accepts a single op-state dict, a list/tuple of op-state dicts, or anything
+    else (None / legacy int returns / patched mocks) which is ignored. This keeps
+    the wiring robust as send_outboxes / process_pending_responses /
+    check_and_send_followups migrate from scalar returns to op-state lists.
+    """
+    if isinstance(result, dict):
+        operation_states.append(result)
+    elif isinstance(result, (list, tuple)):
+        operation_states.extend(item for item in result if isinstance(item, dict))
+    return operation_states
+
+
 def _combine_graph_operation_states(operation_states):
     states = [
         state for state in operation_states
@@ -250,11 +265,15 @@ def refresh_and_process_user(user_id: str):
         )
         return
 
-    # Process outbound emails (now with indexing)
-    send_outboxes(user_id, headers, headers_provider=get_graph_headers)
-
     graph_operation_states = []
-    
+
+    # Process outbound emails (now with indexing). Per-item send failures are
+    # returned as op-states so a swallowed failure escalates the health rail.
+    _extend_operation_states(
+        graph_operation_states,
+        send_outboxes(user_id, headers, headers_provider=get_graph_headers),
+    )
+
     # Scan for client replies (inbox - catch all replies, not just unread)
     print(f"\n🔍 Scanning inbox for client replies...")
     graph_operation_states.append(
@@ -277,10 +296,16 @@ def refresh_and_process_user(user_id: str):
         print("ℹ️ Stored processing failure replay disabled; failures remain visible for review")
 
     # Retry any pending responses that failed to send previously
-    process_pending_responses(user_id, get_graph_headers())
+    _extend_operation_states(
+        graph_operation_states,
+        process_pending_responses(user_id, get_graph_headers()),
+    )
 
     # Check and send follow-up emails for threads without responses
-    check_and_send_followups(user_id, get_graph_headers())
+    _extend_operation_states(
+        graph_operation_states,
+        check_and_send_followups(user_id, get_graph_headers()),
+    )
 
     # Auto-cleanup Firestore if collections are getting large (stay within free tier)
     auto_cleanup_firestore(user_id)

@@ -130,7 +130,7 @@ class PendingResponsesTests(unittest.TestCase):
         }), patch.object(pending_responses, "find_matching_sent_message_for_retry", return_value=None):
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
-        self.assertEqual(sent, 0)
+        self.assertEqual([s for s in sent if s.get("status") == "healthy"], [])
         retry_payload = active_doc.reference.update_calls[-1]
         self.assertEqual(retry_payload["attempts"], 2)
         self.assertEqual(retry_payload["lastError"], "HTTP 429 rate limited after 3 attempts")
@@ -157,7 +157,7 @@ class PendingResponsesTests(unittest.TestCase):
         }):
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
-        self.assertEqual(sent, 0)
+        self.assertEqual([s for s in sent if s.get("status") == "healthy"], [])
         self.assertTrue(active_doc.reference.deleted)
         self.assertEqual([], active_doc.reference.update_calls)
         dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
@@ -192,7 +192,7 @@ class PendingResponsesTests(unittest.TestCase):
         }), patch.object(pending_responses, "find_matching_sent_message_for_retry", return_value=None):
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
-        self.assertEqual(sent, 0)
+        self.assertEqual([s for s in sent if s.get("status") == "healthy"], [])
         self.assertEqual([], active_doc.reference.update_calls)
         self.assertTrue(active_doc.reference.deleted)
         dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
@@ -238,7 +238,7 @@ class PendingResponsesTests(unittest.TestCase):
         ) as sent_guard:
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
-        self.assertEqual(sent, 0)
+        self.assertEqual([s for s in sent if s.get("status") == "healthy"], [])
         sent_guard.assert_called_once()
         self.assertEqual(sent_guard.call_args.kwargs["subject"], "0 Gemini Ave, Houston")
         self.assertEqual(sent_guard.call_args.kwargs["conversation_id"], "conv-1")
@@ -293,7 +293,7 @@ class PendingResponsesTests(unittest.TestCase):
         ) as continuation_guard:
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
-        self.assertEqual(sent, 0)
+        self.assertEqual([s for s in sent if s.get("status") == "healthy"], [])
         continuation_guard.assert_called_once()
         self.assertEqual(continuation_guard.call_args.kwargs["conversation_id"], "conv-1")
         self.assertTrue(active_doc.reference.deleted)
@@ -330,7 +330,7 @@ class PendingResponsesTests(unittest.TestCase):
         ):
             sent = pending_responses.process_pending_responses("uid-1", {"Authorization": "Bearer token"})
 
-        self.assertEqual(sent, 0)
+        self.assertEqual([s for s in sent if s.get("status") == "healthy"], [])
         self.assertTrue(active_doc.reference.deleted)
         self.assertEqual([], active_doc.reference.update_calls)
         dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
