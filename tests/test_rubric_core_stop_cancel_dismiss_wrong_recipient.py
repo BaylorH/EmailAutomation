@@ -31,6 +31,15 @@ class FakeDoc:
         return self._data
 
 
+class _FakeSnap:
+    def __init__(self, data):
+        self._data = data
+        self.exists = data is not None
+
+    def to_dict(self):
+        return dict(self._data) if self._data is not None else None
+
+
 class FakeFirestoreNode:
     def __init__(self, root, path=None):
         self.root = root
@@ -41,6 +50,9 @@ class FakeFirestoreNode:
 
     def document(self, name):
         return FakeFirestoreNode(self.root, self.path + ["document", name])
+
+    def get(self):
+        return _FakeSnap(self.root.seeded.get(tuple(self.path)))
 
     def set(self, data, merge=False):
         self.root.set_calls.append((tuple(self.path), data, merge))
@@ -54,9 +66,24 @@ class FakeFirestore:
     def __init__(self):
         self.set_calls = []
         self.add_calls = []
+        self.seeded = {}
 
     def collection(self, name):
         return FakeFirestoreNode(self, ["collection", name])
+
+    def seed_thread(self, user_id, thread_id, thread_data, message_ids=()):
+        # #16 thread-binding validation re-reads the server-side thread + reply
+        # target; seed them so a valid (uncancelled) dashboard reply passes and
+        # the cancel/wrong-recipient gate (not a missing thread) governs.
+        tpath = (
+            "collection", "users", "document", user_id,
+            "collection", "threads", "document", str(thread_id),
+        )
+        self.seeded[tpath] = thread_data
+        for mid in message_ids:
+            self.seeded[tpath + ("collection", "messages", "document", str(mid))] = {
+                "sourceMessage": {"graphMessageId": str(mid)},
+            }
 
 
 class StopCancelDismissWrongRecipientTest(unittest.TestCase):
@@ -99,6 +126,11 @@ class StopCancelDismissWrongRecipientTest(unittest.TestCase):
         queued = self._sendable_queued_snapshot()
         doc = FakeDoc(queued, doc_id="outbox-wrongrcpt-1")
         fake_fs = FakeFirestore()
+        fake_fs.seed_thread(
+            "uid-1", "thread-1",
+            {"clientId": "client-1", "status": "active", "rowNumber": 20},
+            message_ids=["graph-message-1"],
+        )
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \

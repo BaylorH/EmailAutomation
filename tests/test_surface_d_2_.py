@@ -65,6 +65,21 @@ class _RecNode:
     def get(self):
         if self.path == [("c", "users"), ("d", self.root.user_id)]:
             return _FakeSnap(self.root.user_data, exists=True)
+        # #16 pre-send thread-binding validation re-reads the server-side thread
+        # doc and the reply-target message doc under it. Serve seeded ones so a
+        # valid dashboard reply passes validation and reaches the manual-
+        # continuation guard rather than failing "thread_not_found".
+        base = [("c", "users"), ("d", self.root.user_id), ("c", "threads")]
+        if len(self.path) == 4 and self.path[:3] == base:
+            thread = self.root.threads.get(self.path[3][1])
+            return _FakeSnap(thread or {}, exists=thread is not None)
+        if (
+            len(self.path) == 6
+            and self.path[:3] == base
+            and self.path[4] == ("c", "messages")
+        ):
+            key = (self.path[3][1], self.path[5][1])
+            return _FakeSnap({}, exists=key in self.root.thread_messages)
         return _FakeSnap(exists=False)
 
     def add(self, data):
@@ -83,10 +98,15 @@ class _RecNode:
 
 
 class _RecFS:
-    def __init__(self, user_id="uid-1", user_data=None, outbox_docs=None):
+    def __init__(self, user_id="uid-1", user_data=None, outbox_docs=None,
+                 threads=None, thread_messages=None):
         self.user_id = user_id
         self.user_data = user_data or {}
         self.outbox_docs = outbox_docs or []
+        # #16 thread-binding validation: seeded server-side threads and the
+        # (thread_id, message_id) pairs recorded under them.
+        self.threads = threads or {}
+        self.thread_messages = set(thread_messages or ())
         self.adds = []
         self.sets = []
         self.updates = []
@@ -276,7 +296,13 @@ class SignatureIdentityManualContinuationTest(unittest.TestCase):
             "lastError": "prior send timed out",
         }, doc_id="outbox-manual-cont")
 
-        fake_fs = _RecFS()
+        # Seed the open server-side thread + recorded reply target so #16's
+        # thread-binding validation passes and execution reaches the #15
+        # manual-continuation guard (the behavior under test).
+        fake_fs = _RecFS(
+            threads={"thread-xyz": {"clientId": "client-1", "status": "active"}},
+            thread_messages={("thread-xyz", "msg-abc")},
+        )
         send_and_index = MagicMock()
         send_reply = MagicMock()
 

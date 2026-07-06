@@ -42,6 +42,15 @@ class FakeDoc:
         return self._data
 
 
+class _FakeSnap:
+    def __init__(self, data):
+        self._data = data
+        self.exists = data is not None
+
+    def to_dict(self):
+        return dict(self._data) if self._data is not None else None
+
+
 class FakeNode:
     def __init__(self, root, path):
         self.root = root
@@ -52,6 +61,9 @@ class FakeNode:
 
     def document(self, name):
         return FakeNode(self.root, self.path + ["document", name])
+
+    def get(self):
+        return _FakeSnap(self.root.seeded.get(tuple(self.path)))
 
     def set(self, data, merge=False):
         self.root.set_calls.append((tuple(self.path), data, merge))
@@ -65,9 +77,25 @@ class FakeFirestore:
     def __init__(self):
         self.set_calls = []
         self.add_calls = []
+        self.seeded = {}
 
     def collection(self, name):
         return FakeNode(self, ["collection", name])
+
+    def seed_thread(self, user_id, thread_id, thread_data, message_ids=()):
+        # #16 thread-binding validation re-reads the server-side thread and the
+        # recorded reply-target message. Seed both so a valid dashboard reply
+        # passes validation and the stop/cancel/continuation guards (not a
+        # missing thread) govern the outcome.
+        tpath = (
+            "collection", "users", "document", user_id,
+            "collection", "threads", "document", str(thread_id),
+        )
+        self.seeded[tpath] = thread_data
+        for mid in message_ids:
+            self.seeded[tpath + ("collection", "messages", "document", str(mid))] = {
+                "sourceMessage": {"graphMessageId": str(mid)},
+            }
 
     # -- convenience views over recorded writes -----------------------------
     def audit_payloads(self):
@@ -153,6 +181,13 @@ class ComboStopCancelDuringClaimTests(unittest.TestCase):
         """
         doc = FakeDoc(dict(queued), doc_id=queued.get("_docId", "outbox-1"))
         fake_fs = FakeFirestore()
+        # Seed the open server-side thread + reply target for the reply-anchored
+        # snapshots so #16 thread-binding validation passes.
+        fake_fs.seed_thread(
+            self.UID, "thread-1",
+            {"clientId": "client-1", "status": "active", "rowNumber": 20},
+            message_ids=["graph-message-1"],
+        )
         fresh = live_data if live_data is not None else queued
 
         retry_result = retry_result or {}

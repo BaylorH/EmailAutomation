@@ -118,6 +118,21 @@ class FakeFirestore:
         )
         self.seeded[path] = client_data
 
+    def seed_thread(self, user_id, thread_id, thread_data, message_ids=()):
+        # #16 pre-send thread-binding validation re-reads the server-side thread
+        # (must exist, be open, match the item's clientId) and confirms the
+        # replyToMessageId is a recorded message under it. Seed both so a valid
+        # dashboard reply passes validation and reaches the send path.
+        tpath = (
+            "collection", "users", "document", user_id,
+            "collection", "threads", "document", str(thread_id),
+        )
+        self.seeded[tpath] = thread_data
+        for mid in message_ids:
+            self.seeded[tpath + ("collection", "messages", "document", str(mid))] = {
+                "sourceMessage": {"graphMessageId": str(mid)},
+            }
+
     def collection(self, name):
         return FakeFirestoreNode(self, ["collection", name])
 
@@ -265,6 +280,14 @@ class StopCancelDismissManualContinuationTest(unittest.TestCase):
         doc = FakeDoc(queued, doc_id="outbox-mancont-1")
         fake_fs = FakeFirestore()
         fake_fs.seed_client("uid-1", self.CLIENT_ID, client_data)
+        # The thread is open (the CLIENT may be stopped; the thread itself is
+        # active) with the reply target recorded, so #16's thread-binding
+        # validation passes and the stop/no-stop decision governs the send.
+        fake_fs.seed_thread(
+            "uid-1", "thread-1",
+            {"clientId": self.CLIENT_ID, "status": "active", "rowNumber": 20},
+            message_ids=["graph-message-1"],
+        )
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \

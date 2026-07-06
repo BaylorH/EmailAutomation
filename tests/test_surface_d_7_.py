@@ -381,9 +381,16 @@ class ReplyAllManualContinuationTests(unittest.TestCase):
              mock.patch.object(pending_mod, "find_matching_sent_message_for_retry", return_value=None), \
              mock.patch.object(pending_mod, "find_sent_conversation_continuation_for_retry", return_value=continuation), \
              mock.patch.object(pending_mod, "_move_pending_response_to_dead_letter", dead_letter_spy):
-            sent_count = pending_mod.process_pending_responses(self.USER_ID, {"Authorization": "Bearer fake"})
+            op_states = pending_mod.process_pending_responses(self.USER_ID, {"Authorization": "Bearer fake"})
 
-        self.assertEqual(0, sent_count, "no reply-all should be sent on manual continuation")
+        # #20 GO-condition: process_pending_responses now returns a list of Graph
+        # operation-states, not an int send count. A manual continuation defers
+        # to dead-letter without sending, so NO error op-state surfaces.
+        self.assertIsInstance(op_states, list)
+        self.assertEqual(
+            [], [s for s in op_states if s.get("status") == "error"],
+            "no reply-all should be sent (or fail) on manual continuation",
+        )
         send_spy.assert_not_called()
         dead_letter_spy.assert_called_once()
         reason = dead_letter_spy.call_args.args[3]
