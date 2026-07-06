@@ -1360,6 +1360,76 @@ def _clear_thread_action_notifications(
         return 0
 
 
+def _resume_paused_thread_after_manual_continuation(
+    user_id: str,
+    headers: Dict[str, str],
+    thread_id: str,
+    thread_data: Dict[str, Any],
+    msg: Dict[str, Any],
+) -> bool:
+    """Handle an operator's out-of-band manual reply on a paused/escalated thread.
+
+    When the operator replies to an escalated thread directly from Outlook (a
+    Sent-Items continuation) instead of using the dashboard, the escalation's
+    open ``action_needed`` notification and the ``paused`` thread status become
+    stale — the thread would otherwise stay paused forever. On the next scan we
+    detect the operator's manual continuation (a Sent-Items message in the same
+    conversation sent after the thread was paused) and, when found:
+
+    (a) clear the stale open ``action_needed`` notification for the thread, and
+    (b) resume (unpause) the thread so processing continues normally.
+
+    Returns True when the thread was resumed. Conservative on failure: if the
+    Sent Items guard is unreadable we leave the escalation visible.
+    """
+    if (thread_data or {}).get("status") != THREAD_STATUS["paused"]:
+        return False
+
+    conversation_id = msg.get("conversationId")
+    if not conversation_id:
+        return False
+
+    # Anchor on when the thread was paused/escalated — the operator's manual
+    # continuation would have been sent after that point.
+    paused_after = _timestamp_to_utc(
+        (thread_data or {}).get("statusUpdatedAt")
+        or (thread_data or {}).get("updatedAt")
+    )
+    if not paused_after:
+        return False
+
+    try:
+        manual_continuation = find_sent_conversation_continuation_for_retry(
+            headers,
+            conversation_id=conversation_id,
+            sent_after=paused_after,
+        )
+    except SentMailGuardLookupError as e:
+        # Sent Items unreadable: stay conservative and leave the escalation visible.
+        print(
+            f"⚠️ Could not verify operator manual continuation for paused thread "
+            f"{thread_id[:20]}...: {e}"
+        )
+        return False
+
+    if not manual_continuation:
+        return False
+
+    client_id = (thread_data or {}).get("clientId")
+    _clear_thread_action_notifications(user_id, client_id, thread_id)
+    update_thread_status(
+        user_id,
+        thread_id,
+        THREAD_STATUS["active"],
+        "manual_continuation_resumed",
+    )
+    print(
+        f"▶️ Resumed paused thread {thread_id[:20]}... after operator manually "
+        "continued the conversation out-of-band; cleared stale action notification"
+    )
+    return True
+
+
 TERMINAL_THREAD_STATUSES = {THREAD_STATUS["completed"], THREAD_STATUS["stopped"]}
 NON_PENDING_OUTBOX_STATUSES = {
     "cancel_requested",
@@ -3155,6 +3225,18 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             f"⏹️ Client automation is paused/stopped for thread {thread_id[:20]}...; "
             "saving inbound message for history only"
         )
+
+    # If the operator manually replied to a paused/escalated thread directly from
+    # Outlook (out-of-band Sent-Items continuation) instead of using the dashboard,
+    # clear the stale open action_needed notification and resume the thread so
+    # processing continues normally rather than staying paused forever.
+    if thread_status == THREAD_STATUS["paused"] and not client_paused:
+        if _resume_paused_thread_after_manual_continuation(
+            user_id, headers, thread_id, thread_data, msg
+        ):
+            thread_data["status"] = THREAD_STATUS["active"]
+            thread_data["statusReason"] = "manual_continuation_resumed"
+            thread_status = THREAD_STATUS["active"]
 
     # Terminal threads keep late replies for history but must not generate new AI work or auto-replies,
     # except when the user approved a same-contact replacement property in this email thread.
