@@ -3506,17 +3506,24 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         # Update thread status to paused - waiting for user to handle call
                         update_thread_status(user_id, thread_id, THREAD_STATUS["paused"], "call_requested")
 
-                        # If phone number is provided, skip email response (just notification)
-                        # If no phone number, we'll send a brief response asking for it
+                        # A call request ALWAYS escalates to the operator — never auto-reply,
+                        # whether or not a phone number was included. LIVE break: a broker who
+                        # asked to "talk over the phone" (no number) fell through to the
+                        # phone-number-ask AND the missing-fields auto-reply paths below,
+                        # talking over the human handoff (only an incidental reply-all filter
+                        # stopped delivery). Suppress the response unconditionally so the
+                        # operator handles the call; this matches the deterministic guard that
+                        # already nulls response_email for call_requested.
+                        proposal["skip_response"] = True
                         if phone_number:
                             print(f"📞 Phone number found - skipping email response, notification only")
-                            # Mark that we should skip the normal email response
-                            proposal["skip_response"] = True
-                            # Highlight blue - row needs user attention (paused)
-                            try:
-                                highlight_row(sheet_id, rownum, ROW_HIGHLIGHT_BLUE)
-                            except Exception as e:
-                                print(f"⚠️ Could not highlight row: {e}")
+                        else:
+                            print(f"📞 No phone number - escalating to operator, skipping email response")
+                        # Highlight blue - row needs user attention (paused)
+                        try:
+                            highlight_row(sheet_id, rownum, ROW_HIGHLIGHT_BLUE)
+                        except Exception as e:
+                            print(f"⚠️ Could not highlight row: {e}")
                     except Exception as e:
                         print(f"❌ Failed to write call_requested notification: {e}")
 
