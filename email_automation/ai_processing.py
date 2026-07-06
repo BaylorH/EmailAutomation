@@ -1303,6 +1303,32 @@ _OPS_EX_RE = re.compile(
     r"\$\s*([0-9]{1,3}(?:\.[0-9]{1,2})?)",
     re.IGNORECASE,
 )
+# A rent keyword immediately preceding a $ figure marks that figure as the RENT
+# line. "nnn" is the ONLY lease-basis word in the OpEx label set above, so a
+# figure-first hit ending in "nnn" ("Rent $0.82 NNN") is ambiguous: the NNN is
+# the rent's triple-net BASIS, not a separate OpEx figure. Guard #19's extractor
+# from mistaking such a rent line for OpEx (which would overwrite a valid LLM
+# OpEx and land rent+opex on mixed bases before #15 annualizes).
+_RENT_KW_BEFORE_FIGURE_RE = re.compile(
+    r"(?:asking|base\s+rent|lease\s+rate|rent|rate)\b[^\d$]{0,10}$",
+    re.IGNORECASE,
+)
+
+
+def _opex_match_is_rent_basis_line(text: str, m: "re.Match") -> bool:
+    """True when a figure-first OpEx hit is really the rent line's NNN basis.
+
+    Only the bare "nnn" label is ambiguous (cam/tmi/opex/operating-expense are
+    unambiguous OpEx labels). When such a figure is immediately preceded by a
+    rent keyword, it is the asking rent stated on a triple-net basis, so it must
+    not be mined as OpEx.
+    """
+    if m.group(1) is None:
+        return False  # keyword-first hit ($ after the label) is a genuine OpEx figure
+    if not m.group(0).rstrip().lower().endswith("nnn"):
+        return False
+    before = text[max(0, m.start() - 26): m.start()]
+    return bool(_RENT_KW_BEFORE_FIGURE_RE.search(before))
 # Total SF as an area (thousands-grouped or 4+ digits), not a $/SF rate figure.
 _TOTAL_SF_RE = re.compile(
     r"(?<![\w$/.])((?:\d{1,3}(?:,\d{3})+)|\d{4,})\s*(?:sf|sq\.?\s*ft|square\s*f(?:ee|oo)t)\b",
@@ -1548,15 +1574,21 @@ def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
             if annual >= 0.01:
                 return f"{annual:.2f}"
 
-    m = _OPS_EX_RE.search(text)
-    if m and not _HYPOTHETICAL_RENT_RE.search(text[max(0, m.start() - 40): m.end()]):
+    for m in _OPS_EX_RE.finditer(text):
+        if _HYPOTHETICAL_RENT_RE.search(text[max(0, m.start() - 40): m.end()]):
+            continue
+        # Skip a rent-basis line ("Rent $0.82 NNN") so the rent figure is never
+        # mined as OpEx; keep scanning for a genuine OpEx figure downstream.
+        if _opex_match_is_rent_basis_line(text, m):
+            continue
         raw = m.group(1) or m.group(2)
-        if raw is not None:
-            val = float(raw)
-            window = text[max(0, m.start() - 15): min(len(text), m.end() + 25)]
-            annual = val * 12 if _is_monthly_context(window) else val
-            if annual >= 0.01:
-                return f"{annual:.2f}"
+        if raw is None:
+            continue
+        val = float(raw)
+        window = text[max(0, m.start() - 15): min(len(text), m.end() + 25)]
+        annual = val * 12 if _is_monthly_context(window) else val
+        if annual >= 0.01:
+            return f"{annual:.2f}"
     return None
 
 
