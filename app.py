@@ -186,7 +186,7 @@ def _require_json_object():
     return data, None
 
 
-def verify_firebase_token(f):
+def verify_firebase_token(f=None, *, check_revoked=False):
     """
     Decorator: require a valid Firebase ID token on a mutating/send-capable route.
 
@@ -194,30 +194,44 @@ def verify_firebase_token(f):
     SDK, and stashes the verified uid on `g.firebase_uid`. Any missing / malformed
     / unverifiable token fails closed with 401. The verified uid is the ONLY
     trusted source of identity — handlers must ignore body/session uid.
-    """
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "") or ""
-        if not auth_header.startswith("Bearer "):
-            return jsonify({"success": False, "error": "Authentication required"}), 401
-        token = auth_header[len("Bearer "):].strip()
-        if not token:
-            return jsonify({"success": False, "error": "Authentication required"}), 401
-        if firebase_auth is None:
-            print("❌ Firebase auth unavailable; rejecting authenticated request", flush=True)
-            return jsonify({"success": False, "error": "Authentication unavailable"}), 401
-        try:
-            decoded = firebase_auth.verify_id_token(token)
-        except Exception as e:
-            print(f"⚠️ Firebase token verification failed: {type(e).__name__}", flush=True)
-            return jsonify({"success": False, "error": "Invalid authentication token"}), 401
-        uid = decoded.get("uid") if isinstance(decoded, dict) else None
-        if not _is_nonempty_str(uid):
-            return jsonify({"success": False, "error": "Invalid authentication token"}), 401
-        g.firebase_uid = uid
-        return f(*args, **kwargs)
 
-    return wrapper
+    Usable bare (``@verify_firebase_token``) or parameterized
+    (``@verify_firebase_token(check_revoked=True)``). When ``check_revoked`` is
+    True the token is additionally checked against Firebase for revocation /
+    disabled-user state — reserved for destructive routes where a stale-but-
+    unexpired token from a revoked operator must not act. It costs one extra
+    Admin round-trip, so the default stays False for high-volume routes.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            auth_header = request.headers.get("Authorization", "") or ""
+            if not auth_header.startswith("Bearer "):
+                return jsonify({"success": False, "error": "Authentication required"}), 401
+            token = auth_header[len("Bearer "):].strip()
+            if not token:
+                return jsonify({"success": False, "error": "Authentication required"}), 401
+            if firebase_auth is None:
+                print("❌ Firebase auth unavailable; rejecting authenticated request", flush=True)
+                return jsonify({"success": False, "error": "Authentication unavailable"}), 401
+            try:
+                decoded = firebase_auth.verify_id_token(token, check_revoked=check_revoked)
+            except Exception as e:
+                print(f"⚠️ Firebase token verification failed: {type(e).__name__}", flush=True)
+                return jsonify({"success": False, "error": "Invalid authentication token"}), 401
+            uid = decoded.get("uid") if isinstance(decoded, dict) else None
+            if not _is_nonempty_str(uid):
+                return jsonify({"success": False, "error": "Invalid authentication token"}), 401
+            g.firebase_uid = uid
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    # Bare usage: @verify_firebase_token
+    if f is not None:
+        return decorator(f)
+    # Parameterized usage: @verify_firebase_token(check_revoked=True)
+    return decorator
 
 
 # Get the base URL for redirect URI
@@ -716,7 +730,7 @@ scheduler_status = {"running": False, "last_run": None, "last_result": None}
 _scheduler_lock = threading.Lock()
 
 @app.route("/api/trigger-scheduler", methods=["POST"])
-@verify_firebase_token
+@verify_firebase_token(check_revoked=True)
 def api_trigger_scheduler():
     """
     API endpoint to manually trigger the email scheduler.
@@ -2597,7 +2611,7 @@ def api_firestore_inspect():
 
 
 @app.route("/api/firestore-cleanup", methods=["POST"])
-@verify_firebase_token
+@verify_firebase_token(check_revoked=True)
 def api_firestore_cleanup():
     """
     Clean up stale Firestore data.
@@ -2737,7 +2751,7 @@ def api_firestore_cleanup():
 
 
 @app.route("/api/clear-outlook-emails", methods=["POST"])
-@verify_firebase_token
+@verify_firebase_token(check_revoked=True)
 def api_clear_outlook_emails():
     """
     Clear campaign-related emails from Outlook (SentItems and optionally Inbox).

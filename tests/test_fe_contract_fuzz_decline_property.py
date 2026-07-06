@@ -167,11 +167,32 @@ class DeclinePropertyFuzz(unittest.TestCase):
         # A caller naming another tenant's uid + that tenant's sheetId must be
         # refused: identity/authorisation come from the TOKEN uid's client
         # (resolved sheet "s1"), so a foreign sheetId never matches.
+        #
+        # The lookup mock enforces the boundary directly: it FAILS if the handler
+        # ever resolves the client config from the body-supplied uid instead of
+        # the authenticated token uid ("u1"). A bare return_value would pass even
+        # if the handler looked up `_get_client_config("victim-uid", ...)`, so the
+        # 403 alone wouldn't prove the token uid drove the lookup.
+        seen_uids = []
+
+        def _config_for(uid, *args, **kwargs):
+            seen_uids.append(uid)
+            self.assertEqual(
+                uid, "u1",
+                "client-config lookup must use the authenticated TOKEN uid, "
+                f"not a body-supplied uid; got {uid!r}",
+            )
+            return ("s1", None, None)
+
         with patch("email_automation.clients._get_client_config",
-                   return_value=("s1", None, None)):
+                   side_effect=_config_for):
             r = self.post(self.valid(uid="victim-uid", sheetId="victim-sheet",
                                      rowNumber=3))
         self.assertEqual(r.status_code, 403, r.get_json())
+        self.assertIn("u1", seen_uids,
+                      "handler never resolved the client config from the token uid")
+        self.assertNotIn("victim-uid", seen_uids,
+                         "handler leaked the body-supplied uid into the client-config lookup")
         self.assert_not_deleted()
         self.assert_no_send()
 
