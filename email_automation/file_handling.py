@@ -763,7 +763,7 @@ def _linked_asset_stub_entry(
     method: str,
     source_type: str,
     error: str,
-    **flags: Any,
+    **flags: bool,
 ) -> Dict[str, Any]:
     """Build a non-content manifest entry (manual-review or failed-download).
 
