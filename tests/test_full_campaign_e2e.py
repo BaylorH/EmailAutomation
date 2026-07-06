@@ -806,15 +806,21 @@ class FullCampaignE2ETests(unittest.TestCase):
         self.assertEqual(f"{PROPERTY_ADDRESS}, {CITY}", result["targetAnchor"])
         applied = {a["column"]: a for a in result["applied"]}
         self.assertEqual("Sheet1!E3", applied["Total SF"]["range"])  # E=col5, row 3
-        self.assertEqual("18,500", applied["Total SF"]["newValue"])
+        # The deterministic Total SF extractor normalizes to a plain integer
+        # (comma stripped) — the canonical sheet-numeric form used across the
+        # codebase (battery tests write "12000"/"2000"/"9000") — and overwrites
+        # the LLM's comma-formatted "18,500". Same value, canonical form.
+        self.assertEqual("18500", applied["Total SF"]["newValue"])
         # the write really landed on row 3 of the fake grid
-        self.assertEqual("18,500", world.grid[3][4])
+        self.assertEqual("18500", world.grid[3][4])
 
     def test_stage8_followup_withholds_after_broker_reply(self):
         world = World()
         with patched(world):
             sent, paused = _drive_through(world, 8)["followup"]
-        self.assertEqual(0, sent)
+        # #20: check_and_send_followups now returns a Graph op-state list; a
+        # withheld follow-up sends nothing, so the list is empty (no error state).
+        self.assertEqual([], sent)
         # proves the WITHHOLD happened via the real broker-reply pause branch
         self.assertEqual("paused", paused)
         # gate discriminates: terminal blocks, active-due does not
@@ -872,8 +878,9 @@ class FullCampaignE2ETests(unittest.TestCase):
             sheet_result = out["sheet"]
             self.assertEqual(f"{PROPERTY_ADDRESS}, {CITY}", sheet_result["targetAnchor"])
             self.assertTrue(all(a["range"].endswith("3") for a in sheet_result["applied"]))
-            # follow-up gate withheld after reply (0 sent, thread paused by real gate)
-            self.assertEqual((0, "paused"), out["followup"])
+            # follow-up gate withheld after reply (#20 op-state list empty -> no
+            # send, thread paused by the real broker-reply gate)
+            self.assertEqual(([], "paused"), out["followup"])
             # completion: terminal, no further sends, no stuck/hidden-failed item
             sends_before, sends_after, status, health = out["completion"]
             self.assertEqual(sends_before, sends_after)

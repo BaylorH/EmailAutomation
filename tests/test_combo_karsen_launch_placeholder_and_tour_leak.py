@@ -357,14 +357,19 @@ class KarsenLaunchPlaceholderAndTourLeakComboTests(unittest.TestCase):
 
     def test_only_the_clean_viable_reply_sends_across_the_whole_deck(self):
         docs = self._build_queue()
-        fake_fs, recorder, sent_count = self._run_queue(docs)
+        fake_fs, recorder, op_states = self._run_queue(docs)
 
         # --- CORE INTERACTION INVARIANT: exactly ONE real send, and it is the
         # clean/viable doc carrying its OWN anchor (thread/recipient/msg). If a
         # placeholder, tour body, already-sent, or manually-continued sibling had
         # leaked into the send lane -- or the clean send borrowed a neighbor's
-        # anchor -- this assertion goes red.
-        self.assertEqual(1, sent_count)
+        # anchor -- this assertion goes red. (#20: process_pending_responses now
+        # returns a Graph op-state list; exactly one HEALTHY send op-state.)
+        self.assertEqual(
+            1, len([s for s in op_states if s.get("status") == "healthy"]),
+            "exactly one clean reply may reach a real send",
+        )
+        self.assertEqual([], [s for s in op_states if s.get("status") == "error"])
         self.assertEqual(1, len(recorder.calls),
                          "Exactly one reply may reach a real Graph send across the deck.")
         call = recorder.calls[0]
@@ -435,9 +440,13 @@ class KarsenLaunchPlaceholderAndTourLeakComboTests(unittest.TestCase):
              patch("email_automation.sent_mail_guard.requests.get", fake_graph.get), \
              patch("email_automation.sent_mail_guard.exponential_backoff_request",
                    side_effect=lambda fn: fn()):
-            sent_count = pending_responses.process_pending_responses(self.UID, self.HEADERS)
+            op_states = pending_responses.process_pending_responses(self.UID, self.HEADERS)
 
-        self.assertEqual(1, sent_count)
+        self.assertEqual(
+            1, len([s for s in op_states if s.get("status") == "healthy"]),
+            "the clean, uncollided reply sends exactly once",
+        )
+        self.assertEqual([], [s for s in op_states if s.get("status") == "error"])
         self.assertEqual(1, len(recorder.calls))
         self.assertEqual("thread-clean", recorder.calls[0]["thread_id"])
         self.assertTrue(docs["D"].reference.deleted)
