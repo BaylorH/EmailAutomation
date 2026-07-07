@@ -379,13 +379,17 @@ def get_default_mode_for_canonical(canonical: str) -> str:
         return "skip"
 
 
-def detect_column_mapping(headers: List[str], use_ai: bool = True) -> Dict[str, Any]:
+def detect_column_mapping(headers: List[str], use_ai: bool = True,
+                          db: Any = None, user_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Detect column mappings from sheet headers.
 
     Args:
         headers: List of column header strings from the sheet
         use_ai: If True, uses AI for semantic matching. If False, uses simple alias matching.
+        db: Optional Firestore handle. When provided with user_id, the AI matching
+            call is metered. No-op otherwise (behavior-neutral).
+        user_id: Optional user id for usage metering (see db).
 
     Returns:
         {
@@ -421,7 +425,8 @@ def detect_column_mapping(headers: List[str], use_ai: bool = True) -> Dict[str, 
         unmapped_canonicals = [c for c in CANONICAL_FIELDS if c not in mappings]
 
         if unmapped_headers and unmapped_canonicals:
-            ai_mappings = _ai_match_columns(unmapped_headers, unmapped_canonicals)
+            ai_mappings = _ai_match_columns(unmapped_headers, unmapped_canonicals,
+                                            db=db, user_id=user_id)
             for canonical, (header, conf) in ai_mappings.items():
                 if header not in mapped_headers:
                     mappings[canonical] = header
@@ -448,10 +453,15 @@ def detect_column_mapping(headers: List[str], use_ai: bool = True) -> Dict[str, 
     }
 
 
-def _ai_match_columns(headers: List[str], canonicals: List[str]) -> Dict[str, tuple]:
+def _ai_match_columns(headers: List[str], canonicals: List[str],
+                      db: Any = None, user_id: Optional[str] = None) -> Dict[str, tuple]:
     """
     Use AI to semantically match remaining headers to canonical fields.
     Returns: {"canonical": ("header", confidence), ...}
+
+    db / user_id are optional. When BOTH are provided, the paid OpenAI call is
+    metered via track_openai_usage_safely; otherwise metering is a no-op (no
+    live caller threads them today, so this stays behavior-neutral).
     """
     try:
         from .clients import client  # OpenAI client
@@ -481,6 +491,23 @@ Only include matches you're confident about (>0.7). Skip fields with no good mat
             input=[{"role": "user", "content": prompt}],
             temperature=0.1
         )
+
+        # Best-effort usage metering — no-op unless a caller supplies db + user_id.
+        if db is not None and user_id:
+            from .openai_usage import track_openai_usage_safely
+            track_openai_usage_safely(
+                db=db,
+                user_id=user_id,
+                operation="sheet.ai_match_columns",
+                model="gpt-4o-mini",
+                usage=getattr(response, "usage", None),
+                request_id=getattr(response, "id", None),
+                endpoint="responses",
+                metadata={
+                    "headerCount": len(headers or []),
+                    "canonicalCount": len(canonicals or []),
+                },
+            )
 
         raw = response.output_text.strip()
         if raw.startswith("```"):

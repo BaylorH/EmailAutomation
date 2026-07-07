@@ -599,8 +599,14 @@ class OpenAIProvider(ABC):
     def chat_completion(self, messages: List[Dict[str, str]],
                         model: str = None,
                         temperature: float = 0.3,
-                        response_format: Dict = None) -> str:
-        """Get a chat completion. Returns the assistant's response content."""
+                        response_format: Dict = None,
+                        db: Any = None,
+                        user_id: Optional[str] = None) -> str:
+        """Get a chat completion. Returns the assistant's response content.
+
+        db / user_id are optional usage-metering hooks: when both are supplied the
+        paid call is metered, otherwise metering is a no-op.
+        """
         pass
 
     @abstractmethod
@@ -622,9 +628,12 @@ class RealOpenAIProvider(OpenAIProvider):
     def chat_completion(self, messages: List[Dict[str, str]],
                         model: str = None,
                         temperature: float = 0.3,
-                        response_format: Dict = None) -> str:
+                        response_format: Dict = None,
+                        db: Any = None,
+                        user_id: Optional[str] = None) -> str:
+        resolved_model = model or self.model
         kwargs = {
-            "model": model or self.model,
+            "model": resolved_model,
             "messages": messages,
             "temperature": temperature
         }
@@ -632,6 +641,21 @@ class RealOpenAIProvider(OpenAIProvider):
             kwargs["response_format"] = response_format
 
         response = self.client.chat.completions.create(**kwargs)
+
+        # Best-effort usage metering — no-op unless a caller supplies db + user_id.
+        if db is not None and user_id:
+            from email_automation.openai_usage import track_openai_usage_safely
+            track_openai_usage_safely(
+                db=db,
+                user_id=user_id,
+                operation="provider.chat_completion",
+                model=resolved_model,
+                usage=getattr(response, "usage", None),
+                request_id=getattr(response, "id", None),
+                endpoint="chat.completions",
+                metadata={"messageCount": len(messages or [])},
+            )
+
         return response.choices[0].message.content
 
     def upload_file(self, content: bytes, filename: str,
