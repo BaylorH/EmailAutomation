@@ -1,6 +1,7 @@
 import json
 import hashlib
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
@@ -2725,6 +2726,454 @@ def apply_proposal_to_sheet(
         print(f"❌ Failed to apply proposal to sheet: {e}")
         return {"applied": [], "skipped": [{"reason": f"exception: {e}"}]}
 
+# ===========================================================================
+# PROMPT DECOMPOSITION (feature-flagged; default OFF)
+# ---------------------------------------------------------------------------
+# When DECOMPOSE_PROMPT is falsy/unset, propose_sheet_updates runs the original
+# single-call gpt-5.2 "monolith" path, byte-for-byte unchanged. When enabled,
+# propose_sheet_updates instead runs _run_decomposed_pipeline, which splits the
+# one multimodal call into cheap, narrow sub-calls:
+#   classify-intent (gpt-4o-mini) -> events[]
+#   extract-fields  (gpt-4o-mini, multimodal) -> updates[]
+#   write-notes     (gpt-4o-mini) -> notes
+#   draft-reply     (gpt-5.2, only when intent permits) -> response_email
+#   assemble        (pure code) -> {updates, events, response_email, notes}
+# The assembled dict has the SAME post-parse shape the monolith's json.loads
+# produces, so it flows through the EXISTING deterministic guard ladder in
+# propose_sheet_updates unchanged. Each sub-call parses defensively and degrades
+# to a safe default; the whole pipeline never raises.
+# ===========================================================================
+
+
+def _decompose_prompt_enabled() -> bool:
+    """Return True when the decomposed multi-call pipeline is enabled.
+
+    Default OFF. Read fresh each call (not cached at import) so the flag can be
+    toggled per-request or in tests without a module reload. Only explicit truthy
+    values enable it; anything else (unset, empty, "0", "false") stays on the
+    unchanged monolith path.
+    """
+    return os.getenv("DECOMPOSE_PROMPT", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _strip_json_code_fence(raw: str) -> str:
+    """Strip a leading/trailing ``` code fence, mirroring the monolith parser."""
+    raw = (raw or "").strip()
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        json_lines = []
+        in_json = False
+        for line in lines:
+            if line.strip().startswith("```"):
+                in_json = not in_json
+                continue
+            if in_json:
+                json_lines.append(line)
+        raw = "\n".join(json_lines)
+    return raw
+
+
+def _parse_json_object(raw: str, default):
+    """Defensive JSON parse for a decomposed sub-call.
+
+    Same discipline as the monolith: strip code fences, json.loads, and on
+    JSONDecodeError (or non-object) return the caller's safe default instead of
+    raising. Keeps a single sub-call failure from crashing propose_sheet_updates.
+    """
+    try:
+        parsed = json.loads(_strip_json_code_fence(raw))
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"⚠️ decomposed sub-call JSON parse failed (safe-default): {e}")
+        return default
+    return parsed if isinstance(parsed, dict) else default
+
+
+def _meter_decomposed_subcall(resp, *, uid, client_id, thread_id, operation, model,
+                              sheet_id, rownum, extra_meta=None) -> None:
+    """Meter one decomposed sub-call so usage stays covered under decomposition.
+
+    Mirrors the monolith's track_openai_usage_safely call (never raises) with a
+    per-sub-call operation label and the correct model for cost attribution.
+    """
+    metadata = {"sheetId": sheet_id, "rowNumber": rownum, "decomposed": True}
+    if extra_meta:
+        metadata.update(extra_meta)
+    track_openai_usage_safely(
+        db=_fs,
+        user_id=uid,
+        client_id=client_id,
+        thread_id=thread_id,
+        operation=operation,
+        model=model,
+        usage=getattr(resp, "usage", None),
+        request_id=getattr(resp, "id", None),
+        endpoint="responses",
+        metadata=metadata,
+    )
+
+
+def _classify_intent(*, event_rules, target_anchor, last_human_message, conversation,
+                     uid, client_id, thread_id, sheet_id, rownum) -> List[dict]:
+    """classify-intent (gpt-4o-mini): LAST HUMAN message -> events[].
+
+    Reuses the monolith EVENT_RULES prose so the 9-type enum + sub-reasons are
+    identical. Emits the same event object shape the monolith emits. Defensive
+    parse; returns [] on any failure (the deterministic event augmenter still
+    re-evaluates the fresh message downstream).
+    """
+    try:
+        last_human_block = ""
+        if last_human_message:
+            last_human_block = (
+                "\nLAST HUMAN MESSAGE (AUTHORITATIVE — detect EVENTS from ONLY this text; "
+                "treat quoted/forwarded reply history in the full thread below as context, "
+                "not live signal):\n"
+                f"{json.dumps(last_human_message)}\n"
+            )
+        prompt = (
+            "You classify the intent of a commercial-real-estate email thread into "
+            "structured EVENTS. Analyze ONLY the LAST HUMAN message for events; the full "
+            "thread is context.\n\n"
+            f"TARGET PROPERTY (canonical identity for matching): {target_anchor}\n\n"
+            f"{event_rules}\n"
+            f"{last_human_block}\n"
+            "CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded "
+            f"history):\n{json.dumps(conversation, indent=2)}\n\n"
+            "OUTPUT ONLY valid JSON in this exact format (the events array may be empty):\n"
+            '{\n'
+            '  "events": [\n'
+            '    {\n'
+            '      "type": "call_requested | property_unavailable | new_property | '
+            'close_conversation | needs_user_input | contact_optout | wrong_contact | '
+            'property_issue | tour_requested",\n'
+            '      "address": "<new_property only>",\n'
+            '      "city": "<new_property only>",\n'
+            '      "email": "<new_property only>",\n'
+            '      "contactName": "<new_property only>",\n'
+            '      "link": "<new_property only>",\n'
+            '      "notes": "<short context / close_conversation reason>",\n'
+            '      "reason": "<needs_user_input | contact_optout | wrong_contact | '
+            'property_unavailable reason enum>",\n'
+            '      "question": "<needs_user_input only>",\n'
+            '      "suggestedContact": "<wrong_contact only>",\n'
+            '      "suggestedEmail": "<wrong_contact only>",\n'
+            '      "suggestedPhone": "<wrong_contact only>",\n'
+            '      "issue": "<property_issue only>",\n'
+            '      "severity": "<property_issue: critical | major | minor>"\n'
+            '    }\n'
+            '  ]\n'
+            '}\n'
+            "Include ONLY the optional fields relevant to each event type; omit the rest."
+        )
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            temperature=0.1,
+        )
+        _meter_decomposed_subcall(
+            resp, uid=uid, client_id=client_id, thread_id=thread_id,
+            operation="ai.classify_intent", model="gpt-4o-mini",
+            sheet_id=sheet_id, rownum=rownum,
+            extra_meta={"conversationMessageCount": len(conversation or [])},
+        )
+        parsed = _parse_json_object(getattr(resp, "output_text", "") or "", default={})
+        events = parsed.get("events")
+        return events if isinstance(events, list) else []
+    except Exception as e:  # noqa: BLE001 — degrade to safe default, never crash the pipeline
+        print(f"⚠️ decomposed classify_intent failed (safe-default []): {e}")
+        return []
+
+
+def _extract_fields(*, column_rules, doc_selection_rules, header, rowvals, rownum,
+                    missing_fields, target_anchor, conversation, pdf_manifest, url_texts,
+                    uid, client_id, thread_id, sheet_id, extraction_fields) -> List[dict]:
+    """extract-fields (gpt-4o-mini, multimodal): message + PDFs/vision -> updates[].
+
+    Preserves the monolith's multimodal input (up to 3 page images per PDF plus the
+    input_file fallback) so scanned/complex PDFs still extract. Reuses COLUMN_RULES
+    + DOC_SELECTION_RULES. Defensive parse; returns [] on failure (the deterministic
+    rent/SF regex nets still run downstream).
+    """
+    try:
+        # TODO(model-tiering): when a PDF manifest carries multiple candidate
+        # buildings/addresses that do not cleanly match the TARGET PROPERTY,
+        # escalate THIS extraction sub-call to model="gpt-5.2" for the harder
+        # multi-building disambiguation. Default stays gpt-4o-mini for the common
+        # single-building case (cheap path).
+        model = "gpt-4o-mini"
+
+        prompt_parts = [
+            "You extract sheet-column field values for ONE Google Sheet row from an "
+            "email thread and its attachments.\n\n"
+            f"TARGET PROPERTY (canonical identity for matching): {target_anchor}\n\n"
+            f"{column_rules}\n{doc_selection_rules}\n\n"
+            f"SHEET HEADER (row 2):\n{json.dumps(header)}\n\n"
+            f"CURRENT ROW VALUES (row {rownum}):\n{json.dumps(rowvals)}\n\n"
+            f"MISSING REQUIRED FIELDS (if any):\n{json.dumps(missing_fields)}\n\n"
+            "CONVERSATION HISTORY (latest last):\n"
+            f"{json.dumps(conversation, indent=2)}"
+        ]
+
+        if pdf_manifest:
+            prompt_parts.append("\n\n=== PDF ATTACHMENTS ===")
+            for pdf in pdf_manifest:
+                name = pdf.get("name") or "<unnamed.pdf>"
+                text = pdf.get("text") or ""
+                method = pdf.get("method", "unknown")
+                prompt_parts.append(f"\n--- PDF: {name} (extraction method: {method}) ---")
+                if text:
+                    prompt_parts.append(_clip_for_prompt(text, _PDF_TEXT_CHAR_LIMIT))
+                else:
+                    prompt_parts.append("[No text extracted - see images below if available]")
+
+        if url_texts:
+            prompt_parts.append("\nURL CONTENT FETCHED:")
+            for url_info in url_texts:
+                prompt_parts.append(f"\nURL: {url_info['url']}")
+                prompt_parts.append(
+                    f"Content: {_clip_for_prompt(url_info.get('text') or '', _URL_TEXT_CHAR_LIMIT)}"
+                )
+
+        prompt_parts.append(
+            "\n\nBe conservative: only suggest changes you can cite from the text, "
+            "attachments, or fetched URLs.\n\n"
+            "OUTPUT ONLY valid JSON in this exact format (the updates array may be empty):\n"
+            '{\n'
+            '  "updates": [\n'
+            '    {"column": "<exact header name>", "value": "<new value as string>", '
+            '"confidence": 0.85, "reason": "<brief explanation>"}\n'
+            '  ]\n'
+            '}\n'
+        )
+        prompt = "".join(prompt_parts)
+
+        # Multimodal input: page images (max 3/PDF) + input_file fallback + text,
+        # built exactly as the monolith builds it so vision extraction is preserved.
+        input_content = []
+        if pdf_manifest:
+            for pdf in pdf_manifest:
+                images = pdf.get("images") or []
+                for img_b64 in images[:3]:
+                    input_content.append({
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{img_b64}",
+                    })
+                file_id = pdf.get("file_id") or pdf.get("id")
+                if file_id and pdf.get("method") in ("openai_upload", "openai_upload+images", "failed"):
+                    input_content.append({"type": "input_file", "file_id": file_id})
+        input_content.append({"type": "input_text", "text": prompt})
+
+        resp = client.responses.create(
+            model=model,
+            input=[{"role": "user", "content": input_content}],
+            temperature=0.1,
+        )
+        _meter_decomposed_subcall(
+            resp, uid=uid, client_id=client_id, thread_id=thread_id,
+            operation="ai.extract_fields", model=model,
+            sheet_id=sheet_id, rownum=rownum,
+            extra_meta={
+                "headerCount": len(header or []),
+                "hasPdfManifest": bool(pdf_manifest),
+                "pdfCount": len(pdf_manifest or []),
+                "urlTextCount": len(url_texts or []),
+                "configuredExtractionFieldCount": len(extraction_fields or []),
+            },
+        )
+        parsed = _parse_json_object(getattr(resp, "output_text", "") or "", default={})
+        updates = parsed.get("updates")
+        return updates if isinstance(updates, list) else []
+    except Exception as e:  # noqa: BLE001 — degrade to safe default, never crash the pipeline
+        print(f"⚠️ decomposed extract_fields failed (safe-default []): {e}")
+        return []
+
+
+def _write_notes(*, notes_rules, conversation, pdf_manifest, url_texts, updates,
+                 uid, client_id, thread_id, sheet_id, rownum) -> str:
+    """write-notes (gpt-4o-mini): -> notes (top-level str).
+
+    Reuses NOTES_RULES. Given the fields already headed for columns so it avoids
+    redundancy. Defensive parse; returns "" on failure.
+    """
+    try:
+        evidence = []
+        for pdf in (pdf_manifest or []):
+            text = (pdf or {}).get("text") or ""
+            if text:
+                evidence.append(
+                    f"PDF {pdf.get('name', '')}: {_clip_for_prompt(text, _PDF_TEXT_CHAR_LIMIT)}"
+                )
+        for u in (url_texts or []):
+            text = (u or {}).get("text") or ""
+            if text:
+                evidence.append(f"URL {u.get('url', '')}: {_clip_for_prompt(text, _URL_TEXT_CHAR_LIMIT)}")
+        evidence_block = ("\n\nEVIDENCE:\n" + "\n".join(evidence)) if evidence else ""
+        prompt = (
+            'You write the terse "notes" field for a commercial-real-estate sheet row.\n\n'
+            f"{notes_rules}\n\n"
+            "Field values already being written to columns (DO NOT repeat these in notes):\n"
+            f"{json.dumps(updates)}\n\n"
+            f"CONVERSATION HISTORY (latest last):\n{json.dumps(conversation, indent=2)}"
+            f"{evidence_block}\n\n"
+            'OUTPUT ONLY valid JSON: {"notes": "<terse fragments separated by \' • \', '
+            'or empty string if no context beyond column data>"}'
+        )
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            temperature=0.1,
+        )
+        _meter_decomposed_subcall(
+            resp, uid=uid, client_id=client_id, thread_id=thread_id,
+            operation="ai.write_notes", model="gpt-4o-mini",
+            sheet_id=sheet_id, rownum=rownum,
+        )
+        parsed = _parse_json_object(getattr(resp, "output_text", "") or "", default={})
+        notes = parsed.get("notes")
+        return notes if isinstance(notes, str) else ""
+    except Exception as e:  # noqa: BLE001 — degrade to safe default, never crash the pipeline
+        print(f"⚠️ decomposed write_notes failed (safe-default ''): {e}")
+        return ""
+
+
+def _reply_permitted_by_intent(events) -> bool:
+    """Mirror the monolith's null-reply conditions at the pipeline gate.
+
+    Skip the (expensive) gpt-5.2 draft-reply entirely when the classified intent
+    forbids an auto-reply per RESPONSE_EMAIL_RULES. The downstream guard ladder +
+    scenario selection still own the FINAL skip_response decision — this only
+    avoids paying for a draft that would be nulled anyway.
+    """
+    types = {(e or {}).get("type") for e in (events or []) if isinstance(e, dict)}
+    # Hard null-reply events: user must handle these, not the auto-responder.
+    if types & {"needs_user_input", "contact_optout", "wrong_contact", "tour_requested"}:
+        return False
+    # close_conversation replies ONLY for the all_info_gathered closing thank-you;
+    # every other close reason means the conversation is over (no response_email).
+    for e in (events or []):
+        if isinstance(e, dict) and e.get("type") == "close_conversation":
+            if (e.get("notes") or "") != "all_info_gathered":
+                return False
+    return True
+
+
+def _draft_reply(*, response_email_rules, events, contact_context, target_anchor,
+                 missing_fields, last_human_message, conversation,
+                 uid, client_id, thread_id, sheet_id, rownum) -> Optional[str]:
+    """draft-reply (gpt-5.2): -> response_email, ONLY when intent permits.
+
+    Returns None WITHOUT calling the model when intent forbids a reply. When
+    permitted, the model still returns null per RESPONSE_EMAIL_RULES for cases it
+    owns (e.g. call_requested with a phone number provided). Reuses
+    RESPONSE_EMAIL_RULES. Defensive parse; returns None on failure.
+    """
+    try:
+        if not _reply_permitted_by_intent(events):
+            return None
+        last_human_block = ""
+        if last_human_message:
+            last_human_block = (
+                "\nLAST HUMAN MESSAGE (AUTHORITATIVE):\n"
+                f"{json.dumps(last_human_message)}\n"
+            )
+        prompt = (
+            "You draft ONE professional reply email for a commercial-real-estate thread.\n\n"
+            f"TARGET PROPERTY: {target_anchor}\n"
+            f"{contact_context}\n\n"
+            f"{response_email_rules}\n\n"
+            "DETECTED EVENTS (already classified — obey the null-reply rules above):\n"
+            f"{json.dumps(events)}\n\n"
+            f"MISSING REQUIRED FIELDS (if any):\n{json.dumps(missing_fields)}\n"
+            f"{last_human_block}\n"
+            f"CONVERSATION HISTORY (latest last):\n{json.dumps(conversation, indent=2)}\n\n"
+            'OUTPUT ONLY valid JSON: {"response_email": "<email body per the rules above, '
+            'or null when the rules say not to auto-respond>"}'
+        )
+        resp = client.responses.create(
+            model="gpt-5.2",
+            input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            temperature=0.1,
+        )
+        _meter_decomposed_subcall(
+            resp, uid=uid, client_id=client_id, thread_id=thread_id,
+            operation="ai.draft_reply", model="gpt-5.2",
+            sheet_id=sheet_id, rownum=rownum,
+        )
+        parsed = _parse_json_object(getattr(resp, "output_text", "") or "", default={})
+        value = parsed.get("response_email")
+        return value if isinstance(value, str) and value.strip() else None
+    except Exception as e:  # noqa: BLE001 — degrade to safe default, never crash the pipeline
+        print(f"⚠️ decomposed draft_reply failed (safe-default None): {e}")
+        return None
+
+
+def _assemble_proposal(*, updates, events, response_email, notes) -> Dict:
+    """assemble (pure code): merge sub-results into the monolith post-parse dict.
+
+    No LLM. Produces {updates, events, response_email, notes} with the same keys
+    and types the monolith's json.loads yields, so the downstream deterministic
+    guard ladder consumes it identically.
+    """
+    return {
+        "updates": updates if isinstance(updates, list) else [],
+        "events": events if isinstance(events, list) else [],
+        "response_email": response_email if isinstance(response_email, str) else None,
+        "notes": notes if isinstance(notes, str) else "",
+    }
+
+
+def _run_decomposed_pipeline(*, event_rules, column_rules, doc_selection_rules,
+                             notes_rules, response_email_rules,
+                             target_anchor, last_human_message, contact_context,
+                             missing_fields, header, rowvals, rownum, conversation,
+                             pdf_manifest, url_texts, extraction_fields,
+                             uid, client_id, thread_id, sheet_id) -> Dict:
+    """Flag-ON path: run the decomposed sub-calls + pure assemble.
+
+    Returns the SAME post-parse proposal dict {updates, events, response_email,
+    notes} the monolith produces, which then flows through propose_sheet_updates'
+    existing deterministic guard ladder unchanged. Each sub-call already degrades
+    independently; this wrapper additionally guarantees a valid proposal dict even
+    if assembly (or anything else) fails — it never raises.
+    """
+    try:
+        events = _classify_intent(
+            event_rules=event_rules, target_anchor=target_anchor,
+            last_human_message=last_human_message, conversation=conversation,
+            uid=uid, client_id=client_id, thread_id=thread_id,
+            sheet_id=sheet_id, rownum=rownum,
+        )
+        updates = _extract_fields(
+            column_rules=column_rules, doc_selection_rules=doc_selection_rules,
+            header=header, rowvals=rowvals, rownum=rownum, missing_fields=missing_fields,
+            target_anchor=target_anchor, conversation=conversation,
+            pdf_manifest=pdf_manifest, url_texts=url_texts,
+            uid=uid, client_id=client_id, thread_id=thread_id,
+            sheet_id=sheet_id, extraction_fields=extraction_fields,
+        )
+        notes = _write_notes(
+            notes_rules=notes_rules, conversation=conversation,
+            pdf_manifest=pdf_manifest, url_texts=url_texts, updates=updates,
+            uid=uid, client_id=client_id, thread_id=thread_id,
+            sheet_id=sheet_id, rownum=rownum,
+        )
+        response_email = _draft_reply(
+            response_email_rules=response_email_rules, events=events,
+            contact_context=contact_context, target_anchor=target_anchor,
+            missing_fields=missing_fields, last_human_message=last_human_message,
+            conversation=conversation,
+            uid=uid, client_id=client_id, thread_id=thread_id,
+            sheet_id=sheet_id, rownum=rownum,
+        )
+        return _assemble_proposal(
+            updates=updates, events=events,
+            response_email=response_email, notes=notes,
+        )
+    except Exception as e:  # noqa: BLE001 — never crash propose_sheet_updates
+        print(f"⚠️ decomposed pipeline failed (safe-default proposal): {e}")
+        return {"updates": [], "events": [], "response_email": None, "notes": ""}
+
+
 def propose_sheet_updates(uid: str,
                           client_id: str,
                           email: str,
@@ -3177,7 +3626,21 @@ IMPORTANT: The response should feel natural and conversational, not robotic or t
                 f"{json.dumps(last_human_message)}\n"
             )
 
-        prompt_parts = [f"""
+        # ---- Route: decomposed pipeline (flag ON) vs monolith (flag OFF) ----
+        if _decompose_prompt_enabled():
+            proposal = _run_decomposed_pipeline(
+                event_rules=EVENT_RULES, column_rules=COLUMN_RULES,
+                doc_selection_rules=DOC_SELECTION_RULES, notes_rules=NOTES_RULES,
+                response_email_rules=RESPONSE_EMAIL_RULES,
+                target_anchor=target_anchor, last_human_message=last_human_message,
+                contact_context=contact_context, missing_fields=missing_fields,
+                header=header, rowvals=rowvals, rownum=rownum, conversation=conversation,
+                pdf_manifest=pdf_manifest, url_texts=url_texts,
+                extraction_fields=extraction_fields,
+                uid=uid, client_id=client_id, thread_id=thread_id, sheet_id=sheet_id,
+            )
+        else:
+            prompt_parts = [f"""
 You are analyzing a conversation thread to suggest updates to ONE Google Sheet row, detect key events, and generate an appropriate response email.
 
 TARGET PROPERTY (canonical identity for matching): {target_anchor}
@@ -3202,30 +3665,30 @@ CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded his
 {json.dumps(conversation, indent=2)}
 """.rstrip()]
 
-        # PDF attachments - include extracted text directly in prompt
-        if pdf_manifest:
-            prompt_parts.append("\n\n=== PDF ATTACHMENTS ===")
-            for pdf in pdf_manifest:
-                name = pdf.get("name") or "<unnamed.pdf>"
-                text = pdf.get("text") or ""
-                method = pdf.get("method", "unknown")
+            # PDF attachments - include extracted text directly in prompt
+            if pdf_manifest:
+                prompt_parts.append("\n\n=== PDF ATTACHMENTS ===")
+                for pdf in pdf_manifest:
+                    name = pdf.get("name") or "<unnamed.pdf>"
+                    text = pdf.get("text") or ""
+                    method = pdf.get("method", "unknown")
 
-                prompt_parts.append(f"\n--- PDF: {name} (extraction method: {method}) ---")
-                if text:
-                    # Include extracted text; clip but retain deep field-bearing lines.
-                    prompt_parts.append(_clip_for_prompt(text, _PDF_TEXT_CHAR_LIMIT))
-                else:
-                    prompt_parts.append("[No text extracted - see images below if available]")
+                    prompt_parts.append(f"\n--- PDF: {name} (extraction method: {method}) ---")
+                    if text:
+                        # Include extracted text; clip but retain deep field-bearing lines.
+                        prompt_parts.append(_clip_for_prompt(text, _PDF_TEXT_CHAR_LIMIT))
+                    else:
+                        prompt_parts.append("[No text extracted - see images below if available]")
 
-        # URL content (already fetched)
-        if url_texts:
-            prompt_parts.append("\nURL CONTENT FETCHED:")
-            for url_info in url_texts:
-                prompt_parts.append(f"\nURL: {url_info['url']}")
-                prompt_parts.append(f"Content: {_clip_for_prompt(url_info.get('text') or '', _URL_TEXT_CHAR_LIMIT)}")
+            # URL content (already fetched)
+            if url_texts:
+                prompt_parts.append("\nURL CONTENT FETCHED:")
+                for url_info in url_texts:
+                    prompt_parts.append(f"\nURL: {url_info['url']}")
+                    prompt_parts.append(f"Content: {_clip_for_prompt(url_info.get('text') or '', _URL_TEXT_CHAR_LIMIT)}")
 
-        # Output contract
-        prompt_parts.append("""
+            # Output contract
+            prompt_parts.append("""
 Be conservative: only suggest changes you can cite from the text, attachments, or fetched URLs.
 
 OUTPUT ONLY valid JSON in this exact format:
@@ -3261,87 +3724,87 @@ OUTPUT ONLY valid JSON in this exact format:
 }
 """)
 
-        prompt = "".join(prompt_parts)
+            prompt = "".join(prompt_parts)
 
-        # ---- Prepare inputs (images for vision, files as fallback, then text) --------------------------
-        input_content = []
+            # ---- Prepare inputs (images for vision, files as fallback, then text) --------------------------
+            input_content = []
 
-        # Add PDF page images for vision processing (scanned PDFs, complex layouts)
-        if pdf_manifest:
-            for pdf in pdf_manifest:
-                images = pdf.get("images") or []
-                name = pdf.get("name", "PDF")
+            # Add PDF page images for vision processing (scanned PDFs, complex layouts)
+            if pdf_manifest:
+                for pdf in pdf_manifest:
+                    images = pdf.get("images") or []
+                    name = pdf.get("name", "PDF")
 
-                # Add images for vision (pages with little extractable text)
-                for i, img_b64 in enumerate(images[:3]):  # Max 3 pages per PDF
-                    input_content.append({
-                        "type": "input_image",
-                        "image_url": f"data:image/png;base64,{img_b64}"
-                    })
-                    print(f"📷 Added page {i+1} image from {name} for vision analysis")
+                    # Add images for vision (pages with little extractable text)
+                    for i, img_b64 in enumerate(images[:3]):  # Max 3 pages per PDF
+                        input_content.append({
+                            "type": "input_image",
+                            "image_url": f"data:image/png;base64,{img_b64}"
+                        })
+                        print(f"📷 Added page {i+1} image from {name} for vision analysis")
 
-                # Add file_id as fallback if we have it and extraction was poor.
-                file_id = pdf.get("file_id") or pdf.get("id")
-                if file_id and pdf.get("method") in ("openai_upload", "openai_upload+images", "failed"):
-                    input_content.append({"type": "input_file", "file_id": file_id})
+                    # Add file_id as fallback if we have it and extraction was poor.
+                    file_id = pdf.get("file_id") or pdf.get("id")
+                    if file_id and pdf.get("method") in ("openai_upload", "openai_upload+images", "failed"):
+                        input_content.append({"type": "input_file", "file_id": file_id})
 
-        input_content.append({"type": "input_text", "text": prompt})
+            input_content.append({"type": "input_text", "text": prompt})
 
-        # ---- Call OpenAI (low temperature for determinism) --------------------
-        response = client.responses.create(
-            model="gpt-5.2",  # GPT-5.2 Thinking for complex extraction
-            input=[{"role": "user", "content": input_content}],
-            temperature=0.1
-        )
-        # The OpenAI call above ALWAYS bills, even under dry_run (dry_run only
-        # skips the sheetChangeLog Firestore write below, not the paid API call).
-        # Meter unconditionally so dry-run spend (e.g. the app.py new-property
-        # extraction path) is captured.
-        track_openai_usage_safely(
-            db=_fs,
-            user_id=uid,
-            client_id=client_id,
-            thread_id=thread_id,
-            operation="ai.extract_sheet_updates",
-            model="gpt-5.2",
-            usage=getattr(response, "usage", None),
-            request_id=getattr(response, "id", None),
-            endpoint="responses",
-            metadata={
-                "sheetId": sheet_id,
-                "rowNumber": rownum,
-                "headerCount": len(header or []),
-                "conversationMessageCount": len(conversation or []),
-                "hasPdfManifest": bool(pdf_manifest),
-                "pdfCount": len(pdf_manifest or []),
-                "urlTextCount": len(url_texts or []),
-                "configuredExtractionFieldCount": len(extraction_fields or []),
-                "dryRun": bool(dry_run),
-            },
-        )
+            # ---- Call OpenAI (low temperature for determinism) --------------------
+            response = client.responses.create(
+                model="gpt-5.2",  # GPT-5.2 Thinking for complex extraction
+                input=[{"role": "user", "content": input_content}],
+                temperature=0.1
+            )
+            # The OpenAI call above ALWAYS bills, even under dry_run (dry_run only
+            # skips the sheetChangeLog Firestore write below, not the paid API call).
+            # Meter unconditionally so dry-run spend (e.g. the app.py new-property
+            # extraction path) is captured.
+            track_openai_usage_safely(
+                db=_fs,
+                user_id=uid,
+                client_id=client_id,
+                thread_id=thread_id,
+                operation="ai.extract_sheet_updates",
+                model="gpt-5.2",
+                usage=getattr(response, "usage", None),
+                request_id=getattr(response, "id", None),
+                endpoint="responses",
+                metadata={
+                    "sheetId": sheet_id,
+                    "rowNumber": rownum,
+                    "headerCount": len(header or []),
+                    "conversationMessageCount": len(conversation or []),
+                    "hasPdfManifest": bool(pdf_manifest),
+                    "pdfCount": len(pdf_manifest or []),
+                    "urlTextCount": len(url_texts or []),
+                    "configuredExtractionFieldCount": len(extraction_fields or []),
+                    "dryRun": bool(dry_run),
+                },
+            )
 
-        raw_response = (response.output_text or "").strip()
+            raw_response = (response.output_text or "").strip()
 
-        # ---- Parse JSON safely ------------------------------------------------
-        try:
-            # Strip code fences if present
-            if raw_response.startswith("```"):
-                lines = raw_response.split("\n")
-                json_lines = []
-                in_json = False
-                for line in lines:
-                    if line.strip().startswith("```"):
-                        in_json = not in_json
-                        continue
-                    if in_json:
-                        json_lines.append(line)
-                raw_response = "\n".join(json_lines)
+            # ---- Parse JSON safely ------------------------------------------------
+            try:
+                # Strip code fences if present
+                if raw_response.startswith("```"):
+                    lines = raw_response.split("\n")
+                    json_lines = []
+                    in_json = False
+                    for line in lines:
+                        if line.strip().startswith("```"):
+                            in_json = not in_json
+                            continue
+                        if in_json:
+                            json_lines.append(line)
+                    raw_response = "\n".join(json_lines)
 
-            proposal = json.loads(raw_response)
-        except json.JSONDecodeError as e:
-            print(f"❌ Failed to parse OpenAI JSON response: {e}")
-            print(f"Raw response: {raw_response}")
-            return None
+                proposal = json.loads(raw_response)
+            except json.JSONDecodeError as e:
+                print(f"❌ Failed to parse OpenAI JSON response: {e}")
+                print(f"Raw response: {raw_response}")
+                return None
 
         if not isinstance(proposal, dict):
             print(f"❌ Invalid proposal structure: {proposal}")
