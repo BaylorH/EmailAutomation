@@ -58,9 +58,17 @@ def _string_value(node):
 
 def _env_reads(tree):
     """Yield every string env-var name read via os.getenv / os.environ.get /
-    os.environ[...] / os.environ.setdefault in the given AST."""
+    os.environ[...] / os.environ.setdefault / _clean_env in the given AST.
+
+    _clean_env("X") is app_config.py's secret-reading helper (added in
+    1079201 to strip trailing newlines off Secret Manager payloads). It wraps
+    os.getenv internally with a *variable* name, so without recognizing the
+    helper by name the scanner would go blind to every secret app_config reads
+    — silently making the omitted-name guard below vacuous for exactly the
+    reads most likely to add an omitted secret."""
     for node in ast.walk(tree):
         # os.getenv("X") / getenv("X") / os.environ.get("X") / environ.get("X")
+        # / _clean_env("X")
         if isinstance(node, ast.Call) and node.args:
             func = node.func
             name = None
@@ -68,7 +76,7 @@ def _env_reads(tree):
                 name = func.attr
             elif isinstance(func, ast.Name):
                 name = func.id
-            if name in {"getenv", "get", "setdefault"}:
+            if name in {"getenv", "get", "setdefault", "_clean_env"}:
                 value = _string_value(node.args[0])
                 if value is not None:
                     yield value, node.lineno
