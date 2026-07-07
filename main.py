@@ -287,6 +287,25 @@ def refresh_and_process_user(user_id: str):
                 print("⚠️ Forced Graph token refresh failed; using existing token if available")
 
         if not result or "access_token" not in result:
+            # acquire_token_silent() collapses both "no matching refresh token" and
+            # "redemption error" into a bare None, hiding the real cause. Re-run via
+            # the _with_error variant so the failure is debuggable in the logs.
+            # None here means MSAL found no refresh token matching this account +
+            # client_id (e.g. a whitespace-polluted AZURE_API_APP_ID would break the
+            # cache-key match) — a non-None dict carries the actual AADSTS error.
+            err = app.acquire_token_silent_with_error(SCOPES, account=account)
+            if err is None:
+                print(
+                    f"❌ MSAL silent auth: no refresh token matched account for "
+                    f"{user_id} (client_id={CLIENT_ID!r}, scopes={SCOPES})"
+                )
+            else:
+                print(
+                    f"❌ MSAL silent auth error for {user_id}: "
+                    f"error={err.get('error')!r} "
+                    f"error_description={err.get('error_description')!r} "
+                    f"correlation_id={err.get('correlation_id')!r}"
+                )
             raise RuntimeError("silent_auth_failed")
 
         access_token = result["access_token"]

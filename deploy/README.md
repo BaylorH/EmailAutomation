@@ -22,6 +22,8 @@ service-account JSON to `$RUNNER_TEMP/sa.json`).
 |------|---------|
 | `../Dockerfile` | Container image: `python:3.12-slim`, installs `requirements.txt`, non-root `appuser`, entrypoint `python main.py`. |
 | `cloudrun-job.yaml` | Cloud Run Job spec — task timeout, service-account placeholder, env vars (parameterized bucket + launch-safety scope), Secret Manager references. |
+| `cloudrun-service.yaml` | **Phase-1 webhook** Cloud Run *Service* spec — same image, gunicorn entrypoint serving `service.py` (`POST /process-user`), per-user lease, `PROCESS_USER_AUTH` gate. |
+| `../service.py` | HTTP entrypoint: wraps `main.refresh_and_process_user` behind `run_with_user_lease`; routes `POST /process-user` + `GET /healthz`. |
 | `../email_automation/app_config.py` | `FIREBASE_BUCKET` now reads env, defaults to historical value. |
 | `../firebase_helpers.py` | Same env parameterization on the bucket that actually drives the token-cache round-trip. |
 | `../main.py` | SIGTERM→`sys.exit` bridge so the atexit token-cache upload runs on container shutdown. |
@@ -182,6 +184,46 @@ no longer gets cancelled after ~30 min; it lives until `timeoutSeconds`
 predecessor, not a broken trigger.
 
 ---
+
+## Phase-1 webhook (Cloud Run Service) — `cloudrun-service.yaml`
+
+Alongside the batch JOB, `service.py` exposes the **same per-user pipeline** as an
+HTTP endpoint so a queue (Cloud Tasks) can drive one user per request instead of
+cron-scanning all users. FUNCTIONALITY-NEUTRAL: the endpoint calls
+`main.refresh_and_process_user(uid)` unchanged, wrapped in a **per-user lease**
+(`schedulerLeases/emailAutomation:{uid}`, TTL 600s / 10 min — see
+`scheduler_lease.DEFAULT_USER_LEASE_TTL_SECONDS`). The global batch lease
+(`schedulerLeases/emailAutomation`, 45-min TTL) and `run_with_scheduler_lease`
+are untouched; the two lease families never share a doc.
+
+Contract:
+
+| Route | Request | Response |
+|-------|---------|----------|
+| `POST /process-user` | JSON `{"uid": "<firebase-uid>"}` | `200 {"status":"processed"}` ran · `200 {"status":"skipped_locked"}` same-uid already running · `400` missing/blank uid or non-JSON · `401` auth required + missing/wrong secret · `500 {"error":...}` pipeline raised (Cloud Tasks retries) |
+| `GET /healthz` | — | `200` (never auth-gated) |
+
+**Auth.** Optional in-app shared secret via `PROCESS_USER_AUTH`; when set, requests
+must send it as `Authorization: Bearer <secret>` or `X-Process-User-Auth: <secret>`
+(constant-time compare). When unset the endpoint is open — rely on Cloud Run IAM.
+**TODO(auth):** real OIDC ID-token verification for the Cloud Tasks→Cloud Run
+invoker is deferred to the platform layer (deploy the service with "require
+authentication" and give Cloud Tasks an OIDC token whose audience is the service
+URL); the shared secret is the in-app defense-in-depth minimum.
+
+```bash
+# Same image as the job; the Service overrides the entrypoint to gunicorn.
+gcloud builds submit --tag "$IMAGE" .
+printf '%s' "REPLACE_ME" | gcloud secrets create process-user-auth --data-file=- || true
+# edit deploy/cloudrun-service.yaml: set image + all *_PLACEHOLDER values
+gcloud run services replace deploy/cloudrun-service.yaml --region "$REGION"
+```
+
+Pinned by `tests/test_ws_b_cloudrun_service_spec.py` (gunicorn entrypoint, request
+timeout <= user-lease TTL, secret gate wired, ADC only, no batch scope trio) and
+`tests/test_user_lease.py` + `tests/test_process_user_service.py` (lease + HTTP
+contract). **Not built/pushed/deployed** in this environment (same hard rule as
+the job scaffold).
 
 ## Verified vs Unverified (honest gaps)
 

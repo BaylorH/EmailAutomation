@@ -3,15 +3,34 @@ import os
 # E2E Test Mode - skips validation and uses mock values where needed
 E2E_TEST_MODE = os.getenv("E2E_TEST_MODE") == "true"
 
+
+def _clean_env(name):
+    """Read an env var and strip surrounding whitespace.
+
+    Google Secret Manager payloads are commonly created with a trailing
+    newline (e.g. `echo "value" | gcloud secrets create`). Cloud Run injects
+    those bytes verbatim as env vars, so a secret-bound credential can arrive
+    as "value\\n". MSAL partitions its token cache by client_id, so a trailing
+    newline on AZURE_API_APP_ID makes acquire_token_silent find NO matching
+    refresh token (returns None) even though get_accounts() still succeeds —
+    surfacing as an opaque silent_auth_failed. A trailing newline on the
+    client secret would likewise fail token redemption (invalid_client).
+    Local .env-based runs are unaffected (no trailing newline), which is why
+    this only ever bit the deployed service. Strip defensively at the boundary.
+    """
+    value = os.getenv(name)
+    return value.strip() if value is not None else None
+
+
 # Azure/Microsoft Graph Config
-CLIENT_ID = os.getenv("AZURE_API_APP_ID") or ("mock-client-id" if E2E_TEST_MODE else None)
-CLIENT_SECRET = os.getenv("AZURE_API_CLIENT_SECRET") or ("mock-client-secret" if E2E_TEST_MODE else None)
+CLIENT_ID = _clean_env("AZURE_API_APP_ID") or ("mock-client-id" if E2E_TEST_MODE else None)
+CLIENT_SECRET = _clean_env("AZURE_API_CLIENT_SECRET") or ("mock-client-secret" if E2E_TEST_MODE else None)
 AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Mail.ReadWrite", "Mail.Send"]
 TOKEN_CACHE = "msal_token_cache.bin"
 
 # Firebase Config
-FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY") or ("mock-firebase-key" if E2E_TEST_MODE else None)
+FIREBASE_API_KEY = _clean_env("FIREBASE_API_KEY") or ("mock-firebase-key" if E2E_TEST_MODE else None)
 # Storage bucket is env-parameterizable for the Cloud Run Job runtime.
 # Defaults to the historical hardcoded value so behavior is unchanged when
 # FIREBASE_BUCKET is unset (GitHub Actions cron, local runs).
@@ -22,7 +41,7 @@ FRONTEND_EMAIL_ACCESS_URL = os.getenv(
 )
 
 # OpenAI Config
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ("mock-openai-key" if E2E_TEST_MODE else None)
+OPENAI_API_KEY = _clean_env("OPENAI_API_KEY") or ("mock-openai-key" if E2E_TEST_MODE else None)
 OPENAI_ASSISTANT_MODEL = os.getenv("OPENAI_ASSISTANT_MODEL", "gpt-5.2")
 
 # Email Templates
