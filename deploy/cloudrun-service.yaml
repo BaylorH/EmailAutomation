@@ -1,0 +1,129 @@
+# Cloud Run SERVICE definition for the EmailAutomation per-user webhook.
+#
+# Phase-1 of the webhook migration: alongside the batch Cloud Run JOB
+# (cloudrun-job.yaml, `python main.py` over all users on a cron), this SERVICE
+# exposes the SAME image as an HTTP endpoint (`service.py`, POST /process-user)
+# so a queue (Cloud Tasks) can drive one user per request. The pipeline itself
+# is unchanged — the service just calls main.refresh_and_process_user under the
+# per-user Firestore lease (schedulerLeases/emailAutomation:{uid}).
+#
+# SCAFFOLD ONLY — every ALL_CAPS_PLACEHOLDER must be replaced before
+# `gcloud run services replace`. No real project IDs / buckets / secrets are
+# committed; secret VALUES live in Secret Manager and are referenced, never
+# inlined. Do NOT build/push/deploy from this file automatically.
+#
+# Apply (does NOT run automatically — see deploy/README.md):
+#   gcloud run services replace deploy/cloudrun-service.yaml --region REGION
+#
+# The container image is identical to the JOB's; only the entrypoint differs.
+# The JOB Dockerfile ENTRYPOINT stays `python main.py`; this SERVICE overrides
+# the container command to serve the Flask app via gunicorn, so one image backs
+# both the batch job and the webhook.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: email-automation-process-user
+  labels:
+    app: email-automation
+    component: webhook
+  annotations:
+    run.googleapis.com/launch-stage: GA
+    # Require authentication at the platform layer: Cloud Tasks must present an
+    # OIDC token whose audience is this service URL. Combined with the in-app
+    # PROCESS_USER_AUTH shared secret below (defense in depth).
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        # One in-flight request per container: the per-user lease already makes
+        # same-uid concurrency safe, but low concurrency keeps a single slow
+        # Graph pipeline from starving co-tenant requests on the same instance.
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "10"
+    spec:
+      # Bounded so a request cannot outlive the per-user lease TTL
+      # (scheduler_lease.DEFAULT_USER_LEASE_TTL_SECONDS = 600s). A request that
+      # outlived its lease could let a retry run the same user concurrently.
+      timeoutSeconds: 540
+      containerConcurrency: 1
+      serviceAccountName: SERVICE_ACCOUNT_PLACEHOLDER@PROJECT_ID_PLACEHOLDER.iam.gserviceaccount.com
+      containers:
+        - name: webhook
+          image: REGION-docker.pkg.dev/PROJECT_ID_PLACEHOLDER/AR_REPO_PLACEHOLDER/email-automation:TAG_PLACEHOLDER
+          # Override the image's `python main.py` entrypoint: serve the Flask
+          # app. gunicorn binds Cloud Run's injected $PORT; a single worker with
+          # threads keeps the token-cache file writes (relative path) simple.
+          command: ["gunicorn"]
+          args:
+            - "--bind=:8080"
+            - "--workers=1"
+            - "--threads=8"
+            - "--timeout=0"
+            - "service:app"
+          ports:
+            - name: http1
+              containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          env:
+            # --- Storage bucket (env-parameterized; defaults to historical
+            #     value when unset — see app_config.py / firebase_helpers.py). ---
+            - name: FIREBASE_BUCKET
+              value: FIREBASE_BUCKET_PLACEHOLDER.firebasestorage.app
+            # --- Non-secret Azure app id (used for the appid prefix check). ---
+            - name: AZURE_API_APP_ID
+              value: AZURE_API_APP_ID_PLACEHOLDER
+            # --- In-app shared-secret gate for POST /process-user. Referenced
+            #     from Secret Manager. When unset the endpoint is open (rely on
+            #     Cloud Run IAM only); set it before any public exposure. ---
+            - name: PROCESS_USER_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: process-user-auth
+                  key: latest
+            # --- Secrets: referenced from Secret Manager, never inlined.
+            #     Same set the per-user pipeline reads in the batch job. ---
+            - name: AZURE_API_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: azure-api-client-secret
+                  key: latest
+            - name: FIREBASE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: firebase-api-key
+                  key: latest
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openai-api-key
+                  key: latest
+            - name: GOOGLE_OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: google-oauth-client-id
+                  key: latest
+            - name: GOOGLE_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: google-oauth-client-secret
+                  key: latest
+            - name: GOOGLE_REFRESH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: google-refresh-token
+                  key: latest
+            # NOTE: GOOGLE_APPLICATION_CREDENTIALS is intentionally absent.
+            # Cloud Run supplies ADC via the service's service account, so
+            # firestore.Client() authenticates with no key file.
+            #
+            # NOTE: the batch job's launch-safety scope trio
+            # (SITESIFT_DEV_SCOPED_SCHEDULER / _TARGET_USER_IDS /
+            # _ALLOWED_USER_IDS) is intentionally OMITTED here: the webhook
+            # processes exactly the uid in the request body and never calls
+            # scheduler_scope.resolve_scheduler_user_ids (that guard is on the
+            # batch run_all_users path only). The caller (Cloud Tasks enqueuer)
+            # owns which uids are dispatched.
