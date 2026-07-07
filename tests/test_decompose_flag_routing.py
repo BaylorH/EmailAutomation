@@ -125,11 +125,12 @@ class PipelineWiringTests(unittest.TestCase):
         return kw
 
     def test_pipeline_invokes_each_subcall_and_assembles(self):
+        # FIX 2: the two signal-bearing sub-calls now return (value, ok) tuples.
         with mock.patch.object(ai, "_classify_intent",
-                               return_value=[{"type": "call_requested"}]) as ci, \
+                               return_value=([{"type": "call_requested"}], True)) as ci, \
              mock.patch.object(ai, "_extract_fields",
-                               return_value=[{"column": "Rent/SF /Yr", "value": "12.00",
-                                              "confidence": 0.9, "reason": "flyer"}]) as ef, \
+                               return_value=([{"column": "Rent/SF /Yr", "value": "12.00",
+                                               "confidence": 0.9, "reason": "flyer"}], True)) as ef, \
              mock.patch.object(ai, "_write_notes", return_value="NNN • available") as wn, \
              mock.patch.object(ai, "_draft_reply", return_value="Hi, thanks.") as dr:
             out = ai._run_decomposed_pipeline(**self._pipe_kwargs())
@@ -139,9 +140,11 @@ class PipelineWiringTests(unittest.TestCase):
         wn.assert_called_once()
         dr.assert_called_once()
         # notes sub-call is fed the extracted updates (redundancy avoidance).
-        self.assertEqual(wn.call_args.kwargs["updates"], ef.return_value)
+        self.assertEqual(wn.call_args.kwargs["updates"],
+                         [{"column": "Rent/SF /Yr", "value": "12.00",
+                           "confidence": 0.9, "reason": "flyer"}])
         # draft sub-call is fed the classified events (gating).
-        self.assertEqual(dr.call_args.kwargs["events"], ci.return_value)
+        self.assertEqual(dr.call_args.kwargs["events"], [{"type": "call_requested"}])
         # Pure assembly matches the monolith post-parse contract shape.
         self.assertEqual(out, {
             "updates": [{"column": "Rent/SF /Yr", "value": "12.00",
@@ -151,13 +154,55 @@ class PipelineWiringTests(unittest.TestCase):
             "notes": "NNN • available",
         })
 
-    def test_pipeline_degrades_to_safe_proposal_when_subcall_raises(self):
-        with mock.patch.object(ai, "_classify_intent", return_value=[]), \
+    def test_pipeline_returns_none_when_wrapper_raises(self):
+        # FIX 2: the wrapper's outer except now returns None (monolith-equivalent
+        # drop), NOT an empty proposal dict.
+        with mock.patch.object(ai, "_classify_intent", return_value=([], True)), \
              mock.patch.object(ai, "_extract_fields", side_effect=RuntimeError("boom")):
             out = ai._run_decomposed_pipeline(**self._pipe_kwargs())
-        # Never raises; returns a valid empty proposal so the downstream guard
-        # ladder still runs.
-        self.assertEqual(out, {"updates": [], "events": [], "response_email": None, "notes": ""})
+        self.assertIsNone(out)
+
+    def test_pipeline_returns_none_when_both_signal_calls_hard_fail(self):
+        # FIX 2: both signal-bearing sub-calls hard-fail (ok=False) -> the pipeline
+        # drops the turn (returns None), matching the monolith's None-on-failed-call.
+        with mock.patch.object(ai, "_classify_intent", return_value=([], False)), \
+             mock.patch.object(ai, "_extract_fields", return_value=([], False)), \
+             mock.patch.object(ai, "_write_notes", return_value="") as wn, \
+             mock.patch.object(ai, "_draft_reply", return_value=None) as dr:
+            out = ai._run_decomposed_pipeline(**self._pipe_kwargs())
+        self.assertIsNone(out)
+        # Short-circuited before notes/draft.
+        wn.assert_not_called()
+        dr.assert_not_called()
+
+    def test_pipeline_proceeds_when_one_signal_call_succeeds(self):
+        # FIX 2: classify ok, extract hard-fail -> still assemble a dict; draft is
+        # gated on ci_ok=True so it may run.
+        with mock.patch.object(ai, "_classify_intent", return_value=([], True)), \
+             mock.patch.object(ai, "_extract_fields", return_value=([], False)), \
+             mock.patch.object(ai, "_write_notes", return_value="") as wn, \
+             mock.patch.object(ai, "_draft_reply", return_value=None) as dr:
+            out = ai._run_decomposed_pipeline(**self._pipe_kwargs())
+        self.assertIsInstance(out, dict)
+        for key in ("updates", "events", "response_email", "notes"):
+            self.assertIn(key, out)
+        wn.assert_called_once()
+        dr.assert_called_once()
+
+    def test_pipeline_suppresses_reply_when_classify_hard_failed(self):
+        # FIX 2 conservative gate: classify hard-fail but extract ok -> proceed, but
+        # suppress the auto-reply (can't know if a null-reply-critical event exists),
+        # so _draft_reply is never called and response_email is None.
+        with mock.patch.object(ai, "_classify_intent", return_value=([], False)), \
+             mock.patch.object(ai, "_extract_fields",
+                               return_value=([{"column": "X", "value": "1"}], True)), \
+             mock.patch.object(ai, "_write_notes", return_value="") as wn, \
+             mock.patch.object(ai, "_draft_reply", return_value="SHOULD NOT RUN") as dr:
+            out = ai._run_decomposed_pipeline(**self._pipe_kwargs())
+        self.assertIsInstance(out, dict)
+        self.assertIsNone(out["response_email"])
+        dr.assert_not_called()
+        wn.assert_called_once()
 
     def test_assemble_coerces_bad_types(self):
         out = ai._assemble_proposal(updates=None, events="oops",
@@ -173,38 +218,48 @@ class SubCallSafetyTests(unittest.TestCase):
         fake = _fake_client('{"events": [{"type": "call_requested"}]}')
         with mock.patch.object(ai, "client", fake), \
              mock.patch.object(ai, "track_openai_usage_safely") as track:
-            events = ai._classify_intent(
+            events, ok = ai._classify_intent(
                 event_rules="RULES", target_anchor="1 Randolph Ct",
                 last_human_message="Call me", conversation=[{"direction": "inbound", "content": "Call me"}],
+                missing_fields=["Total SF"],
                 uid="u", client_id="c", thread_id="t", sheet_id="s", rownum=3,
             )
         self.assertEqual(events, [{"type": "call_requested"}])
-        self.assertEqual(fake.responses.create.call_args.kwargs["model"], "gpt-4o-mini")
+        self.assertTrue(ok)  # FIX 2: valid parse -> ok True
+        # FIX 3: classify runs on gpt-5.2 for cutover-equivalent detection power.
+        self.assertEqual(fake.responses.create.call_args.kwargs["model"], "gpt-5.2")
         self.assertEqual(track.call_args.kwargs["operation"], "ai.classify_intent")
-        self.assertEqual(track.call_args.kwargs["model"], "gpt-4o-mini")
+        self.assertEqual(track.call_args.kwargs["model"], "gpt-5.2")
+        # FIX 1: the missing-fields list is surfaced to the classifier prompt so it
+        # can evaluate all_info_gathered (close_conversation).
+        prompt_text = fake.responses.create.call_args.kwargs["input"][0]["content"][0]["text"]
+        self.assertIn("MISSING REQUIRED FIELDS", prompt_text)
+        self.assertIn("Total SF", prompt_text)
 
     def test_classify_intent_returns_empty_on_client_error(self):
         fake = mock.Mock()
         fake.responses.create.side_effect = RuntimeError("network down")
         with mock.patch.object(ai, "client", fake):
-            events = ai._classify_intent(
+            events, ok = ai._classify_intent(
                 event_rules="RULES", target_anchor="x", last_human_message="hi",
-                conversation=[], uid="u", client_id="c", thread_id="t",
+                conversation=[], missing_fields=[], uid="u", client_id="c", thread_id="t",
                 sheet_id="s", rownum=3,
             )
         self.assertEqual(events, [])
+        self.assertFalse(ok)  # FIX 2: API call raised -> hard failure
 
     def test_extract_fields_returns_empty_on_bad_json(self):
         fake = _fake_client("not json at all")
         with mock.patch.object(ai, "client", fake), \
              mock.patch.object(ai, "track_openai_usage_safely"):
-            updates = ai._extract_fields(
+            updates, ok = ai._extract_fields(
                 column_rules="C", doc_selection_rules="D", header=["A"], rowvals=["x"],
                 rownum=3, missing_fields=[], target_anchor="x", conversation=[],
                 pdf_manifest=None, url_texts=None, uid="u", client_id="c",
                 thread_id="t", sheet_id="s", extraction_fields=None,
             )
         self.assertEqual(updates, [])
+        self.assertFalse(ok)  # FIX 2: unparseable JSON -> hard failure
 
     def test_extract_fields_preserves_multimodal_input(self):
         fake = _fake_client('{"updates": []}')
@@ -213,12 +268,14 @@ class SubCallSafetyTests(unittest.TestCase):
                          "id": "file_123"}]
         with mock.patch.object(ai, "client", fake), \
              mock.patch.object(ai, "track_openai_usage_safely"):
-            ai._extract_fields(
+            updates, ok = ai._extract_fields(
                 column_rules="C", doc_selection_rules="D", header=["A"], rowvals=["x"],
                 rownum=3, missing_fields=[], target_anchor="x", conversation=[],
                 pdf_manifest=pdf_manifest, url_texts=None, uid="u", client_id="c",
                 thread_id="t", sheet_id="s", extraction_fields=None,
             )
+        self.assertEqual(updates, [])
+        self.assertTrue(ok)  # FIX 2: valid (empty) parse -> ok True
         content = fake.responses.create.call_args.kwargs["input"][0]["content"]
         kinds = [part["type"] for part in content]
         # Two page images (capped) + input_file fallback + the text prompt.

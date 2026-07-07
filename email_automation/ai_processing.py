@@ -4,7 +4,7 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import client, _sheets_client, _fs
 from .messaging import build_conversation_payload
@@ -2745,6 +2745,19 @@ def apply_proposal_to_sheet(
 # ===========================================================================
 
 
+# classify-intent runs on gpt-5.2 (NOT the cheap gpt-4o-mini used by the other
+# narrow sub-calls). Cutover-equivalence requires the classifier to match the
+# monolith's null-reply-critical detection power: needs_user_input /
+# contact_optout / wrong_contact have essentially NO deterministic backfill in
+# `_augment_events_with_deterministic_signals` (it only strips false positives and
+# injects wrong_contact via colleague-redirect), so a weaker classifier would
+# silently drop reply-and-skip signals the monolith catches. Tiering classify down
+# to gpt-4o-mini is a FUTURE cost optimization gated on golden-replay proving the
+# cheap model's null-reply detection matches — do NOT downgrade without that
+# evidence.
+_CLASSIFY_INTENT_MODEL = "gpt-5.2"
+
+
 def _decompose_prompt_enabled() -> bool:
     """Return True when the decomposed multi-call pipeline is enabled.
 
@@ -2813,13 +2826,20 @@ def _meter_decomposed_subcall(resp, *, uid, client_id, thread_id, operation, mod
 
 
 def _classify_intent(*, event_rules, target_anchor, last_human_message, conversation,
-                     uid, client_id, thread_id, sheet_id, rownum) -> List[dict]:
-    """classify-intent (gpt-4o-mini): LAST HUMAN message -> events[].
+                     missing_fields=None, uid, client_id, thread_id, sheet_id,
+                     rownum) -> Tuple[List[dict], bool]:
+    """classify-intent (gpt-5.2): LAST HUMAN message -> (events[], ok).
 
     Reuses the monolith EVENT_RULES prose so the 9-type enum + sub-reasons are
-    identical. Emits the same event object shape the monolith emits. Defensive
-    parse; returns [] on any failure (the deterministic event augmenter still
-    re-evaluates the fresh message downstream).
+    identical. Emits the same event object shape the monolith emits. Runs on
+    gpt-5.2 (see `_CLASSIFY_INTENT_MODEL`) so its null-reply-critical detection
+    matches the monolith.
+
+    Returns ``(events, ok)``. ``ok`` is False ONLY on a HARD failure — the API
+    call raised, or the response JSON was unparseable — mirroring the monolith's
+    None-on-failed-call. A valid-but-empty (or valid non-object) response is
+    ``ok=True`` with ``events=[]``; the deterministic event augmenter still
+    re-evaluates the fresh message downstream.
     """
     try:
         last_human_block = ""
@@ -2837,6 +2857,7 @@ def _classify_intent(*, event_rules, target_anchor, last_human_message, conversa
             f"TARGET PROPERTY (canonical identity for matching): {target_anchor}\n\n"
             f"{event_rules}\n"
             f"{last_human_block}\n"
+            f"MISSING REQUIRED FIELDS (if any):\n{json.dumps(missing_fields)}\n\n"
             "CONVERSATION HISTORY (latest last, for CONTEXT — includes quoted/forwarded "
             f"history):\n{json.dumps(conversation, indent=2)}\n\n"
             "OUTPUT ONLY valid JSON in this exact format (the events array may be empty):\n"
@@ -2866,41 +2887,107 @@ def _classify_intent(*, event_rules, target_anchor, last_human_message, conversa
             "Include ONLY the optional fields relevant to each event type; omit the rest."
         )
         resp = client.responses.create(
-            model="gpt-4o-mini",
+            model=_CLASSIFY_INTENT_MODEL,
             input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
             temperature=0.1,
         )
         _meter_decomposed_subcall(
             resp, uid=uid, client_id=client_id, thread_id=thread_id,
-            operation="ai.classify_intent", model="gpt-4o-mini",
+            operation="ai.classify_intent", model=_CLASSIFY_INTENT_MODEL,
             sheet_id=sheet_id, rownum=rownum,
             extra_meta={"conversationMessageCount": len(conversation or [])},
         )
-        parsed = _parse_json_object(getattr(resp, "output_text", "") or "", default={})
+        try:
+            parsed = json.loads(_strip_json_code_fence(getattr(resp, "output_text", "") or ""))
+        except (json.JSONDecodeError, TypeError) as e:
+            print(f"⚠️ decomposed classify_intent JSON parse failed (hard-fail): {e}")
+            return [], False
+        if not isinstance(parsed, dict):
+            return [], True  # valid JSON but not an object -> no events, not a hard failure
         events = parsed.get("events")
-        return events if isinstance(events, list) else []
-    except Exception as e:  # noqa: BLE001 — degrade to safe default, never crash the pipeline
-        print(f"⚠️ decomposed classify_intent failed (safe-default []): {e}")
-        return []
+        return (events if isinstance(events, list) else []), True
+    except Exception as e:  # noqa: BLE001 — HARD failure (API raised); signal drop-decision
+        print(f"⚠️ decomposed classify_intent failed (hard-fail []): {e}")
+        return [], False
+
+
+# Street-address pattern: a 1-6 digit street number followed by a street name and
+# a street-type suffix. Deliberately precise (address-shaped only) so zips, prices,
+# SF, years, and clear-height figures do NOT register as addresses. Only
+# non-capturing groups so `.findall` yields whole matched address strings.
+_STREET_TYPE_SUFFIX = (
+    r"st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ct|court|ln|lane|"
+    r"way|pkwy|parkway|pl|place|ter|terrace|cir|circle|hwy|highway|sq|square"
+)
+_STREET_ADDRESS_RE = re.compile(
+    r"\b\d{1,6}\s+"                       # street number
+    r"(?:[a-z][a-z'.\-]*\s+){1,4}"          # 1-4 street-name words
+    r"(?:" + _STREET_TYPE_SUFFIX + r")\b",  # street-type suffix
+    re.IGNORECASE,
+)
+
+
+def _distinct_street_addresses(text: str) -> set:
+    """Normalized (lowercased, whitespace-collapsed) distinct street addresses."""
+    out = set()
+    for m in _STREET_ADDRESS_RE.findall(text or ""):
+        out.add(" ".join(m.split()).lower())
+    return out
+
+
+def _pdf_manifest_needs_escalation(pdf_manifest, target_anchor) -> bool:
+    """True when a PDF manifest shows genuine MULTI-BUILDING ambiguity that warrants
+    escalating the extract-fields sub-call from gpt-4o-mini to gpt-5.2.
+
+    Escalation is COST-ONLY-safe (gpt-5.2 is strictly more capable), so this biases
+    toward escalating on real multi-building ambiguity but does NOT fire on ordinary
+    single-building flyers. Detection is precise and address-pattern based (NOT
+    zips/prices/SF/years): escalate when the combined manifest text carries >=2
+    DISTINCT street addresses that are not all the TARGET address. Secondary signal:
+    reuse `_address_binding_numbers` — if the combined text carries street-number
+    tokens the target does not, AND there are >=2 distinct address patterns,
+    escalate. Empty/None manifest or no address patterns -> False (cheap path).
+    """
+    try:
+        if not pdf_manifest:
+            return False
+        combined = " ".join((p or {}).get("text") or "" for p in pdf_manifest)
+        if not combined.strip():
+            return False
+        distinct = _distinct_street_addresses(combined)
+        if len(distinct) < 2:
+            return False
+        target_addrs = _distinct_street_addresses(target_anchor or "")
+        # >=2 distinct addresses and they are not all the target address.
+        if not distinct <= target_addrs:
+            return True
+        # Secondary: competing street-number tokens beyond the target's.
+        extra_binding = _address_binding_numbers(combined) - _address_binding_numbers(target_anchor or "")
+        return bool(extra_binding)
+    except Exception as e:  # noqa: BLE001 — a detector hiccup must never break extraction
+        print(f"⚠️ pdf-manifest escalation check failed (no-escalate): {e}")
+        return False
 
 
 def _extract_fields(*, column_rules, doc_selection_rules, header, rowvals, rownum,
                     missing_fields, target_anchor, conversation, pdf_manifest, url_texts,
-                    uid, client_id, thread_id, sheet_id, extraction_fields) -> List[dict]:
-    """extract-fields (gpt-4o-mini, multimodal): message + PDFs/vision -> updates[].
+                    uid, client_id, thread_id, sheet_id, extraction_fields) -> Tuple[List[dict], bool]:
+    """extract-fields (multimodal): message + PDFs/vision -> (updates[], ok).
 
     Preserves the monolith's multimodal input (up to 3 page images per PDF plus the
     input_file fallback) so scanned/complex PDFs still extract. Reuses COLUMN_RULES
-    + DOC_SELECTION_RULES. Defensive parse; returns [] on failure (the deterministic
-    rent/SF regex nets still run downstream).
+    + DOC_SELECTION_RULES. Defaults to the cheap gpt-4o-mini path but escalates to
+    gpt-5.2 for genuine multi-building PDFs (see `_pdf_manifest_needs_escalation`).
+
+    Returns ``(updates, ok)``. ``ok`` is False ONLY on a HARD failure — the API call
+    raised, or the response JSON was unparseable — mirroring the monolith's
+    None-on-failed-call. A valid-but-empty (or valid non-object) response is
+    ``ok=True`` with ``updates=[]``; the deterministic rent/SF regex nets still run
+    downstream.
     """
     try:
-        # TODO(model-tiering): when a PDF manifest carries multiple candidate
-        # buildings/addresses that do not cleanly match the TARGET PROPERTY,
-        # escalate THIS extraction sub-call to model="gpt-5.2" for the harder
-        # multi-building disambiguation. Default stays gpt-4o-mini for the common
-        # single-building case (cheap path).
-        model = "gpt-4o-mini"
+        # Multi-building PDFs get the more-capable model; single-building stays cheap.
+        model = "gpt-5.2" if _pdf_manifest_needs_escalation(pdf_manifest, target_anchor) else "gpt-4o-mini"
 
         prompt_parts = [
             "You extract sheet-column field values for ONE Google Sheet row from an "
@@ -2980,12 +3067,18 @@ def _extract_fields(*, column_rules, doc_selection_rules, header, rowvals, rownu
                 "configuredExtractionFieldCount": len(extraction_fields or []),
             },
         )
-        parsed = _parse_json_object(getattr(resp, "output_text", "") or "", default={})
+        try:
+            parsed = json.loads(_strip_json_code_fence(getattr(resp, "output_text", "") or ""))
+        except (json.JSONDecodeError, TypeError) as e:
+            print(f"⚠️ decomposed extract_fields JSON parse failed (hard-fail): {e}")
+            return [], False
+        if not isinstance(parsed, dict):
+            return [], True  # valid JSON but not an object -> no updates, not a hard failure
         updates = parsed.get("updates")
-        return updates if isinstance(updates, list) else []
-    except Exception as e:  # noqa: BLE001 — degrade to safe default, never crash the pipeline
-        print(f"⚠️ decomposed extract_fields failed (safe-default []): {e}")
-        return []
+        return (updates if isinstance(updates, list) else []), True
+    except Exception as e:  # noqa: BLE001 — HARD failure (API raised); signal drop-decision
+        print(f"⚠️ decomposed extract_fields failed (hard-fail []): {e}")
+        return [], False
 
 
 def _write_notes(*, notes_rules, conversation, pdf_manifest, url_texts, updates,
@@ -3127,23 +3220,28 @@ def _run_decomposed_pipeline(*, event_rules, column_rules, doc_selection_rules,
                              target_anchor, last_human_message, contact_context,
                              missing_fields, header, rowvals, rownum, conversation,
                              pdf_manifest, url_texts, extraction_fields,
-                             uid, client_id, thread_id, sheet_id) -> Dict:
+                             uid, client_id, thread_id, sheet_id) -> Optional[Dict]:
     """Flag-ON path: run the decomposed sub-calls + pure assemble.
 
     Returns the SAME post-parse proposal dict {updates, events, response_email,
     notes} the monolith produces, which then flows through propose_sheet_updates'
-    existing deterministic guard ladder unchanged. Each sub-call already degrades
-    independently; this wrapper additionally guarantees a valid proposal dict even
-    if assembly (or anything else) fails — it never raises.
+    existing deterministic guard ladder unchanged.
+
+    Returns None (drops the turn) when BOTH signal-bearing sub-calls hard-fail, or
+    when the wrapper itself hits an exception — matching the monolith's
+    None-on-failed-call / None-on-outer-except, so processing.py's ``if proposal:``
+    gate SKIPS the turn (rather than applying an empty proposal) on a total model
+    failure.
     """
     try:
-        events = _classify_intent(
+        events, ci_ok = _classify_intent(
             event_rules=event_rules, target_anchor=target_anchor,
             last_human_message=last_human_message, conversation=conversation,
+            missing_fields=missing_fields,
             uid=uid, client_id=client_id, thread_id=thread_id,
             sheet_id=sheet_id, rownum=rownum,
         )
-        updates = _extract_fields(
+        updates, ef_ok = _extract_fields(
             column_rules=column_rules, doc_selection_rules=doc_selection_rules,
             header=header, rowvals=rowvals, rownum=rownum, missing_fields=missing_fields,
             target_anchor=target_anchor, conversation=conversation,
@@ -3151,27 +3249,41 @@ def _run_decomposed_pipeline(*, event_rules, column_rules, doc_selection_rules,
             uid=uid, client_id=client_id, thread_id=thread_id,
             sheet_id=sheet_id, extraction_fields=extraction_fields,
         )
+        # Total model failure: both signal-bearing sub-calls hard-failed. Drop the
+        # turn (monolith-equivalent) so it is retried, not committed as empty.
+        if not ci_ok and not ef_ok:
+            print("⚠️ decomposed pipeline: classify+extract both hard-failed — "
+                  "returning None (monolith-equivalent drop)")
+            return None
         notes = _write_notes(
             notes_rules=notes_rules, conversation=conversation,
             pdf_manifest=pdf_manifest, url_texts=url_texts, updates=updates,
             uid=uid, client_id=client_id, thread_id=thread_id,
             sheet_id=sheet_id, rownum=rownum,
         )
-        response_email = _draft_reply(
-            response_email_rules=response_email_rules, events=events,
-            contact_context=contact_context, target_anchor=target_anchor,
-            missing_fields=missing_fields, last_human_message=last_human_message,
-            conversation=conversation,
-            uid=uid, client_id=client_id, thread_id=thread_id,
-            sheet_id=sheet_id, rownum=rownum,
-        )
+        # Conservative reply gate: only draft when intent classification SUCCEEDED.
+        # If classify hard-failed we don't know whether a null-reply-critical event
+        # (needs_user_input / contact_optout / wrong_contact) is present, and those
+        # have no deterministic backfill — so suppress the auto-reply like the
+        # monolith would rather than risk auto-responding into a reply-and-skip case.
+        if ci_ok:
+            response_email = _draft_reply(
+                response_email_rules=response_email_rules, events=events,
+                contact_context=contact_context, target_anchor=target_anchor,
+                missing_fields=missing_fields, last_human_message=last_human_message,
+                conversation=conversation,
+                uid=uid, client_id=client_id, thread_id=thread_id,
+                sheet_id=sheet_id, rownum=rownum,
+            )
+        else:
+            response_email = None
         return _assemble_proposal(
             updates=updates, events=events,
             response_email=response_email, notes=notes,
         )
-    except Exception as e:  # noqa: BLE001 — never crash propose_sheet_updates
-        print(f"⚠️ decomposed pipeline failed (safe-default proposal): {e}")
-        return {"updates": [], "events": [], "response_email": None, "notes": ""}
+    except Exception as e:  # noqa: BLE001 — mirror the monolith's outer except: drop the turn
+        print(f"⚠️ decomposed pipeline failed (returning None — monolith-equivalent drop): {e}")
+        return None
 
 
 def propose_sheet_updates(uid: str,
