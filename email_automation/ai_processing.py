@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import client, _sheets_client, _fs
+from .budget_guard import should_block_openai_call
 from .messaging import build_conversation_payload
 from .sheets import _header_index_map, _get_first_tab_title, _col_letter, _execute_with_retry
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
@@ -1029,6 +1030,13 @@ def _augment_events_with_deterministic_signals(
         proposal["events"] = [
             e for e in events if (e or {}).get("type") != "wrong_contact"
         ]
+        # BUG-A (pressure test): an OOO auto-reply is a machine bounce, not a human
+        # response. The model intermittently drafts a reply ("I'll follow up after
+        # you're back") — suppress it AND skip the send entirely (not a template
+        # fallback) so we never ping the auto-responder (noise / possible loop).
+        # Wait for the human's real reply on a later scan.
+        proposal["response_email"] = None
+        proposal["skip_response"] = True
         return proposal
 
     # Engaged-alternative guard (LIVE break B9): a scoped "not interested in that
@@ -1327,8 +1335,18 @@ def _opex_match_is_rent_basis_line(text: str, m: "re.Match") -> bool:
         return False  # keyword-first hit ($ after the label) is a genuine OpEx figure
     if not m.group(0).rstrip().lower().endswith("nnn"):
         return False
-    before = text[max(0, m.start() - 26): m.start()]
-    return bool(_RENT_KW_BEFORE_FIGURE_RE.search(before))
+    # BUG-B (pressure test): a bare figure-first "$X NNN" is a RENT quote on a
+    # triple-net BASIS, not an OpEx figure. Previously it was only skipped when a
+    # rent keyword preceded it, so "$9.25 NNN" was mined as OpEx — and "$8.50 NNN
+    # with $3.50 opex" returned 8.50 (the rent), clobbering the real $3.50. Treat
+    # any bare "$X NNN" as rent-basis; it is OpEx ONLY when the NNN figure is
+    # DIRECTLY qualified as an estimate/charge ("$3.50 NNN est"). A separate later
+    # "$Y opex" belongs to that figure, so restrict the lookahead to before the
+    # next "$".
+    directly_after = text[m.end(): m.end() + 12].lower().split("$", 1)[0]
+    if re.search(r"\b(?:est|estimate[ds]?|charges?)\b", directly_after):
+        return False  # "$X NNN est/charges" -> genuine OpEx estimate
+    return True  # bare "$X NNN" -> rent-basis line, do not mine as OpEx
 # Total SF as an area (thousands-grouped or 4+ digits), not a $/SF rate figure.
 _TOTAL_SF_RE = re.compile(
     r"(?<![\w$/.])((?:\d{1,3}(?:,\d{3})+)|\d{4,})\s*(?:sf|sq\.?\s*ft|square\s*f(?:ee|oo)t)\b",
@@ -2757,6 +2775,17 @@ def propose_sheet_updates(uid: str,
         dry_run: If True, skips Firestore logging (useful for testing).
     """
     try:
+        # Hard OpenAI budget stop (flag-gated: ENFORCE_OPENAI_BUDGET, default OFF).
+        # When enforcement is ON and global current-month spend has reached
+        # USAGE_MONTHLY_BUDGET_USD, DEFER this turn — return None (as on a failed
+        # call) so processing.py's `if proposal:` gate SKIPS it and the message is
+        # retried once budget frees up, rather than making the paid call. dry_run
+        # still bills the model, so this guards that path too. No-op when the flag
+        # is off (byte-identical to today).
+        if should_block_openai_call(_fs):
+            print("⛔ OpenAI monthly budget reached — deferring extraction "
+                  "(ENFORCE_OPENAI_BUDGET on; raise USAGE_MONTHLY_BUDGET_USD or wait for next month).")
+            return None
         # Build conversation payload (chronological; latest last)
         # If conversation is provided directly (e.g., from tests), use it; otherwise fetch from Firestore
         if conversation is None:
