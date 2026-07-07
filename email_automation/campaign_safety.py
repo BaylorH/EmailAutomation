@@ -4,7 +4,13 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 
 
 CLIENT_AUTOMATION_PAUSED_REASON = "client_automation_paused"
-CLIENT_TERMINAL_STATUSES = {"stopped", "archived", "deleted"}
+ORPHAN_DELETED_CAMPAIGN_REASON = "orphan_deleted_campaign"
+# "completed" is terminal: `_maybe_mark_client_completed` (processing.py) auto-marks a
+# campaign completed once every thread is terminal and no work remains. Honoring it here
+# is what stops a finished campaign from being monitored — so campaigns no longer have to
+# be frozen by hand. A freshly-started campaign is never "completed", so this never gates
+# new work.
+CLIENT_TERMINAL_STATUSES = {"stopped", "archived", "deleted", "completed"}
 
 
 def normalize_client_status(value: Any) -> str:
@@ -60,6 +66,14 @@ def get_client_automation_pause(
         return False, "", {}
 
     if not getattr(client_doc, "exists", False):
+        # DELIBERATE fail-open. A missing client doc is NOT proof of a deleted campaign:
+        # a live thread can legitimately reach here with a clientId whose doc read returns
+        # not-exists (fixture-shaped state, eventual consistency, mid-provision). Gating on
+        # exists==False over-gates the mainline inbound path (proven by the tour/nonviable
+        # processing suite). True orphan-gating needs an explicit deletion tombstone
+        # (e.g. clients/{id}.deletedAt or a deleted-campaigns registry) so a *confirmed*
+        # deletion can be told apart from an absent read — do it there, not here. See
+        # ORPHAN_DELETED_CAMPAIGN_REASON.
         return False, "", {}
 
     client_data = client_doc.to_dict() or {}
