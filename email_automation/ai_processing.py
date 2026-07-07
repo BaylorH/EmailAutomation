@@ -3293,28 +3293,32 @@ OUTPUT ONLY valid JSON in this exact format:
             input=[{"role": "user", "content": input_content}],
             temperature=0.1
         )
-        if not dry_run:
-            track_openai_usage_safely(
-                db=_fs,
-                user_id=uid,
-                client_id=client_id,
-                thread_id=thread_id,
-                operation="ai.extract_sheet_updates",
-                model="gpt-5.2",
-                usage=getattr(response, "usage", None),
-                request_id=getattr(response, "id", None),
-                endpoint="responses",
-                metadata={
-                    "sheetId": sheet_id,
-                    "rowNumber": rownum,
-                    "headerCount": len(header or []),
-                    "conversationMessageCount": len(conversation or []),
-                    "hasPdfManifest": bool(pdf_manifest),
-                    "pdfCount": len(pdf_manifest or []),
-                    "urlTextCount": len(url_texts or []),
-                    "configuredExtractionFieldCount": len(extraction_fields or []),
-                },
-            )
+        # The OpenAI call above ALWAYS bills, even under dry_run (dry_run only
+        # skips the sheetChangeLog Firestore write below, not the paid API call).
+        # Meter unconditionally so dry-run spend (e.g. the app.py new-property
+        # extraction path) is captured.
+        track_openai_usage_safely(
+            db=_fs,
+            user_id=uid,
+            client_id=client_id,
+            thread_id=thread_id,
+            operation="ai.extract_sheet_updates",
+            model="gpt-5.2",
+            usage=getattr(response, "usage", None),
+            request_id=getattr(response, "id", None),
+            endpoint="responses",
+            metadata={
+                "sheetId": sheet_id,
+                "rowNumber": rownum,
+                "headerCount": len(header or []),
+                "conversationMessageCount": len(conversation or []),
+                "hasPdfManifest": bool(pdf_manifest),
+                "pdfCount": len(pdf_manifest or []),
+                "urlTextCount": len(url_texts or []),
+                "configuredExtractionFieldCount": len(extraction_fields or []),
+                "dryRun": bool(dry_run),
+            },
+        )
 
         raw_response = (response.output_text or "").strip()
 

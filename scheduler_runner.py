@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 import openai
 from bs4 import BeautifulSoup
 from google.cloud.firestore_v1 import FieldFilter
+from email_automation.openai_usage import track_openai_usage_safely
 
 # Config
 CLIENT_ID         = os.getenv("AZURE_API_APP_ID")
@@ -2065,6 +2066,26 @@ OUTPUT ONLY valid JSON in this exact format:
             model=OPENAI_ASSISTANT_MODEL,
             input=[{"role": "user", "content": input_content}],
             temperature=0.1
+        )
+
+        # Best-effort usage metering (never raises into the caller).
+        track_openai_usage_safely(
+            db=_fs,
+            user_id=uid,
+            client_id=client_id,
+            thread_id=thread_id,
+            operation="ai.propose_sheet_updates",
+            model=OPENAI_ASSISTANT_MODEL,
+            usage=getattr(response, "usage", None),
+            request_id=getattr(response, "id", None),
+            endpoint="responses",
+            metadata={
+                "sheetId": sheet_id,
+                "rowNumber": rownum,
+                "headerCount": len(header or []),
+                "fileManifestCount": len(file_manifest or []),
+                "urlTextCount": len(url_texts or []),
+            },
         )
 
         raw_response = (response.output_text or "").strip()
