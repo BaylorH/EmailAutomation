@@ -2441,6 +2441,22 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                         clean_subject = clean_subject[len(prefix):].strip()
                 thread_meta["propertyAddress"] = clean_subject
 
+            # Combined send mode: one thread covers ALL of a broker's properties.
+            # Record every property/row it spans (additive — singular
+            # propertyAddress/rowNumber above stay set for backward compatibility)
+            # so a future reply parser can fan an answer back across the listings.
+            if isinstance(thread_context, dict):
+                combined_addresses = thread_context.get("propertyAddresses")
+                if isinstance(combined_addresses, list):
+                    cleaned_addresses = [str(a).strip() for a in combined_addresses if a]
+                    if cleaned_addresses:
+                        thread_meta["propertyAddresses"] = cleaned_addresses
+                combined_rows = thread_context.get("rows")
+                if isinstance(combined_rows, list):
+                    cleaned_rows = [r for r in combined_rows if r]
+                    if cleaned_rows:
+                        thread_meta["rows"] = cleaned_rows
+
             # Save thread root with retry
             thread_saved = False
             for attempt in range(MAX_INDEX_RETRIES):
@@ -2870,18 +2886,37 @@ def send_outboxes(
 
         # Check if multiple properties for same broker
         if len(valid_items) > 1:
-            print(f"🔗 Detected {len(valid_items)} properties for same broker: {recipient_email}")
-            _send_multi_property_email(
-                user_id,
-                _fresh_graph_headers(headers, headers_provider),
-                recipient_email,
-                valid_items,
-                user_signature,
-                signature_mode,
-                user_email,
-                headers_provider=headers_provider,
-                operation_states=operation_states,
-            )
+            # Per-campaign send mode: 'separate' (default — one email per property)
+            # or 'combined' (one email covering ALL of this broker's properties).
+            # Absent / any non-'combined' value → separate, so queued items and
+            # older frontends stay byte-identical to today's behavior.
+            send_mode = (valid_items[0].get('data') or {}).get('sendMode') or 'separate'
+            if send_mode == 'combined':
+                print(f"🔗 Detected {len(valid_items)} properties for same broker (COMBINED mode): {recipient_email}")
+                _send_combined_property_email(
+                    user_id,
+                    _fresh_graph_headers(headers, headers_provider),
+                    recipient_email,
+                    valid_items,
+                    user_signature,
+                    signature_mode,
+                    user_email,
+                    headers_provider=headers_provider,
+                    operation_states=operation_states,
+                )
+            else:
+                print(f"🔗 Detected {len(valid_items)} properties for same broker: {recipient_email}")
+                _send_multi_property_email(
+                    user_id,
+                    _fresh_graph_headers(headers, headers_provider),
+                    recipient_email,
+                    valid_items,
+                    user_signature,
+                    signature_mode,
+                    user_email,
+                    headers_provider=headers_provider,
+                    operation_states=operation_states,
+                )
         else:
             # Single property - send normally
             item = valid_items[0]
@@ -3252,6 +3287,321 @@ def _send_multi_property_email(
         if idx < len(properties) - 1:
             print(f"  ⏳ Waiting 2 minutes before sending next email to avoid spam detection...")
             time.sleep(120)
+
+
+def _send_combined_property_email(
+    user_id: str,
+    headers: Dict[str, str],
+    recipient_email: str,
+    items: list,
+    user_signature: str = None,
+    signature_mode: str = None,
+    user_email: str = None,
+    headers_provider: Optional[Callable[[], Dict[str, str]]] = None,
+    operation_states: Optional[list] = None,
+):
+    """
+    Send ONE combined email covering ALL of a broker's properties.
+
+    Opt-in counterpart to _send_multi_property_email (which sends one email per
+    property). Selected when the outbox items carry sendMode == 'combined'.
+
+    The N per-property outbox items collapse into a single Graph send / thread.
+    It is ONE atomic send unit: every surviving row is finalized together on
+    success, or bumped/dead-lettered together on failure. We never retry a
+    subset — one Graph send already covered every property, so a per-item retry
+    would double-send.
+
+    The combined body is generated once by the frontend and stamped identically
+    on every item, so items[0]['script'] is the whole message; we do NOT
+    concatenate here.
+    """
+    # Opt-out short-circuit (mirror separate mode): drop every queued item.
+    from .processing import is_contact_opted_out
+    optout_record = is_contact_opted_out(user_id, recipient_email)
+    if optout_record:
+        print(f"🚫 Skipping combined email to opted-out contact: {recipient_email}")
+        for item in items:
+            _terminalize_outbox_action_audit(
+                user_id,
+                item['doc'].reference,
+                item['data'],
+                "opt_out_skipped",
+                {
+                    "skippedAt": SERVER_TIMESTAMP,
+                    "skipReason": optout_record.get("reason", "contact_opted_out"),
+                },
+            )
+            item['doc'].reference.delete()
+        print(f"🗑️ Deleted {len(items)} outbox items (recipient opted out)")
+        return
+
+    # Build the claimed working set: skip cancelled items, claim each (so no other
+    # worker double-processes a row), drop duplicates. Everything that survives
+    # here is part of the single send.
+    recipient_guard_sheet_cache: Dict[str, Any] = {}
+    claimed = []
+    for item in items:
+        ref = item['doc'].reference
+        data = item['data']
+
+        if _delete_cancelled_outbox_item_if_needed(ref, data, user_id=user_id):
+            continue
+
+        if not _claim_outbox_item(ref, data, user_id=user_id):
+            print("   ⏭️ Skipping a property - already being processed by another worker")
+            continue
+
+        fresh_data = _get_current_outbox_data(ref)
+        if fresh_data is None:
+            continue
+        if fresh_data:
+            data = fresh_data
+
+        if _delete_cancelled_outbox_item_if_needed(ref, data, user_id=user_id):
+            continue
+
+        clientId = (data.get("clientId") or "").strip()
+        row_number = data.get("rowNumber")
+
+        if _pause_client_outbox_item_if_needed(user_id, ref, data):
+            print(f"   ⏸️ Moved combined outbox item for paused/stopped client {clientId or 'n/a'} to dead letter")
+            continue
+
+        if _dead_letter_campaign_recipient_row_mismatch_if_needed(
+            user_id,
+            ref,
+            data,
+            recipient_email,
+            row_number_override=row_number,
+            sheet_metadata_cache=recipient_guard_sheet_cache,
+        ):
+            print(f"   🛑 Blocked row-recipient mismatch for {recipient_email}")
+            continue
+
+        subject = data.get("subject", "")
+        property_address = subject or _extract_property_from_script(data.get("script", ""))
+
+        # Defense in depth: don't re-send about a property that already has a thread.
+        if _has_existing_thread_for_property(user_id, recipient_email, property_address, client_id=clientId):
+            print(f"   🚫 DUPLICATE DETECTED: Already sent to {recipient_email} about '{property_address}' — dropping from combined set")
+            _terminalize_outbox_action_audit(
+                user_id,
+                ref,
+                data,
+                "duplicate_skipped",
+                {"skippedAt": SERVER_TIMESTAMP, "skipReason": "existing_thread_for_property"},
+            )
+            ref.delete()
+            continue
+
+        claimed.append({
+            "item": item,
+            "ref": ref,
+            "data": data,
+            "clientId": clientId,
+            "rowNumber": row_number,
+            "subject": subject,
+            "property_address": property_address,
+            "attempts": int(data.get("attempts") or 0),
+        })
+
+    if not claimed:
+        print(f"   ⚠️ No combinable properties left for {recipient_email} (all cancelled/duplicate/claimed elsewhere)")
+        return
+
+    print(f"📬 Sending ONE combined email to {recipient_email} covering {len(claimed)} propert{'y' if len(claimed) == 1 else 'ies'}")
+
+    primary = claimed[0]
+    data0 = primary["data"]
+    clientId = primary["clientId"]
+    primary_row = primary["rowNumber"]
+    primary_doc_id = primary["item"]['doc'].id
+
+    def _fail_all(reason_prefix: str, error_msg: str):
+        """Atomic failure: bump attempts / dead-letter EVERY claimed item together."""
+        for c in claimed:
+            new_attempts = c["attempts"] + 1
+            if new_attempts >= MAX_OUTBOX_ATTEMPTS:
+                _move_to_dead_letter(
+                    user_id, c["ref"], c["data"],
+                    f"{reason_prefix} after {new_attempts} attempts: {error_msg}",
+                )
+            else:
+                c["ref"].set(
+                    {
+                        "attempts": new_attempts,
+                        "lastError": error_msg,
+                        "lastSendAttemptAt": datetime.now(timezone.utc) - timedelta(seconds=5),
+                        "status": "retrying",
+                        "processingBy": None,
+                        "processingAt": None,
+                    },
+                    merge=True,
+                )
+                _mark_outbox_action_audit_retrying(user_id, c["ref"], c["data"], new_attempts, error_msg)
+        _record_operation_state(
+            operation_states,
+            _outbox_send_operation_state("error", doc_id=primary_doc_id, recipient=recipient_email, error=error_msg),
+        )
+
+    def _dead_letter_all(reason: str):
+        """Terminal (manual-review) failure: dead-letter every claimed item."""
+        for c in claimed:
+            _move_to_dead_letter(user_id, c["ref"], c["data"], reason)
+        _record_operation_state(
+            operation_states,
+            _outbox_send_operation_state("error", doc_id=primary_doc_id, recipient=recipient_email, error=reason),
+        )
+
+    try:
+        # Contact name + name-placeholder resolution (once, from the primary row).
+        contact_name = data0.get("contactName") or data0.get("firstName")
+        contact_name_failure_reason = None
+        raw_script = data0.get("script", "")
+        if not contact_name and NAME_PLACEHOLDER_RE.search(raw_script or ""):
+            name_resolution = _resolve_campaign_launch_contact_name_result_from_sheet(
+                user_id,
+                data0,
+                row_number_override=primary_row,
+                sheet_metadata_cache=recipient_guard_sheet_cache,
+            )
+            contact_name = name_resolution.get("contact_name")
+            contact_name_failure_reason = name_resolution.get("failure_reason")
+
+        script = _personalize_name_placeholders(raw_script, contact_name)
+
+        # Shared-body guards → the whole group is terminal (manual review).
+        # The guard dead-letters the primary; dead-letter the rest to match.
+        if _dead_letter_unresolved_name_placeholder_if_needed(
+            user_id, primary["ref"], data0, script, contact_name_failure_reason
+        ):
+            for c in claimed[1:]:
+                _move_to_dead_letter(user_id, c["ref"], c["data"], "Unresolved contact name in combined send; manual review required")
+            _record_operation_state(
+                operation_states,
+                _outbox_send_operation_state("error", doc_id=primary_doc_id, recipient=recipient_email, error="unresolved_contact_name"),
+            )
+            print(f"   🛑 Blocked unresolved contact name for combined {recipient_email}; manual review required")
+            return
+        if _dead_letter_unsafe_outbound_body_if_needed(user_id, primary["ref"], data0, script):
+            for c in claimed[1:]:
+                _move_to_dead_letter(user_id, c["ref"], c["data"], "Unsafe outbound body in combined send; manual review required")
+            _record_operation_state(
+                operation_states,
+                _outbox_send_operation_state("error", doc_id=primary_doc_id, recipient=recipient_email, error="unsafe_outbound_body"),
+            )
+            print(f"   🛑 Blocked unsafe combined body for {recipient_email}; manual review required")
+            return
+
+        combined_subject = data0.get("combinedSubject") or primary["subject"] or None
+
+        # Sent-Items retry guard: if a prior attempt of this combined send already
+        # went out, reconcile ALL items instead of re-sending (avoids double-send).
+        current_headers = _fresh_graph_headers(headers, headers_provider)
+        prior_send = _sent_retry_reconciliation_result(
+            current_headers,
+            data0,
+            recipient_email,
+            script,
+            combined_subject,
+        )
+        if prior_send.get("sent"):
+            for c in claimed:
+                _record_outbox_reconciliation(
+                    user_id,
+                    c["ref"],
+                    c["data"],
+                    "Prior failed attempt appears already sent in Sent Items; stopped before retry",
+                    prior_send,
+                    prior_send.get("sent", []),
+                    delete_original=True,
+                )
+            print(f"  ⚠️ Prior combined send detected for {recipient_email}; reconciled {len(claimed)} items without retrying")
+            return
+        if prior_send.get("manualContinuation"):
+            _dead_letter_all(_manual_continuation_retry_reason(prior_send))
+            return
+        if prior_send.get("guardLookupError"):
+            _dead_letter_all(
+                f"Sent Items retry guard could not verify prior send; manual review required before retry: {prior_send['guardLookupError']}"
+            )
+            return
+
+        # followUpConfig (from primary item, client-doc fallback).
+        followup_config = data0.get("followUpConfig")
+        if not followup_config and clientId:
+            try:
+                from .clients import _fs
+                client_doc = _fs.collection("users").document(user_id).collection("clients").document(clientId).get()
+                if client_doc.exists:
+                    followup_config = (client_doc.to_dict() or {}).get("followUpConfig")
+            except Exception as e:
+                print(f"   ⚠️ Could not fetch followUpConfig from client: {e}")
+
+        property_addresses = [c["property_address"] for c in claimed if c["property_address"]]
+        rows = [c["rowNumber"] for c in claimed if c["rowNumber"]]
+        thread_context = {
+            "propertyAddresses": property_addresses,
+            "rows": rows,
+        }
+
+        send_started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        res = send_and_index_email(
+            user_id, current_headers, script, [recipient_email],
+            client_id_or_none=clientId, row_number=primary_row,
+            user_signature=user_signature, subject_override=combined_subject,
+            signature_mode=signature_mode, followup_config=followup_config,
+            contact_name=contact_name, user_email=user_email,
+            thread_context=thread_context,
+        )
+        any_errors = bool([e for e in res.get("errors", {}) if "opted out" not in str(res["errors"].get(e, ""))])
+
+        if not any_errors and res.get("sent"):
+            for c in claimed:
+                _finalize_successful_outbox_item(
+                    user_id, c["ref"], c["data"],
+                    row_number=c["rowNumber"], client_id=c["clientId"],
+                    send_result=res,
+                )
+            print(f"  ✅ Sent ONE combined email + finalized {len(claimed)} rows for {recipient_email}")
+            _record_operation_state(
+                operation_states,
+                _outbox_send_operation_state("healthy", doc_id=primary_doc_id, recipient=recipient_email),
+            )
+        elif not res.get("sent") and res.get("opted_out") and _all_send_errors_are_opt_out(res.get("errors", {})):
+            for c in claimed:
+                _terminalize_outbox_action_audit(
+                    user_id, c["ref"], c["data"], "opt_out_skipped",
+                    {"skippedAt": SERVER_TIMESTAMP, "skipReason": "contact_opted_out"},
+                )
+                c["ref"].delete()
+            print(f"  🚫 Deleted {len(claimed)} combined outbox items for opted-out recipient {recipient_email}")
+        else:
+            error_msg = json.dumps(res.get("errors", {}))[:1500]
+            identity_recipients = _send_identity_recipients(res)
+            if identity_recipients:
+                # Graph accepted the send but indexing failed -> reconcile all,
+                # not a send failure (retrying would double-send).
+                for c in claimed:
+                    _record_outbox_reconciliation(
+                        user_id, c["ref"], c["data"], error_msg,
+                        {**res, "sent": identity_recipients}, identity_recipients,
+                        delete_original=True,
+                    )
+                print(f"  ⚠️ Combined send accepted by Graph but indexing failed; reconciled {len(claimed)} items")
+                _record_operation_state(
+                    operation_states,
+                    _outbox_send_operation_state("healthy", doc_id=primary_doc_id, recipient=recipient_email),
+                )
+            else:
+                _fail_all("Combined send errors", error_msg)
+                print(f"  ⚠️ Combined send failed for {recipient_email}; bumped/retried {len(claimed)} items")
+
+    except Exception as e:
+        error_msg = str(e)[:1500]
+        _fail_all("Combined send exception", error_msg)
+        print(f"  💥 Combined send error for {recipient_email}: {e}")
 
 
 def _send_single_outbox_item(

@@ -1,6 +1,7 @@
 import unittest
 import os
 from unittest.mock import patch
+from contextlib import ExitStack
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
@@ -2265,6 +2266,163 @@ class DailySendCapTests(unittest.TestCase):
         with patch.dict(os.environ, {"SITESIFT_DAILY_SEND_CAP": "banana"}):
             self.assertEqual(email_module._resolve_daily_send_cap(),
                              email_module.DEFAULT_DAILY_SEND_CAP)
+
+
+class SendModeCombineTests(unittest.TestCase):
+    """sendMode='combined' — one email per broker, atomic across the broker's rows."""
+
+    RECIPIENT = "bp21harrison+golden@gmail.com"
+    ADDRS = ["100 Dashboard Way", "200 Interference Rd", "300 Drip Feed Dr"]
+
+    def _same_broker_docs(self, *, send_mode=None, count=3):
+        docs = []
+        for i in range(count):
+            data = {
+                "assignedEmails": [self.RECIPIENT],
+                "script": "Hi Avery,\n\n- 100 Dashboard Way\n- 200 Interference Rd\n- 300 Drip Feed Dr",
+                "clientId": "client-1",
+                "subject": self.ADDRS[i],
+                "rowNumber": 3 + i,
+                "contactName": "Avery Rep",
+                "combinedSubject": "100 Dashboard Way (+2 more)",
+            }
+            if send_mode is not None:
+                data["sendMode"] = send_mode
+            docs.append(FakeDoc(data, doc_id=f"outbox-{i + 1}"))
+        return docs
+
+    @staticmethod
+    def _items(docs):
+        return [{"doc": d, "data": d.to_dict()} for d in docs]
+
+    def _combined_patches(self, stack, *, existing=False):
+        """Enter the common combined-send patches; return (finalize, dead_letter) mocks."""
+        def p(name, **kw):
+            return stack.enter_context(patch.object(email_module, name, **kw))
+
+        stack.enter_context(patch("email_automation.clients._fs", FakeFirestore()))
+        stack.enter_context(patch("email_automation.processing.is_contact_opted_out", return_value=None))
+        p("_claim_outbox_item", return_value=True)
+        p("_get_current_outbox_data", return_value={})
+        p("_pause_client_outbox_item_if_needed", return_value=False)
+        p("_dead_letter_campaign_recipient_row_mismatch_if_needed", return_value=False)
+        if callable(existing):
+            p("_has_existing_thread_for_property", side_effect=existing)
+        else:
+            p("_has_existing_thread_for_property", return_value=bool(existing))
+        p("_dead_letter_unresolved_name_placeholder_if_needed", return_value=False)
+        p("_dead_letter_unsafe_outbound_body_if_needed", return_value=False)
+        p("_sent_retry_reconciliation_result", return_value={"sent": []})
+        p("_fresh_graph_headers", side_effect=lambda h, prov=None: h)
+        p("_send_identity_recipients", return_value=[])
+        p("_terminalize_outbox_action_audit", return_value=None)
+        p("_mark_outbox_action_audit_retrying", return_value=None)
+        finalize = p("_finalize_successful_outbox_item")
+        dead_letter = p("_move_to_dead_letter")
+        return finalize, dead_letter
+
+    # --- routing (Step 1 branch) -------------------------------------------
+    def test_send_outboxes_defaults_to_separate_when_sendmode_absent(self):
+        docs = self._same_broker_docs(send_mode=None, count=2)
+        fake_fs = FakeFirestoreWithOutbox(docs, counter_store={})
+        calls = {"multi": 0, "combined": 0}
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_send_multi_property_email",
+                          side_effect=lambda *a, **k: calls.__setitem__("multi", calls["multi"] + 1)), \
+             patch.object(email_module, "_send_combined_property_email",
+                          side_effect=lambda *a, **k: calls.__setitem__("combined", calls["combined"] + 1)), \
+             patch.object(email_module.time, "sleep", return_value=None):
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+        self.assertEqual(calls["multi"], 1, "absent sendMode → separate (multi) path")
+        self.assertEqual(calls["combined"], 0, "must not combine without opt-in")
+
+    def test_send_outboxes_routes_to_combined_when_sendmode_combined(self):
+        docs = self._same_broker_docs(send_mode="combined", count=2)
+        fake_fs = FakeFirestoreWithOutbox(docs, counter_store={})
+        calls = {"multi": 0, "combined": 0}
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_send_multi_property_email",
+                          side_effect=lambda *a, **k: calls.__setitem__("multi", calls["multi"] + 1)), \
+             patch.object(email_module, "_send_combined_property_email",
+                          side_effect=lambda *a, **k: calls.__setitem__("combined", calls["combined"] + 1)), \
+             patch.object(email_module.time, "sleep", return_value=None):
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer t"})
+        self.assertEqual(calls["combined"], 1, "sendMode=combined → combined path")
+        self.assertEqual(calls["multi"], 0, "must not also run the separate path")
+
+    # --- combined sender behavior ------------------------------------------
+    def test_combined_send_collapses_to_one_email_and_finalizes_all_rows(self):
+        docs = self._same_broker_docs(send_mode="combined", count=3)
+        captured = {}
+
+        def record_send(_uid, _headers, _script, recipients, **kwargs):
+            captured["recipients"] = recipients
+            captured["thread_context"] = kwargs.get("thread_context")
+            captured["subject"] = kwargs.get("subject_override")
+            return {"sent": recipients, "errors": {}}
+
+        with ExitStack() as stack:
+            finalize, dead_letter = self._combined_patches(stack)
+            send = stack.enter_context(
+                patch.object(email_module, "send_and_index_email", side_effect=record_send)
+            )
+            email_module._send_combined_property_email(
+                "uid-1", {"Authorization": "Bearer t"}, self.RECIPIENT, self._items(docs),
+            )
+
+        send.assert_called_once()
+        self.assertEqual(captured["recipients"], [self.RECIPIENT], "ONE send to the broker")
+        self.assertEqual(finalize.call_count, 3, "every row finalized off the single send")
+        dead_letter.assert_not_called()
+        self.assertEqual(captured["thread_context"]["propertyAddresses"], self.ADDRS)
+        self.assertEqual(captured["thread_context"]["rows"], [3, 4, 5])
+        self.assertEqual(captured["subject"], "100 Dashboard Way (+2 more)")
+
+    def test_combined_send_failure_bumps_all_rows_atomically(self):
+        docs = self._same_broker_docs(send_mode="combined", count=3)
+        with ExitStack() as stack:
+            finalize, dead_letter = self._combined_patches(stack)
+            send = stack.enter_context(patch.object(
+                email_module, "send_and_index_email",
+                return_value={"sent": [], "errors": {"_all": "graph boom"}},
+            ))
+            email_module._send_combined_property_email(
+                "uid-1", {"Authorization": "Bearer t"}, self.RECIPIENT, self._items(docs),
+            )
+
+        send.assert_called_once()
+        finalize.assert_not_called()
+        dead_letter.assert_not_called()  # attempts=1 < MAX → retry, not dead-letter
+        for d in docs:
+            self.assertFalse(d.reference.deleted, "no row deleted on a failed combined send")
+            statuses = [args[0].get("status") for (args, _kw) in d.reference.set_calls if args]
+            self.assertIn("retrying", statuses, "each row released + bumped for a single retry")
+
+    def test_combined_send_drops_duplicate_property_then_sends_remaining(self):
+        docs = self._same_broker_docs(send_mode="combined", count=3)
+        captured = {}
+
+        def already_sent(_uid, _rcpt, prop_addr, **_k):
+            return prop_addr == "100 Dashboard Way"
+
+        def record_send(_uid, _headers, _script, recipients, **kwargs):
+            captured["thread_context"] = kwargs.get("thread_context")
+            return {"sent": recipients, "errors": {}}
+
+        with ExitStack() as stack:
+            finalize, _dead_letter = self._combined_patches(stack, existing=already_sent)
+            send = stack.enter_context(
+                patch.object(email_module, "send_and_index_email", side_effect=record_send)
+            )
+            email_module._send_combined_property_email(
+                "uid-1", {"Authorization": "Bearer t"}, self.RECIPIENT, self._items(docs),
+            )
+
+        self.assertTrue(docs[0].reference.deleted, "already-sent property dropped from the group")
+        send.assert_called_once()
+        self.assertEqual(captured["thread_context"]["propertyAddresses"],
+                         ["200 Interference Rd", "300 Drip Feed Dr"])
+        self.assertEqual(finalize.call_count, 2, "only the surviving rows finalize")
 
 
 if __name__ == "__main__":
