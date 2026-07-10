@@ -9,6 +9,7 @@ Break IDs map to the live-testing report:
   B20/L21/M22 — link surfacing + prompt truncation.
 """
 import inspect
+import json
 import os
 import sys
 import unittest
@@ -170,6 +171,69 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             "Use attachments only to fill field values that the latest broker message does not provide.",
             source,
         )
+
+    def _run_loading_precedence_replay(self, broker_body, flyer_text, model_updates):
+        fake_response = mock.Mock()
+        fake_response.output_text = json.dumps({
+            "updates": model_updates,
+            "events": [],
+            "response_email": None,
+            "notes": "",
+        })
+        fake_response.usage = None
+        fake_response.id = "resp-loading-precedence-replay"
+        fake_client = mock.Mock()
+        fake_client.responses.create.return_value = fake_response
+        with mock.patch.object(a, "client", fake_client):
+            return a.propose_sheet_updates(
+                uid="baylor-proof",
+                client_id="loading-precedence-replay",
+                email="bp21harrison@gmail.com",
+                sheet_id="proof-sheet",
+                header=["Property Address", "Drive Ins", "Docks"],
+                rownum=3,
+                rowvals=["570 W Cheyenne Ave", "", ""],
+                thread_id="proof-thread",
+                pdf_manifest=[{
+                    "name": "older-flyer.pdf",
+                    "text": flyer_text,
+                    "method": "production-replay",
+                }],
+                conversation=_conv(broker_body),
+                column_config={
+                    "mappings": {"drive_ins": "Drive Ins", "docks": "Docks"},
+                    "requiredFields": [],
+                },
+                dry_run=True,
+            )
+
+    def test_proposal_latest_broker_counts_override_conflicting_flyer(self):
+        out = self._run_loading_precedence_replay(
+            "The current setup has 4 dock-high doors and 1 drive-in.",
+            "OLDER FLYER: 1 dock-high door and 13 drive-ins.",
+            [
+                {"column": "Docks", "value": "4", "confidence": 0.98,
+                 "reason": "Latest broker message."},
+                {"column": "Drive Ins", "value": "1", "confidence": 0.98,
+                 "reason": "Latest broker message."},
+            ],
+        )
+        self.assertEqual(a._proposal_update_for_column(out, "Docks")["value"], "4")
+        self.assertEqual(a._proposal_update_for_column(out, "Drive Ins")["value"], "1")
+
+    def test_proposal_uses_flyer_counts_when_latest_broker_omits_them(self):
+        out = self._run_loading_precedence_replay(
+            "All current loading details are in the attached flyer.",
+            "CURRENT FLYER: 2 dock-high doors and 1 drive-in.",
+            [
+                {"column": "Docks", "value": "2", "confidence": 0.96,
+                 "reason": "Matched current property flyer."},
+                {"column": "Drive Ins", "value": "1", "confidence": 0.96,
+                 "reason": "Matched current property flyer."},
+            ],
+        )
+        self.assertEqual(a._proposal_update_for_column(out, "Docks")["value"], "2")
+        self.assertEqual(a._proposal_update_for_column(out, "Drive Ins")["value"], "1")
 
     def test_semantic_model_loading_updates_survive_deterministic_augmenter(self):
         header, cfg = self._night_hdr_cfg()
