@@ -23,9 +23,11 @@ so the test leaves no lingering exit-time upload handler.
 """
 
 import atexit
+import io
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch, MagicMock
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
@@ -130,6 +132,19 @@ def _run_refresh(
 
 
 class InlineTokenCachePersistTests(unittest.TestCase):
+    def test_changed_cache_persists_without_invoking_the_atexit_backstop(self):
+        """The success path itself must upload; this test deliberately leaves
+        the registered exit handler untouched so it cannot mask a missing inline
+        persist."""
+        upload_mock, fake_cache, _, state_after_run = _run_refresh(
+            has_state_changed=True,
+            invoke_backstop=False,
+        )
+
+        self.assertEqual(upload_mock.call_count, 1)
+        self.assertEqual(fake_cache.serialize_calls, 1)
+        self.assertFalse(state_after_run)
+
     def test_changed_cache_is_persisted_inline_for_the_uid(self):
         """(a) has_state_changed True → inline upload_token called with the uid."""
         upload_mock, fake_cache, _, state_after_run = _run_refresh(
@@ -176,6 +191,30 @@ class InlineTokenCachePersistTests(unittest.TestCase):
             "a best-effort persist failure must not abort the user's run; "
             "record_user_health must still fire before the backstop retry",
         )
+
+    def test_inline_failure_warning_is_emitted_before_backstop_retry(self):
+        output = io.StringIO()
+        warning_seen_before_retry = []
+        attempts = 0
+
+        def upload_side_effect(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("Storage 503")
+            warning_seen_before_retry.append(
+                "Inline token cache persist failed" in output.getvalue()
+            )
+
+        with redirect_stdout(output):
+            _run_refresh(
+                has_state_changed=True,
+                upload_side_effect=upload_side_effect,
+                invoke_backstop=True,
+            )
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(warning_seen_before_retry, [True])
 
 
 if __name__ == "__main__":

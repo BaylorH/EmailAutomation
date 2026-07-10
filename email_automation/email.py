@@ -3414,11 +3414,39 @@ def _send_combined_property_email(
                 candidate["ref"],
                 candidate["data"],
             ):
+                reason = (
+                    "Combined email includes a paused/stopped campaign; "
+                    "manual review required before sending the group"
+                )
                 print(
                     "   ⏸️ Moved combined outbox item for paused/stopped client "
                     f"{candidate['clientId'] or 'n/a'} to dead letter"
                 )
-                continue
+                # The shared script can mention every property, including this
+                # paused one. Sending a reduced subset would still leak the
+                # paused property's content, so block the complete atomic group.
+                for blocked in state_verified + claimed_candidates[index + 1:]:
+                    _move_to_dead_letter(
+                        user_id,
+                        blocked["ref"],
+                        blocked["data"],
+                        reason,
+                    )
+                for blocked in state_verified + claimed_candidates[index:]:
+                    _record_operation_state(
+                        operation_states,
+                        _outbox_send_operation_state(
+                            "error",
+                            doc_id=blocked["item"]['doc'].id,
+                            recipient=recipient_email,
+                            error=reason,
+                            operation_path="combined",
+                            client_id=blocked["clientId"],
+                            row_number=blocked["rowNumber"],
+                        ),
+                    )
+                print("   🛑 Paused/stopped campaign blocked the entire combined group")
+                return
         except CampaignStateUnavailableError as error:
             reason = _campaign_state_unavailable_reason(error)
             for blocked in state_verified + claimed_candidates[index:]:

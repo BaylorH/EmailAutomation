@@ -10,6 +10,7 @@ from flask_cors import CORS
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
 from email_automation.budget_guard import BudgetDeferredError, should_block_openai_call
+from email_automation.scheduler_scope import SchedulerScopeError, resolve_scheduler_user_ids
 from email_automation.app_config import (
     cors_origins as _cors_origins,
     destructive_admin_routes_enabled as _destructive_admin_routes_enabled,
@@ -297,22 +298,29 @@ def auto_upload_token():
     return {"success": False, "error": "No token file found"}
 
 def run_scheduler():
-    """Run the full scheduler for all users - same logic as main.py"""
+    """Run the scheduler for the user set allowed by the runtime scope."""
     if not SCHEDULER_AVAILABLE:
         return {"success": False, "error": "Scheduler functionality not available - missing dependencies"}
 
     try:
         all_users = list_user_ids()
         print(f"📦 Found {len(all_users)} token cache users: {all_users}", flush=True)
+
+        try:
+            scope = resolve_scheduler_user_ids(all_users)
+        except SchedulerScopeError as e:
+            print(f"🚫 Scheduler scope blocked: {e}", flush=True)
+            return {"success": False, "error": "Scheduler scope blocked"}
         
         results = []
-        for uid in all_users:
+        for uid in scope.user_ids:
             result = refresh_and_process_user(uid)
             results.append({"user_id": uid, "result": result})
         
         return {
             "success": True, 
-            "message": f"Scheduler completed for {len(all_users)} users",
+            "message": f"Scheduler completed for {len(scope.user_ids)} users",
+            "scope": scope.mode,
             "results": results
         }
     except Exception as e:
@@ -749,6 +757,23 @@ def api_trigger_scheduler():
             "error": "Scheduler functionality not available - missing required environment variables or dependencies"
         }), 503
 
+    caller_uid = _safe_uid(g.get("firebase_uid"))
+    if caller_uid is None:
+        return jsonify({"success": False, "error": "Not authorized"}), 403
+
+    try:
+        manual_scope = resolve_scheduler_user_ids(list_user_ids())
+    except SchedulerScopeError as e:
+        print(f"🚫 Manual scheduler trigger scope blocked: {e}", flush=True)
+        return jsonify({"success": False, "error": "Manual scheduler trigger is disabled"}), 403
+
+    # This HTTP endpoint is developer-only. Even when the service's normal
+    # scheduled runtime explicitly permits all users, a dashboard/API request
+    # must never fan out to them. The verified caller must be one of the exact
+    # dev-scoped targets; run_scheduler() re-resolves the same scope in-thread.
+    if manual_scope.mode != "dev_scoped" or caller_uid not in manual_scope.user_ids:
+        return jsonify({"success": False, "error": "Manual scheduler trigger is disabled"}), 403
+
     # Atomically claim the run so concurrent/rapid triggers can't double-start.
     with _scheduler_lock:
         if scheduler_status["running"]:
@@ -980,12 +1005,13 @@ def api_accept_new_property():
         # Anything else is an IDOR / row-anchor-corruption attempt -> fail closed
         # BEFORE any sheet write or OpenAI spend.
         from email_automation.clients import _fs
+        notif_ref = (
+            _fs.collection("users").document(uid)
+            .collection("clients").document(client_id)
+            .collection("notifications").document(notification_id)
+        )
         try:
-            notif_snapshot = (
-                _fs.collection("users").document(uid)
-                .collection("clients").document(client_id)
-                .collection("notifications").document(notification_id).get()
-            )
+            notif_snapshot = notif_ref.get()
         except Exception as e:
             print(f"❌ accept-new-property notification lookup failed: {type(e).__name__}: {e}")
             return jsonify({"success": False, "error": "Failed to accept new property"}), 502
@@ -998,6 +1024,17 @@ def api_accept_new_property():
         expected_sheet_id = notif_meta.get("sheetId") or notif_data.get("sheetId")
         if not _is_nonempty_str(expected_sheet_id) or sheet_id != expected_sheet_id:
             return jsonify({"success": False, "error": "sheetId does not match the notification"}), 403
+
+        accepted_row_number = notif_data.get("acceptedRowNumber")
+        if accepted_row_number is not None:
+            if isinstance(accepted_row_number, bool):
+                return jsonify({"success": False, "error": "Failed to accept new property"}), 502
+            try:
+                accepted_row_number = int(accepted_row_number)
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "error": "Failed to accept new property"}), 502
+            if accepted_row_number < 1:
+                return jsonify({"success": False, "error": "Failed to accept new property"}), 502
         # ===================================================================
 
         # A budget deferral must happen before the sheet row is inserted. If it
@@ -1042,8 +1079,26 @@ def api_accept_new_property():
         if notes:
             values_by_header["listing brokers comments"] = notes
 
-        # Create the row
-        new_rownum = insert_property_row_above_divider(sheets, sheet_id, tab_title, values_by_header)
+        # notificationId is the idempotency key. Persist the inserted row anchor
+        # immediately so a retry after later PDF/AI work cannot create a second
+        # property row.
+        if accepted_row_number is not None:
+            new_rownum = accepted_row_number
+        else:
+            new_rownum = insert_property_row_above_divider(
+                sheets,
+                sheet_id,
+                tab_title,
+                values_by_header,
+            )
+            try:
+                notif_ref.set({"acceptedRowNumber": new_rownum}, merge=True)
+            except Exception as e:
+                print(
+                    "❌ accept-new-property could not persist its row anchor: "
+                    f"{type(e).__name__}: {e}"
+                )
+                return jsonify({"success": False, "error": "Failed to accept new property"}), 502
 
         # Read header and format sheet
         header = _read_header_row2(sheets, sheet_id, tab_title)

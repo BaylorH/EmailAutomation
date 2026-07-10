@@ -2483,6 +2483,45 @@ class SendModeCombineTests(unittest.TestCase):
         for call in dead_letter.call_args_list:
             self.assertIn("paused/stopped", call.args[3])
 
+    def test_one_paused_client_blocks_the_entire_mixed_client_combined_group(self):
+        docs = self._same_broker_docs(send_mode="combined", count=3)
+        docs[1]._data["clientId"] = "paused-client"
+        operation_states = []
+
+        def client_pause(_uid, client_id):
+            if client_id == "paused-client":
+                return True, "operator_paused", {"status": "paused"}
+            return False, "", {"status": "active"}
+
+        with ExitStack() as stack:
+            finalize, dead_letter = self._combined_patches(
+                stack,
+                use_real_client_pause=True,
+            )
+            stack.enter_context(patch.object(
+                email_module,
+                "get_client_automation_pause",
+                side_effect=client_pause,
+            ))
+            send = stack.enter_context(patch.object(email_module, "send_and_index_email"))
+            email_module._send_combined_property_email(
+                "uid-1",
+                {"Authorization": "Bearer t"},
+                self.RECIPIENT,
+                self._items(docs),
+                operation_states=operation_states,
+            )
+
+        send.assert_not_called()
+        finalize.assert_not_called()
+        self.assertEqual(
+            dead_letter.call_count,
+            3,
+            "one paused campaign must block every row sharing the combined body",
+        )
+        self.assertEqual(len(operation_states), 3)
+        self.assertTrue(all(state["status"] == "error" for state in operation_states))
+
     def test_campaign_state_read_failure_blocks_and_dead_letters_entire_combined_group(self):
         docs = self._same_broker_docs(send_mode="combined", count=3)
         operation_states = []
