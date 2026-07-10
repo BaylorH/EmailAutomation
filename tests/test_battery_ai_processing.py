@@ -387,6 +387,30 @@ class RentOpexSfExtractionTests(unittest.TestCase):
                     "1",
                 )
 
+    def test_attachment_fallback_fills_each_loading_field_only_once(self):
+        header, cfg = self._night_hdr_cfg()
+        out = a._augment_proposal_with_deterministic_extractions(
+            {"updates": [], "events": []},
+            ["570 W Cheyenne Ave", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("See the attached documents for dock and drive-in counts."),
+            extra_texts=[
+                "First flyer: 2 dock-high doors.",
+                "Second flyer: 8 drive-ins and 9 dock-high doors.",
+                "Third flyer: 7 drive-ins.",
+            ],
+        )
+
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Loading Docks")["value"],
+            "2",
+        )
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Drive Ins")["value"],
+            "8",
+        )
+
     def test_augmenter_never_guesses_counts_without_numbers(self):
         header, cfg = self._night_hdr_cfg()
         proposal = {"updates": [], "events": []}

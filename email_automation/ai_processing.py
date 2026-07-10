@@ -1767,19 +1767,35 @@ def _augment_proposal_with_deterministic_extractions(
             _extract_dock_count_from_text,
         )
 
+    drive_ins_filled = bool(
+        _proposal_update_for_column(proposal, drive_ins_col)
+        or (_row_value_for_column(rowvals, header, drive_ins_col) or "").strip()
+    )
+    docks_filled = bool(
+        _proposal_update_for_column(proposal, docks_col)
+        or (_row_value_for_column(rowvals, header, docks_col) or "").strip()
+    )
     for text in evidence_texts[1:]:
-        if fresh_drive_ins is None and not fresh_blocks_drive_ins_flyer:
+        if (
+            fresh_drive_ins is None
+            and not fresh_blocks_drive_ins_flyer
+            and not drive_ins_filled
+        ):
             _fill(
                 drive_ins_col,
                 _extract_drive_in_count_from_text(text),
                 "Deterministic fallback parsed drive-in count from the broker's flyer.",
             )
-        if fresh_docks is None and not fresh_blocks_docks_flyer:
+            drive_ins_filled = bool(
+                _proposal_update_for_column(proposal, drive_ins_col)
+            )
+        if fresh_docks is None and not fresh_blocks_docks_flyer and not docks_filled:
             _fill(
                 docks_col,
                 _extract_dock_count_from_text(text),
                 "Deterministic fallback parsed loading-dock count from the broker's flyer.",
             )
+            docks_filled = bool(_proposal_update_for_column(proposal, docks_col))
     return proposal
 
 
@@ -1852,8 +1868,8 @@ _WORD_TO_NUMBER = {
 }
 
 _ATTACHMENT_NOUN_RE = (
-    r"(?:attached\s+(?:flyer|brochure|pdf|document|file)|attachment|flyer|"
-    r"brochure|pdf|offering\s+memorandum|om)"
+    r"(?:attached\s+(?:flyers?|brochures?|pdfs?|documents?|files?)|attachments?|"
+    r"flyers?|brochures?|pdfs?|offering\s+memorand(?:um|a)|om)"
 )
 
 
