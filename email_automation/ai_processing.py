@@ -1767,13 +1767,16 @@ def _augment_proposal_with_deterministic_extractions(
             _extract_dock_count_from_text,
         )
 
+    # An existing model proposal may have come from any attachment. Re-evaluate
+    # ordered attachment evidence deterministically when the Sheet cell itself is
+    # blank; the first explicit count for each field wins.
     drive_ins_filled = bool(
-        _proposal_update_for_column(proposal, drive_ins_col)
-        or (_row_value_for_column(rowvals, header, drive_ins_col) or "").strip()
+        (_row_value_for_column(rowvals, header, drive_ins_col) or "").strip()
+        or fresh_drive_ins is not None
     )
     docks_filled = bool(
-        _proposal_update_for_column(proposal, docks_col)
-        or (_row_value_for_column(rowvals, header, docks_col) or "").strip()
+        (_row_value_for_column(rowvals, header, docks_col) or "").strip()
+        or fresh_docks is not None
     )
     for text in evidence_texts[1:]:
         if (
@@ -1781,21 +1784,21 @@ def _augment_proposal_with_deterministic_extractions(
             and not fresh_blocks_drive_ins_flyer
             and not drive_ins_filled
         ):
+            attachment_drive_ins = _extract_drive_in_count_from_text(text)
             _fill(
                 drive_ins_col,
-                _extract_drive_in_count_from_text(text),
+                attachment_drive_ins,
                 "Deterministic fallback parsed drive-in count from the broker's flyer.",
             )
-            drive_ins_filled = bool(
-                _proposal_update_for_column(proposal, drive_ins_col)
-            )
+            drive_ins_filled = attachment_drive_ins is not None
         if fresh_docks is None and not fresh_blocks_docks_flyer and not docks_filled:
+            attachment_docks = _extract_dock_count_from_text(text)
             _fill(
                 docks_col,
-                _extract_dock_count_from_text(text),
+                attachment_docks,
                 "Deterministic fallback parsed loading-dock count from the broker's flyer.",
             )
-            docks_filled = bool(_proposal_update_for_column(proposal, docks_col))
+            docks_filled = attachment_docks is not None
     return proposal
 
 
@@ -1816,8 +1819,8 @@ _NO_SEPARATE_OPEX_RE = re.compile(
 )
 
 # ---- Fabricated door-count guard --------------------------------------------
-_DRIVE_IN_KW = r"(?:drive[-\s]?in|grade[-\s]?level|drive\s+in\s+door)"
-_DOCK_KW = r"(?:dock|loading\s+dock)"
+_DRIVE_IN_KW = r"(?:drive[-\s]?ins?|grade[-\s]?level|drive\s+in\s+doors?)"
+_DOCK_KW = r"(?:docks?|loading\s+docks?)"
 
 
 # Spelled-out counts (broker text often says "two docks", not "2 docks").
@@ -1869,7 +1872,12 @@ _WORD_TO_NUMBER = {
 
 _ATTACHMENT_NOUN_RE = (
     r"(?:attached\s+(?:flyers?|brochures?|pdfs?|documents?|files?)|attachments?|"
-    r"flyers?|brochures?|pdfs?|offering\s+memorand(?:um|a)|om)"
+    r"flyers?|brochures?|pdfs?|specs?|offering\s+memorand(?:um|a)|om)"
+)
+
+_DELEGATION_NEGATION_RE = re.compile(
+    r"\b(?:no|not|doesn['’]?t|does\s+not|without|uncertain|unknown|tbd)\b",
+    re.IGNORECASE,
 )
 
 
@@ -1881,20 +1889,31 @@ def _delegates_feature_count_to_attachment(text: str, keyword_re: str) -> bool:
     # "See attached flyer:\nDocks and drive-in counts." Keep other line breaks
     # as hard boundaries so unrelated nearby clauses cannot authorize a field.
     normalized = re.sub(r":\s*\n\s*", ": ", text)
-    gap = r"[^;.!?\n]"
+    gap = r"[^,;.!?\n]"
     patterns = (
         # "See the attached flyer for dock counts."
-        rf"\b(?:see|refer\s+to|check|review|per)\b{gap}{{0,100}}"
+        rf"\b(?:see|refer\s+to|check|review|use|per)\b{gap}{{0,100}}"
         rf"\b{_ATTACHMENT_NOUN_RE}\b{gap}{{0,100}}{keyword_re}",
         # "Dock counts are on page 2 of the brochure."
         rf"{keyword_re}{gap}{{0,80}}\b(?:in|on|per|from)\b{gap}{{0,80}}"
         rf"\b{_ATTACHMENT_NOUN_RE}\b",
+        # "Dock count: see attached flyer."
+        rf"{keyword_re}{gap}{{0,80}}\b(?:see|refer\s+to|check|review|use)\b"
+        rf"{gap}{{0,80}}\b{_ATTACHMENT_NOUN_RE}\b",
         # "The OM has dock counts."
         rf"\b{_ATTACHMENT_NOUN_RE}\b{gap}{{0,80}}"
         rf"\b(?:shows?|lists?|contains?|includes?|has|provides?)\b{gap}{{0,80}}"
         rf"{keyword_re}",
+        # "For docks and drive-ins, refer to the attachment."
+        rf"\bfor\b[^;.!?\n]{{0,80}}{keyword_re}[^;.!?\n]{{0,80}},\s*"
+        rf"(?:please\s+)?(?:see|refer\s+to|check|review|use)\b"
+        rf"[^;.!?\n]{{0,80}}\b{_ATTACHMENT_NOUN_RE}\b",
     )
-    return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in patterns)
+    for pattern in patterns:
+        match = re.search(pattern, normalized, re.IGNORECASE)
+        if match and not _DELEGATION_NEGATION_RE.search(match.group(0)):
+            return True
+    return False
 # "<count> drive-in(s)/grade-level (ramp|door)s" — count immediately precedes the
 # keyword so unrelated numbers ("suite 3, drive-in access") never bind.
 _DRIVE_IN_COUNT_RE = re.compile(
@@ -2000,20 +2019,92 @@ def _parse_feature_count(raw: str) -> Optional[str]:
     return str(value) if 0 <= value <= 200 else None
 
 
-def _extract_drive_in_count_from_text(text: str) -> Optional[str]:
-    """Explicit drive-in / grade-level door count, or None (never guesses)."""
+_CURRENT_COUNT_MARKER_RE = re.compile(
+    r"\b(?:actual(?:ly)?|current(?:ly)?|now|correction|corrected|revised|updated|"
+    r"in\s+fact|instead)\b",
+    re.IGNORECASE,
+)
+_STALE_COUNT_MARKER_RE = re.compile(
+    r"\b(?:old|older|previous|prior|formerly|used\s+to|"
+    r"(?:attached\s+)?(?:flyer|brochure|om)\s+"
+    r"(?:says|said|lists|listed|shows|showed|has|contains|includes))\b",
+    re.IGNORECASE,
+)
+_IMMEDIATE_COUNT_NEGATION_RE = re.compile(
+    r"\b(?:not|isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _feature_range_spans(text: str, keyword_re: str) -> List[tuple]:
+    count = rf"(?:\d{{1,3}}|{_WORD_NUMBER_RE})"
+    range_values = (
+        rf"(?:\d{{1,3}}\s*-\s*\d{{1,3}}|"
+        rf"{count}\s*(?:–|—|\bto\b|\bor\b)\s*{count})"
+    )
+    patterns = (
+        rf"{range_values}\s*(?:x\s*)?{keyword_re}",
+        rf"{keyword_re}[^;.!?\n]{{0,30}}{range_values}",
+    )
+    spans = []
+    for pattern in patterns:
+        spans.extend(match.span() for match in re.finditer(pattern, text, re.IGNORECASE))
+    return spans
+
+
+def _extract_feature_count_from_text(
+    text: str,
+    count_re: "re.Pattern",
+    keyword_re: str,
+) -> Optional[str]:
     if not text:
         return None
-    m = _DRIVE_IN_COUNT_RE.search(text)
-    return _parse_feature_count(m.group(1) or m.group(2)) if m else None
+
+    range_spans = _feature_range_spans(text, keyword_re)
+    candidates = []
+    for match in count_re.finditer(text):
+        if any(start <= match.start() < end for start, end in range_spans):
+            continue
+        raw = match.group(1) or match.group(2)
+        value = _parse_feature_count(raw)
+        if value is None:
+            continue
+        before = text[max(0, match.start() - 60):match.start()]
+        if _IMMEDIATE_COUNT_NEGATION_RE.search(before[-20:]):
+            continue
+        score = float(match.start())
+        if _CURRENT_COUNT_MARKER_RE.search(before):
+            score += len(text) * 10
+        if _STALE_COUNT_MARKER_RE.search(before):
+            score -= len(text) * 10
+        candidates.append((score, match.start(), value))
+
+    zero_re = re.compile(
+        rf"\b(?:no|none(?:\s+of)?(?:\s+the)?)\s+(?:{keyword_re})\b",
+        re.IGNORECASE,
+    )
+    for match in zero_re.finditer(text):
+        before = text[max(0, match.start() - 60):match.start()]
+        if _STALE_COUNT_MARKER_RE.search(before):
+            continue
+        score = float(match.start())
+        if _CURRENT_COUNT_MARKER_RE.search(before):
+            score += len(text) * 10
+        candidates.append((score, match.start(), "0"))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def _extract_drive_in_count_from_text(text: str) -> Optional[str]:
+    """Explicit drive-in / grade-level door count, or None (never guesses)."""
+    return _extract_feature_count_from_text(text, _DRIVE_IN_COUNT_RE, _DRIVE_IN_KW)
 
 
 def _extract_dock_count_from_text(text: str) -> Optional[str]:
     """Explicit loading-dock / dock-high door count, or None (never guesses)."""
-    if not text:
-        return None
-    m = _DOCK_COUNT_RE.search(text)
-    return _parse_feature_count(m.group(1) or m.group(2)) if m else None
+    return _extract_feature_count_from_text(text, _DOCK_COUNT_RE, _DOCK_KW)
 
 
 def _suppress_updates_on_contact_optout(proposal: dict) -> dict:
