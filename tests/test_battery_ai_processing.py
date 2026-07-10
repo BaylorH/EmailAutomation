@@ -8,6 +8,7 @@ Break IDs map to the live-testing report:
   R13/X03/R05/R09/R04/S03/D07 — extraction; E_*/F_*/H_* — quoted-history events;
   B20/L21/M22 — link surfacing + prompt truncation.
 """
+import json
 import os
 import sys
 import unittest
@@ -141,8 +142,7 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             _conv("It's leased. It was going for $18/SF on 12,000 SF."))
         self.assertEqual(out["updates"], [])
 
-    # --- LIVE break 600 Flyer Facts Blvd: flyer-only counts -------------------
-    def test_augmenter_fills_drive_ins_and_docks_from_flyer_text(self):
+    def test_attachment_regex_does_not_create_loading_updates_without_model(self):
         header, cfg = self._night_hdr_cfg()
         proposal = {"updates": [], "events": []}
         flyer = ("FOR LEASE - 600 Flyer Facts Blvd\n"
@@ -153,10 +153,154 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             extra_texts=[flyer])
         di = a._proposal_update_for_column(out, "Drive Ins")
         dk = a._proposal_update_for_column(out, "Loading Docks")
-        self.assertIsNotNone(di, "drive-in count stated in the flyer must be written")
-        self.assertEqual(di["value"], "1")
-        self.assertIsNotNone(dk)
-        self.assertEqual(dk["value"], "2")
+        self.assertIsNone(di)
+        self.assertIsNone(dk)
+
+    def _run_loading_precedence_replay(
+        self, broker_body, flyer_text, model_updates, docks_header="Docks",
+    ) -> tuple[dict, str]:
+        fake_response = mock.Mock()
+        fake_response.output_text = json.dumps({
+            "updates": model_updates,
+            "events": [],
+            "response_email": None,
+            "notes": "",
+        })
+        fake_response.usage = None
+        fake_response.id = "resp-loading-precedence-replay"
+        fake_client = mock.Mock()
+        fake_client.responses.create.return_value = fake_response
+        with mock.patch.object(a, "client", fake_client):
+            proposal = a.propose_sheet_updates(
+                uid="baylor-proof",
+                client_id="loading-precedence-replay",
+                email="bp21harrison@gmail.com",
+                sheet_id="proof-sheet",
+                header=["Property Address", "Drive Ins", docks_header],
+                rownum=3,
+                rowvals=["570 W Cheyenne Ave", "", ""],
+                thread_id="proof-thread",
+                pdf_manifest=[{
+                    "name": "older-flyer.pdf",
+                    "text": flyer_text,
+                    "method": "production-replay",
+                }],
+                conversation=_conv(broker_body),
+                column_config={
+                    "mappings": {"drive_ins": "Drive Ins", "docks": docks_header},
+                    "requiredFields": [],
+                },
+                dry_run=True,
+            )
+        request_content = fake_client.responses.create.call_args.kwargs["input"][0]["content"]
+        prompt = request_content[-1]["text"]
+        return proposal, prompt
+
+    def test_proposal_latest_broker_counts_override_conflicting_flyer(self):
+        broker_body = "The current setup has 4 dock-high doors and 1 drive-in."
+        flyer_text = "OLDER FLYER: 1 dock-high door and 13 drive-ins."
+        out, prompt = self._run_loading_precedence_replay(
+            broker_body,
+            flyer_text,
+            [
+                {"column": "Loading Docks", "value": "4", "confidence": 0.98,
+                 "reason": "Latest broker message."},
+                {"column": "Drive Ins", "value": "1", "confidence": 0.98,
+                 "reason": "Latest broker message."},
+            ],
+            docks_header="Loading Docks",
+        )
+        self.assertNotIn("Trust ATTACHMENTS (PDFs) over the email body when numbers conflict.", prompt)
+        self.assertIn(
+            "FIELD VALUES ONLY: when the latest broker message and an attachment conflict, use the latest broker message.",
+            prompt,
+        )
+        self.assertIn(broker_body, prompt)
+        self.assertIn(flyer_text, prompt)
+        self.assertEqual(a._proposal_update_for_column(out, "Loading Docks")["value"], "4")
+        self.assertEqual(a._proposal_update_for_column(out, "Drive Ins")["value"], "1")
+
+    def test_proposal_uses_flyer_counts_when_latest_broker_omits_them(self):
+        broker_body = "All current loading details are in the attached flyer."
+        flyer_text = "CURRENT FLYER: 2 dock-high doors and 1 drive-in."
+        out, prompt = self._run_loading_precedence_replay(
+            broker_body,
+            flyer_text,
+            [
+                {"column": "Docks", "value": "2", "confidence": 0.96,
+                 "reason": "Matched current property flyer."},
+                {"column": "Drive Ins", "value": "1", "confidence": 0.96,
+                 "reason": "Matched current property flyer."},
+            ],
+        )
+        self.assertIn(
+            "Use attachments only to fill field values that the latest broker message does not provide.",
+            prompt,
+        )
+        self.assertIn(broker_body, prompt)
+        self.assertIn(flyer_text, prompt)
+        self.assertEqual(a._proposal_update_for_column(out, "Docks")["value"], "2")
+        self.assertEqual(a._proposal_update_for_column(out, "Drive Ins")["value"], "1")
+
+    def test_semantic_model_loading_updates_survive_deterministic_augmenter(self):
+        header, cfg = self._night_hdr_cfg()
+        proposal = {
+            "updates": [
+                {"column": "Loading Docks", "value": "4", "reason": "semantic model"},
+                {"column": "Drive Ins", "value": "1", "reason": "semantic model"},
+            ],
+            "events": [],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["570 W Cheyenne Ave", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("It has 4 docks and 1 drive-in."),
+            extra_texts=["The old flyer lists 1 dock and 13 drive-ins."],
+        )
+        self.assertEqual(a._proposal_update_for_column(out, "Loading Docks")["value"], "4")
+        self.assertEqual(a._proposal_update_for_column(out, "Drive Ins")["value"], "1")
+
+    def test_loading_regex_never_creates_or_vetoes_semantic_updates(self):
+        header, cfg = self._night_hdr_cfg()
+        cases = [
+            "The building has 2 docks, but the tenant requires 4 docks.",
+            "Suite 100 has 2 docks. Suite 200 has 4 docks.",
+            "The subject has 2 docks; the adjacent building has 6 docks.",
+            "It could add 4 dock-high doors if the tenant signs.",
+            "There is potential for 3 drive-ins after conversion.",
+            "Door dimensions are 10 x 12 dock doors.",
+            "There are 2 docks at the front and 3 docks at the rear.",
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                empty = a._augment_proposal_with_deterministic_extractions(
+                    {"updates": [], "events": []},
+                    ["570 W Cheyenne Ave", "", "", "", "", ""],
+                    header,
+                    cfg,
+                    _conv(body),
+                )
+                self.assertIsNone(a._proposal_update_for_column(empty, "Loading Docks"))
+                self.assertIsNone(a._proposal_update_for_column(empty, "Drive Ins"))
+
+        semantic = a._augment_proposal_with_deterministic_extractions(
+            {
+                "updates": [
+                    {"column": "Loading Docks", "value": "2", "reason": "semantic model"},
+                ],
+                "events": [],
+            },
+            ["570 W Cheyenne Ave", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("The building has 2 docks, but the tenant requires 4 docks."),
+        )
+        self.assertEqual(
+            a._proposal_update_for_column(semantic, "Loading Docks")["value"],
+            "2",
+        )
 
     def test_augmenter_never_guesses_counts_without_numbers(self):
         header, cfg = self._night_hdr_cfg()

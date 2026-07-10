@@ -1636,12 +1636,6 @@ def _augment_proposal_with_deterministic_extractions(
     mappings = (effective_config or {}).get("mappings", {})
     # Only mine the broker's FRESH message; quoted history must not seed values.
     fresh_text = _fresh_inbound_text(conversation)
-    # Flyer/linked-PDF text is legitimate evidence for fields the message body
-    # omits ("all the specs are in the attached flyer"). Used for the loading
-    # counts below; the rent/SF extractors stay message-scoped because a flyer
-    # can carry stale pricing superseded by the email body.
-    evidence_texts = [fresh_text] + [t for t in (extra_texts or []) if t]
-
     def _fill(col_name: Optional[str], value: Optional[str], reason: str) -> None:
         # Resolve to the canonical sheet header spelling (#15 wrote canonical names;
         # #19's mapping values may be lowercase, e.g. "total sf" vs header "Total SF").
@@ -1685,31 +1679,11 @@ def _augment_proposal_with_deterministic_extractions(
         _extract_total_sf_from_text(fresh_text),
         "Deterministic fallback parsed total square footage from the latest broker message.",
     )
-    # Loading counts: mined from the fresh message OR flyer/linked-PDF text
-    # (LIVE break 600 Flyer Facts Blvd: "1 drive-in ramp" lived only in the
-    # flyer PDF and was never written). Explicit numeric counts only — the
-    # fabricated-door-count guard philosophy holds: no number, no write.
-    drive_ins_col = (
-        mappings.get("drive_ins")
-        or _find_header_name(header, "Drive Ins")
-        or _find_header_name(header, "Drive-Ins")
-    )
-    docks_col = (
-        mappings.get("docks")
-        or _find_header_name(header, "Docks")
-        or _find_header_name(header, "Loading Docks")
-    )
-    for text in evidence_texts:
-        _fill(
-            drive_ins_col,
-            _extract_drive_in_count_from_text(text),
-            "Deterministic fallback parsed drive-in count from the broker's message or flyer.",
-        )
-        _fill(
-            docks_col,
-            _extract_dock_count_from_text(text),
-            "Deterministic fallback parsed loading-dock count from the broker's message or flyer.",
-        )
+    # Loading counts are semantic: entity binding, current-vs-hypothetical state,
+    # dimensions, subtotals, and multi-property attachments cannot be resolved by
+    # proximity regexes safely. The source-aware model owns these updates; the
+    # deterministic fabricated-count guard below may reject unsupported values,
+    # but no regex path may create, overwrite, or veto a loading-count update.
     return proposal
 
 
@@ -2775,7 +2749,8 @@ def propose_sheet_updates(uid: str,
 
         DOC_SELECTION_RULES = """
 DOCUMENT SELECTION & EXTRACTION (strict):
-- Trust ATTACHMENTS (PDFs) over the email body when numbers conflict.
+- FIELD VALUES ONLY: when the latest broker message and an attachment conflict, use the latest broker message.
+  Use attachments only to fill field values that the latest broker message does not provide.
 - Extract values ONLY for the TARGET PROPERTY. If a PDF shows multiple buildings/addresses, use the page/section
   that explicitly matches the TARGET PROPERTY (address/city). If no exact match, do not use that PDF for updates.
 - If an attachment clearly refers to a different address, ignore it unless the LAST HUMAN message explicitly proposes
