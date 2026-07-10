@@ -43,8 +43,10 @@ class FakeDb:
     def __init__(self, users, raise_on_users=False):
         self._users = users
         self._raise = raise_on_users
+        self.users_collection_reads = 0
     def collection(self, name):
         if name == "users":
+            self.users_collection_reads += 1
             if self._raise:
                 raise RuntimeError("firestore down")
             return _Coll([_UserSnap([_DaySnap(k, v) for k, v in u.items()]) for u in self._users])
@@ -79,6 +81,12 @@ class FlagAndLimitTests(unittest.TestCase):
 
 
 class BlockDecisionTests(unittest.TestCase):
+    def setUp(self):
+        bg.reset_budget_spend_cache()
+
+    def tearDown(self):
+        bg.reset_budget_spend_cache()
+
     def test_off_never_blocks_even_over_budget(self):
         with mock.patch.dict(os.environ, {"USAGE_MONTHLY_BUDGET_USD": "10"}):
             os.environ.pop("ENFORCE_OPENAI_BUDGET", None)
@@ -101,6 +109,21 @@ class BlockDecisionTests(unittest.TestCase):
     def test_fail_open_on_db_error(self):
         with mock.patch.dict(os.environ, {"ENFORCE_OPENAI_BUDGET": "1", "USAGE_MONTHLY_BUDGET_USD": "10"}):
             self.assertFalse(bg.should_block_openai_call(FakeDb([], raise_on_users=True), now=NOW))
+
+    def test_reuses_month_spend_within_cache_window(self):
+        db = _db_july_spend(9.99)
+        with mock.patch.dict(os.environ, {"ENFORCE_OPENAI_BUDGET": "1", "USAGE_MONTHLY_BUDGET_USD": "10"}):
+            self.assertFalse(bg.should_block_openai_call(db, now=NOW))
+            self.assertFalse(bg.should_block_openai_call(db, now=NOW))
+        self.assertEqual(db.users_collection_reads, 1)
+
+    def test_cache_key_changes_at_month_boundary(self):
+        db = _db_july_spend(9.99)
+        august = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        with mock.patch.dict(os.environ, {"ENFORCE_OPENAI_BUDGET": "1", "USAGE_MONTHLY_BUDGET_USD": "10"}):
+            bg.should_block_openai_call(db, now=NOW)
+            bg.should_block_openai_call(db, now=august)
+        self.assertEqual(db.users_collection_reads, 2)
 
 
 class AggregationTests(unittest.TestCase):

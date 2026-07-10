@@ -7,10 +7,13 @@ can SKIP the paid call (defer the turn) instead of overspending.
 
 Spend is aggregated from the per-user ``openaiUsageDaily`` rollups (``totalCostUsd``)
 that ``record_openai_usage`` already maintains — no new writes, and consistent
-with the admin dashboard's own aggregation.
+with the admin dashboard's own aggregation. Enforcement checks cache that total
+briefly per database/month so a multi-message scheduler run does not rescan every
+user and every day for each extraction.
 
-Cost note: O(users x month-days) reads per check — fine for the current small
-beta. For scale, maintain a ``systemMetrics`` monthly counter and read it O(1).
+Cost note: the first enforced check is O(users x month-days); subsequent checks
+within the short cache window are O(1). A ``systemMetrics`` monthly counter is
+still the long-term path for high-volume scale.
 
 Failure policy: FAIL-OPEN. A budget-check error (Firestore hiccup, etc.) must not
 break extraction; actual spend is still metered and visible on the dashboard, so
@@ -18,10 +21,34 @@ a brief overshoot is preferable to halting the pipeline. Flip to fail-closed onl
 if hard cost containment is required over availability.
 """
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 _TRUTHY = {"1", "true", "yes", "on"}
+_DEFAULT_SPEND_CACHE_TTL_SECONDS = 60.0
+_SPEND_CACHE = {}
+_SPEND_CACHE_LOCK = threading.Lock()
+
+
+class BudgetDeferredError(RuntimeError):
+    """Paid AI work was intentionally deferred and must remain retryable."""
+
+
+def reset_budget_spend_cache() -> None:
+    """Clear cached spend totals (primarily for deterministic tests and run setup)."""
+    with _SPEND_CACHE_LOCK:
+        _SPEND_CACHE.clear()
+
+
+def _spend_cache_ttl_seconds() -> float:
+    raw = os.getenv("OPENAI_BUDGET_CACHE_TTL_SECONDS", "")
+    try:
+        parsed = float(raw or _DEFAULT_SPEND_CACHE_TTL_SECONDS)
+    except (TypeError, ValueError):
+        return _DEFAULT_SPEND_CACHE_TTL_SECONDS
+    return max(0.0, parsed)
 
 
 def budget_enforcement_enabled() -> bool:
@@ -62,6 +89,25 @@ def global_month_spend_usd(db: Any, *, now: Optional[datetime] = None) -> float:
     return total
 
 
+def _cached_global_month_spend_usd(db: Any, *, now: Optional[datetime] = None) -> float:
+    month = _month_prefix(now)
+    cache_key = (id(db), month)
+    monotonic_now = time.monotonic()
+    ttl_seconds = _spend_cache_ttl_seconds()
+
+    if ttl_seconds > 0:
+        with _SPEND_CACHE_LOCK:
+            cached = _SPEND_CACHE.get(cache_key)
+            if cached and cached[0] > monotonic_now:
+                return cached[1]
+
+    spent = global_month_spend_usd(db, now=now)
+    if ttl_seconds > 0:
+        with _SPEND_CACHE_LOCK:
+            _SPEND_CACHE[cache_key] = (monotonic_now + ttl_seconds, spent)
+    return spent
+
+
 def budget_status(db: Any, *, now: Optional[datetime] = None) -> Dict[str, Any]:
     """Full status for logging / the dashboard: enforced flag, limit, spend,
     over-budget, remaining. Fail-open: on a read error, spentUsd=None + not over."""
@@ -92,7 +138,7 @@ def should_block_openai_call(db: Any, *, now: Optional[datetime] = None) -> bool
         limit = monthly_budget_limit_usd()
         if limit <= 0:
             return False
-        return global_month_spend_usd(db, now=now) >= limit
+        return _cached_global_month_spend_usd(db, now=now) >= limit
     except Exception as e:  # noqa: BLE001 — never block extraction due to a check error
         print(f"⚠️ budget_guard: check failed (fail-open, allowing call): {e}")
         return False

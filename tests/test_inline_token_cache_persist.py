@@ -67,7 +67,7 @@ HEALTHY_INBOX = {"status": "healthy", "operation": "inbox_scan"}
 HEALTHY_SENT = {"status": "healthy", "operation": "sent_items_scan"}
 
 
-def _run_refresh(*, has_state_changed, upload_side_effect=None, uid="uid-1"):
+def _run_refresh(*, has_state_changed, upload_side_effect=None, uid="uid-1", invoke_backstop=False):
     """Drive refresh_and_process_user with a FakeTokenCache whose
     has_state_changed is fixed. Returns (upload_mock, fake_cache, health_mock).
 
@@ -82,6 +82,15 @@ def _run_refresh(*, has_state_changed, upload_side_effect=None, uid="uid-1"):
 
     upload_mock = MagicMock(side_effect=upload_side_effect)
     health_mock = MagicMock(return_value={})
+    registered_handlers = []
+
+    def register_handler(handler):
+        registered_handlers.append(handler)
+        return handler
+
+    def unregister_handler(handler):
+        if handler in registered_handlers:
+            registered_handlers.remove(handler)
 
     try:
         with patch.object(main, "TOKEN_CACHE", token_path), \
@@ -98,9 +107,14 @@ def _run_refresh(*, has_state_changed, upload_side_effect=None, uid="uid-1"):
              patch.object(main, "auto_cleanup_firestore"), \
              patch.object(main, "reconcile_stale_processing_failures"), \
              patch.object(main, "record_user_health", health_mock), \
-             patch.object(atexit, "register"), \
-             patch.object(atexit, "unregister"):
+             patch.object(atexit, "register", side_effect=register_handler), \
+             patch.object(atexit, "unregister", side_effect=unregister_handler):
             main.refresh_and_process_user(uid)
+            if invoke_backstop:
+                self_registered = list(registered_handlers)
+                if not self_registered:
+                    raise AssertionError("refresh_and_process_user did not register its cache backstop")
+                self_registered[-1]()
     finally:
         # Neutralize any lingering exit-time handler that closed over fake_cache.
         fake_cache.has_state_changed = False
@@ -112,7 +126,10 @@ def _run_refresh(*, has_state_changed, upload_side_effect=None, uid="uid-1"):
 class InlineTokenCachePersistTests(unittest.TestCase):
     def test_changed_cache_is_persisted_inline_for_the_uid(self):
         """(a) has_state_changed True → inline upload_token called with the uid."""
-        upload_mock, fake_cache, _ = _run_refresh(has_state_changed=True)
+        upload_mock, fake_cache, _ = _run_refresh(
+            has_state_changed=True,
+            invoke_backstop=True,
+        )
 
         self.assertTrue(
             upload_mock.called,
@@ -123,7 +140,8 @@ class InlineTokenCachePersistTests(unittest.TestCase):
         # Persisted for THIS user's cache.
         _, kwargs = upload_mock.call_args
         self.assertEqual("uid-1", kwargs.get("user_id"))
-        self.assertTrue(fake_cache.serialize_calls >= 1)
+        self.assertEqual(upload_mock.call_count, 1)
+        self.assertEqual(fake_cache.serialize_calls, 1)
 
     def test_unchanged_cache_skips_the_storage_put(self):
         """(b) has_state_changed False → no upload (idempotent no-op)."""

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import client, _sheets_client, _fs
-from .budget_guard import should_block_openai_call
+from .budget_guard import BudgetDeferredError, should_block_openai_call
 from .messaging import build_conversation_payload
 from .sheets import _header_index_map, _get_first_tab_title, _col_letter, _execute_with_retry
 from .app_config import REQUIRED_FIELDS_FOR_CLOSE
@@ -2777,15 +2777,16 @@ def propose_sheet_updates(uid: str,
     try:
         # Hard OpenAI budget stop (flag-gated: ENFORCE_OPENAI_BUDGET, default OFF).
         # When enforcement is ON and global current-month spend has reached
-        # USAGE_MONTHLY_BUDGET_USD, DEFER this turn — return None (as on a failed
-        # call) so processing.py's `if proposal:` gate SKIPS it and the message is
-        # retried once budget frees up, rather than making the paid call. dry_run
-        # still bills the model, so this guards that path too. No-op when the flag
-        # is off (byte-identical to today).
+        # USAGE_MONTHLY_BUDGET_USD, DEFER this turn with an explicit exception so
+        # every caller leaves the source message visible/retryable. dry_run still
+        # bills the model, so this guards that path too. No-op when the flag is off.
         if should_block_openai_call(_fs):
-            print("⛔ OpenAI monthly budget reached — deferring extraction "
-                  "(ENFORCE_OPENAI_BUDGET on; raise USAGE_MONTHLY_BUDGET_USD or wait for next month).")
-            return None
+            message = (
+                "OpenAI monthly budget reached; extraction deferred until the "
+                "budget is raised or the next monthly window begins"
+            )
+            print(f"⛔ {message}")
+            raise BudgetDeferredError(message)
         # Build conversation payload (chronological; latest last)
         # If conversation is provided directly (e.g., from tests), use it; otherwise fetch from Firestore
         if conversation is None:
@@ -3469,6 +3470,8 @@ OUTPUT ONLY valid JSON in this exact format:
 
         return proposal
 
+    except BudgetDeferredError:
+        raise
     except Exception as e:
         print(f"❌ Failed to propose sheet updates: {e}")
         return None

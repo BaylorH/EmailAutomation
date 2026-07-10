@@ -94,12 +94,12 @@ class MissingClientDocFailsOpenTests(unittest.TestCase):
         )
         self.assertFalse(paused, "missing client doc must fail open (no hot-path over-gate)")
 
-    def test_transient_read_error_fails_open(self):
+    def test_transient_read_error_fails_closed_and_retryable(self):
         fs = _FakeRef(raise_on_get=True)
-        paused, _reason, _data = campaign_safety.get_client_automation_pause(
-            "uid-1", "client-1", firestore_client=fs
-        )
-        self.assertFalse(paused, "transient read error must fail open, not gate")
+        with self.assertRaises(campaign_safety.CampaignStateUnavailableError):
+            campaign_safety.get_client_automation_pause(
+                "uid-1", "client-1", firestore_client=fs
+            )
 
     def test_no_client_id_is_not_gated(self):
         # Threads with NO clientId hit the downstream email-recovery path.

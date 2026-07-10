@@ -13,6 +13,10 @@ ORPHAN_DELETED_CAMPAIGN_REASON = "orphan_deleted_campaign"
 CLIENT_TERMINAL_STATUSES = {"stopped", "archived", "deleted", "completed"}
 
 
+class CampaignStateUnavailableError(RuntimeError):
+    """Campaign automation state could not be verified; no send may proceed."""
+
+
 def normalize_client_status(value: Any) -> str:
     return str(value or "").strip().lower()
 
@@ -63,7 +67,9 @@ def get_client_automation_pause(
         )
     except Exception as e:
         print(f"   ⚠️ Could not fetch client automation state for {client_id}: {e}")
-        return False, "", {}
+        raise CampaignStateUnavailableError(
+            f"Could not verify automation state for client {client_id}"
+        ) from e
 
     if not getattr(client_doc, "exists", False):
         # DELIBERATE fail-open. A missing client doc is NOT proof of a deleted campaign:

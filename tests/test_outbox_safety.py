@@ -2295,7 +2295,7 @@ class SendModeCombineTests(unittest.TestCase):
     def _items(docs):
         return [{"doc": d, "data": d.to_dict()} for d in docs]
 
-    def _combined_patches(self, stack, *, existing=False):
+    def _combined_patches(self, stack, *, existing=False, use_real_client_pause=False):
         """Enter the common combined-send patches; return (finalize, dead_letter) mocks."""
         def p(name, **kw):
             return stack.enter_context(patch.object(email_module, name, **kw))
@@ -2304,7 +2304,8 @@ class SendModeCombineTests(unittest.TestCase):
         stack.enter_context(patch("email_automation.processing.is_contact_opted_out", return_value=None))
         p("_claim_outbox_item", return_value=True)
         p("_get_current_outbox_data", return_value={})
-        p("_pause_client_outbox_item_if_needed", return_value=False)
+        if not use_real_client_pause:
+            p("_pause_client_outbox_item_if_needed", return_value=False)
         p("_dead_letter_campaign_recipient_row_mismatch_if_needed", return_value=False)
         if callable(existing):
             p("_has_existing_thread_for_property", side_effect=existing)
@@ -2377,6 +2378,30 @@ class SendModeCombineTests(unittest.TestCase):
         self.assertEqual(captured["thread_context"]["propertyAddresses"], self.ADDRS)
         self.assertEqual(captured["thread_context"]["rows"], [3, 4, 5])
         self.assertEqual(captured["subject"], "100 Dashboard Way (+2 more)")
+
+    def test_completed_campaign_blocks_every_combined_row_before_graph_send(self):
+        docs = self._same_broker_docs(send_mode="combined", count=3)
+
+        with ExitStack() as stack:
+            finalize, dead_letter = self._combined_patches(
+                stack,
+                use_real_client_pause=True,
+            )
+            stack.enter_context(patch.object(
+                email_module,
+                "get_client_automation_pause",
+                return_value=(True, "completed", {"status": "completed"}),
+            ))
+            send = stack.enter_context(patch.object(email_module, "send_and_index_email"))
+            email_module._send_combined_property_email(
+                "uid-1", {"Authorization": "Bearer t"}, self.RECIPIENT, self._items(docs),
+            )
+
+        send.assert_not_called()
+        finalize.assert_not_called()
+        self.assertEqual(dead_letter.call_count, 3)
+        for call in dead_letter.call_args_list:
+            self.assertIn("paused/stopped", call.args[3])
 
     def test_combined_send_failure_bumps_all_rows_atomically(self):
         docs = self._same_broker_docs(send_mode="combined", count=3)

@@ -10,6 +10,7 @@ from unittest import mock
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
 from email_automation import ai_processing as ai  # noqa: E402
+from email_automation.budget_guard import BudgetDeferredError  # noqa: E402
 from email_automation.campaign_safety import is_client_automation_paused  # noqa: E402
 
 HEADER = ["Property Address", "City", "Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Notes"]
@@ -76,14 +77,14 @@ class BugB_OpexNNN(unittest.TestCase):
 
 
 class BudgetGuardWiring(unittest.TestCase):
-    def test_over_budget_defers_returns_none_without_model_call(self):
+    def test_over_budget_defers_with_visible_retryable_error_without_model_call(self):
         fake = _fake_client(json.dumps({"updates": [], "events": [], "response_email": None}))
         with mock.patch.object(ai, "client", fake), \
              mock.patch.object(ai, "should_block_openai_call", return_value=True):
-            p = ai.propose_sheet_updates(uid="u", client_id="c", email="b@x.com", sheet_id="s",
+            with self.assertRaises(BudgetDeferredError):
+                ai.propose_sheet_updates(uid="u", client_id="c", email="b@x.com", sheet_id="s",
                                          header=HEADER, rownum=3, rowvals=list(ROW), thread_id="t",
                                          conversation=[{"direction": "inbound", "content": "hi"}], dry_run=True)
-        self.assertIsNone(p, "over-budget must defer (return None)")
         fake.responses.create.assert_not_called()
 
     def test_under_budget_proceeds_and_calls_model(self):
