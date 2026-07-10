@@ -158,6 +158,33 @@ class RentOpexSfExtractionTests(unittest.TestCase):
         self.assertIsNotNone(dk)
         self.assertEqual(dk["value"], "2")
 
+    def test_fresh_message_door_counts_outrank_conflicting_flyer_text(self):
+        header, cfg = self._night_hdr_cfg()
+        proposal = {"updates": [], "events": []}
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["570 W Cheyenne Ave", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv(
+                "It has 4 dock-high doors, 1 drive-in door, 28-foot clear "
+                "height, and 800 amps of 277/480V 3-phase power."
+            ),
+            extra_texts=[
+                "570 W Cheyenne Specs\n"
+                "1 dock, 13 drive-ins, 18 clear, 200a/277-480v."
+            ],
+        )
+
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Loading Docks")["value"],
+            "4",
+        )
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Drive Ins")["value"],
+            "1",
+        )
+
     def test_augmenter_never_guesses_counts_without_numbers(self):
         header, cfg = self._night_hdr_cfg()
         proposal = {"updates": [], "events": []}

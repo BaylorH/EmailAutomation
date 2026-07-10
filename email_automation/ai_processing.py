@@ -1699,17 +1699,31 @@ def _augment_proposal_with_deterministic_extractions(
         or _find_header_name(header, "Docks")
         or _find_header_name(header, "Loading Docks")
     )
-    for text in evidence_texts:
-        _fill(
-            drive_ins_col,
-            _extract_drive_in_count_from_text(text),
-            "Deterministic fallback parsed drive-in count from the broker's message or flyer.",
-        )
-        _fill(
-            docks_col,
-            _extract_dock_count_from_text(text),
-            "Deterministic fallback parsed loading-dock count from the broker's message or flyer.",
-        )
+    fresh_drive_ins = _extract_drive_in_count_from_text(fresh_text)
+    fresh_docks = _extract_dock_count_from_text(fresh_text)
+    _fill(
+        drive_ins_col,
+        fresh_drive_ins,
+        "Deterministic fallback parsed drive-in count from the broker's message.",
+    )
+    _fill(
+        docks_col,
+        fresh_docks,
+        "Deterministic fallback parsed loading-dock count from the broker's message.",
+    )
+    for text in evidence_texts[1:]:
+        if not fresh_drive_ins:
+            _fill(
+                drive_ins_col,
+                _extract_drive_in_count_from_text(text),
+                "Deterministic fallback parsed drive-in count from the broker's flyer.",
+            )
+        if not fresh_docks:
+            _fill(
+                docks_col,
+                _extract_dock_count_from_text(text),
+                "Deterministic fallback parsed loading-dock count from the broker's flyer.",
+            )
     return proposal
 
 
