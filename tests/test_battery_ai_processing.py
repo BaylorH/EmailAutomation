@@ -8,7 +8,6 @@ Break IDs map to the live-testing report:
   R13/X03/R05/R09/R04/S03/D07 — extraction; E_*/F_*/H_* — quoted-history events;
   B20/L21/M22 — link surfacing + prompt truncation.
 """
-import inspect
 import json
 import os
 import sys
@@ -157,22 +156,9 @@ class RentOpexSfExtractionTests(unittest.TestCase):
         self.assertIsNone(di)
         self.assertIsNone(dk)
 
-    def test_document_selection_prompt_prefers_latest_human_message(self):
-        source = inspect.getsource(a.propose_sheet_updates)
-        self.assertNotIn(
-            "Trust ATTACHMENTS (PDFs) over the email body when numbers conflict.",
-            source,
-        )
-        self.assertIn(
-            "FIELD VALUES ONLY: when the latest broker message and an attachment conflict, use the latest broker message.",
-            source,
-        )
-        self.assertIn(
-            "Use attachments only to fill field values that the latest broker message does not provide.",
-            source,
-        )
-
-    def _run_loading_precedence_replay(self, broker_body, flyer_text, model_updates):
+    def _run_loading_precedence_replay(
+        self, broker_body, flyer_text, model_updates, docks_header="Docks",
+    ) -> tuple[dict, str]:
         fake_response = mock.Mock()
         fake_response.output_text = json.dumps({
             "updates": model_updates,
@@ -185,12 +171,12 @@ class RentOpexSfExtractionTests(unittest.TestCase):
         fake_client = mock.Mock()
         fake_client.responses.create.return_value = fake_response
         with mock.patch.object(a, "client", fake_client):
-            return a.propose_sheet_updates(
+            proposal = a.propose_sheet_updates(
                 uid="baylor-proof",
                 client_id="loading-precedence-replay",
                 email="bp21harrison@gmail.com",
                 sheet_id="proof-sheet",
-                header=["Property Address", "Drive Ins", "Docks"],
+                header=["Property Address", "Drive Ins", docks_header],
                 rownum=3,
                 rowvals=["570 W Cheyenne Ave", "", ""],
                 thread_id="proof-thread",
@@ -201,30 +187,45 @@ class RentOpexSfExtractionTests(unittest.TestCase):
                 }],
                 conversation=_conv(broker_body),
                 column_config={
-                    "mappings": {"drive_ins": "Drive Ins", "docks": "Docks"},
+                    "mappings": {"drive_ins": "Drive Ins", "docks": docks_header},
                     "requiredFields": [],
                 },
                 dry_run=True,
             )
+        request_content = fake_client.responses.create.call_args.kwargs["input"][0]["content"]
+        prompt = request_content[-1]["text"]
+        return proposal, prompt
 
     def test_proposal_latest_broker_counts_override_conflicting_flyer(self):
-        out = self._run_loading_precedence_replay(
-            "The current setup has 4 dock-high doors and 1 drive-in.",
-            "OLDER FLYER: 1 dock-high door and 13 drive-ins.",
+        broker_body = "The current setup has 4 dock-high doors and 1 drive-in."
+        flyer_text = "OLDER FLYER: 1 dock-high door and 13 drive-ins."
+        out, prompt = self._run_loading_precedence_replay(
+            broker_body,
+            flyer_text,
             [
-                {"column": "Docks", "value": "4", "confidence": 0.98,
+                {"column": "Loading Docks", "value": "4", "confidence": 0.98,
                  "reason": "Latest broker message."},
                 {"column": "Drive Ins", "value": "1", "confidence": 0.98,
                  "reason": "Latest broker message."},
             ],
+            docks_header="Loading Docks",
         )
-        self.assertEqual(a._proposal_update_for_column(out, "Docks")["value"], "4")
+        self.assertNotIn("Trust ATTACHMENTS (PDFs) over the email body when numbers conflict.", prompt)
+        self.assertIn(
+            "FIELD VALUES ONLY: when the latest broker message and an attachment conflict, use the latest broker message.",
+            prompt,
+        )
+        self.assertIn(broker_body, prompt)
+        self.assertIn(flyer_text, prompt)
+        self.assertEqual(a._proposal_update_for_column(out, "Loading Docks")["value"], "4")
         self.assertEqual(a._proposal_update_for_column(out, "Drive Ins")["value"], "1")
 
     def test_proposal_uses_flyer_counts_when_latest_broker_omits_them(self):
-        out = self._run_loading_precedence_replay(
-            "All current loading details are in the attached flyer.",
-            "CURRENT FLYER: 2 dock-high doors and 1 drive-in.",
+        broker_body = "All current loading details are in the attached flyer."
+        flyer_text = "CURRENT FLYER: 2 dock-high doors and 1 drive-in."
+        out, prompt = self._run_loading_precedence_replay(
+            broker_body,
+            flyer_text,
             [
                 {"column": "Docks", "value": "2", "confidence": 0.96,
                  "reason": "Matched current property flyer."},
@@ -232,6 +233,12 @@ class RentOpexSfExtractionTests(unittest.TestCase):
                  "reason": "Matched current property flyer."},
             ],
         )
+        self.assertIn(
+            "Use attachments only to fill field values that the latest broker message does not provide.",
+            prompt,
+        )
+        self.assertIn(broker_body, prompt)
+        self.assertIn(flyer_text, prompt)
         self.assertEqual(a._proposal_update_for_column(out, "Docks")["value"], "2")
         self.assertEqual(a._proposal_update_for_column(out, "Drive Ins")["value"], "1")
 
