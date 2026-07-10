@@ -67,12 +67,15 @@ HEALTHY_INBOX = {"status": "healthy", "operation": "inbox_scan"}
 HEALTHY_SENT = {"status": "healthy", "operation": "sent_items_scan"}
 
 
-def _run_refresh(*, has_state_changed, upload_side_effect=None, uid="uid-1", invoke_backstop=False):
+def _run_refresh(
+    *, has_state_changed, upload_side_effect=None, uid="uid-1", invoke_backstop=False
+) -> tuple[MagicMock, FakeTokenCache, MagicMock]:
     """Drive refresh_and_process_user with a FakeTokenCache whose
     has_state_changed is fixed. Returns (upload_mock, fake_cache, health_mock).
 
-    atexit.register/unregister are patched to no-ops so the exit-time backstop
-    handler is not left registered against the (now torn-down) test doubles.
+    atexit.register/unregister use local handler tracking so the exit-time
+    backstop can be captured and invoked without registering it with the real
+    process.
     """
     fake_cache = FakeTokenCache(has_state_changed=has_state_changed)
 
@@ -84,11 +87,11 @@ def _run_refresh(*, has_state_changed, upload_side_effect=None, uid="uid-1", inv
     health_mock = MagicMock(return_value={})
     registered_handlers = []
 
-    def register_handler(handler):
+    def register_handler(handler) -> object:
         registered_handlers.append(handler)
         return handler
 
-    def unregister_handler(handler):
+    def unregister_handler(handler) -> None:
         if handler in registered_handlers:
             registered_handlers.remove(handler)
 
@@ -155,16 +158,19 @@ class InlineTokenCachePersistTests(unittest.TestCase):
     def test_persist_failure_does_not_propagate(self):
         """(c) a persist exception is swallowed — the run still completes and the
         health record is still written (the atexit backstop covers the upload)."""
-        upload_mock, _, health_mock = _run_refresh(
+        upload_mock, fake_cache, health_mock = _run_refresh(
             has_state_changed=True,
-            upload_side_effect=RuntimeError("Storage 503"),
+            upload_side_effect=[RuntimeError("Storage 503"), None],
+            invoke_backstop=True,
         )
 
-        self.assertTrue(upload_mock.called, "inline persist must have been attempted")
+        self.assertEqual(upload_mock.call_count, 2)
+        self.assertEqual(fake_cache.serialize_calls, 2)
+        self.assertFalse(fake_cache.has_state_changed)
         self.assertTrue(
             health_mock.called,
             "a best-effort persist failure must not abort the user's run; "
-            "record_user_health must still fire",
+            "record_user_health must still fire before the backstop retry",
         )
 
 

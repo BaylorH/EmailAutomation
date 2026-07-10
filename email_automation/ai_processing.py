@@ -2772,7 +2772,8 @@ def propose_sheet_updates(uid: str,
         extraction_fields: Optional list of canonical field keys (e.g., ["total_sf", "ops_ex_sf"]) that the user
                           wants extracted. If provided, only these fields will be included in extraction rules.
                           If None, all extractable fields are used.
-        dry_run: If True, skips Firestore logging (useful for testing).
+        dry_run: If True, skips the sheetChangeLog Firestore write. OpenAI usage
+                 metering still writes because the model call is still billed.
     """
     try:
         # Hard OpenAI budget stop (flag-gated: ENFORCE_OPENAI_BUDGET, default OFF).
