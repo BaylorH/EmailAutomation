@@ -8,7 +8,8 @@ FUNCTIONALITY-NEUTRAL: the endpoint reuses refresh_and_process_user unchanged.
 Contract pinned here:
   * POST /process-user {"uid": ...}  → 200 {"status":"processed"} and the
     pipeline runs under the per-user lease,
-  * a locked user            → 200 {"status":"skipped_locked"} (pipeline NOT run),
+  * a locked user            → 503 {"status":"skipped_locked"} (pipeline NOT run,
+    so Cloud Tasks retries after the active worker releases the lease),
   * missing/blank uid        → 400,
   * downstream exception     → 500 (so Cloud Tasks retries),
   * GET /healthz             → 200,
@@ -80,14 +81,35 @@ class ProcessUserServiceTests(unittest.TestCase):
         self.assertEqual("abc", seen["uid"])
         refresh.assert_called_once_with("abc")
 
-    def test_locked_user_returns_skipped(self):
+    def test_locked_user_returns_retryable_status(self):
         with patch.object(service, "run_with_user_lease", side_effect=_lease_locked), \
                 patch.object(service, "refresh_and_process_user") as refresh:
             resp = self.client.post("/process-user", json={"uid": "user-123"})
 
-        self.assertEqual(200, resp.status_code)
+        self.assertEqual(503, resp.status_code)
         self.assertEqual("skipped_locked", resp.get_json()["status"])
         refresh.assert_not_called()
+
+    def test_locked_delivery_then_redelivery_processes_exactly_once(self):
+        attempts = {"count": 0}
+
+        def acquire_on_redelivery(uid, fn, **kwargs):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                return False
+            fn()
+            return True
+
+        with patch.object(service, "run_with_user_lease", side_effect=acquire_on_redelivery), \
+                patch.object(service, "refresh_and_process_user") as refresh:
+            first = self.client.post("/process-user", json={"uid": "user-123"})
+            second = self.client.post("/process-user", json={"uid": "user-123"})
+
+        self.assertEqual(503, first.status_code)
+        self.assertEqual("skipped_locked", first.get_json()["status"])
+        self.assertEqual(200, second.status_code)
+        self.assertEqual("processed", second.get_json()["status"])
+        refresh.assert_called_once_with("user-123")
 
     def test_missing_uid_returns_400(self):
         with patch.object(service, "run_with_user_lease", side_effect=_lease_runs), \
