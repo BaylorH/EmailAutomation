@@ -285,6 +285,37 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             source,
         )
 
+    def test_spelled_loading_counts_above_twelve_are_not_coerced_to_zero(self):
+        self.assertEqual(
+            a._extract_drive_in_count_from_text("The building has thirteen drive-ins."),
+            "13",
+        )
+        self.assertEqual(
+            a._extract_dock_count_from_text("There are twenty docks."),
+            "20",
+        )
+
+    def test_fresh_message_can_delegate_loading_counts_to_attached_flyer(self):
+        header, cfg = self._night_hdr_cfg()
+        proposal = {"updates": [], "events": []}
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["570 W Cheyenne Ave", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("See the attached flyer for dock and drive-in counts."),
+            extra_texts=["Loading: 2 dock-high doors and 1 drive-in ramp."],
+        )
+
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Loading Docks")["value"],
+            "2",
+        )
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Drive Ins")["value"],
+            "1",
+        )
+
     def test_augmenter_never_guesses_counts_without_numbers(self):
         header, cfg = self._night_hdr_cfg()
         proposal = {"updates": [], "events": []}

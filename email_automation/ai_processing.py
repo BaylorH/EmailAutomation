@@ -1712,6 +1712,16 @@ def _augment_proposal_with_deterministic_extractions(
     fresh_docks = _extract_dock_count_from_text(fresh_text)
     fresh_mentions_drive_ins = bool(re.search(_DRIVE_IN_KW, fresh_text, re.IGNORECASE))
     fresh_mentions_docks = bool(re.search(_DOCK_KW, fresh_text, re.IGNORECASE))
+    fresh_delegates_drive_ins = _delegates_feature_count_to_attachment(
+        fresh_text,
+        _DRIVE_IN_KW,
+    )
+    fresh_delegates_docks = _delegates_feature_count_to_attachment(
+        fresh_text,
+        _DOCK_KW,
+    )
+    fresh_blocks_drive_ins_flyer = fresh_mentions_drive_ins and not fresh_delegates_drive_ins
+    fresh_blocks_docks_flyer = fresh_mentions_docks and not fresh_delegates_docks
     _fill(
         drive_ins_col,
         fresh_drive_ins,
@@ -1746,25 +1756,25 @@ def _augment_proposal_with_deterministic_extractions(
                 update for update in (proposal.get("updates") or []) if update is not existing
             ]
 
-    if fresh_mentions_drive_ins and fresh_drive_ins is None:
+    if fresh_blocks_drive_ins_flyer and fresh_drive_ins is None:
         _drop_attachment_count_when_fresh_is_ambiguous(
             drive_ins_col,
             _extract_drive_in_count_from_text,
         )
-    if fresh_mentions_docks and fresh_docks is None:
+    if fresh_blocks_docks_flyer and fresh_docks is None:
         _drop_attachment_count_when_fresh_is_ambiguous(
             docks_col,
             _extract_dock_count_from_text,
         )
 
     for text in evidence_texts[1:]:
-        if not fresh_mentions_drive_ins:
+        if fresh_drive_ins is None and not fresh_blocks_drive_ins_flyer:
             _fill(
                 drive_ins_col,
                 _extract_drive_in_count_from_text(text),
                 "Deterministic fallback parsed drive-in count from the broker's flyer.",
             )
-        if not fresh_mentions_docks:
+        if fresh_docks is None and not fresh_blocks_docks_flyer:
             _fill(
                 docks_col,
                 _extract_dock_count_from_text(text),
@@ -1796,7 +1806,7 @@ _DOCK_KW = r"(?:dock|loading\s+dock)"
 
 # Spelled-out counts (broker text often says "two docks", not "2 docks").
 _WORD_NUMBER_RE = (
-    r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
     r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
     r"thirty|forty|fifty|sixty|seventy|eighty|ninety)"
 )
@@ -1827,9 +1837,47 @@ def _has_explicit_feature_count(text: str, keyword_re: str) -> bool:
 
 
 _WORD_TO_NUMBER = {
+    "zero": 0,
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
     "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+    "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
 }
+
+_ATTACHMENT_DELEGATION_RE = re.compile(
+    r"\b(?:see|refer\s+to|check|review|per)\b[^.?!\n]{0,80}"
+    r"\b(?:attached|attachment|flyer|brochure|pdf)\b"
+    r"|\b(?:attached|attachment|flyer|brochure|pdf)\b[^.?!\n]{0,80}"
+    r"\b(?:shows?|lists?|contains?|includes?|has|for)\b",
+    re.IGNORECASE,
+)
+
+
+def _delegates_feature_count_to_attachment(text: str, keyword_re: str) -> bool:
+    """Whether the feature's sentence explicitly delegates its count to a document."""
+    if not text:
+        return False
+    for feature in re.finditer(keyword_re, text, re.IGNORECASE):
+        sentence_start = max(
+            text.rfind(".", 0, feature.start()),
+            text.rfind("?", 0, feature.start()),
+            text.rfind("!", 0, feature.start()),
+            text.rfind("\n", 0, feature.start()),
+        ) + 1
+        sentence_ends = [
+            pos for pos in (
+                text.find(".", feature.end()),
+                text.find("?", feature.end()),
+                text.find("!", feature.end()),
+                text.find("\n", feature.end()),
+            ) if pos >= 0
+        ]
+        sentence_end = min(sentence_ends) if sentence_ends else len(text)
+        if _ATTACHMENT_DELEGATION_RE.search(text[sentence_start:sentence_end]):
+            return True
+    return False
 # "<count> drive-in(s)/grade-level (ramp|door)s" — count immediately precedes the
 # keyword so unrelated numbers ("suite 3, drive-in access") never bind.
 _DRIVE_IN_COUNT_RE = re.compile(
@@ -1923,7 +1971,9 @@ def _parse_feature_count(raw: str) -> Optional[str]:
     if raw.isdigit():
         value = int(raw)
     else:
-        value = _WORD_TO_NUMBER.get(raw, 0)
+        value = _WORD_TO_NUMBER.get(raw)
+        if value is None:
+            return None
     return str(value) if 0 <= value <= 200 else None
 
 
