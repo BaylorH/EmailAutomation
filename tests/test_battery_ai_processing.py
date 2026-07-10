@@ -163,7 +163,11 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             source,
         )
         self.assertIn(
-            "Trust the LAST HUMAN message over attachments when values conflict.",
+            "FIELD VALUES ONLY: when the latest broker message and an attachment conflict, use the latest broker message.",
+            source,
+        )
+        self.assertIn(
+            "Use attachments only to fill field values that the latest broker message does not provide.",
             source,
         )
 

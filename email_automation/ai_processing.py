@@ -2749,8 +2749,8 @@ def propose_sheet_updates(uid: str,
 
         DOC_SELECTION_RULES = """
 DOCUMENT SELECTION & EXTRACTION (strict):
-- Trust the LAST HUMAN message over attachments when values conflict. Use attachments only to fill fields the
-  LAST HUMAN message does not address; attachments may contain older marketing data superseded by the broker.
+- FIELD VALUES ONLY: when the latest broker message and an attachment conflict, use the latest broker message.
+  Use attachments only to fill field values that the latest broker message does not provide.
 - Extract values ONLY for the TARGET PROPERTY. If a PDF shows multiple buildings/addresses, use the page/section
   that explicitly matches the TARGET PROPERTY (address/city). If no exact match, do not use that PDF for updates.
 - If an attachment clearly refers to a different address, ignore it unless the LAST HUMAN message explicitly proposes
