@@ -332,15 +332,50 @@ class _FakePendingFs:
 
     def __init__(self, docs):
         self._docs = docs
+        self._seeded = {
+            ("systemConfig", "campaignAccess"): {
+                "automationEnabled": True,
+                "allowedUids": [],
+            },
+            ("users", ReplyAllManualContinuationTests.USER_ID, "clients", "client-1"): {
+                "status": "live",
+                "automationPaused": False,
+            },
+        }
 
     def collection(self, name):
-        return self
+        return _FakePendingNode(self, (name,))
+
+
+class _FakePendingSnapshot:
+    def __init__(self, data=None):
+        self._data = data
+        self.exists = data is not None
+
+    def to_dict(self):
+        return dict(self._data or {})
+
+
+class _FakePendingNode:
+    def __init__(self, root, path):
+        self.root = root
+        self.path = path
+
+    def collection(self, name):
+        return _FakePendingNode(self.root, self.path + (name,))
 
     def document(self, name):
-        return self
+        return _FakePendingNode(self.root, self.path + (name,))
+
+    def get(self):
+        return _FakePendingSnapshot(self.root._seeded.get(self.path))
 
     def stream(self):
-        return list(self._docs)
+        if self.path == (
+            "users", ReplyAllManualContinuationTests.USER_ID, "pendingResponses",
+        ):
+            return list(self.root._docs)
+        return []
 
 
 class ReplyAllManualContinuationTests(unittest.TestCase):
@@ -358,6 +393,7 @@ class ReplyAllManualContinuationTests(unittest.TestCase):
     def _pending_doc(self):
         return _FakePendingDoc("pending-1", {
             "threadId": "thread-1",
+            "clientId": "client-1",
             "msgId": "msg-1",
             "recipient": "broker@acme.com",
             "ccEmails": ["teammate@acme.com", "assistant@myfirm.com"],

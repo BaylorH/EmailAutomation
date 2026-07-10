@@ -1,5 +1,6 @@
 import os
 import unittest
+from contextvars import copy_context
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ os.environ.setdefault(
 )
 
 from email_automation import processing
+from email_automation.campaign_safety import CampaignAutomationDecision
 
 
 class FakeResponse:
@@ -26,25 +28,68 @@ class FakeResponse:
             raise AssertionError(f"Unexpected HTTP status {self.status_code}")
 
 
-class FakeFirestore:
-    def collection(self, _name):
-        return self
-
-    def document(self, _doc_id):
-        return self
-
-    def get(self):
-        return self
-
-    @property
-    def exists(self):
-        return True
+class FakeSnapshot:
+    def __init__(self, data=None, exists=True):
+        self._data = data or {}
+        self.exists = exists
 
     def to_dict(self):
-        return {"email": "baylor.freelance@outlook.com"}
+        return self._data
+
+
+class FakeFirestore:
+    def __init__(self, path=()):
+        self.path = path
+
+    def collection(self, name):
+        return FakeFirestore(self.path + (name,))
+
+    def document(self, doc_id):
+        return FakeFirestore(self.path + (doc_id,))
+
+    def get(self):
+        if self.path == ("systemConfig", "campaignAccess"):
+            return FakeSnapshot({"automationEnabled": True, "allowedUids": []})
+        if len(self.path) == 2 and self.path[0] == "users":
+            return FakeSnapshot({"email": "baylor.freelance@outlook.com"})
+        if len(self.path) == 4 and self.path[2] == "threads":
+            return FakeSnapshot({"clientId": "client-1", "status": "active"})
+        if len(self.path) == 4 and self.path[2] == "clients":
+            return FakeSnapshot({"status": "live", "automationPaused": False})
+        return FakeSnapshot(exists=False)
 
 
 class ProcessingReplyIndexingTests(unittest.TestCase):
+    def test_other_context_terminal_outcome_cannot_suppress_current_retry(self):
+        terminal = CampaignAutomationDecision(
+            state="blocked",
+            reason="other_campaign_stopped",
+            client_data={},
+            metadata={"terminal": True},
+        )
+        current_context = copy_context()
+        other_context = copy_context()
+        processing.send_reply_in_thread.last_error = "current request failed"
+        processing.send_reply_in_thread.last_outcome = "send_failed"
+        processing.send_reply_in_thread.sent_but_unindexed = False
+        other_context.run(processing._set_reply_campaign_suppression, terminal)
+
+        with patch.object(processing, "queue_pending_response") as queue_retry, \
+                patch.object(processing, "record_sent_unindexed_response") as reconcile:
+            outcome = current_context.run(
+                processing._queue_response_retry_or_reconciliation,
+                "uid-1",
+                "thread-1",
+                "msg-1",
+                "bp21harrison@gmail.com",
+                "Hi,\n\nThanks.",
+                "client-1",
+            )
+
+        self.assertEqual("queued_retry", outcome)
+        queue_retry.assert_called_once()
+        reconcile.assert_not_called()
+
     @patch.object(processing.time, "sleep", return_value=None)
     @patch.object(processing.requests, "get")
     def test_sent_reply_lookup_skips_older_conversation_messages(self, requests_get, _sleep):
@@ -80,8 +125,12 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
         self.assertIn("sentDateTime ge 2026-06-09T19:09:00Z", requests_get.call_args.kwargs["params"]["$filter"])
 
     def test_sent_but_unindexed_auto_response_is_not_queued_for_retry(self):
-        processing.send_reply_in_thread.last_error = "Failed to index reply after 3 attempts"
-        processing.send_reply_in_thread.sent_but_unindexed = True
+        processing._reset_reply_send_outcome()
+        processing._set_reply_send_outcome(
+            error="Failed to index reply after 3 attempts",
+            sent_but_unindexed=True,
+            outcome="sent_but_unindexed",
+        )
 
         with patch.object(processing, "queue_pending_response") as queue_retry, \
                 patch.object(processing, "record_sent_unindexed_response") as record_reconciliation:
@@ -109,8 +158,12 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
         )
 
     def test_sent_but_unindexed_outcome_counts_as_response_attempted(self):
-        processing.send_reply_in_thread.last_error = "Failed to index reply after 3 attempts"
-        processing.send_reply_in_thread.sent_but_unindexed = True
+        processing._reset_reply_send_outcome()
+        processing._set_reply_send_outcome(
+            error="Failed to index reply after 3 attempts",
+            sent_but_unindexed=True,
+            outcome="sent_but_unindexed",
+        )
 
         with patch.object(processing, "queue_pending_response") as queue_retry, \
                 patch.object(processing, "record_sent_unindexed_response") as record_reconciliation:

@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
 with patch("google.cloud.firestore.Client", return_value=MagicMock()):
-    from email_automation import processing
+    from email_automation import campaign_safety, processing
 
 
 class FakeSnapshot:
@@ -86,14 +86,38 @@ class FakeFirestore:
         self.thread_ref = thread_ref
         self.client_ref = client_ref
         self.thread_docs = thread_docs or {}
+        self.client_ref._data.update({
+            "status": "live",
+            "automationPaused": False,
+        })
 
     def collection(self, name):
         if name == "users":
             return FakeCollection(FakeUserRef(self.thread_ref, self.client_ref, self.thread_docs))
+        if name == "systemConfig":
+            return FakeCollection(FakeDocumentRef({
+                "automationEnabled": True,
+                "allowedUids": [],
+            }))
         return FakeCollection(FakeDocumentRef({}, exists=False))
 
 
 class CompoundNonviableProcessingTests(unittest.TestCase):
+    def setUp(self):
+        self._campaign_gate = patch.object(
+            processing,
+            "get_client_automation_decision",
+            side_effect=lambda user_id, client_id: campaign_safety.get_client_automation_decision(
+                user_id,
+                client_id,
+                firestore_client=processing._fs,
+            ),
+        )
+        self._campaign_gate.start()
+
+    def tearDown(self):
+        self._campaign_gate.stop()
+
     def _common_graph_message(self, *, msg_id, subject, from_email, body, internet_message_id, conversation_id):
         return {
             "id": msg_id,

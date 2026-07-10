@@ -16,9 +16,42 @@ from .sent_mail_guard import (
     sent_after_from_retry_data,
 )
 from .outbound_safety import validate_outbound_body
+from .campaign_safety import (
+    CAMPAIGN_AUTOMATION_ALLOW,
+    CAMPAIGN_AUTOMATION_BLOCKED,
+    get_client_automation_decision,
+)
 
 # Maximum retry attempts before giving up
 MAX_RESPONSE_ATTEMPTS = 5
+
+
+def _preserve_pending_campaign_suppression(doc, decision) -> None:
+    doc.reference.update({
+        "status": "queued",
+        "processingBy": None,
+        "processingAt": None,
+        "automationSuppressedState": decision.state,
+        "automationSuppressedReason": decision.reason,
+        "automationSuppressedAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+    })
+
+
+def _gate_pending_response(user_id: str, doc, data: Dict[str, Any]) -> bool:
+    decision = get_client_automation_decision(user_id, data.get("clientId"))
+    if decision.state == CAMPAIGN_AUTOMATION_ALLOW:
+        return False
+    if decision.state == CAMPAIGN_AUTOMATION_BLOCKED and decision.metadata.get("terminal"):
+        _move_pending_response_to_dead_letter(
+            user_id,
+            doc,
+            data,
+            f"Client campaign is stopped; pending reply canceled: {decision.reason}",
+        )
+        return True
+    _preserve_pending_campaign_suppression(doc, decision)
+    return True
 
 
 def _move_pending_response_to_dead_letter(user_id: str, doc, data: Dict[str, Any], reason: str) -> None:
@@ -157,6 +190,9 @@ def get_pending_responses(user_id: str) -> list:
         data = doc.to_dict()
         attempts = data.get("attempts", 0)
 
+        if _gate_pending_response(user_id, doc, data):
+            continue
+
         if attempts >= MAX_RESPONSE_ATTEMPTS:
             reason = data.get("lastError") or f"Exceeded max attempts ({MAX_RESPONSE_ATTEMPTS})"
             print(f"☠️ Pending response exceeded max attempts ({MAX_RESPONSE_ATTEMPTS}): {doc.id[:30]}...")
@@ -188,6 +224,14 @@ def _pending_response_operation_state(
     return state
 
 
+def _get_local_campaign_suppression(getter=None):
+    """Return suppression produced by this pending-response execution only."""
+    if getter is None:
+        from .processing import _get_reply_campaign_suppression
+        getter = _get_reply_campaign_suppression
+    return getter()
+
+
 def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
     """
     Retry sending all pending responses.
@@ -197,7 +241,19 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
     failure now escalates the health rail via
     ``main._combine_graph_operation_states``.
     """
-    from .processing import send_reply_in_thread
+    from . import processing as processing_module
+
+    send_reply_in_thread = processing_module.send_reply_in_thread
+    reset_reply_send_outcome = getattr(
+        processing_module,
+        "_reset_reply_send_outcome",
+        lambda: None,
+    )
+    get_reply_send_outcome = getattr(
+        processing_module,
+        "_get_reply_send_outcome",
+        lambda: None,
+    )
 
     operation_states: List[Dict[str, Any]] = []
 
@@ -221,6 +277,10 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
         print(f"  → Retrying response to {recipient} (attempt {attempts + 1}/{MAX_RESPONSE_ATTEMPTS})")
 
         try:
+            if _gate_pending_response(user_id, doc, data):
+                print("    ⏸️ Pending response suppressed by current campaign state")
+                continue
+
             body_validation = validate_outbound_body(response_body)
             if not body_validation.is_safe:
                 _move_pending_response_to_dead_letter(
@@ -292,6 +352,7 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
                     print("    ⚠️ Manual continuation found in Sent Items; moved pending response to manual review")
                     continue
 
+            reset_reply_send_outcome()
             sent = send_reply_in_thread(
                 user_id=user_id,
                 headers=headers,
@@ -308,14 +369,34 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
                     _pending_response_operation_state("healthy", recipient=recipient)
                 )
             else:
+                send_outcome = get_reply_send_outcome()
                 failure_reason = (
-                    getattr(send_reply_in_thread, "last_error", None)
+                    getattr(send_outcome, "error", None)
                     or "send_reply_in_thread returned False"
                 )
-                sent_but_unindexed = (
-                    getattr(send_reply_in_thread, "sent_but_unindexed", False)
-                    or getattr(send_reply_in_thread, "last_outcome", None) == "sent_but_unindexed"
+                sent_but_unindexed = bool(
+                    getattr(send_outcome, "sent_but_unindexed", False)
+                    or getattr(send_outcome, "outcome", None) == "sent_but_unindexed"
                 )
+                suppression_kind = getattr(
+                    send_outcome, "campaign_suppression_kind", None
+                )
+                local_decision = getattr(send_outcome, "campaign_decision", None)
+                if suppression_kind in {"maintenance", "unknown"}:
+                    decision = local_decision or get_client_automation_decision(
+                        user_id, data.get("clientId")
+                    )
+                    _preserve_pending_campaign_suppression(doc, decision)
+                    print("    ⏸️ Campaign changed during retry; pending response preserved")
+                    continue
+                if suppression_kind == "terminal":
+                    _move_pending_response_to_dead_letter(
+                        user_id,
+                        doc,
+                        data,
+                        f"Client campaign stopped during retry; pending reply canceled: {failure_reason}",
+                    )
+                    continue
                 if sent_but_unindexed:
                     record_sent_unindexed_response(
                         user_id,

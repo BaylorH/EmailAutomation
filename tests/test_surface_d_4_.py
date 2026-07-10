@@ -61,6 +61,10 @@ class FakeDocRef:
     def delete(self):
         self.deleted = True
 
+    def set(self, data, merge=False):
+        self.set_calls = getattr(self, "set_calls", [])
+        self.set_calls.append((data, merge))
+
 
 class FakeDoc:
     def __init__(self, data, doc_id):
@@ -110,6 +114,9 @@ class FakeFirestore:
         self.set_calls = []
         self.add_calls = []
         self.seeded = {}
+        self.seeded[(
+            "collection", "systemConfig", "document", "campaignAccess",
+        )] = {"automationEnabled": True, "allowedUids": []}
 
     def seed_client(self, user_id, client_id, client_data):
         path = (
@@ -357,14 +364,14 @@ class StopCancelDismissManualContinuationTest(unittest.TestCase):
         self.assertTrue(fake_fs.add_calls, "expected a dead-letter write for the stopped item")
         dead_letter_payload = fake_fs.add_calls[-1][1]
         self.assertEqual("dead_lettered", dead_letter_payload["status"])
-        self.assertIn("paused/stopped", dead_letter_payload["failureReason"])
+        self.assertIn("campaign is stopped", dead_letter_payload["failureReason"].lower())
 
     def test_live_client_manual_continuation_still_sends(self):
         # NEGATIVE CONTROL: identical manual continuation, but the client is LIVE
         # (not stopped). The SAME real pipeline must reach the send path -- proving
         # the halt above is caused by the stop, not by the harness never sending.
         doc, _fs, get_reply_sender, send_outbox_as_reply, _sie = self._run_send(
-            {"status": "live"}
+            {"status": "live", "automationPaused": False}
         )
 
         self.assertFalse(doc.reference.deleted)
@@ -444,7 +451,11 @@ class StopCancelDismissOperatorVisibleFailureTest(unittest.TestCase):
         data = self._queued_snapshot()
         doc = FakeDoc(data, doc_id="outbox-ovf-2")
         fake_fs = FakeFirestore()
-        fake_fs.seed_client("uid-1", self.CLIENT_ID, {"status": "live"})
+        fake_fs.seed_client(
+            "uid-1",
+            self.CLIENT_ID,
+            {"status": "live", "automationPaused": False},
+        )
 
         with patch("email_automation.clients._fs", fake_fs):
             paused = email_module._pause_client_outbox_item_if_needed(

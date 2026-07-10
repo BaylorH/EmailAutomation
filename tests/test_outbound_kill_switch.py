@@ -22,6 +22,44 @@ from email_automation import email as email_module
 
 
 OUTBOUND_MODE_ENV = "SITESIFT_OUTBOUND_MODE"
+CLIENT_ID = "client-kill-switch-live"
+
+
+class _GateSnapshot:
+    def __init__(self, data=None):
+        self._data = data
+        self.exists = data is not None
+
+    def to_dict(self):
+        return dict(self._data or {})
+
+
+class _GateNode:
+    def __init__(self, docs, path=()):
+        self.docs = docs
+        self.path = path
+
+    def collection(self, name):
+        return _GateNode(self.docs, self.path + (name,))
+
+    def document(self, name):
+        return _GateNode(self.docs, self.path + (name,))
+
+    def get(self):
+        return _GateSnapshot(self.docs.get(self.path))
+
+
+def _live_gate_firestore():
+    return _GateNode({
+        ("users", "user-1", "clients", CLIENT_ID): {
+            "status": "live",
+            "automationPaused": False,
+        },
+        ("systemConfig", "campaignAccess"): {
+            "automationEnabled": True,
+            "allowedUids": [],
+        },
+    })
 
 
 def _clear_outbound_mode(env):
@@ -113,6 +151,7 @@ class SendAndIndexEmailKillSwitchTests(unittest.TestCase):
         os.environ[OUTBOUND_MODE_ENV] = mode
         fake = _fake_requests()
         with patch.object(email_module, "requests", fake), \
+             patch("email_automation.clients._fs", _live_gate_firestore()), \
              patch("email_automation.processing.is_contact_opted_out", return_value=None), \
              patch.object(email_module, "save_thread_root", return_value=True), \
              patch.object(email_module, "save_message", return_value=True), \
@@ -128,6 +167,7 @@ class SendAndIndexEmailKillSwitchTests(unittest.TestCase):
                 headers={"Authorization": "Bearer x"},
                 script="Hello, this is a clean outreach message about available space.",
                 recipients=["broker@example.com"],
+                client_id_or_none=CLIENT_ID,
                 signature_mode="none",
             )
         return result, fake

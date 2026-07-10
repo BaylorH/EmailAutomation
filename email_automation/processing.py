@@ -4,6 +4,8 @@ import hashlib
 import json
 import time
 import logging
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 import os
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
@@ -56,9 +58,28 @@ from .property_images import (
     build_property_image_sheet_updates,
     select_property_image_candidate,
 )
-from .campaign_safety import get_client_automation_pause, stopped_followup_patch
+from .campaign_safety import (
+    CAMPAIGN_AUTOMATION_ALLOW,
+    CAMPAIGN_AUTOMATION_BLOCKED,
+    get_client_automation_decision,
+    stopped_followup_patch,
+)
 
 logger = logging.getLogger(__name__)
+
+@dataclass(frozen=True)
+class ReplySendOutcome:
+    error: Optional[str] = None
+    sent_but_unindexed: bool = False
+    outcome: Optional[str] = None
+    subject: Optional[str] = None
+    conversation_id: Optional[str] = None
+    send_attempt_at: Optional[datetime] = None
+    campaign_decision: Optional[Any] = None
+    campaign_suppression_kind: Optional[str] = None
+
+
+_REPLY_SEND_OUTCOME = ContextVar("reply_send_outcome", default=ReplySendOutcome())
 
 
 DEFAULT_AUTOMATIC_INBOX_REPLY_ALLOWLIST = {
@@ -74,6 +95,70 @@ DEFAULT_TOUR_ACTION_ALLOWLIST = {
 
 class RetryableProcessingError(Exception):
     """Raised when a message should remain unprocessed so the next scan can retry it."""
+
+
+def _campaign_suppression_kind(decision) -> Optional[str]:
+    if decision.state == CAMPAIGN_AUTOMATION_ALLOW:
+        return None
+    if decision.state == CAMPAIGN_AUTOMATION_BLOCKED and decision.metadata.get("terminal"):
+        return "terminal"
+    if decision.state == CAMPAIGN_AUTOMATION_BLOCKED:
+        return "maintenance"
+    return "unknown"
+
+
+def _set_reply_campaign_suppression(decision) -> None:
+    kind = _campaign_suppression_kind(decision)
+    _set_reply_send_outcome(
+        error=f"Campaign automation suppressed before Graph send: {decision.reason}",
+        outcome=(
+            "blocked_campaign_terminal"
+            if kind == "terminal"
+            else f"suppressed_campaign_{kind}"
+        ),
+        campaign_decision=decision,
+        campaign_suppression_kind=kind,
+    )
+
+
+def _mirror_reply_send_outcome(outcome: ReplySendOutcome) -> None:
+    send_reply_in_thread.last_error = outcome.error
+    send_reply_in_thread.sent_but_unindexed = outcome.sent_but_unindexed
+    send_reply_in_thread.last_outcome = outcome.outcome
+    send_reply_in_thread.last_subject = outcome.subject
+    send_reply_in_thread.last_conversation_id = outcome.conversation_id
+    send_reply_in_thread.last_send_attempt_at = outcome.send_attempt_at
+    send_reply_in_thread.last_campaign_decision = outcome.campaign_decision
+
+
+def _set_reply_send_outcome(**changes) -> ReplySendOutcome:
+    outcome = replace(_REPLY_SEND_OUTCOME.get(), **changes)
+    _REPLY_SEND_OUTCOME.set(outcome)
+    _mirror_reply_send_outcome(outcome)
+    return outcome
+
+
+def _reset_reply_send_outcome() -> ReplySendOutcome:
+    outcome = ReplySendOutcome()
+    _REPLY_SEND_OUTCOME.set(outcome)
+    _mirror_reply_send_outcome(outcome)
+    return outcome
+
+
+def _get_reply_send_outcome() -> ReplySendOutcome:
+    return _REPLY_SEND_OUTCOME.get()
+
+
+def _get_reply_campaign_suppression():
+    outcome = _get_reply_send_outcome()
+    return outcome.campaign_suppression_kind, outcome.campaign_decision
+
+
+def _clear_reply_campaign_suppression() -> None:
+    _set_reply_send_outcome(
+        campaign_suppression_kind=None,
+        campaign_decision=None,
+    )
 
 
 def _should_mark_processed_after_error(error: Optional[Exception]) -> bool:
@@ -143,14 +228,18 @@ def _queue_response_retry_or_reconciliation(
     source_context: str = "autoResponse",
 ) -> str:
     """Queue a retry only when Graph did not already accept the reply."""
-    failure_reason = (
-        getattr(send_reply_in_thread, "last_error", None)
-        or "send_reply_in_thread returned False"
-    )
+    send_outcome = _get_reply_send_outcome()
+    failure_reason = send_outcome.error or "send_reply_in_thread returned False"
     sent_but_unindexed = (
-        getattr(send_reply_in_thread, "sent_but_unindexed", False)
-        or getattr(send_reply_in_thread, "last_outcome", None) == "sent_but_unindexed"
+        send_outcome.sent_but_unindexed
+        or send_outcome.outcome == "sent_but_unindexed"
     )
+    if (
+        send_outcome.campaign_suppression_kind == "terminal"
+        or send_outcome.outcome == "blocked_campaign_terminal"
+    ):
+        print("⏹️ Campaign stopped during auto-reply preparation; no retry was queued")
+        return "campaign_stopped"
     if sent_but_unindexed:
         record_sent_unindexed_response(
             user_id,
@@ -173,9 +262,9 @@ def _queue_response_retry_or_reconciliation(
         response_body,
         client_id,
         error=failure_reason,
-        subject=getattr(send_reply_in_thread, "last_subject", None),
-        conversation_id=getattr(send_reply_in_thread, "last_conversation_id", None),
-        last_send_attempt_at=getattr(send_reply_in_thread, "last_send_attempt_at", None),
+        subject=send_outcome.subject,
+        conversation_id=send_outcome.conversation_id,
+        last_send_attempt_at=send_outcome.send_attempt_at,
     )
     return "queued_retry"
 
@@ -1010,6 +1099,29 @@ def retry_processing_failures(
         thread_id = data.get("threadId")
         client_id = data.get("clientId")
         attempts = int(data.get("processingAttempts") or 0)
+
+        decision = get_client_automation_decision(user_id, client_id)
+        suppression_kind = _campaign_suppression_kind(decision)
+        if suppression_kind:
+            terminal = suppression_kind == "terminal"
+            try:
+                doc.reference.set({
+                    "processingAttempts": attempts,
+                    "retryable": False if terminal else bool(data.get("retryable", True)),
+                    "recoveryStatus": (
+                        "campaign_stopped"
+                        if terminal
+                        else "campaign_automation_suppressed"
+                    ),
+                    "automationSuppressedState": decision.state,
+                    "automationSuppressedReason": decision.reason,
+                    "automationSuppressedAt": SERVER_TIMESTAMP,
+                    "updatedAt": SERVER_TIMESTAMP,
+                }, merge=True)
+            except Exception as update_error:
+                print(f"⚠️ Could not preserve processing failure campaign gate: {update_error}")
+            result["skipped"] += 1
+            continue
 
         if not data.get("retryable", True) or not message_id or attempts >= max_attempts:
             result["skipped"] += 1
@@ -2734,9 +2846,11 @@ def _align_response_greeting(response_body: Optional[str], contact_name: Optiona
 
 
 def _mark_reply_sent_but_unindexed(reason: str) -> bool:
-    send_reply_in_thread.last_error = reason
-    send_reply_in_thread.sent_but_unindexed = True
-    send_reply_in_thread.last_outcome = "sent_but_unindexed"
+    _set_reply_send_outcome(
+        error=reason,
+        sent_but_unindexed=True,
+        outcome="sent_but_unindexed",
+    )
     print(f"   ⚠️ SENT-BUT-UNINDEXED: {reason}")
     return False
 
@@ -2775,24 +2889,23 @@ def _tour_actions_allowed(user_id: str) -> bool:
 
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
-    send_reply_in_thread.last_error = None
-    send_reply_in_thread.sent_but_unindexed = False
-    send_reply_in_thread.last_outcome = None
-    send_reply_in_thread.last_subject = None
-    send_reply_in_thread.last_conversation_id = None
-    send_reply_in_thread.last_send_attempt_at = None
+    _reset_reply_send_outcome()
     body_validation = validate_outbound_body(body)
     if not body_validation.is_safe:
-        send_reply_in_thread.last_error = f"{body_validation.reason}; manual review required before auto-reply"
-        send_reply_in_thread.last_outcome = "blocked_unsafe_body"
+        _set_reply_send_outcome(
+            error=f"{body_validation.reason}; manual review required before auto-reply",
+            outcome="blocked_unsafe_body",
+        )
         print(f"   🛑 Blocked unsafe auto-reply body: {body_validation.reason}")
         return False
     if not _automatic_inbox_replies_allowed(user_id):
-        send_reply_in_thread.last_error = (
-            "Automatic inbox replies are disabled for this user; "
-            "manual review required before auto-reply"
+        _set_reply_send_outcome(
+            error=(
+                "Automatic inbox replies are disabled for this user; "
+                "manual review required before auto-reply"
+            ),
+            outcome="blocked_auto_reply_policy",
         )
-        send_reply_in_thread.last_outcome = "blocked_auto_reply_policy"
         print(f"   🛑 Blocked automatic inbox reply for non-allowlisted user {user_id}")
         return False
     try:
@@ -2817,6 +2930,21 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         import requests
         import time
 
+        thread_doc = (
+            _fs.collection("users")
+            .document(user_id)
+            .collection("threads")
+            .document(thread_id)
+            .get()
+        )
+        thread_data = thread_doc.to_dict() if thread_doc.exists else {}
+        client_id = (thread_data or {}).get("clientId")
+        decision = get_client_automation_decision(user_id, client_id)
+        if decision.denies_autonomous_work:
+            _set_reply_campaign_suppression(decision)
+            print(f"   🛑 {_get_reply_send_outcome().error}")
+            return False
+
         base = "https://graph.microsoft.com/v1.0"
         current_meta = {}
 
@@ -2836,8 +2964,10 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             )
             if current_meta_resp.status_code == 200:
                 current_meta = current_meta_resp.json() or {}
-                send_reply_in_thread.last_subject = current_meta.get("subject")
-                send_reply_in_thread.last_conversation_id = current_meta.get("conversationId")
+                _set_reply_send_outcome(
+                    subject=current_meta.get("subject"),
+                    conversation_id=current_meta.get("conversationId"),
+                )
         except Exception as exc:
             print(f"   ⚠️ Could not fetch reply thread identity before send: {exc}")
 
@@ -2870,16 +3000,18 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             max_retries=GRAPH_SEND_MAX_RETRIES,
         )
         if not create_reply_resp or create_reply_resp.status_code not in [200, 201]:
-            send_reply_in_thread.last_error = f"createReplyAll failed: {create_reply_resp.status_code if create_reply_resp else 'no response'}"
-            send_reply_in_thread.last_outcome = "send_failed"
-            print(f"   ❌ {send_reply_in_thread.last_error}")
+            failure_reason = f"createReplyAll failed: {create_reply_resp.status_code if create_reply_resp else 'no response'}"
+            _set_reply_send_outcome(error=failure_reason, outcome="send_failed")
+            print(f"   ❌ {failure_reason}")
             return False
 
         reply_draft = create_reply_resp.json() or {}
         reply_draft_id = reply_draft.get("id")
         if not reply_draft_id:
-            send_reply_in_thread.last_error = "createReplyAll returned no draft id"
-            send_reply_in_thread.last_outcome = "send_failed"
+            _set_reply_send_outcome(
+                error="createReplyAll returned no draft id",
+                outcome="send_failed",
+            )
             print("   ❌ createReplyAll returned no draft id")
             return False
 
@@ -2904,8 +3036,10 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         )
         recipient_payload = recipient_result["payload"]
         if not (recipient_payload["toRecipients"] or recipient_payload["ccRecipients"]):
-            send_reply_in_thread.last_error = "No safe reply-all recipients remained after filtering"
-            send_reply_in_thread.last_outcome = "send_failed"
+            _set_reply_send_outcome(
+                error="No safe reply-all recipients remained after filtering",
+                outcome="send_failed",
+            )
             print("   ❌ No safe reply-all recipients remained after filtering")
             _delete_graph_reply_draft(headers, reply_draft_id, base=base)
             return False
@@ -2925,9 +3059,9 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             max_retries=GRAPH_SEND_MAX_RETRIES,
         )
         if not patch_resp or patch_resp.status_code not in [200, 202, 204]:
-            send_reply_in_thread.last_error = f"Reply-all draft patch failed: {patch_resp.status_code if patch_resp else 'no response'}"
-            send_reply_in_thread.last_outcome = "send_failed"
-            print(f"   ❌ {send_reply_in_thread.last_error}")
+            failure_reason = f"Reply-all draft patch failed: {patch_resp.status_code if patch_resp else 'no response'}"
+            _set_reply_send_outcome(error=failure_reason, outcome="send_failed")
+            print(f"   ❌ {failure_reason}")
             return False
 
         signature_attachments = []
@@ -2950,8 +3084,15 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             except Exception as e:
                 print(f"   ⚠️ Error attaching {attachment['name']}: {e}")
 
+        decision = get_client_automation_decision(user_id, client_id)
+        if decision.denies_autonomous_work:
+            _set_reply_campaign_suppression(decision)
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            print(f"   🛑 {_get_reply_send_outcome().error}")
+            return False
+
         reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
-        send_reply_in_thread.last_send_attempt_at = reply_sent_after
+        _set_reply_send_outcome(send_attempt_at=reply_sent_after)
         resp = exponential_backoff_request(
             lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
             max_retries=1,
@@ -2962,9 +3103,9 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             print(f"   ✅ Sent reply via createReplyAll draft")
 
         if not reply_sent_successfully:
-            send_reply_in_thread.last_error = f"Reply-all draft send failed: {resp.status_code if resp else 'no response'}"
-            send_reply_in_thread.last_outcome = "send_failed"
-            print(f"   ❌ {send_reply_in_thread.last_error}")
+            failure_reason = f"Reply-all draft send failed: {resp.status_code if resp else 'no response'}"
+            _set_reply_send_outcome(error=failure_reason, outcome="send_failed")
+            print(f"   ❌ {failure_reason}")
             return False
 
         # Reply was sent successfully - now index it
@@ -2986,7 +3127,7 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             )
             conversation_id = current_msg_resp.json().get("conversationId") if current_msg_resp.status_code == 200 else None
             if conversation_id:
-                send_reply_in_thread.last_conversation_id = conversation_id
+                _set_reply_send_outcome(conversation_id=conversation_id)
 
             if conversation_id:
                 sent_msg = _find_recent_sent_message_for_conversation(
@@ -3065,13 +3206,15 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         except Exception as e:
             return _mark_reply_sent_but_unindexed(f"Failed to index sent reply: {e}")
 
-        send_reply_in_thread.last_outcome = "sent_indexed"
+        _set_reply_send_outcome(outcome="sent_indexed")
         return True
 
     except Exception as e:
-        send_reply_in_thread.last_error = str(e)
-        send_reply_in_thread.sent_but_unindexed = False
-        send_reply_in_thread.last_outcome = "send_failed"
+        _set_reply_send_outcome(
+            error=str(e),
+            sent_but_unindexed=False,
+            outcome="send_failed",
+        )
         print(f"   ❌ Failed to send reply: {e}")
         return False
 
@@ -3477,31 +3620,39 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         print(f"⚠️ Could not fetch thread status data: {e}")
 
     thread_status = thread_data.get("status") or get_thread_status(user_id, thread_id)
-    client_paused, client_pause_reason, _client_data = get_client_automation_pause(
+    campaign_decision = get_client_automation_decision(
         user_id,
         thread_data.get("clientId"),
     )
-    if client_paused:
+    campaign_suppression_kind = _campaign_suppression_kind(campaign_decision)
+    client_terminal = campaign_suppression_kind == "terminal"
+    client_denied = campaign_suppression_kind is not None
+    if client_terminal:
         try:
-            thread_ref.update(stopped_followup_patch(client_pause_reason))
+            thread_ref.update(stopped_followup_patch(campaign_decision.reason))
         except Exception as e:
-            print(f"⚠️ Could not mark paused client thread stopped: {e}")
+            print(f"⚠️ Could not mark stopped client thread stopped: {e}")
         thread_data.update({
             "status": THREAD_STATUS["stopped"],
             "followUpStatus": "stopped",
-            "statusReason": client_pause_reason,
+            "statusReason": campaign_decision.reason,
         })
         thread_status = THREAD_STATUS["stopped"]
         print(
-            f"⏹️ Client automation is paused/stopped for thread {thread_id[:20]}...; "
+            f"⏹️ Client campaign is stopped for thread {thread_id[:20]}...; "
             "saving inbound message for history only"
+        )
+    elif client_denied:
+        print(
+            f"⏸️ Client automation is unavailable for thread {thread_id[:20]}...; "
+            "saving inbound message for history only without changing terminal state"
         )
 
     # If the operator manually replied to a paused/escalated thread directly from
     # Outlook (out-of-band Sent-Items continuation) instead of using the dashboard,
     # clear the stale open action_needed notification and resume the thread so
     # processing continues normally rather than staying paused forever.
-    if thread_status == THREAD_STATUS["paused"] and not client_paused:
+    if thread_status == THREAD_STATUS["paused"] and not client_denied:
         if _resume_paused_thread_after_manual_continuation(
             user_id, headers, thread_id, thread_data, msg
         ):
@@ -3512,7 +3663,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     # Terminal threads keep late replies for history but must not generate new AI work or auto-replies,
     # except when the user approved a same-contact replacement property in this email thread.
     replacement_context = _active_replacement_context(thread_data, _full_text)
-    if replacement_context and thread_status == THREAD_STATUS["stopped"] and not client_paused:
+    if replacement_context and thread_status == THREAD_STATUS["stopped"] and not client_denied:
         replacement_subject = replacement_context["address"]
         if replacement_context.get("city"):
             replacement_subject = f"{replacement_subject}, {replacement_context['city']}"
@@ -3532,8 +3683,16 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             f"{replacement_subject} row {replacement_context['rowNumber']}"
         )
 
-    if _should_skip_processing_for_terminal_thread(thread_status, thread_data, _full_text):
-        print(f"⏹️ Thread {thread_id[:20]}... is {thread_status} - saving message but skipping processing")
+    if client_denied or _should_skip_processing_for_terminal_thread(thread_status, thread_data, _full_text):
+        reason_label = (
+            f"campaign automation is {campaign_suppression_kind}"
+            if client_denied
+            else f"thread is {thread_status}"
+        )
+        print(
+            f"⏹️ {reason_label} for {thread_id[:20]}... - "
+            "saving message but skipping processing"
+        )
         # Still save the message for conversation history, but don't process or auto-reply
         # Fall through to message saving, but set a flag to skip processing
         skip_processing_for_terminal = True
@@ -3622,7 +3781,12 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
     # If thread is terminal, skip further processing (AI, sheet updates, auto-replies)
     if skip_processing_for_terminal:
-        print(f"⏹️ Skipping processing for terminal thread - message saved for history only")
+        print("⏹️ Skipping suppressed processing - message saved for history only")
+        if client_denied and not client_terminal:
+            raise RetryableProcessingError(
+                "Campaign automation is temporarily unavailable; inbound evidence was saved "
+                f"but downstream processing remains retryable ({campaign_decision.reason})"
+            )
         return
 
     # Step 1: fetch Google Sheet (required) and log header + counterparty email

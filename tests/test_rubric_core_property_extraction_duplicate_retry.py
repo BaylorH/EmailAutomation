@@ -9,8 +9,7 @@ os.environ.setdefault(
 import unittest
 from unittest.mock import patch, MagicMock
 
-from email_automation import messaging
-from email_automation import processing
+from email_automation import clients, messaging, processing
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,6 +107,15 @@ class CorePropertyExtractionDuplicateRetryTests(unittest.TestCase):
         happen when it should)."""
         fake_fs = _FakeFirestore()
         user_id = "uid-prop"
+        client_id = "c1"
+        fake_fs.data[("users", user_id, "clients", client_id)] = {
+            "status": "live",
+            "automationPaused": False,
+        }
+        fake_fs.data[("systemConfig", "campaignAccess")] = {
+            "automationEnabled": True,
+            "allowedUids": [],
+        }
 
         already_id = "m-already-extracted"
         fresh_id = "m-fresh-reply"
@@ -123,6 +131,7 @@ class CorePropertyExtractionDuplicateRetryTests(unittest.TestCase):
 
         with patch.object(messaging, "_fs", fake_fs), \
                 patch.object(processing, "_fs", fake_fs), \
+                patch.object(clients, "_fs", fake_fs), \
                 patch.object(processing, "_fetch_graph_message_by_id", side_effect=fake_fetch), \
                 patch.object(processing, "_find_existing_retry_artifact_for_message", return_value=None), \
                 patch.object(processing, "_find_sent_item_continuing_conversation", return_value=None), \
@@ -140,14 +149,14 @@ class CorePropertyExtractionDuplicateRetryTests(unittest.TestCase):
             failures.document("f-already").set({
                 "messageId": already_id,
                 "threadId": "t-already",
-                "clientId": "c1",
+                "clientId": client_id,
                 "processingAttempts": 0,
                 "retryable": True,
             })
             failures.document("f-fresh").set({
                 "messageId": fresh_id,
                 "threadId": "t-fresh",
-                "clientId": "c1",
+                "clientId": client_id,
                 "processingAttempts": 0,
                 "retryable": True,
             })

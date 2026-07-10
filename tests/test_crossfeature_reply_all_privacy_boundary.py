@@ -56,6 +56,7 @@ from email_automation.email import (
 # Scenario constants
 # ---------------------------------------------------------------------------
 USER_ID = "user-cre-1"
+CLIENT_ID = "client-reply-all-privacy-1"
 OPERATOR_EMAIL = "operator@sitesift.com"
 OPERATOR_ALIAS = "operator+campaign1@sitesift.com"      # same mailbox as operator
 BROKER = "broker@brokerage.com"                          # legit lead (To)
@@ -195,6 +196,12 @@ class _FakeUserDoc:
     def collection(self, name):
         if name == "optedOutContacts":
             return _FakeOptOutCollection(self._records)
+        if name == "clients":
+            return _FakeOptOutCollection({
+                CLIENT_ID: {"status": "live", "automationPaused": False},
+            })
+        if name == "archivedClients":
+            return _FakeOptOutCollection({})
         return _FakeOptOutCollection({})
 
 
@@ -216,6 +223,10 @@ class _FakeFirestore:
     def collection(self, name):
         if name == "users":
             return _FakeUsersCollection(self._records)
+        if name == "systemConfig":
+            return _FakeOptOutCollection({
+                "campaignAccess": {"automationEnabled": True, "allowedUids": []},
+            })
         return _FakeUsersCollection({})
 
 
@@ -246,6 +257,7 @@ def _outbox_reply_decision(*, guard_graph, send_graph, fake_fs, data):
 
     # No continuation -> the real reply-all send fires, real filter inside.
     with patch.object(email_mod, "requests", send_graph), \
+            patch("email_automation.clients._fs", fake_fs), \
             patch.object(processing_mod, "_fs", fake_fs):
         res = _send_outbox_as_reply(
             USER_ID,
@@ -254,6 +266,7 @@ def _outbox_reply_decision(*, guard_graph, send_graph, fake_fs, data):
             REPLY_TO_MSG_ID,
             "thread-1",
             user_email=OPERATOR_EMAIL,
+            client_id=CLIENT_ID,
         )
     return "sent", res
 

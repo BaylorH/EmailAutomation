@@ -25,6 +25,7 @@ os.environ.setdefault(
 )
 
 from email_automation import email as email_module
+from email_automation.campaign_safety import CampaignAutomationDecision
 
 
 class FakeSnapshot:
@@ -116,6 +117,8 @@ class FakeDoc:
 THREAD_KEY = "users/uid-1/threads/thread-1"
 MESSAGE_KEY = "users/uid-1/threads/thread-1/messages/graph-message-1"
 DEAD_LETTER_KEY = "users/uid-1/deadLetterQueue"
+ACTIVE_CLIENT_KEY = "users/uid-1/clients/client-a"
+CAMPAIGN_ACCESS_KEY = "systemConfig/campaignAccess"
 
 
 def _dashboard_reply_doc(overrides=None, doc_id="outbox-thread-reply"):
@@ -156,7 +159,19 @@ class OutboxThreadReplyBindingTests(unittest.TestCase):
     """Gap 1 + 2: pre-send validation of client-supplied thread binding."""
 
     def _run_send(self, doc, fake_fs, reply_sender="me@example.invalid"):
+        fake_fs.snapshots.setdefault(
+            ACTIVE_CLIENT_KEY,
+            FakeSnapshot({"status": "live", "automationPaused": False}),
+        )
+        fake_fs.snapshots.setdefault(
+            CAMPAIGN_ACCESS_KEY,
+            FakeSnapshot({"automationEnabled": True, "allowedUids": []}),
+        )
         with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_read_client_automation_decision", return_value=CampaignAutomationDecision(
+                 state="allow", reason="", client_data={"status": "live"},
+                 metadata={"terminal": False, "stopKind": "none"},
+             )), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_get_reply_message_sender", return_value=reply_sender) as get_reply_sender, \
              patch.object(email_module, "_send_outbox_as_reply") as send_outbox_as_reply, \
@@ -254,6 +269,7 @@ class OutboxThreadReplyBindingTests(unittest.TestCase):
         """Messages keyed by internetMessageId are matched via sourceMessage.graphMessageId."""
         fake_fs = FakeFirestore({
             THREAD_KEY: FakeSnapshot({"clientId": "client-a", "status": "paused"}),
+            ACTIVE_CLIENT_KEY: FakeSnapshot({"status": "live", "automationPaused": False}),
         })
         fake_fs.query_results[(
             "users/uid-1/threads/thread-1/messages",
@@ -261,6 +277,10 @@ class OutboxThreadReplyBindingTests(unittest.TestCase):
             "==",
             "graph-message-1",
         )] = [FakeSnapshot({"direction": "inbound"})]
+        fake_fs.snapshots[CAMPAIGN_ACCESS_KEY] = FakeSnapshot({
+            "automationEnabled": True,
+            "allowedUids": [],
+        })
         doc = _dashboard_reply_doc()
 
         with patch("email_automation.clients._fs", fake_fs), \
@@ -292,6 +312,8 @@ class OutboxThreadReplyBindingTests(unittest.TestCase):
         fake_fs = FakeFirestore({
             THREAD_KEY: FakeSnapshot({"clientId": "client-a", "status": "paused", "rowNumber": 42}),
             MESSAGE_KEY: FakeSnapshot({"direction": "inbound"}),
+            ACTIVE_CLIENT_KEY: FakeSnapshot({"status": "live", "automationPaused": False}),
+            CAMPAIGN_ACCESS_KEY: FakeSnapshot({"automationEnabled": True, "allowedUids": []}),
         })
         doc = _dashboard_reply_doc()
 

@@ -25,6 +25,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 from email_automation import messaging, processing
+from email_automation.campaign_safety import CampaignAutomationDecision
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,7 +299,7 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
     suppression is caused by the terminal status, not the harness.
     """
 
-    def _drive(self, thread_status):
+    def _drive(self, thread_status, campaign_decision=None):
         user_id = "uid-terminal"
         thread_id = "thread-terminal-1"
         msg_id = "graph-msg-terminal"
@@ -322,6 +323,10 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
 
         thread_data = {"status": thread_status, "clientId": "client-x"}
         fake_fs = _TerminalFakeFs(thread_data)
+        campaign_decision = campaign_decision or CampaignAutomationDecision(
+            state="allow", reason="", client_data={"status": "live"},
+            metadata={"terminal": False, "stopKind": "none"},
+        )
 
         base = "https://graph.microsoft.com/v1.0"
 
@@ -349,7 +354,7 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
              patch.object(processing, "_fs", fake_fs), \
              patch.object(processing, "lookup_thread_by_message_id", return_value=thread_id), \
              patch.object(processing, "lookup_thread_by_conversation_id", return_value=thread_id), \
-             patch.object(processing, "get_client_automation_pause", return_value=(False, "", {})), \
+             patch.object(processing, "get_client_automation_decision", return_value=campaign_decision), \
              patch.object(processing, "get_thread_status", return_value=thread_status), \
              patch.object(processing, "save_message", return_value=True), \
              patch.object(processing, "index_message_id", return_value=True), \
@@ -359,31 +364,62 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
              patch("email_automation.followup.cancel_followup_on_response", return_value=None):
             fake_requests.get.side_effect = fake_get
             raised_sentinel = False
+            raised_retryable = False
             try:
                 processing.process_inbox_message(user_id, {"Authorization": "Bearer t"}, msg)
             except _Sentinel:
                 raised_sentinel = True
+            except processing.RetryableProcessingError:
+                raised_retryable = True
 
-        return send_spy, fetch_spy, raised_sentinel
+        return send_spy, fetch_spy, raised_sentinel, raised_retryable, fake_fs
 
     def test_terminal_thread_suppresses_inbox_autoreply_pipeline(self):
         # TERMINAL (stopped): pipeline is suppressed at the terminal gate.
-        send_spy, fetch_spy, raised = self._drive(processing.THREAD_STATUS["stopped"])
+        send_spy, fetch_spy, raised, retryable, _fake_fs = self._drive(processing.THREAD_STATUS["stopped"])
         send_spy.assert_not_called()
         fetch_spy.assert_not_called()
         self.assertFalse(
             raised,
             "terminal thread must return before the pipeline (no fetch_and_log)",
         )
+        self.assertFalse(retryable)
 
         # POSITIVE CONTROL (active): identical reply enters the pipeline past the
         # terminal gate — proving the terminal status is what stops the send.
-        send_spy2, fetch_spy2, raised2 = self._drive(processing.THREAD_STATUS["active"])
+        send_spy2, fetch_spy2, raised2, retryable2, _fake_fs2 = self._drive(processing.THREAD_STATUS["active"])
         fetch_spy2.assert_called_once()
         self.assertTrue(
             raised2,
             "active thread must proceed past the terminal gate into the pipeline",
         )
+        self.assertFalse(retryable2)
+
+    def test_maintenance_pause_saves_inbound_without_terminalizing_or_processing(self):
+        decision = CampaignAutomationDecision(
+            state="blocked",
+            reason="campaign_maintenance",
+            client_data={"status": "live", "automationPaused": True},
+            metadata={"terminal": False, "stopKind": "maintenance_pause"},
+        )
+
+        send_spy, fetch_spy, raised, retryable, fake_fs = self._drive(
+            processing.THREAD_STATUS["active"],
+            campaign_decision=decision,
+        )
+
+        send_spy.assert_not_called()
+        fetch_spy.assert_not_called()
+        self.assertFalse(raised)
+        self.assertTrue(
+            retryable,
+            "maintenance-suppressed inbound evidence must remain retryable",
+        )
+        terminal_updates = [
+            update for update in fake_fs._holder.get("updates", [])
+            if update.get("status") == processing.THREAD_STATUS["stopped"]
+        ]
+        self.assertEqual([], terminal_updates)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -503,7 +539,16 @@ class InboxAutoReplyWrongRecipientTests(unittest.TestCase):
                 patch("email_automation.messaging.lookup_thread_by_message_id", return_value="thread-w"), \
                 patch("email_automation.messaging.index_conversation_id", return_value=True), \
                 patch("email_automation.messaging.save_message", return_value=True), \
-                patch.object(processing, "is_contact_opted_out", side_effect=fake_optout):
+                patch.object(processing, "is_contact_opted_out", side_effect=fake_optout), \
+                patch.object(
+                    processing,
+                    "get_client_automation_decision",
+                    return_value=CampaignAutomationDecision(
+                        state="allow", reason="", client_data={"status": "live"},
+                        metadata={"terminal": False, "stopKind": "none"},
+                    ),
+                    create=True,
+                ):
             sent = processing.send_reply_in_thread(
                 user_id,
                 {"Authorization": "Bearer token"},
@@ -522,6 +567,71 @@ class InboxAutoReplyWrongRecipientTests(unittest.TestCase):
             "good": good_recipient,
             "outcome": getattr(processing.send_reply_in_thread, "last_outcome", None),
         }
+
+    def test_autoreply_rechecks_campaign_stop_immediately_before_graph_send(self):
+        user_id = "uid-allowlisted"
+        posts = []
+        deletes = []
+        decisions = [
+            CampaignAutomationDecision(
+                state="allow", reason="", client_data={"status": "live"},
+                metadata={"terminal": False, "stopKind": "none"},
+            ),
+            CampaignAutomationDecision(
+                state="blocked", reason="client_stopped_by_user",
+                client_data={"status": "stopping"},
+                metadata={"terminal": True, "stopKind": "terminal_stop"},
+            ),
+        ]
+
+        def fake_get(url, **_kwargs):
+            return _FakeResponse(200, {
+                "conversationId": "conv-stop",
+                "subject": "RE: 200 Market St",
+            })
+
+        def fake_post(url, **_kwargs):
+            posts.append(url)
+            if url.endswith("/createReplyAll"):
+                return _FakeResponse(201, {
+                    "id": "reply-draft-stop",
+                    "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
+                    "ccRecipients": [],
+                })
+            if url.endswith("/send"):
+                raise AssertionError("stopped campaign must not reach Graph /send")
+            return _FakeResponse(500)
+
+        def fake_delete(url, **_kwargs):
+            deletes.append(url)
+            return _FakeResponse(204)
+
+        with patch("email_automation.utils.exponential_backoff_request", side_effect=lambda func, **k: func()), \
+                patch("email_automation.clients._fs", _AutoReplyFakeFs()), \
+                patch.object(processing.requests, "get", side_effect=fake_get), \
+                patch.object(processing.requests, "post", side_effect=fake_post), \
+                patch.object(processing.requests, "patch", return_value=_FakeResponse(200)), \
+                patch.object(processing.requests, "delete", side_effect=fake_delete), \
+                patch.object(processing, "is_contact_opted_out", return_value=None), \
+                patch.object(
+                    processing,
+                    "get_client_automation_decision",
+                    side_effect=decisions,
+                    create=True,
+                ):
+            sent = processing.send_reply_in_thread(
+                user_id,
+                {"Authorization": "Bearer token"},
+                "Hi Broker,\n\nThanks for the details.",
+                "msg-stop",
+                "bp21harrison@gmail.com",
+                "thread-stop",
+            )
+
+        self.assertFalse(sent)
+        self.assertFalse(any(url.endswith("/send") for url in posts))
+        self.assertTrue(any(url.endswith("/reply-draft-stop") for url in deletes))
+        self.assertEqual("blocked_campaign_terminal", processing.send_reply_in_thread.last_outcome)
 
     def test_autoreply_strips_optedout_wrong_recipient_before_graph_send(self):
         wrong = "opted-out-broker@wrong-brokerage.com"

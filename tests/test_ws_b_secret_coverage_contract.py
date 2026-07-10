@@ -68,7 +68,7 @@ def _env_reads(tree):
                 name = func.attr
             elif isinstance(func, ast.Name):
                 name = func.id
-            if name in {"getenv", "get", "setdefault"}:
+            if name in {"getenv", "get", "setdefault", "_clean_env"}:
                 value = _string_value(node.args[0])
                 if value is not None:
                     yield value, node.lineno

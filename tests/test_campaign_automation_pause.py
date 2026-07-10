@@ -62,7 +62,98 @@ class _FakeFirestore:
         return _FakeUsersCollection(self._users)
 
 
+class _PathFirestore:
+    def __init__(self, values, path=()):
+        self._values = values
+        self._path = path
+
+    def collection(self, name):
+        return _PathFirestore(self._values, self._path + (name,))
+
+    def document(self, document_id):
+        return _PathFirestore(self._values, self._path + (document_id,))
+
+    def get(self):
+        value = self._values.get(self._path)
+        if isinstance(value, Exception):
+            raise value
+        if self._path not in self._values:
+            return _FakeSnapshot(exists=False)
+        return _FakeSnapshot(value)
+
+
 class CampaignAutomationPauseTests(unittest.TestCase):
+    BAYLOR_UID = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
+
+    def _policy_firestore(self, user_id, client_data, policy):
+        return _PathFirestore({
+            ("users", user_id, "clients", "client-1"): client_data,
+            ("systemConfig", "campaignAccess"): policy,
+        })
+
+    def test_global_maintenance_blocks_normal_active_client(self):
+        decision = campaign_safety.get_client_automation_decision(
+            "normal-user",
+            "client-1",
+            firestore_client=self._policy_firestore(
+                "normal-user",
+                {"status": "active"},
+                {"automationEnabled": False, "allowedUids": [self.BAYLOR_UID]},
+            ),
+        )
+
+        self.assertEqual(campaign_safety.CAMPAIGN_AUTOMATION_BLOCKED, decision.state)
+        self.assertEqual("global_automation_disabled", decision.reason)
+        self.assertFalse(decision.metadata["terminal"])
+
+    def test_global_maintenance_allows_allowlisted_baylor_active_client(self):
+        decision = campaign_safety.get_client_automation_decision(
+            self.BAYLOR_UID,
+            "client-1",
+            firestore_client=self._policy_firestore(
+                self.BAYLOR_UID,
+                {"status": "active"},
+                {"automationEnabled": False, "allowedUids": [self.BAYLOR_UID]},
+            ),
+        )
+
+        self.assertEqual(campaign_safety.CAMPAIGN_AUTOMATION_ALLOW, decision.state)
+
+    def test_unreadable_or_malformed_global_config_is_unknown_and_fail_closed(self):
+        policies = (
+            RuntimeError("Firestore unavailable"),
+            {"automationEnabled": "false", "allowedUids": [self.BAYLOR_UID]},
+            {"automationEnabled": False, "allowedUids": "not-a-list"},
+        )
+
+        for policy in policies:
+            with self.subTest(policy=policy), contextlib.redirect_stdout(io.StringIO()):
+                decision = campaign_safety.get_client_automation_decision(
+                    "normal-user",
+                    "client-1",
+                    firestore_client=self._policy_firestore(
+                        "normal-user", {"status": "active"}, policy
+                    ),
+                )
+
+            self.assertEqual(campaign_safety.CAMPAIGN_AUTOMATION_UNKNOWN, decision.state)
+            self.assertTrue(decision.denies_autonomous_work)
+
+    def test_terminal_client_remains_terminal_when_global_config_is_malformed(self):
+        decision = campaign_safety.get_client_automation_decision(
+            "normal-user",
+            "client-1",
+            firestore_client=self._policy_firestore(
+                "normal-user",
+                {"status": "stopped", "statusReason": "operator_stop"},
+                {"automationEnabled": "invalid"},
+            ),
+        )
+
+        self.assertEqual(campaign_safety.CAMPAIGN_AUTOMATION_BLOCKED, decision.state)
+        self.assertEqual("operator_stop", decision.reason)
+        self.assertTrue(decision.metadata["terminal"])
+
     def test_explicit_automation_pause_blocks_client_processing(self):
         self.assertTrue(
             campaign_safety.is_client_automation_paused({
@@ -98,7 +189,7 @@ class CampaignAutomationPauseTests(unittest.TestCase):
         self.assertFalse(maintenance.metadata["terminal"])
 
     def test_terminal_statuses_all_block_autonomous_work(self):
-        for status in ("stopped", "archived", "deleted", "completed"):
+        for status in ("stopping", "stopped", "archived", "deleted", "completed"):
             with self.subTest(status=status):
                 decision = campaign_safety.classify_client_automation_state({"status": status})
                 self.assertEqual(campaign_safety.CAMPAIGN_AUTOMATION_BLOCKED, decision.state)

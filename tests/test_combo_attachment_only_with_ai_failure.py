@@ -51,6 +51,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from email_automation import processing
+from email_automation.campaign_safety import CampaignAutomationDecision
 from email_automation import sheet_operations
 from email_automation.file_handling import fetch_and_process_linked_assets
 
@@ -216,6 +217,16 @@ class ComboAttachmentOnlyWithAiFailureTests(unittest.TestCase):
             return graph_response
 
         with patch.object(processing, "_fs", fake_fs), \
+             patch.object(
+                 processing,
+                 "get_client_automation_decision",
+                 return_value=CampaignAutomationDecision(
+                     state="allow",
+                     reason="",
+                     client_data={"status": "live", "automationPaused": False},
+                     metadata={"source": "systemConfig/campaignAccess", "terminal": False},
+                 ),
+             ), \
              patch.object(processing, "has_processed", return_value=False), \
              patch.object(processing, "exponential_backoff_request", side_effect=lambda fn: fn()), \
              patch.object(processing.requests, "get", side_effect=fake_get), \

@@ -14,6 +14,7 @@ os.environ.setdefault(
 from email_automation import email as email_module
 from email_automation import sent_mail_guard
 from email_automation import utils
+from email_automation.campaign_safety import CampaignAutomationDecision
 
 
 class FakeResponse:
@@ -35,6 +36,20 @@ class FakeResponse:
 
 
 class GraphRetryPolicyTests(unittest.TestCase):
+    def setUp(self):
+        decision_patch = patch.object(
+            email_module,
+            "_read_client_automation_decision",
+            return_value=CampaignAutomationDecision(
+                state="allow",
+                reason="",
+                client_data={"status": "live"},
+                metadata={"terminal": False, "stopKind": "none"},
+            ),
+        )
+        decision_patch.start()
+        self.addCleanup(decision_patch.stop)
+
     def test_rate_limit_failure_preserves_graph_error_details(self):
         responses = [
             FakeResponse(

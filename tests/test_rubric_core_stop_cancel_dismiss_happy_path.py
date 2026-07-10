@@ -39,14 +39,25 @@ class _FakeUsersRoot:
     def __init__(self, user_id, client_id, client_data):
         client_ref = _FakeDocRef(_FakeSnapshot(client_data, exists=True))
         clients_col = _FakeCollection({client_id: client_ref})
+        archived_clients_col = _FakeCollection({})
         user_ref = _FakeDocRef(None)
-        # user doc only needs .collection("clients")
-        user_ref.collection = lambda name: clients_col
+        user_ref.collection = lambda name: (
+            clients_col if name == "clients" else archived_clients_col
+        )
         self._users = _FakeCollection({user_id: user_ref})
+        self._system_config = _FakeCollection({
+            "campaignAccess": _FakeDocRef(_FakeSnapshot({
+                "automationEnabled": True,
+                "allowedUids": [],
+            }))
+        })
 
     def collection(self, name):
-        assert name == "users"
-        return self._users
+        if name == "users":
+            return self._users
+        if name == "systemConfig":
+            return self._system_config
+        raise AssertionError(f"unexpected collection {name}")
 
 
 class CoreStopCancelDismissHappyPathTests(unittest.TestCase):
@@ -94,7 +105,11 @@ class CoreStopCancelDismissHappyPathTests(unittest.TestCase):
         # Guard against a vacuous gate: a live client must NOT be paused.
         user_id = "user-live"
         client_id = "client-7"
-        fake_fs = _FakeUsersRoot(user_id, client_id, {"status": "live"})
+        fake_fs = _FakeUsersRoot(
+            user_id,
+            client_id,
+            {"status": "live", "automationPaused": False},
+        )
 
         paused, reason, _ = campaign_safety.get_client_automation_pause(
             user_id,

@@ -13,8 +13,13 @@ CLIENT_AUTOMATION_STATE_NOT_FOUND_REASON = "client_automation_state_not_found"
 CLIENT_AUTOMATION_STATE_READ_ERROR_REASON = "client_automation_state_read_error"
 CLIENT_AUTOMATION_STATE_MALFORMED_REASON = "client_automation_state_malformed"
 MISSING_CLIENT_ID_REASON = "missing_client_id"
+GLOBAL_AUTOMATION_DISABLED_REASON = "global_automation_disabled"
+GLOBAL_AUTOMATION_STATE_READ_ERROR_REASON = "global_automation_state_read_error"
+GLOBAL_AUTOMATION_STATE_MALFORMED_REASON = "global_automation_state_malformed"
+GLOBAL_CAMPAIGN_ACCESS_SOURCE = "systemConfig/campaignAccess"
+BAYLOR_GLOBAL_AUTOMATION_FALLBACK_UID = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
 
-CLIENT_TERMINAL_STATUSES = {"stopped", "archived", "deleted", "completed"}
+CLIENT_TERMINAL_STATUSES = {"stopping", "stopped", "archived", "deleted", "completed"}
 CLIENT_ACTIVE_STATUSES = {"active", "live"}
 PAUSE_REASON_FIELDS = (
     "automationPauseReason",
@@ -218,6 +223,75 @@ def _log_campaign_state_warning(reason: str) -> None:
     print(f"   ⚠️ Campaign automation state unavailable: {reason}")
 
 
+def _global_campaign_access_decision(
+    fs,
+    user_id: str,
+    client_decision: CampaignAutomationDecision,
+) -> CampaignAutomationDecision:
+    try:
+        policy_doc = fs.collection("systemConfig").document("campaignAccess").get()
+    except Exception:
+        _log_campaign_state_warning(GLOBAL_AUTOMATION_STATE_READ_ERROR_REASON)
+        return _decision(
+            CAMPAIGN_AUTOMATION_UNKNOWN,
+            GLOBAL_AUTOMATION_STATE_READ_ERROR_REASON,
+            client_decision.client_data,
+            source=GLOBAL_CAMPAIGN_ACCESS_SOURCE,
+        )
+
+    if not getattr(policy_doc, "exists", False):
+        if user_id == BAYLOR_GLOBAL_AUTOMATION_FALLBACK_UID:
+            return client_decision
+        return _decision(
+            CAMPAIGN_AUTOMATION_BLOCKED,
+            GLOBAL_AUTOMATION_DISABLED_REASON,
+            client_decision.client_data,
+            source=GLOBAL_CAMPAIGN_ACCESS_SOURCE,
+            stop_kind="global_maintenance",
+            terminal=False,
+        )
+
+    try:
+        policy = policy_doc.to_dict()
+    except Exception:
+        policy = None
+    if not isinstance(policy, dict):
+        _log_campaign_state_warning(GLOBAL_AUTOMATION_STATE_MALFORMED_REASON)
+        return _decision(
+            CAMPAIGN_AUTOMATION_UNKNOWN,
+            GLOBAL_AUTOMATION_STATE_MALFORMED_REASON,
+            client_decision.client_data,
+            source=GLOBAL_CAMPAIGN_ACCESS_SOURCE,
+        )
+
+    automation_enabled = policy.get("automationEnabled")
+    allowed_uids = policy.get("allowedUids")
+    if (
+        not isinstance(automation_enabled, bool)
+        or not isinstance(allowed_uids, list)
+        or any(not isinstance(uid, str) or not uid.strip() for uid in allowed_uids)
+    ):
+        _log_campaign_state_warning(GLOBAL_AUTOMATION_STATE_MALFORMED_REASON)
+        return _decision(
+            CAMPAIGN_AUTOMATION_UNKNOWN,
+            GLOBAL_AUTOMATION_STATE_MALFORMED_REASON,
+            client_decision.client_data,
+            source=GLOBAL_CAMPAIGN_ACCESS_SOURCE,
+        )
+
+    if automation_enabled or user_id in {uid.strip() for uid in allowed_uids}:
+        return client_decision
+
+    return _decision(
+        CAMPAIGN_AUTOMATION_BLOCKED,
+        GLOBAL_AUTOMATION_DISABLED_REASON,
+        client_decision.client_data,
+        source=GLOBAL_CAMPAIGN_ACCESS_SOURCE,
+        stop_kind="global_maintenance",
+        terminal=False,
+    )
+
+
 def get_client_automation_decision(
     user_id: str,
     client_id: Optional[str],
@@ -270,7 +344,9 @@ def get_client_automation_decision(
 
     if getattr(active_doc, "exists", False):
         try:
-            return classify_client_automation_state(active_doc.to_dict(), source="clients")
+            client_decision = classify_client_automation_state(
+                active_doc.to_dict(), source="clients"
+            )
         except Exception:
             _log_campaign_state_warning(CLIENT_AUTOMATION_STATE_MALFORMED_REASON)
             return _decision(
@@ -278,6 +354,9 @@ def get_client_automation_decision(
                 CLIENT_AUTOMATION_STATE_MALFORMED_REASON,
                 source="clients",
             )
+        if client_decision.denies_autonomous_work:
+            return client_decision
+        return _global_campaign_access_decision(fs, user_id, client_decision)
 
     return _decision(CAMPAIGN_AUTOMATION_UNKNOWN, CLIENT_AUTOMATION_STATE_NOT_FOUND_REASON)
 

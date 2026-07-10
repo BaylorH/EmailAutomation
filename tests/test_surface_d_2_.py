@@ -266,7 +266,7 @@ class SignatureIdentityTerminalStateTest(unittest.TestCase):
         # The stop is operator-visible: the item is moved to the dead-letter queue.
         dead = fake_fs.dead_letters()
         self.assertEqual(1, len(dead))
-        self.assertIn("paused/stopped", dead[0]["failureReason"].lower())
+        self.assertIn("campaign is stopped", dead[0]["failureReason"].lower())
         self.assertIn("stopped by operator", dead[0]["failureReason"].lower())
         # Original outbox item consumed (not left to silently retry a send).
         self.assertTrue(doc.reference.deleted)

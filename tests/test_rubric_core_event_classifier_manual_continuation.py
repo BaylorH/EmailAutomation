@@ -9,7 +9,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
 
-from email_automation import processing
+from email_automation import clients, processing
 
 
 # --- Minimal Firestore double.
@@ -114,6 +114,14 @@ def _seed_failure(fake_fs):
         "retryable": True,
         "createdAt": datetime(2026, 7, 2, 11, 0, 0, tzinfo=timezone.utc),
     }
+    fake_fs.docs[("users", USER_ID, "clients", CLIENT_ID)] = {
+        "status": "live",
+        "automationPaused": False,
+    }
+    fake_fs.docs[("systemConfig", "campaignAccess")] = {
+        "automationEnabled": True,
+        "allowedUids": [],
+    }
     return path
 
 
@@ -134,6 +142,7 @@ class CoreEventClassifierManualContinuationTests(unittest.TestCase):
         auto_path_spy = MagicMock(name="process_inbox_message")
 
         with patch.object(processing, "_fs", fake_fs), \
+             patch.object(clients, "_fs", fake_fs), \
              patch.object(processing, "has_processed", return_value=False), \
              patch.object(processing, "mark_processed"), \
              patch.object(processing, "_fetch_graph_message_by_id", return_value=dict(GRAPH_MSG)), \
@@ -165,6 +174,7 @@ class CoreEventClassifierManualContinuationTests(unittest.TestCase):
         auto_path_spy2 = MagicMock(name="process_inbox_message")
 
         with patch.object(processing, "_fs", fake_fs2), \
+             patch.object(clients, "_fs", fake_fs2), \
              patch.object(processing, "has_processed", return_value=False), \
              patch.object(processing, "mark_processed"), \
              patch.object(processing, "_fetch_graph_message_by_id", return_value=dict(GRAPH_MSG)), \

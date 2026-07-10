@@ -34,6 +34,17 @@ class FakeFirestoreNode:
     def delete(self):
         self.root.deleted_paths.append(tuple(self.path))
 
+    def get(self):
+        data = self.root.seeded.get(tuple(self.path))
+        return type(
+            "Snapshot",
+            (),
+            {
+                "exists": data is not None,
+                "to_dict": lambda _self: dict(data or {}),
+            },
+        )()
+
     def set(self, data, merge=False):
         self.root.set_calls.append((tuple(self.path), data, merge))
 
@@ -47,6 +58,15 @@ class FakeFirestore:
         self.deleted_paths = []
         self.set_calls = []
         self.add_calls = []
+        self.seeded = {
+            (
+                "collection", "users", "document", "uid-1",
+                "collection", "clients", "document", "client-1",
+            ): {"status": "live", "automationPaused": False},
+            (
+                "collection", "systemConfig", "document", "campaignAccess",
+            ): {"automationEnabled": True, "allowedUids": []},
+        }
 
     def collection(self, name):
         return FakeFirestoreNode(self, ["collection", name])
@@ -301,7 +321,9 @@ class BackendActionAuditTests(unittest.TestCase):
 
         requests_post.side_effect = fake_post
 
-        with patch.object(email_module.requests, "patch", return_value=FakeResponse(200)), \
+        fake_fs = FakeFirestore()
+        with patch("email_automation.clients._fs", fake_fs), \
+                patch.object(email_module.requests, "patch", return_value=FakeResponse(200)), \
                 patch("email_automation.processing.is_contact_opted_out", return_value=None):
             result = email_module._send_outbox_as_reply(
                 "uid-1",
@@ -312,6 +334,7 @@ class BackendActionAuditTests(unittest.TestCase):
                 user_signature="Baylor Harrison\nbaylor.freelance@outlook.com",
                 signature_mode="professional",
                 user_email="baylor.freelance@outlook.com",
+                client_id="client-1",
             )
 
         self.assertTrue(result["sent"])
@@ -353,21 +376,23 @@ class BackendActionAuditTests(unittest.TestCase):
             "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
         })
 
-        result = email_module.send_and_index_email(
-            "uid-1",
-            {"Authorization": "Bearer token"},
-            "Hi Ron,\n\nPlease confirm the 9:00 AM tour slot for 0 Gemini Ave.",
-            ["bp21harrison@gmail.com"],
-            client_id_or_none="client-1",
-            row_number=20,
-            subject_override="Tour slot: 0 Gemini Ave at 9:00 AM",
-            thread_context={
-                "source": "dashboard_tour_planner",
-                "actionType": "tour_invite",
-                "tourInvite": {"arrivalTime": "9:00 AM", "departureTime": "9:30 AM"},
-                "property": {"address": "0 Gemini Ave", "city": "Houston", "state": "TX"},
-            },
-        )
+        fake_fs = FakeFirestore()
+        with patch("email_automation.clients._fs", fake_fs):
+            result = email_module.send_and_index_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "Hi Ron,\n\nPlease confirm the 9:00 AM tour slot for 0 Gemini Ave.",
+                ["bp21harrison@gmail.com"],
+                client_id_or_none="client-1",
+                row_number=20,
+                subject_override="Tour slot: 0 Gemini Ave at 9:00 AM",
+                thread_context={
+                    "source": "dashboard_tour_planner",
+                    "actionType": "tour_invite",
+                    "tourInvite": {"arrivalTime": "9:00 AM", "departureTime": "9:30 AM"},
+                    "property": {"address": "0 Gemini Ave", "city": "Houston", "state": "TX"},
+                },
+            )
 
         self.assertEqual(["bp21harrison@gmail.com"], result["sent"])
         thread_meta = save_thread_root.call_args[0][2]
