@@ -11,6 +11,7 @@ os.environ.setdefault(
 
 from email_automation import email as email_module
 from email_automation import notifications as notifications_module
+from email_automation.campaign_safety import CampaignStateUnavailableError
 
 
 class FakeDocRef:
@@ -267,6 +268,85 @@ class FakeSheetsClient:
 
 
 class OutboxSafetyTests(unittest.TestCase):
+    def test_single_send_dead_letters_when_campaign_state_cannot_be_verified(self):
+        doc = FakeDoc({
+            "assignedEmails": ["bp21harrison@gmail.com"],
+            "script": "Hi Avery,\n\nCould you confirm the available square feet?",
+            "clientId": "client-1",
+            "subject": "100 State Check Way",
+            "rowNumber": 3,
+        }, doc_id="outbox-state-unavailable")
+
+        operation_states = []
+        with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_current_outbox_data", return_value={}), \
+             patch.object(
+                 email_module,
+                 "get_client_automation_pause",
+                 side_effect=CampaignStateUnavailableError("Firestore 503"),
+             ), \
+             patch.object(email_module, "_move_to_dead_letter") as dead_letter, \
+             patch.object(email_module, "send_and_index_email") as send:
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+                operation_states=operation_states,
+            )
+
+        send.assert_not_called()
+        dead_letter.assert_called_once()
+        self.assertIn("Could not verify campaign automation state", dead_letter.call_args.args[3])
+        self.assertIn("manual review required", dead_letter.call_args.args[3])
+        self.assertEqual(len(operation_states), 1)
+        self.assertEqual(operation_states[0]["status"], "error")
+        self.assertEqual(operation_states[0]["operationPath"], "single")
+        self.assertEqual(operation_states[0]["clientId"], "client-1")
+        self.assertEqual(operation_states[0]["rowNumber"], 3)
+
+    def test_separate_group_dead_letters_each_unverifiable_item_and_continues(self):
+        docs = [
+            FakeDoc({
+                "assignedEmails": ["bp21harrison@gmail.com"],
+                "script": "Hi Avery,\n\nCould you confirm the available square feet?",
+                "clientId": "client-1",
+                "subject": f"{100 + index} State Check Way",
+                "rowNumber": 3 + index,
+            }, doc_id=f"outbox-state-unavailable-{index}")
+            for index in range(2)
+        ]
+
+        operation_states = []
+        with patch("email_automation.processing.is_contact_opted_out", return_value=None), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_get_current_outbox_data", return_value={}), \
+             patch.object(
+                 email_module,
+                 "get_client_automation_pause",
+                 side_effect=CampaignStateUnavailableError("Firestore 503"),
+             ), \
+             patch.object(email_module, "_move_to_dead_letter") as dead_letter, \
+             patch.object(email_module, "send_and_index_email") as send, \
+             patch.object(email_module.time, "sleep", return_value=None):
+            email_module._send_multi_property_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "bp21harrison@gmail.com",
+                [{"doc": doc, "data": doc.to_dict()} for doc in docs],
+                operation_states=operation_states,
+            )
+
+        send.assert_not_called()
+        self.assertEqual(dead_letter.call_count, 2)
+        for call in dead_letter.call_args_list:
+            self.assertIn("Could not verify campaign automation state", call.args[3])
+            self.assertIn("manual review required", call.args[3])
+        self.assertEqual(len(operation_states), 2)
+        self.assertEqual(
+            [(state["operationPath"], state["clientId"], state["rowNumber"]) for state in operation_states],
+            [("separate", "client-1", 3), ("separate", "client-1", 4)],
+        )
+
     def test_cancel_requested_item_is_deleted_without_sending(self):
         doc = FakeDoc({
             "assignedEmails": ["bp21harrison@gmail.com"],
@@ -1081,8 +1161,46 @@ class OutboxSafetyTests(unittest.TestCase):
 
         with patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_dead_letter_campaign_recipient_row_mismatch_if_needed", return_value=False), \
              patch("email_automation.clients._fs", FakeFirestore()), \
              patch.object(email_module, "_select_script_for_recipient", return_value="Wrong fallback body") as select_script, \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": ["bp21harrison@gmail.com"],
+                 "errors": {},
+             }) as send_and_index_email, \
+             patch.object(email_module, "_finalize_successful_outbox_item"):
+            email_module._send_single_outbox_item(
+                "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        select_script.assert_not_called()
+        send_and_index_email.assert_called_once()
+        self.assertEqual(send_and_index_email.call_args.args[2], reviewed_body)
+
+    def test_campaign_launch_outbox_uses_reviewed_body_even_for_existing_contact(self):
+        reviewed_body = (
+            "Hi Test,\n\nI am checking availability and specs for the property "
+            "in the subject."
+        )
+        doc = FakeDoc({
+            "assignedEmails": ["bp21harrison@gmail.com"],
+            "script": reviewed_body,
+            "clientId": "client-1",
+            "subject": "570 W Cheyenne Ave, North Las Vegas",
+            "rowNumber": 3,
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "scriptSelectionMode": "exact",
+            "actionAuditId": "audit-launch",
+        }, doc_id="outbox-launch")
+
+        with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_dead_letter_campaign_recipient_row_mismatch_if_needed", return_value=False), \
+             patch("email_automation.clients._fs", FakeFirestore()), \
+             patch.object(email_module, "_select_script_for_recipient", return_value="Wrong history-based body") as select_script, \
              patch.object(email_module, "send_and_index_email", return_value={
                  "sent": ["bp21harrison@gmail.com"],
                  "errors": {},
@@ -2295,7 +2413,7 @@ class SendModeCombineTests(unittest.TestCase):
     def _items(docs):
         return [{"doc": d, "data": d.to_dict()} for d in docs]
 
-    def _combined_patches(self, stack, *, existing=False):
+    def _combined_patches(self, stack, *, existing=False, use_real_client_pause=False) -> tuple:
         """Enter the common combined-send patches; return (finalize, dead_letter) mocks."""
         def p(name, **kw):
             return stack.enter_context(patch.object(email_module, name, **kw))
@@ -2304,7 +2422,8 @@ class SendModeCombineTests(unittest.TestCase):
         stack.enter_context(patch("email_automation.processing.is_contact_opted_out", return_value=None))
         p("_claim_outbox_item", return_value=True)
         p("_get_current_outbox_data", return_value={})
-        p("_pause_client_outbox_item_if_needed", return_value=False)
+        if not use_real_client_pause:
+            p("_pause_client_outbox_item_if_needed", return_value=False)
         p("_dead_letter_campaign_recipient_row_mismatch_if_needed", return_value=False)
         if callable(existing):
             p("_has_existing_thread_for_property", side_effect=existing)
@@ -2377,6 +2496,101 @@ class SendModeCombineTests(unittest.TestCase):
         self.assertEqual(captured["thread_context"]["propertyAddresses"], self.ADDRS)
         self.assertEqual(captured["thread_context"]["rows"], [3, 4, 5])
         self.assertEqual(captured["subject"], "100 Dashboard Way (+2 more)")
+
+    def test_completed_campaign_blocks_every_combined_row_before_graph_send(self):
+        docs = self._same_broker_docs(send_mode="combined", count=3)
+
+        with ExitStack() as stack:
+            finalize, dead_letter = self._combined_patches(
+                stack,
+                use_real_client_pause=True,
+            )
+            stack.enter_context(patch.object(
+                email_module,
+                "get_client_automation_pause",
+                return_value=(True, "completed", {"status": "completed"}),
+            ))
+            send = stack.enter_context(patch.object(email_module, "send_and_index_email"))
+            email_module._send_combined_property_email(
+                "uid-1", {"Authorization": "Bearer t"}, self.RECIPIENT, self._items(docs),
+            )
+
+        send.assert_not_called()
+        finalize.assert_not_called()
+        self.assertEqual(dead_letter.call_count, 3)
+        for call in dead_letter.call_args_list:
+            self.assertIn("paused/stopped", call.args[3])
+
+    def test_one_paused_client_blocks_the_entire_mixed_client_combined_group(self):
+        docs = self._same_broker_docs(send_mode="combined", count=3)
+        docs[1]._data["clientId"] = "paused-client"
+        operation_states = []
+
+        def client_pause(_uid, client_id):
+            if client_id == "paused-client":
+                return True, "operator_paused", {"status": "paused"}
+            return False, "", {"status": "active"}
+
+        with ExitStack() as stack:
+            finalize, dead_letter = self._combined_patches(
+                stack,
+                use_real_client_pause=True,
+            )
+            stack.enter_context(patch.object(
+                email_module,
+                "get_client_automation_pause",
+                side_effect=client_pause,
+            ))
+            send = stack.enter_context(patch.object(email_module, "send_and_index_email"))
+            email_module._send_combined_property_email(
+                "uid-1",
+                {"Authorization": "Bearer t"},
+                self.RECIPIENT,
+                self._items(docs),
+                operation_states=operation_states,
+            )
+
+        send.assert_not_called()
+        finalize.assert_not_called()
+        self.assertEqual(
+            dead_letter.call_count,
+            3,
+            "one paused campaign must block every row sharing the combined body",
+        )
+        self.assertEqual(len(operation_states), 3)
+        self.assertTrue(all(state["status"] == "error" for state in operation_states))
+
+    def test_campaign_state_read_failure_blocks_and_dead_letters_entire_combined_group(self):
+        docs = self._same_broker_docs(send_mode="combined", count=3)
+        operation_states = []
+
+        with ExitStack() as stack:
+            finalize, dead_letter = self._combined_patches(
+                stack,
+                use_real_client_pause=True,
+            )
+            stack.enter_context(patch.object(
+                email_module,
+                "get_client_automation_pause",
+                side_effect=CampaignStateUnavailableError("Firestore 503"),
+            ))
+            send = stack.enter_context(patch.object(email_module, "send_and_index_email"))
+            email_module._send_combined_property_email(
+                "uid-1", {"Authorization": "Bearer t"}, self.RECIPIENT, self._items(docs),
+                operation_states=operation_states,
+            )
+
+        send.assert_not_called()
+        finalize.assert_not_called()
+        self.assertEqual(dead_letter.call_count, 3)
+        for call in dead_letter.call_args_list:
+            self.assertIn("Could not verify campaign automation state", call.args[3])
+            self.assertIn("manual review required", call.args[3])
+        self.assertEqual(len(operation_states), 3)
+        self.assertEqual(
+            [(state["operationPath"], state["clientId"], state["rowNumber"]) for state in operation_states],
+            [("combined", "client-1", 3), ("combined", "client-1", 4), ("combined", "client-1", 5)],
+        )
 
     def test_combined_send_failure_bumps_all_rows_atomically(self):
         docs = self._same_broker_docs(send_mode="combined", count=3)

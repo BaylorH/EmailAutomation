@@ -35,7 +35,7 @@ from .results_feature_gate import (
     is_tour_invite_outbox,
     should_pause_results_outbox_for_user,
 )
-from .campaign_safety import get_client_automation_pause
+from .campaign_safety import CampaignStateUnavailableError, get_client_automation_pause
 from .outbound_safety import validate_outbound_body
 
 logger = logging.getLogger(__name__)
@@ -437,6 +437,13 @@ def _pause_client_outbox_item_if_needed(user_id: str, doc_ref, data: dict) -> bo
         f"Client automation is paused/stopped; manual review required before sending: {reason}",
     )
     return True
+
+
+def _campaign_state_unavailable_reason(error: Exception) -> str:
+    return (
+        "Could not verify campaign automation state; manual review required "
+        f"before sending: {str(error)[:1000]}"
+    )
 
 
 def _is_campaign_launch_outbox(data: dict) -> bool:
@@ -2704,6 +2711,9 @@ def _outbox_send_operation_state(
     doc_id: Optional[str] = None,
     recipient: Optional[str] = None,
     error: Optional[Any] = None,
+    operation_path: Optional[str] = None,
+    client_id: Optional[str] = None,
+    row_number: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Build a Graph operation-state for an outbox send outcome (GO-condition #3).
 
@@ -2717,6 +2727,12 @@ def _outbox_send_operation_state(
         state["recipient"] = recipient
     if error is not None:
         state["error"] = str(error)[:1500]
+    if operation_path:
+        state["operationPath"] = operation_path
+    if client_id:
+        state["clientId"] = client_id
+    if row_number is not None:
+        state["rowNumber"] = row_number
     return state
 
 
@@ -3046,8 +3062,26 @@ def _send_multi_property_email(
         attempts = int(data.get("attempts") or 0)
         row_number = data.get("rowNumber") or prop.get('rowNumber')
 
-        if _pause_client_outbox_item_if_needed(user_id, item['doc'].reference, data):
-            print(f"   ⏸️ Moved outbox item for paused/stopped client {clientId or 'n/a'} to dead letter")
+        try:
+            if _pause_client_outbox_item_if_needed(user_id, item['doc'].reference, data):
+                print(f"   ⏸️ Moved outbox item for paused/stopped client {clientId or 'n/a'} to dead letter")
+                continue
+        except CampaignStateUnavailableError as error:
+            reason = _campaign_state_unavailable_reason(error)
+            _move_to_dead_letter(user_id, item['doc'].reference, data, reason)
+            _record_operation_state(
+                operation_states,
+                _outbox_send_operation_state(
+                    "error",
+                    doc_id=item['doc'].id,
+                    recipient=recipient_email,
+                    error=reason,
+                    operation_path="separate",
+                    client_id=clientId,
+                    row_number=row_number,
+                ),
+            )
+            print(f"   🛑 {reason}")
             continue
 
         if _dead_letter_campaign_recipient_row_mismatch_if_needed(
@@ -3336,11 +3370,11 @@ def _send_combined_property_email(
         print(f"🗑️ Deleted {len(items)} outbox items (recipient opted out)")
         return
 
-    # Build the claimed working set: skip cancelled items, claim each (so no other
-    # worker double-processes a row), drop duplicates. Everything that survives
-    # here is part of the single send.
+    # Build the claimed working set first. Campaign-state verification is a
+    # second phase so one unreadable row blocks the entire operator-approved
+    # combined message instead of allowing a partial send.
     recipient_guard_sheet_cache: Dict[str, Any] = {}
-    claimed = []
+    claimed_candidates = []
     for item in items:
         ref = item['doc'].reference
         data = item['data']
@@ -3363,10 +3397,89 @@ def _send_combined_property_email(
 
         clientId = (data.get("clientId") or "").strip()
         row_number = data.get("rowNumber")
+        claimed_candidates.append({
+            "item": item,
+            "ref": ref,
+            "data": data,
+            "clientId": clientId,
+            "rowNumber": row_number,
+            "attempts": int(data.get("attempts") or 0),
+        })
 
-        if _pause_client_outbox_item_if_needed(user_id, ref, data):
-            print(f"   ⏸️ Moved combined outbox item for paused/stopped client {clientId or 'n/a'} to dead letter")
-            continue
+    state_verified = []
+    for index, candidate in enumerate(claimed_candidates):
+        try:
+            if _pause_client_outbox_item_if_needed(
+                user_id,
+                candidate["ref"],
+                candidate["data"],
+            ):
+                reason = (
+                    "Combined email includes a paused/stopped campaign; "
+                    "manual review required before sending the group"
+                )
+                print(
+                    "   ⏸️ Moved combined outbox item for paused/stopped client "
+                    f"{candidate['clientId'] or 'n/a'} to dead letter"
+                )
+                # The shared script can mention every property, including this
+                # paused one. Sending a reduced subset would still leak the
+                # paused property's content, so block the complete atomic group.
+                for blocked in state_verified + claimed_candidates[index + 1:]:
+                    _move_to_dead_letter(
+                        user_id,
+                        blocked["ref"],
+                        blocked["data"],
+                        reason,
+                    )
+                for blocked in state_verified + claimed_candidates[index:]:
+                    _record_operation_state(
+                        operation_states,
+                        _outbox_send_operation_state(
+                            "error",
+                            doc_id=blocked["item"]['doc'].id,
+                            recipient=recipient_email,
+                            error=reason,
+                            operation_path="combined",
+                            client_id=blocked["clientId"],
+                            row_number=blocked["rowNumber"],
+                        ),
+                    )
+                print("   🛑 Paused/stopped campaign blocked the entire combined group")
+                return
+        except CampaignStateUnavailableError as error:
+            reason = _campaign_state_unavailable_reason(error)
+            for blocked in state_verified + claimed_candidates[index:]:
+                _move_to_dead_letter(
+                    user_id,
+                    blocked["ref"],
+                    blocked["data"],
+                    reason,
+                )
+            for blocked in state_verified + claimed_candidates[index:]:
+                _record_operation_state(
+                    operation_states,
+                    _outbox_send_operation_state(
+                        "error",
+                        doc_id=blocked["item"]['doc'].id,
+                        recipient=recipient_email,
+                        error=reason,
+                        operation_path="combined",
+                        client_id=blocked["clientId"],
+                        row_number=blocked["rowNumber"],
+                    ),
+                )
+            print(f"   🛑 {reason}; blocked the entire combined group")
+            return
+        state_verified.append(candidate)
+
+    claimed = []
+    for candidate in state_verified:
+        item = candidate["item"]
+        ref = candidate["ref"]
+        data = candidate["data"]
+        clientId = candidate["clientId"]
+        row_number = candidate["rowNumber"]
 
         if _dead_letter_campaign_recipient_row_mismatch_if_needed(
             user_id,
@@ -3396,14 +3509,9 @@ def _send_combined_property_email(
             continue
 
         claimed.append({
-            "item": item,
-            "ref": ref,
-            "data": data,
-            "clientId": clientId,
-            "rowNumber": row_number,
+            **candidate,
             "subject": subject,
             "property_address": property_address,
-            "attempts": int(data.get("attempts") or 0),
         })
 
     if not claimed:
@@ -3661,8 +3769,25 @@ def _send_single_outbox_item(
 
     emails = data.get("assignedEmails") or []
     clientId = (data.get("clientId") or "").strip()
-    if _pause_client_outbox_item_if_needed(user_id, d.reference, data):
-        print(f"   ⏸️ Moved outbox item {d.id} for paused/stopped client {clientId or 'n/a'} to dead letter")
+    try:
+        if _pause_client_outbox_item_if_needed(user_id, d.reference, data):
+            print(f"   ⏸️ Moved outbox item {d.id} for paused/stopped client {clientId or 'n/a'} to dead letter")
+            return
+    except CampaignStateUnavailableError as error:
+        reason = _campaign_state_unavailable_reason(error)
+        _move_to_dead_letter(user_id, d.reference, data, reason)
+        _record_operation_state(
+            operation_states,
+            _outbox_send_operation_state(
+                "error",
+                doc_id=d.id,
+                error=reason,
+                operation_path="single",
+                client_id=clientId,
+                row_number=data.get("rowNumber"),
+            ),
+        )
+        print(f"   🛑 {reason}")
         return
 
     attempts = int(data.get("attempts") or 0)

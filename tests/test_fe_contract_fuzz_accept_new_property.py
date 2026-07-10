@@ -82,6 +82,8 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
         self.insert_row = MagicMock(return_value=7)  # THE state-changing call
         self.apply_proposal = MagicMock(return_value={"applied": []})  # AI write
         self.propose = MagicMock(return_value={"updates": []})
+        self.read_single_row = MagicMock(return_value=[])
+        self.should_block_openai = MagicMock(return_value=False)
         self.append_links = MagicMock()
 
         # Firestore double. The hardened handler now loads the notification
@@ -91,9 +93,7 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
         # path to the same doc, which exists and is anchored to the default
         # valid sheetId ("sheet-abc") so the happy-path payload passes the
         # ownership guard. (uid-mismatch tests reject before this read.)
-        notif_doc = MagicMock()
-        notif_doc.exists = True
-        notif_doc.to_dict.return_value = {
+        self.notif_data = {
             "kind": "action_needed",
             "meta": {"status": "pending_approval", "sheetId": "sheet-abc",
                      "address": "123 Main St"},
@@ -103,7 +103,21 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
         self.fake_fs = MagicMock()
         self.fake_fs.collection.return_value = self.fake_fs
         self.fake_fs.document.return_value = self.fake_fs
-        self.fake_fs.get.return_value = notif_doc
+
+        def get_snapshot():
+            snapshot = MagicMock()
+            snapshot.exists = True
+            snapshot.to_dict.return_value = dict(self.notif_data)
+            return snapshot
+
+        def merge_notification(payload, merge=False):
+            if merge:
+                self.notif_data.update(payload)
+            else:
+                self.notif_data = dict(payload)
+
+        self.fake_fs.get.side_effect = get_snapshot
+        self.fake_fs.set.side_effect = merge_notification
 
         # Identity now comes from a verified Firebase ID token; the valid payload
         # uid ("user-1") is the token uid, and every request carries a bearer.
@@ -122,12 +136,10 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
             patch("email_automation.sheets._read_header_row2", MagicMock(return_value=["address", "city", "email"])),
             patch("email_automation.sheets.format_sheet_columns_autosize_with_exceptions", MagicMock()),
             patch("email_automation.sheets.append_links_to_flyer_link_column", self.append_links),
-            # _read_row does not actually exist in email_automation.sheets; the
-            # handler imports it inside the pdfManifest branch (latent ImportError,
-            # swallowed by try/except). create=True so the faked AI path is testable.
-            patch("email_automation.sheets._read_row", MagicMock(return_value=[]), create=True),
+            patch("email_automation.sheet_operations._read_single_row", self.read_single_row),
             patch("email_automation.ai_processing.propose_sheet_updates", self.propose),
             patch("email_automation.ai_processing.apply_proposal_to_sheet", self.apply_proposal),
+            patch.object(appmod, "should_block_openai_call", self.should_block_openai),
             patch("email_automation.column_config.get_default_column_config", MagicMock(return_value={})),
         ]
         for p in self._patchers:
@@ -208,7 +220,23 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
         self.assertTrue(resp.get_json().get("success"))
         self.assertTrue(self.insert_row.called)
+        self.read_single_row.assert_called_once()
+        self.propose.assert_called_once()
         self.assert_no_send_to_disallowed("happy_pdf")
+
+    def test_budget_deferral_is_retryable_and_does_not_write_a_sheet_row(self):
+        self.should_block_openai.return_value = True
+        pd = valid_property_data(pdfManifest=[{"text": "some pdf text"}])
+
+        resp = self._post(valid_payload(propertyData=pd))
+
+        self.assertEqual(resp.status_code, 503, resp.get_data(as_text=True))
+        body = resp.get_json()
+        self.assertFalse(body.get("success"))
+        self.assertTrue(body.get("retryable"))
+        self.assertEqual(body.get("code"), "openai_budget_deferred")
+        self.insert_row.assert_not_called()
+        self.propose.assert_not_called()
 
     # ========================================================================
     # REQUIRED-FIELD MUTATIONS (expected robust -> 400)
@@ -359,10 +387,32 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
         self.assertEqual(r1.status_code, 200)
         self.assertEqual(r2.status_code, 200)
         self.assert_no_send_to_disallowed("duplicate")
-        # Documented observation: handler has no idempotency guard (no dedup on
-        # notificationId), so a double submit writes the row twice. Not a send,
-        # so recorded as a low-severity note rather than a hard failure here.
-        self.assertEqual(self.insert_row.call_count, 2)
+        self.assertEqual(
+            self.insert_row.call_count,
+            1,
+            "replaying the same notification must reuse its accepted row",
+        )
+
+    def test_post_insert_budget_deferral_retry_reuses_the_inserted_row(self):
+        self.propose.side_effect = [
+            appmod.BudgetDeferredError("budget reached after row insert"),
+            {"updates": []},
+        ]
+        pd = valid_property_data(pdfManifest=[{"text": "some pdf text"}])
+        payload = valid_payload(propertyData=pd)
+
+        first = self._post(payload)
+        second = self._post(payload)
+
+        self.assertEqual(first.status_code, 503, first.get_data(as_text=True))
+        self.assertTrue(first.get_json().get("retryable"))
+        self.assertEqual(second.status_code, 200, second.get_data(as_text=True))
+        self.assertEqual(
+            self.insert_row.call_count,
+            1,
+            "a retry after post-insert AI deferral must not add a second row",
+        )
+        self.assertEqual(second.get_json().get("rowNumber"), 7)
 
     # ========================================================================
     # UNEXPECTED EXTRA FIELDS

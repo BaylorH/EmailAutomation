@@ -101,6 +101,15 @@ class _RoutingDoc:
         # users/{uid} or anything else -> not found (safe default)
         return _doc(False, None)
 
+    def set(self, data, merge=False):
+        segs = [s[0] for s in self._path]
+        ids = [s[1] for s in self._path]
+        if segs != ["users", "clients", "notifications"]:
+            raise AssertionError(f"unexpected Firestore write path: {segs}")
+        key = (ids[0], ids[1], ids[2])
+        current = self._root._notifications.get(key, {}) if merge else {}
+        self._root._notifications[key] = {**current, **data}
+
 
 class AcceptNewPropertyAuthz(unittest.TestCase):
     def setUp(self):

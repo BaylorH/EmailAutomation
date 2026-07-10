@@ -492,12 +492,12 @@
     },
     {
       "id": "admin.usage_readonly",
-      "name": "Admin usage and spend readback",
+      "name": "Admin usage, spend readback, and budget guard",
       "lane": "production_v1_admin",
       "releaseStatus": "prod_guarded",
       "normalUserAccess": false,
       "ownerModules": {
-        "backend": ["email_automation/openai_usage.py"],
+        "backend": ["email_automation/openai_usage.py", "email_automation/budget_guard.py"],
         "frontend": ["src/components/UsagePage.jsx"],
         "functions": ["functions/index.js"],
         "firestoreRules": ["firestore.rules"]
@@ -507,7 +507,7 @@
       "dataWrites": [],
       "promptContracts": ["usage_readonly_admin"],
       "uiSurfaces": ["Usage admin page", "Spend charts"],
-      "testFixtures": ["admin_usage_baylor_jill_only", "normal_user_usage_denied"],
+      "testFixtures": ["admin_usage_baylor_jill_only", "normal_user_usage_denied", "openai_budget_guard_fail_open"],
       "manualScreenshotRubrics": ["usage_page_admin_only", "monthly_cost_by_user_visible"],
       "codeRabbitChecks": ["Admin entitlement", "Privacy boundary"],
       "adversarialRubrics": ["entitlement_bypass"],

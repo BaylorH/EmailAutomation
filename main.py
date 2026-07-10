@@ -235,6 +235,10 @@ def refresh_and_process_user(user_id: str):
             with open(TOKEN_CACHE, "w") as f:
                 f.write(cache.serialize())
             upload_token(FIREBASE_API_KEY, input_file=TOKEN_CACHE, user_id=user_id)
+            # MSAL does NOT clear has_state_changed on serialize(); reset it here so
+            # the inline persist (end of this fn) and the atexit backstop don't
+            # double-upload the same rotation.
+            cache.has_state_changed = False
             print(f"✅ Token cache uploaded for {user_id}")
 
     atexit.unregister(_save_cache)
@@ -404,6 +408,21 @@ def refresh_and_process_user(user_id: str):
         token_state=latest_token_state,
         graph_state=_combine_graph_operation_states(graph_operation_states),
     )
+
+    # Persist a mid-run token refresh (new access token / ROTATED refresh token)
+    # INLINE on the success path. atexit handlers do NOT run when a Cloud Run
+    # worker is SIGKILLed / OOM-killed / timed-out, so relying on the atexit
+    # backstop alone can silently drop a rotated refresh token and force re-auth
+    # on the next run. _save_cache() no-ops when has_state_changed is False, so an
+    # unchanged run adds no Storage PUT. Best-effort: a persist failure must not
+    # fail the user's run — the atexit registration above remains the backstop.
+    try:
+        _save_cache()
+    except Exception as e:
+        print(
+            f"⚠️ Inline token cache persist failed for {user_id} "
+            f"(atexit backstop still applies): {e}"
+        )
 
 
 def run_all_users():

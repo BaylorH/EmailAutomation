@@ -143,6 +143,15 @@ class TriggerSchedulerFuzz(unittest.TestCase):
         self.addCleanup(self._p_verify.stop)
         self.AUTH = {"Authorization": "Bearer testtoken"}
 
+        self._p_scope_env = patch.dict(os.environ, {
+            "SITESIFT_DEV_SCOPED_SCHEDULER": "1",
+            "SITESIFT_SCHEDULER_TARGET_USER_IDS": "u1",
+            "SITESIFT_SCHEDULER_ALLOWED_USER_IDS": "u1",
+        })
+        self._p_scope_env.start()
+        self.addCleanup(self._p_scope_env.stop)
+        self.list_users_mock.return_value = ["u1"]
+
         self.addCleanup(self._restore_available)
 
     def _restore_available(self):
@@ -215,6 +224,34 @@ class TriggerSchedulerFuzz(unittest.TestCase):
         self._assert_robust(resp, "no-body")
         self.assertIn(resp.status_code, (200, 400, 415))
         self._assert_no_disallowed_send() if resp.status_code != 200 else None
+
+    def test_all_user_scope_is_rejected_by_the_manual_http_trigger(self):
+        with patch.dict(os.environ, {
+            "SITESIFT_DEV_SCOPED_SCHEDULER": "0",
+            "SITESIFT_SCHEDULER_ALLOW_ALL_USERS": "1",
+        }):
+            resp = self.client.post(
+                "/api/trigger-scheduler",
+                data="",
+                content_type="application/json",
+                headers=self.AUTH,
+            )
+
+        self.assertEqual(resp.status_code, 403, resp.get_data(as_text=True))
+        self.run_scheduler_mock.assert_not_called()
+
+    def test_authenticated_caller_must_match_the_dev_scoped_target(self):
+        self.verify_mock.return_value = {"uid": "different-user"}
+
+        resp = self.client.post(
+            "/api/trigger-scheduler",
+            data="",
+            content_type="application/json",
+            headers=self.AUTH,
+        )
+
+        self.assertEqual(resp.status_code, 403, resp.get_data(as_text=True))
+        self.run_scheduler_mock.assert_not_called()
 
     # ------------------------------------------------------- correct guard paths
     def test_already_running_returns_409(self):
@@ -372,6 +409,49 @@ class TriggerSchedulerFuzz(unittest.TestCase):
             "rapid/concurrent requests each spawn a full scheduler run "
             "(duplicate sends)." % (statuses,),
         )
+
+
+class RunSchedulerScopeTests(unittest.TestCase):
+    RUNTIME_SCOPE_KEYS = (
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "CLOUD_RUN_JOB",
+        "CLOUD_RUN_EXECUTION",
+        "K_SERVICE",
+        "K_REVISION",
+        "SITESIFT_SCHEDULER_ALLOW_ALL_USERS",
+    )
+
+    def test_run_scheduler_processes_only_the_explicit_dev_target(self):
+        with patch.dict(os.environ, {
+            "SITESIFT_DEV_SCOPED_SCHEDULER": "1",
+            "SITESIFT_SCHEDULER_TARGET_USER_IDS": "u1",
+            "SITESIFT_SCHEDULER_ALLOWED_USER_IDS": "u1",
+        }):
+            for key in self.RUNTIME_SCOPE_KEYS:
+                os.environ.pop(key, None)
+            with patch.object(appmod, "SCHEDULER_AVAILABLE", True), \
+                 patch.object(appmod, "list_user_ids", return_value=["u1", "u2"]), \
+                 patch.object(appmod, "refresh_and_process_user", return_value={"success": True}) as refresh:
+                result = appmod.run_scheduler()
+
+        self.assertTrue(result.get("success"), result)
+        refresh.assert_called_once_with("u1")
+
+    def test_run_scheduler_fails_closed_in_an_unrecognized_runtime(self):
+        with patch.dict(os.environ, {
+            "SITESIFT_DEV_SCOPED_SCHEDULER": "0",
+        }):
+            for key in self.RUNTIME_SCOPE_KEYS:
+                os.environ.pop(key, None)
+            with patch.object(appmod, "SCHEDULER_AVAILABLE", True), \
+                 patch.object(appmod, "list_user_ids", return_value=["u1", "u2"]), \
+                 patch.object(appmod, "refresh_and_process_user", return_value={"success": True}) as refresh:
+                result = appmod.run_scheduler()
+
+        self.assertFalse(result.get("success"), result)
+        self.assertIn("scope", result.get("error", "").lower())
+        refresh.assert_not_called()
 
 
 if __name__ == "__main__":
