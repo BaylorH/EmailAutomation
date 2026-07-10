@@ -1642,14 +1642,23 @@ def _augment_proposal_with_deterministic_extractions(
     # can carry stale pricing superseded by the email body.
     evidence_texts = [fresh_text] + [t for t in (extra_texts or []) if t]
 
-    def _fill(col_name: Optional[str], value: Optional[str], reason: str) -> None:
+    def _fill(
+        col_name: Optional[str],
+        value: Optional[str],
+        reason: str,
+        *,
+        overwrite_existing_row: bool = False,
+    ) -> None:
         # Resolve to the canonical sheet header spelling (#15 wrote canonical names;
         # #19's mapping values may be lowercase, e.g. "total sf" vs header "Total SF").
         canonical = _find_header_name(header, col_name) if col_name else None
         if not value or not canonical:
             return
         col_name = canonical
-        if (_row_value_for_column(rowvals, header, col_name) or "").strip():
+        if (
+            not overwrite_existing_row
+            and (_row_value_for_column(rowvals, header, col_name) or "").strip()
+        ):
             return
         update = {"column": col_name, "value": value, "confidence": 0.92, "reason": reason}
         existing = _proposal_update_for_column(proposal, col_name)
@@ -1701,24 +1710,61 @@ def _augment_proposal_with_deterministic_extractions(
     )
     fresh_drive_ins = _extract_drive_in_count_from_text(fresh_text)
     fresh_docks = _extract_dock_count_from_text(fresh_text)
+    fresh_mentions_drive_ins = bool(re.search(_DRIVE_IN_KW, fresh_text, re.IGNORECASE))
+    fresh_mentions_docks = bool(re.search(_DOCK_KW, fresh_text, re.IGNORECASE))
     _fill(
         drive_ins_col,
         fresh_drive_ins,
         "Deterministic fallback parsed drive-in count from the broker's message.",
+        overwrite_existing_row=True,
     )
     _fill(
         docks_col,
         fresh_docks,
         "Deterministic fallback parsed loading-dock count from the broker's message.",
+        overwrite_existing_row=True,
     )
+
+    # If the fresh message discusses a loading feature but does not state a
+    # parseable count, an attachment must not silently supply (or preserve) a
+    # potentially stale number for that field. Keep the result conservative and
+    # let the model/request-for-clarification handle the broker's latest wording.
+    def _drop_attachment_count_when_fresh_is_ambiguous(
+        col_name: Optional[str],
+        extractor,
+    ) -> None:
+        existing = _proposal_update_for_column(proposal, col_name)
+        if not existing:
+            return
+        attachment_values = set()
+        for text in evidence_texts[1:]:
+            value = extractor(text)
+            if value is not None:
+                attachment_values.add(value)
+        if str(existing.get("value") or "").strip() in attachment_values:
+            proposal["updates"] = [
+                update for update in (proposal.get("updates") or []) if update is not existing
+            ]
+
+    if fresh_mentions_drive_ins and fresh_drive_ins is None:
+        _drop_attachment_count_when_fresh_is_ambiguous(
+            drive_ins_col,
+            _extract_drive_in_count_from_text,
+        )
+    if fresh_mentions_docks and fresh_docks is None:
+        _drop_attachment_count_when_fresh_is_ambiguous(
+            docks_col,
+            _extract_dock_count_from_text,
+        )
+
     for text in evidence_texts[1:]:
-        if not fresh_drive_ins:
+        if not fresh_mentions_drive_ins:
             _fill(
                 drive_ins_col,
                 _extract_drive_in_count_from_text(text),
                 "Deterministic fallback parsed drive-in count from the broker's flyer.",
             )
-        if not fresh_docks:
+        if not fresh_mentions_docks:
             _fill(
                 docks_col,
                 _extract_dock_count_from_text(text),
@@ -1787,15 +1833,21 @@ _WORD_TO_NUMBER = {
 # "<count> drive-in(s)/grade-level (ramp|door)s" — count immediately precedes the
 # keyword so unrelated numbers ("suite 3, drive-in access") never bind.
 _DRIVE_IN_COUNT_RE = re.compile(
-    r"\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
+    r"(?:\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
     r"(?:drive[-\s]?ins?|grade[-\s]?level)\b"
-    r"(?:\s*(?:ramps?|doors?))?",
+    r"(?:\s*(?:ramps?|doors?))?"
+    r"|\b(?:drive[-\s]?ins?|grade[-\s]?level)\b"
+    r"(?:\s*(?:ramps?|doors?))?\s*(?::|=|-|count\s*(?:is|of)?|total\s*(?:is|of)?)\s*"
+    r"(\d{1,3}|" + _WORD_NUMBER_RE + r"))",
     re.IGNORECASE,
 )
 # "<count> (dock-high|loading) dock(s)/door(s)" variants.
 _DOCK_COUNT_RE = re.compile(
-    r"\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
-    r"(?:dock[-\s]?high\s+doors?|loading\s+docks?|docks?\b(?:\s*doors?)?|dock\s+doors?)",
+    r"(?:\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
+    r"(?:dock[-\s]?high\s+doors?|loading\s+docks?|docks?\b(?:\s*doors?)?|dock\s+doors?)"
+    r"|\b(?:dock[-\s]?high\s+doors?|loading\s+docks?|docks?\b(?:\s*doors?)?|dock\s+doors?)"
+    r"\s*(?::|=|-|count\s*(?:is|of)?|total\s*(?:is|of)?)\s*"
+    r"(\d{1,3}|" + _WORD_NUMBER_RE + r"))",
     re.IGNORECASE,
 )
 
@@ -1872,7 +1924,7 @@ def _parse_feature_count(raw: str) -> Optional[str]:
         value = int(raw)
     else:
         value = _WORD_TO_NUMBER.get(raw, 0)
-    return str(value) if 1 <= value <= 200 else None
+    return str(value) if 0 <= value <= 200 else None
 
 
 def _extract_drive_in_count_from_text(text: str) -> Optional[str]:
@@ -1880,7 +1932,7 @@ def _extract_drive_in_count_from_text(text: str) -> Optional[str]:
     if not text:
         return None
     m = _DRIVE_IN_COUNT_RE.search(text)
-    return _parse_feature_count(m.group(1)) if m else None
+    return _parse_feature_count(m.group(1) or m.group(2)) if m else None
 
 
 def _extract_dock_count_from_text(text: str) -> Optional[str]:
@@ -1888,7 +1940,7 @@ def _extract_dock_count_from_text(text: str) -> Optional[str]:
     if not text:
         return None
     m = _DOCK_COUNT_RE.search(text)
-    return _parse_feature_count(m.group(1)) if m else None
+    return _parse_feature_count(m.group(1) or m.group(2)) if m else None
 
 
 def _suppress_updates_on_contact_optout(proposal: dict) -> dict:
@@ -2789,7 +2841,8 @@ def propose_sheet_updates(uid: str,
 
         DOC_SELECTION_RULES = """
 DOCUMENT SELECTION & EXTRACTION (strict):
-- Trust ATTACHMENTS (PDFs) over the email body when numbers conflict.
+- Trust the LAST HUMAN message over attachments when values conflict. Use attachments only to fill fields the
+  LAST HUMAN message does not address; attachments may contain older marketing data superseded by the broker.
 - Extract values ONLY for the TARGET PROPERTY. If a PDF shows multiple buildings/addresses, use the page/section
   that explicitly matches the TARGET PROPERTY (address/city). If no exact match, do not use that PDF for updates.
 - If an attachment clearly refers to a different address, ignore it unless the LAST HUMAN message explicitly proposes

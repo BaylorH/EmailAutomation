@@ -8,6 +8,7 @@ Break IDs map to the live-testing report:
   R13/X03/R05/R09/R04/S03/D07 — extraction; E_*/F_*/H_* — quoted-history events;
   B20/L21/M22 — link surfacing + prompt truncation.
 """
+import inspect
 import os
 import sys
 import unittest
@@ -183,6 +184,105 @@ class RentOpexSfExtractionTests(unittest.TestCase):
         self.assertEqual(
             a._proposal_update_for_column(out, "Drive Ins")["value"],
             "1",
+        )
+
+    def test_fresh_zero_drive_ins_outranks_conflicting_flyer_text(self):
+        header, cfg = self._night_hdr_cfg()
+        proposal = {"updates": [], "events": []}
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["570 W Cheyenne Ave", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("There are 4 dock-high doors and 0 drive-in doors."),
+            extra_texts=["The flyer lists 1 dock and 13 drive-ins."],
+        )
+
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Loading Docks")["value"],
+            "4",
+        )
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Drive Ins")["value"],
+            "0",
+        )
+
+    def test_label_first_fresh_counts_outrank_conflicting_flyer_text(self):
+        header, cfg = self._night_hdr_cfg()
+        proposal = {"updates": [], "events": []}
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["570 W Cheyenne Ave", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("Dock-high doors: 4; drive-in doors: 1."),
+            extra_texts=["The flyer lists 1 dock and 13 drive-ins."],
+        )
+
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Loading Docks")["value"],
+            "4",
+        )
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Drive Ins")["value"],
+            "1",
+        )
+
+    def test_fresh_counts_correct_nonblank_sheet_and_conflicting_proposal(self):
+        header, cfg = self._night_hdr_cfg()
+        proposal = {
+            "updates": [
+                {"column": "Loading Docks", "value": "1", "reason": "flyer"},
+                {"column": "Drive Ins", "value": "13", "reason": "flyer"},
+            ],
+            "events": [],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["570 W Cheyenne Ave", "", "", "", "2", "2"],
+            header,
+            cfg,
+            _conv("It has 4 dock-high doors and 1 drive-in door."),
+            extra_texts=["The flyer lists 1 dock and 13 drive-ins."],
+        )
+
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Loading Docks")["value"],
+            "4",
+        )
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Drive Ins")["value"],
+            "1",
+        )
+
+    def test_fresh_feature_mention_blocks_flyer_fallback_when_parser_is_unsure(self):
+        header, cfg = self._night_hdr_cfg()
+        proposal = {
+            "updates": [
+                {"column": "Drive Ins", "value": "13", "reason": "PDF flyer"},
+            ],
+            "events": [],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["570 W Cheyenne Ave", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("Drive-in loading is limited; confirm the exact count with ownership."),
+            extra_texts=["The older flyer lists 13 drive-ins."],
+        )
+
+        self.assertIsNone(a._proposal_update_for_column(out, "Drive Ins"))
+
+    def test_document_selection_prompt_prefers_latest_human_message(self):
+        source = inspect.getsource(a.propose_sheet_updates)
+        self.assertNotIn(
+            "Trust ATTACHMENTS (PDFs) over the email body when numbers conflict.",
+            source,
+        )
+        self.assertIn(
+            "Trust the LAST HUMAN message over attachments when values conflict.",
+            source,
         )
 
     def test_augmenter_never_guesses_counts_without_numbers(self):
