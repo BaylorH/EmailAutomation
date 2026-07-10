@@ -1805,10 +1805,15 @@ _DOCK_KW = r"(?:dock|loading\s+dock)"
 
 
 # Spelled-out counts (broker text often says "two docks", not "2 docks").
-_WORD_NUMBER_RE = (
+_ONES_WORD_RE = r"(?:one|two|three|four|five|six|seven|eight|nine)"
+_SMALL_WORD_RE = (
     r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
-    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
-    r"thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)"
+)
+_TENS_WORD_RE = r"(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+_WORD_NUMBER_RE = (
+    r"(?:" + _TENS_WORD_RE + r"(?:[-\s]+" + _ONES_WORD_RE + r")?|"
+    + _SMALL_WORD_RE + r")"
 )
 # Digits OR spelled-out numbers; \b anchors so "twenty" matches but "twentyish" and
 # substrings inside larger words never do.
@@ -1846,38 +1851,34 @@ _WORD_TO_NUMBER = {
     "seventy": 70, "eighty": 80, "ninety": 90,
 }
 
-_ATTACHMENT_DELEGATION_RE = re.compile(
-    r"\b(?:see|refer\s+to|check|review|per)\b[^.?!\n]{0,80}"
-    r"\b(?:attached|attachment|flyer|brochure|pdf)\b"
-    r"|\b(?:attached|attachment|flyer|brochure|pdf)\b[^.?!\n]{0,80}"
-    r"\b(?:shows?|lists?|contains?|includes?|has|for)\b",
-    re.IGNORECASE,
+_ATTACHMENT_NOUN_RE = (
+    r"(?:attached\s+(?:flyer|brochure|pdf|document|file)|attachment|flyer|"
+    r"brochure|pdf|offering\s+memorandum|om)"
 )
 
 
 def _delegates_feature_count_to_attachment(text: str, keyword_re: str) -> bool:
-    """Whether the feature's sentence explicitly delegates its count to a document."""
+    """Whether the feature is explicitly tied to an attachment as its source."""
     if not text:
         return False
-    for feature in re.finditer(keyword_re, text, re.IGNORECASE):
-        sentence_start = max(
-            text.rfind(".", 0, feature.start()),
-            text.rfind("?", 0, feature.start()),
-            text.rfind("!", 0, feature.start()),
-            text.rfind("\n", 0, feature.start()),
-        ) + 1
-        sentence_ends = [
-            pos for pos in (
-                text.find(".", feature.end()),
-                text.find("?", feature.end()),
-                text.find("!", feature.end()),
-                text.find("\n", feature.end()),
-            ) if pos >= 0
-        ]
-        sentence_end = min(sentence_ends) if sentence_ends else len(text)
-        if _ATTACHMENT_DELEGATION_RE.search(text[sentence_start:sentence_end]):
-            return True
-    return False
+    # A colon followed by a line break commonly introduces the delegated fields:
+    # "See attached flyer:\nDocks and drive-in counts." Keep other line breaks
+    # as hard boundaries so unrelated nearby clauses cannot authorize a field.
+    normalized = re.sub(r":\s*\n\s*", ": ", text)
+    gap = r"[^;.!?\n]"
+    patterns = (
+        # "See the attached flyer for dock counts."
+        rf"\b(?:see|refer\s+to|check|review|per)\b{gap}{{0,100}}"
+        rf"\b{_ATTACHMENT_NOUN_RE}\b{gap}{{0,100}}{keyword_re}",
+        # "Dock counts are on page 2 of the brochure."
+        rf"{keyword_re}{gap}{{0,80}}\b(?:in|on|per|from)\b{gap}{{0,80}}"
+        rf"\b{_ATTACHMENT_NOUN_RE}\b",
+        # "The OM has dock counts."
+        rf"\b{_ATTACHMENT_NOUN_RE}\b{gap}{{0,80}}"
+        rf"\b(?:shows?|lists?|contains?|includes?|has|provides?)\b{gap}{{0,80}}"
+        rf"{keyword_re}",
+    )
+    return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in patterns)
 # "<count> drive-in(s)/grade-level (ramp|door)s" — count immediately precedes the
 # keyword so unrelated numbers ("suite 3, drive-in access") never bind.
 _DRIVE_IN_COUNT_RE = re.compile(
@@ -1967,11 +1968,17 @@ def _augment_proposal_opex_basis(
 
 
 def _parse_feature_count(raw: str) -> Optional[str]:
-    raw = (raw or "").strip().lower()
+    raw = re.sub(r"[-\s]+", " ", (raw or "").strip().lower())
     if raw.isdigit():
         value = int(raw)
     else:
-        value = _WORD_TO_NUMBER.get(raw)
+        parts = raw.split()
+        if len(parts) == 2:
+            tens = _WORD_TO_NUMBER.get(parts[0])
+            ones = _WORD_TO_NUMBER.get(parts[1])
+            value = tens + ones if tens in range(20, 100, 10) and ones in range(1, 10) else None
+        else:
+            value = _WORD_TO_NUMBER.get(raw)
         if value is None:
             return None
     return str(value) if 0 <= value <= 200 else None

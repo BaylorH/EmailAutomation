@@ -316,6 +316,77 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             "1",
         )
 
+    def test_attachment_delegation_is_specific_to_each_loading_field(self):
+        header, cfg = self._night_hdr_cfg()
+        out = a._augment_proposal_with_deterministic_extractions(
+            {"updates": [], "events": []},
+            ["570 W Cheyenne Ave", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("Drive-ins are limited; see attached flyer for dock counts."),
+            extra_texts=["Loading: 2 dock-high doors and 13 drive-ins."],
+        )
+
+        self.assertEqual(
+            a._proposal_update_for_column(out, "Loading Docks")["value"],
+            "2",
+        )
+        self.assertIsNone(a._proposal_update_for_column(out, "Drive Ins"))
+
+    def test_attachment_reference_for_photos_does_not_delegate_drive_in_count(self):
+        header, cfg = self._night_hdr_cfg()
+        out = a._augment_proposal_with_deterministic_extractions(
+            {"updates": [], "events": []},
+            ["570 W Cheyenne Ave", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("See attached flyer for photos; drive-in count is uncertain."),
+            extra_texts=["Loading: 13 drive-ins."],
+        )
+
+        self.assertIsNone(a._proposal_update_for_column(out, "Drive Ins"))
+
+    def test_compound_word_loading_counts_are_parsed_as_whole_numbers(self):
+        self.assertEqual(
+            a._extract_dock_count_from_text("There are twenty-four docks."),
+            "24",
+        )
+        self.assertEqual(
+            a._extract_drive_in_count_from_text("The site has thirty-two drive-ins."),
+            "32",
+        )
+        self.assertEqual(
+            a._extract_dock_count_from_text("It provides ninety nine dock doors."),
+            "99",
+        )
+
+    def test_common_attachment_delegation_phrasings_fill_loading_counts(self):
+        header, cfg = self._night_hdr_cfg()
+        cases = [
+            "The dock and drive-in counts are in the attached flyer.",
+            "See attached flyer:\nDocks and drive-in counts.",
+            "Dock and drive-in counts are on page 2 of the brochure.",
+            "The OM has dock and drive-in counts.",
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                out = a._augment_proposal_with_deterministic_extractions(
+                    {"updates": [], "events": []},
+                    ["570 W Cheyenne Ave", "", "", "", "", ""],
+                    header,
+                    cfg,
+                    _conv(body),
+                    extra_texts=["Loading: 2 dock-high doors and 1 drive-in ramp."],
+                )
+                self.assertEqual(
+                    a._proposal_update_for_column(out, "Loading Docks")["value"],
+                    "2",
+                )
+                self.assertEqual(
+                    a._proposal_update_for_column(out, "Drive Ins")["value"],
+                    "1",
+                )
+
     def test_augmenter_never_guesses_counts_without_numbers(self):
         header, cfg = self._night_hdr_cfg()
         proposal = {"updates": [], "events": []}
