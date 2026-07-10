@@ -1,34 +1,285 @@
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from google.cloud.firestore import SERVER_TIMESTAMP
 
 
+CAMPAIGN_AUTOMATION_ALLOW = "allow"
+CAMPAIGN_AUTOMATION_BLOCKED = "blocked"
+CAMPAIGN_AUTOMATION_UNKNOWN = "unknown"
+
 CLIENT_AUTOMATION_PAUSED_REASON = "client_automation_paused"
-CLIENT_TERMINAL_STATUSES = {"stopped", "archived", "deleted"}
+CLIENT_AUTOMATION_STATE_NOT_FOUND_REASON = "client_automation_state_not_found"
+CLIENT_AUTOMATION_STATE_READ_ERROR_REASON = "client_automation_state_read_error"
+CLIENT_AUTOMATION_STATE_MALFORMED_REASON = "client_automation_state_malformed"
+MISSING_CLIENT_ID_REASON = "missing_client_id"
+
+CLIENT_TERMINAL_STATUSES = {"stopped", "archived", "deleted", "completed"}
+CLIENT_ACTIVE_STATUSES = {"active", "live"}
+PAUSE_REASON_FIELDS = (
+    "automationPauseReason",
+    "statusReason",
+    "pauseReason",
+    "pausedReason",
+)
+
+
+@dataclass(frozen=True)
+class CampaignAutomationDecision:
+    """A fail-closed decision for work that would autonomously affect a campaign."""
+
+    state: str
+    reason: str
+    client_data: Dict[str, Any]
+    metadata: Dict[str, Any]
+
+    @property
+    def allows_autonomous_work(self) -> bool:
+        return self.state == CAMPAIGN_AUTOMATION_ALLOW
+
+    @property
+    def denies_autonomous_work(self) -> bool:
+        return not self.allows_autonomous_work
 
 
 def normalize_client_status(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
-def is_client_automation_paused(client_data: Optional[Dict[str, Any]]) -> bool:
-    """True when a campaign/client should not send, auto-reply, or schedule follow-ups."""
+def _pause_reason(client_data: Dict[str, Any], default: str) -> Tuple[str, Optional[str]]:
+    for field in PAUSE_REASON_FIELDS:
+        value = client_data.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip(), field
+    return default, None
+
+
+def _decision(
+    state: str,
+    reason: str,
+    client_data: Optional[Dict[str, Any]] = None,
+    *,
+    source: str = "",
+    stop_kind: str = "none",
+    terminal: bool = False,
+    reason_field: Optional[str] = None,
+) -> CampaignAutomationDecision:
+    return CampaignAutomationDecision(
+        state=state,
+        reason=reason,
+        client_data=dict(client_data or {}),
+        metadata={
+            "source": source,
+            "stopKind": stop_kind,
+            "terminal": terminal,
+            "reasonField": reason_field,
+        },
+    )
+
+
+def classify_client_automation_state(
+    client_data: Optional[Dict[str, Any]],
+    *,
+    source: str = "",
+) -> CampaignAutomationDecision:
+    """Classify a loaded client document without permitting ambiguous state.
+
+    The active client status is intentionally allow-listed. A status we do not
+    understand is not evidence that autonomous sends, replies, or follow-ups
+    are safe to perform.
+    """
     if not isinstance(client_data, dict):
-        return False
-    if client_data.get("automationPaused") is True or client_data.get("automation_paused") is True:
-        return True
-    return normalize_client_status(client_data.get("status")) in CLIENT_TERMINAL_STATUSES
+        return _decision(
+            CAMPAIGN_AUTOMATION_UNKNOWN,
+            CLIENT_AUTOMATION_STATE_MALFORMED_REASON,
+            source=source,
+        )
+
+    automation_paused = client_data.get("automationPaused")
+    legacy_automation_paused = client_data.get("automation_paused")
+    if automation_paused is not None and not isinstance(automation_paused, bool):
+        return _decision(
+            CAMPAIGN_AUTOMATION_UNKNOWN,
+            CLIENT_AUTOMATION_STATE_MALFORMED_REASON,
+            client_data,
+            source=source,
+        )
+    if legacy_automation_paused is not None and not isinstance(legacy_automation_paused, bool):
+        return _decision(
+            CAMPAIGN_AUTOMATION_UNKNOWN,
+            CLIENT_AUTOMATION_STATE_MALFORMED_REASON,
+            client_data,
+            source=source,
+        )
+    if (
+        automation_paused is not None
+        and legacy_automation_paused is not None
+        and automation_paused != legacy_automation_paused
+    ):
+        return _decision(
+            CAMPAIGN_AUTOMATION_UNKNOWN,
+            CLIENT_AUTOMATION_STATE_MALFORMED_REASON,
+            client_data,
+            source=source,
+        )
+
+    status_value = client_data.get("status")
+    if status_value is not None and (not isinstance(status_value, str) or not status_value.strip()):
+        return _decision(
+            CAMPAIGN_AUTOMATION_UNKNOWN,
+            CLIENT_AUTOMATION_STATE_MALFORMED_REASON,
+            client_data,
+            source=source,
+        )
+    status = normalize_client_status(status_value) if status_value is not None else ""
+
+    if source == "archivedClients":
+        reason, reason_field = _pause_reason(client_data, CLIENT_AUTOMATION_PAUSED_REASON)
+        return _decision(
+            CAMPAIGN_AUTOMATION_BLOCKED,
+            reason,
+            client_data,
+            source=source,
+            stop_kind="terminal_stop",
+            terminal=True,
+            reason_field=reason_field,
+        )
+
+    if status in CLIENT_TERMINAL_STATUSES:
+        reason, reason_field = _pause_reason(client_data, CLIENT_AUTOMATION_PAUSED_REASON)
+        return _decision(
+            CAMPAIGN_AUTOMATION_BLOCKED,
+            reason,
+            client_data,
+            source=source,
+            stop_kind="terminal_stop",
+            terminal=True,
+            reason_field=reason_field,
+        )
+
+    if automation_paused is True or legacy_automation_paused is True:
+        reason, reason_field = _pause_reason(client_data, CLIENT_AUTOMATION_PAUSED_REASON)
+        return _decision(
+            CAMPAIGN_AUTOMATION_BLOCKED,
+            reason,
+            client_data,
+            source=source,
+            stop_kind="maintenance_pause",
+            terminal=False,
+            reason_field=reason_field,
+        )
+
+    if status_value is None:
+        return _decision(
+            CAMPAIGN_AUTOMATION_UNKNOWN,
+            CLIENT_AUTOMATION_STATE_MALFORMED_REASON,
+            client_data,
+            source=source,
+        )
+
+    if status in CLIENT_ACTIVE_STATUSES:
+        return _decision(
+            CAMPAIGN_AUTOMATION_ALLOW,
+            "",
+            client_data,
+            source=source,
+        )
+
+    return _decision(
+        CAMPAIGN_AUTOMATION_UNKNOWN,
+        CLIENT_AUTOMATION_STATE_MALFORMED_REASON,
+        client_data,
+        source=source,
+    )
+
+
+def is_client_automation_paused(client_data: Optional[Dict[str, Any]]) -> bool:
+    """Legacy boolean adapter: deny automation for blocked and unknown state."""
+    return classify_client_automation_state(client_data).denies_autonomous_work
 
 
 def client_automation_pause_reason(client_data: Optional[Dict[str, Any]]) -> str:
     if not isinstance(client_data, dict):
         return CLIENT_AUTOMATION_PAUSED_REASON
+    return _pause_reason(client_data, CLIENT_AUTOMATION_PAUSED_REASON)[0]
+
+
+def _read_client_document(fs, user_id: str, collection_name: str, client_id: str):
     return (
-        client_data.get("automationPauseReason")
-        or client_data.get("statusReason")
-        or client_data.get("pauseReason")
-        or CLIENT_AUTOMATION_PAUSED_REASON
+        fs.collection("users")
+        .document(user_id)
+        .collection(collection_name)
+        .document(client_id)
+        .get()
     )
+
+
+def _log_campaign_state_warning(reason: str) -> None:
+    print(f"   ⚠️ Campaign automation state unavailable: {reason}")
+
+
+def get_client_automation_decision(
+    user_id: str,
+    client_id: Optional[str],
+    *,
+    firestore_client=None,
+) -> CampaignAutomationDecision:
+    """Read active then archived client state and fail closed when it is uncertain."""
+    if not isinstance(user_id, str) or not user_id.strip() or not isinstance(client_id, str) or not client_id.strip():
+        return _decision(CAMPAIGN_AUTOMATION_UNKNOWN, MISSING_CLIENT_ID_REASON)
+
+    client_id = client_id.strip()
+    try:
+        fs = firestore_client
+        if fs is None:
+            from .clients import _fs
+
+            fs = _fs
+    except Exception:
+        _log_campaign_state_warning(CLIENT_AUTOMATION_STATE_READ_ERROR_REASON)
+        return _decision(CAMPAIGN_AUTOMATION_UNKNOWN, CLIENT_AUTOMATION_STATE_READ_ERROR_REASON)
+
+    active_doc = None
+    archived_doc = None
+    active_read_failed = False
+    archived_read_failed = False
+    try:
+        active_doc = _read_client_document(fs, user_id, "clients", client_id)
+    except Exception:
+        active_read_failed = True
+
+    try:
+        archived_doc = _read_client_document(fs, user_id, "archivedClients", client_id)
+    except Exception:
+        archived_read_failed = True
+
+    if getattr(archived_doc, "exists", False):
+        try:
+            return classify_client_automation_state(archived_doc.to_dict(), source="archivedClients")
+        except Exception:
+            _log_campaign_state_warning(CLIENT_AUTOMATION_STATE_MALFORMED_REASON)
+            return _decision(
+                CAMPAIGN_AUTOMATION_UNKNOWN,
+                CLIENT_AUTOMATION_STATE_MALFORMED_REASON,
+                source="archivedClients",
+            )
+
+    if active_read_failed or archived_read_failed:
+        _log_campaign_state_warning(CLIENT_AUTOMATION_STATE_READ_ERROR_REASON)
+        return _decision(CAMPAIGN_AUTOMATION_UNKNOWN, CLIENT_AUTOMATION_STATE_READ_ERROR_REASON)
+
+    if getattr(active_doc, "exists", False):
+        try:
+            return classify_client_automation_state(active_doc.to_dict(), source="clients")
+        except Exception:
+            _log_campaign_state_warning(CLIENT_AUTOMATION_STATE_MALFORMED_REASON)
+            return _decision(
+                CAMPAIGN_AUTOMATION_UNKNOWN,
+                CLIENT_AUTOMATION_STATE_MALFORMED_REASON,
+                source="clients",
+            )
+
+    return _decision(CAMPAIGN_AUTOMATION_UNKNOWN, CLIENT_AUTOMATION_STATE_NOT_FOUND_REASON)
 
 
 def get_client_automation_pause(
@@ -37,35 +288,13 @@ def get_client_automation_pause(
     *,
     firestore_client=None,
 ) -> Tuple[bool, str, Dict[str, Any]]:
-    """Fetch client state and return whether automation should be stopped for it."""
-    if not user_id or not client_id:
-        return False, "", {}
-
-    fs = firestore_client
-    if fs is None:
-        from .clients import _fs
-
-        fs = _fs
-
-    try:
-        client_doc = (
-            fs.collection("users")
-            .document(user_id)
-            .collection("clients")
-            .document(str(client_id))
-            .get()
-        )
-    except Exception as e:
-        print(f"   ⚠️ Could not fetch client automation state for {client_id}: {e}")
-        return False, "", {}
-
-    if not getattr(client_doc, "exists", False):
-        return False, "", {}
-
-    client_data = client_doc.to_dict() or {}
-    if not is_client_automation_paused(client_data):
-        return False, "", client_data
-    return True, client_automation_pause_reason(client_data), client_data
+    """Legacy tuple adapter. Its boolean now denies autonomous work fail-closed."""
+    decision = get_client_automation_decision(
+        user_id,
+        client_id,
+        firestore_client=firestore_client,
+    )
+    return decision.denies_autonomous_work, decision.reason, decision.client_data
 
 
 def stopped_followup_patch(reason: str = CLIENT_AUTOMATION_PAUSED_REASON) -> Dict[str, Any]:
