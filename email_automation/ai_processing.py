@@ -1636,17 +1636,7 @@ def _augment_proposal_with_deterministic_extractions(
     mappings = (effective_config or {}).get("mappings", {})
     # Only mine the broker's FRESH message; quoted history must not seed values.
     fresh_text = _fresh_inbound_text(conversation)
-    # Flyer/linked-PDF text is legitimate evidence for fields the message body
-    # omits ("all the specs are in the attached flyer"). Used for the loading
-    # counts below; the rent/SF extractors stay message-scoped because a flyer
-    # can carry stale pricing superseded by the email body.
-    evidence_texts = [fresh_text] + [t for t in (extra_texts or []) if t]
-
-    def _fill(
-        col_name: Optional[str],
-        value: Optional[str],
-        reason: str,
-    ) -> None:
+    def _fill(col_name: Optional[str], value: Optional[str], reason: str) -> None:
         # Resolve to the canonical sheet header spelling (#15 wrote canonical names;
         # #19's mapping values may be lowercase, e.g. "total sf" vs header "Total SF").
         canonical = _find_header_name(header, col_name) if col_name else None
@@ -1689,118 +1679,11 @@ def _augment_proposal_with_deterministic_extractions(
         _extract_total_sf_from_text(fresh_text),
         "Deterministic fallback parsed total square footage from the latest broker message.",
     )
-    # Loading counts: mined from the fresh message OR flyer/linked-PDF text
-    # (LIVE break 600 Flyer Facts Blvd: "1 drive-in ramp" lived only in the
-    # flyer PDF and was never written). Explicit numeric counts only — the
-    # fabricated-door-count guard philosophy holds: no number, no write.
-    drive_ins_col = (
-        mappings.get("drive_ins")
-        or _find_header_name(header, "Drive Ins")
-        or _find_header_name(header, "Drive-Ins")
-    )
-    docks_col = (
-        mappings.get("docks")
-        or _find_header_name(header, "Docks")
-        or _find_header_name(header, "Loading Docks")
-    )
-    fresh_drive_ins = _extract_drive_in_count_from_text(fresh_text)
-    fresh_docks = _extract_dock_count_from_text(fresh_text)
-    fresh_mentions_drive_ins = bool(re.search(_DRIVE_IN_KW, fresh_text, re.IGNORECASE))
-    fresh_mentions_docks = bool(re.search(_DOCK_KW, fresh_text, re.IGNORECASE))
-    fresh_delegates_drive_ins = _delegates_feature_count_to_attachment(
-        fresh_text,
-        _DRIVE_IN_KW,
-    )
-    fresh_delegates_docks = _delegates_feature_count_to_attachment(
-        fresh_text,
-        _DOCK_KW,
-    )
-    fresh_blocks_drive_ins_flyer = fresh_mentions_drive_ins and not fresh_delegates_drive_ins
-    fresh_blocks_docks_flyer = fresh_mentions_docks and not fresh_delegates_docks
-
-    # Count regexes are evidence guards, not semantic extractors. They cannot
-    # reliably bind a number to the target property, distinguish current from
-    # hypothetical capacity, or aggregate subtotals. Never let them create or
-    # overwrite a fresh-message update. They may only WITHHOLD a model value that
-    # directly conflicts with the broker's latest explicit count.
-    def _drop_conflicting_model_count(
-        col_name: Optional[str],
-        fresh_value: Optional[str],
-        fresh_blocks_flyer: bool,
-        extractor,
-    ) -> None:
-        existing = _proposal_update_for_column(proposal, col_name)
-        if not existing:
-            return
-        existing_value = str(existing.get("value") or "").strip()
-        if fresh_value is not None and existing_value != fresh_value:
-            proposal["updates"] = [
-                update for update in (proposal.get("updates") or []) if update is not existing
-            ]
-            return
-        if not fresh_blocks_flyer or fresh_value is not None:
-            return
-        attachment_values = set()
-        for text in evidence_texts[1:]:
-            value = extractor(text)
-            if value is not None:
-                attachment_values.add(value)
-        if existing_value in attachment_values:
-            proposal["updates"] = [
-                update for update in (proposal.get("updates") or []) if update is not existing
-            ]
-
-    _drop_conflicting_model_count(
-        drive_ins_col,
-        fresh_drive_ins,
-        fresh_blocks_drive_ins_flyer,
-        _extract_drive_in_count_from_text,
-    )
-    _drop_conflicting_model_count(
-        docks_col,
-        fresh_docks,
-        fresh_blocks_docks_flyer,
-        _extract_dock_count_from_text,
-    )
-
-    # Preserve the flyer-only regression, but only under an explicit delegation
-    # from the broker, a blank Sheet cell, no semantic-model update, and unanimous
-    # document evidence. Any disagreement stays blank for follow-up/review.
-    def _fill_unanimous_delegated_attachment_count(
-        col_name: Optional[str],
-        delegated: bool,
-        extractor,
-        label: str,
-    ) -> None:
-        if not delegated or _proposal_update_for_column(proposal, col_name):
-            return
-        if (_row_value_for_column(rowvals, header, col_name) or "").strip():
-            return
-        values = {
-            value
-            for text in evidence_texts[1:]
-            if (value := extractor(text)) is not None
-        }
-        if len(values) != 1:
-            return
-        _fill(
-            col_name,
-            next(iter(values)),
-            f"Deterministic fallback parsed unanimous {label} from explicitly delegated documents.",
-        )
-
-    _fill_unanimous_delegated_attachment_count(
-        drive_ins_col,
-        fresh_delegates_drive_ins,
-        _extract_drive_in_count_from_text,
-        "drive-in count",
-    )
-    _fill_unanimous_delegated_attachment_count(
-        docks_col,
-        fresh_delegates_docks,
-        _extract_dock_count_from_text,
-        "loading-dock count",
-    )
+    # Loading counts are semantic: entity binding, current-vs-hypothetical state,
+    # dimensions, subtotals, and multi-property attachments cannot be resolved by
+    # proximity regexes safely. The source-aware model owns these updates; the
+    # deterministic fabricated-count guard below may reject unsupported values,
+    # but no regex path may create, overwrite, or veto a loading-count update.
     return proposal
 
 
@@ -1821,20 +1704,15 @@ _NO_SEPARATE_OPEX_RE = re.compile(
 )
 
 # ---- Fabricated door-count guard --------------------------------------------
-_DRIVE_IN_KW = r"(?:drive[-\s]?ins?|grade[-\s]?level|drive\s+in\s+doors?)"
-_DOCK_KW = r"(?:docks?|loading\s+docks?)"
+_DRIVE_IN_KW = r"(?:drive[-\s]?in|grade[-\s]?level|drive\s+in\s+door)"
+_DOCK_KW = r"(?:dock|loading\s+dock)"
 
 
 # Spelled-out counts (broker text often says "two docks", not "2 docks").
-_ONES_WORD_RE = r"(?:one|two|three|four|five|six|seven|eight|nine)"
-_SMALL_WORD_RE = (
-    r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
-    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)"
-)
-_TENS_WORD_RE = r"(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
 _WORD_NUMBER_RE = (
-    r"(?:" + _TENS_WORD_RE + r"(?:[-\s]+" + _ONES_WORD_RE + r")?|"
-    + _SMALL_WORD_RE + r")"
+    r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+    r"thirty|forty|fifty|sixty|seventy|eighty|ninety)"
 )
 # Digits OR spelled-out numbers; \b anchors so "twenty" matches but "twentyish" and
 # substrings inside larger words never do.
@@ -1863,109 +1741,21 @@ def _has_explicit_feature_count(text: str, keyword_re: str) -> bool:
 
 
 _WORD_TO_NUMBER = {
-    "zero": 0,
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
     "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
-    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
-    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
-    "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
-    "seventy": 70, "eighty": 80, "ninety": 90,
 }
-
-_ATTACHMENT_NOUN_RE = (
-    r"(?:attached\s+(?:flyers?|brochures?|pdfs?|documents?|files?)|attachments?|"
-    r"flyers?|brochures?|pdfs?|specs?|offering\s+memorand(?:um|a)|om)"
-)
-
-_DELEGATION_NEGATION_RE = re.compile(
-    r"\b(?:no|not|doesn['’]?t|does\s+not|without|uncertain|unknown|tbd)\b",
-    re.IGNORECASE,
-)
-_DELEGATION_CLAUSE_BOUNDARY_RE = re.compile(
-    r"[,;]|\b(?:but|however|although)\b",
-    re.IGNORECASE,
-)
-
-
-def _delegation_match_negates_feature(span: str, keyword_re: str) -> bool:
-    """True when every feature mention in a delegation span is locally negated."""
-    boundaries = list(_DELEGATION_CLAUSE_BOUNDARY_RE.finditer(span))
-    found_feature = False
-    for feature in re.finditer(keyword_re, span, re.IGNORECASE):
-        found_feature = True
-        start = max(
-            (boundary.end() for boundary in boundaries if boundary.end() <= feature.start()),
-            default=0,
-        )
-        end = min(
-            (boundary.start() for boundary in boundaries if boundary.start() >= feature.end()),
-            default=len(span),
-        )
-        if not _DELEGATION_NEGATION_RE.search(span[start:end]):
-            return False
-    return found_feature
-
-
-def _delegates_feature_count_to_attachment(text: str, keyword_re: str) -> bool:
-    """Whether the feature is explicitly tied to an attachment as its source."""
-    if not text:
-        return False
-    # A colon followed by a line break commonly introduces the delegated fields:
-    # "See attached flyer:\nDocks and drive-in counts." Keep other line breaks
-    # as hard boundaries so unrelated nearby clauses cannot authorize a field.
-    normalized = re.sub(r":\s*\n\s*", ": ", text)
-    global_delegation = re.search(
-        rf"\b(?:all\s+(?:the\s+)?(?:specs?|details?)|all\s+loading\s+information)\b"
-        rf"[^,;.!?\n]{{0,80}}\b(?:in|on|from|per)\b[^,;.!?\n]{{0,80}}"
-        rf"\b{_ATTACHMENT_NOUN_RE}\b",
-        normalized,
-        re.IGNORECASE,
-    )
-    if global_delegation and not _DELEGATION_NEGATION_RE.search(global_delegation.group(0)):
-        return True
-    gap = r"[^,;.!?\n]"
-    patterns = (
-        # "See the attached flyer for dock counts."
-        rf"\b(?:see|refer\s+to|check|review|use|per)\b{gap}{{0,100}}"
-        rf"\b{_ATTACHMENT_NOUN_RE}\b{gap}{{0,100}}{keyword_re}",
-        # "Dock counts are on page 2 of the brochure."
-        rf"{keyword_re}{gap}{{0,80}}\b(?:in|on|per|from)\b{gap}{{0,80}}"
-        rf"\b{_ATTACHMENT_NOUN_RE}\b",
-        # "Dock count: see attached flyer."
-        rf"{keyword_re}{gap}{{0,80}}\b(?:see|refer\s+to|check|review|use)\b"
-        rf"{gap}{{0,80}}\b{_ATTACHMENT_NOUN_RE}\b",
-        # "The OM has dock counts."
-        rf"\b{_ATTACHMENT_NOUN_RE}\b{gap}{{0,80}}"
-        rf"\b(?:shows?|lists?|contains?|includes?|has|provides?)\b{gap}{{0,80}}"
-        rf"{keyword_re}",
-        # "For docks and drive-ins, refer to the attachment."
-        rf"\bfor\b[^;.!?\n]{{0,80}}{keyword_re}[^;.!?\n]{{0,80}},\s*"
-        rf"(?:please\s+)?(?:see|refer\s+to|check|review|use)\b"
-        rf"[^;.!?\n]{{0,80}}\b{_ATTACHMENT_NOUN_RE}\b",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, normalized, re.IGNORECASE)
-        if match and not _delegation_match_negates_feature(match.group(0), keyword_re):
-            return True
-    return False
 # "<count> drive-in(s)/grade-level (ramp|door)s" — count immediately precedes the
 # keyword so unrelated numbers ("suite 3, drive-in access") never bind.
 _DRIVE_IN_COUNT_RE = re.compile(
-    r"(?:\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
+    r"\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
     r"(?:drive[-\s]?ins?|grade[-\s]?level)\b"
-    r"(?:\s*(?:ramps?|doors?))?"
-    r"|\b(?:drive[-\s]?ins?|grade[-\s]?level)\b"
-    r"(?:\s*(?:ramps?|doors?))?\s*(?::|=|-|count\s*(?:is|of)?|total\s*(?:is|of)?)\s*"
-    r"(\d{1,3}|" + _WORD_NUMBER_RE + r"))",
+    r"(?:\s*(?:ramps?|doors?))?",
     re.IGNORECASE,
 )
 # "<count> (dock-high|loading) dock(s)/door(s)" variants.
 _DOCK_COUNT_RE = re.compile(
-    r"(?:\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
-    r"(?:dock[-\s]?high\s+doors?|loading\s+docks?|docks?\b(?:\s*doors?)?|dock\s+doors?)"
-    r"|\b(?:dock[-\s]?high\s+doors?|loading\s+docks?|docks?\b(?:\s*doors?)?|dock\s+doors?)"
-    r"\s*(?::|=|-|count\s*(?:is|of)?|total\s*(?:is|of)?)\s*"
-    r"(\d{1,3}|" + _WORD_NUMBER_RE + r"))",
+    r"\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
+    r"(?:dock[-\s]?high\s+doors?|loading\s+docks?|docks?\b(?:\s*doors?)?|dock\s+doors?)",
     re.IGNORECASE,
 )
 
@@ -2037,108 +1827,28 @@ def _augment_proposal_opex_basis(
 
 
 def _parse_feature_count(raw: str) -> Optional[str]:
-    raw = re.sub(r"[-\s]+", " ", (raw or "").strip().lower())
+    raw = (raw or "").strip().lower()
     if raw.isdigit():
         value = int(raw)
     else:
-        parts = raw.split()
-        if len(parts) == 2:
-            tens = _WORD_TO_NUMBER.get(parts[0])
-            ones = _WORD_TO_NUMBER.get(parts[1])
-            value = tens + ones if tens in range(20, 100, 10) and ones in range(1, 10) else None
-        else:
-            value = _WORD_TO_NUMBER.get(raw)
-        if value is None:
-            return None
-    return str(value) if 0 <= value <= 200 else None
-
-
-_CURRENT_COUNT_MARKER_RE = re.compile(
-    r"\b(?:actual(?:ly)?|current(?:ly)?|now|correction|corrected|revised|updated|"
-    r"in\s+fact|instead)\b",
-    re.IGNORECASE,
-)
-_STALE_COUNT_MARKER_RE = re.compile(
-    r"\b(?:old|older|previous|prior|formerly|used\s+to|"
-    r"(?:attached\s+)?(?:flyer|brochure|om)\s+"
-    r"(?:says|said|lists|listed|shows|showed|has|contains|includes))\b",
-    re.IGNORECASE,
-)
-_IMMEDIATE_COUNT_NEGATION_RE = re.compile(
-    r"\b(?:not|isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t)\s*$",
-    re.IGNORECASE,
-)
-
-
-def _feature_range_spans(text: str, keyword_re: str) -> List[tuple]:
-    count = rf"(?:\d{{1,3}}|{_WORD_NUMBER_RE})"
-    range_values = (
-        rf"(?:\d{{1,3}}\s*-\s*\d{{1,3}}|"
-        rf"{count}\s*(?:–|—|\bto\b|\bor\b)\s*{count})"
-    )
-    patterns = (
-        rf"{range_values}\s*(?:x\s*)?{keyword_re}",
-        rf"{keyword_re}[^;.!?\n]{{0,30}}{range_values}",
-    )
-    spans = []
-    for pattern in patterns:
-        spans.extend(match.span() for match in re.finditer(pattern, text, re.IGNORECASE))
-    return spans
-
-
-def _extract_feature_count_from_text(
-    text: str,
-    count_re: "re.Pattern",
-    keyword_re: str,
-) -> Optional[str]:
-    if not text:
-        return None
-
-    range_spans = _feature_range_spans(text, keyword_re)
-    candidates = []
-    for match in count_re.finditer(text):
-        if any(start <= match.start() < end for start, end in range_spans):
-            continue
-        raw = match.group(1) or match.group(2)
-        value = _parse_feature_count(raw)
-        if value is None:
-            continue
-        before = text[max(0, match.start() - 60):match.start()]
-        if _IMMEDIATE_COUNT_NEGATION_RE.search(before[-20:]):
-            continue
-        score = float(match.start())
-        if _CURRENT_COUNT_MARKER_RE.search(before):
-            score += len(text) * 10
-        if _STALE_COUNT_MARKER_RE.search(before):
-            score -= len(text) * 10
-        candidates.append((score, match.start(), value))
-
-    zero_re = re.compile(
-        rf"\b(?:no|none(?:\s+of)?(?:\s+the)?)\s+(?:{keyword_re})\b",
-        re.IGNORECASE,
-    )
-    for match in zero_re.finditer(text):
-        before = text[max(0, match.start() - 60):match.start()]
-        if _STALE_COUNT_MARKER_RE.search(before):
-            continue
-        score = float(match.start())
-        if _CURRENT_COUNT_MARKER_RE.search(before):
-            score += len(text) * 10
-        candidates.append((score, match.start(), "0"))
-
-    if not candidates:
-        return None
-    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+        value = _WORD_TO_NUMBER.get(raw, 0)
+    return str(value) if 1 <= value <= 200 else None
 
 
 def _extract_drive_in_count_from_text(text: str) -> Optional[str]:
     """Explicit drive-in / grade-level door count, or None (never guesses)."""
-    return _extract_feature_count_from_text(text, _DRIVE_IN_COUNT_RE, _DRIVE_IN_KW)
+    if not text:
+        return None
+    m = _DRIVE_IN_COUNT_RE.search(text)
+    return _parse_feature_count(m.group(1)) if m else None
 
 
 def _extract_dock_count_from_text(text: str) -> Optional[str]:
     """Explicit loading-dock / dock-high door count, or None (never guesses)."""
-    return _extract_feature_count_from_text(text, _DOCK_COUNT_RE, _DOCK_KW)
+    if not text:
+        return None
+    m = _DOCK_COUNT_RE.search(text)
+    return _parse_feature_count(m.group(1)) if m else None
 
 
 def _suppress_updates_on_contact_optout(proposal: dict) -> dict:

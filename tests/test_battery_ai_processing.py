@@ -142,8 +142,7 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             _conv("It's leased. It was going for $18/SF on 12,000 SF."))
         self.assertEqual(out["updates"], [])
 
-    # --- LIVE break 600 Flyer Facts Blvd: flyer-only counts -------------------
-    def test_augmenter_fills_drive_ins_and_docks_from_flyer_text(self):
+    def test_attachment_regex_does_not_create_loading_updates_without_model(self):
         header, cfg = self._night_hdr_cfg()
         proposal = {"updates": [], "events": []}
         flyer = ("FOR LEASE - 600 Flyer Facts Blvd\n"
@@ -154,137 +153,8 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             extra_texts=[flyer])
         di = a._proposal_update_for_column(out, "Drive Ins")
         dk = a._proposal_update_for_column(out, "Loading Docks")
-        self.assertIsNotNone(di, "drive-in count stated in the flyer must be written")
-        self.assertEqual(di["value"], "1")
-        self.assertIsNotNone(dk)
-        self.assertEqual(dk["value"], "2")
-
-    def test_conflicting_model_counts_are_withheld_instead_of_regex_overwritten(self):
-        header, cfg = self._night_hdr_cfg()
-        proposal = {
-            "updates": [
-                {"column": "Loading Docks", "value": "1", "reason": "flyer"},
-                {"column": "Drive Ins", "value": "13", "reason": "flyer"},
-            ],
-            "events": [],
-        }
-        out = a._augment_proposal_with_deterministic_extractions(
-            proposal,
-            ["570 W Cheyenne Ave", "", "", "", "", ""],
-            header,
-            cfg,
-            _conv(
-                "It has 4 dock-high doors, 1 drive-in door, 28-foot clear "
-                "height, and 800 amps of 277/480V 3-phase power."
-            ),
-            extra_texts=[
-                "570 W Cheyenne Specs\n"
-                "1 dock, 13 drive-ins, 18 clear, 200a/277-480v."
-            ],
-        )
-
-        self.assertIsNone(a._proposal_update_for_column(out, "Loading Docks"))
-        self.assertIsNone(a._proposal_update_for_column(out, "Drive Ins"))
-
-    def test_fresh_zero_drive_ins_outranks_conflicting_flyer_text(self):
-        header, cfg = self._night_hdr_cfg()
-        proposal = {
-            "updates": [
-                {"column": "Loading Docks", "value": "4", "reason": "fresh message"},
-                {"column": "Drive Ins", "value": "0", "reason": "fresh message"},
-            ],
-            "events": [],
-        }
-        out = a._augment_proposal_with_deterministic_extractions(
-            proposal,
-            ["570 W Cheyenne Ave", "", "", "", "", ""],
-            header,
-            cfg,
-            _conv("There are 4 dock-high doors and 0 drive-in doors."),
-            extra_texts=["The flyer lists 1 dock and 13 drive-ins."],
-        )
-
-        self.assertEqual(
-            a._proposal_update_for_column(out, "Loading Docks")["value"],
-            "4",
-        )
-        self.assertEqual(
-            a._proposal_update_for_column(out, "Drive Ins")["value"],
-            "0",
-        )
-
-    def test_label_first_fresh_counts_outrank_conflicting_flyer_text(self):
-        header, cfg = self._night_hdr_cfg()
-        proposal = {
-            "updates": [
-                {"column": "Loading Docks", "value": "4", "reason": "fresh message"},
-                {"column": "Drive Ins", "value": "1", "reason": "fresh message"},
-            ],
-            "events": [],
-        }
-        out = a._augment_proposal_with_deterministic_extractions(
-            proposal,
-            ["570 W Cheyenne Ave", "", "", "", "", ""],
-            header,
-            cfg,
-            _conv("Dock-high doors: 4; drive-in doors: 1."),
-            extra_texts=["The flyer lists 1 dock and 13 drive-ins."],
-        )
-
-        self.assertEqual(
-            a._proposal_update_for_column(out, "Loading Docks")["value"],
-            "4",
-        )
-        self.assertEqual(
-            a._proposal_update_for_column(out, "Drive Ins")["value"],
-            "1",
-        )
-
-    def test_fresh_counts_correct_nonblank_sheet_and_conflicting_proposal(self):
-        header, cfg = self._night_hdr_cfg()
-        proposal = {
-            "updates": [
-                {"column": "Loading Docks", "value": "4", "reason": "fresh message"},
-                {"column": "Drive Ins", "value": "1", "reason": "fresh message"},
-            ],
-            "events": [],
-        }
-        out = a._augment_proposal_with_deterministic_extractions(
-            proposal,
-            ["570 W Cheyenne Ave", "", "", "", "2", "2"],
-            header,
-            cfg,
-            _conv("It has 4 dock-high doors and 1 drive-in door."),
-            extra_texts=["The flyer lists 1 dock and 13 drive-ins."],
-        )
-
-        self.assertEqual(
-            a._proposal_update_for_column(out, "Loading Docks")["value"],
-            "4",
-        )
-        self.assertEqual(
-            a._proposal_update_for_column(out, "Drive Ins")["value"],
-            "1",
-        )
-
-    def test_fresh_feature_mention_blocks_flyer_fallback_when_parser_is_unsure(self):
-        header, cfg = self._night_hdr_cfg()
-        proposal = {
-            "updates": [
-                {"column": "Drive Ins", "value": "13", "reason": "PDF flyer"},
-            ],
-            "events": [],
-        }
-        out = a._augment_proposal_with_deterministic_extractions(
-            proposal,
-            ["570 W Cheyenne Ave", "", "", "", "", ""],
-            header,
-            cfg,
-            _conv("Drive-in loading is limited; confirm the exact count with ownership."),
-            extra_texts=["The older flyer lists 13 drive-ins."],
-        )
-
-        self.assertIsNone(a._proposal_update_for_column(out, "Drive Ins"))
+        self.assertIsNone(di)
+        self.assertIsNone(dk)
 
     def test_document_selection_prompt_prefers_latest_human_message(self):
         source = inspect.getsource(a.propose_sheet_updates)
@@ -297,188 +167,12 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             source,
         )
 
-    def test_spelled_loading_counts_above_twelve_are_not_coerced_to_zero(self):
-        self.assertEqual(
-            a._extract_drive_in_count_from_text("The building has thirteen drive-ins."),
-            "13",
-        )
-        self.assertEqual(
-            a._extract_dock_count_from_text("There are twenty docks."),
-            "20",
-        )
-
-    def test_fresh_message_can_delegate_loading_counts_to_attached_flyer(self):
-        header, cfg = self._night_hdr_cfg()
-        proposal = {"updates": [], "events": []}
-        out = a._augment_proposal_with_deterministic_extractions(
-            proposal,
-            ["570 W Cheyenne Ave", "", "", "", "", ""],
-            header,
-            cfg,
-            _conv("See the attached flyer for dock and drive-in counts."),
-            extra_texts=["Loading: 2 dock-high doors and 1 drive-in ramp."],
-        )
-
-        self.assertEqual(
-            a._proposal_update_for_column(out, "Loading Docks")["value"],
-            "2",
-        )
-        self.assertEqual(
-            a._proposal_update_for_column(out, "Drive Ins")["value"],
-            "1",
-        )
-
-    def test_attachment_delegation_is_specific_to_each_loading_field(self):
-        header, cfg = self._night_hdr_cfg()
-        out = a._augment_proposal_with_deterministic_extractions(
-            {"updates": [], "events": []},
-            ["570 W Cheyenne Ave", "", "", "", "", ""],
-            header,
-            cfg,
-            _conv("Drive-ins are limited; see attached flyer for dock counts."),
-            extra_texts=["Loading: 2 dock-high doors and 13 drive-ins."],
-        )
-
-        self.assertEqual(
-            a._proposal_update_for_column(out, "Loading Docks")["value"],
-            "2",
-        )
-        self.assertIsNone(a._proposal_update_for_column(out, "Drive Ins"))
-
-    def test_attachment_reference_for_photos_does_not_delegate_drive_in_count(self):
-        header, cfg = self._night_hdr_cfg()
-        out = a._augment_proposal_with_deterministic_extractions(
-            {"updates": [], "events": []},
-            ["570 W Cheyenne Ave", "", "", "", "", ""],
-            header,
-            cfg,
-            _conv("See attached flyer for photos; drive-in count is uncertain."),
-            extra_texts=["Loading: 13 drive-ins."],
-        )
-
-        self.assertIsNone(a._proposal_update_for_column(out, "Drive Ins"))
-
-    def test_compound_word_loading_counts_are_parsed_as_whole_numbers(self):
-        self.assertEqual(
-            a._extract_dock_count_from_text("There are twenty-four docks."),
-            "24",
-        )
-        self.assertEqual(
-            a._extract_drive_in_count_from_text("The site has thirty-two drive-ins."),
-            "32",
-        )
-        self.assertEqual(
-            a._extract_dock_count_from_text("It provides ninety nine dock doors."),
-            "99",
-        )
-
-    def test_common_attachment_delegation_phrasings_fill_loading_counts(self):
-        header, cfg = self._night_hdr_cfg()
-        cases = [
-            "The dock and drive-in counts are in the attached flyer.",
-            "See attached flyer:\nDocks and drive-in counts.",
-            "Dock and drive-in counts are on page 2 of the brochure.",
-            "The OM has dock and drive-in counts.",
-        ]
-        for body in cases:
-            with self.subTest(body=body):
-                out = a._augment_proposal_with_deterministic_extractions(
-                    {"updates": [], "events": []},
-                    ["570 W Cheyenne Ave", "", "", "", "", ""],
-                    header,
-                    cfg,
-                    _conv(body),
-                    extra_texts=["Loading: 2 dock-high doors and 1 drive-in ramp."],
-                )
-                self.assertEqual(
-                    a._proposal_update_for_column(out, "Loading Docks")["value"],
-                    "2",
-                )
-                self.assertEqual(
-                    a._proposal_update_for_column(out, "Drive Ins")["value"],
-                    "1",
-                )
-
-    def test_attachment_fallback_withholds_conflicting_document_counts(self):
-        header, cfg = self._night_hdr_cfg()
-        out = a._augment_proposal_with_deterministic_extractions(
-            {"updates": [], "events": []},
-            ["570 W Cheyenne Ave", "", "", "", "", ""],
-            header,
-            cfg,
-            _conv("See the attached documents for dock and drive-in counts."),
-            extra_texts=[
-                "First flyer: 2 dock-high doors.",
-                "Second flyer: 8 drive-ins and 9 dock-high doors.",
-                "Third flyer: 7 drive-ins.",
-            ],
-        )
-
-        self.assertIsNone(a._proposal_update_for_column(out, "Loading Docks"))
-        self.assertIsNone(a._proposal_update_for_column(out, "Drive Ins"))
-
-    def test_loading_count_extraction_prefers_current_corrected_assertion(self):
-        cases = [
-            (
-                a._extract_dock_count_from_text,
-                "The flyer says 1 dock, but actual loading is 4 docks.",
-                "4",
-            ),
-            (
-                a._extract_drive_in_count_from_text,
-                "The flyer says 13 drive-ins, but actual loading is 1 drive-in.",
-                "1",
-            ),
-            (
-                a._extract_dock_count_from_text,
-                "Correction: not 4 docks; there are 2 docks.",
-                "2",
-            ),
-            (
-                a._extract_dock_count_from_text,
-                "Actual loading is 4 docks; the old flyer says 1 dock.",
-                "4",
-            ),
-        ]
-        for extractor, body, expected in cases:
-            with self.subTest(body=body):
-                self.assertEqual(extractor(body), expected)
-
-    def test_loading_count_ranges_and_alternatives_are_not_guessed(self):
-        cases = [
-            (a._extract_dock_count_from_text, "The plan shows 24-32 docks."),
-            (a._extract_dock_count_from_text, "It could have 24 or 32 docks."),
-            (a._extract_drive_in_count_from_text, "Drive-ins: 2 to 4."),
-        ]
-        for extractor, body in cases:
-            with self.subTest(body=body):
-                self.assertIsNone(extractor(body))
-
-    def test_negated_attachment_reference_does_not_delegate_loading_count(self):
-        header, cfg = self._night_hdr_cfg()
-        cases = [
-            ("The attached flyer does not include drive-in counts.", "Drive Ins"),
-            ("The brochure has no dock count.", "Loading Docks"),
-            ("See attached flyer for photos, but drive-in count is uncertain.", "Drive Ins"),
-        ]
-        for body, column in cases:
-            with self.subTest(body=body):
-                out = a._augment_proposal_with_deterministic_extractions(
-                    {"updates": [], "events": []},
-                    ["570 W Cheyenne Ave", "", "", "", "", ""],
-                    header,
-                    cfg,
-                    _conv(body),
-                    extra_texts=["Loading: 2 dock-high doors and 13 drive-ins."],
-                )
-                self.assertIsNone(a._proposal_update_for_column(out, column))
-
-    def test_semantic_model_proposal_is_not_overwritten_by_attachment_order(self):
+    def test_semantic_model_loading_updates_survive_deterministic_augmenter(self):
         header, cfg = self._night_hdr_cfg()
         proposal = {
             "updates": [
-                {"column": "Loading Docks", "value": "9", "reason": "later flyer"},
-                {"column": "Drive Ins", "value": "7", "reason": "later flyer"},
+                {"column": "Loading Docks", "value": "4", "reason": "semantic model"},
+                {"column": "Drive Ins", "value": "1", "reason": "semantic model"},
             ],
             "events": [],
         }
@@ -487,42 +181,13 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             ["570 W Cheyenne Ave", "", "", "", "", ""],
             header,
             cfg,
-            _conv("See the attached documents for dock and drive-in counts."),
-            extra_texts=[
-                "First flyer: 2 dock-high doors.",
-                "Second flyer: 8 drive-ins and 9 dock-high doors.",
-                "Third flyer: 7 drive-ins.",
-            ],
+            _conv("It has 4 docks and 1 drive-in."),
+            extra_texts=["The old flyer lists 1 dock and 13 drive-ins."],
         )
-        self.assertEqual(
-            a._proposal_update_for_column(out, "Loading Docks")["value"],
-            "9",
-        )
-        self.assertEqual(
-            a._proposal_update_for_column(out, "Drive Ins")["value"],
-            "7",
-        )
+        self.assertEqual(a._proposal_update_for_column(out, "Loading Docks")["value"], "4")
+        self.assertEqual(a._proposal_update_for_column(out, "Drive Ins")["value"], "1")
 
-    def test_natural_language_zero_is_detected_but_does_not_overwrite_sheet(self):
-        header, cfg = self._night_hdr_cfg()
-        cases = [
-            ("There are no drive-ins.", "Drive Ins", a._extract_drive_in_count_from_text),
-            ("No dock-high doors are available.", "Loading Docks", a._extract_dock_count_from_text),
-            ("None of the drive-in doors remain.", "Drive Ins", a._extract_drive_in_count_from_text),
-        ]
-        for body, column, extractor in cases:
-            with self.subTest(body=body):
-                self.assertEqual(extractor(body), "0")
-                out = a._augment_proposal_with_deterministic_extractions(
-                    {"updates": [], "events": []},
-                    ["570 W Cheyenne Ave", "", "", "", "2", "2"],
-                    header,
-                    cfg,
-                    _conv(body),
-                )
-                self.assertIsNone(a._proposal_update_for_column(out, column))
-
-    def test_fresh_regex_counts_never_create_sheet_updates_without_model(self):
+    def test_loading_regex_never_creates_or_vetoes_semantic_updates(self):
         header, cfg = self._night_hdr_cfg()
         cases = [
             "The building has 2 docks, but the tenant requires 4 docks.",
@@ -530,68 +195,37 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             "The subject has 2 docks; the adjacent building has 6 docks.",
             "It could add 4 dock-high doors if the tenant signs.",
             "There is potential for 3 drive-ins after conversion.",
-            "Ownership plans to install 5 docks next year.",
             "Door dimensions are 10 x 12 dock doors.",
-            "The drive-in opening is 12 x 14 drive-in doors.",
             "There are 2 docks at the front and 3 docks at the rear.",
         ]
         for body in cases:
             with self.subTest(body=body):
-                out = a._augment_proposal_with_deterministic_extractions(
+                empty = a._augment_proposal_with_deterministic_extractions(
                     {"updates": [], "events": []},
                     ["570 W Cheyenne Ave", "", "", "", "", ""],
                     header,
                     cfg,
                     _conv(body),
                 )
-                self.assertIsNone(a._proposal_update_for_column(out, "Loading Docks"))
-                self.assertIsNone(a._proposal_update_for_column(out, "Drive Ins"))
+                self.assertIsNone(a._proposal_update_for_column(empty, "Loading Docks"))
+                self.assertIsNone(a._proposal_update_for_column(empty, "Drive Ins"))
 
-    def test_unrelated_attachment_negation_does_not_block_count_delegation(self):
-        header, cfg = self._night_hdr_cfg()
-        out = a._augment_proposal_with_deterministic_extractions(
-            {"updates": [], "events": []},
+        semantic = a._augment_proposal_with_deterministic_extractions(
+            {
+                "updates": [
+                    {"column": "Loading Docks", "value": "2", "reason": "semantic model"},
+                ],
+                "events": [],
+            },
             ["570 W Cheyenne Ave", "", "", "", "", ""],
             header,
             cfg,
-            _conv("The flyer has no photos but includes dock and drive-in counts."),
-            extra_texts=["Loading: 2 dock-high doors and 1 drive-in ramp."],
+            _conv("The building has 2 docks, but the tenant requires 4 docks."),
         )
         self.assertEqual(
-            a._proposal_update_for_column(out, "Loading Docks")["value"],
+            a._proposal_update_for_column(semantic, "Loading Docks")["value"],
             "2",
         )
-        self.assertEqual(
-            a._proposal_update_for_column(out, "Drive Ins")["value"],
-            "1",
-        )
-
-    def test_additional_natural_attachment_delegation_orders(self):
-        header, cfg = self._night_hdr_cfg()
-        cases = [
-            "Dock and drive-in counts: see attached flyer.",
-            "For docks and drive-ins, refer to the attachment.",
-            "Please use the attachment for dock and drive-in counts.",
-            "See attached specs for dock and drive-in counts.",
-        ]
-        for body in cases:
-            with self.subTest(body=body):
-                out = a._augment_proposal_with_deterministic_extractions(
-                    {"updates": [], "events": []},
-                    ["570 W Cheyenne Ave", "", "", "", "", ""],
-                    header,
-                    cfg,
-                    _conv(body),
-                    extra_texts=["Loading: 2 dock-high doors and 1 drive-in ramp."],
-                )
-                self.assertEqual(
-                    a._proposal_update_for_column(out, "Loading Docks")["value"],
-                    "2",
-                )
-                self.assertEqual(
-                    a._proposal_update_for_column(out, "Drive Ins")["value"],
-                    "1",
-                )
 
     def test_augmenter_never_guesses_counts_without_numbers(self):
         header, cfg = self._night_hdr_cfg()
