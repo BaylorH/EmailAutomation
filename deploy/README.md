@@ -200,7 +200,7 @@ Contract:
 
 | Route | Request | Response |
 |-------|---------|----------|
-| `POST /process-user` | JSON `{"uid": "<firebase-uid>"}` | `200 {"status":"processed"}` ran · `200 {"status":"skipped_locked"}` same-uid already running · `400` missing/blank uid or non-JSON · `401` auth required + missing/wrong secret · `500 {"error":...}` pipeline raised (Cloud Tasks retries) |
+| `POST /process-user` | JSON `{"uid": "<firebase-uid>"}` | `200 {"status":"processed"}` ran · `503 {"status":"skipped_locked"}` same-uid already running (Cloud Tasks retries) · `400` missing/blank uid or non-JSON · `401` auth required + missing/wrong secret · `500 {"error":...}` pipeline raised (Cloud Tasks retries) |
 | `GET /healthz` | — | `200` (never auth-gated) |
 
 **Auth.** Optional in-app shared secret via `PROCESS_USER_AUTH`; when set, requests
