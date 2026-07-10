@@ -12,7 +12,8 @@ Routes
 POST /process-user   body {"uid": "<firebase-uid>"}
     Runs ``run_with_user_lease(uid, lambda: refresh_and_process_user(uid))``.
       * 200 {"status": "processed"}       — lease acquired, pipeline ran
-      * 200 {"status": "skipped_locked"}  — user already being processed
+      * 503 {"status": "skipped_locked"}  — user already being processed;
+        retry so work created after the active worker's snapshot is not stranded
       * 400 {"status": "error", ...}      — missing / blank uid or non-JSON body
       * 401 {"status": "error", ...}      — auth required and missing/wrong secret
       * 500 {"status": "error", "error"}  — pipeline raised (so Cloud Tasks retries)
@@ -99,7 +100,10 @@ def process_user():
 
     if acquired:
         return jsonify({"status": "processed", "uid": uid}), 200
-    return jsonify({"status": "skipped_locked", "uid": uid}), 200
+    # A concurrent worker may already have taken its Firestore snapshot before
+    # this request's outbox item was created. A non-2xx response keeps the Cloud
+    # Task retryable instead of acknowledging work that no worker has observed.
+    return jsonify({"status": "skipped_locked", "uid": uid}), 503
 
 
 if __name__ == "__main__":
