@@ -2711,6 +2711,9 @@ def _outbox_send_operation_state(
     doc_id: Optional[str] = None,
     recipient: Optional[str] = None,
     error: Optional[Any] = None,
+    operation_path: Optional[str] = None,
+    client_id: Optional[str] = None,
+    row_number: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Build a Graph operation-state for an outbox send outcome (GO-condition #3).
 
@@ -2724,6 +2727,12 @@ def _outbox_send_operation_state(
         state["recipient"] = recipient
     if error is not None:
         state["error"] = str(error)[:1500]
+    if operation_path:
+        state["operationPath"] = operation_path
+    if client_id:
+        state["clientId"] = client_id
+    if row_number is not None:
+        state["rowNumber"] = row_number
     return state
 
 
@@ -3067,6 +3076,9 @@ def _send_multi_property_email(
                     doc_id=item['doc'].id,
                     recipient=recipient_email,
                     error=reason,
+                    operation_path="separate",
+                    client_id=clientId,
+                    row_number=row_number,
                 ),
             )
             print(f"   🛑 {reason}")
@@ -3416,15 +3428,19 @@ def _send_combined_property_email(
                     blocked["data"],
                     reason,
                 )
-            _record_operation_state(
-                operation_states,
-                _outbox_send_operation_state(
-                    "error",
-                    doc_id=candidate["item"]['doc'].id,
-                    recipient=recipient_email,
-                    error=reason,
-                ),
-            )
+            for blocked in state_verified + claimed_candidates[index:]:
+                _record_operation_state(
+                    operation_states,
+                    _outbox_send_operation_state(
+                        "error",
+                        doc_id=blocked["item"]['doc'].id,
+                        recipient=recipient_email,
+                        error=reason,
+                        operation_path="combined",
+                        client_id=blocked["clientId"],
+                        row_number=blocked["rowNumber"],
+                    ),
+                )
             print(f"   🛑 {reason}; blocked the entire combined group")
             return
         state_verified.append(candidate)
@@ -3734,7 +3750,14 @@ def _send_single_outbox_item(
         _move_to_dead_letter(user_id, d.reference, data, reason)
         _record_operation_state(
             operation_states,
-            _outbox_send_operation_state("error", doc_id=d.id, error=reason),
+            _outbox_send_operation_state(
+                "error",
+                doc_id=d.id,
+                error=reason,
+                operation_path="single",
+                client_id=clientId,
+                row_number=data.get("rowNumber"),
+            ),
         )
         print(f"   🛑 {reason}")
         return

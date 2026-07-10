@@ -277,6 +277,7 @@ class OutboxSafetyTests(unittest.TestCase):
             "rowNumber": 3,
         }, doc_id="outbox-state-unavailable")
 
+        operation_states = []
         with patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_get_current_outbox_data", return_value={}), \
              patch.object(
@@ -290,12 +291,18 @@ class OutboxSafetyTests(unittest.TestCase):
                 "uid-1",
                 {"Authorization": "Bearer token"},
                 {"doc": doc, "data": doc.to_dict()},
+                operation_states=operation_states,
             )
 
         send.assert_not_called()
         dead_letter.assert_called_once()
         self.assertIn("Could not verify campaign automation state", dead_letter.call_args.args[3])
         self.assertIn("manual review required", dead_letter.call_args.args[3])
+        self.assertEqual(len(operation_states), 1)
+        self.assertEqual(operation_states[0]["status"], "error")
+        self.assertEqual(operation_states[0]["operationPath"], "single")
+        self.assertEqual(operation_states[0]["clientId"], "client-1")
+        self.assertEqual(operation_states[0]["rowNumber"], 3)
 
     def test_separate_group_dead_letters_each_unverifiable_item_and_continues(self):
         docs = [
@@ -309,6 +316,7 @@ class OutboxSafetyTests(unittest.TestCase):
             for index in range(2)
         ]
 
+        operation_states = []
         with patch("email_automation.processing.is_contact_opted_out", return_value=None), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_get_current_outbox_data", return_value={}), \
@@ -325,6 +333,7 @@ class OutboxSafetyTests(unittest.TestCase):
                 {"Authorization": "Bearer token"},
                 "bp21harrison@gmail.com",
                 [{"doc": doc, "data": doc.to_dict()} for doc in docs],
+                operation_states=operation_states,
             )
 
         send.assert_not_called()
@@ -332,6 +341,11 @@ class OutboxSafetyTests(unittest.TestCase):
         for call in dead_letter.call_args_list:
             self.assertIn("Could not verify campaign automation state", call.args[3])
             self.assertIn("manual review required", call.args[3])
+        self.assertEqual(len(operation_states), 2)
+        self.assertEqual(
+            [(state["operationPath"], state["clientId"], state["rowNumber"]) for state in operation_states],
+            [("separate", "client-1", 3), ("separate", "client-1", 4)],
+        )
 
     def test_cancel_requested_item_is_deleted_without_sending(self):
         doc = FakeDoc({
@@ -2471,6 +2485,7 @@ class SendModeCombineTests(unittest.TestCase):
 
     def test_campaign_state_read_failure_blocks_and_dead_letters_entire_combined_group(self):
         docs = self._same_broker_docs(send_mode="combined", count=3)
+        operation_states = []
 
         with ExitStack() as stack:
             finalize, dead_letter = self._combined_patches(
@@ -2485,6 +2500,7 @@ class SendModeCombineTests(unittest.TestCase):
             send = stack.enter_context(patch.object(email_module, "send_and_index_email"))
             email_module._send_combined_property_email(
                 "uid-1", {"Authorization": "Bearer t"}, self.RECIPIENT, self._items(docs),
+                operation_states=operation_states,
             )
 
         send.assert_not_called()
@@ -2493,6 +2509,11 @@ class SendModeCombineTests(unittest.TestCase):
         for call in dead_letter.call_args_list:
             self.assertIn("Could not verify campaign automation state", call.args[3])
             self.assertIn("manual review required", call.args[3])
+        self.assertEqual(len(operation_states), 3)
+        self.assertEqual(
+            [(state["operationPath"], state["clientId"], state["rowNumber"]) for state in operation_states],
+            [("combined", "client-1", 3), ("combined", "client-1", 4), ("combined", "client-1", 5)],
+        )
 
     def test_combined_send_failure_bumps_all_rows_atomically(self):
         docs = self._same_broker_docs(send_mode="combined", count=3)

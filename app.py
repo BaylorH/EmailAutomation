@@ -9,6 +9,7 @@ from flask import Flask, request, jsonify, render_template_string, redirect, url
 from flask_cors import CORS
 from msal import ConfidentialClientApplication, SerializableTokenCache
 from firebase_helpers import upload_token
+from email_automation.budget_guard import BudgetDeferredError, should_block_openai_call
 from email_automation.app_config import (
     cors_origins as _cors_origins,
     destructive_admin_routes_enabled as _destructive_admin_routes_enabled,
@@ -999,6 +1000,17 @@ def api_accept_new_property():
             return jsonify({"success": False, "error": "sheetId does not match the notification"}), 403
         # ===================================================================
 
+        # A budget deferral must happen before the sheet row is inserted. If it
+        # were discovered only inside propose_sheet_updates(), retrying the
+        # action could create a duplicate property row.
+        if pdf_manifest and should_block_openai_call(_fs):
+            return jsonify({
+                "success": False,
+                "retryable": True,
+                "code": "openai_budget_deferred",
+                "error": "AI extraction is temporarily deferred; retry this property later.",
+            }), 503
+
         # Import required modules
         from email_automation.clients import _sheets_client
         from email_automation.sheets import _get_first_tab_title, _read_header_row2, format_sheet_columns_autosize_with_exceptions, append_links_to_flyer_link_column
@@ -1050,11 +1062,11 @@ def api_accept_new_property():
         if pdf_manifest and new_rownum:
             try:
                 from email_automation.ai_processing import propose_sheet_updates, apply_proposal_to_sheet
-                from email_automation.sheets import _read_row
+                from email_automation.sheet_operations import _read_single_row
                 from email_automation.column_config import get_default_column_config
 
                 # Read the current row values (just created, mostly empty)
-                rowvals = _read_row(sheets, sheet_id, tab_title, new_rownum) or []
+                rowvals = _read_single_row(sheets, sheet_id, tab_title, header, new_rownum) or []
 
                 # Get client's column config if available
                 from email_automation.clients import _fs
@@ -1099,6 +1111,8 @@ def api_accept_new_property():
                     for upd in extracted_updates:
                         print(f"   • {upd.get('column')}: {upd.get('newValue')}")
 
+            except BudgetDeferredError:
+                raise
             except Exception as e:
                 print(f"⚠️ Could not run AI extraction on PDFs: {e}")
                 import traceback
@@ -1112,6 +1126,14 @@ def api_accept_new_property():
             "rowNumber": new_rownum
         })
 
+    except BudgetDeferredError as e:
+        print(f"⏳ New-property PDF extraction deferred: {e}")
+        return jsonify({
+            "success": False,
+            "retryable": True,
+            "code": "openai_budget_deferred",
+            "error": "AI extraction is temporarily deferred; retry this property later.",
+        }), 503
     except Exception as e:
         print(f"❌ Failed to accept new property: {type(e).__name__}: {e}")
         import traceback

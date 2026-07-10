@@ -69,9 +69,10 @@ HEALTHY_SENT = {"status": "healthy", "operation": "sent_items_scan"}
 
 def _run_refresh(
     *, has_state_changed, upload_side_effect=None, uid="uid-1", invoke_backstop=False
-) -> tuple[MagicMock, FakeTokenCache, MagicMock]:
+) -> tuple[MagicMock, FakeTokenCache, MagicMock, bool]:
     """Drive refresh_and_process_user with a FakeTokenCache whose
-    has_state_changed is fixed. Returns (upload_mock, fake_cache, health_mock).
+    has_state_changed is fixed. Returns (upload_mock, fake_cache, health_mock,
+    state_after_run) so cleanup cannot mask a failed cache-marker reset.
 
     atexit.register/unregister use local handler tracking so the exit-time
     backstop can be captured and invoked without registering it with the real
@@ -86,6 +87,7 @@ def _run_refresh(
     upload_mock = MagicMock(side_effect=upload_side_effect)
     health_mock = MagicMock(return_value={})
     registered_handlers = []
+    state_after_run = fake_cache.has_state_changed
 
     def register_handler(handler) -> object:
         registered_handlers.append(handler)
@@ -118,18 +120,19 @@ def _run_refresh(
                 if not self_registered:
                     raise AssertionError("refresh_and_process_user did not register its cache backstop")
                 self_registered[-1]()
+            state_after_run = fake_cache.has_state_changed
     finally:
         # Neutralize any lingering exit-time handler that closed over fake_cache.
         fake_cache.has_state_changed = False
         os.unlink(token_path)
 
-    return upload_mock, fake_cache, health_mock
+    return upload_mock, fake_cache, health_mock, state_after_run
 
 
 class InlineTokenCachePersistTests(unittest.TestCase):
     def test_changed_cache_is_persisted_inline_for_the_uid(self):
         """(a) has_state_changed True → inline upload_token called with the uid."""
-        upload_mock, fake_cache, _ = _run_refresh(
+        upload_mock, fake_cache, _, state_after_run = _run_refresh(
             has_state_changed=True,
             invoke_backstop=True,
         )
@@ -145,10 +148,11 @@ class InlineTokenCachePersistTests(unittest.TestCase):
         self.assertEqual("uid-1", kwargs.get("user_id"))
         self.assertEqual(upload_mock.call_count, 1)
         self.assertEqual(fake_cache.serialize_calls, 1)
+        self.assertFalse(state_after_run)
 
     def test_unchanged_cache_skips_the_storage_put(self):
         """(b) has_state_changed False → no upload (idempotent no-op)."""
-        upload_mock, _, _ = _run_refresh(has_state_changed=False)
+        upload_mock, _, _, _ = _run_refresh(has_state_changed=False)
 
         self.assertFalse(
             upload_mock.called,
@@ -158,7 +162,7 @@ class InlineTokenCachePersistTests(unittest.TestCase):
     def test_persist_failure_does_not_propagate(self):
         """(c) a persist exception is swallowed — the run still completes and the
         health record is still written (the atexit backstop covers the upload)."""
-        upload_mock, fake_cache, health_mock = _run_refresh(
+        upload_mock, fake_cache, health_mock, state_after_run = _run_refresh(
             has_state_changed=True,
             upload_side_effect=[RuntimeError("Storage 503"), None],
             invoke_backstop=True,
@@ -166,7 +170,7 @@ class InlineTokenCachePersistTests(unittest.TestCase):
 
         self.assertEqual(upload_mock.call_count, 2)
         self.assertEqual(fake_cache.serialize_calls, 2)
-        self.assertFalse(fake_cache.has_state_changed)
+        self.assertFalse(state_after_run)
         self.assertTrue(
             health_mock.called,
             "a best-effort persist failure must not abort the user's run; "

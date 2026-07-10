@@ -82,6 +82,8 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
         self.insert_row = MagicMock(return_value=7)  # THE state-changing call
         self.apply_proposal = MagicMock(return_value={"applied": []})  # AI write
         self.propose = MagicMock(return_value={"updates": []})
+        self.read_single_row = MagicMock(return_value=[])
+        self.should_block_openai = MagicMock(return_value=False)
         self.append_links = MagicMock()
 
         # Firestore double. The hardened handler now loads the notification
@@ -122,12 +124,10 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
             patch("email_automation.sheets._read_header_row2", MagicMock(return_value=["address", "city", "email"])),
             patch("email_automation.sheets.format_sheet_columns_autosize_with_exceptions", MagicMock()),
             patch("email_automation.sheets.append_links_to_flyer_link_column", self.append_links),
-            # _read_row does not actually exist in email_automation.sheets; the
-            # handler imports it inside the pdfManifest branch (latent ImportError,
-            # swallowed by try/except). create=True so the faked AI path is testable.
-            patch("email_automation.sheets._read_row", MagicMock(return_value=[]), create=True),
+            patch("email_automation.sheet_operations._read_single_row", self.read_single_row),
             patch("email_automation.ai_processing.propose_sheet_updates", self.propose),
             patch("email_automation.ai_processing.apply_proposal_to_sheet", self.apply_proposal),
+            patch.object(appmod, "should_block_openai_call", self.should_block_openai),
             patch("email_automation.column_config.get_default_column_config", MagicMock(return_value={})),
         ]
         for p in self._patchers:
@@ -208,7 +208,23 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
         self.assertTrue(resp.get_json().get("success"))
         self.assertTrue(self.insert_row.called)
+        self.read_single_row.assert_called_once()
+        self.propose.assert_called_once()
         self.assert_no_send_to_disallowed("happy_pdf")
+
+    def test_budget_deferral_is_retryable_and_does_not_write_a_sheet_row(self):
+        self.should_block_openai.return_value = True
+        pd = valid_property_data(pdfManifest=[{"text": "some pdf text"}])
+
+        resp = self._post(valid_payload(propertyData=pd))
+
+        self.assertEqual(resp.status_code, 503, resp.get_data(as_text=True))
+        body = resp.get_json()
+        self.assertFalse(body.get("success"))
+        self.assertTrue(body.get("retryable"))
+        self.assertEqual(body.get("code"), "openai_budget_deferred")
+        self.insert_row.assert_not_called()
+        self.propose.assert_not_called()
 
     # ========================================================================
     # REQUIRED-FIELD MUTATIONS (expected robust -> 400)
