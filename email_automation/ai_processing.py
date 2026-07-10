@@ -1646,8 +1646,6 @@ def _augment_proposal_with_deterministic_extractions(
         col_name: Optional[str],
         value: Optional[str],
         reason: str,
-        *,
-        overwrite_existing_row: bool = False,
     ) -> None:
         # Resolve to the canonical sheet header spelling (#15 wrote canonical names;
         # #19's mapping values may be lowercase, e.g. "total sf" vs header "Total SF").
@@ -1655,10 +1653,7 @@ def _augment_proposal_with_deterministic_extractions(
         if not value or not canonical:
             return
         col_name = canonical
-        if (
-            not overwrite_existing_row
-            and (_row_value_for_column(rowvals, header, col_name) or "").strip()
-        ):
+        if (_row_value_for_column(rowvals, header, col_name) or "").strip():
             return
         update = {"column": col_name, "value": value, "confidence": 0.92, "reason": reason}
         existing = _proposal_update_for_column(proposal, col_name)
@@ -1722,83 +1717,90 @@ def _augment_proposal_with_deterministic_extractions(
     )
     fresh_blocks_drive_ins_flyer = fresh_mentions_drive_ins and not fresh_delegates_drive_ins
     fresh_blocks_docks_flyer = fresh_mentions_docks and not fresh_delegates_docks
-    _fill(
-        drive_ins_col,
-        fresh_drive_ins,
-        "Deterministic fallback parsed drive-in count from the broker's message.",
-        overwrite_existing_row=True,
-    )
-    _fill(
-        docks_col,
-        fresh_docks,
-        "Deterministic fallback parsed loading-dock count from the broker's message.",
-        overwrite_existing_row=True,
-    )
 
-    # If the fresh message discusses a loading feature but does not state a
-    # parseable count, an attachment must not silently supply (or preserve) a
-    # potentially stale number for that field. Keep the result conservative and
-    # let the model/request-for-clarification handle the broker's latest wording.
-    def _drop_attachment_count_when_fresh_is_ambiguous(
+    # Count regexes are evidence guards, not semantic extractors. They cannot
+    # reliably bind a number to the target property, distinguish current from
+    # hypothetical capacity, or aggregate subtotals. Never let them create or
+    # overwrite a fresh-message update. They may only WITHHOLD a model value that
+    # directly conflicts with the broker's latest explicit count.
+    def _drop_conflicting_model_count(
         col_name: Optional[str],
+        fresh_value: Optional[str],
+        fresh_blocks_flyer: bool,
         extractor,
     ) -> None:
         existing = _proposal_update_for_column(proposal, col_name)
         if not existing:
+            return
+        existing_value = str(existing.get("value") or "").strip()
+        if fresh_value is not None and existing_value != fresh_value:
+            proposal["updates"] = [
+                update for update in (proposal.get("updates") or []) if update is not existing
+            ]
+            return
+        if not fresh_blocks_flyer or fresh_value is not None:
             return
         attachment_values = set()
         for text in evidence_texts[1:]:
             value = extractor(text)
             if value is not None:
                 attachment_values.add(value)
-        if str(existing.get("value") or "").strip() in attachment_values:
+        if existing_value in attachment_values:
             proposal["updates"] = [
                 update for update in (proposal.get("updates") or []) if update is not existing
             ]
 
-    if fresh_blocks_drive_ins_flyer and fresh_drive_ins is None:
-        _drop_attachment_count_when_fresh_is_ambiguous(
-            drive_ins_col,
-            _extract_drive_in_count_from_text,
-        )
-    if fresh_blocks_docks_flyer and fresh_docks is None:
-        _drop_attachment_count_when_fresh_is_ambiguous(
-            docks_col,
-            _extract_dock_count_from_text,
+    _drop_conflicting_model_count(
+        drive_ins_col,
+        fresh_drive_ins,
+        fresh_blocks_drive_ins_flyer,
+        _extract_drive_in_count_from_text,
+    )
+    _drop_conflicting_model_count(
+        docks_col,
+        fresh_docks,
+        fresh_blocks_docks_flyer,
+        _extract_dock_count_from_text,
+    )
+
+    # Preserve the flyer-only regression, but only under an explicit delegation
+    # from the broker, a blank Sheet cell, no semantic-model update, and unanimous
+    # document evidence. Any disagreement stays blank for follow-up/review.
+    def _fill_unanimous_delegated_attachment_count(
+        col_name: Optional[str],
+        delegated: bool,
+        extractor,
+        label: str,
+    ) -> None:
+        if not delegated or _proposal_update_for_column(proposal, col_name):
+            return
+        if (_row_value_for_column(rowvals, header, col_name) or "").strip():
+            return
+        values = {
+            value
+            for text in evidence_texts[1:]
+            if (value := extractor(text)) is not None
+        }
+        if len(values) != 1:
+            return
+        _fill(
+            col_name,
+            next(iter(values)),
+            f"Deterministic fallback parsed unanimous {label} from explicitly delegated documents.",
         )
 
-    # An existing model proposal may have come from any attachment. Re-evaluate
-    # ordered attachment evidence deterministically when the Sheet cell itself is
-    # blank; the first explicit count for each field wins.
-    drive_ins_filled = bool(
-        (_row_value_for_column(rowvals, header, drive_ins_col) or "").strip()
-        or fresh_drive_ins is not None
+    _fill_unanimous_delegated_attachment_count(
+        drive_ins_col,
+        fresh_delegates_drive_ins,
+        _extract_drive_in_count_from_text,
+        "drive-in count",
     )
-    docks_filled = bool(
-        (_row_value_for_column(rowvals, header, docks_col) or "").strip()
-        or fresh_docks is not None
+    _fill_unanimous_delegated_attachment_count(
+        docks_col,
+        fresh_delegates_docks,
+        _extract_dock_count_from_text,
+        "loading-dock count",
     )
-    for text in evidence_texts[1:]:
-        if (
-            fresh_drive_ins is None
-            and not fresh_blocks_drive_ins_flyer
-            and not drive_ins_filled
-        ):
-            attachment_drive_ins = _extract_drive_in_count_from_text(text)
-            _fill(
-                drive_ins_col,
-                attachment_drive_ins,
-                "Deterministic fallback parsed drive-in count from the broker's flyer.",
-            )
-            drive_ins_filled = attachment_drive_ins is not None
-        if fresh_docks is None and not fresh_blocks_docks_flyer and not docks_filled:
-            attachment_docks = _extract_dock_count_from_text(text)
-            _fill(
-                docks_col,
-                attachment_docks,
-                "Deterministic fallback parsed loading-dock count from the broker's flyer.",
-            )
-            docks_filled = attachment_docks is not None
     return proposal
 
 
@@ -1879,6 +1881,29 @@ _DELEGATION_NEGATION_RE = re.compile(
     r"\b(?:no|not|doesn['’]?t|does\s+not|without|uncertain|unknown|tbd)\b",
     re.IGNORECASE,
 )
+_DELEGATION_CLAUSE_BOUNDARY_RE = re.compile(
+    r"[,;]|\b(?:but|however|although)\b",
+    re.IGNORECASE,
+)
+
+
+def _delegation_match_negates_feature(span: str, keyword_re: str) -> bool:
+    """True when every feature mention in a delegation span is locally negated."""
+    boundaries = list(_DELEGATION_CLAUSE_BOUNDARY_RE.finditer(span))
+    found_feature = False
+    for feature in re.finditer(keyword_re, span, re.IGNORECASE):
+        found_feature = True
+        start = max(
+            (boundary.end() for boundary in boundaries if boundary.end() <= feature.start()),
+            default=0,
+        )
+        end = min(
+            (boundary.start() for boundary in boundaries if boundary.start() >= feature.end()),
+            default=len(span),
+        )
+        if not _DELEGATION_NEGATION_RE.search(span[start:end]):
+            return False
+    return found_feature
 
 
 def _delegates_feature_count_to_attachment(text: str, keyword_re: str) -> bool:
@@ -1889,6 +1914,15 @@ def _delegates_feature_count_to_attachment(text: str, keyword_re: str) -> bool:
     # "See attached flyer:\nDocks and drive-in counts." Keep other line breaks
     # as hard boundaries so unrelated nearby clauses cannot authorize a field.
     normalized = re.sub(r":\s*\n\s*", ": ", text)
+    global_delegation = re.search(
+        rf"\b(?:all\s+(?:the\s+)?(?:specs?|details?)|all\s+loading\s+information)\b"
+        rf"[^,;.!?\n]{{0,80}}\b(?:in|on|from|per)\b[^,;.!?\n]{{0,80}}"
+        rf"\b{_ATTACHMENT_NOUN_RE}\b",
+        normalized,
+        re.IGNORECASE,
+    )
+    if global_delegation and not _DELEGATION_NEGATION_RE.search(global_delegation.group(0)):
+        return True
     gap = r"[^,;.!?\n]"
     patterns = (
         # "See the attached flyer for dock counts."
@@ -1911,7 +1945,7 @@ def _delegates_feature_count_to_attachment(text: str, keyword_re: str) -> bool:
     )
     for pattern in patterns:
         match = re.search(pattern, normalized, re.IGNORECASE)
-        if match and not _DELEGATION_NEGATION_RE.search(match.group(0)):
+        if match and not _delegation_match_negates_feature(match.group(0), keyword_re):
             return True
     return False
 # "<count> drive-in(s)/grade-level (ramp|door)s" — count immediately precedes the
