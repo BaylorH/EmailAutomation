@@ -1161,8 +1161,46 @@ class OutboxSafetyTests(unittest.TestCase):
 
         with patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_dead_letter_campaign_recipient_row_mismatch_if_needed", return_value=False), \
              patch("email_automation.clients._fs", FakeFirestore()), \
              patch.object(email_module, "_select_script_for_recipient", return_value="Wrong fallback body") as select_script, \
+             patch.object(email_module, "send_and_index_email", return_value={
+                 "sent": ["bp21harrison@gmail.com"],
+                 "errors": {},
+             }) as send_and_index_email, \
+             patch.object(email_module, "_finalize_successful_outbox_item"):
+            email_module._send_single_outbox_item(
+                "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        select_script.assert_not_called()
+        send_and_index_email.assert_called_once()
+        self.assertEqual(send_and_index_email.call_args.args[2], reviewed_body)
+
+    def test_campaign_launch_outbox_uses_reviewed_body_even_for_existing_contact(self):
+        reviewed_body = (
+            "Hi Test,\n\nI am checking availability and specs for the property "
+            "in the subject."
+        )
+        doc = FakeDoc({
+            "assignedEmails": ["bp21harrison@gmail.com"],
+            "script": reviewed_body,
+            "clientId": "client-1",
+            "subject": "570 W Cheyenne Ave, North Las Vegas",
+            "rowNumber": 3,
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "scriptSelectionMode": "exact",
+            "actionAuditId": "audit-launch",
+        }, doc_id="outbox-launch")
+
+        with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_dead_letter_campaign_recipient_row_mismatch_if_needed", return_value=False), \
+             patch("email_automation.clients._fs", FakeFirestore()), \
+             patch.object(email_module, "_select_script_for_recipient", return_value="Wrong history-based body") as select_script, \
              patch.object(email_module, "send_and_index_email", return_value={
                  "sent": ["bp21harrison@gmail.com"],
                  "errors": {},
