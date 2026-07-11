@@ -143,6 +143,7 @@ class GraphScanHealthTests(unittest.TestCase):
                      "status": "healthy",
                      "operation": "sent_items_scan",
                  }), \
+                 patch.object(main, "retry_processing_failures"), \
                  patch.object(main, "process_pending_responses"), \
                  patch.object(main, "check_and_send_followups"), \
                  patch.object(main, "auto_cleanup_firestore"), \
@@ -185,6 +186,7 @@ class GraphScanHealthTests(unittest.TestCase):
                      "status": "healthy",
                      "operation": "sent_items_scan",
                  }), \
+                 patch.object(main, "retry_processing_failures"), \
                  patch.object(main, "process_pending_responses"), \
                  patch.object(main, "check_and_send_followups"), \
                  patch.object(main, "auto_cleanup_firestore"), \

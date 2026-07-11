@@ -449,7 +449,8 @@ class OutboxSafetyTests(unittest.TestCase):
                 "errors": {},
             }
 
-        with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+        with patch("email_automation.clients._fs", FakeFirestore()), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "get_contact_email_count", return_value=0), \
@@ -1405,7 +1406,8 @@ class OutboxSafetyTests(unittest.TestCase):
                  "conversationIds": {"bp21harrison+reviewed@gmail.com": "conversation-reviewed"},
              }) as send_and_index_email, \
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
-             patch.object(email_module, "highlight_row"):
+             patch.object(email_module, "highlight_row"), \
+             patch.object(email_module, "delete_notification_and_decrement_counters"):
             email_module._send_single_outbox_item(
                 "uid-1",
                 {"Authorization": "Bearer token"},

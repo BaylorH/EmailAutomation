@@ -370,8 +370,8 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
              patch.object(processing, "get_client_automation_decision", return_value=campaign_decision) as decision_spy, \
              patch.object(processing, "_find_client_id_by_email", return_value=resolved_client_id) as resolver_spy, \
              patch.object(processing, "get_thread_status", return_value=thread_status), \
-             patch.object(processing, "save_message", return_value=True), \
-             patch.object(processing, "index_message_id", return_value=True), \
+             patch.object(processing, "save_message", return_value=True) as save_spy, \
+             patch.object(processing, "index_message_id", return_value=True) as index_spy, \
              patch.object(processing, "dump_thread_from_firestore", return_value=None), \
              patch.object(processing, "fetch_and_log_sheet_for_thread", fetch_spy), \
              patch.object(processing, "send_reply_in_thread", send_spy), \
@@ -389,6 +389,8 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
         return (
             send_spy,
             fetch_spy,
+            save_spy,
+            index_spy,
             raised_sentinel,
             raised_retryable,
             fake_fs,
@@ -398,7 +400,7 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
 
     def test_terminal_thread_suppresses_inbox_autoreply_pipeline(self):
         # TERMINAL (stopped): pipeline is suppressed at the terminal gate.
-        send_spy, fetch_spy, raised, retryable, _fake_fs, _decision, _resolver = self._drive(processing.THREAD_STATUS["stopped"])
+        send_spy, fetch_spy, _save, _index, raised, retryable, _fake_fs, _decision, _resolver = self._drive(processing.THREAD_STATUS["stopped"])
         send_spy.assert_not_called()
         fetch_spy.assert_not_called()
         self.assertFalse(
@@ -409,7 +411,7 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
 
         # POSITIVE CONTROL (active): identical reply enters the pipeline past the
         # terminal gate — proving the terminal status is what stops the send.
-        send_spy2, fetch_spy2, raised2, retryable2, _fake_fs2, _decision2, _resolver2 = self._drive(processing.THREAD_STATUS["active"])
+        send_spy2, fetch_spy2, _save2, _index2, raised2, retryable2, _fake_fs2, _decision2, _resolver2 = self._drive(processing.THREAD_STATUS["active"])
         fetch_spy2.assert_called_once()
         self.assertTrue(
             raised2,
@@ -425,13 +427,25 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
             metadata={"terminal": False, "stopKind": "maintenance_pause"},
         )
 
-        send_spy, fetch_spy, raised, retryable, fake_fs, _decision, _resolver = self._drive(
+        (
+            send_spy,
+            fetch_spy,
+            save_spy,
+            index_spy,
+            raised,
+            retryable,
+            fake_fs,
+            _decision,
+            _resolver,
+        ) = self._drive(
             processing.THREAD_STATUS["active"],
             campaign_decision=decision,
         )
 
         send_spy.assert_not_called()
         fetch_spy.assert_not_called()
+        save_spy.assert_called_once()
+        index_spy.assert_called_once()
         self.assertFalse(raised)
         self.assertTrue(
             retryable,
@@ -447,6 +461,8 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
         (
             _send_spy,
             fetch_spy,
+            _save_spy,
+            _index_spy,
             raised,
             retryable,
             fake_fs,
@@ -478,6 +494,8 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
         (
             _send_spy,
             fetch_spy,
+            _save_spy,
+            _index_spy,
             raised,
             retryable,
             _fake_fs,

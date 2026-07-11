@@ -79,6 +79,8 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         with patch.object(processing, "exponential_backoff_request", return_value=response), \
              patch.object(processing, "has_processed", return_value=False), \
              patch.object(processing, "_match_message_to_thread", return_value="thread-1"), \
+             patch.object(processing, "_has_processing_failure_record", return_value=False), \
+             patch.object(processing, "_client_id_for_processing_failure", return_value="unknown"), \
              patch.object(processing, "process_inbox_message", side_effect=ValueError("flyer_links crash")), \
              patch.object(processing, "_record_ai_processing_failure") as record_failure, \
              patch.object(processing, "mark_processed") as mark_processed, \
@@ -128,6 +130,7 @@ class ProcessingRetryabilityTests(unittest.TestCase):
              patch.object(processing, "_match_message_to_thread", return_value="thread-1"), \
              patch.object(processing, "_has_processing_failure_record", return_value=True, create=True), \
              patch.object(processing, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation, create=True) as continuation_guard, \
+             patch.object(processing, "_client_id_for_processing_failure", return_value="unknown"), \
              patch.object(processing, "process_inbox_message") as process_message, \
              patch.object(processing, "mark_processed") as mark_processed, \
              patch.object(processing, "_record_processing_failure_blocked_by_manual_continuation", create=True) as record_blocked, \
