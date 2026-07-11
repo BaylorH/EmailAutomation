@@ -100,6 +100,18 @@ def classify_client_automation_state(
             source=source,
         )
 
+    if source == "archivedClients":
+        reason, reason_field = _pause_reason(client_data, CLIENT_AUTOMATION_PAUSED_REASON)
+        return _decision(
+            CAMPAIGN_AUTOMATION_BLOCKED,
+            reason,
+            client_data,
+            source=source,
+            stop_kind="terminal_stop",
+            terminal=True,
+            reason_field=reason_field,
+        )
+
     automation_paused = client_data.get("automationPaused")
     legacy_automation_paused = client_data.get("automation_paused")
     if automation_paused is not None and not isinstance(automation_paused, bool):
@@ -137,18 +149,6 @@ def classify_client_automation_state(
             source=source,
         )
     status = normalize_client_status(status_value) if status_value is not None else ""
-
-    if source == "archivedClients":
-        reason, reason_field = _pause_reason(client_data, CLIENT_AUTOMATION_PAUSED_REASON)
-        return _decision(
-            CAMPAIGN_AUTOMATION_BLOCKED,
-            reason,
-            client_data,
-            source=source,
-            stop_kind="terminal_stop",
-            terminal=True,
-            reason_field=reason_field,
-        )
 
     if status in CLIENT_TERMINAL_STATUSES:
         reason, reason_field = _pause_reason(client_data, CLIENT_AUTOMATION_PAUSED_REASON)
@@ -196,6 +196,17 @@ def classify_client_automation_state(
         client_data,
         source=source,
     )
+
+
+def campaign_suppression_kind(decision: CampaignAutomationDecision) -> Optional[str]:
+    """Normalize campaign decisions for autonomous send/retry callers."""
+    if decision.state == CAMPAIGN_AUTOMATION_ALLOW:
+        return None
+    if decision.state == CAMPAIGN_AUTOMATION_BLOCKED and decision.metadata.get("terminal"):
+        return "terminal"
+    if decision.state == CAMPAIGN_AUTOMATION_BLOCKED:
+        return "maintenance"
+    return "unknown"
 
 
 def is_client_automation_paused(client_data: Optional[Dict[str, Any]]) -> bool:

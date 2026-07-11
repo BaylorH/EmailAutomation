@@ -256,6 +256,61 @@ class FollowupTerminalStateTests(unittest.TestCase):
             maintenance_context.run(followup._get_followup_campaign_suppression)[0],
         )
 
+    def test_terminal_followup_persists_the_clean_campaign_reason(self):
+        past = datetime.now(timezone.utc) - followup.timedelta(hours=1)
+
+        class WaitingQuery:
+            def __init__(self, docs):
+                self.docs = docs
+
+            def where(self, *_args, **_kwargs):
+                return self
+
+            def stream(self):
+                return self.docs
+
+        thread_ref = FakeThreadRef()
+        thread_doc = type("ThreadDoc", (), {
+            "id": "thread-terminal",
+            "reference": thread_ref,
+            "to_dict": lambda self: {
+                "clientId": "client-1",
+                "followUpStatus": "waiting",
+                "followUpConfig": {
+                    "enabled": True,
+                    "nextFollowUpAt": past,
+                    "currentFollowUpIndex": 0,
+                    "followUps": [{"message": "Following up."}],
+                },
+                "hasInboundReply": False,
+            },
+        })()
+        fake_fs = WaitingQuery([thread_doc])
+        fake_fs.collection = lambda _name: fake_fs
+        fake_fs.document = lambda _name: fake_fs
+        terminal = CampaignAutomationDecision(
+            state="blocked",
+            reason="client_stopped_by_user",
+            client_data={"status": "stopped"},
+            metadata={"terminal": True, "stopKind": "terminal_stop"},
+        )
+
+        def suppressed_send(**_kwargs):
+            followup._set_followup_campaign_suppression(terminal)
+            return False
+
+        with patch.object(followup, "_fs", fake_fs), patch.object(
+            followup, "_next_business_followup_time", side_effect=lambda now, _cfg: now
+        ), patch.object(followup, "_claim_followup", return_value=True), patch.object(
+            followup, "_send_followup_email", side_effect=suppressed_send
+        ):
+            followup.check_and_send_followups(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertEqual("stopped", thread_ref.updates[-1]["followUpStatus"])
+        self.assertEqual("client_stopped_by_user", thread_ref.updates[-1]["statusReason"])
+
     def test_followup_suppression_ignores_stale_shared_send_attributes(self):
         followup._clear_followup_campaign_suppression()
         followup._send_followup_email.campaign_suppression_kind = "terminal"

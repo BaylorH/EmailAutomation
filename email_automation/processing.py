@@ -59,8 +59,7 @@ from .property_images import (
     select_property_image_candidate,
 )
 from .campaign_safety import (
-    CAMPAIGN_AUTOMATION_ALLOW,
-    CAMPAIGN_AUTOMATION_BLOCKED,
+    campaign_suppression_kind as classify_campaign_suppression,
     get_client_automation_decision,
     stopped_followup_patch,
 )
@@ -97,18 +96,8 @@ class RetryableProcessingError(Exception):
     """Raised when a message should remain unprocessed so the next scan can retry it."""
 
 
-def _campaign_suppression_kind(decision) -> Optional[str]:
-    if decision.state == CAMPAIGN_AUTOMATION_ALLOW:
-        return None
-    if decision.state == CAMPAIGN_AUTOMATION_BLOCKED and decision.metadata.get("terminal"):
-        return "terminal"
-    if decision.state == CAMPAIGN_AUTOMATION_BLOCKED:
-        return "maintenance"
-    return "unknown"
-
-
 def _set_reply_campaign_suppression(decision) -> None:
-    kind = _campaign_suppression_kind(decision)
+    kind = classify_campaign_suppression(decision)
     _set_reply_send_outcome(
         error=f"Campaign automation suppressed before Graph send: {decision.reason}",
         outcome=(
@@ -1101,7 +1090,7 @@ def retry_processing_failures(
         attempts = int(data.get("processingAttempts") or 0)
 
         decision = get_client_automation_decision(user_id, client_id)
-        suppression_kind = _campaign_suppression_kind(decision)
+        suppression_kind = classify_campaign_suppression(decision)
         if suppression_kind:
             terminal = suppression_kind == "terminal"
             try:
@@ -3624,7 +3613,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         user_id,
         thread_data.get("clientId"),
     )
-    campaign_suppression_kind = _campaign_suppression_kind(campaign_decision)
+    campaign_suppression_kind = classify_campaign_suppression(campaign_decision)
     client_terminal = campaign_suppression_kind == "terminal"
     client_denied = campaign_suppression_kind is not None
     if client_terminal:

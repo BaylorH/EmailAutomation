@@ -1020,13 +1020,18 @@ class OutboxSafetyTests(unittest.TestCase):
 
     def test_maintenance_paused_client_outbox_item_stays_queued_without_send(self):
         doc_ref = FakeDocRef("paused-outbox")
-        data = {"clientId": "client-1", "script": "Hi Avery"}
+        data = {
+            "clientId": "client-1",
+            "script": "Hi Avery",
+            "actionAuditId": "audit-1",
+        }
 
         with patch.object(
             email_module,
             "get_client_automation_pause",
             return_value=(True, "admin_incident_pause", {"automationPaused": True}),
-        ), patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter:
+        ), patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter, \
+             patch.object(email_module, "_update_action_audit") as update_action_audit:
             blocked = email_module._pause_client_outbox_item_if_needed(
                 "uid-1",
                 doc_ref,
@@ -1038,6 +1043,11 @@ class OutboxSafetyTests(unittest.TestCase):
         retry_payload = doc_ref.set_calls[-1][0][0]
         self.assertEqual("queued", retry_payload["status"])
         self.assertEqual("blocked", retry_payload["automationSuppressedState"])
+        update_action_audit.assert_called_once()
+        audit_payload = update_action_audit.call_args.args[2]
+        self.assertEqual("queued", audit_payload["status"])
+        self.assertEqual("blocked", audit_payload["automationSuppressedState"])
+        self.assertEqual("admin_incident_pause", audit_payload["automationSuppressedReason"])
 
     def test_stopped_client_outbox_item_moves_to_dead_letter_before_send(self):
         doc_ref = FakeDocRef("stopped-outbox")

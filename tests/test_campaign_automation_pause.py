@@ -267,6 +267,41 @@ class CampaignAutomationPauseTests(unittest.TestCase):
         self.assertEqual("archivedClients", decision.metadata["source"])
         self.assertTrue(decision.metadata["terminal"])
 
+    def test_archived_client_is_terminal_even_when_legacy_fields_are_malformed(self):
+        malformed_archived_records = (
+            {"status": [], "automationPaused": "false"},
+            {"status": "live", "automationPaused": True, "automation_paused": False},
+        )
+
+        for archived_record in malformed_archived_records:
+            with self.subTest(archived_record=archived_record):
+                decision = campaign_safety.classify_client_automation_state(
+                    archived_record,
+                    source="archivedClients",
+                )
+
+                self.assertEqual(campaign_safety.CAMPAIGN_AUTOMATION_BLOCKED, decision.state)
+                self.assertEqual("terminal_stop", decision.metadata["stopKind"])
+                self.assertTrue(decision.metadata["terminal"])
+
+    def test_shared_suppression_classifier_covers_every_decision_state(self):
+        decisions = (
+            (campaign_safety.CAMPAIGN_AUTOMATION_ALLOW, False, None),
+            (campaign_safety.CAMPAIGN_AUTOMATION_BLOCKED, True, "terminal"),
+            (campaign_safety.CAMPAIGN_AUTOMATION_BLOCKED, False, "maintenance"),
+            (campaign_safety.CAMPAIGN_AUTOMATION_UNKNOWN, False, "unknown"),
+        )
+
+        for state, terminal, expected in decisions:
+            with self.subTest(state=state, terminal=terminal):
+                decision = campaign_safety.CampaignAutomationDecision(
+                    state=state,
+                    reason="test_reason",
+                    client_data={},
+                    metadata={"terminal": terminal},
+                )
+                self.assertEqual(expected, campaign_safety.campaign_suppression_kind(decision))
+
     def test_read_error_log_uses_stable_reason_without_raw_exception_text(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

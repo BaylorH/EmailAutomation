@@ -474,29 +474,40 @@ def _pause_client_outbox_item_if_needed(user_id: str, doc_ref, data: dict) -> bo
         )
         return True
 
-    _preserve_retryable_outbox_suppression(doc_ref, decision)
+    _preserve_retryable_outbox_suppression(user_id, doc_ref, data, decision)
     return True
 
 
 def _preserve_retryable_outbox_suppression(
+    user_id: str,
     doc_ref,
+    data: Dict[str, Any],
     decision,
     *,
     extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Release a claim without consuming an attempt or destroying queued work."""
-    doc_ref.set(
+    suppression_payload = {
+        "status": "queued",
+        "processingBy": None,
+        "processingAt": None,
+        "automationSuppressedState": decision.state,
+        "automationSuppressedReason": decision.reason,
+        "automationSuppressedAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+        **(extra or {}),
+    }
+    doc_ref.set(suppression_payload, merge=True)
+    _terminalize_outbox_action_audit(
+        user_id,
+        doc_ref,
+        data,
+        "queued",
         {
-            "status": "queued",
-            "processingBy": None,
-            "processingAt": None,
             "automationSuppressedState": decision.state,
             "automationSuppressedReason": decision.reason,
             "automationSuppressedAt": SERVER_TIMESTAMP,
-            "updatedAt": SERVER_TIMESTAMP,
-            **(extra or {}),
         },
-        merge=True,
     )
 
 
@@ -569,7 +580,9 @@ def _handle_suppressed_outbox_send_result(
         reason = send_result.get("campaignAutomationReason") or "campaign_state_unavailable"
 
     _preserve_retryable_outbox_suppression(
+        user_id,
         doc_ref,
+        data,
         _SuppressionDecision(),
         extra=partial_state,
     )

@@ -86,7 +86,7 @@ class FakeFirestore:
 
 
 class PendingResponsesTests(unittest.TestCase):
-    def test_other_context_sent_unindexed_outcome_cannot_reconcile_delete_current_retry(self):
+    def test_failed_send_without_local_outcome_keeps_current_retry(self):
         active_doc = FakeDoc("thread-active", {
             "threadId": "thread-active",
             "msgId": "message-2",
@@ -96,29 +96,8 @@ class PendingResponsesTests(unittest.TestCase):
             "attempts": 0,
         })
         fake_fs = FakeFirestore([active_doc])
-        other_context = copy_context()
-
         def fake_send_reply_in_thread(**_kwargs):
-            other_context.run(
-                setattr,
-                fake_send_reply_in_thread,
-                "last_error",
-                "other request sent but could not index",
-            )
-            other_context.run(
-                setattr, fake_send_reply_in_thread, "sent_but_unindexed", True
-            )
-            other_context.run(
-                setattr,
-                fake_send_reply_in_thread,
-                "last_outcome",
-                "sent_but_unindexed",
-            )
             return False
-
-        fake_send_reply_in_thread.last_error = None
-        fake_send_reply_in_thread.sent_but_unindexed = False
-        fake_send_reply_in_thread.last_outcome = None
 
         with self._mock_clients_module(fake_fs), patch.object(
             processing, "send_reply_in_thread", new=fake_send_reply_in_thread
@@ -163,16 +142,27 @@ class PendingResponsesTests(unittest.TestCase):
         )
 
     def test_pending_suppression_ignores_stale_shared_send_attributes(self):
-        processing._clear_reply_campaign_suppression()
-        processing.send_reply_in_thread.last_outcome = "blocked_campaign_terminal"
-        processing.send_reply_in_thread.last_campaign_decision = CampaignAutomationDecision(
+        token = processing._REPLY_SEND_OUTCOME.set(processing.ReplySendOutcome())
+        self.addCleanup(processing._REPLY_SEND_OUTCOME.reset, token)
+        stale_decision = CampaignAutomationDecision(
             state="blocked",
             reason="other_campaign_stopped",
             client_data={},
             metadata={"terminal": True},
         )
 
-        kind, decision = pending_responses._get_local_campaign_suppression()
+        with patch.object(
+            processing.send_reply_in_thread,
+            "last_outcome",
+            "blocked_campaign_terminal",
+            create=True,
+        ), patch.object(
+            processing.send_reply_in_thread,
+            "last_campaign_decision",
+            stale_decision,
+            create=True,
+        ):
+            kind, decision = pending_responses._get_local_campaign_suppression()
 
         self.assertIsNone(kind)
         self.assertIsNone(decision)
@@ -351,9 +341,9 @@ class PendingResponsesTests(unittest.TestCase):
             metadata={"terminal": False, "stopKind": "none"},
         )
 
-        fail_send = lambda **_kwargs: (_ for _ in ()).throw(
-            AssertionError("unknown campaign state must not send")
-        )
+        def fail_send(**_kwargs):
+            raise AssertionError("unknown campaign state must not send")
+
         with self._mock_clients_module(fake_fs), patch.object(
             processing, "send_reply_in_thread", new=fail_send
         ):

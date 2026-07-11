@@ -40,8 +40,7 @@ from .sent_mail_guard import (
     sent_after_from_retry_data,
 )
 from .campaign_safety import (
-    CAMPAIGN_AUTOMATION_ALLOW,
-    CAMPAIGN_AUTOMATION_BLOCKED,
+    campaign_suppression_kind as classify_campaign_suppression,
     get_client_automation_decision,
     stopped_followup_patch,
 )
@@ -81,18 +80,8 @@ _FOLLOWUP_SEND_OUTCOME = ContextVar(
 )
 
 
-def _campaign_suppression_kind(decision) -> Optional[str]:
-    if decision.state == CAMPAIGN_AUTOMATION_ALLOW:
-        return None
-    if decision.state == CAMPAIGN_AUTOMATION_BLOCKED and decision.metadata.get("terminal"):
-        return "terminal"
-    if decision.state == CAMPAIGN_AUTOMATION_BLOCKED:
-        return "maintenance"
-    return "unknown"
-
-
 def _set_followup_campaign_suppression(decision) -> None:
-    kind = _campaign_suppression_kind(decision)
+    kind = classify_campaign_suppression(decision)
     _set_followup_send_outcome(
         campaign_suppression_kind=kind,
         campaign_decision=decision,
@@ -520,7 +509,7 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
             user_id,
             thread_data.get("clientId"),
         )
-        suppression_kind = _campaign_suppression_kind(campaign_decision)
+        suppression_kind = classify_campaign_suppression(campaign_decision)
         if suppression_kind == "terminal":
             print(
                 f"   ⏹️ Thread {thread_id[:20]}... belongs to stopped client; "
@@ -644,8 +633,13 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
             campaign_suppression_kind = send_outcome.campaign_suppression_kind
             if campaign_suppression_kind == "terminal":
                 try:
+                    stop_reason = (
+                        send_outcome.campaign_decision.reason
+                        if send_outcome.campaign_decision
+                        else send_outcome.error
+                    )
                     thread_doc.reference.update(
-                        stopped_followup_patch(send_outcome.error)
+                        stopped_followup_patch(stop_reason)
                     )
                 except Exception as e:
                     print(f"   ⚠️ Failed to terminalize stopped follow-up: {e}")

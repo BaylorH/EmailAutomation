@@ -67,11 +67,15 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
             client_data={},
             metadata={"terminal": True},
         )
+        self.addCleanup(processing._reset_reply_send_outcome)
+        processing._reset_reply_send_outcome()
+        processing._set_reply_send_outcome(
+            error="current request failed",
+            outcome="send_failed",
+            sent_but_unindexed=False,
+        )
         current_context = copy_context()
         other_context = copy_context()
-        processing.send_reply_in_thread.last_error = "current request failed"
-        processing.send_reply_in_thread.last_outcome = "send_failed"
-        processing.send_reply_in_thread.sent_but_unindexed = False
         other_context.run(processing._set_reply_campaign_suppression, terminal)
 
         with patch.object(processing, "queue_pending_response") as queue_retry, \
