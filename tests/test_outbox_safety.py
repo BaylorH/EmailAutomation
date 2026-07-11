@@ -97,6 +97,20 @@ def _seed_open_thread(fake_fs, user_id="uid-1", thread_id="thread-1",
     ] = FakeSnapshot({"direction": "inbound"})
 
 
+def _action_audit_payload(fake_fs, user_id, audit_id):
+    audit_path = (
+        "collection", "users", "document", user_id,
+        "collection", "actionAudit", "document", audit_id,
+    )
+    matches = [
+        payload for path, payload, _merge in fake_fs.set_calls
+        if path == audit_path
+    ]
+    if len(matches) != 1:
+        raise AssertionError(f"Expected one actionAudit write at {audit_path}, found {len(matches)}")
+    return matches[0]
+
+
 class FakeSnapshot:
     def __init__(self, data=None, exists=True):
         self._data = data or {}
@@ -1328,7 +1342,7 @@ class OutboxSafetyTests(unittest.TestCase):
         save_outbox_reply_message.assert_called_once()
         delete_notification.assert_called_once_with("uid-1", "client-1", "notification-1")
         self.assertTrue(doc.reference.deleted)
-        audit_payload = fake_fs.set_calls[-2][1]
+        audit_payload = _action_audit_payload(fake_fs, "uid-1", "audit-dashboard-reply")
         self.assertEqual("sent", audit_payload["status"])
         self.assertEqual("audit-dashboard-reply", doc.to_dict()["actionAuditId"])
         self.assertEqual("graph-reply-message-1", audit_payload["sentMessageId"])
@@ -1379,7 +1393,7 @@ class OutboxSafetyTests(unittest.TestCase):
             ["baylor@manifoldengineering.ai"],
             save_outbox_reply_message.call_args.kwargs["cc_emails"],
         )
-        audit_payload = fake_fs.set_calls[-2][1]
+        audit_payload = _action_audit_payload(fake_fs, "uid-1", "audit-dashboard-reply")
         self.assertEqual("sent", audit_payload["status"])
         self.assertEqual(
             ["bp21harrison@gmail.com", "baylor@manifoldengineering.ai"],
@@ -1418,7 +1432,7 @@ class OutboxSafetyTests(unittest.TestCase):
         send_and_index_email.assert_called_once()
         self.assertEqual(["bp21harrison+reviewed@gmail.com"], send_and_index_email.call_args.args[3])
         self.assertTrue(doc.reference.deleted)
-        audit_payload = fake_fs.set_calls[-2][1]
+        audit_payload = _action_audit_payload(fake_fs, "uid-1", "audit-dashboard-reply")
         self.assertEqual("sent", audit_payload["status"])
         self.assertEqual("draft-reviewed", audit_payload["sentMessageId"])
 

@@ -361,6 +361,15 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
 
         send_spy = MagicMock(name="send_reply_in_thread", return_value=True)
         fetch_spy = MagicMock(name="fetch_and_log_sheet_for_thread", side_effect=_Sentinel())
+        persistence_events = []
+
+        def record_save(*_args, **_kwargs):
+            persistence_events.append("save")
+            return True
+
+        def record_index(*_args, **_kwargs):
+            persistence_events.append("index")
+            return True
 
         with patch.object(processing, "requests") as fake_requests, \
              patch.object(processing, "exponential_backoff_request", side_effect=lambda func, **k: func()), \
@@ -370,8 +379,8 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
              patch.object(processing, "get_client_automation_decision", return_value=campaign_decision) as decision_spy, \
              patch.object(processing, "_find_client_id_by_email", return_value=resolved_client_id) as resolver_spy, \
              patch.object(processing, "get_thread_status", return_value=thread_status), \
-             patch.object(processing, "save_message", return_value=True) as save_spy, \
-             patch.object(processing, "index_message_id", return_value=True) as index_spy, \
+             patch.object(processing, "save_message", side_effect=record_save) as save_spy, \
+             patch.object(processing, "index_message_id", side_effect=record_index) as index_spy, \
              patch.object(processing, "dump_thread_from_firestore", return_value=None), \
              patch.object(processing, "fetch_and_log_sheet_for_thread", fetch_spy), \
              patch.object(processing, "send_reply_in_thread", send_spy), \
@@ -391,6 +400,7 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
             fetch_spy,
             save_spy,
             index_spy,
+            persistence_events,
             raised_sentinel,
             raised_retryable,
             fake_fs,
@@ -400,9 +410,37 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
 
     def test_terminal_thread_suppresses_inbox_autoreply_pipeline(self):
         # TERMINAL (stopped): pipeline is suppressed at the terminal gate.
-        send_spy, fetch_spy, _save, _index, raised, retryable, _fake_fs, _decision, _resolver = self._drive(processing.THREAD_STATUS["stopped"])
+        (
+            send_spy,
+            fetch_spy,
+            save_spy,
+            index_spy,
+            persistence_events,
+            raised,
+            retryable,
+            _fake_fs,
+            _decision,
+            _resolver,
+        ) = self._drive(processing.THREAD_STATUS["stopped"])
         send_spy.assert_not_called()
         fetch_spy.assert_not_called()
+        self.assertEqual(
+            (
+                "uid-terminal",
+                "thread-terminal-1",
+                "<broker-reply-terminal@acme.com>",
+            ),
+            save_spy.call_args.args[:3],
+        )
+        saved_record = save_spy.call_args.args[3]
+        self.assertEqual("inbound", saved_record["direction"])
+        self.assertEqual("<broker-reply-terminal@acme.com>", saved_record["headers"]["internetMessageId"])
+        index_spy.assert_called_once_with(
+            "uid-terminal",
+            "<broker-reply-terminal@acme.com>",
+            "thread-terminal-1",
+        )
+        self.assertEqual(["save", "index"], persistence_events)
         self.assertFalse(
             raised,
             "terminal thread must return before the pipeline (no fetch_and_log)",
@@ -411,7 +449,18 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
 
         # POSITIVE CONTROL (active): identical reply enters the pipeline past the
         # terminal gate — proving the terminal status is what stops the send.
-        send_spy2, fetch_spy2, _save2, _index2, raised2, retryable2, _fake_fs2, _decision2, _resolver2 = self._drive(processing.THREAD_STATUS["active"])
+        (
+            _send_spy2,
+            fetch_spy2,
+            _save2,
+            _index2,
+            _events2,
+            raised2,
+            retryable2,
+            _fake_fs2,
+            _decision2,
+            _resolver2,
+        ) = self._drive(processing.THREAD_STATUS["active"])
         fetch_spy2.assert_called_once()
         self.assertTrue(
             raised2,
@@ -432,6 +481,7 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
             fetch_spy,
             save_spy,
             index_spy,
+            persistence_events,
             raised,
             retryable,
             fake_fs,
@@ -444,8 +494,23 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
 
         send_spy.assert_not_called()
         fetch_spy.assert_not_called()
-        save_spy.assert_called_once()
-        index_spy.assert_called_once()
+        self.assertEqual(
+            (
+                "uid-terminal",
+                "thread-terminal-1",
+                "<broker-reply-terminal@acme.com>",
+            ),
+            save_spy.call_args.args[:3],
+        )
+        saved_record = save_spy.call_args.args[3]
+        self.assertEqual("inbound", saved_record["direction"])
+        self.assertEqual("<broker-reply-terminal@acme.com>", saved_record["headers"]["internetMessageId"])
+        index_spy.assert_called_once_with(
+            "uid-terminal",
+            "<broker-reply-terminal@acme.com>",
+            "thread-terminal-1",
+        )
+        self.assertEqual(["save", "index"], persistence_events)
         self.assertFalse(raised)
         self.assertTrue(
             retryable,
@@ -463,6 +528,7 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
             fetch_spy,
             _save_spy,
             _index_spy,
+            _persistence_events,
             raised,
             retryable,
             fake_fs,
@@ -496,6 +562,7 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
             fetch_spy,
             _save_spy,
             _index_spy,
+            _persistence_events,
             raised,
             retryable,
             _fake_fs,

@@ -13,6 +13,45 @@ from email_automation import processing
 from email_automation.campaign_safety import CampaignAutomationDecision
 
 
+class _ThreadLookupSnapshot:
+    def __init__(self, data):
+        self._data = data
+
+    @property
+    def exists(self):
+        return self._data is not None
+
+    def to_dict(self):
+        return dict(self._data or {})
+
+
+class _ThreadLookupNode:
+    def __init__(self, root, path=()):
+        self._root = root
+        self._path = path
+
+    def collection(self, name):
+        return _ThreadLookupNode(self._root, self._path + (name,))
+
+    def document(self, doc_id):
+        return _ThreadLookupNode(self._root, self._path + (doc_id,))
+
+    def get(self):
+        self._root.get_calls.append(self._path)
+        return _ThreadLookupSnapshot(self._root.documents.get(self._path))
+
+
+class _ThreadLookupFirestore:
+    def __init__(self, user_id, thread_id, client_id):
+        self.documents = {
+            ("users", user_id, "threads", thread_id): {"clientId": client_id},
+        }
+        self.get_calls = []
+
+    def collection(self, name):
+        return _ThreadLookupNode(self, (name,))
+
+
 class ProcessingRetryabilityTests(unittest.TestCase):
     def setUp(self):
         self._campaign_decision_patch = patch.object(
@@ -63,6 +102,7 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         reconcile.assert_not_called()
 
     def test_scan_records_unexpected_processing_crash_without_marking_processed(self):
+        fake_fs = _ThreadLookupFirestore("uid-1", "thread-1", "client-1")
         response = MagicMock()
         received_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         response.json.return_value = {
@@ -76,11 +116,11 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             ]
         }
 
-        with patch.object(processing, "exponential_backoff_request", return_value=response), \
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "exponential_backoff_request", return_value=response), \
              patch.object(processing, "has_processed", return_value=False), \
              patch.object(processing, "_match_message_to_thread", return_value="thread-1"), \
              patch.object(processing, "_has_processing_failure_record", return_value=False), \
-             patch.object(processing, "_client_id_for_processing_failure", return_value="unknown"), \
              patch.object(processing, "process_inbox_message", side_effect=ValueError("flyer_links crash")), \
              patch.object(processing, "_record_ai_processing_failure") as record_failure, \
              patch.object(processing, "mark_processed") as mark_processed, \
@@ -94,15 +134,20 @@ class ProcessingRetryabilityTests(unittest.TestCase):
 
         record_failure.assert_called_once_with(
             "uid-1",
-            "unknown",
+            "client-1",
             "thread-1",
             "<message-1@example.test>",
             "flyer_links crash",
         )
         mark_processed.assert_not_called()
         self.assertEqual(0, result["processed"])
+        self.assertEqual(
+            [("users", "uid-1", "threads", "thread-1")],
+            fake_fs.get_calls,
+        )
 
     def test_scan_skips_inbox_retry_when_user_manually_continued_conversation(self):
+        fake_fs = _ThreadLookupFirestore("uid-1", "thread-1", "client-1")
         response = MagicMock()
         received_at_dt = (datetime.now(timezone.utc) - timedelta(minutes=10)).replace(microsecond=0)
         manual_sent_at = (received_at_dt + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
@@ -125,12 +170,12 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             "sentDateTime": manual_sent_at,
         }
 
-        with patch.object(processing, "exponential_backoff_request", return_value=response), \
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "exponential_backoff_request", return_value=response), \
              patch.object(processing, "has_processed", return_value=False), \
              patch.object(processing, "_match_message_to_thread", return_value="thread-1"), \
              patch.object(processing, "_has_processing_failure_record", return_value=True, create=True), \
              patch.object(processing, "find_sent_conversation_continuation_for_retry", return_value=manual_continuation, create=True) as continuation_guard, \
-             patch.object(processing, "_client_id_for_processing_failure", return_value="unknown"), \
              patch.object(processing, "process_inbox_message") as process_message, \
              patch.object(processing, "mark_processed") as mark_processed, \
              patch.object(processing, "_record_processing_failure_blocked_by_manual_continuation", create=True) as record_blocked, \
@@ -148,7 +193,7 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         process_message.assert_not_called()
         record_blocked.assert_called_once_with(
             "uid-1",
-            "unknown",
+            "client-1",
             "thread-1",
             "<message-1@example.test>",
             manual_continuation,
@@ -156,6 +201,10 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         mark_processed.assert_called_once_with("uid-1", "<message-1@example.test>")
         self.assertEqual(0, result["processed"])
         self.assertEqual(1, result["skipped"])
+        self.assertEqual(
+            [("users", "uid-1", "threads", "thread-1")],
+            fake_fs.get_calls,
+        )
 
     def test_successful_retry_can_clear_matching_processing_failure(self):
         fake_fs = MagicMock()
