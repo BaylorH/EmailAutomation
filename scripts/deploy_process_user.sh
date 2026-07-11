@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ACCOUNT="bp21harrison@gmail.com"
-PROJECT="email-automation-cache"
-PROJECT_NUMBER="248289505828"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$SCRIPT_DIR/process_user_gcloud_preflight.sh"
+
+ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+PROJECT="$PROCESS_USER_PROJECT"
+PROJECT_NUMBER="$PROCESS_USER_PROJECT_NUMBER"
 REGION="us-central1"
 SERVICE="process-user"
 IMAGE_REPOSITORY="${REGION}-docker.pkg.dev/${PROJECT}/cloud-run-source-deploy/${SERVICE}"
 SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
 mode="dry-run"
 case "${1:-}" in
@@ -20,16 +23,7 @@ case "${1:-}" in
     ;;
 esac
 
-if [[ "${GCLOUD_ACCOUNT:-}" != "$ACCOUNT" ]]; then
-  printf 'Refusing: GCLOUD_ACCOUNT must be exactly %s.\n' "$ACCOUNT" >&2
-  exit 65
-fi
-export CLOUDSDK_CORE_ACCOUNT="$ACCOUNT"
-
-if [[ -n "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-}" ]]; then
-  printf 'Refusing: gcloud service-account impersonation must be disabled.\n' >&2
-  exit 66
-fi
+process_user_gcloud_preflight local
 
 if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
   printf 'Refusing: deployment checkout must be clean.\n' >&2
@@ -74,40 +68,7 @@ if [[ "$mode" == "dry-run" ]]; then
   exit 0
 fi
 
-configured_impersonation="$(
-  gcloud config get-value auth/impersonate_service_account \
-    --account "$ACCOUNT" \
-    --project "$PROJECT"
-)"
-if [[ -n "$configured_impersonation" && "$configured_impersonation" != "(unset)" ]]; then
-  printf 'Refusing: gcloud auth/impersonate_service_account must be unset.\n' >&2
-  exit 69
-fi
-
-auth_accounts="$(
-  gcloud auth list \
-    --account "$ACCOUNT" \
-    --project "$PROJECT" \
-    "--filter=account=${ACCOUNT}" \
-    "--format=value(account)"
-)"
-auth_count="$(printf '%s\n' "$auth_accounts" | awk 'NF { count++ } END { print count + 0 }')"
-if [[ "$auth_count" != "1" || "$auth_accounts" != "$ACCOUNT" ]]; then
-  printf 'Refusing: expected exactly one gcloud auth account matching %s.\n' "$ACCOUNT" >&2
-  exit 70
-fi
-
-project_info="$(
-  gcloud projects describe "$PROJECT" \
-    --account "$ACCOUNT" \
-    "--format=value(projectNumber,lifecycleState)"
-)"
-IFS=$'\t' read -r actual_project_number lifecycle_state <<< "$project_info"
-if [[ "$actual_project_number" != "$PROJECT_NUMBER" || "$lifecycle_state" != "ACTIVE" ]]; then
-  printf 'Refusing: expected project %s number %s ACTIVE; got %s.\n' \
-    "$PROJECT" "$PROJECT_NUMBER" "$project_info" >&2
-  exit 71
-fi
+process_user_gcloud_preflight apply
 
 "${build_command[@]}"
 digest="$("${digest_command[@]}")"

@@ -276,59 +276,26 @@ traffic mutation, including rollback-command and readback failures.
 ```bash
 set -Eeuo pipefail
 
-APPROVED_ACCOUNT="bp21harrison@gmail.com"
-PROJECT="email-automation-cache"
-PROJECT_NUMBER="248289505828"
+PREFLIGHT_HELPER="${PREFLIGHT_HELPER:-$PWD/scripts/process_user_gcloud_preflight.sh}"
 REGION="us-central1"
 SERVICE="process-user"
 REPOSITORY="cloud-run-source-deploy"
-ROLLBACK_REVISION="process-user-lock-0837727b"
+ROLLBACK_REVISION="REPLACE_ME_ROLLBACK_REVISION"
+EXPECTED_ROLLBACK_IMAGE="REPLACE_ME_ROLLBACK_IMAGE@sha256:REPLACE_ME_ROLLBACK_DIGEST"
 
-if [[ "${GCLOUD_ACCOUNT:-}" != "$APPROVED_ACCOUNT" ]]; then
-  printf 'Refusing: GCLOUD_ACCOUNT must be exactly %s.\n' "$APPROVED_ACCOUNT" >&2
+if [[ "$ROLLBACK_REVISION" == *REPLACE_ME* || "$EXPECTED_ROLLBACK_IMAGE" == *REPLACE_ME* ]]; then
+  printf 'Refusing: replace every REPLACE_ME rollback target before running.\n' >&2
   exit 65
 fi
-export CLOUDSDK_CORE_ACCOUNT="$APPROVED_ACCOUNT"
-
-if [[ -n "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-}" ]]; then
-  printf 'Refusing: gcloud service-account impersonation must be disabled.\n' >&2
+if [[ ! -f "$PREFLIGHT_HELPER" ]]; then
+  printf 'Refusing: run from the repository root or set PREFLIGHT_HELPER explicitly.\n' >&2
   exit 66
 fi
+source "$PREFLIGHT_HELPER"
+process_user_gcloud_preflight apply
 
-configured_impersonation="$(
-  gcloud config get-value auth/impersonate_service_account \
-    --account "$APPROVED_ACCOUNT" \
-    --project "$PROJECT"
-)"
-if [[ -n "$configured_impersonation" && "$configured_impersonation" != "(unset)" ]]; then
-  printf 'Refusing: gcloud auth/impersonate_service_account must be unset.\n' >&2
-  exit 67
-fi
-
-auth_accounts="$(
-  gcloud auth list \
-    --account "$APPROVED_ACCOUNT" \
-    --project "$PROJECT" \
-    "--filter=account=${APPROVED_ACCOUNT}" \
-    "--format=value(account)"
-)"
-auth_count="$(printf '%s\n' "$auth_accounts" | awk 'NF { count++ } END { print count + 0 }')"
-if [[ "$auth_count" != "1" || "$auth_accounts" != "$APPROVED_ACCOUNT" ]]; then
-  printf 'Refusing: expected exactly one approved gcloud auth account.\n' >&2
-  exit 68
-fi
-
-project_info="$(
-  gcloud projects describe "$PROJECT" \
-    --account "$APPROVED_ACCOUNT" \
-    --project "$PROJECT" \
-    "--format=value(projectNumber,lifecycleState)"
-)"
-IFS=$'\t' read -r actual_project_number lifecycle_state <<< "$project_info"
-if [[ "$actual_project_number" != "$PROJECT_NUMBER" || "$lifecycle_state" != "ACTIVE" ]]; then
-  printf 'Refusing: expected project %s number %s ACTIVE.\n' "$PROJECT" "$PROJECT_NUMBER" >&2
-  exit 69
-fi
+APPROVED_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+PROJECT="$PROCESS_USER_PROJECT"
 
 short_sha="$(git rev-parse --short=12 HEAD)"
 if [[ ! "$short_sha" =~ ^[0-9a-f]{12}$ ]]; then
@@ -408,6 +375,28 @@ if spec.get("containerConcurrency") != 1:
 annotations = revision.get("metadata", {}).get("annotations", {})
 if annotations.get("autoscaling.knative.dev/maxScale") != "10":
     raise SystemExit("Release A revision maxScale is not 10")
+PY
+
+if [[ ! "$EXPECTED_ROLLBACK_IMAGE" =~ ^${REGION}-docker\.pkg\.dev/${PROJECT}/${REPOSITORY}/${SERVICE}(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$ ]]; then
+  printf 'Refusing: EXPECTED_ROLLBACK_IMAGE must be an immutable process-user image digest.\n' >&2
+  exit 72
+fi
+rollback_revision_json="$(
+  gcloud run revisions describe "$ROLLBACK_REVISION" \
+    --account "$APPROVED_ACCOUNT" \
+    --project "$PROJECT" \
+    --region "$REGION" \
+    --format=json
+)"
+REVISION_JSON="$rollback_revision_json" EXPECTED_IMAGE="$EXPECTED_ROLLBACK_IMAGE" python3 - <<'PY'
+import json
+import os
+
+revision = json.loads(os.environ["REVISION_JSON"])
+containers = revision.get("spec", {}).get("containers", [])
+image = containers[0].get("image", "") if len(containers) == 1 else ""
+if image != os.environ["EXPECTED_IMAGE"]:
+    raise SystemExit(f"rollback revision image does not match the expected digest: {image!r}")
 PY
 
 traffic_revision_at_100() {

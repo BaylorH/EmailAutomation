@@ -15,6 +15,7 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy_process_user.sh"
+PREFLIGHT_HELPER = REPO_ROOT / "scripts" / "process_user_gcloud_preflight.sh"
 DEPLOY_README = REPO_ROOT / "deploy" / "README.md"
 
 ACCOUNT = "bp21harrison@gmail.com"
@@ -32,6 +33,11 @@ DIGEST = "sha256:" + "a" * 64
 IMAGE = f"{TAG}@{DIGEST}"
 SERVICE_ACCOUNT = "248289505828-compute@developer.gserviceaccount.com"
 ROLLBACK_REVISION = "process-user-lock-0837727b"
+ROLLBACK_DIGEST = "sha256:" + "c" * 64
+ROLLBACK_IMAGE = (
+    "us-central1-docker.pkg.dev/email-automation-cache/"
+    f"cloud-run-source-deploy/process-user@{ROLLBACK_DIGEST}"
+)
 RELEASE_REVISION = "process-user-release-a-abc123"
 
 ENV_VARS = (
@@ -190,6 +196,14 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(self._git_calls(), self._git_preflight_calls())
         self.assertIn(TAG, result.stdout)
         self.assertIn("dry-run", result.stdout.lower())
+
+    def test_deploy_script_sources_shared_preflight_helper(self):
+        script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+        self.assertTrue(PREFLIGHT_HELPER.is_file())
+        self.assertIn('source "$SCRIPT_DIR/process_user_gcloud_preflight.sh"', script)
+        self.assertIn("process_user_gcloud_preflight", script)
+        self.assertNotIn("gcloud auth list", script)
+        self.assertNotIn("gcloud projects describe", script)
 
     def test_explicit_dry_run_makes_zero_gcloud_calls(self):
         result = self._run("--dry-run")
@@ -356,6 +370,8 @@ class DeployScriptContractTests(unittest.TestCase):
                 PROJECT,
                 "--account",
                 ACCOUNT,
+                "--project",
+                PROJECT,
                 "--format=value(projectNumber,lifecycleState)",
             ],
         ]
@@ -432,7 +448,12 @@ class RollbackRunbookContractTests(unittest.TestCase):
         _write_executable(self.bin_dir / "git", self._fake_git_source())
         _write_executable(self.bin_dir / "gcloud", self._fake_gcloud_source())
 
-    def _run(self, scenario: str = "ok", account: str | None = ACCOUNT):
+    def _run(
+        self,
+        scenario: str = "ok",
+        account: str | None = ACCOUNT,
+        replace_rollback_placeholders: bool = True,
+    ):
         env = os.environ.copy()
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
         env["FAKE_GCLOUD_LOG"] = str(self.log)
@@ -448,8 +469,17 @@ class RollbackRunbookContractTests(unittest.TestCase):
             env.pop("GCLOUD_ACCOUNT", None)
         else:
             env["GCLOUD_ACCOUNT"] = account
+        runbook = self._extract_runbook()
+        if replace_rollback_placeholders:
+            runbook = runbook.replace(
+                'ROLLBACK_REVISION="REPLACE_ME_ROLLBACK_REVISION"',
+                f'ROLLBACK_REVISION="{ROLLBACK_REVISION}"',
+            ).replace(
+                'EXPECTED_ROLLBACK_IMAGE="REPLACE_ME_ROLLBACK_IMAGE@sha256:REPLACE_ME_ROLLBACK_DIGEST"',
+                f'EXPECTED_ROLLBACK_IMAGE="{ROLLBACK_IMAGE}"',
+            )
         return subprocess.run(
-            ["bash", "-c", self._extract_runbook()],
+            ["bash", "-c", runbook],
             cwd=REPO_ROOT,
             env=env,
             text=True,
@@ -486,6 +516,29 @@ class RollbackRunbookContractTests(unittest.TestCase):
         self.assertEqual(self._traffic_targets(), [ROLLBACK_REVISION, RELEASE_REVISION])
         state = json.loads(self.state.read_text())
         self.assertEqual(state["current"], RELEASE_REVISION)
+
+    def test_runbook_sources_shared_preflight_without_duplicating_checks(self):
+        runbook = self._extract_runbook()
+        self.assertIn("scripts/process_user_gcloud_preflight.sh", runbook)
+        self.assertIn("process_user_gcloud_preflight", runbook)
+        self.assertNotIn("gcloud auth list", runbook)
+        self.assertNotIn("gcloud projects describe", runbook)
+
+    def test_unedited_rollback_placeholders_fail_before_gcloud(self):
+        result = self._run(replace_rollback_placeholders=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("REPLACE_ME", result.stderr)
+        self.assertEqual(self._calls(), [])
+
+    def test_missing_rollback_revision_fails_before_traffic_mutation(self):
+        result = self._run(scenario="rollback_revision_missing")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._traffic_targets(), [])
+
+    def test_mismatched_rollback_image_fails_before_traffic_mutation(self):
+        result = self._run(scenario="mismatched_rollback_image")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._traffic_targets(), [])
 
     def test_rollback_mutation_failure_still_restores_release_a(self):
         result = self._run(scenario="rollback_update_failure")
@@ -620,6 +673,19 @@ class RollbackRunbookContractTests(unittest.TestCase):
                 raise SystemExit(0)
 
             if args[:3] == ["run", "revisions", "describe"]:
+                revision_name = args[3]
+                if scenario == "rollback_revision_missing" and revision_name == "{ROLLBACK_REVISION}":
+                    raise SystemExit(1)
+                if revision_name == "{ROLLBACK_REVISION}":
+                    rollback_image = (
+                        "{TAG}@sha256:" + "d" * 64
+                        if scenario == "mismatched_rollback_image"
+                        else "{ROLLBACK_IMAGE}"
+                    )
+                    print(json.dumps({{
+                        "spec": {{"containers": [{{"image": rollback_image}}]}},
+                    }}))
+                    raise SystemExit(0)
                 release_image = (
                     "{TAG}@sha256:" + "b" * 64
                     if scenario == "mismatched_release_image"

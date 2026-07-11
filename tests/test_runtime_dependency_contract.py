@@ -90,7 +90,10 @@ class RuntimeDependencyContractTests(unittest.TestCase):
         )
         self.assertRegex(
             dockerfile,
-            re.compile(r"(?m)^RUN\s+pip\s+install\b[^\n]*\s-r\s+requirements\.lock\s*$"),
+            re.compile(
+                r"(?m)^RUN\s+pip\s+install\b[^\n]*"
+                r"--require-hashes\b[^\n]*\s-r\s+requirements\.lock\s*$"
+            ),
         )
 
     def test_deployment_lock_pins_every_distribution_with_hashes(self):
@@ -110,19 +113,28 @@ class RuntimeDependencyContractTests(unittest.TestCase):
         self.assertFalse(current, "lock file ended with an incomplete continuation")
         self.assertGreater(len(logical_lines), 20)
 
-        locked_names = set()
+        locked_requirements = {}
         for line in logical_lines:
             requirement_text = line.split(" --hash=", 1)[0].strip()
             requirement = Requirement(requirement_text)
             self.assertRegex(str(requirement.specifier), r"^==[^,]+$")
             self.assertIn("--hash=sha256:", line)
-            locked_names.add(requirement.name.lower().replace("_", "-"))
+            normalized_name = requirement.name.lower().replace("_", "-")
+            self.assertNotIn(normalized_name, locked_requirements)
+            locked_requirements[normalized_name] = requirement
 
-        direct_names = {
-            Requirement(requirement).name.lower().replace("_", "-")
-            for requirement in _active_requirements()
-        }
-        self.assertTrue(direct_names.issubset(locked_names))
+        for direct_text in _active_requirements():
+            direct = Requirement(direct_text)
+            normalized_name = direct.name.lower().replace("_", "-")
+            self.assertIn(normalized_name, locked_requirements)
+            locked = locked_requirements[normalized_name]
+            locked_versions = list(locked.specifier)
+            self.assertEqual(len(locked_versions), 1)
+            locked_version = locked_versions[0].version
+            self.assertTrue(
+                direct.specifier.contains(locked_version, prereleases=True),
+                f"locked requirement {locked} does not satisfy direct requirement {direct}",
+            )
 
 
 if __name__ == "__main__":
