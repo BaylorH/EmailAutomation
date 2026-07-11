@@ -32,7 +32,30 @@ def _production_python_sources() -> list[Path]:
     ]
 
 
+def _parse_locked_requirement(line: str) -> Requirement:
+    requirement_text = line.split(" --hash=", 1)[0].strip()
+    requirement = Requirement(requirement_text)
+    if not re.fullmatch(r"==[^=*,\s]+", str(requirement.specifier)):
+        raise ValueError(f"lock requirement is not an exact pin: {requirement}")
+    hash_values = re.findall(r"(?:^|\s)--hash=([^\s]+)", line)
+    if not hash_values or not all(
+        re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+        for value in hash_values
+    ):
+        raise ValueError(f"lock requirement has an invalid SHA-256 hash: {requirement}")
+    return requirement
+
+
 class RuntimeDependencyContractTests(unittest.TestCase):
+    def test_lock_line_validator_rejects_non_exact_pins_and_malformed_hashes(self):
+        valid_hash = "a" * 64
+        with self.assertRaises(ValueError):
+            _parse_locked_requirement(f"demo==1.* --hash=sha256:{valid_hash}")
+        with self.assertRaises(ValueError):
+            _parse_locked_requirement(f"demo===1.0 --hash=sha256:{valid_hash}")
+        with self.assertRaises(ValueError):
+            _parse_locked_requirement("demo==1.0 --hash=sha256:abc")
+
     def test_dockerfile_pins_python_base_image_by_digest(self):
         dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
         self.assertRegex(
@@ -115,10 +138,7 @@ class RuntimeDependencyContractTests(unittest.TestCase):
 
         locked_requirements = {}
         for line in logical_lines:
-            requirement_text = line.split(" --hash=", 1)[0].strip()
-            requirement = Requirement(requirement_text)
-            self.assertRegex(str(requirement.specifier), r"^==[^,]+$")
-            self.assertIn("--hash=sha256:", line)
+            requirement = _parse_locked_requirement(line)
             normalized_name = requirement.name.lower().replace("_", "-")
             self.assertNotIn(normalized_name, locked_requirements)
             locked_requirements[normalized_name] = requirement
