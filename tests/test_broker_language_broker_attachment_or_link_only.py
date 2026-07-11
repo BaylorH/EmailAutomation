@@ -36,6 +36,7 @@ SOURCE_URL_PATTERN = r'https?://[^\s<>"\']+'
 from email_automation import file_handling as fh
 from email_automation import property_images as pi
 from email_automation import processing as proc
+from email_automation.campaign_safety import CampaignAutomationDecision
 from email_automation import sheets as sh
 from email_automation.utils import _sanitize_url
 
@@ -322,6 +323,16 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
 
         patchers = [
             mock.patch.object(proc, "_fs", FakeFirestore(thread_ref, client_ref)),
+            mock.patch.object(
+                proc,
+                "get_client_automation_decision",
+                return_value=CampaignAutomationDecision(
+                    state="allow",
+                    reason="",
+                    client_data={"status": "live", "automationPaused": False},
+                    metadata={"source": "systemConfig/campaignAccess", "terminal": False},
+                ),
+            ),
             mock.patch.object(proc, "exponential_backoff_request", return_value=full_body_response),
             mock.patch.object(proc.requests, "get", return_value=me_response),
             mock.patch.object(proc, "lookup_thread_by_message_id", return_value=self.THREAD_ID),

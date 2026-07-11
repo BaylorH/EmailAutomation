@@ -11,6 +11,7 @@ os.environ.setdefault(
 )
 
 from email_automation import processing
+from email_automation.campaign_safety import CampaignAutomationDecision
 
 
 class FakeResponse:
@@ -36,11 +37,30 @@ class FakeSnapshot:
 
 
 class FakeUserDoc:
-    def __init__(self, user_data):
+    def __init__(self, user_data, collection_name=None):
         self.user_data = user_data
+        self.collection_name = collection_name
 
     def get(self):
+        if self.collection_name == "threads":
+            return FakeSnapshot({"clientId": "client-1", "status": "active"})
+        if self.collection_name == "clients":
+            return FakeSnapshot({"status": "live", "automationPaused": False})
+        if self.collection_name == "archivedClients":
+            return FakeSnapshot(exists=False)
         return FakeSnapshot(self.user_data)
+
+    def collection(self, name):
+        return FakeNestedCollection(self.user_data, name)
+
+
+class FakeNestedCollection:
+    def __init__(self, user_data, name):
+        self.user_data = user_data
+        self.name = name
+
+    def document(self, _doc_id):
+        return FakeUserDoc(self.user_data, self.name)
 
 
 class FakeUsersCollection:
@@ -181,6 +201,10 @@ class ProcessingReplySafetyTests(unittest.TestCase):
         }
 
         with patch.dict(os.environ, {"SITESIFT_AUTO_REPLY_ALLOWLIST": "uid-1"}), \
+             patch.object(processing, "get_client_automation_decision", return_value=CampaignAutomationDecision(
+                 state="allow", reason="", client_data={"status": "live"},
+                 metadata={"terminal": False, "stopKind": "none"},
+             )), \
              patch("email_automation.clients._fs", FakeFirestore({
                  "email": "baylor.freelance@outlook.com",
                  "signatureMode": "custom",

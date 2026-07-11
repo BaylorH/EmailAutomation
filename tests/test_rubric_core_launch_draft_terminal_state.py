@@ -24,6 +24,7 @@ class _FsForImport:
 _gcf.Client = lambda *a, **k: _FsForImport()
 
 from email_automation import email as email_mod
+from email_automation.campaign_safety import CampaignAutomationDecision
 
 
 class _FakeSnapshot:
@@ -57,13 +58,24 @@ class _FakeFirestore:
     def __init__(self, user_id, client_id, client_data):
         client_ref = _FakeDocRef(_FakeSnapshot(client_data, exists=True))
         clients_col = _FakeCollection({client_id: client_ref})
+        archived_clients_col = _FakeCollection({})
         user_ref = _FakeDocRef(None)
-        user_ref.collection = lambda name: clients_col
+        user_ref.collection = lambda name: (
+            clients_col if name == "clients" else archived_clients_col
+        )
         self._users = _FakeCollection({user_id: user_ref})
 
     def collection(self, name):
-        assert name == "users"
-        return self._users
+        if name == "users":
+            return self._users
+        if name == "systemConfig":
+            return _FakeCollection({
+                "campaignAccess": _FakeDocRef(_FakeSnapshot({
+                    "automationEnabled": True,
+                    "allowedUids": [],
+                }, exists=True))
+            })
+        raise AssertionError(f"Unexpected collection: {name}")
 
 
 class _FakeOutboxDocRef:
@@ -71,6 +83,19 @@ class _FakeOutboxDocRef:
 
     def __init__(self, doc_id):
         self.id = doc_id
+        self.set_calls = []
+
+    def set(self, data, merge=False):
+        self.set_calls.append((data, merge))
+
+
+class _FakeGraphResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
 
 
 class CoreLaunchDraftTerminalStateTests(unittest.TestCase):
@@ -152,6 +177,144 @@ class CoreLaunchDraftTerminalStateTests(unittest.TestCase):
             "launch outbox for a live client must NOT be dropped by the terminal gate",
         )
         dead_letter.assert_not_called()
+
+    def test_launch_outbox_for_maintenance_pause_stays_retryable(self):
+        data = self._launch_outbox_data()
+        doc_ref = _FakeOutboxDocRef("outbox-maintenance")
+        decision = CampaignAutomationDecision(
+            state="blocked",
+            reason="campaign_maintenance",
+            client_data={"status": "live", "automationPaused": True},
+            metadata={"terminal": False, "stopKind": "maintenance_pause"},
+        )
+
+        with mock.patch.object(
+            email_mod,
+            "get_client_automation_decision",
+            return_value=decision,
+            create=True,
+        ), mock.patch.object(email_mod, "_move_to_dead_letter") as dead_letter:
+            blocked = email_mod._pause_client_outbox_item_if_needed(
+                self.USER_ID, doc_ref, data
+            )
+
+        self.assertTrue(blocked)
+        dead_letter.assert_not_called()
+        payload, merge = doc_ref.set_calls[-1]
+        self.assertTrue(merge)
+        self.assertEqual("queued", payload["status"])
+        self.assertEqual("blocked", payload["automationSuppressedState"])
+        self.assertEqual("campaign_maintenance", payload["automationSuppressedReason"])
+        self.assertIsNone(payload["processingBy"])
+        self.assertNotIn("attempts", payload)
+
+    def test_launch_outbox_for_unknown_state_stays_retryable(self):
+        data = self._launch_outbox_data()
+        doc_ref = _FakeOutboxDocRef("outbox-unknown")
+        decision = CampaignAutomationDecision(
+            state="unknown",
+            reason="client_automation_state_read_error",
+            client_data={},
+            metadata={"terminal": False, "stopKind": "none"},
+        )
+
+        with mock.patch.object(
+            email_mod,
+            "get_client_automation_decision",
+            return_value=decision,
+            create=True,
+        ), mock.patch.object(email_mod, "_move_to_dead_letter") as dead_letter:
+            blocked = email_mod._pause_client_outbox_item_if_needed(
+                self.USER_ID, doc_ref, data
+            )
+
+        self.assertTrue(blocked)
+        dead_letter.assert_not_called()
+        payload, _merge = doc_ref.set_calls[-1]
+        self.assertEqual("queued", payload["status"])
+        self.assertEqual("unknown", payload["automationSuppressedState"])
+        self.assertNotIn("attempts", payload)
+
+    def test_indexed_send_rechecks_campaign_stop_immediately_before_graph_send(self):
+        decision = CampaignAutomationDecision(
+            state="blocked",
+            reason="client_stopped_by_user",
+            client_data={"status": "stopping"},
+            metadata={"terminal": True, "stopKind": "terminal_stop"},
+        )
+        posts = []
+
+        def fake_post(url, **_kwargs):
+            posts.append(url)
+            if url.endswith("/me/messages"):
+                return _FakeGraphResponse(201, {"id": "draft-stop"})
+            if url.endswith("/send"):
+                raise AssertionError("stopped campaign must not reach Graph /send")
+            return _FakeGraphResponse(500)
+
+        with mock.patch.object(
+            email_mod, "get_client_automation_decision", return_value=decision
+        ), mock.patch.object(
+            email_mod, "exponential_backoff_request", side_effect=lambda func, **_kwargs: func()
+        ), mock.patch.object(
+            email_mod.requests, "post", side_effect=fake_post
+        ), mock.patch.object(
+            email_mod.requests,
+            "get",
+            return_value=_FakeGraphResponse(200, {
+                "internetMessageId": "<draft-stop@example.test>",
+                "conversationId": "conversation-stop",
+                "subject": "123 Main St",
+            }),
+        ), mock.patch.object(
+            email_mod, "_delete_graph_reply_draft"
+        ) as delete_draft, mock.patch(
+            "email_automation.processing.is_contact_opted_out", return_value=None
+        ):
+            result = email_mod.send_and_index_email(
+                self.USER_ID,
+                {"Authorization": "Bearer token"},
+                "Hi Broker,\n\nCan you confirm availability?",
+                ["bp21harrison@gmail.com"],
+                client_id_or_none=self.CLIENT_ID,
+                subject_override="123 Main St",
+            )
+
+        self.assertTrue(result["campaignAutomationSuppressed"])
+        self.assertTrue(result["campaignAutomationTerminal"])
+        self.assertFalse(any(url.endswith("/send") for url in posts))
+        delete_draft.assert_called_once()
+
+    def test_mid_batch_maintenance_suppression_retries_only_unsent_recipients(self):
+        data = {
+            **self._launch_outbox_data(),
+            "assignedEmails": ["sent@example.com", "waiting@example.com"],
+            "sentRecipients": [],
+        }
+        doc_ref = _FakeOutboxDocRef("outbox-partial")
+        send_result = {
+            "sent": ["sent@example.com"],
+            "errors": {"waiting@example.com": "campaign_maintenance"},
+            "campaignAutomationSuppressed": True,
+            "campaignAutomationState": "blocked",
+            "campaignAutomationReason": "campaign_maintenance",
+            "campaignAutomationTerminal": False,
+        }
+
+        handled = email_mod._handle_suppressed_outbox_send_result(
+            self.USER_ID,
+            doc_ref,
+            data,
+            send_result,
+        )
+
+        self.assertTrue(handled)
+        payload, merge = doc_ref.set_calls[-1]
+        self.assertTrue(merge)
+        self.assertEqual(["waiting@example.com"], payload.get("assignedEmails"))
+        self.assertEqual(["sent@example.com"], payload.get("sentRecipients"))
+        self.assertTrue(payload.get("partialSend"))
+        self.assertNotIn("attempts", payload)
 
 
 if __name__ == "__main__":

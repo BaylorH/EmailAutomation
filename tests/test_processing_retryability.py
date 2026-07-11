@@ -10,9 +10,64 @@ os.environ.setdefault(
 )
 
 from email_automation import processing
+from email_automation.campaign_safety import CampaignAutomationDecision
+
+
+class _ThreadLookupSnapshot:
+    def __init__(self, data):
+        self._data = data
+
+    @property
+    def exists(self):
+        return self._data is not None
+
+    def to_dict(self):
+        return dict(self._data or {})
+
+
+class _ThreadLookupNode:
+    def __init__(self, root, path=()):
+        self._root = root
+        self._path = path
+
+    def collection(self, name):
+        return _ThreadLookupNode(self._root, self._path + (name,))
+
+    def document(self, doc_id):
+        return _ThreadLookupNode(self._root, self._path + (doc_id,))
+
+    def get(self):
+        self._root.get_calls.append(self._path)
+        return _ThreadLookupSnapshot(self._root.documents.get(self._path))
+
+
+class _ThreadLookupFirestore:
+    def __init__(self, user_id, thread_id, client_id):
+        self.documents = {
+            ("users", user_id, "threads", thread_id): {"clientId": client_id},
+        }
+        self.get_calls = []
+
+    def collection(self, name):
+        return _ThreadLookupNode(self, (name,))
 
 
 class ProcessingRetryabilityTests(unittest.TestCase):
+    def setUp(self):
+        self._campaign_decision_patch = patch.object(
+            processing,
+            "get_client_automation_decision",
+            return_value=CampaignAutomationDecision(
+                state="allow",
+                reason="",
+                client_data={"status": "live"},
+                metadata={"terminal": False, "stopKind": "none"},
+            ),
+            create=True,
+        )
+        self.campaign_decision = self._campaign_decision_patch.start()
+        self.addCleanup(self._campaign_decision_patch.stop)
+
     def test_retryable_ai_failures_do_not_mark_messages_processed(self):
         self.assertFalse(
             processing._should_mark_processed_after_error(
@@ -22,7 +77,32 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         self.assertFalse(processing._should_mark_processed_after_error(ValueError("unexpected bug")))
         self.assertTrue(processing._should_mark_processed_after_error(None))
 
+    def test_terminal_campaign_suppression_does_not_queue_auto_reply_retry(self):
+        processing._reset_reply_send_outcome()
+        processing._set_reply_send_outcome(
+            outcome="blocked_campaign_terminal",
+            error="client_stopped_by_user",
+            sent_but_unindexed=False,
+            campaign_suppression_kind="terminal",
+        )
+
+        with patch.object(processing, "queue_pending_response") as queue_pending, \
+             patch.object(processing, "record_sent_unindexed_response") as reconcile:
+            outcome = processing._queue_response_retry_or_reconciliation(
+                "uid-1",
+                "thread-1",
+                "message-1",
+                "bp21harrison@gmail.com",
+                "Thanks for the update.",
+                "client-1",
+            )
+
+        self.assertEqual("campaign_stopped", outcome)
+        queue_pending.assert_not_called()
+        reconcile.assert_not_called()
+
     def test_scan_records_unexpected_processing_crash_without_marking_processed(self):
+        fake_fs = _ThreadLookupFirestore("uid-1", "thread-1", "client-1")
         response = MagicMock()
         received_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         response.json.return_value = {
@@ -36,9 +116,11 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             ]
         }
 
-        with patch.object(processing, "exponential_backoff_request", return_value=response), \
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "exponential_backoff_request", return_value=response), \
              patch.object(processing, "has_processed", return_value=False), \
              patch.object(processing, "_match_message_to_thread", return_value="thread-1"), \
+             patch.object(processing, "_has_processing_failure_record", return_value=False), \
              patch.object(processing, "process_inbox_message", side_effect=ValueError("flyer_links crash")), \
              patch.object(processing, "_record_ai_processing_failure") as record_failure, \
              patch.object(processing, "mark_processed") as mark_processed, \
@@ -52,15 +134,20 @@ class ProcessingRetryabilityTests(unittest.TestCase):
 
         record_failure.assert_called_once_with(
             "uid-1",
-            "unknown",
+            "client-1",
             "thread-1",
             "<message-1@example.test>",
             "flyer_links crash",
         )
         mark_processed.assert_not_called()
         self.assertEqual(0, result["processed"])
+        self.assertEqual(
+            [("users", "uid-1", "threads", "thread-1")],
+            fake_fs.get_calls,
+        )
 
     def test_scan_skips_inbox_retry_when_user_manually_continued_conversation(self):
+        fake_fs = _ThreadLookupFirestore("uid-1", "thread-1", "client-1")
         response = MagicMock()
         received_at_dt = (datetime.now(timezone.utc) - timedelta(minutes=10)).replace(microsecond=0)
         manual_sent_at = (received_at_dt + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
@@ -83,7 +170,8 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             "sentDateTime": manual_sent_at,
         }
 
-        with patch.object(processing, "exponential_backoff_request", return_value=response), \
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "exponential_backoff_request", return_value=response), \
              patch.object(processing, "has_processed", return_value=False), \
              patch.object(processing, "_match_message_to_thread", return_value="thread-1"), \
              patch.object(processing, "_has_processing_failure_record", return_value=True, create=True), \
@@ -105,7 +193,7 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         process_message.assert_not_called()
         record_blocked.assert_called_once_with(
             "uid-1",
-            "unknown",
+            "client-1",
             "thread-1",
             "<message-1@example.test>",
             manual_continuation,
@@ -113,6 +201,10 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         mark_processed.assert_called_once_with("uid-1", "<message-1@example.test>")
         self.assertEqual(0, result["processed"])
         self.assertEqual(1, result["skipped"])
+        self.assertEqual(
+            [("users", "uid-1", "threads", "thread-1")],
+            fake_fs.get_calls,
+        )
 
     def test_successful_retry_can_clear_matching_processing_failure(self):
         fake_fs = MagicMock()
@@ -258,6 +350,113 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         self.assertEqual(2, update_payload["processingAttempts"])
         self.assertTrue(update_payload["retryable"])
         self.assertIn("still failing", update_payload["lastRetryError"])
+
+    def test_retry_processing_failures_preserves_work_when_campaign_is_maintenance_paused(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__message-1"
+        failure_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "messageId": "message-1",
+            "retryable": True,
+            "processingAttempts": 1,
+        }
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value.collection.return_value = failures_collection
+        self.campaign_decision.return_value = CampaignAutomationDecision(
+            state="blocked",
+            reason="campaign_maintenance",
+            client_data={"status": "live", "automationPaused": True},
+            metadata={"terminal": False, "stopKind": "maintenance_pause"},
+        )
+
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "has_processed", return_value=False), \
+             patch.object(processing, "_fetch_graph_message_by_id") as fetch_message, \
+             patch.object(processing, "process_inbox_message") as process_message:
+            result = processing.retry_processing_failures(
+                "uid-1", {"Authorization": "Bearer fake"}
+            )
+
+        self.assertEqual(1, result["skipped"])
+        self.assertEqual(0, result["retried"])
+        fetch_message.assert_not_called()
+        process_message.assert_not_called()
+        failure_doc.reference.delete.assert_not_called()
+        payload = failure_doc.reference.set.call_args.args[0]
+        self.assertTrue(payload["retryable"])
+        self.assertEqual(1, payload["processingAttempts"])
+        self.assertEqual("blocked", payload["automationSuppressedState"])
+
+    def test_maintenance_never_resurrects_non_retryable_processing_failure(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__message-1"
+        failure_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "messageId": "message-1",
+            "retryable": False,
+            "processingAttempts": 1,
+            "recoveryStatus": "blocked_manual_continuation",
+        }
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value.collection.return_value = failures_collection
+        self.campaign_decision.return_value = CampaignAutomationDecision(
+            state="blocked",
+            reason="campaign_maintenance",
+            client_data={"status": "live", "automationPaused": True},
+            metadata={"terminal": False, "stopKind": "maintenance_pause"},
+        )
+
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "_fetch_graph_message_by_id") as fetch_message:
+            result = processing.retry_processing_failures(
+                "uid-1", {"Authorization": "Bearer fake"}
+            )
+
+        self.assertEqual(1, result["skipped"])
+        fetch_message.assert_not_called()
+        payload = failure_doc.reference.set.call_args.args[0]
+        self.assertFalse(payload["retryable"])
+
+    def test_retry_processing_failures_preserves_work_when_campaign_state_is_unknown(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__message-1"
+        failure_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "messageId": "message-1",
+            "retryable": True,
+            "processingAttempts": 2,
+        }
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value.collection.return_value = failures_collection
+        self.campaign_decision.return_value = CampaignAutomationDecision(
+            state="unknown",
+            reason="client_automation_state_read_error",
+            client_data={},
+            metadata={"terminal": False, "stopKind": "none"},
+        )
+
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "has_processed", return_value=False), \
+             patch.object(processing, "_fetch_graph_message_by_id") as fetch_message:
+            result = processing.retry_processing_failures(
+                "uid-1", {"Authorization": "Bearer fake"}
+            )
+
+        self.assertEqual(1, result["skipped"])
+        fetch_message.assert_not_called()
+        payload = failure_doc.reference.set.call_args.args[0]
+        self.assertTrue(payload["retryable"])
+        self.assertEqual(2, payload["processingAttempts"])
+        self.assertEqual("unknown", payload["automationSuppressedState"])
 
     def test_retry_processing_failures_skips_stale_failure_without_fetching_graph(self):
         failure_doc = MagicMock()

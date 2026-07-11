@@ -31,6 +31,7 @@ import main
 from email_automation import email as email_module
 from email_automation import followup as followup_module
 from email_automation import pending_responses
+from email_automation import processing as processing_module
 
 
 # ---------------------------------------------------------------------------
@@ -307,18 +308,36 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
             doc_id="thread-1",
         )
         fake_fs = self._make_fs([active_doc])
+        send_outcome = types.SimpleNamespace(
+            error=None,
+            sent_but_unindexed=False,
+            outcome=None,
+            campaign_suppression_kind=None,
+            campaign_decision=None,
+        )
 
         def fake_send_reply_in_thread(**_kwargs):
+            send_outcome.error = "HTTP 500 Graph send failed"
             return False
 
         fake_send_reply_in_thread.last_error = "HTTP 500 Graph send failed"
 
-        with patch.dict(sys.modules, {
-            "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
-            "email_automation.processing": types.SimpleNamespace(
-                send_reply_in_thread=fake_send_reply_in_thread,
+        with patch.object(
+            pending_responses,
+            "get_client_automation_decision",
+            return_value=types.SimpleNamespace(
+                state="allow", reason="", metadata={"terminal": False}
             ),
-        }):
+        ), patch.dict(sys.modules, {
+            "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
+        }), patch.object(
+            processing_module, "send_reply_in_thread", new=fake_send_reply_in_thread
+        ), patch.object(
+            processing_module, "_reset_reply_send_outcome",
+            side_effect=lambda: setattr(send_outcome, "error", None),
+        ), patch.object(
+            processing_module, "_get_reply_send_outcome", return_value=send_outcome
+        ):
             states = pending_responses.process_pending_responses(
                 "uid-1", {"Authorization": "Bearer token"}
             )
@@ -347,12 +366,29 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
         def fake_send_reply_in_thread(**_kwargs):
             return True
 
-        with patch.dict(sys.modules, {
-            "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
-            "email_automation.processing": types.SimpleNamespace(
-                send_reply_in_thread=fake_send_reply_in_thread,
+        send_outcome = types.SimpleNamespace(
+            error=None,
+            sent_but_unindexed=False,
+            outcome=None,
+            campaign_suppression_kind=None,
+            campaign_decision=None,
+        )
+
+        with patch.object(
+            pending_responses,
+            "get_client_automation_decision",
+            return_value=types.SimpleNamespace(
+                state="allow", reason="", metadata={"terminal": False}
             ),
-        }):
+        ), patch.dict(sys.modules, {
+            "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
+        }), patch.object(
+            processing_module, "send_reply_in_thread", new=fake_send_reply_in_thread
+        ), patch.object(
+            processing_module, "_reset_reply_send_outcome", return_value=send_outcome
+        ), patch.object(
+            processing_module, "_get_reply_send_outcome", return_value=send_outcome
+        ):
             states = pending_responses.process_pending_responses(
                 "uid-1", {"Authorization": "Bearer token"}
             )
@@ -414,12 +450,23 @@ class FollowupSendFailureObservabilityTests(unittest.TestCase):
         fake_fs = _FS([thread_doc])
 
         def fake_send_followup_email(**_kwargs):
+            followup_module._set_followup_send_outcome(
+                error="HTTP 502 Graph follow-up send failed"
+            )
             return False
 
         fake_send_followup_email.last_error = "HTTP 502 Graph follow-up send failed"
 
         with patch.object(followup_module, "_fs", fake_fs), \
-             patch.object(followup_module, "get_client_automation_pause", return_value=(False, None, {})), \
+             patch.object(
+                 followup_module,
+                 "get_client_automation_decision",
+                 return_value=types.SimpleNamespace(
+                     state="allow",
+                     reason="",
+                     metadata={"terminal": False},
+                 ),
+             ), \
              patch.object(followup_module, "_next_business_followup_time", side_effect=lambda now, cfg: now), \
              patch.object(followup_module, "_claim_followup", return_value=True), \
              patch.object(followup_module, "_release_followup_claim"), \

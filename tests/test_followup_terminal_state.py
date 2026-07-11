@@ -1,5 +1,6 @@
 import os
 import unittest
+from contextvars import copy_context
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ os.environ.setdefault(
 )
 
 from email_automation import followup
+from email_automation.campaign_safety import CampaignAutomationDecision
 
 
 class FakeResponse:
@@ -158,6 +160,179 @@ class FakeFollowupFirestore:
 
 
 class FollowupTerminalStateTests(unittest.TestCase):
+    def test_other_context_fail_closed_outcome_cannot_disable_current_followup(self):
+        past = datetime.now(timezone.utc) - followup.timedelta(hours=1)
+
+        class WaitingQuery:
+            def __init__(self, docs):
+                self.docs = docs
+
+            def where(self, *_args, **_kwargs):
+                return self
+
+            def stream(self):
+                return self.docs
+
+        thread_ref = FakeThreadRef()
+        thread_doc = type("ThreadDoc", (), {
+            "id": "thread-current",
+            "reference": thread_ref,
+            "to_dict": lambda self: {
+                "clientId": "client-1",
+                "followUpStatus": "waiting",
+                "followUpConfig": {
+                    "enabled": True,
+                    "nextFollowUpAt": past,
+                    "currentFollowUpIndex": 0,
+                    "followUps": [{"message": "Following up."}],
+                },
+                "hasInboundReply": False,
+            },
+        })()
+        fake_fs = WaitingQuery([thread_doc])
+        fake_fs.collection = lambda _name: fake_fs
+        fake_fs.document = lambda _name: fake_fs
+        other_context = copy_context()
+
+        def fake_send_followup(**_kwargs):
+            other_context.run(
+                followup._set_followup_send_outcome,
+                error="other request guard failed closed",
+                guard_failed_closed=True,
+            )
+            return False
+
+        with patch.object(followup, "_fs", fake_fs), patch.object(
+            followup, "_next_business_followup_time", side_effect=lambda now, _cfg: now
+        ), patch.object(followup, "_claim_followup", return_value=True), patch.object(
+            followup, "_release_followup_claim"
+        ) as release, patch.object(
+            followup, "_send_followup_email", new=fake_send_followup
+        ):
+            states = followup.check_and_send_followups(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertFalse(release.call_args.kwargs["fail_closed"])
+        self.assertEqual("follow-up send failed", states[0]["error"])
+        self.assertFalse(any(
+            update.get("followUpConfig.enabled") is False
+            for update in thread_ref.updates
+        ))
+
+    def test_campaign_suppression_outcome_is_isolated_per_execution_context(self):
+        terminal = CampaignAutomationDecision(
+            state="blocked",
+            reason="campaign_stopped",
+            client_data={},
+            metadata={"terminal": True},
+        )
+        maintenance = CampaignAutomationDecision(
+            state="blocked",
+            reason="campaign_maintenance",
+            client_data={},
+            metadata={"terminal": False},
+        )
+        terminal_context = copy_context()
+        maintenance_context = copy_context()
+
+        terminal_context.run(followup._set_followup_campaign_suppression, terminal)
+        maintenance_context.run(followup._set_followup_campaign_suppression, maintenance)
+
+        self.assertEqual(
+            "terminal",
+            terminal_context.run(followup._get_followup_campaign_suppression)[0],
+        )
+        self.assertEqual(
+            "maintenance",
+            maintenance_context.run(followup._get_followup_campaign_suppression)[0],
+        )
+
+    def test_terminal_followup_persists_the_clean_campaign_reason(self):
+        past = datetime.now(timezone.utc) - followup.timedelta(hours=1)
+
+        class WaitingQuery:
+            def __init__(self, docs):
+                self.docs = docs
+
+            def where(self, *_args, **_kwargs):
+                return self
+
+            def stream(self):
+                return self.docs
+
+        thread_ref = FakeThreadRef()
+        thread_doc = type("ThreadDoc", (), {
+            "id": "thread-terminal",
+            "reference": thread_ref,
+            "to_dict": lambda self: {
+                "clientId": "client-1",
+                "followUpStatus": "waiting",
+                "followUpConfig": {
+                    "enabled": True,
+                    "nextFollowUpAt": past,
+                    "currentFollowUpIndex": 0,
+                    "followUps": [{"message": "Following up."}],
+                },
+                "hasInboundReply": False,
+            },
+        })()
+        fake_fs = WaitingQuery([thread_doc])
+        fake_fs.collection = lambda _name: fake_fs
+        fake_fs.document = lambda _name: fake_fs
+        terminal = CampaignAutomationDecision(
+            state="blocked",
+            reason="client_stopped_by_user",
+            client_data={"status": "stopped"},
+            metadata={"terminal": True, "stopKind": "terminal_stop"},
+        )
+
+        def suppressed_send(**_kwargs):
+            followup._set_followup_campaign_suppression(terminal)
+            return False
+
+        with patch.object(followup, "_fs", fake_fs), patch.object(
+            followup, "_next_business_followup_time", side_effect=lambda now, _cfg: now
+        ), patch.object(followup, "_claim_followup", return_value=True), patch.object(
+            followup, "_send_followup_email", side_effect=suppressed_send
+        ):
+            followup.check_and_send_followups(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertEqual("stopped", thread_ref.updates[-1]["followUpStatus"])
+        self.assertEqual("client_stopped_by_user", thread_ref.updates[-1]["statusReason"])
+
+    def test_followup_suppression_ignores_stale_shared_send_attributes(self):
+        followup._clear_followup_campaign_suppression()
+        followup._send_followup_email.campaign_suppression_kind = "terminal"
+
+        kind, decision = followup._get_local_followup_campaign_suppression()
+
+        self.assertIsNone(kind)
+        self.assertIsNone(decision)
+
+    def setUp(self):
+        self._campaign_decision_patch = patch.object(
+            followup,
+            "get_client_automation_decision",
+            return_value=CampaignAutomationDecision(
+                state="allow",
+                reason="",
+                client_data={"status": "live"},
+                metadata={"terminal": False, "stopKind": "none"},
+            ),
+            create=True,
+        )
+        self.campaign_decision = self._campaign_decision_patch.start()
+        self.addCleanup(self._campaign_decision_patch.stop)
+        self._optout_patch = patch(
+            "email_automation.processing.is_contact_opted_out",
+            return_value=None,
+        )
+        self._optout_patch.start()
+        self.addCleanup(self._optout_patch.stop)
+
     def test_weekend_followup_window_defers_to_monday_business_start(self):
         sunday = datetime(2026, 6, 21, 17, 1, tzinfo=timezone.utc)
 
@@ -551,6 +726,89 @@ class FollowupTerminalStateTests(unittest.TestCase):
         post.assert_not_called()
         self.assertIn("completed", followup._send_followup_email.last_error)
         self.assertTrue(followup._send_followup_email.guard_failed_closed)
+
+    def test_followup_rechecks_campaign_stop_immediately_before_graph_send(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+        })
+        fake_fs = FakeFollowupFirestore(
+            [outbound],
+            thread_data={
+                "clientId": "client-1",
+                "status": "active",
+                "followUpStatus": "waiting",
+                "followUpConfig": {"enabled": True, "currentFollowUpIndex": 0},
+            },
+        )
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "followUps": [{"message": "Hi Riley,\n\nJust following up."}],
+        }
+        thread_data = {
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "contactName": "Riley Broker",
+        }
+        posts = []
+
+        def run_request(func, **_kwargs):
+            return func()
+
+        def fake_get(url, **_kwargs):
+            if "/me/messages?" in url:
+                return FakeResponse(200, {"value": []})
+            return FakeResponse(200, {
+                "value": [{"id": "graph-root", "subject": "0 Gemini Ave", "conversationId": "conv-1"}]
+            })
+
+        def fake_post(url, **_kwargs):
+            posts.append(url)
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "reply-draft-stop",
+                    "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
+                    "ccRecipients": [],
+                })
+            if url.endswith("/send"):
+                raise AssertionError("stopped campaign must not reach Graph /send")
+            return FakeResponse(201)
+
+        self.campaign_decision.side_effect = [
+            CampaignAutomationDecision(
+                state="allow", reason="", client_data={"status": "live"},
+                metadata={"terminal": False, "stopKind": "none"},
+            ),
+            CampaignAutomationDecision(
+                state="blocked", reason="client_stopped_by_user",
+                client_data={"status": "stopping"},
+                metadata={"terminal": True, "stopKind": "terminal_stop"},
+            ),
+        ]
+
+        with patch.object(followup, "_fs", fake_fs), \
+             patch.object(followup, "exponential_backoff_request", side_effect=run_request), \
+             patch.object(requests, "get", side_effect=fake_get), \
+             patch.object(requests, "post", side_effect=fake_post), \
+             patch.object(requests, "patch", return_value=FakeResponse(200)), \
+             patch("email_automation.processing.is_contact_opted_out", return_value=None), \
+             patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+            )
+
+        self.assertFalse(result)
+        self.assertFalse(any(url.endswith("/send") for url in posts))
+        delete_draft.assert_called_once()
+        self.assertEqual("terminal", followup._send_followup_email.campaign_suppression_kind)
+        self.assertIn("client_stopped_by_user", followup._send_followup_email.last_error)
 
     def test_followup_rechecks_action_needed_state_before_reply_all_draft(self):
         outbound = FakeMessageDoc({

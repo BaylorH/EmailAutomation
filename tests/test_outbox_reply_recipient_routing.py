@@ -9,6 +9,7 @@ os.environ.setdefault(
 )
 
 from email_automation import email as email_module
+from email_automation.campaign_safety import CampaignAutomationDecision
 
 
 class FakeDocRef:
@@ -92,6 +93,20 @@ VALID_THREAD_REPLY_TARGET = {"ok": True, "reason": None, "thread": {}, "status":
 
 
 class OutboxReplyRecipientRoutingTests(unittest.TestCase):
+    def setUp(self):
+        decision_patch = patch.object(
+            email_module,
+            "_read_client_automation_decision",
+            return_value=CampaignAutomationDecision(
+                state="allow",
+                reason="",
+                client_data={"status": "live"},
+                metadata={"terminal": False, "stopKind": "none"},
+            ),
+        )
+        decision_patch.start()
+        self.addCleanup(decision_patch.stop)
+
     def _thread_reply_outbox(self, assigned_email):
         return FakeDoc({
             "assignedEmails": [assigned_email],

@@ -35,10 +35,17 @@ from .results_feature_gate import (
     is_tour_invite_outbox,
     should_pause_results_outbox_for_user,
 )
-from .campaign_safety import get_client_automation_pause
+from .campaign_safety import (
+    CAMPAIGN_AUTOMATION_ALLOW,
+    CAMPAIGN_AUTOMATION_BLOCKED,
+    CampaignAutomationDecision,
+    get_client_automation_decision,
+    get_client_automation_pause,
+)
 from .outbound_safety import validate_outbound_body
 
 logger = logging.getLogger(__name__)
+_ORIGINAL_GET_CLIENT_AUTOMATION_PAUSE = get_client_automation_pause
 
 # Maximum retry attempts before moving to dead-letter queue
 MAX_OUTBOX_ATTEMPTS = 5
@@ -425,16 +432,159 @@ def _pause_results_outbox_item_if_needed(user_id: str, doc_ref, data: dict) -> b
     return True
 
 
+def _read_client_automation_decision(user_id: str, client_id: Optional[str]):
+    """Use the tri-state reader while preserving legacy test/extension patches."""
+    if get_client_automation_pause is _ORIGINAL_GET_CLIENT_AUTOMATION_PAUSE:
+        return get_client_automation_decision(user_id, client_id)
+
+    paused, reason, client_data = get_client_automation_pause(user_id, client_id)
+    if not paused:
+        return CampaignAutomationDecision(
+            state=CAMPAIGN_AUTOMATION_ALLOW,
+            reason="",
+            client_data=client_data or {},
+            metadata={"terminal": False, "stopKind": "none", "source": "legacy_adapter"},
+        )
+    normalized_reason = str(reason or "").strip().lower()
+    terminal = any(token in normalized_reason for token in ("stop", "archiv", "delet", "complet"))
+    return CampaignAutomationDecision(
+        state=CAMPAIGN_AUTOMATION_BLOCKED,
+        reason=str(reason or "client_automation_paused"),
+        client_data=client_data or {},
+        metadata={
+            "terminal": terminal,
+            "stopKind": "terminal_stop" if terminal else "maintenance_pause",
+            "source": "legacy_adapter",
+        },
+    )
+
+
 def _pause_client_outbox_item_if_needed(user_id: str, doc_ref, data: dict) -> bool:
     client_id = (data.get("clientId") or "").strip()
-    paused, reason, _client_data = get_client_automation_pause(user_id, client_id)
-    if not paused:
+    decision = _read_client_automation_decision(user_id, client_id)
+    if decision.state == CAMPAIGN_AUTOMATION_ALLOW:
         return False
-    _move_to_dead_letter(
+
+    if decision.state == CAMPAIGN_AUTOMATION_BLOCKED and decision.metadata.get("terminal"):
+        _move_to_dead_letter(
+            user_id,
+            doc_ref,
+            data,
+            f"Client campaign is stopped; send canceled: {decision.reason}",
+        )
+        return True
+
+    _preserve_retryable_outbox_suppression(user_id, doc_ref, data, decision)
+    return True
+
+
+def _preserve_retryable_outbox_suppression(
+    user_id: str,
+    doc_ref,
+    data: Dict[str, Any],
+    decision,
+    *,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Release a claim without consuming an attempt or destroying queued work."""
+    suppression_payload = {
+        "status": "queued",
+        "processingBy": None,
+        "processingAt": None,
+        "automationSuppressedState": decision.state,
+        "automationSuppressedReason": decision.reason,
+        "automationSuppressedAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+        **(extra or {}),
+    }
+    doc_ref.set(suppression_payload, merge=True)
+    _terminalize_outbox_action_audit(
         user_id,
         doc_ref,
         data,
-        f"Client automation is paused/stopped; manual review required before sending: {reason}",
+        "queued",
+        {
+            "automationSuppressedState": decision.state,
+            "automationSuppressedReason": decision.reason,
+            "automationSuppressedAt": SERVER_TIMESTAMP,
+        },
+    )
+
+
+def _campaign_suppression_result(decision) -> Dict[str, Any]:
+    terminal = bool(
+        decision.state == CAMPAIGN_AUTOMATION_BLOCKED
+        and decision.metadata.get("terminal")
+    )
+    return {
+        "campaignAutomationSuppressed": True,
+        "campaignAutomationState": decision.state,
+        "campaignAutomationReason": decision.reason,
+        "campaignAutomationTerminal": terminal,
+    }
+
+
+def _handle_suppressed_outbox_send_result(
+    user_id: str,
+    doc_ref,
+    data: Dict[str, Any],
+    send_result: Optional[Dict[str, Any]],
+    *,
+    previously_sent_recipients: Optional[List[str]] = None,
+) -> bool:
+    if not (send_result or {}).get("campaignAutomationSuppressed"):
+        return False
+
+    accepted_recipients = _ordered_unique(
+        list(data.get("sentRecipients") or [])
+        + list(previously_sent_recipients or [])
+        + list(send_result.get("sent") or [])
+        + _send_identity_recipients(send_result)
+    )
+    assigned_recipients = [
+        recipient
+        for recipient in (data.get("assignedEmails") or [])
+        if isinstance(recipient, str)
+    ]
+    accepted_set = {
+        recipient.strip().lower()
+        for recipient in accepted_recipients
+        if isinstance(recipient, str) and recipient.strip()
+    }
+    remaining_recipients = [
+        recipient
+        for recipient in assigned_recipients
+        if recipient.strip().lower() not in accepted_set
+    ]
+    partial_state = {}
+    if accepted_recipients:
+        partial_state = {
+            "assignedEmails": remaining_recipients,
+            "sentRecipients": accepted_recipients,
+            "partialSend": True,
+        }
+
+    if send_result.get("campaignAutomationTerminal"):
+        terminal_data = {**data, **partial_state}
+        _move_to_dead_letter(
+            user_id,
+            doc_ref,
+            terminal_data,
+            "Client campaign stopped during send preparation; send canceled: "
+            f"{send_result.get('campaignAutomationReason') or 'campaign_stopped'}",
+        )
+        return True
+
+    class _SuppressionDecision:
+        state = send_result.get("campaignAutomationState") or "unknown"
+        reason = send_result.get("campaignAutomationReason") or "campaign_state_unavailable"
+
+    _preserve_retryable_outbox_suppression(
+        user_id,
+        doc_ref,
+        data,
+        _SuppressionDecision(),
+        extra=partial_state,
     )
     return True
 
@@ -1458,7 +1608,8 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
                           thread_id: str, user_signature: str = None,
                           signature_mode: str = None, user_email: str = None,
                           fallback_to_emails: Optional[List[str]] = None,
-                          fallback_cc_emails: Optional[List[str]] = None) -> dict:
+                          fallback_cc_emails: Optional[List[str]] = None,
+                          client_id: Optional[str] = None) -> dict:
     """
     Send an outbox item as a reply to an existing message in a thread.
 
@@ -1612,6 +1763,17 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
                         print(f"   📎 Attached {attachment['name']}")
                 except Exception as e:
                     print(f"   ⚠️ Error attaching {attachment['name']}: {e}")
+
+        decision = _read_client_automation_decision(user_id, client_id)
+        if decision.denies_autonomous_work:
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            reason = f"Campaign send suppressed before Graph send: {decision.reason}"
+            print(f"   🛑 {reason}")
+            return {
+                "sent": False,
+                "error": reason,
+                **_campaign_suppression_result(decision),
+            }
 
         sent_after = datetime.now(timezone.utc) - timedelta(seconds=10)
         resp = exponential_backoff_request(
@@ -2388,7 +2550,17 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
             if not internet_message_id:
                 raise Exception("No internetMessageId returned from Graph")
 
-            # 3. Send draft
+            # 3. Send draft. This is the irreversible boundary, so campaign
+            # eligibility must be read again after draft preparation.
+            decision = _read_client_automation_decision(user_id, client_id_or_none)
+            if decision.denies_autonomous_work:
+                _delete_graph_reply_draft(headers, draft_id, base=base)
+                reason = f"Campaign send suppressed before Graph send: {decision.reason}"
+                results["errors"][addr] = reason
+                results.update(_campaign_suppression_result(decision))
+                print(f"🛑 {reason}")
+                return results
+
             exponential_backoff_request(
                 lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30),
                 max_retries=1,
@@ -3166,6 +3338,10 @@ def _send_multi_property_email(
                                        signature_mode=signature_mode, followup_config=followup_config,
                                        contact_name=contact_name, user_email=user_email,
                                        allow_scheduling_language=_is_tour_invite_outbox(data))
+            if _handle_suppressed_outbox_send_result(
+                user_id, item['doc'].reference, data, res
+            ):
+                continue
             any_errors = bool([e for e in res.get("errors", {}) if "opted out" not in str(res["errors"].get(e, ""))])
 
             if not any_errors and res["sent"]:
@@ -3555,6 +3731,12 @@ def _send_combined_property_email(
             contact_name=contact_name, user_email=user_email,
             thread_context=thread_context,
         )
+        if res.get("campaignAutomationSuppressed"):
+            for c in claimed:
+                _handle_suppressed_outbox_send_result(
+                    user_id, c["ref"], c["data"], res
+                )
+            return
         any_errors = bool([e for e in res.get("errors", {}) if "opted out" not in str(res["errors"].get(e, ""))])
 
         if not any_errors and res.get("sent"):
@@ -3847,7 +4029,19 @@ def _send_single_outbox_item(
                         signature_mode=signature_mode, user_email=user_email,
                         fallback_to_emails=emails,
                         fallback_cc_emails=data.get("ccEmails") or data.get("ccRecipients") or [],
+                        client_id=clientId,
                     )
+
+                    if _handle_suppressed_outbox_send_result(
+                        user_id,
+                        d.reference,
+                        data,
+                        res,
+                        previously_sent_recipients=_ordered_unique(
+                            all_sent + _send_identity_recipients(send_identity)
+                        ),
+                    ):
+                        return
 
                     if res.get("sent"):
                         recipient = emails[0] if emails else "unknown"
@@ -3926,6 +4120,16 @@ def _send_single_outbox_item(
                         thread_context=_thread_context_from_outbox(data),
                         allow_scheduling_language=_is_tour_invite_outbox(data),
                     )
+                    if _handle_suppressed_outbox_send_result(
+                        user_id,
+                        d.reference,
+                        data,
+                        res,
+                        previously_sent_recipients=_ordered_unique(
+                            all_sent + _send_identity_recipients(send_identity)
+                        ),
+                    ):
+                        return
                     all_sent.extend(res.get("sent", []))
                     all_errors.update(res.get("errors", {}))
                     _merge_send_identity(send_identity, res)
@@ -4028,6 +4232,17 @@ def _send_single_outbox_item(
                                            contact_name=recipient_contact_name, user_email=user_email,
                                            thread_context=_thread_context_from_outbox(data),
                                            allow_scheduling_language=_is_tour_invite_outbox(data))
+
+                if _handle_suppressed_outbox_send_result(
+                    user_id,
+                    d.reference,
+                    data,
+                    res,
+                    previously_sent_recipients=_ordered_unique(
+                        all_sent + _send_identity_recipients(send_identity)
+                    ),
+                ):
+                    return
 
                 all_sent.extend(res.get("sent", []))
                 all_errors.update(res.get("errors", {}))

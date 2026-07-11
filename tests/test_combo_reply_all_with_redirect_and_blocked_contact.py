@@ -54,6 +54,7 @@ from email_automation import processing as processing_mod
 # Cast (deck personas)
 # ---------------------------------------------------------------------------
 OPERATOR = "operator@sitesift.com"          # the mailbox running SiteSift (self)
+CLIENT_ID = "client-reply-all-1"
 WRONG_CONTACT = "broker@acme.com"           # broker who replied (wrong contact, still on-thread)
 SAFE_TEAMMATE = "colleague@acme.com"        # safe teammate the broker CC'd
 BLOCKED_BROKER = "blocked-broker@acme.com"  # prior interest, later opted out -> blocked
@@ -100,8 +101,15 @@ class _FakeUserDoc:
         self._by_hash = by_hash
 
     def collection(self, name):
-        assert name == "optedOutContacts", f"unexpected subcollection {name}"
-        return _FakeOptOutDocs(self._by_hash)
+        if name == "optedOutContacts":
+            return _FakeOptOutDocs(self._by_hash)
+        if name == "clients":
+            return _FakeOptOutDocs({
+                CLIENT_ID: {"status": "live", "automationPaused": False},
+            })
+        if name == "archivedClients":
+            return _FakeOptOutDocs({})
+        raise AssertionError(f"unexpected subcollection {name}")
 
 
 class _FakeUsersCollection:
@@ -123,8 +131,13 @@ class _FakeFirestore:
         }
 
     def collection(self, name):
-        assert name == "users", f"unexpected collection {name}"
-        return _FakeUsersCollection(self._by_hash)
+        if name == "users":
+            return _FakeUsersCollection(self._by_hash)
+        if name == "systemConfig":
+            return _FakeOptOutDocs({
+                "campaignAccess": {"automationEnabled": True, "allowedUids": []},
+            })
+        raise AssertionError(f"unexpected collection {name}")
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +256,7 @@ class ComboReplyAllRedirectBlockedContactTests(unittest.TestCase):
         # Only the Graph HTTP boundary and the Firestore client are faked.
         # _filter_reply_all_draft_recipients + is_contact_opted_out run REAL.
         with patch.object(email_mod, "requests", graph), \
+             patch("email_automation.clients._fs", firestore), \
              patch.object(processing_mod, "_fs", firestore), \
              patch("email_automation.utils.time.sleep", return_value=None), \
              patch.object(email_mod.time, "sleep", return_value=None):
@@ -255,6 +269,7 @@ class ComboReplyAllRedirectBlockedContactTests(unittest.TestCase):
                 user_signature=None,
                 signature_mode=None,
                 user_email=OPERATOR,
+                client_id=CLIENT_ID,
             )
         return result, graph
 

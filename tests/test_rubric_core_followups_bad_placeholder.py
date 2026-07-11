@@ -11,7 +11,10 @@ from unittest.mock import patch
 
 import requests
 
-from email_automation import followup
+from email_automation import clients, followup
+
+
+CLIENT_ID = "client-followup-placeholder"
 
 
 class FakeResponse:
@@ -84,6 +87,24 @@ class FakeFollowupThreadsCollection:
         return FakeFollowupThreadNode(self.updates, self.messages)
 
 
+class FakeGateDocument:
+    def __init__(self, data=None):
+        self.data = data
+
+    def get(self):
+        snapshot = FakeThreadSnapshot(self.data or {})
+        snapshot.exists = self.data is not None
+        return snapshot
+
+
+class FakeGateCollection:
+    def __init__(self, documents):
+        self.documents = documents
+
+    def document(self, doc_id):
+        return FakeGateDocument(self.documents.get(doc_id))
+
+
 class FakeFollowupUserNode:
     def __init__(self, updates, messages):
         self.updates = updates
@@ -94,9 +115,15 @@ class FakeFollowupUserNode:
         return FakeThreadSnapshot({"email": "baylor.freelance@outlook.com"})
 
     def collection(self, name):
-        if name != "threads":
-            raise AssertionError(f"Unexpected user collection: {name}")
-        return FakeFollowupThreadsCollection(self.updates, self.messages)
+        if name == "threads":
+            return FakeFollowupThreadsCollection(self.updates, self.messages)
+        if name == "clients":
+            return FakeGateCollection({
+                CLIENT_ID: {"status": "live", "automationPaused": False},
+            })
+        if name == "archivedClients":
+            return FakeGateCollection({})
+        raise AssertionError(f"Unexpected user collection: {name}")
 
 
 class FakeFollowupFirestore:
@@ -105,9 +132,13 @@ class FakeFollowupFirestore:
         self.messages = messages
 
     def collection(self, name):
-        if name != "users":
-            raise AssertionError(f"Unexpected root collection: {name}")
-        return self
+        if name == "users":
+            return self
+        if name == "systemConfig":
+            return FakeGateCollection({
+                "campaignAccess": {"automationEnabled": True, "allowedUids": []},
+            })
+        raise AssertionError(f"Unexpected root collection: {name}")
 
     def document(self, _user_id):
         return FakeFollowupUserNode(self.updates, self.messages)
@@ -131,16 +162,18 @@ class CoreFollowupsBadPlaceholderTests(unittest.TestCase):
         fake_fs = FakeFollowupFirestore([outbound])
 
         # Template keeps a literal [NAME] token. thread_data intentionally omits
-        # contactName / clientId / rowNumber so nothing resolves the placeholder
+        # contactName / rowNumber so nothing resolves the placeholder
         # before the safety validation runs.
         followup_config = {
             "followUps": [{"message": "Hi [NAME],\n\nJust following up on the space."}],
         }
         thread_data = {
             "email": ["broker@example.com"],
+            "clientId": CLIENT_ID,
         }
 
         with patch.object(followup, "_fs", fake_fs), \
+             patch.object(clients, "_fs", fake_fs), \
              patch.object(
                  followup,
                  "exponential_backoff_request",

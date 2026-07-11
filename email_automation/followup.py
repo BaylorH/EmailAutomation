@@ -15,6 +15,8 @@ Called from main.py after inbox scanning.
 """
 
 import time
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 from zoneinfo import ZoneInfo
@@ -37,7 +39,11 @@ from .sent_mail_guard import (
     find_matching_sent_message_for_retry,
     sent_after_from_retry_data,
 )
-from .campaign_safety import get_client_automation_pause, stopped_followup_patch
+from .campaign_safety import (
+    campaign_suppression_kind as classify_campaign_suppression,
+    get_client_automation_decision,
+    stopped_followup_patch,
+)
 from .outbound_safety import validate_outbound_body
 
 # Claim timeout for follow-up processing (prevent duplicate sends)
@@ -58,6 +64,72 @@ FOLLOWUP_WAIT_UNIT_MAX = {
     "days": 90,
 }
 FOLLOWUP_INVALID_CONFIG_REASON = "followup_config_invalid"
+
+@dataclass(frozen=True)
+class FollowupSendOutcome:
+    error: Optional[str] = None
+    attempt_at: Optional[datetime] = None
+    guard_failed_closed: bool = False
+    campaign_suppression_kind: Optional[str] = None
+    campaign_decision: Optional[Any] = None
+
+
+_FOLLOWUP_SEND_OUTCOME = ContextVar(
+    "followup_send_outcome",
+    default=FollowupSendOutcome(),
+)
+
+
+def _set_followup_campaign_suppression(decision) -> None:
+    kind = classify_campaign_suppression(decision)
+    _set_followup_send_outcome(
+        campaign_suppression_kind=kind,
+        campaign_decision=decision,
+        error=f"Campaign automation suppressed before Graph send: {decision.reason}",
+        guard_failed_closed=kind == "terminal",
+    )
+
+
+def _mirror_followup_send_outcome(outcome: FollowupSendOutcome) -> None:
+    _send_followup_email.last_error = outcome.error
+    _send_followup_email.last_attempt_at = outcome.attempt_at
+    _send_followup_email.guard_failed_closed = outcome.guard_failed_closed
+    _send_followup_email.campaign_suppression_kind = outcome.campaign_suppression_kind
+
+
+def _set_followup_send_outcome(**changes) -> FollowupSendOutcome:
+    outcome = replace(_FOLLOWUP_SEND_OUTCOME.get(), **changes)
+    _FOLLOWUP_SEND_OUTCOME.set(outcome)
+    _mirror_followup_send_outcome(outcome)
+    return outcome
+
+
+def _reset_followup_send_outcome() -> FollowupSendOutcome:
+    outcome = FollowupSendOutcome()
+    _FOLLOWUP_SEND_OUTCOME.set(outcome)
+    _mirror_followup_send_outcome(outcome)
+    return outcome
+
+
+def _get_followup_send_outcome() -> FollowupSendOutcome:
+    return _FOLLOWUP_SEND_OUTCOME.get()
+
+
+def _get_followup_campaign_suppression():
+    outcome = _get_followup_send_outcome()
+    return outcome.campaign_suppression_kind, outcome.campaign_decision
+
+
+def _get_local_followup_campaign_suppression():
+    """Return suppression produced by this execution context only."""
+    return _get_followup_campaign_suppression()
+
+
+def _clear_followup_campaign_suppression() -> None:
+    _set_followup_send_outcome(
+        campaign_suppression_kind=None,
+        campaign_decision=None,
+    )
 
 
 def _validate_followup_steps(followups) -> Optional[str]:
@@ -433,19 +505,37 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
         thread_data = thread_doc.to_dict()
         thread_id = thread_doc.id
 
-        client_paused, client_pause_reason, _client_data = get_client_automation_pause(
+        campaign_decision = get_client_automation_decision(
             user_id,
             thread_data.get("clientId"),
         )
-        if client_paused:
+        suppression_kind = classify_campaign_suppression(campaign_decision)
+        if suppression_kind == "terminal":
             print(
-                f"   ⏹️ Thread {thread_id[:20]}... belongs to paused/stopped client; "
+                f"   ⏹️ Thread {thread_id[:20]}... belongs to stopped client; "
                 "stopping follow-up tracking"
             )
             try:
-                thread_doc.reference.update(stopped_followup_patch(client_pause_reason))
+                thread_doc.reference.update(stopped_followup_patch(campaign_decision.reason))
             except Exception as e:
-                print(f"   ⚠️ Failed to stop follow-up for paused/stopped client: {e}")
+                print(f"   ⚠️ Failed to stop follow-up for stopped client: {e}")
+            continue
+        if suppression_kind:
+            print(
+                f"   ⏸️ Thread {thread_id[:20]}... automation is suppressed; "
+                "preserving follow-up schedule for retry"
+            )
+            try:
+                thread_doc.reference.update({
+                    "followUpConfig.processingBy": None,
+                    "followUpConfig.processingAt": None,
+                    "followUpConfig.automationSuppressedState": campaign_decision.state,
+                    "followUpConfig.automationSuppressedReason": campaign_decision.reason,
+                    "followUpConfig.automationSuppressedAt": SERVER_TIMESTAMP,
+                    "updatedAt": SERVER_TIMESTAMP,
+                })
+            except Exception as e:
+                print(f"   ⚠️ Failed to preserve suppressed follow-up: {e}")
             continue
 
         followup_config = thread_data.get("followUpConfig", {})
@@ -508,6 +598,7 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
             continue
 
         # Send the follow-up
+        _reset_followup_send_outcome()
         success = _send_followup_email(
             user_id=user_id,
             headers=headers,
@@ -538,22 +629,46 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
                 print(f"   ⏳ Waiting 2 minutes before next follow-up ({remaining_threads} remaining)...")
                 time.sleep(120)  # 2 minutes
         else:
+            send_outcome = _get_followup_send_outcome()
+            campaign_suppression_kind = send_outcome.campaign_suppression_kind
+            if campaign_suppression_kind == "terminal":
+                try:
+                    stop_reason = (
+                        send_outcome.campaign_decision.reason
+                        if send_outcome.campaign_decision
+                        else send_outcome.error
+                    )
+                    thread_doc.reference.update(
+                        stopped_followup_patch(stop_reason)
+                    )
+                except Exception as e:
+                    print(f"   ⚠️ Failed to terminalize stopped follow-up: {e}")
+                continue
+            if campaign_suppression_kind in {"maintenance", "unknown"}:
+                _release_followup_claim(
+                    user_id,
+                    thread_id,
+                    reason=send_outcome.error,
+                    current_index=current_index,
+                    fail_closed=False,
+                )
+                continue
+
             # Release the claim so it can be retried
             _release_followup_claim(
                 user_id,
                 thread_id,
-                reason=getattr(_send_followup_email, "last_error", None),
-                attempted_at=getattr(_send_followup_email, "last_attempt_at", None),
+                reason=send_outcome.error,
+                attempted_at=send_outcome.attempt_at,
                 current_index=current_index,
-                fail_closed=getattr(_send_followup_email, "guard_failed_closed", False),
+                fail_closed=send_outcome.guard_failed_closed,
             )
             # Swallowed per-item Graph send failure -> surface to the health rail.
             operation_states.append(
                 _followup_operation_state(
                     "error",
                     thread_id=thread_id,
-                    error=getattr(_send_followup_email, "last_error", None)
-                    or "follow-up send failed",
+                    error=send_outcome.error or "follow-up send failed",
                 )
             )
 
@@ -572,11 +687,18 @@ def _send_followup_email(
     """Send a follow-up email for a specific thread."""
     import requests
 
-    _send_followup_email.last_error = None
-    _send_followup_email.last_attempt_at = None
-    _send_followup_email.guard_failed_closed = False
+    _reset_followup_send_outcome()
 
     try:
+        campaign_decision = get_client_automation_decision(
+            user_id,
+            thread_data.get("clientId"),
+        )
+        if campaign_decision.denies_autonomous_work:
+            _set_followup_campaign_suppression(campaign_decision)
+            print(f"   🛑 {_get_followup_send_outcome().error}")
+            return False
+
         followups = followup_config.get("followUps", [])
         if followup_index >= len(followups):
             return False
@@ -596,12 +718,12 @@ def _send_followup_email(
         valid_recipients, invalid_recipients = validate_recipient_emails([recipient])
         if invalid_recipients or not valid_recipients:
             invalid_value = invalid_recipients[0] if invalid_recipients else recipient
-            _send_followup_email.last_error = (
+            failure_reason = (
                 f"Invalid follow-up recipient {invalid_value}; "
                 "manual review required before sending follow-up"
             )
-            _send_followup_email.guard_failed_closed = True
-            print(f"   🛑 {_send_followup_email.last_error}")
+            _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+            print(f"   🛑 {failure_reason}")
             return False
 
         recipient = valid_recipients[0]
@@ -609,21 +731,21 @@ def _send_followup_email(
             from .processing import is_contact_opted_out
             optout_record = is_contact_opted_out(user_id, recipient)
         except Exception as e:
-            _send_followup_email.last_error = (
+            failure_reason = (
                 f"Could not verify follow-up opt-out status for {recipient}: {e}; "
                 "manual review required before sending follow-up"
             )
-            _send_followup_email.guard_failed_closed = True
-            print(f"   🛑 {_send_followup_email.last_error}")
+            _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+            print(f"   🛑 {failure_reason}")
             return False
 
         if optout_record:
-            _send_followup_email.last_error = (
+            failure_reason = (
                 f"Follow-up recipient {recipient} is opted out; "
                 "manual review required before sending follow-up"
             )
-            _send_followup_email.guard_failed_closed = True
-            print(f"   🛑 {_send_followup_email.last_error}")
+            _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+            print(f"   🛑 {failure_reason}")
             return False
 
         # Get the last outbound message to reply to
@@ -724,11 +846,11 @@ def _send_followup_email(
 
         body_validation = validate_outbound_body(followup_message)
         if not body_validation.is_safe:
-            _send_followup_email.last_error = (
+            failure_reason = (
                 f"{body_validation.reason}; manual review required before sending follow-up"
             )
-            _send_followup_email.guard_failed_closed = True
-            print(f"   🛑 {_send_followup_email.last_error}")
+            _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+            print(f"   🛑 {failure_reason}")
             return False
 
         # Get user's signature settings
@@ -765,9 +887,9 @@ def _send_followup_email(
                     sent_after=sent_after_from_retry_data(followup_config),
                 )
             except SentMailGuardLookupError as exc:
-                _send_followup_email.last_error = f"Sent Items retry guard failed: {exc}"
-                _send_followup_email.guard_failed_closed = True
-                print(f"   ⚠️ {_send_followup_email.last_error}")
+                failure_reason = f"Sent Items retry guard failed: {exc}"
+                _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+                print(f"   ⚠️ {failure_reason}")
                 return False
 
             if sent_match:
@@ -791,23 +913,23 @@ def _send_followup_email(
                     sent_after=sent_after_from_retry_data(followup_config),
                 )
             except SentMailGuardLookupError as exc:
-                _send_followup_email.last_error = f"Sent Items manual continuation guard failed: {exc}"
-                _send_followup_email.guard_failed_closed = True
-                print(f"   ⚠️ {_send_followup_email.last_error}")
+                failure_reason = f"Sent Items manual continuation guard failed: {exc}"
+                _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+                print(f"   ⚠️ {failure_reason}")
                 return False
 
             if manual_continuation:
-                _send_followup_email.last_error = (
+                failure_reason = (
                     "Follow-up stopped because Sent Items shows the user manually continued "
                     "this conversation; review before retrying the stale follow-up."
                 )
-                _send_followup_email.guard_failed_closed = True
-                print(f"   ⚠️ {_send_followup_email.last_error}")
+                _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+                print(f"   ⚠️ {failure_reason}")
                 return False
 
         # Send as a filtered reply-all draft so broker CCs are preserved safely.
         send_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=5)
-        _send_followup_email.last_attempt_at = send_attempt_at
+        _set_followup_send_outcome(attempt_at=send_attempt_at)
 
         try:
             latest_thread_doc = (
@@ -819,12 +941,12 @@ def _send_followup_email(
             )
             latest_thread_data = latest_thread_doc.to_dict() if latest_thread_doc.exists else thread_data
         except Exception as exc:
-            _send_followup_email.last_error = (
+            failure_reason = (
                 f"Could not verify latest follow-up thread state: {exc}; "
                 "manual review required before sending follow-up"
             )
-            _send_followup_email.guard_failed_closed = True
-            print(f"   🛑 {_send_followup_email.last_error}")
+            _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+            print(f"   🛑 {failure_reason}")
             return False
 
         latest_followup_config = (latest_thread_data or {}).get("followUpConfig") or followup_config
@@ -834,12 +956,12 @@ def _send_followup_email(
             followup_index,
         )
         if terminal_reason:
-            _send_followup_email.last_error = (
+            failure_reason = (
                 f"Follow-up stopped before send because {terminal_reason}; "
                 "manual review required before sending follow-up"
             )
-            _send_followup_email.guard_failed_closed = True
-            print(f"   🛑 {_send_followup_email.last_error}")
+            _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+            print(f"   🛑 {failure_reason}")
             return False
 
         from .email import (
@@ -858,17 +980,19 @@ def _send_followup_email(
             )
         )
         if not create_reply_resp or create_reply_resp.status_code not in [200, 201, 202]:
-            _send_followup_email.last_error = (
+            failure_reason = (
                 f"createReplyAll failed: {create_reply_resp.status_code if create_reply_resp else 'no response'}"
             )
-            print(f"   ❌ {_send_followup_email.last_error}")
+            _set_followup_send_outcome(error=failure_reason)
+            print(f"   ❌ {failure_reason}")
             return False
 
         reply_draft = create_reply_resp.json() or {}
         reply_draft_id = reply_draft.get("id")
         if not reply_draft_id:
-            _send_followup_email.last_error = "createReplyAll returned no draft id"
-            print(f"   ❌ {_send_followup_email.last_error}")
+            failure_reason = "createReplyAll returned no draft id"
+            _set_followup_send_outcome(error=failure_reason)
+            print(f"   ❌ {failure_reason}")
             return False
 
         source_message = dict(last_outbound or {})
@@ -895,13 +1019,13 @@ def _send_followup_email(
                 user_email=user_email,
             )
         except Exception as exc:
-            _send_followup_email.last_error = (
+            failure_reason = (
                 f"Could not filter reply-all recipients: {exc}; "
                 "manual review required before sending follow-up"
             )
-            _send_followup_email.guard_failed_closed = True
+            _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
             _delete_graph_reply_draft(headers, reply_draft_id, base=base)
-            print(f"   🛑 {_send_followup_email.last_error}")
+            print(f"   🛑 {failure_reason}")
             return False
 
         recipient_payload = recipient_result["payload"]
@@ -912,13 +1036,13 @@ def _send_followup_email(
                 for address in recipient_result.get("sentRecipients", [])
             }
             if recipient_lower not in safe_sent_recipients:
-                _send_followup_email.last_error = (
+                failure_reason = (
                     "Primary follow-up recipient did not pass reply-all safety filtering; "
                     "manual review required before sending follow-up"
                 )
-                _send_followup_email.guard_failed_closed = True
+                _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
                 _delete_graph_reply_draft(headers, reply_draft_id, base=base)
-                print(f"   🛑 {_send_followup_email.last_error}")
+                print(f"   🛑 {failure_reason}")
                 return False
             recipient_payload["ccRecipients"] = [
                 cc_recipient
@@ -932,10 +1056,10 @@ def _send_followup_email(
             ]
             recipient_payload["toRecipients"] = [{"emailAddress": {"address": recipient}}]
         if not (recipient_payload["toRecipients"] or recipient_payload["ccRecipients"]):
-            _send_followup_email.last_error = "No safe reply-all recipients remained after filtering"
-            _send_followup_email.guard_failed_closed = True
+            failure_reason = "No safe reply-all recipients remained after filtering"
+            _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
             _delete_graph_reply_draft(headers, reply_draft_id, base=base)
-            print(f"   ❌ {_send_followup_email.last_error}")
+            print(f"   ❌ {failure_reason}")
             return False
 
         final_cc_recipients = [
@@ -957,11 +1081,12 @@ def _send_followup_email(
             )
         )
         if not patch_resp or patch_resp.status_code not in [200, 202]:
-            _send_followup_email.last_error = (
+            failure_reason = (
                 f"Patch reply-all draft failed: {patch_resp.status_code if patch_resp else 'no response'}"
             )
+            _set_followup_send_outcome(error=failure_reason)
             _delete_graph_reply_draft(headers, reply_draft_id, base=base)
-            print(f"   ❌ {_send_followup_email.last_error}")
+            print(f"   ❌ {failure_reason}")
             return False
 
         if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
@@ -979,23 +1104,34 @@ def _send_followup_email(
                     if att_resp and att_resp.status_code in [200, 201]:
                         print(f"      📎 Attached {attachment['name']}")
                     else:
-                        _send_followup_email.last_error = (
+                        failure_reason = (
                             f"Could not attach required signature asset {attachment['name']}; "
                             "manual review required before sending follow-up"
                         )
-                        _send_followup_email.guard_failed_closed = True
+                        _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
                         _delete_graph_reply_draft(headers, reply_draft_id, base=base)
-                        print(f"      🛑 {_send_followup_email.last_error}")
+                        print(f"      🛑 {failure_reason}")
                         return False
                 except Exception as e:
-                    _send_followup_email.last_error = (
+                    failure_reason = (
                         f"Could not attach required signature asset {attachment['name']}: {e}; "
                         "manual review required before sending follow-up"
                     )
-                    _send_followup_email.guard_failed_closed = True
+                    _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
                     _delete_graph_reply_draft(headers, reply_draft_id, base=base)
-                    print(f"      🛑 {_send_followup_email.last_error}")
+                    print(f"      🛑 {failure_reason}")
                     return False
+
+        campaign_decision = get_client_automation_decision(
+            user_id,
+            (latest_thread_data or thread_data).get("clientId")
+            or thread_data.get("clientId"),
+        )
+        if campaign_decision.denies_autonomous_work:
+            _set_followup_campaign_suppression(campaign_decision)
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            print(f"   🛑 {_get_followup_send_outcome().error}")
+            return False
 
         reply_resp = exponential_backoff_request(
             lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
@@ -1021,11 +1157,13 @@ def _send_followup_email(
             return True
         else:
             print(f"   Failed to send follow-up: {reply_resp.status_code}")
-            _send_followup_email.last_error = f"Follow-up Graph send returned HTTP {reply_resp.status_code}"
+            _set_followup_send_outcome(
+                error=f"Follow-up Graph send returned HTTP {reply_resp.status_code}"
+            )
             return False
 
     except Exception as e:
-        _send_followup_email.last_error = str(e)
+        _set_followup_send_outcome(error=str(e))
         print(f"   Error sending follow-up: {e}")
         return False
 

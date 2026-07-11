@@ -330,17 +330,53 @@ class _FakePendingDoc:
 class _FakePendingFs:
     """Minimal Firestore: users/<uid>/pendingResponses stream()."""
 
-    def __init__(self, docs):
+    def __init__(self, docs, user_id):
         self._docs = docs
+        self._user_id = user_id
+        self._seeded = {
+            ("systemConfig", "campaignAccess"): {
+                "automationEnabled": True,
+                "allowedUids": [],
+            },
+            ("users", user_id, "clients", "client-1"): {
+                "status": "live",
+                "automationPaused": False,
+            },
+        }
 
     def collection(self, name):
-        return self
+        return _FakePendingNode(self, (name,))
+
+
+class _FakePendingSnapshot:
+    def __init__(self, data=None):
+        self._data = data
+        self.exists = data is not None
+
+    def to_dict(self):
+        return dict(self._data or {})
+
+
+class _FakePendingNode:
+    def __init__(self, root, path):
+        self.root = root
+        self.path = path
+
+    def collection(self, name):
+        return _FakePendingNode(self.root, self.path + (name,))
 
     def document(self, name):
-        return self
+        return _FakePendingNode(self.root, self.path + (name,))
+
+    def get(self):
+        return _FakePendingSnapshot(self.root._seeded.get(self.path))
 
     def stream(self):
-        return list(self._docs)
+        if self.path == (
+            "users", self.root._user_id, "pendingResponses",
+        ):
+            return list(self.root._docs)
+        return []
 
 
 class ReplyAllManualContinuationTests(unittest.TestCase):
@@ -358,6 +394,7 @@ class ReplyAllManualContinuationTests(unittest.TestCase):
     def _pending_doc(self):
         return _FakePendingDoc("pending-1", {
             "threadId": "thread-1",
+            "clientId": "client-1",
             "msgId": "msg-1",
             "recipient": "broker@acme.com",
             "ccEmails": ["teammate@acme.com", "assistant@myfirm.com"],
@@ -371,7 +408,7 @@ class ReplyAllManualContinuationTests(unittest.TestCase):
     def test_queued_reply_all_defers_to_manual_continuation_without_resending(self):
         continuation = {"id": "sent-user-1", "conversationId": "conversation-1",
                         "sentDateTime": "2026-07-01T12:05:00Z", "recipientCount": 3}
-        fake_fs = _FakePendingFs([self._pending_doc()])
+        fake_fs = _FakePendingFs([self._pending_doc()], self.USER_ID)
         send_spy = MagicMock(return_value=True)
         dead_letter_spy = MagicMock()
 

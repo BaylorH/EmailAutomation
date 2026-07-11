@@ -63,6 +63,10 @@ class FakeFirestoreNode:
 
     def get(self):
         key = "/".join(self.path[1::2])
+        if "/archivedClients/" in f"/{key}/":
+            return FakeSnapshot({}, exists=False)
+        if "/clients/" in f"/{key}/":
+            return self.root.snapshots.get(key, FakeSnapshot({"status": "live"}))
         return self.root.snapshots.get(key, FakeSnapshot({}, exists=False))
 
 
@@ -91,6 +95,20 @@ def _seed_open_thread(fake_fs, user_id="uid-1", thread_id="thread-1",
     fake_fs.snapshots[
         f"users/{user_id}/threads/{thread_id}/messages/{message_id}"
     ] = FakeSnapshot({"direction": "inbound"})
+
+
+def _action_audit_payload(fake_fs, user_id, audit_id):
+    audit_path = (
+        "collection", "users", "document", user_id,
+        "collection", "actionAudit", "document", audit_id,
+    )
+    matches = [
+        payload for path, payload, _merge in fake_fs.set_calls
+        if path == audit_path
+    ]
+    if len(matches) != 1:
+        raise AssertionError(f"Expected one actionAudit write at {audit_path}, found {len(matches)}")
+    return matches[0]
 
 
 class FakeSnapshot:
@@ -164,6 +182,19 @@ class FakeHealthCollection:
         return FakeHealthDocRef(self.sink)
 
 
+class FakeClientCollection:
+    def __init__(self, archived=False):
+        self.archived = archived
+
+    def document(self, _client_id):
+        return type("ClientRef", (), {
+            "get": lambda _self: FakeSnapshot(
+                {} if self.archived else {"status": "live"},
+                exists=not self.archived,
+            )
+        })()
+
+
 class FakeUserNode:
     def __init__(self, docs, user_data=None, counter_store=None, health_sink=None,
                  counter_raise_on_get=False):
@@ -185,6 +216,10 @@ class FakeUserNode:
             )
         if name == "systemHealth":
             return FakeHealthCollection(self.health_sink)
+        if name == "clients":
+            return FakeClientCollection()
+        if name == "archivedClients":
+            return FakeClientCollection(archived=True)
         raise AssertionError(f"Unexpected user collection: {name}")
 
 
@@ -267,6 +302,19 @@ class FakeSheetsClient:
 
 
 class OutboxSafetyTests(unittest.TestCase):
+    def setUp(self):
+        # These tests isolate outbox behavior. Campaign policy is covered in
+        # test_campaign_automation_pause; keep this fixture explicitly active.
+        self._active_campaign = patch.object(
+            email_module,
+            "get_client_automation_pause",
+            return_value=(False, "", {"status": "live"}),
+        )
+        self._active_campaign.start()
+
+    def tearDown(self):
+        self._active_campaign.stop()
+
     def test_cancel_requested_item_is_deleted_without_sending(self):
         doc = FakeDoc({
             "assignedEmails": ["bp21harrison@gmail.com"],
@@ -415,7 +463,9 @@ class OutboxSafetyTests(unittest.TestCase):
                 "errors": {},
             }
 
-        with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+        with patch("email_automation.clients._fs", FakeFirestore()), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "get_contact_email_count", return_value=0), \
              patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter, \
@@ -461,6 +511,7 @@ class OutboxSafetyTests(unittest.TestCase):
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
              patch.object(email_module, "_sheets_client", return_value=fake_sheets), \
@@ -982,14 +1033,45 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertTrue(script.startswith("Hi,"))
         self.assertNotIn("Avery<script>", script)
 
-    def test_paused_client_outbox_item_moves_to_dead_letter_before_send(self):
+    def test_maintenance_paused_client_outbox_item_stays_queued_without_send(self):
         doc_ref = FakeDocRef("paused-outbox")
-        data = {"clientId": "client-1", "script": "Hi Avery"}
+        data = {
+            "clientId": "client-1",
+            "script": "Hi Avery",
+            "actionAuditId": "audit-1",
+        }
 
         with patch.object(
             email_module,
             "get_client_automation_pause",
             return_value=(True, "admin_incident_pause", {"automationPaused": True}),
+        ), patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter, \
+             patch.object(email_module, "_update_action_audit") as update_action_audit:
+            blocked = email_module._pause_client_outbox_item_if_needed(
+                "uid-1",
+                doc_ref,
+                data,
+            )
+
+        self.assertTrue(blocked)
+        move_to_dead_letter.assert_not_called()
+        retry_payload = doc_ref.set_calls[-1][0][0]
+        self.assertEqual("queued", retry_payload["status"])
+        self.assertEqual("blocked", retry_payload["automationSuppressedState"])
+        update_action_audit.assert_called_once()
+        audit_payload = update_action_audit.call_args.args[2]
+        self.assertEqual("queued", audit_payload["status"])
+        self.assertEqual("blocked", audit_payload["automationSuppressedState"])
+        self.assertEqual("admin_incident_pause", audit_payload["automationSuppressedReason"])
+
+    def test_stopped_client_outbox_item_moves_to_dead_letter_before_send(self):
+        doc_ref = FakeDocRef("stopped-outbox")
+        data = {"clientId": "client-1", "script": "Hi Avery"}
+
+        with patch.object(
+            email_module,
+            "get_client_automation_pause",
+            return_value=(True, "client_stopped_by_user", {"status": "stopped"}),
         ), patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter:
             blocked = email_module._pause_client_outbox_item_if_needed(
                 "uid-1",
@@ -999,7 +1081,12 @@ class OutboxSafetyTests(unittest.TestCase):
 
         self.assertTrue(blocked)
         move_to_dead_letter.assert_called_once()
-        self.assertIn("paused/stopped", move_to_dead_letter.call_args.args[3])
+        self.assertIn("stopped", move_to_dead_letter.call_args.args[3])
+        self.assertEqual([], doc_ref.set_calls)
+
+    def test_paused_client_outbox_item_moves_to_dead_letter_before_send(self):
+        """Compatibility contract: a terminal stop still dead-letters before send."""
+        self.test_stopped_client_outbox_item_moves_to_dead_letter_before_send()
 
     def test_jill_tour_outbox_item_moves_to_dead_letter_before_send(self):
         doc_ref = FakeDocRef("jill-tour-outbox")
@@ -1255,7 +1342,7 @@ class OutboxSafetyTests(unittest.TestCase):
         save_outbox_reply_message.assert_called_once()
         delete_notification.assert_called_once_with("uid-1", "client-1", "notification-1")
         self.assertTrue(doc.reference.deleted)
-        audit_payload = fake_fs.set_calls[-2][1]
+        audit_payload = _action_audit_payload(fake_fs, "uid-1", "audit-dashboard-reply")
         self.assertEqual("sent", audit_payload["status"])
         self.assertEqual("audit-dashboard-reply", doc.to_dict()["actionAuditId"])
         self.assertEqual("graph-reply-message-1", audit_payload["sentMessageId"])
@@ -1306,7 +1393,7 @@ class OutboxSafetyTests(unittest.TestCase):
             ["baylor@manifoldengineering.ai"],
             save_outbox_reply_message.call_args.kwargs["cc_emails"],
         )
-        audit_payload = fake_fs.set_calls[-2][1]
+        audit_payload = _action_audit_payload(fake_fs, "uid-1", "audit-dashboard-reply")
         self.assertEqual("sent", audit_payload["status"])
         self.assertEqual(
             ["bp21harrison@gmail.com", "baylor@manifoldengineering.ai"],
@@ -1333,7 +1420,8 @@ class OutboxSafetyTests(unittest.TestCase):
                  "conversationIds": {"bp21harrison+reviewed@gmail.com": "conversation-reviewed"},
              }) as send_and_index_email, \
              patch.object(email_module, "_get_sheet_id_or_fail", return_value="sheet-1"), \
-             patch.object(email_module, "highlight_row"):
+             patch.object(email_module, "highlight_row"), \
+             patch.object(email_module, "delete_notification_and_decrement_counters"):
             email_module._send_single_outbox_item(
                 "uid-1",
                 {"Authorization": "Bearer token"},
@@ -1344,7 +1432,7 @@ class OutboxSafetyTests(unittest.TestCase):
         send_and_index_email.assert_called_once()
         self.assertEqual(["bp21harrison+reviewed@gmail.com"], send_and_index_email.call_args.args[3])
         self.assertTrue(doc.reference.deleted)
-        audit_payload = fake_fs.set_calls[-2][1]
+        audit_payload = _action_audit_payload(fake_fs, "uid-1", "audit-dashboard-reply")
         self.assertEqual("sent", audit_payload["status"])
         self.assertEqual("draft-reviewed", audit_payload["sentMessageId"])
 
@@ -1839,6 +1927,7 @@ class OutboxSafetyTests(unittest.TestCase):
 
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
              patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None), \
@@ -1858,6 +1947,115 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(audit_payload["status"], "retrying")
         self.assertEqual(audit_payload["sentRecipients"], ["bp21harrison+sent@gmail.com"])
         self.assertEqual(audit_payload["remainingRecipients"], ["bp21harrison+failed@gmail.com"])
+
+    def test_mid_batch_campaign_suppression_never_requeues_already_sent_recipient(self):
+        sent_recipient = "bp21harrison+sent@gmail.com"
+        waiting_recipient = "bp21harrison+waiting@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [sent_recipient, waiting_recipient],
+            "script": "Hi,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "123 Maintenance Boundary Way",
+            "rowNumber": 21,
+            "attempts": 0,
+            "actionAuditId": "audit-maintenance-boundary",
+            "followUpConfig": {"enabled": False},
+        }, doc_id="outbox-maintenance-boundary")
+        fake_fs = FakeFirestore()
+
+        def send_result(_user_id, _headers, _script, recipients, **_kwargs):
+            recipient = recipients[0]
+            if recipient == sent_recipient:
+                return {
+                    "sent": [recipient],
+                    "errors": {},
+                    "sentMessageIds": {recipient: "graph-sent-1"},
+                }
+            return {
+                "sent": [],
+                "errors": {recipient: "campaign_maintenance"},
+                "campaignAutomationSuppressed": True,
+                "campaignAutomationState": "blocked",
+                "campaignAutomationReason": "campaign_maintenance",
+                "campaignAutomationTerminal": False,
+            }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
+             patch.object(email_module, "find_matching_sent_message_for_retry", return_value=None), \
+             patch.object(email_module, "send_and_index_email", side_effect=send_result):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        retry_payload = next(
+            call[0][0]
+            for call in doc.reference.set_calls
+            if call[0][0].get("automationSuppressedState")
+        )
+        self.assertEqual([waiting_recipient], retry_payload["assignedEmails"])
+        self.assertEqual([sent_recipient], retry_payload["sentRecipients"])
+        self.assertTrue(retry_payload["partialSend"])
+
+    def test_mid_batch_suppression_preserves_recipient_found_in_sent_items(self):
+        reconciled_recipient = "bp21harrison+reconciled@gmail.com"
+        waiting_recipient = "bp21harrison+waiting@gmail.com"
+        doc = FakeDoc({
+            "assignedEmails": [reconciled_recipient, waiting_recipient],
+            "script": "Hi,\n\nCan you share details?\n\nThanks",
+            "clientId": "client-1",
+            "subject": "123 Reconciliation Boundary Way",
+            "rowNumber": 22,
+            "attempts": 1,
+            "actionAuditId": "audit-reconciliation-boundary",
+            "followUpConfig": {"enabled": False},
+        }, doc_id="outbox-reconciliation-boundary")
+        fake_fs = FakeFirestore()
+
+        def prior_send(_headers, _data, recipient, *_args, **_kwargs):
+            if recipient == reconciled_recipient:
+                return {
+                    "sent": [recipient],
+                    "sentMessageIds": {recipient: "graph-reconciled-1"},
+                    "internetMessageIds": {recipient: "<graph-reconciled-1@example.com>"},
+                }
+            return {"sent": []}
+
+        suppressed = {
+            "sent": [],
+            "errors": {waiting_recipient: "campaign_maintenance"},
+            "campaignAutomationSuppressed": True,
+            "campaignAutomationState": "blocked",
+            "campaignAutomationReason": "campaign_maintenance",
+            "campaignAutomationTerminal": False,
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), \
+             patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "_pause_client_outbox_item_if_needed", return_value=False), \
+             patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
+             patch.object(email_module, "_select_script_for_recipient", return_value=doc.to_dict()["script"]), \
+             patch.object(email_module, "_sent_retry_reconciliation_result", side_effect=prior_send), \
+             patch.object(email_module, "send_and_index_email", return_value=suppressed):
+            email_module._send_single_outbox_item(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                {"doc": doc, "data": doc.to_dict()},
+            )
+
+        retry_payload = next(
+            call[0][0]
+            for call in doc.reference.set_calls
+            if call[0][0].get("automationSuppressedState")
+        )
+        self.assertEqual([waiting_recipient], retry_payload["assignedEmails"])
+        self.assertEqual([reconciled_recipient], retry_payload["sentRecipients"])
+        self.assertTrue(retry_payload["partialSend"])
 
     def test_graph_accepted_unindexed_outbox_moves_to_reconciliation_without_retry(self):
         recipient = "bp21harrison+unindexed@gmail.com"

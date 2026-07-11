@@ -63,6 +63,7 @@ os.environ.setdefault(
 )
 
 from email_automation import pending_responses
+from email_automation import processing as processing_module
 from email_automation.outbound_safety import validate_outbound_body
 from email_automation.ai_processing import _augment_events_with_deterministic_signals
 
@@ -93,9 +94,10 @@ class _FakeDoc:
 
 
 class _FakeCollection:
-    def __init__(self, docs=None):
+    def __init__(self, docs=None, client_status=None):
         self.docs = docs or []
         self.add_calls = []
+        self.client_status = client_status
 
     def stream(self):
         return list(self.docs)
@@ -103,6 +105,15 @@ class _FakeCollection:
     def add(self, data):
         self.add_calls.append(data)
         return _FakeDocRef()
+
+    def document(self, _doc_id):
+        status = self.client_status
+        return types.SimpleNamespace(
+            get=lambda: types.SimpleNamespace(
+                exists=status is not None,
+                to_dict=lambda: {"status": status} if status is not None else None,
+            )
+        )
 
 
 class _FakeFirestore:
@@ -118,6 +129,20 @@ class _FakeFirestore:
     def collection(self, name):
         if name == "users":
             return self
+        if name == "systemConfig":
+            return types.SimpleNamespace(
+                document=lambda _doc_id: types.SimpleNamespace(
+                    get=lambda: types.SimpleNamespace(
+                        exists=True,
+                        to_dict=lambda: {
+                            "automationEnabled": True,
+                            "allowedUids": [],
+                        },
+                    )
+                )
+            )
+        if name in {"clients", "archivedClients"}:
+            return _FakeCollection(client_status="live" if name == "clients" else None)
         return self.collections.setdefault(name, _FakeCollection())
 
 
@@ -340,8 +365,8 @@ class KarsenLaunchPlaceholderAndTourLeakComboTests(unittest.TestCase):
 
         with patch.dict(sys.modules, {
             "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
-            "email_automation.processing": types.SimpleNamespace(send_reply_in_thread=recorder),
         }), \
+             patch.object(processing_module, "send_reply_in_thread", new=recorder), \
              patch("email_automation.sent_mail_guard.requests.get", fake_graph.get), \
              patch("email_automation.sent_mail_guard.exponential_backoff_request",
                    side_effect=lambda fn: fn()):
@@ -435,8 +460,8 @@ class KarsenLaunchPlaceholderAndTourLeakComboTests(unittest.TestCase):
 
         with patch.dict(sys.modules, {
             "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
-            "email_automation.processing": types.SimpleNamespace(send_reply_in_thread=recorder),
         }), \
+             patch.object(processing_module, "send_reply_in_thread", new=recorder), \
              patch("email_automation.sent_mail_guard.requests.get", fake_graph.get), \
              patch("email_automation.sent_mail_guard.exponential_backoff_request",
                    side_effect=lambda fn: fn()):

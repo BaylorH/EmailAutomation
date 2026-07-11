@@ -562,10 +562,15 @@ def stage1_upload(world):
     """UPLOAD: roster upload persists user + client/campaign rows into Firestore.
     Verified by the REAL clients._get_sheet_id_or_fail reading the campaign back."""
     world.fs.collection("users").document(USER_ID).set({"email": "owner@example.com"})
+    world.fs.collection("systemConfig").document("campaignAccess").set({
+        "automationEnabled": True,
+        "allowedUids": [],
+    })
     world.fs.collection("users").document(USER_ID).collection("clients").document(CLIENT_ID).set({
         "sheetId": SHEET_ID,
         "name": "Tenant Rep Campaign",
         "status": "live",
+        "automationPaused": False,
     })
     # REAL production read proves the uploaded campaign row is persisted & readable.
     resolved_sheet = clients._get_sheet_id_or_fail(USER_ID, CLIENT_ID)
