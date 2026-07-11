@@ -17,7 +17,8 @@ POST /process-user   body {"uid": "<firebase-uid>"}
       * 400 {"status": "error", ...}      — missing / blank uid or non-JSON body
       * 401 {"status": "error", ...}      — auth required and missing/wrong secret
       * 500 {"status": "error", "error"}  — pipeline raised (so Cloud Tasks retries)
-GET  /healthz        — liveness probe, always 200 (never auth-gated)
+GET  /health         — Cloud Run-safe liveness probe, always 200
+GET  /healthz        — legacy liveness alias, always 200 (never auth-gated)
 
 Auth
 ----
@@ -73,6 +74,7 @@ def _auth_ok() -> bool:
     return hmac.compare_digest(provided, expected)
 
 
+@app.get("/health")
 @app.get("/healthz")
 def healthz():
     return jsonify({"status": "ok"}), 200
