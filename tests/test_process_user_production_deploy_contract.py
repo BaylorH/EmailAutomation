@@ -411,7 +411,7 @@ class DeployScriptContractTests(unittest.TestCase):
             "--region", REGION,
             "--image", IMAGE,
             "--command", "gunicorn",
-            "--args", "--bind=:8080,--workers=1,--threads=8,--timeout=0,service:app",
+            "--args=--bind=:8080,--workers=1,--threads=8,--timeout=0,service:app",
             "--service-account", SERVICE_ACCOUNT,
             "--concurrency", "1",
             "--timeout", "540",
