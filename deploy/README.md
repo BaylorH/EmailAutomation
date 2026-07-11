@@ -23,7 +23,7 @@ service-account JSON to `$RUNNER_TEMP/sa.json`).
 | `../Dockerfile` | Container image: `python:3.12-slim`, installs `requirements.txt`, non-root `appuser`, entrypoint `python main.py`. |
 | `cloudrun-job.yaml` | Cloud Run Job spec — task timeout, service-account placeholder, env vars (parameterized bucket + launch-safety scope), Secret Manager references. |
 | `cloudrun-service.yaml` | **Phase-1 webhook** Cloud Run *Service* spec — same image, gunicorn entrypoint serving `service.py` (`POST /process-user`), per-user lease, `PROCESS_USER_AUTH` gate. |
-| `../service.py` | HTTP entrypoint: wraps `main.refresh_and_process_user` behind `run_with_user_lease`; routes `POST /process-user` + `GET /healthz`. |
+| `../service.py` | HTTP entrypoint: wraps `main.refresh_and_process_user` behind `run_with_user_lease`; routes `POST /process-user` + `GET /health` with legacy `/healthz`. |
 | `../email_automation/app_config.py` | `FIREBASE_BUCKET` now reads env, defaults to historical value. |
 | `../firebase_helpers.py` | Same env parameterization on the bucket that actually drives the token-cache round-trip. |
 | `../main.py` | SIGTERM→`sys.exit` bridge so the atexit token-cache upload runs on container shutdown. |
@@ -201,7 +201,8 @@ Contract:
 | Route | Request | Response |
 |-------|---------|----------|
 | `POST /process-user` | JSON `{"uid": "<firebase-uid>"}` | `200 {"status":"processed"}` ran · `503 {"status":"skipped_locked"}` same-uid already running (Cloud Tasks retries) · `400` missing/blank uid or non-JSON · `401` auth required + missing/wrong secret · `500 {"error":...}` pipeline raised (Cloud Tasks retries) |
-| `GET /healthz` | — | `200` (never auth-gated) |
+| `GET /health` | — | `200` (never auth-gated; use this for external Cloud Run canaries because Cloud Run reserves some paths ending in `z`) |
+| `GET /healthz` | — | `200` legacy/local alias |
 
 **Auth.** Optional in-app shared secret via `PROCESS_USER_AUTH`; when set, requests
 must send it as `Authorization: Bearer <secret>` or `X-Process-User-Auth: <secret>`

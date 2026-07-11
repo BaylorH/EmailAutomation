@@ -12,7 +12,7 @@ Contract pinned here:
     so Cloud Tasks retries after the active worker releases the lease),
   * missing/blank uid        → 400,
   * downstream exception     → 500 (so Cloud Tasks retries),
-  * GET /healthz             → 200,
+  * GET /health and /healthz → 200,
   * shared-secret auth gate  → 401 when PROCESS_USER_AUTH is set and the secret
     is missing/wrong; open when the env var is unset.
 
@@ -51,6 +51,10 @@ class ProcessUserServiceTests(unittest.TestCase):
 
     def test_healthz_ok(self):
         resp = self.client.get("/healthz")
+        self.assertEqual(200, resp.status_code)
+
+    def test_cloud_run_safe_health_alias_ok(self):
+        resp = self.client.get("/health")
         self.assertEqual(200, resp.status_code)
 
     def test_process_user_runs_pipeline_under_lease(self):
@@ -198,6 +202,11 @@ class ProcessUserAuthTests(unittest.TestCase):
     def test_healthz_open_even_when_auth_required(self):
         with patch.dict(os.environ, {"PROCESS_USER_AUTH": "s3cret"}):
             resp = self.client.get("/healthz")
+        self.assertEqual(200, resp.status_code)
+
+    def test_cloud_run_safe_health_alias_open_even_when_auth_required(self):
+        with patch.dict(os.environ, {"PROCESS_USER_AUTH": "s3cret"}):
+            resp = self.client.get("/health")
         self.assertEqual(200, resp.status_code)
 
 
