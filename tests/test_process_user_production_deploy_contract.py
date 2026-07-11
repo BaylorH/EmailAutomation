@@ -31,10 +31,7 @@ TAG = (
 )
 DIGEST = "sha256:" + "a" * 64
 IMAGE = f"{TAG}@{DIGEST}"
-CANONICAL_IMAGE = (
-    "us-central1-docker.pkg.dev/email-automation-cache/"
-    f"cloud-run-source-deploy/process-user@{DIGEST}"
-)
+CANONICAL_IMAGE = f"{TAG.rsplit(':', 1)[0]}@{DIGEST}"
 SERVICE_ACCOUNT = "248289505828-compute@developer.gserviceaccount.com"
 ROLLBACK_REVISION = "process-user-lock-0837727b"
 ROLLBACK_DIGEST = "sha256:" + "c" * 64
@@ -682,7 +679,7 @@ class RollbackRunbookContractTests(unittest.TestCase):
                     raise SystemExit(1)
                 if revision_name == "{ROLLBACK_REVISION}":
                     rollback_image = (
-                        "{TAG}@sha256:" + "d" * 64
+                        "{ROLLBACK_IMAGE.rsplit('@', 1)[0]}@sha256:" + "d" * 64
                         if scenario == "mismatched_rollback_image"
                         else "{ROLLBACK_IMAGE}"
                     )
