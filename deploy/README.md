@@ -313,7 +313,7 @@ if [[ ! "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   printf 'Refusing: Release A image digest readback was invalid.\n' >&2
   exit 71
 fi
-expected_image="${image_tag}@${image_digest}"
+expected_image="${REGION}-docker.pkg.dev/${PROJECT}/${REPOSITORY}/${SERVICE}@${image_digest}"
 
 service_json="$(
   gcloud run services describe "$SERVICE" \
@@ -377,8 +377,8 @@ if annotations.get("autoscaling.knative.dev/maxScale") != "10":
     raise SystemExit("Release A revision maxScale is not 10")
 PY
 
-if [[ ! "$EXPECTED_ROLLBACK_IMAGE" =~ ^${REGION}-docker\.pkg\.dev/${PROJECT}/${REPOSITORY}/${SERVICE}(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$ ]]; then
-  printf 'Refusing: EXPECTED_ROLLBACK_IMAGE must be an immutable process-user image digest.\n' >&2
+if [[ ! "$EXPECTED_ROLLBACK_IMAGE" =~ ^${REGION}-docker\.pkg\.dev/${PROJECT}/${REPOSITORY}/${SERVICE}@sha256:[0-9a-f]{64}$ ]]; then
+  printf 'Refusing: EXPECTED_ROLLBACK_IMAGE must use Cloud Run canonical repository@digest form.\n' >&2
   exit 72
 fi
 rollback_revision_json="$(

@@ -31,6 +31,10 @@ TAG = (
 )
 DIGEST = "sha256:" + "a" * 64
 IMAGE = f"{TAG}@{DIGEST}"
+CANONICAL_IMAGE = (
+    "us-central1-docker.pkg.dev/email-automation-cache/"
+    f"cloud-run-source-deploy/process-user@{DIGEST}"
+)
 SERVICE_ACCOUNT = "248289505828-compute@developer.gserviceaccount.com"
 ROLLBACK_REVISION = "process-user-lock-0837727b"
 ROLLBACK_DIGEST = "sha256:" + "c" * 64
@@ -687,9 +691,10 @@ class RollbackRunbookContractTests(unittest.TestCase):
                     }}))
                     raise SystemExit(0)
                 release_image = (
-                    "{TAG}@sha256:" + "b" * 64
+                    "us-central1-docker.pkg.dev/email-automation-cache/"
+                    "cloud-run-source-deploy/process-user@sha256:" + "b" * 64
                     if scenario == "mismatched_release_image"
-                    else "{IMAGE}"
+                    else "{CANONICAL_IMAGE}"
                 )
                 print(json.dumps({{
                     "metadata": {{"annotations": {{"autoscaling.knative.dev/maxScale": "10"}}}},
