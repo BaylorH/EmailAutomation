@@ -1,0 +1,161 @@
+"""Production runtime dependency contract for the process-user service."""
+
+import ast
+from pathlib import Path
+import re
+import unittest
+
+from packaging.requirements import Requirement
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REQUIREMENTS_PATH = REPO_ROOT / "requirements.txt"
+LOCK_PATH = REPO_ROOT / "requirements.lock"
+DOCKERFILE_PATH = REPO_ROOT / "Dockerfile"
+
+
+def _active_requirements() -> list[str]:
+    return [
+        line.strip()
+        for line in REQUIREMENTS_PATH.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def _production_python_sources() -> list[Path]:
+    excluded_roots = {"tests", ".venv", "venv", "build", "dist"}
+    return [
+        path
+        for path in REPO_ROOT.rglob("*.py")
+        if excluded_roots.isdisjoint(path.relative_to(REPO_ROOT).parts)
+        and not any(part.startswith(".") for part in path.relative_to(REPO_ROOT).parts)
+    ]
+
+
+def _parse_locked_requirement(line: str) -> Requirement:
+    requirement_text = line.split(" --hash=", 1)[0].strip()
+    requirement = Requirement(requirement_text)
+    if not re.fullmatch(r"==[^=*,\s]+", str(requirement.specifier)):
+        raise ValueError(f"lock requirement is not an exact pin: {requirement}")
+    hash_values = re.findall(r"(?:^|\s)--hash=([^\s]+)", line)
+    if not hash_values or not all(
+        re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+        for value in hash_values
+    ):
+        raise ValueError(f"lock requirement has an invalid SHA-256 hash: {requirement}")
+    return requirement
+
+
+class RuntimeDependencyContractTests(unittest.TestCase):
+    def test_lock_line_validator_rejects_non_exact_pins_and_malformed_hashes(self):
+        valid_hash = "a" * 64
+        with self.assertRaises(ValueError):
+            _parse_locked_requirement(f"demo==1.* --hash=sha256:{valid_hash}")
+        with self.assertRaises(ValueError):
+            _parse_locked_requirement(f"demo===1.0 --hash=sha256:{valid_hash}")
+        with self.assertRaises(ValueError):
+            _parse_locked_requirement("demo==1.0 --hash=sha256:abc")
+
+    def test_dockerfile_pins_python_base_image_by_digest(self):
+        dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
+        self.assertRegex(
+            dockerfile,
+            r"(?m)^FROM python:3\.12-slim@sha256:[0-9a-f]{64}$",
+        )
+
+    def test_firebase_admin_is_exactly_pinned_for_production(self):
+        requirements = _active_requirements()
+        self.assertEqual(requirements.count("firebase-admin==7.5.0"), 1)
+        self.assertFalse(
+            any(
+                requirement.lower().startswith("firebase-admin")
+                and requirement != "firebase-admin==7.5.0"
+                for requirement in requirements
+            ),
+            "firebase-admin must have one exact production pin",
+        )
+
+    def test_production_firebase_admin_imports_map_to_declared_distribution(self):
+        declared_distributions = {
+            Requirement(requirement).name.lower().replace("_", "-")
+            for requirement in _active_requirements()
+        }
+        firebase_imports = []
+        for path in _production_python_sources():
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    modules = [node.module]
+                else:
+                    continue
+                firebase_imports.extend(
+                    (path.relative_to(REPO_ROOT), module)
+                    for module in modules
+                    if module.split(".", 1)[0] == "firebase_admin"
+                )
+
+        self.assertTrue(firebase_imports, "production source must import firebase_admin")
+        for path, module in firebase_imports:
+            distribution = module.split(".", 1)[0].lower().replace("_", "-")
+            self.assertIn(
+                distribution,
+                declared_distributions,
+                f"{path} imports {module}, but distribution {distribution} is undeclared",
+            )
+
+    def test_dockerfile_installs_requirements_file(self):
+        dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
+        self.assertRegex(
+            dockerfile,
+            r"(?m)^COPY\s+requirements\.lock\s+\./\s*$",
+        )
+        self.assertRegex(
+            dockerfile,
+            re.compile(
+                r"(?m)^RUN\s+pip\s+install\b[^\n]*"
+                r"--require-hashes\b[^\n]*\s-r\s+requirements\.lock\s*$"
+            ),
+        )
+
+    def test_deployment_lock_pins_every_distribution_with_hashes(self):
+        lock_text = LOCK_PATH.read_text(encoding="utf-8")
+        logical_lines = []
+        current = ""
+        for raw_line in lock_text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            current = f"{current} {line}".strip()
+            if current.endswith("\\"):
+                current = current[:-1].strip()
+                continue
+            logical_lines.append(current)
+            current = ""
+        self.assertFalse(current, "lock file ended with an incomplete continuation")
+        self.assertGreater(len(logical_lines), 20)
+
+        locked_requirements = {}
+        for line in logical_lines:
+            requirement = _parse_locked_requirement(line)
+            normalized_name = requirement.name.lower().replace("_", "-")
+            self.assertNotIn(normalized_name, locked_requirements)
+            locked_requirements[normalized_name] = requirement
+
+        for direct_text in _active_requirements():
+            direct = Requirement(direct_text)
+            normalized_name = direct.name.lower().replace("_", "-")
+            self.assertIn(normalized_name, locked_requirements)
+            locked = locked_requirements[normalized_name]
+            locked_versions = list(locked.specifier)
+            self.assertEqual(len(locked_versions), 1)
+            locked_version = locked_versions[0].version
+            self.assertTrue(
+                direct.specifier.contains(locked_version, prereleases=True),
+                f"locked requirement {locked} does not satisfy direct requirement {direct}",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

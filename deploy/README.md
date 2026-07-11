@@ -265,3 +265,215 @@ the job scaffold).
   Pinned by `tests/test_ws_b_cloudrun_job_spec.py`. If a real run ever needs more
   than 40m, raise `DEFAULT_TTL_SECONDS` first, then the timeout, keeping
   timeout `<=` TTL.
+
+### Prove rollback and guaranteed Release A restoration
+
+Run this only after the exact `release-a` revision has been promoted to 100%
+traffic and its image/readback checks have passed. The block refuses to mutate
+traffic otherwise. It restores that same Release A revision on every exit after
+traffic mutation, including rollback-command and readback failures.
+
+```bash
+set -Eeuo pipefail
+
+PREFLIGHT_HELPER="${PREFLIGHT_HELPER:-$PWD/scripts/process_user_gcloud_preflight.sh}"
+REGION="us-central1"
+SERVICE="process-user"
+REPOSITORY="cloud-run-source-deploy"
+ROLLBACK_REVISION="REPLACE_ME_ROLLBACK_REVISION"
+EXPECTED_ROLLBACK_IMAGE="REPLACE_ME_ROLLBACK_IMAGE@sha256:REPLACE_ME_ROLLBACK_DIGEST"
+
+if [[ "$ROLLBACK_REVISION" == *REPLACE_ME* || "$EXPECTED_ROLLBACK_IMAGE" == *REPLACE_ME* ]]; then
+  printf 'Refusing: replace every REPLACE_ME rollback target before running.\n' >&2
+  exit 65
+fi
+if [[ ! -f "$PREFLIGHT_HELPER" ]]; then
+  printf 'Refusing: run from the repository root or set PREFLIGHT_HELPER explicitly.\n' >&2
+  exit 66
+fi
+source "$PREFLIGHT_HELPER"
+process_user_gcloud_preflight apply
+
+APPROVED_ACCOUNT="$PROCESS_USER_APPROVED_ACCOUNT"
+PROJECT="$PROCESS_USER_PROJECT"
+
+short_sha="$(git rev-parse --short=12 HEAD)"
+if [[ ! "$short_sha" =~ ^[0-9a-f]{12}$ ]]; then
+  printf 'Refusing: git HEAD did not resolve to a 12-character lowercase SHA.\n' >&2
+  exit 70
+fi
+image_tag="${REGION}-docker.pkg.dev/${PROJECT}/${REPOSITORY}/${SERVICE}:${short_sha}"
+image_digest="$(
+  gcloud artifacts docker images describe "$image_tag" \
+    --account "$APPROVED_ACCOUNT" \
+    --project "$PROJECT" \
+    '--format=value(image_summary.digest)'
+)"
+if [[ ! "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  printf 'Refusing: Release A image digest readback was invalid.\n' >&2
+  exit 71
+fi
+expected_image="${image_tag}@${image_digest}"
+
+service_json="$(
+  gcloud run services describe "$SERVICE" \
+    --account "$APPROVED_ACCOUNT" \
+    --project "$PROJECT" \
+    --region "$REGION" \
+    --format=json
+)"
+release_revision="$(
+  SERVICE_JSON="$service_json" python3 - <<'PY'
+import json
+import os
+
+service = json.loads(os.environ["SERVICE_JSON"])
+matches = [
+    target.get("revisionName")
+    for target in service.get("status", {}).get("traffic", [])
+    if target.get("tag") == "release-a"
+]
+if len(matches) != 1 or not matches[0]:
+    raise SystemExit(f"expected exactly one release-a tagged revision, found {matches!r}")
+if service.get("metadata", {}).get("annotations", {}).get("run.googleapis.com/maxScale") != "20":
+    raise SystemExit("service-wide run.googleapis.com/maxScale is not 20")
+release_percent = sum(
+    target.get("percent", 0)
+    for target in service.get("status", {}).get("traffic", [])
+    if target.get("revisionName") == matches[0]
+)
+positive_targets = {
+    target.get("revisionName")
+    for target in service.get("status", {}).get("traffic", [])
+    if target.get("percent", 0) > 0
+}
+if release_percent != 100 or positive_targets != {matches[0]}:
+    raise SystemExit("Release A must already be the sole 100 percent traffic target")
+print(matches[0])
+PY
+)"
+
+revision_json="$(
+  gcloud run revisions describe "$release_revision" \
+    --account "$APPROVED_ACCOUNT" \
+    --project "$PROJECT" \
+    --region "$REGION" \
+    --format=json
+)"
+REVISION_JSON="$revision_json" EXPECTED_IMAGE="$expected_image" python3 - <<'PY'
+import json
+import os
+
+revision = json.loads(os.environ["REVISION_JSON"])
+spec = revision.get("spec", {})
+containers = spec.get("containers", [])
+image = containers[0].get("image", "") if len(containers) == 1 else ""
+if image != os.environ["EXPECTED_IMAGE"]:
+    raise SystemExit(f"Release A image does not match the built digest: {image!r}")
+if spec.get("containerConcurrency") != 1:
+    raise SystemExit("Release A containerConcurrency is not 1")
+annotations = revision.get("metadata", {}).get("annotations", {})
+if annotations.get("autoscaling.knative.dev/maxScale") != "10":
+    raise SystemExit("Release A revision maxScale is not 10")
+PY
+
+if [[ ! "$EXPECTED_ROLLBACK_IMAGE" =~ ^${REGION}-docker\.pkg\.dev/${PROJECT}/${REPOSITORY}/${SERVICE}(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$ ]]; then
+  printf 'Refusing: EXPECTED_ROLLBACK_IMAGE must be an immutable process-user image digest.\n' >&2
+  exit 72
+fi
+rollback_revision_json="$(
+  gcloud run revisions describe "$ROLLBACK_REVISION" \
+    --account "$APPROVED_ACCOUNT" \
+    --project "$PROJECT" \
+    --region "$REGION" \
+    --format=json
+)"
+REVISION_JSON="$rollback_revision_json" EXPECTED_IMAGE="$EXPECTED_ROLLBACK_IMAGE" python3 - <<'PY'
+import json
+import os
+
+revision = json.loads(os.environ["REVISION_JSON"])
+containers = revision.get("spec", {}).get("containers", [])
+image = containers[0].get("image", "") if len(containers) == 1 else ""
+if image != os.environ["EXPECTED_IMAGE"]:
+    raise SystemExit(f"rollback revision image does not match the expected digest: {image!r}")
+PY
+
+traffic_revision_at_100() {
+  local current_json
+  current_json="$(
+    gcloud run services describe "$SERVICE" \
+      --account "$APPROVED_ACCOUNT" \
+      --project "$PROJECT" \
+      --region "$REGION" \
+      --format=json
+  )" || return 1
+  SERVICE_JSON="$current_json" python3 - <<'PY'
+import json
+import os
+
+service = json.loads(os.environ["SERVICE_JSON"])
+targets = [
+    item.get("revisionName")
+    for item in service.get("status", {}).get("traffic", [])
+    if item.get("percent", 0) > 0
+]
+if len(targets) != 1:
+    raise SystemExit(f"expected exactly one positive traffic target, found {targets!r}")
+percent = next(
+    item.get("percent")
+    for item in service["status"]["traffic"]
+    if item.get("revisionName") == targets[0] and item.get("percent", 0) > 0
+)
+if percent != 100:
+    raise SystemExit(f"traffic target is at {percent!r}, not 100")
+print(targets[0])
+PY
+}
+
+traffic_is_exactly() {
+  local expected="$1"
+  local actual
+  actual="$(traffic_revision_at_100)" || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
+restore_release_a() {
+  local prior_status="$1"
+  trap - EXIT
+  printf 'Restoring exact Release A revision %s to 100%% traffic...\n' "$release_revision" >&2
+  if ! gcloud run services update-traffic "$SERVICE" \
+      --account "$APPROVED_ACCOUNT" \
+      --project "$PROJECT" \
+      --region "$REGION" \
+      --to-revisions "${release_revision}=100"; then
+    printf 'CRITICAL: Release A traffic restoration command failed.\n' >&2
+    return 1
+  fi
+  if ! traffic_is_exactly "$release_revision"; then
+    printf 'CRITICAL: Release A restoration could not be proven by readback.\n' >&2
+    return 1
+  fi
+  printf 'Release A restoration proven at 100%% traffic.\n'
+  return "$prior_status"
+}
+
+# This trap must be installed before the first rollback traffic mutation.
+trap 'restore_release_a $?' EXIT
+
+if ! gcloud run services update-traffic "$SERVICE" \
+    --account "$APPROVED_ACCOUNT" \
+    --project "$PROJECT" \
+    --region "$REGION" \
+    --to-revisions "${ROLLBACK_REVISION}=100"; then
+  printf 'Rollback traffic mutation failed; EXIT trap will restore Release A.\n' >&2
+  exit 1
+fi
+if ! traffic_is_exactly "$ROLLBACK_REVISION"; then
+  printf 'Rollback readback failed; EXIT trap will restore Release A.\n' >&2
+  exit 1
+fi
+printf 'Rollback revision %s proven at 100%% traffic.\n' "$ROLLBACK_REVISION"
+
+restore_release_a 0
+```

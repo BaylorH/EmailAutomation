@@ -6,7 +6,7 @@
 # The GitHub Actions workflow pins python-version '3.x'; 3.12-slim is chosen
 # here because every requirement (PyMuPDF, Pillow, lxml, pdfplumber, ...) ships
 # a manylinux wheel for 3.12, keeping the build wheel-only and layers minimal.
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 
 # - PYTHONUNBUFFERED: stream logs to Cloud Logging without buffering
 # - PYTHONDONTWRITEBYTECODE: no .pyc clutter in the image
@@ -17,9 +17,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Dependencies first so the layer caches across source-only changes.
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Dependencies first so the layer caches across source-only changes. The lock
+# is resolved for Python 3.12/Linux and includes hashes for every distribution.
+COPY requirements.lock ./
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 # Application source.
 COPY . .
