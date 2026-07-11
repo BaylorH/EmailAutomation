@@ -196,19 +196,11 @@ class FollowupTerminalStateTests(unittest.TestCase):
 
         def fake_send_followup(**_kwargs):
             other_context.run(
-                setattr,
-                fake_send_followup,
-                "last_error",
-                "other request guard failed closed",
-            )
-            other_context.run(
-                setattr, fake_send_followup, "guard_failed_closed", True
+                followup._set_followup_send_outcome,
+                error="other request guard failed closed",
+                guard_failed_closed=True,
             )
             return False
-
-        fake_send_followup.last_error = None
-        fake_send_followup.last_attempt_at = None
-        fake_send_followup.guard_failed_closed = False
 
         with patch.object(followup, "_fs", fake_fs), patch.object(
             followup, "_next_business_followup_time", side_effect=lambda now, _cfg: now

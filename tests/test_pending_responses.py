@@ -332,6 +332,8 @@ class PendingResponsesTests(unittest.TestCase):
             "responseBody": "Hi,\n\nCan you share the flyer?",
             "clientId": "client-1",
             "attempts": pending_responses.MAX_RESPONSE_ATTEMPTS,
+            "processingBy": "worker-stale",
+            "processingAt": "2026-07-10T01:00:00Z",
         })
         fake_fs = FakeFirestore([active_doc])
         self.campaign_decision.return_value = CampaignAutomationDecision(
@@ -355,7 +357,14 @@ class PendingResponsesTests(unittest.TestCase):
         self.assertFalse(active_doc.reference.deleted)
         self.assertEqual([], fake_fs.collections["deadLetterQueue"].add_calls)
         payload = active_doc.reference.update_calls[-1]
+        self.assertEqual("queued", payload["status"])
         self.assertEqual("unknown", payload["automationSuppressedState"])
+        self.assertEqual(
+            "client_automation_state_read_error",
+            payload["automationSuppressedReason"],
+        )
+        self.assertIsNone(payload["processingBy"])
+        self.assertIsNone(payload["processingAt"])
         self.assertNotIn("attempts", payload)
 
     def test_sent_but_unindexed_retry_moves_to_reconciliation_without_resending(self):

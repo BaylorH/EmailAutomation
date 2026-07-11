@@ -299,7 +299,14 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
     suppression is caused by the terminal status, not the harness.
     """
 
-    def _drive(self, thread_status, campaign_decision=None):
+    def _drive(
+        self,
+        thread_status,
+        campaign_decision=None,
+        *,
+        thread_client_id="client-x",
+        resolved_client_id=None,
+    ):
         user_id = "uid-terminal"
         thread_id = "thread-terminal-1"
         msg_id = "graph-msg-terminal"
@@ -321,7 +328,9 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
             ],
         }
 
-        thread_data = {"status": thread_status, "clientId": "client-x"}
+        thread_data = {"status": thread_status}
+        if thread_client_id:
+            thread_data["clientId"] = thread_client_id
         fake_fs = _TerminalFakeFs(thread_data)
         campaign_decision = campaign_decision or CampaignAutomationDecision(
             state="allow", reason="", client_data={"status": "live"},
@@ -354,7 +363,8 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
              patch.object(processing, "_fs", fake_fs), \
              patch.object(processing, "lookup_thread_by_message_id", return_value=thread_id), \
              patch.object(processing, "lookup_thread_by_conversation_id", return_value=thread_id), \
-             patch.object(processing, "get_client_automation_decision", return_value=campaign_decision), \
+             patch.object(processing, "get_client_automation_decision", return_value=campaign_decision) as decision_spy, \
+             patch.object(processing, "_find_client_id_by_email", return_value=resolved_client_id) as resolver_spy, \
              patch.object(processing, "get_thread_status", return_value=thread_status), \
              patch.object(processing, "save_message", return_value=True), \
              patch.object(processing, "index_message_id", return_value=True), \
@@ -372,11 +382,19 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
             except processing.RetryableProcessingError:
                 raised_retryable = True
 
-        return send_spy, fetch_spy, raised_sentinel, raised_retryable, fake_fs
+        return (
+            send_spy,
+            fetch_spy,
+            raised_sentinel,
+            raised_retryable,
+            fake_fs,
+            decision_spy,
+            resolver_spy,
+        )
 
     def test_terminal_thread_suppresses_inbox_autoreply_pipeline(self):
         # TERMINAL (stopped): pipeline is suppressed at the terminal gate.
-        send_spy, fetch_spy, raised, retryable, _fake_fs = self._drive(processing.THREAD_STATUS["stopped"])
+        send_spy, fetch_spy, raised, retryable, _fake_fs, _decision, _resolver = self._drive(processing.THREAD_STATUS["stopped"])
         send_spy.assert_not_called()
         fetch_spy.assert_not_called()
         self.assertFalse(
@@ -387,7 +405,7 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
 
         # POSITIVE CONTROL (active): identical reply enters the pipeline past the
         # terminal gate — proving the terminal status is what stops the send.
-        send_spy2, fetch_spy2, raised2, retryable2, _fake_fs2 = self._drive(processing.THREAD_STATUS["active"])
+        send_spy2, fetch_spy2, raised2, retryable2, _fake_fs2, _decision2, _resolver2 = self._drive(processing.THREAD_STATUS["active"])
         fetch_spy2.assert_called_once()
         self.assertTrue(
             raised2,
@@ -403,7 +421,7 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
             metadata={"terminal": False, "stopKind": "maintenance_pause"},
         )
 
-        send_spy, fetch_spy, raised, retryable, fake_fs = self._drive(
+        send_spy, fetch_spy, raised, retryable, fake_fs, _decision, _resolver = self._drive(
             processing.THREAD_STATUS["active"],
             campaign_decision=decision,
         )
@@ -420,6 +438,37 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
             if update.get("status") == processing.THREAD_STATUS["stopped"]
         ]
         self.assertEqual([], terminal_updates)
+
+    def test_missing_thread_client_id_is_resolved_before_campaign_gate(self):
+        (
+            _send_spy,
+            fetch_spy,
+            raised,
+            retryable,
+            fake_fs,
+            decision_spy,
+            resolver_spy,
+        ) = self._drive(
+            processing.THREAD_STATUS["active"],
+            thread_client_id=None,
+            resolved_client_id="client-recovered",
+        )
+
+        resolver_spy.assert_called_once_with(
+            "uid-terminal",
+            "broker@acme.example",
+        )
+        decision_spy.assert_called_once_with(
+            "uid-terminal",
+            "client-recovered",
+        )
+        self.assertIn(
+            ({"clientId": "client-recovered"}, True),
+            fake_fs._holder.get("writes", []),
+        )
+        fetch_spy.assert_called_once()
+        self.assertTrue(raised)
+        self.assertFalse(retryable)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

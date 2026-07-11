@@ -3609,9 +3609,18 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         print(f"⚠️ Could not fetch thread status data: {e}")
 
     thread_status = thread_data.get("status") or get_thread_status(user_id, thread_id)
+    client_id_for_gate = thread_data.get("clientId")
+    if not client_id_for_gate and from_addr:
+        client_id_for_gate = _find_client_id_by_email(user_id, from_addr)
+        if client_id_for_gate:
+            thread_ref.set({"clientId": client_id_for_gate}, merge=True)
+            thread_data["clientId"] = client_id_for_gate
+            print(
+                f"   ✅ Recovered clientId {client_id_for_gate} before campaign safety gate"
+            )
     campaign_decision = get_client_automation_decision(
         user_id,
-        thread_data.get("clientId"),
+        client_id_for_gate,
     )
     campaign_suppression_kind = classify_campaign_suppression(campaign_decision)
     client_terminal = campaign_suppression_kind == "terminal"
