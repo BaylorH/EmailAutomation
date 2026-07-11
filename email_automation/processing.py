@@ -3613,11 +3613,17 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     if not client_id_for_gate and from_addr:
         client_id_for_gate = _find_client_id_by_email(user_id, from_addr)
         if client_id_for_gate:
-            thread_ref.set({"clientId": client_id_for_gate}, merge=True)
             thread_data["clientId"] = client_id_for_gate
-            print(
-                f"   ✅ Recovered clientId {client_id_for_gate} before campaign safety gate"
-            )
+            try:
+                thread_ref.set({"clientId": client_id_for_gate}, merge=True)
+                print(
+                    f"   ✅ Recovered clientId {client_id_for_gate} before campaign safety gate"
+                )
+            except Exception as e:
+                print(
+                    "   ⚠️ Recovered clientId could not be persisted before the campaign "
+                    f"safety gate: {e}"
+                )
     campaign_decision = get_client_automation_decision(
         user_id,
         client_id_for_gate,

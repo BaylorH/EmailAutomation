@@ -260,6 +260,8 @@ class _TerminalFakeRef:
         return _TerminalFakeDoc(self._holder["thread"])
 
     def set(self, data, merge=False):
+        if self._holder.get("set_error"):
+            raise self._holder["set_error"]
         self._holder.setdefault("writes", []).append((dict(data), merge))
 
     def update(self, data):
@@ -306,6 +308,7 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
         *,
         thread_client_id="client-x",
         resolved_client_id=None,
+        thread_set_error=None,
     ):
         user_id = "uid-terminal"
         thread_id = "thread-terminal-1"
@@ -332,6 +335,7 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
         if thread_client_id:
             thread_data["clientId"] = thread_client_id
         fake_fs = _TerminalFakeFs(thread_data)
+        fake_fs._holder["set_error"] = thread_set_error
         campaign_decision = campaign_decision or CampaignAutomationDecision(
             state="allow", reason="", client_data={"status": "live"},
             metadata={"terminal": False, "stopKind": "none"},
@@ -465,6 +469,31 @@ class InboxAutoReplyTerminalStateTests(unittest.TestCase):
         self.assertIn(
             ({"clientId": "client-recovered"}, True),
             fake_fs._holder.get("writes", []),
+        )
+        fetch_spy.assert_called_once()
+        self.assertTrue(raised)
+        self.assertFalse(retryable)
+
+    def test_recovered_client_id_write_failure_does_not_drop_inbound_processing(self):
+        (
+            _send_spy,
+            fetch_spy,
+            raised,
+            retryable,
+            _fake_fs,
+            decision_spy,
+            resolver_spy,
+        ) = self._drive(
+            processing.THREAD_STATUS["active"],
+            thread_client_id=None,
+            resolved_client_id="client-recovered",
+            thread_set_error=RuntimeError("firestore write unavailable"),
+        )
+
+        resolver_spy.assert_called_once()
+        decision_spy.assert_called_once_with(
+            "uid-terminal",
+            "client-recovered",
         )
         fetch_spy.assert_called_once()
         self.assertTrue(raised)
