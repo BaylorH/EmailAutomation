@@ -51,8 +51,14 @@ from .sent_mail_guard import (
     SentMailGuardLookupError,
     find_sent_conversation_continuation_for_retry,
 )
-from .app_config import REQUIRED_FIELDS_FOR_CLOSE, INBOX_SCAN_WINDOW_HOURS
-from .column_config import find_client_comment_column_index, find_notes_comment_column_index
+from .app_config import INBOX_SCAN_WINDOW_HOURS
+from .column_config import (
+    find_client_comment_column_index,
+    find_notes_comment_column_index,
+    get_column_config_error,
+    get_non_requestable_field_terms,
+    get_required_fields_for_close,
+)
 from .property_images import (
     PROPERTY_IMAGE_SOURCE_REASON,
     build_property_image_sheet_updates,
@@ -2477,11 +2483,30 @@ def _proposal_events(proposal: Dict[str, Any]) -> List[Dict[str, Any]]:
     return normalized_events
 
 
-def _response_mentions_missing_fields(response_body: str, missing_fields: List[str]) -> bool:
-    """Detect whether an LLM response is actually asking for the missing fields."""
+def _response_mentions_missing_fields(
+    response_body: str,
+    missing_fields: List[str],
+    column_config: Optional[dict] = None,
+) -> bool:
+    """Accept only replies that request missing Ask fields and no Note/Skip fields."""
     body = (response_body or "").lower()
     if not body or not missing_fields:
         return False
+
+    if column_config is not None:
+        if get_column_config_error(column_config):
+            return False
+        request_segments = [
+            segment
+            for segment in re.split(r"[\n.!?;]+", body)
+            if re.search(
+                r"\b(?:can|could|would|please|send|share|provide|confirm|need|attach|include|have)\b",
+                segment,
+            )
+        ]
+        for terms in get_non_requestable_field_terms(column_config):
+            if any(term in segment for segment in request_segments for term in terms):
+                return False
 
     aliases = {
         "rail access": ["rail"],
@@ -4685,7 +4710,6 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                             if len(current_row) < len(header):
                                 current_row.extend([""] * (len(header) - len(current_row)))
                             missing_for_close = check_missing_required_fields(current_row, header, column_config)
-                            missing_for_close = [f for f in missing_for_close if f != "Rent/SF /Yr"]
                             if missing_for_close:
                                 print(
                                     f"⚠️ Ignoring close_conversation ({close_reason}) because required fields are still missing: {missing_for_close}"
@@ -5302,20 +5326,15 @@ Could you please provide your phone number so I can give you a call?"""
                         
                         missing_fields = check_missing_required_fields(current_row, header, column_config)
                         
-                        # CRITICAL: Filter out "Rent/SF /Yr" - it should NEVER be requested
-                        missing_fields = [f for f in missing_fields if f != "Rent/SF /Yr"]
-                        
                         if missing_fields:
                             # Scenario 3: Thank you + request missing fields
                             # Use LLM-generated response if available, otherwise use template
-                            if llm_response_email and _response_mentions_missing_fields(llm_response_email, missing_fields):
+                            if llm_response_email and _response_mentions_missing_fields(
+                                llm_response_email,
+                                missing_fields,
+                                column_config,
+                            ):
                                 response_body = llm_response_email
-                                # Safety check: Remove any mention of "Rent/SF /Yr" from LLM response
-                                if "Rent/SF /Yr" in response_body or "Rent/SF/Yr" in response_body:
-                                    print(f"   ⚠️ LLM response contained 'Rent/SF /Yr', removing it...")
-                                    response_body = response_body.replace("Rent/SF /Yr", "").replace("Rent/SF/Yr", "")
-                                    # Clean up any double newlines or formatting issues
-                                    response_body = "\n".join(line for line in response_body.split("\n") if line.strip() and "Rent/SF" not in line)
                                 # Safety check: Remove "Looking forward to your response" phrases
                                 if "Looking forward to your response" in response_body or "Looking forward to hearing from you" in response_body:
                                     print(f"   ⚠️ LLM response contained 'Looking forward' phrase, removing it...")
@@ -5380,7 +5399,7 @@ We'll be in touch if we need any additional information."""
                                         row_number=rownum,
                                         row_anchor=row_anchor,
                                         meta={
-                                            "completedFields": REQUIRED_FIELDS_FOR_CLOSE,
+                                            "completedFields": get_required_fields_for_close(column_config),
                                             "missingFields": []
                                         },
                                         dedupe_key=f"row_completed:{thread_id}:{rownum}"

@@ -8,12 +8,11 @@ from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import client, _sheets_client, _fs
 from .messaging import build_conversation_payload
 from .sheets import _header_index_map, _get_first_tab_title, _col_letter, _execute_with_retry
-from .app_config import REQUIRED_FIELDS_FOR_CLOSE
 from .column_config import (
     CANONICAL_FIELDS,
-    get_default_column_config,
     build_column_rules_prompt,
     get_required_fields_for_close,
+    get_column_config_error,
     find_notes_comment_column_index,
     REQUIRED_FOR_CLOSE,
 )
@@ -23,6 +22,8 @@ from .tour_scheduling import looks_like_tour_only_unavailable
 from .outbound_safety import find_unresolved_placeholders
 
 logger = logging.getLogger(__name__)
+
+REQUIRED_FIELDS_FOR_CLOSE = [CANONICAL_FIELDS[field]["label"] for field in REQUIRED_FOR_CLOSE]
 
 
 def _find_header_name(header: List[str], target: str) -> Optional[str]:
@@ -2041,7 +2042,7 @@ def _filter_config_by_extraction_fields(column_config: dict, extraction_fields: 
     Returns:
         Filtered column_config with only the specified extractable fields in mappings.
     """
-    if not extraction_fields:
+    if extraction_fields is None:
         return column_config
 
     # Create a copy to avoid mutating the original
@@ -2738,12 +2739,29 @@ def propose_sheet_updates(uid: str,
             conversation = build_conversation_payload(uid, thread_id, limit=10, headers=headers)
 
         # ---- Rules sections ---------------------------------------------------
-        # Use dynamic column config if provided, otherwise use defaults
-        effective_config = column_config or get_default_column_config()
+        # A campaign without a complete persisted contract must not reach the model.
+        config_error = get_column_config_error(column_config)
+        if config_error:
+            print(f"❌ Refusing unsafe columnConfig: {config_error}")
+            return None
+        effective_config = column_config
 
-        # If extraction_fields is specified, filter the config to only include those fields
-        if extraction_fields:
-            effective_config = _filter_config_by_extraction_fields(effective_config, extraction_fields)
+        # The persisted columnConfig is canonical. A duplicated client-level value
+        # may be present for legacy readers, but drift must not re-enable Skip fields.
+        if extraction_fields is not None and (
+            not isinstance(extraction_fields, list)
+            or any(not isinstance(field, str) for field in extraction_fields)
+        ):
+            print("❌ Refusing unsafe extractionFields: expected a list of strings")
+            return None
+        configured_extraction_fields = effective_config["extractionFields"]
+        if extraction_fields is not None and set(extraction_fields) != set(configured_extraction_fields):
+            print("❌ Refusing unsafe extractionFields: value disagrees with columnConfig")
+            return None
+        effective_config = _filter_config_by_extraction_fields(
+            effective_config,
+            configured_extraction_fields,
+        )
 
         COLUMN_RULES = build_column_rules_prompt(effective_config)
 
@@ -3047,9 +3065,7 @@ SCENARIOS:
    IMPORTANT:
    - ONLY request fields that are in the MISSING REQUIRED FIELDS list provided above
    - NEVER request fields that are NOT in the missing required fields list
-   - NEVER request "Rent/SF /Yr" - this field should never be asked for
    - NEVER request "Gross Rent" - this is a formula column that calculates automatically
-   - For "Flyer / Link", phrase it naturally: "flyer", "brochure", "marketing materials", or "property flyer"
    - Keep it short and concise
    - End with a simple "Thanks" - do NOT use "Looking forward to your response" or similar phrases
 

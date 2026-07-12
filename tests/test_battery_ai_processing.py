@@ -188,7 +188,11 @@ class RentOpexSfExtractionTests(unittest.TestCase):
                 conversation=_conv(broker_body),
                 column_config={
                     "mappings": {"drive_ins": "Drive Ins", "docks": docks_header},
+                    "extractionFields": ["drive_ins", "docks"],
                     "requiredFields": [],
+                    "formulaFields": [],
+                    "neverRequest": [],
+                    "customFields": {},
                 },
                 dry_run=True,
             )
@@ -1023,7 +1027,12 @@ class RequiredFieldHeaderAliasTests(unittest.TestCase):
         self.assertIn("Ops Ex /SF", missing)
         self.assertIn("Docks", missing)
 
-    def test_missing_flyer_still_detected(self):
+    def test_missing_flyer_does_not_block_completion(self):
         missing = a.check_missing_required_fields(
             self._row(**{"Flyer / Link": ""}), self.HEADER)
-        self.assertIn("Flyer / Link", missing)
+        self.assertNotIn("Flyer / Link", missing)
+
+    def test_missing_rent_blocks_completion(self):
+        missing = a.check_missing_required_fields(
+            self._row(**{"Rent/SF /Yr": ""}), self.HEADER)
+        self.assertIn("Rent/SF /Yr", missing)

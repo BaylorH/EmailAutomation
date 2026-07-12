@@ -312,9 +312,9 @@ def run_test(name: str, prop: dict, messages: List[dict],
             response_lower = response.lower()
             if "gross rent" in response_lower:
                 result.issues.append("Response mentions 'Gross Rent' (forbidden)")
-            # Check if requesting rent/sf when we shouldn't
-            if "rent/sf" in response_lower and "what" in response_lower:
-                result.warnings.append("Response may be requesting Rent/SF (should never request)")
+            # Check if requesting flyer materials when we shouldn't.
+            if any(term in response_lower for term in ("flyer", "brochure")) and "what" in response_lower:
+                result.warnings.append("Response may be requesting Flyer / Link (should never request)")
 
         # Check if AI tried to write to Gross Rent
         for u in updates:

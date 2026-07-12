@@ -168,7 +168,7 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message):
 RESPONSE EMAIL GENERATION:
 - Start with a greeting (e.g., "Hi,")
 - DO NOT include "Best," or any closing - the footer will add it automatically
-- NEVER request "Rent/SF /Yr" - this field should never be asked for
+- NEVER request "Flyer / Link" - this field should never be asked for
 - End with simple "Thanks" - do NOT use "Looking forward to your response"
 - Keep responses concise
 
