@@ -208,6 +208,7 @@ class AcceptNewPropertyFuzz(unittest.TestCase):
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
         self.assertTrue(resp.get_json().get("success"))
         self.assertTrue(self.insert_row.called)
+        self.assertEqual({}, self.apply_proposal.call_args.kwargs.get("column_config"))
         self.assert_no_send_to_disallowed("happy_pdf")
 
     # ========================================================================

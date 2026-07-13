@@ -1092,7 +1092,14 @@ def api_accept_new_property():
                 if proposal and proposal.get("updates"):
                     # Apply the extracted updates to the sheet
                     result = apply_proposal_to_sheet(
-                        uid, client_id, sheet_id, header, new_rownum, rowvals, proposal
+                        uid,
+                        client_id,
+                        sheet_id,
+                        header,
+                        new_rownum,
+                        rowvals,
+                        proposal,
+                        column_config=column_config,
                     )
                     extracted_updates = result.get("applied", [])
                     print(f"🤖 AI extracted {len(extracted_updates)} field(s) from PDF for new property")

@@ -15,6 +15,7 @@ from .column_config import (
     get_column_config_error,
     find_notes_comment_column_index,
     REQUIRED_FOR_CLOSE,
+    is_asset_column_name,
 )
 from .notification_payloads import sanitize_new_property_referral_response
 from .openai_usage import track_openai_usage_safely
@@ -2489,6 +2490,7 @@ def apply_proposal_to_sheet(
     rownum: int,
     current_rowvals: List[str],
     proposal: dict,
+    column_config: Optional[dict] = None,
 ) -> dict:
     """
     Applies proposal['updates'] to the sheet row with AI write guards.
@@ -2540,8 +2542,8 @@ def apply_proposal_to_sheet(
 
             # Skip Flyer/Floorplan columns - these are handled directly via Drive upload
             # AI sometimes proposes local file:// paths from PDF metadata which we don't want
-            if key in ("flyer / link", "floorplan", "flyer/link", "flyer"):
-                skipped.append({"column": col_name, "reason": "handled-by-drive-upload"})
+            if is_asset_column_name(col_name, column_config):
+                skipped.append({"column": col_name, "reason": "handled-by-asset-pipeline"})
                 continue
 
             # Reject any file:// URLs - these are local paths that shouldn't be in the sheet
@@ -2577,7 +2579,12 @@ def apply_proposal_to_sheet(
 
             # 1) no-op
             if (old_val or "") == (new_val or ""):
-                skipped.append({"column": col_name, "reason": "no-change"})
+                skipped.append({
+                    "column": col_name,
+                    "reason": "no-change",
+                    "oldValue": old_val,
+                    "newValue": new_val,
+                })
                 continue
 
             # Check AI_META for write guards
@@ -2683,6 +2690,9 @@ def apply_proposal_to_sheet(
             print("   Skipped updates:")
             for s in skipped:
                 reason = s.get('reason', 'unknown')
+                if reason == "no-change":
+                    print(f"     • {s.get('column', 'Unknown')} (reason: no-change)")
+                    continue
                 old_val = s.get('oldValue', '')
                 conf = s.get('confidence', 'N/A')
                 print(f"     • {s.get('column', 'Unknown')}: '{old_val}' (reason: {reason}, confidence: {conf})")

@@ -58,6 +58,7 @@ from .column_config import (
     find_notes_comment_column_index,
     get_column_config_error,
     get_required_fields_for_close,
+    is_asset_column_name,
     response_requests_nonrequestable_fields,
 )
 from .property_images import (
@@ -211,6 +212,109 @@ def _raise_on_extraction_failures(manifest: Optional[List[Dict[str, Any]]]) -> N
         f"Broker asset extraction failed for {len(failures)} asset(s); "
         f"leaving message unprocessed for retry/manual review: {details}"
     )
+
+
+def _sheet_updates_committed_non_asset_evidence(
+    apply_result: Optional[Dict[str, Any]],
+    column_config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return whether validated broker text was durably applied to the sheet."""
+    if not isinstance(apply_result, dict) or not isinstance(apply_result.get("applied"), list):
+        return False
+    applied_evidence = any(
+        isinstance(update, dict)
+        and bool((update.get("column") or "").strip())
+        and not is_asset_column_name(update.get("column"), column_config)
+        for update in apply_result["applied"]
+    )
+    if applied_evidence:
+        return True
+
+    skipped = apply_result.get("skipped")
+    if not isinstance(skipped, list):
+        return False
+    return any(
+        isinstance(update, dict)
+        and update.get("reason") == "no-change"
+        and bool((update.get("column") or "").strip())
+        and not is_asset_column_name(update.get("column"), column_config)
+        and str(update.get("oldValue") or "").strip() != ""
+        and str(update.get("oldValue")) == str(update.get("newValue"))
+        for update in skipped
+    )
+
+
+def _without_extraction_failures(
+    manifest: List[Dict[str, Any]],
+    failures: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep manifest entries that are not the exact surfaced failure objects."""
+    failure_ids = {id(entry) for entry in failures}
+    return [entry for entry in manifest if id(entry) not in failure_ids]
+
+
+def _record_asset_extraction_warning(
+    user_id: str,
+    client_id: str,
+    thread_id: str,
+    message_id: str,
+    failures: List[Dict[str, Any]],
+) -> bool:
+    """Persist failed asset provenance when usable message text still commits."""
+    if not failures:
+        return True
+    assets = [
+        {
+            "name": entry.get("name"),
+            "sourceUrl": entry.get("source_url"),
+            "sourceType": entry.get("source_type"),
+            "method": entry.get("method"),
+            "error": entry.get("error"),
+        }
+        for entry in failures
+    ]
+    warning_key = hashlib.sha256(
+        json.dumps(
+            {
+                "threadId": thread_id,
+                "messageId": message_id,
+                "assets": assets,
+            },
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    try:
+        _fs.collection("users").document(user_id).collection("assetWarnings").document(warning_key).set({
+            "clientId": client_id,
+            "threadId": thread_id,
+            "messageId": message_id,
+            "status": "degraded_text_processed",
+            "retryable": False,
+            "assets": assets,
+            "createdAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+        }, merge=True)
+        return True
+    except Exception as exc:
+        print(f"⚠️ Could not persist non-blocking asset extraction warning: {exc}")
+        fallback_recorded = _record_ai_processing_failure(
+            user_id,
+            client_id,
+            thread_id,
+            message_id,
+            f"Asset warning persistence failed: {exc}",
+            retryable=False,
+            recovery_status="asset_warning_persistence_failed",
+            record_key_suffix="asset_warning_persistence",
+            metadata={"assetWarnings": assets},
+        )
+        if not fallback_recorded:
+            raise RetryableProcessingError(
+                "Asset warning and fallback persistence both failed; leaving message "
+                "unprocessed for operator visibility"
+            )
+        return False
 
 
 def _queue_response_retry_or_reconciliation(
@@ -411,20 +515,45 @@ def _find_recent_sent_message_for_conversation(
     return None
 
 
-def _record_ai_processing_failure(user_id: str, client_id: str, thread_id: str, message_id: str, reason: str):
+def _record_ai_processing_failure(
+    user_id: str,
+    client_id: str,
+    thread_id: str,
+    message_id: str,
+    reason: str,
+    *,
+    retryable: bool = True,
+    recovery_status: Optional[str] = None,
+    record_key_suffix: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
     try:
         doc_id = f"{thread_id}__{message_id or int(time.time())}"
-        _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).set({
+        if record_key_suffix:
+            safe_suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", record_key_suffix).strip("_")
+            if safe_suffix:
+                doc_id = f"{doc_id}__{safe_suffix}"
+        payload = {
             "clientId": client_id,
             "threadId": thread_id,
             "messageId": message_id,
             "reason": reason,
-            "retryable": True,
+            "retryable": retryable,
             "createdAt": SERVER_TIMESTAMP,
             "updatedAt": SERVER_TIMESTAMP,
-        }, merge=True)
+        }
+        if recovery_status:
+            payload["recoveryStatus"] = recovery_status
+        if isinstance(metadata, dict) and metadata:
+            payload["metadata"] = metadata
+        _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).set(
+            payload,
+            merge=True,
+        )
+        return True
     except Exception as e:
         print(f"⚠️ Could not record AI processing failure: {e}")
+        return False
 
 
 def _has_processing_failure_record(user_id: str, thread_id: str, message_id: str) -> bool:
@@ -1034,7 +1163,10 @@ def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[
         try:
             data = doc.to_dict() or {}
             message_id = data.get("messageId")
-            if message_id and has_processed(user_id, message_id):
+            preserve_operator_warning = (
+                data.get("recoveryStatus") == "asset_warning_persistence_failed"
+            )
+            if message_id and has_processed(user_id, message_id) and not preserve_operator_warning:
                 doc.reference.delete()
                 result["cleared"] += 1
             else:
@@ -1095,6 +1227,10 @@ def retry_processing_failures(
         thread_id = data.get("threadId")
         client_id = data.get("clientId")
         attempts = int(data.get("processingAttempts") or 0)
+
+        if data.get("recoveryStatus") == "asset_warning_persistence_failed":
+            result["skipped"] += 1
+            continue
 
         decision = get_client_automation_decision(user_id, client_id)
         suppression_kind = classify_campaign_suppression(decision)
@@ -3977,12 +4113,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     flyer_links.append(link)
                     print(f"   📄 Categorized linked asset as flyer: {filename}")
 
-        # SAFETY GATE: extraction failures surfaced by file_handling (failed PDF
-        # extraction, broken/protected broker links, manual-review file-share
-        # links) must keep this message UNPROCESSED. Continuing silently leaves
-        # error=None at the caller, the message gets marked processed, and the
-        # broker's attachment/link payload is lost with no retry or visibility.
-        _raise_on_extraction_failures(pdf_manifest)
+        asset_failures = _extraction_failure_entries(pdf_manifest)
+        usable_pdf_manifest = _without_extraction_failures(pdf_manifest, asset_failures)
+        pdf_manifest = usable_pdf_manifest
 
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)
@@ -3991,15 +4124,22 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         # Pass column_config and extraction_fields for per-client AI configuration
         proposal = propose_sheet_updates(
             user_id, client_id, to_addr_lower, sheet_id, header, rownum, rowvals,
-            thread_id, pdf_manifest=pdf_manifest, url_texts=url_texts, contact_name=contact_name,
+            thread_id, pdf_manifest=usable_pdf_manifest, url_texts=url_texts, contact_name=contact_name,
             headers=headers, column_config=column_config, extraction_fields=extraction_fields
         )
-        
+
         if proposal:
             # Process updates
             if proposal.get("updates"):
                 apply_result = apply_proposal_to_sheet(
-                    user_id, client_id, sheet_id, header, rownum, rowvals, proposal
+                    user_id,
+                    client_id,
+                    sheet_id,
+                    header,
+                    rownum,
+                    rowvals,
+                    proposal,
+                    column_config=column_config,
                 )
 
                 # Store applied record in sheetChangeLog
@@ -4042,6 +4182,28 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     notes=proposal.get("notes"),
                     address=property_address
                 )
+
+                if asset_failures:
+                    if not _sheet_updates_committed_non_asset_evidence(
+                        apply_result,
+                        column_config,
+                    ):
+                        _raise_on_extraction_failures(asset_failures)
+                    _record_asset_extraction_warning(
+                        user_id,
+                        client_id,
+                        thread_id,
+                        internet_message_id or msg_id,
+                        asset_failures,
+                    )
+                    print(
+                        f"⚠️ Continued with broker text after {len(asset_failures)} asset "
+                        "extraction warning(s); provenance was saved for review"
+                    )
+                    asset_failures = []
+
+            if asset_failures:
+                _raise_on_extraction_failures(asset_failures)
 
             # Process events from the proposal
             sheets = _sheets_client()
