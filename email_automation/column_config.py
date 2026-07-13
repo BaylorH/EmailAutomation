@@ -514,7 +514,7 @@ _FIELD_REQUEST_INTENT_RE = re.compile(
     r"\b(?:ask|request|need)\b"
     r"|\bplease\b"
     r"|^\s*(?:send|share|provide|confirm|attach|include|supply|forward)\b"
-    r"|\b(?:can|could|would|will)\s+(?:i|you|we|they)\b"
+    r"|\b(?:can|could|would|will|may)\s+(?:i|you|we|they)\b"
     r"|^\s*any\s+chance\s+(?:that\s+)?(?:i|you|we|they)\s+can\b"
     r"|^\s*do\s+you\s+know\b"
     r"|^\s*would\s+it\s+be\s+possible\s+to\b"

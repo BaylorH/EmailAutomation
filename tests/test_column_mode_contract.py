@@ -174,6 +174,7 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
             "Any chance you can share the flyer?",
             "Do you know the flyer?",
             "Could I get the flyer?",
+            "May I get the flyer?",
             "Would it be possible to send the flyer?",
             "I would appreciate a flyer.",
         ):
