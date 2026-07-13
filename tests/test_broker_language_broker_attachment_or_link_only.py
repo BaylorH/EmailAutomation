@@ -323,7 +323,12 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
 
         send_reply = mock.MagicMock(return_value=True)
         self.asset_warning_recorder = mock.MagicMock()
-        proposal = proposal or {"skip_response": True}
+        self.apply_proposal = mock.MagicMock(
+            return_value={"applied": (proposal or {}).get("updates") or [], "skipped": []}
+        )
+        self.propose_sheet_updates = mock.MagicMock(
+            return_value={"skip_response": True} if proposal is None else proposal
+        )
 
         patchers = [
             mock.patch.object(proc, "_fs", FakeFirestore(thread_ref, client_ref)),
@@ -366,11 +371,15 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
             # If the extraction failure is NOT surfaced, processing continues to
             # the proposal; skip_response makes that continuation terminate
             # cleanly with error=None (the historical silent-loss outcome).
-            mock.patch.object(proc, "propose_sheet_updates", return_value=proposal),
+            mock.patch.object(
+                proc,
+                "propose_sheet_updates",
+                side_effect=self.propose_sheet_updates,
+            ),
             mock.patch.object(
                 proc,
                 "apply_proposal_to_sheet",
-                return_value={"applied": proposal.get("updates") or [], "skipped": []},
+                side_effect=self.apply_proposal,
             ),
             mock.patch.object(proc, "add_client_notifications"),
             mock.patch.object(
@@ -499,6 +508,35 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
         self.assertEqual("<extraction-gate@example.test>", warning_args[3])
         self.assertEqual("dead-flyer.pdf", warning_args[4][0]["name"])
         self.assertEqual("404 Not Found", warning_args[4][0]["error"])
+        self.apply_proposal.assert_called_once()
+        self.assertEqual(proposal, self.apply_proposal.call_args.args[-1])
+        proposal_manifest = self.propose_sheet_updates.call_args.kwargs["pdf_manifest"]
+        self.assertEqual([], proposal_manifest)
+        send_reply.assert_not_called()
+
+    def test_broken_link_with_event_only_proposal_stays_retryable(self):
+        fh_patches = [
+            mock.patch.object(fh, "fetch_pdf_attachments", return_value=[]),
+            mock.patch.object(
+                fh,
+                "_download_linked_asset",
+                side_effect=ValueError("404 Not Found"),
+            ),
+        ]
+
+        error, send_reply = self._drive_real_process_inbox_message(
+            body="All details are at https://example.com/dead-flyer.pdf",
+            has_attachments=False,
+            fh_patches=fh_patches,
+            proposal={
+                "updates": [],
+                "events": [{"type": "unsupported_event"}],
+                "skip_response": True,
+            },
+        )
+
+        self.assertIsInstance(error, proc.RetryableProcessingError)
+        self.asset_warning_recorder.assert_not_called()
         send_reply.assert_not_called()
 
     def test_genuine_retryable_error_is_respected_control(self):
@@ -511,21 +549,21 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
 class TestBrokenAssetGracefulDegradation(unittest.TestCase):
     """A dead flyer link must not discard independently extracted broker facts."""
 
-    def test_sheet_updates_allow_text_processing_to_continue(self):
-        proposal = {
-            "updates": [
-                {"column": "Total SF", "value": "18,500"},
-                {"column": "Rent/SF/Yr", "value": "$12.50"},
+    def test_applied_sheet_updates_allow_text_processing_to_continue(self):
+        apply_result = {
+            "applied": [
+                {"column": "Total SF", "newValue": "18,500"},
+                {"column": "Rent/SF/Yr", "newValue": "$12.50"},
             ],
-            "events": [],
+            "skipped": [],
         }
 
-        self.assertTrue(proc._proposal_has_non_asset_evidence(proposal))
+        self.assertTrue(proc._sheet_updates_committed_non_asset_evidence(apply_result))
 
-    def test_link_only_reply_remains_retryable(self):
-        proposal = {"updates": [], "events": [], "skip_response": True}
+    def test_rejected_or_missing_updates_remain_retryable(self):
+        apply_result = {"applied": [], "skipped": [{"reason": "placeholder"}]}
 
-        self.assertFalse(proc._proposal_has_non_asset_evidence(proposal))
+        self.assertFalse(proc._sheet_updates_committed_non_asset_evidence(apply_result))
 
     def test_warning_persistence_failure_does_not_block_text_processing(self):
         failing_fs = mock.MagicMock()

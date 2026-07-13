@@ -213,17 +213,15 @@ def _raise_on_extraction_failures(manifest: Optional[List[Dict[str, Any]]]) -> N
     )
 
 
-def _proposal_has_non_asset_evidence(proposal: Optional[Dict[str, Any]]) -> bool:
-    """Return whether broker-authored text produced a durable result without assets."""
-    if not isinstance(proposal, dict):
-        return False
-    updates = [
-        update
-        for update in (proposal.get("updates") or [])
-        if isinstance(update, dict)
-        and str(update.get("value") or update.get("newValue") or "").strip()
-    ]
-    return bool(updates or _proposal_events(proposal))
+def _sheet_updates_committed_non_asset_evidence(
+    apply_result: Optional[Dict[str, Any]],
+) -> bool:
+    """Return whether validated broker text was durably applied to the sheet."""
+    return bool(
+        isinstance(apply_result, dict)
+        and isinstance(apply_result.get("applied"), list)
+        and apply_result["applied"]
+    )
 
 
 def _without_extraction_failures(
@@ -497,7 +495,7 @@ def _record_ai_processing_failure(
     *,
     retryable: bool = True,
     recovery_status: Optional[str] = None,
-):
+) -> None:
     try:
         doc_id = f"{thread_id}__{message_id or int(time.time())}"
         payload = {
@@ -4071,6 +4069,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
 
         asset_failures = _extraction_failure_entries(pdf_manifest)
         usable_pdf_manifest = _without_extraction_failures(pdf_manifest, asset_failures)
+        pdf_manifest = usable_pdf_manifest
 
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)
@@ -4083,22 +4082,6 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             headers=headers, column_config=column_config, extraction_fields=extraction_fields
         )
 
-        if asset_failures:
-            if not _proposal_has_non_asset_evidence(proposal):
-                _raise_on_extraction_failures(asset_failures)
-            _record_asset_extraction_warning(
-                user_id,
-                client_id,
-                thread_id,
-                internet_message_id or msg_id,
-                asset_failures,
-            )
-            print(
-                f"⚠️ Continued with broker text after {len(asset_failures)} asset "
-                "extraction warning(s); provenance was saved for review"
-            )
-            pdf_manifest = usable_pdf_manifest
-        
         if proposal:
             # Process updates
             if proposal.get("updates"):
@@ -4146,6 +4129,25 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     notes=proposal.get("notes"),
                     address=property_address
                 )
+
+                if asset_failures:
+                    if not _sheet_updates_committed_non_asset_evidence(apply_result):
+                        _raise_on_extraction_failures(asset_failures)
+                    _record_asset_extraction_warning(
+                        user_id,
+                        client_id,
+                        thread_id,
+                        internet_message_id or msg_id,
+                        asset_failures,
+                    )
+                    print(
+                        f"⚠️ Continued with broker text after {len(asset_failures)} asset "
+                        "extraction warning(s); provenance was saved for review"
+                    )
+                    asset_failures = []
+
+            if asset_failures:
+                _raise_on_extraction_failures(asset_failures)
 
             # Process events from the proposal
             sheets = _sheets_client()
