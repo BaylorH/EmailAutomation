@@ -257,6 +257,14 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             "retryable": False,
             "recoveryStatus": "asset_warning_persistence_failed",
         }
+        operator_replay_doc = MagicMock()
+        operator_replay_doc.id = "thread-5__message-replay"
+        operator_replay_doc.to_dict.return_value = {
+            "threadId": "thread-5",
+            "messageId": "message-replay",
+            "retryable": True,
+            "recoveryStatus": "operator_replay_in_progress",
+        }
 
         failures_collection = MagicMock()
         failures_collection.limit.return_value.stream.return_value = [
@@ -264,21 +272,61 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             retry_doc,
             missing_id_doc,
             warning_fallback_doc,
+            operator_replay_doc,
         ]
         fake_fs = MagicMock()
         fake_fs.collection.return_value.document.return_value.collection.return_value = failures_collection
 
         def fake_has_processed(_user_id, message_id) -> bool:
-            return message_id in {"message-processed", "message-warning"}
+            return message_id in {
+                "message-processed",
+                "message-warning",
+                "message-replay",
+            }
 
         with patch.object(processing, "_fs", fake_fs), patch.object(processing, "has_processed", side_effect=fake_has_processed):
             result = processing.reconcile_stale_processing_failures("uid-1")
 
-        self.assertEqual({"checked": 4, "cleared": 1, "retained": 3}, result)
+        self.assertEqual({"checked": 5, "cleared": 1, "retained": 4}, result)
         processed_doc.reference.delete.assert_called_once()
         retry_doc.reference.delete.assert_not_called()
         missing_id_doc.reference.delete.assert_not_called()
         warning_fallback_doc.reference.delete.assert_not_called()
+        operator_replay_doc.reference.delete.assert_not_called()
+
+    def test_retry_processing_failures_preserves_operator_replay_claim(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__message-1"
+        failure_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "messageId": "message-1",
+            "retryable": True,
+            "processingAttempts": 0,
+            "recoveryStatus": "operator_replay_in_progress",
+        }
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value.collection.return_value = failures_collection
+
+        with patch.object(processing, "_fs", fake_fs), \
+             patch.object(processing, "has_processed", return_value=True) as has_processed, \
+             patch.object(processing, "_fetch_graph_message_by_id") as fetch_message, \
+             patch.object(processing, "process_inbox_message") as process_message:
+            result = processing.retry_processing_failures(
+                "uid-1",
+                {"Authorization": "Bearer fake"},
+            )
+
+        self.assertEqual(
+            {"checked": 1, "retried": 0, "succeeded": 0, "failed": 0, "skipped": 1},
+            result,
+        )
+        has_processed.assert_not_called()
+        fetch_message.assert_not_called()
+        process_message.assert_not_called()
+        failure_doc.reference.delete.assert_not_called()
 
     def test_retry_processing_failures_processes_exact_graph_message_and_clears_success(self):
         failure_doc = MagicMock()

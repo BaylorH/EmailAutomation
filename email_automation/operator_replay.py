@@ -26,7 +26,8 @@ APPROVED_OPERATOR_RECIPIENT = "baylor.freelance@outlook.com"
 APPROVED_BP21_LOCAL_PART = "bp21harrison"
 APPROVED_BP21_DOMAIN = "gmail.com"
 ALLOWED_THREAD_STATUSES = {"active", "paused"}
-REPLAY_LEASE_TTL_SECONDS = 10 * 60
+REPLAY_SCHEDULER_LEASE_TTL_SECONDS = 10 * 60
+REPLAY_USER_LEASE_TTL_SECONDS = 30 * 60
 
 
 class ReplayRefused(RuntimeError):
@@ -723,7 +724,7 @@ def replay_exact_message(
             request.uid,
             _under_lease,
             fs_client=fs_client,
-            ttl_seconds=REPLAY_LEASE_TTL_SECONDS,
+            ttl_seconds=REPLAY_USER_LEASE_TTL_SECONDS,
         )
         if not acquired:
             raise ReplayRefused("The existing per-user lease is held; replay refused")
@@ -731,7 +732,7 @@ def replay_exact_message(
     scheduler_acquired = scheduler_lease_runner(
         _under_scheduler_lease,
         fs_client=fs_client,
-        ttl_seconds=REPLAY_LEASE_TTL_SECONDS,
+        ttl_seconds=REPLAY_SCHEDULER_LEASE_TTL_SECONDS,
     )
     if not scheduler_acquired:
         raise ReplayRefused("The global scheduler lease is held; replay refused")

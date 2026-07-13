@@ -1177,6 +1177,10 @@ def _mark_processing_failure_blocked_by_manual_continuation(doc, sent_artifact: 
         print(f"⚠️ Could not mark processing failure blocked by manual continuation: {e}")
 
 
+def _is_operator_replay_recovery_status(value: Any) -> bool:
+    return str(value or "").strip().startswith("operator_replay_")
+
+
 def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[str, int]:
     """Clear failure markers for messages that are already marked processed.
 
@@ -1200,7 +1204,15 @@ def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[
             preserve_operator_warning = (
                 data.get("recoveryStatus") == "asset_warning_persistence_failed"
             )
-            if message_id and has_processed(user_id, message_id) and not preserve_operator_warning:
+            preserve_operator_replay = _is_operator_replay_recovery_status(
+                data.get("recoveryStatus")
+            )
+            if (
+                message_id
+                and not preserve_operator_warning
+                and not preserve_operator_replay
+                and has_processed(user_id, message_id)
+            ):
                 doc.reference.delete()
                 result["cleared"] += 1
             else:
@@ -1261,6 +1273,10 @@ def retry_processing_failures(
         thread_id = data.get("threadId")
         client_id = data.get("clientId")
         attempts = int(data.get("processingAttempts") or 0)
+
+        if _is_operator_replay_recovery_status(data.get("recoveryStatus")):
+            result["skipped"] += 1
+            continue
 
         if data.get("recoveryStatus") == "asset_warning_persistence_failed":
             result["skipped"] += 1

@@ -276,7 +276,7 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.find_continuation.assert_called_once()
         self.lease_runner.assert_called_once()
         self.scheduler_lease_runner.assert_called_once()
-        self.assertEqual(10 * 60, self.lease_runner.call_args.kwargs["ttl_seconds"])
+        self.assertEqual(30 * 60, self.lease_runner.call_args.kwargs["ttl_seconds"])
         self.assertEqual(
             10 * 60,
             self.scheduler_lease_runner.call_args.kwargs["ttl_seconds"],
