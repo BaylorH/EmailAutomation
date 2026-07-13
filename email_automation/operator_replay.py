@@ -9,7 +9,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 import requests
-from google.cloud.firestore import SERVER_TIMESTAMP
+from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .campaign_safety import get_client_automation_decision
 from .sent_mail_guard import coerce_utc_datetime, sent_after_from_retry_data
@@ -335,6 +335,7 @@ def _verify_degraded_asset_postcondition(
     request: ReplayRequest,
     fs_client,
     attempt_started_at: datetime,
+    attempt_id: str,
 ) -> bool:
     from .processing import _get_reply_send_outcome
 
@@ -348,10 +349,17 @@ def _verify_degraded_asset_postcondition(
 
     freshness_floor = attempt_started_at - timedelta(seconds=5)
 
-    def fresh_matching(collection_name: str, predicate) -> bool:
+    def fresh_matching(
+        collection_name: str,
+        identity_field: str,
+        identity_value: str,
+        predicate,
+    ) -> bool:
+        collection_ref = _user_ref(fs_client, request.uid).collection(collection_name)
         snapshots = (
-            _user_ref(fs_client, request.uid)
-            .collection(collection_name)
+            collection_ref
+            .where(filter=FieldFilter(identity_field, "==", identity_value))
+            .limit(20)
             .stream()
         )
         for snapshot in snapshots:
@@ -365,6 +373,8 @@ def _verify_degraded_asset_postcondition(
 
     warning_is_fresh = fresh_matching(
         "assetWarnings",
+        "messageId",
+        request.internet_message_id,
         lambda data: (
             _clean(data.get("clientId")) == request.client_id
             and _clean(data.get("threadId")) == request.thread_id
@@ -374,9 +384,15 @@ def _verify_degraded_asset_postcondition(
     )
     sheet_evidence_is_fresh = fresh_matching(
         "sheetChangeLog",
+        "replayAttemptId",
+        attempt_id,
         lambda data: (
             _clean(data.get("clientId")) == request.client_id
             and _clean(data.get("threadId")) == request.thread_id
+            and _clean(data.get("sourceGraphMessageId")) == request.graph_message_id
+            and _clean(data.get("sourceInternetMessageId"))
+            == request.internet_message_id
+            and _clean(data.get("replayAttemptId")) == attempt_id
             and data.get("status") == "applied"
             and isinstance(data.get("applied"), dict)
         ),
@@ -469,7 +485,7 @@ def replay_exact_message(
         Callable[..., Optional[Dict[str, Any]]]
     ] = None,
     verify_postcondition: Optional[
-        Callable[[ReplayRequest, Any, datetime], bool]
+        Callable[[ReplayRequest, Any, datetime, str], bool]
     ] = None,
     lease_runner: Optional[Callable[..., bool]] = None,
 ) -> ReplayResult:
@@ -566,6 +582,7 @@ def replay_exact_message(
                 request.internet_message_id,
                 message.get("conversationId"),
             ],
+            allow_broad_scan=False,
         )
         if existing_artifact:
             raise ReplayRefused(
@@ -631,6 +648,7 @@ def replay_exact_message(
                     request.internet_message_id,
                     message.get("conversationId"),
                 ],
+                allow_broad_scan=False,
             )
             if post_process_artifact:
                 failure_ref.set(
@@ -643,7 +661,12 @@ def replay_exact_message(
                 raise ReplayRefused(
                     "A post-processing artifact requires manual review before completion"
                 )
-            if not verify_postcondition(request, fs_client, attempt_started_at):
+            if not verify_postcondition(
+                request,
+                fs_client,
+                attempt_started_at,
+                attempt_id,
+            ):
                 failure_ref.set(
                     {
                         "recoveryStatus": "operator_replay_blocked_postcondition",

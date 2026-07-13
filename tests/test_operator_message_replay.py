@@ -695,14 +695,20 @@ class OperatorReplayPostconditionTests(unittest.TestCase):
             "assetWarnings": MagicMock(),
             "sheetChangeLog": MagicMock(),
         }
-        collections["assetWarnings"].stream.return_value = [
+        warning_query = MagicMock()
+        warning_query.limit.return_value = warning_query
+        warning_query.stream.return_value = [
             SimpleNamespace(to_dict=lambda value=value: deepcopy(value))
             for value in warnings
         ]
-        collections["sheetChangeLog"].stream.return_value = [
+        collections["assetWarnings"].where.return_value = warning_query
+        change_query = MagicMock()
+        change_query.limit.return_value = change_query
+        change_query.stream.return_value = [
             SimpleNamespace(to_dict=lambda value=value: deepcopy(value))
             for value in changes
         ]
+        collections["sheetChangeLog"].where.return_value = change_query
         user_ref.collection.side_effect = lambda name: collections[name]
         return fs
 
@@ -736,7 +742,7 @@ class OperatorReplayPostconditionTests(unittest.TestCase):
             ),
         ):
             verified = operator_replay._verify_degraded_asset_postcondition(
-                _request(), fs, started
+                _request(), fs, started, "attempt-123"
             )
 
         self.assertFalse(verified)
@@ -744,6 +750,7 @@ class OperatorReplayPostconditionTests(unittest.TestCase):
     def test_postcondition_requires_fresh_sheet_warning_and_no_send(self):
         started = datetime(2026, 7, 12, 18, 0, tzinfo=timezone.utc)
         fresh = started + timedelta(seconds=1)
+        attempt_id = "attempt-123"
         fs = self._firestore_with(
             [{
                 "clientId": CLIENT_ID,
@@ -755,6 +762,9 @@ class OperatorReplayPostconditionTests(unittest.TestCase):
             [{
                 "clientId": CLIENT_ID,
                 "threadId": THREAD_ID,
+                "sourceGraphMessageId": GRAPH_MESSAGE_ID,
+                "sourceInternetMessageId": INTERNET_MESSAGE_ID,
+                "replayAttemptId": attempt_id,
                 "status": "applied",
                 "applied": {"applied": [{"column": "Rent", "newValue": "12"}]},
                 "createdAt": fresh,
@@ -771,7 +781,7 @@ class OperatorReplayPostconditionTests(unittest.TestCase):
         ):
             self.assertTrue(
                 operator_replay._verify_degraded_asset_postcondition(
-                    _request(), fs, started
+                    _request(), fs, started, attempt_id
                 )
             )
 
@@ -785,9 +795,75 @@ class OperatorReplayPostconditionTests(unittest.TestCase):
         ):
             self.assertFalse(
                 operator_replay._verify_degraded_asset_postcondition(
-                    _request(), fs, started
+                    _request(), fs, started, attempt_id
                 )
             )
+
+    def test_postcondition_rejects_sheet_evidence_from_another_message_or_attempt(self):
+        started = datetime(2026, 7, 12, 18, 0, tzinfo=timezone.utc)
+        fresh = started + timedelta(seconds=1)
+        attempt_id = "attempt-123"
+        warning = {
+            "clientId": CLIENT_ID,
+            "threadId": THREAD_ID,
+            "messageId": INTERNET_MESSAGE_ID,
+            "status": "degraded_text_processed",
+            "updatedAt": fresh,
+        }
+        base_change = {
+            "clientId": CLIENT_ID,
+            "threadId": THREAD_ID,
+            "sourceGraphMessageId": GRAPH_MESSAGE_ID,
+            "sourceInternetMessageId": INTERNET_MESSAGE_ID,
+            "replayAttemptId": attempt_id,
+            "status": "applied",
+            "applied": {"applied": [{"column": "Rent", "newValue": "12"}]},
+            "createdAt": fresh,
+        }
+
+        with patch(
+            "email_automation.processing._get_reply_send_outcome",
+            return_value=SimpleNamespace(
+                error=None,
+                sent_but_unindexed=False,
+                outcome="suppressed_operator_replay_no_send",
+            ),
+        ):
+            for changed_field, wrong_value in (
+                ("sourceGraphMessageId", "different-graph-message"),
+                ("sourceInternetMessageId", "<different@example.test>"),
+                ("replayAttemptId", "different-attempt"),
+            ):
+                with self.subTest(changed_field=changed_field):
+                    change = dict(base_change)
+                    change[changed_field] = wrong_value
+                    fs = self._firestore_with([warning], [change])
+                    self.assertFalse(
+                        operator_replay._verify_degraded_asset_postcondition(
+                            _request(), fs, started, attempt_id
+                        )
+                    )
+
+
+class OperatorReplayExactArtifactQueryTests(unittest.TestCase):
+    def test_exact_replay_guard_does_not_stream_the_whole_collection(self):
+        from email_automation import processing
+
+        collection = MagicMock()
+        targeted_query = MagicMock()
+        collection.where.return_value.limit.return_value = targeted_query
+        targeted_query.stream.return_value = []
+
+        docs = processing._candidate_artifact_docs(
+            collection,
+            {GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID},
+            processing.PROCESSING_RETRY_SOURCE_MESSAGE_FIELDS,
+            THREAD_ID,
+            allow_broad_scan=False,
+        )
+
+        self.assertEqual([], docs)
+        collection.stream.assert_not_called()
 
 
 class OperatorReplayProcessorClaimTests(unittest.TestCase):

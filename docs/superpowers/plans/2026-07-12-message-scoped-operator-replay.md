@@ -4,7 +4,7 @@
 
 **Goal:** Safely replay one exact failed Baylor inbox message without running any other user or campaign work.
 
-**Architecture:** Add a narrow replay service function that validates UID, client, thread, Graph message ID, RFC message ID, sender, recipient, failure record, processed markers, and Sent Items state before invoking the existing single-message processor under the existing per-user lease. Add a dry-run-first CLI that acquires the user's Graph token but never scans the inbox, outbox, pending responses, follow-ups, or any other failure.
+**Architecture:** Add a narrow replay service function that validates UID, client, thread, Graph message ID, RFC message ID, sender, recipient, failure record, processed markers, and Sent Items state before invoking the existing single-message processor under the existing per-user lease. Recovery-artifact checks use exact source-message queries only. Completion requires fresh Sheet evidence stamped with the exact Graph ID, RFC ID, and replay attempt. Add a dry-run-first CLI that acquires the user's Graph token but never scans the inbox, outbox, pending responses, follow-ups, or any other failure.
 
 **Tech Stack:** Python, Firestore, Microsoft Graph, MSAL, existing EmailAutomation processing and lease helpers.
 
@@ -27,7 +27,7 @@
 - Modify: `email_automation/operator_replay.py`
 - Modify: `tests/test_operator_message_replay.py`
 
-- [ ] Write failing tests proving one exact Graph fetch, one claim-consuming `process_inbox_message` call, both processed markers, and atomic movement of only the exact failure into resolved replay history after success.
+- [ ] Write failing tests proving one exact Graph fetch, exact-only artifact queries, one claim-consuming `process_inbox_message` call, fresh attempt-bound Sheet evidence, both processed markers, and atomic movement of only the exact failure into resolved replay history after success.
 - [ ] Add a failure test proving processing exceptions preserve the active failure and both fail-closed replay preclaims.
 - [ ] Implement the exact-message callback under `run_with_user_lease`; do not call `refresh_and_process_user`, `scan_inbox_against_index`, outbox, pending response, or follow-up functions.
 - [ ] Run focused and adjacent processing/lease tests.

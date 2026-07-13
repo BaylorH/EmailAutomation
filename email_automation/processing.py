@@ -898,7 +898,12 @@ def _candidate_artifact_docs(
     candidates: set,
     fields: tuple,
     thread_id: Optional[str],
+    *,
+    allow_broad_scan: bool = True,
 ) -> List[Any]:
+    if not allow_broad_scan:
+        return _query_source_message_artifacts(collection_ref, candidates, fields)
+
     docs = _query_thread_artifacts(collection_ref, thread_id)
     if not docs and not thread_id:
         docs = _query_source_message_artifacts(collection_ref, candidates, fields)
@@ -968,6 +973,8 @@ def _scan_retry_artifact_collection(
     candidates: set,
     thread_id: Optional[str],
     include_terminal_outbox: bool = False,
+    *,
+    allow_broad_scan: bool = True,
 ) -> Optional[Dict[str, Any]]:
     try:
         docs = _candidate_artifact_docs(
@@ -975,6 +982,7 @@ def _scan_retry_artifact_collection(
             candidates,
             PROCESSING_RETRY_SOURCE_MESSAGE_FIELDS,
             thread_id,
+            allow_broad_scan=allow_broad_scan,
         )
     except Exception as e:
         print(f"⚠️ Could not scan processing retry guard collection {collection_name}: {e}")
@@ -999,6 +1007,8 @@ def _find_existing_retry_artifact_for_message(
     message_id: str,
     client_id: Optional[str] = None,
     additional_message_ids: Optional[List[str]] = None,
+    *,
+    allow_broad_scan: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Find visible work already created for the broker message being replayed.
 
@@ -1032,6 +1042,7 @@ def _find_existing_retry_artifact_for_message(
             candidates,
             thread_id,
             include_terminal_outbox=include_terminal_outbox,
+            allow_broad_scan=allow_broad_scan,
         )
         if artifact:
             return artifact
@@ -1048,6 +1059,7 @@ def _find_existing_retry_artifact_for_message(
             candidates,
             thread_id,
             include_terminal_outbox=True,
+            allow_broad_scan=allow_broad_scan,
         )
         if artifact:
             return artifact
@@ -4216,6 +4228,9 @@ def process_inbox_message(
                         "applied": apply_result,
                         "status": "applied",
                         "threadId": thread_id,
+                        "sourceGraphMessageId": msg_id,
+                        "sourceInternetMessageId": internet_message_id,
+                        "replayAttemptId": operator_replay_attempt_id,
                         "createdAt": SERVER_TIMESTAMP,
                         "fileIds": file_ids,
                         "proposalHash": applied_hash,
