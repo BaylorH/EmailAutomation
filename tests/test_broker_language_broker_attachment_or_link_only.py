@@ -279,7 +279,13 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
     THREAD_ID = "thread-extraction-gate"
 
     def _drive_real_process_inbox_message(
-        self, *, body, has_attachments, fh_patches, proposal=None
+        self,
+        *,
+        body,
+        has_attachments,
+        fh_patches,
+        proposal=None,
+        apply_result_override=None,
     ):
         """Run the REAL process_inbox_message (and the REAL file_handling
         manifest builders) with only external boundaries faked. Returns the
@@ -323,9 +329,12 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
 
         send_reply = mock.MagicMock(return_value=True)
         self.asset_warning_recorder = mock.MagicMock()
-        self.apply_proposal = mock.MagicMock(
-            return_value={"applied": (proposal or {}).get("updates") or [], "skipped": []}
+        apply_result = (
+            apply_result_override
+            if apply_result_override is not None
+            else {"applied": (proposal or {}).get("updates") or [], "skipped": []}
         )
+        self.apply_proposal = mock.MagicMock(return_value=apply_result)
         self.propose_sheet_updates = mock.MagicMock(
             return_value={"skip_response": True} if proposal is None else proposal
         )
@@ -532,6 +541,38 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
                 "updates": [],
                 "events": [{"type": "unsupported_event"}],
                 "skip_response": True,
+            },
+        )
+
+        self.assertIsInstance(error, proc.RetryableProcessingError)
+        self.asset_warning_recorder.assert_not_called()
+        send_reply.assert_not_called()
+
+    def test_broken_link_with_rejected_placeholder_update_stays_retryable(self):
+        fh_patches = [
+            mock.patch.object(fh, "fetch_pdf_attachments", return_value=[]),
+            mock.patch.object(
+                fh,
+                "_download_linked_asset",
+                side_effect=ValueError("404 Not Found"),
+            ),
+        ]
+
+        error, send_reply = self._drive_real_process_inbox_message(
+            body=(
+                "The total square footage is TBD. "
+                "The old flyer is https://example.com/dead-flyer.pdf"
+            ),
+            has_attachments=False,
+            fh_patches=fh_patches,
+            proposal={
+                "updates": [{"column": "Total SF", "value": "TBD"}],
+                "events": [],
+                "skip_response": True,
+            },
+            apply_result_override={
+                "applied": [],
+                "skipped": [{"column": "Total SF", "reason": "placeholder"}],
             },
         )
 
