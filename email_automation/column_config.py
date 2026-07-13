@@ -18,6 +18,7 @@ CANONICAL FIELDS:
 """
 
 import json
+import re
 from typing import Dict, List, Optional, Any
 
 
@@ -466,6 +467,50 @@ def get_non_requestable_field_terms(column_config: Dict[str, Any]) -> List[List[
             groups.append([header.strip().lower()])
 
     return groups
+
+
+_FIELD_REQUEST_CUE_RE = re.compile(
+    r"\b(?:ask|can|could|would|please|send|share|provide|confirm|need|attach|"
+    r"include|have|supply|forward)\b",
+    re.IGNORECASE,
+)
+
+
+def contains_column_field_term(text: str, term: str) -> bool:
+    """Match a configured field term as words, never inside another word."""
+    normalized = (term or "").strip()
+    if not normalized:
+        return False
+    pattern = re.escape(normalized).replace(r"\ ", r"\s+")
+    return bool(re.search(
+        rf"(?<![A-Za-z0-9]){pattern}(?![A-Za-z0-9])",
+        text or "",
+        re.IGNORECASE,
+    ))
+
+
+def response_requests_nonrequestable_fields(
+    response_body: str,
+    column_config: Optional[dict],
+) -> bool:
+    """Return True when request language targets a configured Note/Skip field."""
+    body = (response_body or "").strip()
+    if not body:
+        return False
+    if get_column_config_error(column_config):
+        return True
+
+    request_clauses = [
+        clause
+        for clause in re.split(r"[\n.!?;,]+", body)
+        if _FIELD_REQUEST_CUE_RE.search(clause)
+    ]
+    return any(
+        contains_column_field_term(clause, term)
+        for terms in get_non_requestable_field_terms(column_config)
+        for term in terms
+        for clause in request_clauses
+    )
 
 
 def detect_column_mapping(headers: List[str], use_ai: bool = True) -> Dict[str, Any]:

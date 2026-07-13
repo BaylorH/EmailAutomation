@@ -1,5 +1,6 @@
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
@@ -101,6 +102,31 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
             )
         )
 
+    def test_benign_listing_link_context_does_not_invalidate_rent_request(self):
+        body = (
+            "Could you confirm the asking rent, and here is the link to the listing "
+            "for context: https://example.com/listing."
+        )
+
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Rent/SF /Yr"],
+                self.config,
+            )
+        )
+
+    def test_short_alias_does_not_match_inside_unrelated_word(self):
+        body = "Could you confirm the asking rent? This will be useful for review."
+
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Rent/SF /Yr"],
+                self.config,
+            )
+        )
+
     def test_identity_column_words_do_not_count_as_skip_requests(self):
         body = "Could you confirm the asking rent for this city property?"
 
@@ -134,6 +160,87 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
                 ["Rent/SF /Yr"],
                 self.config,
             )
+        )
+
+    def test_independent_guard_rejects_actual_flyer_request(self):
+        body = "Could you please send the flyer or brochure?"
+
+        self.assertTrue(
+            processing._response_requests_nonrequestable_fields(body, self.config)
+        )
+
+    def test_independent_guard_allows_benign_listing_link_context(self):
+        body = "Here is the link to the listing for context."
+
+        self.assertFalse(
+            processing._response_requests_nonrequestable_fields(body, self.config)
+        )
+
+
+class AutomaticResponseScenarioValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.config = get_default_column_config()
+        self.unsafe_llm_body = (
+            "Thanks for the update. Could you also send the flyer or brochure?"
+        )
+
+    def test_scenario_1_uses_safe_alternative_property_fallback(self):
+        body = processing._select_automatic_response_body(
+            "nonviable_with_alternative",
+            self.unsafe_llm_body,
+            self.config,
+            "Alex",
+        )
+
+        self.assertNotIn("flyer", body.lower())
+        self.assertIn("alternative property", body.lower())
+
+    def test_scenario_2_uses_safe_alternatives_fallback(self):
+        body = processing._select_automatic_response_body(
+            "nonviable",
+            self.unsafe_llm_body,
+            self.config,
+            "Alex",
+        )
+
+        self.assertNotIn("flyer", body.lower())
+        self.assertIn("other properties", body.lower())
+
+    def test_scenario_4_uses_safe_completion_fallback(self):
+        body = processing._select_automatic_response_body(
+            "complete",
+            self.unsafe_llm_body,
+            self.config,
+            "Alex",
+        )
+
+        self.assertNotIn("flyer", body.lower())
+        self.assertIn("everything we need", body.lower())
+
+    def test_scenario_keeps_llm_copy_with_benign_link_context(self):
+        safe_llm_body = (
+            "Thanks for the details. Here is the link to the listing I reviewed."
+        )
+
+        body = processing._select_automatic_response_body(
+            "complete",
+            safe_llm_body,
+            self.config,
+            "Alex",
+        )
+
+        self.assertEqual(safe_llm_body, body)
+
+
+class ProposalFailureVisibilityRegressionTests(unittest.TestCase):
+    def test_proposal_none_branch_records_failure_and_raises_retryable(self):
+        source = Path(processing.__file__).read_text(encoding="utf-8")
+
+        self.assertIn('else:\n            print("ℹ️ No proposal generated; nothing to apply.")', source)
+        self.assertIn("_record_ai_processing_failure(", source)
+        self.assertIn(
+            'raise RetryableProcessingError("OpenAI proposal was unavailable or invalid JSON")',
+            source,
         )
 
 

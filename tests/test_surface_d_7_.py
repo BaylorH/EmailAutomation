@@ -23,6 +23,7 @@ Reported NOT APPLICABLE (no fake test written):
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -38,6 +39,7 @@ from email_automation import email as email_mod
 from email_automation import pending_responses as pending_mod
 from email_automation import processing as processing_mod
 from email_automation import dead_letter_recovery as dlr_mod
+from email_automation.column_config import get_default_column_config
 
 
 # =========================================================================
@@ -118,6 +120,9 @@ class LaunchDraftHappyPathTests(unittest.TestCase):
              mock.patch.object(email_mod, "_delete_cancelled_outbox_item_if_needed", return_value=False), \
              mock.patch.object(email_mod, "_pause_results_outbox_item_if_needed", return_value=False), \
              mock.patch.object(email_mod, "_pause_client_outbox_item_if_needed", return_value=False), \
+             mock.patch.object(email_mod, "_read_client_automation_decision", return_value=SimpleNamespace(
+                 client_data={"columnConfig": get_default_column_config()},
+             )), \
              mock.patch.object(email_mod, "_has_existing_thread_for_property", return_value=False), \
              mock.patch.object(email_mod, "_campaign_sheet_header_and_row", return_value=(header, row)), \
              mock.patch.object(email_mod, "_fresh_graph_headers", side_effect=lambda h, p=None: h), \

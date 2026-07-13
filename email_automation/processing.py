@@ -53,11 +53,12 @@ from .sent_mail_guard import (
 )
 from .app_config import INBOX_SCAN_WINDOW_HOURS
 from .column_config import (
+    contains_column_field_term,
     find_client_comment_column_index,
     find_notes_comment_column_index,
     get_column_config_error,
-    get_non_requestable_field_terms,
     get_required_fields_for_close,
+    response_requests_nonrequestable_fields,
 )
 from .property_images import (
     PROPERTY_IMAGE_SOURCE_REASON,
@@ -2483,6 +2484,17 @@ def _proposal_events(proposal: Dict[str, Any]) -> List[Dict[str, Any]]:
     return normalized_events
 
 
+def _contains_field_term(text: str, term: str) -> bool:
+    return contains_column_field_term(text, term)
+
+
+def _response_requests_nonrequestable_fields(
+    response_body: str,
+    column_config: Optional[dict],
+) -> bool:
+    return response_requests_nonrequestable_fields(response_body, column_config)
+
+
 def _response_mentions_missing_fields(
     response_body: str,
     missing_fields: List[str],
@@ -2492,21 +2504,8 @@ def _response_mentions_missing_fields(
     body = (response_body or "").lower()
     if not body or not missing_fields:
         return False
-
-    if column_config is not None:
-        if get_column_config_error(column_config):
-            return False
-        request_segments = [
-            segment
-            for segment in re.split(r"[\n.!?;]+", body)
-            if re.search(
-                r"\b(?:can|could|would|please|send|share|provide|confirm|need|attach|include|have)\b",
-                segment,
-            )
-        ]
-        for terms in get_non_requestable_field_terms(column_config):
-            if any(term in segment for segment in request_segments for term in terms):
-                return False
+    if _response_requests_nonrequestable_fields(body, column_config):
+        return False
 
     aliases = {
         "rail access": ["rail"],
@@ -2523,9 +2522,45 @@ def _response_mentions_missing_fields(
     for field in missing_fields:
         key = (field or "").strip().lower()
         candidates = aliases.get(key, [part for part in re.split(r"[^a-z0-9]+", key) if len(part) > 2])
-        if any(candidate in body for candidate in candidates):
+        if any(_contains_field_term(body, candidate) for candidate in candidates):
             return True
     return False
+
+
+def _select_automatic_response_body(
+    scenario: str,
+    llm_response_email: Optional[str],
+    column_config: Optional[dict],
+    contact_name: Optional[str],
+) -> str:
+    """Use LLM copy only when it does not request configured Note/Skip fields."""
+    if llm_response_email and not _response_requests_nonrequestable_fields(
+        llm_response_email,
+        column_config,
+    ):
+        return llm_response_email
+
+    greeting = _build_greeting(contact_name)
+    fallbacks = {
+        "nonviable_with_alternative": f"""{greeting}
+
+Thank you for letting me know that property is no longer available, and thanks for suggesting the alternative property.
+
+I'll review the new property details and get back to you if I have any questions.""",
+        "nonviable": f"""{greeting}
+
+Thank you for letting me know that property is no longer available.
+
+Do you have any other properties that might be a good fit for our requirements?""",
+        "complete": f"""{greeting}
+
+Thank you for providing all the requested information! We now have everything we need for your property details.
+
+We'll be in touch if we need any additional information.""",
+    }
+    if scenario not in fallbacks:
+        raise ValueError(f"Unknown automatic response scenario: {scenario}")
+    return fallbacks[scenario]
 
 
 def _format_event_property(event: Dict[str, Any]) -> str:
@@ -5228,17 +5263,16 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 # Scenario 1: Property became non-viable AND new property was suggested
                 if old_row_became_nonviable and has_new_property_path:
                     print(f"   📍 SCENARIO 1: Non-viable + new property suggested")
-                    # Use LLM-generated response if available, otherwise use template
-                    if llm_response_email:
-                        response_body = llm_response_email
+                    response_body = _select_automatic_response_body(
+                        "nonviable_with_alternative",
+                        llm_response_email,
+                        column_config,
+                        contact_name,
+                    )
+                    if response_body == llm_response_email:
                         print(f"🤖 Using LLM-generated response for non-viable + new property scenario")
-                    else:
-                        greeting = _build_greeting(contact_name)
-                        response_body = f"""{greeting}
-
-Thank you for letting me know that property is no longer available, and thanks for suggesting the alternative property.
-
-I'll review the new property details and get back to you if I have any questions."""
+                    elif llm_response_email:
+                        print("⚠️ Ignoring LLM response because it requested a Note/Skip field")
                     
                     sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                     if sent:
@@ -5253,17 +5287,16 @@ I'll review the new property details and get back to you if I have any questions
                 # Scenario 2: Property became non-viable but NO new property suggested
                 elif old_row_became_nonviable and not has_new_property_path:
                     print(f"   📍 SCENARIO 2: Non-viable, no new property")
-                    # Use LLM-generated response if available, otherwise use template
-                    if llm_response_email:
-                        response_body = llm_response_email
+                    response_body = _select_automatic_response_body(
+                        "nonviable",
+                        llm_response_email,
+                        column_config,
+                        contact_name,
+                    )
+                    if response_body == llm_response_email:
                         print(f"🤖 Using LLM-generated response for non-viable scenario")
-                    else:
-                        greeting = _build_greeting(contact_name)
-                        response_body = f"""{greeting}
-
-Thank you for letting me know that property is no longer available.
-
-Do you have any other properties that might be a good fit for our requirements?"""
+                    elif llm_response_email:
+                        print("⚠️ Ignoring LLM response because it requested a Note/Skip field")
                     
                     sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                     if sent:
@@ -5373,17 +5406,16 @@ To complete the property details, could you please provide:
                                 )
                         else:
                             # Scenario 4: All fields complete - send closing
-                            # Use LLM-generated response if available, otherwise use template
-                            if llm_response_email:
-                                response_body = llm_response_email
+                            response_body = _select_automatic_response_body(
+                                "complete",
+                                llm_response_email,
+                                column_config,
+                                contact_name,
+                            )
+                            if response_body == llm_response_email:
                                 print(f"🤖 Using LLM-generated response for all fields complete scenario")
-                            else:
-                                greeting = _build_greeting(contact_name)
-                                response_body = f"""{greeting}
-
-Thank you for providing all the requested information! We now have everything we need for your property details.
-
-We'll be in touch if we need any additional information."""
+                            elif llm_response_email:
+                                print("⚠️ Ignoring LLM response because it requested a Note/Skip field")
 
                             sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                             if sent:

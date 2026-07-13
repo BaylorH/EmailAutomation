@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from email_automation import ai_processing, processing
+from email_automation.column_config import get_default_column_config
 
 
 class ProcessingCompletionGuardTests(unittest.TestCase):
@@ -13,7 +14,11 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
     def test_missing_field_response_must_reference_requested_detail(self):
         body = "Thanks for the info. Could you also confirm whether the building has rail access?"
 
-        self.assertTrue(processing._response_mentions_missing_fields(body, ["Rail Access"]))
+        self.assertTrue(processing._response_mentions_missing_fields(
+            body,
+            ["Rail Access"],
+            get_default_column_config(),
+        ))
 
     def test_all_info_close_event_requires_complete_required_fields(self):
         event = {"type": "close_conversation", "notes": "all_info_gathered"}

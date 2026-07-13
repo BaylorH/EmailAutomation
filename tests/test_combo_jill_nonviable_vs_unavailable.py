@@ -51,6 +51,7 @@ from email_automation.ai_processing import (
     check_missing_required_fields,
     get_row_anchor,
 )
+from email_automation.column_config import detect_column_mapping
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,9 @@ HEADER = [
     "Docks", "Ceiling Ht", "Power", "Flyer / Link", "Notes",
 ]
 
+COLUMN_CONFIG = detect_column_mapping(HEADER, use_ai=False)
+COLUMN_CONFIG["customFields"] = {}
+
 
 def _row(address, city, contact, email, **cells):
     vals = [address, city, contact, email] + [""] * (len(HEADER) - 4)
@@ -167,6 +171,8 @@ class JillNonviableVsUnavailableDeck(unittest.TestCase):
                 rowvals=rowvals,
                 thread_id="thread-1",
                 conversation=conversation,
+                column_config=COLUMN_CONFIG,
+                extraction_fields=COLUMN_CONFIG["extractionFields"],
                 dry_run=True,
             )
 
@@ -376,8 +382,8 @@ class JillNonviableVsUnavailableDeck(unittest.TestCase):
 
         # When every required field is real data, the gate is empty → no follow-up.
         complete = list(after)
-        for f in ("Ops Ex /SF", "Drive Ins", "Ceiling Ht", "Power", "Flyer / Link"):
-            complete[HEADER.index(f)] = "1" if f != "Flyer / Link" else "http://x/y.pdf"
+        for f in ("Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Ceiling Ht", "Power"):
+            complete[HEADER.index(f)] = "1"
         self.assertEqual([], check_missing_required_fields(complete, HEADER))
 
 

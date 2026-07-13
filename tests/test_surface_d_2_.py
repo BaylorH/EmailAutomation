@@ -23,6 +23,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 from email_automation import email as email_module
+from email_automation.column_config import get_default_column_config
 from email_automation.utils import (
     build_professional_signature_html,
     format_email_body_with_footer,
@@ -368,7 +369,11 @@ class SignatureIdentityDuplicateRetryTest(unittest.TestCase):
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_should_pause_results_outbox_for_user", return_value=False), \
-             patch.object(email_module, "get_client_automation_pause", return_value=(False, None, {})), \
+             patch.object(email_module, "get_client_automation_pause", return_value=(
+                 False,
+                 None,
+                 {"columnConfig": get_default_column_config()},
+             )), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(
                  email_module, "find_matching_sent_message_for_retry",
@@ -440,7 +445,11 @@ class SignatureIdentityOperatorVisibleFailureTest(unittest.TestCase):
         with patch("email_automation.clients._fs", fake_fs), \
              patch.object(email_module, "_claim_outbox_item", return_value=True), \
              patch.object(email_module, "_should_pause_results_outbox_for_user", return_value=False), \
-             patch.object(email_module, "get_client_automation_pause", return_value=(False, None, {})), \
+             patch.object(email_module, "get_client_automation_pause", return_value=(
+                 False,
+                 None,
+                 {"columnConfig": get_default_column_config()},
+             )), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_finalize_successful_outbox_item", finalize), \
              patch.object(email_module, "send_and_index_email", side_effect=fake_send):

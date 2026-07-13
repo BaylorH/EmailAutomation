@@ -28,6 +28,7 @@ from email_automation.ai_processing import (
     _looks_like_tour_slot_reply,
     _looks_like_requirements_mismatch_nonviable,
 )
+from email_automation.column_config import detect_column_mapping
 
 
 def _inbound(text):
@@ -516,12 +517,20 @@ class FIX08_PromptBuilder(unittest.TestCase):
         fake_response.id = "resp_test"
         fake_client = mock.Mock()
         fake_client.responses.create.return_value = fake_response
+        column_config = detect_column_mapping(
+            ["Property Address", "Rent/SF /Yr"],
+            use_ai=False,
+        )
+        column_config["customFields"] = {}
         with mock.patch.object(ai, "client", fake_client):
             ai.propose_sheet_updates(
                 uid="u", client_id="c", email="dana@harborpointcre.com",
                 sheet_id="s", header=["Property Address", "Rent/SF /Yr"], rownum=3,
                 rowvals=["4501 Hollins Ferry Rd", ""], thread_id="t",
-                conversation=conversation, contact_name=contact_name, dry_run=True,
+                conversation=conversation, contact_name=contact_name,
+                column_config=column_config,
+                extraction_fields=column_config["extractionFields"],
+                dry_run=True,
             )
         call = fake_client.responses.create.call_args
         return call.kwargs["input"][0]["content"][-1]["text"]
