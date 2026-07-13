@@ -656,6 +656,33 @@ class OperatorReplayContractTests(unittest.TestCase):
         )
         self.assertIn(failure_path, self.fs.data)
 
+    def test_pre_process_unreadable_artifact_marks_guard_failure_visible(self):
+        self.find_existing_artifact.return_value = {
+            "collection": "outbox",
+            "status": "guard_scan_failed",
+            "guardUnreadable": True,
+            "guardError": "exact artifact query unavailable",
+        }
+
+        with self.assertRaisesRegex(operator_replay.ReplayRefused, "artifact guard"):
+            self.replay(apply=True)
+
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            _failure_id(),
+        )
+        self.assertEqual(
+            "operator_replay_guard_failed",
+            self.fs.data[failure_path]["recoveryStatus"],
+        )
+        self.assertEqual(
+            "exact artifact query unavailable",
+            self.fs.data[failure_path]["replayGuardError"],
+        )
+        self.process_message.assert_not_called()
+
     def test_post_process_artifact_query_error_marks_failure_visible(self):
         self.find_existing_artifact.side_effect = [
             None,

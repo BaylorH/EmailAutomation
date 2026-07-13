@@ -592,6 +592,22 @@ def replay_exact_message(
             ],
             allow_broad_scan=False,
         )
+        if existing_artifact and existing_artifact.get("guardUnreadable"):
+            if apply:
+                failure_ref.set(
+                    {
+                        "recoveryStatus": "operator_replay_guard_failed",
+                        "replayErrorClass": "ArtifactGuardUnreadable",
+                        "replayGuardError": _clean(
+                            existing_artifact.get("guardError")
+                        ),
+                        "updatedAt": SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+            raise ReplayRefused(
+                "Pre-processing artifact guard failed; replay evidence remains visible"
+            )
         if existing_artifact:
             raise ReplayRefused(
                 "An existing recovery artifact already targets this exact message"
