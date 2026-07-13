@@ -181,6 +181,7 @@ class OperatorReplayContractTests(unittest.TestCase):
         _seed_valid_state(self.fs)
         self.fetch_message = MagicMock(return_value=_graph_message())
         self.process_message = MagicMock()
+        self.find_existing_artifact = MagicMock(return_value=None)
         self.find_continuation = MagicMock(return_value=None)
         self.lease_runner = MagicMock(side_effect=_lease_runs)
 
@@ -192,6 +193,7 @@ class OperatorReplayContractTests(unittest.TestCase):
             fs_client=self.fs,
             fetch_message=self.fetch_message,
             process_message=self.process_message,
+            find_existing_artifact=self.find_existing_artifact,
             find_manual_continuation=self.find_continuation,
             lease_runner=self.lease_runner,
         )
@@ -343,6 +345,16 @@ class OperatorReplayContractTests(unittest.TestCase):
         }
 
         self.assert_refused(message="Sent Items")
+
+    def test_refuses_existing_recovery_or_outbound_artifact(self):
+        self.find_existing_artifact.return_value = {
+            "collection": "outbox",
+            "id": "queued-reply",
+            "sourceMessageId": INTERNET_MESSAGE_ID,
+        }
+
+        self.assert_refused(message="recovery artifact")
+        self.find_continuation.assert_not_called()
 
     def test_refuses_when_user_lease_is_held(self):
         self.lease_runner.side_effect = None

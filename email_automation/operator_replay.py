@@ -274,6 +274,7 @@ def replay_exact_message(
     process_message: Optional[
         Callable[[str, Dict[str, str], Dict[str, Any]], Any]
     ] = None,
+    find_existing_artifact: Optional[Callable[..., Optional[Dict[str, Any]]]] = None,
     find_manual_continuation: Optional[Callable[..., Optional[Dict[str, Any]]]] = None,
     lease_runner: Optional[Callable[..., bool]] = None,
 ) -> ReplayResult:
@@ -297,6 +298,10 @@ def replay_exact_message(
         from .processing import process_inbox_message
 
         process_message = process_inbox_message
+    if find_existing_artifact is None:
+        from .processing import _find_existing_retry_artifact_for_message
+
+        find_existing_artifact = _find_existing_retry_artifact_for_message
     if find_manual_continuation is None:
         from .sent_mail_guard import find_sent_conversation_continuation_for_retry
 
@@ -347,6 +352,22 @@ def replay_exact_message(
         thread_status = _validate_thread_and_indexes(
             fs_client, request, thread, message
         )
+
+        existing_artifact = find_existing_artifact(
+            request.uid,
+            request.thread_id,
+            request.internet_message_id,
+            request.client_id,
+            additional_message_ids=[
+                request.graph_message_id,
+                request.internet_message_id,
+                message.get("conversationId"),
+            ],
+        )
+        if existing_artifact:
+            raise ReplayRefused(
+                "An existing recovery artifact already targets this exact message"
+            )
 
         continuation = find_manual_continuation(
             headers,
