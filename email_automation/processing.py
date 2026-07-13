@@ -72,6 +72,7 @@ from .campaign_safety import (
     get_client_automation_decision,
     stopped_followup_patch,
 )
+from .system_health import RESOLVED_DEAD_LETTER_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -1796,6 +1797,8 @@ def _maybe_mark_client_completed(
     threads_ref=None,
     notifications_ref=None,
     outbox_ref=None,
+    pending_responses_ref=None,
+    dead_letter_ref=None,
 ) -> bool:
     """Mark a campaign completed once every thread is terminal and no current work remains."""
     if not client_id:
@@ -1811,6 +1814,10 @@ def _maybe_mark_client_completed(
             notifications_ref = client_ref.collection("notifications")
         if outbox_ref is None:
             outbox_ref = user_ref.collection("outbox")
+        if pending_responses_ref is None:
+            pending_responses_ref = user_ref.collection("pendingResponses")
+        if dead_letter_ref is None:
+            dead_letter_ref = user_ref.collection("deadLetterQueue")
 
         client_snapshot = client_ref.get()
         client_data = client_snapshot.to_dict() if getattr(client_snapshot, "exists", False) else {}
@@ -1852,7 +1859,33 @@ def _maybe_mark_client_completed(
             if outbox_status not in NON_PENDING_OUTBOX_STATUSES:
                 outbox_docs.append(doc)
 
-        if active_threads or action_docs or outbox_docs:
+        pending_response_docs = list(
+            pending_responses_ref
+            .where(filter=FieldFilter("clientId", "==", client_id))
+            .stream()
+        )
+        unresolved_dead_letter_docs = []
+        for doc in (
+            dead_letter_ref
+            .where(filter=FieldFilter("clientId", "==", client_id))
+            .stream()
+        ):
+            data = doc.to_dict() or {}
+            dead_letter_status = str(data.get("status") or "").strip().lower()
+            recovery_status = str(data.get("recoveryStatus") or "").strip().lower()
+            if (
+                dead_letter_status not in RESOLVED_DEAD_LETTER_STATUSES
+                and recovery_status not in RESOLVED_DEAD_LETTER_STATUSES
+            ):
+                unresolved_dead_letter_docs.append(doc)
+
+        if (
+            active_threads
+            or action_docs
+            or outbox_docs
+            or pending_response_docs
+            or unresolved_dead_letter_docs
+        ):
             return False
 
         client_ref.set({
@@ -1864,6 +1897,8 @@ def _maybe_mark_client_completed(
                 "terminalThreads": len(terminal_threads),
                 "activeThreads": len(active_threads),
                 "pendingOutbox": len(outbox_docs),
+                "pendingResponses": len(pending_response_docs),
+                "unresolvedDeadLetters": len(unresolved_dead_letter_docs),
                 "currentActions": len(action_docs),
             },
         }, merge=True)
@@ -2955,10 +2990,37 @@ def is_contact_opted_out(user_id: str, email: str) -> Optional[Dict]:
         }
 
 
+_NON_PERSON_CONTACT_TOKENS = frozenset({
+    "asset", "broker", "brokerage", "colliers", "commercial", "company",
+    "corp", "corporation", "cushman", "director", "group", "holdings", "inc",
+    "international", "leasing", "llc", "management", "manager", "managing",
+    "office", "owner", "partners", "principal", "properties", "property",
+    "realty", "services", "team", "wakefield",
+})
+
+
+def _safe_reply_greeting_first_name(contact_name: Optional[str]) -> Optional[str]:
+    candidate = (contact_name or "").strip()
+    if not candidate or "," in candidate or "@" in candidate:
+        return None
+    candidate_parts = candidate.split()
+    if len(candidate_parts) > 2:
+        return None
+    tokens = [re.sub(r"[^a-z]", "", token.lower()) for token in candidate_parts]
+    if any(token in _NON_PERSON_CONTACT_TOKENS for token in tokens):
+        return None
+    first_name = candidate_parts[0]
+    if len(first_name) > 1 and first_name.isupper():
+        return None
+    if not re.fullmatch(r"[A-Za-z][A-Za-z.'-]{0,63}", first_name):
+        return None
+    return first_name
+
+
 def _build_greeting(contact_name: Optional[str]) -> str:
     """Build a personalized greeting using the contact's first name, or generic 'Hi,' if no name."""
-    if contact_name:
-        first_name = contact_name.split()[0]
+    first_name = _safe_reply_greeting_first_name(contact_name)
+    if first_name:
         return f"Hi {first_name},"
     return "Hi,"
 
@@ -3067,14 +3129,14 @@ def _resolve_reply_identity(
 
 
 def _align_response_greeting(response_body: Optional[str], contact_name: Optional[str]) -> Optional[str]:
-    """Replace a stale named greeting with the resolved reply identity greeting."""
+    """Align named or neutral model greetings with the resolved reply identity."""
     if not response_body:
         return response_body
 
     expected = _build_greeting(contact_name)
     greeting_re = re.compile(
-        r"^(\s*)(?:hi|hello|hey|thanks|thank you)\s+"
-        r"[a-z][a-z'’.-]*(?:\s+[a-z][a-z'’.-]*)?\s*(?:,|[-–—])",
+        r"^(\s*)(?:hi|hello|hey|thanks|thank you)"
+        r"(?:\s+[a-z][a-z'’.-]*(?:\s+[a-z][a-z'’.-]*)?)?\s*(?:,|[-–—])",
         re.IGNORECASE,
     )
     return greeting_re.sub(lambda match: f"{match.group(1)}{expected}", response_body, count=1)
@@ -4793,8 +4855,6 @@ def process_inbox_message(
                             )
                             mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
                             print(f"🚫 Moved property to non-viable and created notification")
-                            if not any((evt or {}).get("type") == "new_property" for evt in events):
-                                _maybe_mark_client_completed(user_id, client_id)
                     except Exception as e:
                         print(f"❌ Failed to handle property_unavailable: {e}")
                         import traceback
@@ -5577,6 +5637,8 @@ def process_inbox_message(
                             user_id, thread_id, msg_id, to_addr_lower, response_body, client_id,
                             failure_label="alternatives request"
                         )
+                    if response_sent:
+                        _maybe_mark_client_completed(user_id, client_id)
                 
                 # Handle call request without phone number - send brief response asking for number
                 if call_requested_no_phone and not response_sent:

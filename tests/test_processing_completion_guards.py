@@ -750,6 +750,8 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             threads_ref=threads_ref,
             notifications_ref=notifications_ref,
             outbox_ref=outbox_ref,
+            pending_responses_ref=FakeQuery([]),
+            dead_letter_ref=FakeQuery([]),
         )
 
         self.assertTrue(completed)
@@ -759,6 +761,8 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
                 "terminalThreads": 2,
                 "activeThreads": 0,
                 "pendingOutbox": 0,
+                "pendingResponses": 0,
+                "unresolvedDeadLetters": 0,
                 "currentActions": 0,
             },
             client_ref._data["completionSummary"],
@@ -816,6 +820,8 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             ]),
             notifications_ref=FakeQuery([]),
             outbox_ref=FakeQuery([]),
+            pending_responses_ref=FakeQuery([]),
+            dead_letter_ref=FakeQuery([]),
         )
 
         self.assertFalse(completed)
@@ -876,6 +882,8 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
                 FakeDoc("action-1", {"kind": "action_needed", "threadId": "thread-2"}),
             ]),
             outbox_ref=FakeQuery([]),
+            pending_responses_ref=FakeQuery([]),
+            dead_letter_ref=FakeQuery([]),
         ))
         self.assertEqual([], with_action.set_calls)
 
@@ -889,8 +897,63 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             outbox_ref=FakeQuery([
                 FakeDoc("outbox-1", {"clientId": "client-1", "status": "queued"}),
             ]),
+            pending_responses_ref=FakeQuery([]),
+            dead_letter_ref=FakeQuery([]),
         ))
         self.assertEqual([], with_outbox.set_calls)
+
+        with_pending_reply = FakeDoc("client-1", {"status": "live"})
+        self.assertFalse(processing._maybe_mark_client_completed(
+            "uid-1",
+            "client-1",
+            client_ref=with_pending_reply,
+            threads_ref=terminal_threads,
+            notifications_ref=FakeQuery([]),
+            outbox_ref=FakeQuery([]),
+            pending_responses_ref=FakeQuery([
+                FakeDoc("pending-1", {"clientId": "client-1", "status": "queued"}),
+            ]),
+            dead_letter_ref=FakeQuery([]),
+        ))
+        self.assertEqual([], with_pending_reply.set_calls)
+
+        with_reconciliation = FakeDoc("client-1", {"status": "live"})
+        self.assertFalse(processing._maybe_mark_client_completed(
+            "uid-1",
+            "client-1",
+            client_ref=with_reconciliation,
+            threads_ref=terminal_threads,
+            notifications_ref=FakeQuery([]),
+            outbox_ref=FakeQuery([]),
+            pending_responses_ref=FakeQuery([]),
+            dead_letter_ref=FakeQuery([
+                FakeDoc("dead-1", {
+                    "clientId": "client-1",
+                    "status": "needs_reconciliation",
+                    "alreadySent": True,
+                }),
+            ]),
+        ))
+        self.assertEqual([], with_reconciliation.set_calls)
+
+        with_resolved_reconciliation = FakeDoc("client-1", {"status": "live"})
+        self.assertTrue(processing._maybe_mark_client_completed(
+            "uid-1",
+            "client-1",
+            client_ref=with_resolved_reconciliation,
+            threads_ref=terminal_threads,
+            notifications_ref=FakeQuery([]),
+            outbox_ref=FakeQuery([]),
+            pending_responses_ref=FakeQuery([]),
+            dead_letter_ref=FakeQuery([
+                FakeDoc("dead-1", {
+                    "clientId": "client-1",
+                    "status": "reconciled",
+                    "alreadySent": True,
+                }),
+            ]),
+        ))
+        self.assertEqual("completed", with_resolved_reconciliation._data["status"])
 
     def test_deterministic_rent_fallback_extracts_asking_rent_not_nnn(self):
         value = ai_processing._extract_rent_sf_yr_from_text(
