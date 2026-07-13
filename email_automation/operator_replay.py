@@ -26,6 +26,7 @@ APPROVED_OPERATOR_RECIPIENT = "baylor.freelance@outlook.com"
 APPROVED_BP21_LOCAL_PART = "bp21harrison"
 APPROVED_BP21_DOMAIN = "gmail.com"
 ALLOWED_THREAD_STATUSES = {"active", "paused"}
+REPLAY_LEASE_TTL_SECONDS = 10 * 60
 
 
 class ReplayRefused(RuntimeError):
@@ -641,18 +642,31 @@ def replay_exact_message(
                     merge=True,
                 )
                 raise
-            post_process_artifact = find_existing_artifact(
-                request.uid,
-                request.thread_id,
-                request.internet_message_id,
-                request.client_id,
-                additional_message_ids=[
-                    request.graph_message_id,
+            try:
+                post_process_artifact = find_existing_artifact(
+                    request.uid,
+                    request.thread_id,
                     request.internet_message_id,
-                    message.get("conversationId"),
-                ],
-                allow_broad_scan=False,
-            )
+                    request.client_id,
+                    additional_message_ids=[
+                        request.graph_message_id,
+                        request.internet_message_id,
+                        message.get("conversationId"),
+                    ],
+                    allow_broad_scan=False,
+                )
+            except Exception as exc:
+                failure_ref.set(
+                    {
+                        "recoveryStatus": "operator_replay_guard_failed",
+                        "replayErrorClass": type(exc).__name__,
+                        "updatedAt": SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+                raise ReplayRefused(
+                    "Post-processing artifact guard failed; replay evidence remains visible"
+                ) from exc
             if post_process_artifact:
                 failure_ref.set(
                     {
@@ -709,7 +723,7 @@ def replay_exact_message(
             request.uid,
             _under_lease,
             fs_client=fs_client,
-            ttl_seconds=30 * 60,
+            ttl_seconds=REPLAY_LEASE_TTL_SECONDS,
         )
         if not acquired:
             raise ReplayRefused("The existing per-user lease is held; replay refused")
@@ -717,7 +731,7 @@ def replay_exact_message(
     scheduler_acquired = scheduler_lease_runner(
         _under_scheduler_lease,
         fs_client=fs_client,
-        ttl_seconds=30 * 60,
+        ttl_seconds=REPLAY_LEASE_TTL_SECONDS,
     )
     if not scheduler_acquired:
         raise ReplayRefused("The global scheduler lease is held; replay refused")

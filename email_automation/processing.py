@@ -870,6 +870,10 @@ def _query_source_message_artifacts(
     seen = set()
     where = getattr(collection_ref, "where", None)
     if not callable(where):
+        if fail_closed_on_limit:
+            raise RuntimeError(
+                "Exact source-message artifact query is unavailable"
+            )
         return docs
 
     for field in fields:

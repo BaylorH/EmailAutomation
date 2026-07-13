@@ -276,6 +276,11 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.find_continuation.assert_called_once()
         self.lease_runner.assert_called_once()
         self.scheduler_lease_runner.assert_called_once()
+        self.assertEqual(10 * 60, self.lease_runner.call_args.kwargs["ttl_seconds"])
+        self.assertEqual(
+            10 * 60,
+            self.scheduler_lease_runner.call_args.kwargs["ttl_seconds"],
+        )
 
     def test_refuses_any_identity_mismatch(self):
         cases = [
@@ -651,6 +656,41 @@ class OperatorReplayContractTests(unittest.TestCase):
         )
         self.assertIn(failure_path, self.fs.data)
 
+    def test_post_process_artifact_query_error_marks_failure_visible(self):
+        self.find_existing_artifact.side_effect = [
+            None,
+            RuntimeError("exact artifact query unavailable"),
+        ]
+
+        with self.assertRaisesRegex(operator_replay.ReplayRefused, "artifact guard"):
+            self.replay(apply=True)
+
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            _failure_id(),
+        )
+        self.assertEqual(
+            "operator_replay_guard_failed",
+            self.fs.data[failure_path]["recoveryStatus"],
+        )
+        self.assertEqual(
+            "RuntimeError",
+            self.fs.data[failure_path]["replayErrorClass"],
+        )
+        for message_id in (GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID):
+            marker_path = (
+                "users",
+                BAYLOR_UID,
+                "processedMessages",
+                b64url_id(message_id),
+            )
+            self.assertEqual(
+                "operator_replay_in_progress",
+                self.fs.data[marker_path]["status"],
+            )
+
     def test_failed_atomic_completion_leaves_preclaims_and_failure_visible(self):
         self.fs.fail_batch_commit_number = 2
 
@@ -992,6 +1032,23 @@ class OperatorReplayExactArtifactQueryTests(unittest.TestCase):
         self.assertIn(first_filter.field_path, processing.PROCESSING_RETRY_SOURCE_MESSAGE_FIELDS)
         self.assertIn(first_filter.value, {GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID})
         query_builder.limit.assert_called_once_with(11)
+
+    def test_exact_replay_guard_fails_closed_when_query_api_is_unavailable(self):
+        from email_automation import processing
+
+        collection = MagicMock()
+        collection.where = None
+
+        artifact = processing._scan_retry_artifact_collection(
+            collection,
+            "outbox",
+            {GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID},
+            THREAD_ID,
+            allow_broad_scan=False,
+        )
+
+        self.assertTrue(artifact["guardUnreadable"])
+        self.assertEqual("guard_scan_failed", artifact["status"])
 
     def test_exact_replay_guard_fails_closed_on_aggregate_ambiguity(self):
         from email_automation import processing
