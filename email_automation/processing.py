@@ -307,6 +307,7 @@ def _record_asset_extraction_warning(
             retryable=False,
             recovery_status="asset_warning_persistence_failed",
             record_key_suffix="asset_warning_persistence",
+            metadata={"assetWarnings": assets},
         )
         if not fallback_recorded:
             raise RetryableProcessingError(
@@ -524,6 +525,7 @@ def _record_ai_processing_failure(
     retryable: bool = True,
     recovery_status: Optional[str] = None,
     record_key_suffix: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
     try:
         doc_id = f"{thread_id}__{message_id or int(time.time())}"
@@ -542,6 +544,8 @@ def _record_ai_processing_failure(
         }
         if recovery_status:
             payload["recoveryStatus"] = recovery_status
+        if isinstance(metadata, dict) and metadata:
+            payload["metadata"] = metadata
         _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).set(
             payload,
             merge=True,

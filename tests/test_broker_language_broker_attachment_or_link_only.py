@@ -727,6 +727,17 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
             retryable=False,
             recovery_status="asset_warning_persistence_failed",
             record_key_suffix="asset_warning_persistence",
+            metadata={
+                "assetWarnings": [
+                    {
+                        "name": "dead.pdf",
+                        "sourceUrl": None,
+                        "sourceType": None,
+                        "method": "failed",
+                        "error": "404",
+                    }
+                ]
+            },
         )
 
     def test_warning_fallback_failure_keeps_message_retryable(self):
@@ -760,6 +771,7 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
                     retryable=False,
                     recovery_status="asset_warning_persistence_failed",
                     record_key_suffix="asset_warning_persistence",
+                    metadata={"assetWarnings": [{"name": "dead.pdf", "error": "404"}]},
                 )
             )
             proc._clear_ai_processing_failure("user-1", "thread-1", "message-1")
@@ -770,6 +782,11 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
         document_calls = [call.args[0] for call in nested_document.call_args_list]
         self.assertIn("thread-1__message-1__asset_warning_persistence", document_calls)
         self.assertIn("thread-1__message-1", document_calls)
+        fallback_set = nested_document.return_value.set.call_args_list[0]
+        self.assertEqual(
+            {"assetWarnings": [{"name": "dead.pdf", "error": "404"}]},
+            fallback_set.args[0]["metadata"],
+        )
 
     def test_asset_column_classifier_uses_default_and_custom_mappings(self):
         self.assertTrue(cc.is_asset_column_name("Brochure"))
