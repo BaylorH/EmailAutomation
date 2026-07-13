@@ -96,6 +96,9 @@ class _Batch:
     def set(self, ref, payload, merge=False):
         self._operations.append(("set", ref._path, deepcopy(payload), merge))
 
+    def create(self, ref, payload):
+        self._operations.append(("create", ref._path, deepcopy(payload), False))
+
     def delete(self, ref):
         self._operations.append(("delete", ref._path, None, False))
 
@@ -103,11 +106,16 @@ class _Batch:
         self._store.batch_commit_count += 1
         if self._store.fail_batch_commit_number == self._store.batch_commit_count:
             raise RuntimeError("atomic batch commit failed")
+        for operation, path, *_ in self._operations:
+            if operation == "create" and path in self._store.data:
+                raise RuntimeError("document already exists")
         self._store.events.append(
             ("batch_commit", tuple((operation, path) for operation, path, *_ in self._operations))
         )
         for operation, path, payload, merge in self._operations:
-            if operation == "set":
+            if operation == "create":
+                self._store.data[path] = deepcopy(payload)
+            elif operation == "set":
                 if merge and path in self._store.data:
                     self._store.data[path].update(deepcopy(payload))
                 else:
@@ -497,7 +505,9 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.fetch_message.assert_not_called()
 
     def test_apply_processes_once_then_marks_both_ids_and_deletes_only_exact_failure(self):
-        def record_process(*args):
+        def record_process(*args, **kwargs):
+            self.assertFalse(kwargs["allow_outbound_reply"])
+            replay_attempt_id = kwargs["operator_replay_attempt_id"]
             for message_id in (GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID):
                 marker_path = (
                     "users",
@@ -508,6 +518,10 @@ class OperatorReplayContractTests(unittest.TestCase):
                 self.assertEqual(
                     "operator_replay_in_progress",
                     self.fs.data[marker_path]["status"],
+                )
+                self.assertEqual(
+                    replay_attempt_id,
+                    self.fs.data[marker_path]["replayAttemptId"],
                 )
             self.fs.events.append(("process", args[2]["id"]))
 
@@ -684,6 +698,40 @@ class OperatorReplayContractTests(unittest.TestCase):
             allow_outbound_reply=False,
             operator_replay_attempt_id=ANY,
         )
+
+    def test_injected_processor_is_also_forced_into_no_reply_mode(self):
+        self.replay(apply=True)
+
+        self.process_message.assert_called_once_with(
+            BAYLOR_UID,
+            {"Authorization": "Bearer test-token"},
+            self.fetch_message.return_value,
+            allow_outbound_reply=False,
+            operator_replay_attempt_id=ANY,
+        )
+
+    def test_apply_refuses_if_processed_marker_appears_after_preflight(self):
+        graph_marker = (
+            "users",
+            BAYLOR_UID,
+            "processedMessages",
+            b64url_id(GRAPH_MESSAGE_ID),
+        )
+
+        def race_marker_into_place(*args, **kwargs):
+            self.fs.data[graph_marker] = {
+                "status": "processed",
+                "processedAt": datetime.now(timezone.utc),
+            }
+            return None
+
+        self.find_recipient_continuation.side_effect = race_marker_into_place
+
+        with self.assertRaisesRegex(operator_replay.ReplayRefused, "claim"):
+            self.replay(apply=True)
+
+        self.assertEqual("processed", self.fs.data[graph_marker]["status"])
+        self.process_message.assert_not_called()
 
 
 class OperatorReplayPostconditionTests(unittest.TestCase):
@@ -864,6 +912,34 @@ class OperatorReplayExactArtifactQueryTests(unittest.TestCase):
 
         self.assertEqual([], docs)
         collection.stream.assert_not_called()
+
+    def test_exact_replay_guard_fails_closed_when_targeted_query_is_truncated(self):
+        from email_automation import processing
+
+        collection = MagicMock()
+        targeted_query = MagicMock()
+        collection.where.return_value.limit.return_value = targeted_query
+        targeted_query.stream.return_value = [
+            SimpleNamespace(
+                id=f"artifact-{index}",
+                to_dict=lambda: {
+                    "threadId": "different-thread",
+                    "sourceMessageId": GRAPH_MESSAGE_ID,
+                },
+            )
+            for index in range(11)
+        ]
+
+        artifact = processing._scan_retry_artifact_collection(
+            collection,
+            "outbox",
+            {GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID},
+            THREAD_ID,
+            allow_broad_scan=False,
+        )
+
+        self.assertTrue(artifact["guardUnreadable"])
+        self.assertEqual("guard_scan_failed", artifact["status"])
 
 
 class OperatorReplayProcessorClaimTests(unittest.TestCase):

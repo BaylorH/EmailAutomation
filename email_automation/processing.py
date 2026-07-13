@@ -863,6 +863,8 @@ def _query_source_message_artifacts(
     candidates: set,
     fields: tuple,
     limit_per_query: int = 10,
+    *,
+    fail_closed_on_limit: bool = False,
 ) -> List[Any]:
     docs = []
     seen = set()
@@ -872,8 +874,14 @@ def _query_source_message_artifacts(
 
     for field in fields:
         for candidate in candidates:
-            query = collection_ref.where(filter=FieldFilter(field, "==", candidate)).limit(limit_per_query)
-            for doc in query.stream():
+            query_limit = limit_per_query + 1 if fail_closed_on_limit else limit_per_query
+            query = collection_ref.where(filter=FieldFilter(field, "==", candidate)).limit(query_limit)
+            query_docs = list(query.stream())
+            if fail_closed_on_limit and len(query_docs) > limit_per_query:
+                raise RuntimeError(
+                    "Exact source-message artifact query exceeded the safe result limit"
+                )
+            for doc in query_docs:
                 doc_id = getattr(doc, "id", None)
                 key = doc_id or id(doc)
                 if key in seen:
@@ -902,7 +910,12 @@ def _candidate_artifact_docs(
     allow_broad_scan: bool = True,
 ) -> List[Any]:
     if not allow_broad_scan:
-        return _query_source_message_artifacts(collection_ref, candidates, fields)
+        return _query_source_message_artifacts(
+            collection_ref,
+            candidates,
+            fields,
+            fail_closed_on_limit=True,
+        )
 
     docs = _query_thread_artifacts(collection_ref, thread_id)
     if not docs and not thread_id:

@@ -405,14 +405,13 @@ def _begin_replay_claim(fs_client, request: ReplayRequest, failure_ref):
     started_at = datetime.now(timezone.utc)
     batch = fs_client.batch()
     for message_id in (request.graph_message_id, request.internet_message_id):
-        batch.set(
+        batch.create(
             _processed_ref(fs_client, request.uid, message_id),
             {
                 "status": "operator_replay_in_progress",
                 "replayAttemptId": attempt_id,
                 "claimedAt": SERVER_TIMESTAMP,
             },
-            merge=False,
         )
     batch.set(
         failure_ref,
@@ -425,7 +424,12 @@ def _begin_replay_claim(fs_client, request: ReplayRequest, failure_ref):
         },
         merge=True,
     )
-    batch.commit()
+    try:
+        batch.commit()
+    except Exception as exc:
+        raise ReplayRefused(
+            "Exact replay claim could not be created atomically"
+        ) from exc
     return attempt_id, started_at
 
 
@@ -618,16 +622,13 @@ def replay_exact_message(
                 failure_ref,
             )
             try:
-                if default_process_message:
-                    process_message(
-                        request.uid,
-                        headers,
-                        message,
-                        allow_outbound_reply=False,
-                        operator_replay_attempt_id=attempt_id,
-                    )
-                else:
-                    process_message(request.uid, headers, message)
+                process_message(
+                    request.uid,
+                    headers,
+                    message,
+                    allow_outbound_reply=False,
+                    operator_replay_attempt_id=attempt_id,
+                )
             except Exception as exc:
                 failure_ref.set(
                     {
