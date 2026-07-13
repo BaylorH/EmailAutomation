@@ -27,7 +27,9 @@ Run:
 """
 import os
 import re
+import io
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 # The exact URL detector used inside processing.process_inbox_message
@@ -701,6 +703,36 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
         )
         sheets.spreadsheets.return_value.values.return_value.batchUpdate.assert_not_called()
 
+    def test_no_change_logging_omits_existing_sheet_value(self):
+        sheets = mock.MagicMock()
+        output = io.StringIO()
+        with mock.patch.object(ai, "_sheets_client", return_value=sheets), mock.patch.object(
+            ai, "_get_first_tab_title", return_value="Sheet1"
+        ), mock.patch.object(ai, "_ensure_ai_meta_tab"), mock.patch.object(
+            ai, "_read_ai_meta_row", return_value=None
+        ), mock.patch.object(ai, "_append_ai_meta"), mock.patch.object(
+            ai, "_append_notes_to_comments"
+        ), mock.patch(
+            "email_automation.sheet_operations._apply_gross_rent_formula_for_row",
+            return_value=False,
+        ), mock.patch.object(ai, "_execute_with_retry", return_value={}), redirect_stdout(output):
+            ai.apply_proposal_to_sheet(
+                uid="user-1",
+                client_id="client-1",
+                sheet_id="sheet-1",
+                header=["Property Address", "Power", "Total SF"],
+                rownum=3,
+                current_rowvals=["912-930 Gemini St", "PRIVATE-800A-3PH", ""],
+                proposal={
+                    "updates": [
+                        {"column": "Power", "value": "PRIVATE-800A-3PH"},
+                        {"column": "Total SF", "value": "18,500"},
+                    ]
+                },
+            )
+
+        self.assertNotIn("PRIVATE-800A-3PH", output.getvalue())
+
     def test_warning_persistence_failure_does_not_block_text_processing(self):
         failing_fs = mock.MagicMock()
         failing_fs.collection.return_value.document.return_value.collection.return_value.document.return_value.set.side_effect = RuntimeError(
@@ -803,13 +835,14 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
         distinct_but_equal = dict(failed)
         usable = {"name": "good.pdf", "method": "pdfplumber", "text": "18,500 SF"}
 
-        self.assertEqual(
-            [distinct_but_equal, usable],
-            proc._without_extraction_failures(
-                [failed, distinct_but_equal, usable],
-                [failed],
-            ),
+        result = proc._without_extraction_failures(
+            [failed, distinct_but_equal, usable],
+            [failed],
         )
+
+        self.assertEqual(2, len(result))
+        self.assertIs(distinct_but_equal, result[0])
+        self.assertIs(usable, result[1])
 
 
 class TestWrongPropertyPdfNoDeterministicGuard(unittest.TestCase):

@@ -268,7 +268,7 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         fake_fs = MagicMock()
         fake_fs.collection.return_value.document.return_value.collection.return_value = failures_collection
 
-        def fake_has_processed(_user_id, message_id):
+        def fake_has_processed(_user_id, message_id) -> bool:
             return message_id in {"message-processed", "message-warning"}
 
         with patch.object(processing, "_fs", fake_fs), patch.object(processing, "has_processed", side_effect=fake_has_processed):
@@ -432,6 +432,41 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         fetch_message.assert_not_called()
         payload = failure_doc.reference.set.call_args.args[0]
         self.assertFalse(payload["retryable"])
+
+    def test_asset_warning_fallback_is_not_rewritten_by_campaign_suppression(self):
+        failure_doc = MagicMock()
+        failure_doc.id = "thread-1__message-1__asset_warning_persistence"
+        failure_doc.to_dict.return_value = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "messageId": "message-1",
+            "retryable": False,
+            "processingAttempts": 0,
+            "recoveryStatus": "asset_warning_persistence_failed",
+            "metadata": {"assetWarnings": [{"name": "dead.pdf", "error": "404"}]},
+        }
+        failures_collection = MagicMock()
+        failures_collection.limit.return_value.stream.return_value = [failure_doc]
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.document.return_value.collection.return_value = failures_collection
+        self.campaign_decision.return_value = CampaignAutomationDecision(
+            state="blocked",
+            reason="client_stopped_by_user",
+            client_data={"status": "stopped"},
+            metadata={"terminal": True, "stopKind": "user_stop"},
+        )
+
+        with patch.object(processing, "_fs", fake_fs), patch.object(
+            processing, "_fetch_graph_message_by_id"
+        ) as fetch_message:
+            result = processing.retry_processing_failures(
+                "uid-1", {"Authorization": "Bearer fake"}
+            )
+
+        self.assertEqual(1, result["skipped"])
+        fetch_message.assert_not_called()
+        failure_doc.reference.set.assert_not_called()
+        failure_doc.reference.delete.assert_not_called()
 
     def test_retry_processing_failures_preserves_work_when_campaign_state_is_unknown(self):
         failure_doc = MagicMock()

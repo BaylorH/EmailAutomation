@@ -1228,6 +1228,10 @@ def retry_processing_failures(
         client_id = data.get("clientId")
         attempts = int(data.get("processingAttempts") or 0)
 
+        if data.get("recoveryStatus") == "asset_warning_persistence_failed":
+            result["skipped"] += 1
+            continue
+
         decision = get_client_automation_decision(user_id, client_id)
         suppression_kind = classify_campaign_suppression(decision)
         if suppression_kind:

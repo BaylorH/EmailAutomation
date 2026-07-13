@@ -2690,6 +2690,9 @@ def apply_proposal_to_sheet(
             print("   Skipped updates:")
             for s in skipped:
                 reason = s.get('reason', 'unknown')
+                if reason == "no-change":
+                    print(f"     • {s.get('column', 'Unknown')} (reason: no-change)")
+                    continue
                 old_val = s.get('oldValue', '')
                 conf = s.get('confidence', 'N/A')
                 print(f"     • {s.get('column', 'Unknown')}: '{old_val}' (reason: {reason}, confidence: {conf})")
