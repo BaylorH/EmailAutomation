@@ -58,6 +58,7 @@ from .column_config import (
     find_notes_comment_column_index,
     get_column_config_error,
     get_required_fields_for_close,
+    is_asset_column_name,
     response_requests_nonrequestable_fields,
 )
 from .property_images import (
@@ -215,12 +216,16 @@ def _raise_on_extraction_failures(manifest: Optional[List[Dict[str, Any]]]) -> N
 
 def _sheet_updates_committed_non_asset_evidence(
     apply_result: Optional[Dict[str, Any]],
+    column_config: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Return whether validated broker text was durably applied to the sheet."""
-    return bool(
-        isinstance(apply_result, dict)
-        and isinstance(apply_result.get("applied"), list)
-        and apply_result["applied"]
+    if not isinstance(apply_result, dict) or not isinstance(apply_result.get("applied"), list):
+        return False
+    return any(
+        isinstance(update, dict)
+        and bool((update.get("column") or "").strip())
+        and not is_asset_column_name(update.get("column"), column_config)
+        for update in apply_result["applied"]
     )
 
 
@@ -239,10 +244,10 @@ def _record_asset_extraction_warning(
     thread_id: str,
     message_id: str,
     failures: List[Dict[str, Any]],
-) -> None:
+) -> bool:
     """Persist failed asset provenance when usable message text still commits."""
     if not failures:
-        return
+        return True
     assets = [
         {
             "name": entry.get("name"),
@@ -275,9 +280,10 @@ def _record_asset_extraction_warning(
             "createdAt": SERVER_TIMESTAMP,
             "updatedAt": SERVER_TIMESTAMP,
         }, merge=True)
+        return True
     except Exception as exc:
         print(f"⚠️ Could not persist non-blocking asset extraction warning: {exc}")
-        _record_ai_processing_failure(
+        fallback_recorded = _record_ai_processing_failure(
             user_id,
             client_id,
             thread_id,
@@ -285,7 +291,14 @@ def _record_asset_extraction_warning(
             f"Asset warning persistence failed: {exc}",
             retryable=False,
             recovery_status="asset_warning_persistence_failed",
+            record_key_suffix="asset_warning_persistence",
         )
+        if not fallback_recorded:
+            raise RetryableProcessingError(
+                "Asset warning and fallback persistence both failed; leaving message "
+                "unprocessed for operator visibility"
+            )
+        return False
 
 
 def _queue_response_retry_or_reconciliation(
@@ -495,9 +508,14 @@ def _record_ai_processing_failure(
     *,
     retryable: bool = True,
     recovery_status: Optional[str] = None,
-) -> None:
+    record_key_suffix: Optional[str] = None,
+) -> bool:
     try:
         doc_id = f"{thread_id}__{message_id or int(time.time())}"
+        if record_key_suffix:
+            safe_suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", record_key_suffix).strip("_")
+            if safe_suffix:
+                doc_id = f"{doc_id}__{safe_suffix}"
         payload = {
             "clientId": client_id,
             "threadId": thread_id,
@@ -513,8 +531,10 @@ def _record_ai_processing_failure(
             payload,
             merge=True,
         )
+        return True
     except Exception as e:
         print(f"⚠️ Could not record AI processing failure: {e}")
+        return False
 
 
 def _has_processing_failure_record(user_id: str, thread_id: str, message_id: str) -> bool:
@@ -4086,7 +4106,14 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             # Process updates
             if proposal.get("updates"):
                 apply_result = apply_proposal_to_sheet(
-                    user_id, client_id, sheet_id, header, rownum, rowvals, proposal
+                    user_id,
+                    client_id,
+                    sheet_id,
+                    header,
+                    rownum,
+                    rowvals,
+                    proposal,
+                    column_config=column_config,
                 )
 
                 # Store applied record in sheetChangeLog
@@ -4131,7 +4158,10 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                 )
 
                 if asset_failures:
-                    if not _sheet_updates_committed_non_asset_evidence(apply_result):
+                    if not _sheet_updates_committed_non_asset_evidence(
+                        apply_result,
+                        column_config,
+                    ):
                         _raise_on_extraction_failures(asset_failures)
                     _record_asset_extraction_warning(
                         user_id,

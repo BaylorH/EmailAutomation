@@ -34,6 +34,8 @@ from unittest import mock
 SOURCE_URL_PATTERN = r'https?://[^\s<>"\']+'
 
 from email_automation import file_handling as fh
+from email_automation import ai_processing as ai
+from email_automation import column_config as cc
 from email_automation import property_images as pi
 from email_automation import processing as proc
 from email_automation.campaign_safety import CampaignAutomationDecision
@@ -606,6 +608,82 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
 
         self.assertFalse(proc._sheet_updates_committed_non_asset_evidence(apply_result))
 
+    def test_asset_alias_only_is_not_non_asset_evidence(self):
+        column_config = {
+            "mappings": {
+                "flyer_link": "Brochure",
+                "floorplan": "Floor Plans",
+            }
+        }
+        apply_result = {
+            "applied": [
+                {"column": "Brochure", "newValue": "https://example.com/dead.pdf"},
+            ],
+            "skipped": [],
+        }
+
+        self.assertFalse(
+            proc._sheet_updates_committed_non_asset_evidence(
+                apply_result,
+                column_config,
+            )
+        )
+
+    def test_mixed_asset_and_spec_updates_have_non_asset_evidence(self):
+        column_config = {"mappings": {"flyer_link": "Offering Materials"}}
+        apply_result = {
+            "applied": [
+                {"column": "Offering Materials", "newValue": "https://example.com/dead.pdf"},
+                {"column": "Total SF", "newValue": "18,500"},
+            ],
+            "skipped": [],
+        }
+
+        self.assertTrue(
+            proc._sheet_updates_committed_non_asset_evidence(
+                apply_result,
+                column_config,
+            )
+        )
+
+    def test_apply_sheet_rejects_custom_mapped_asset_column(self):
+        sheets = mock.MagicMock()
+        column_config = {"mappings": {"flyer_link": "Offering Materials"}}
+        with mock.patch.object(ai, "_sheets_client", return_value=sheets), mock.patch.object(
+            ai, "_get_first_tab_title", return_value="Sheet1"
+        ), mock.patch.object(ai, "_ensure_ai_meta_tab"), mock.patch.object(
+            ai, "_read_ai_meta_row", return_value=None
+        ), mock.patch.object(ai, "_append_ai_meta"), mock.patch.object(
+            ai, "_append_notes_to_comments"
+        ), mock.patch(
+            "email_automation.sheet_operations._apply_gross_rent_formula_for_row",
+            return_value=False,
+        ), mock.patch.object(ai, "_execute_with_retry", return_value={}):
+            result = ai.apply_proposal_to_sheet(
+                uid="user-1",
+                client_id="client-1",
+                sheet_id="sheet-1",
+                header=["Property Address", "Offering Materials"],
+                rownum=3,
+                current_rowvals=["912-930 Gemini St", ""],
+                proposal={
+                    "updates": [
+                        {
+                            "column": "Offering Materials",
+                            "value": "https://example.com/dead.pdf",
+                        }
+                    ]
+                },
+                column_config=column_config,
+            )
+
+        self.assertEqual([], result["applied"])
+        self.assertIn(
+            ("Offering Materials", "handled-by-asset-pipeline"),
+            {(item.get("column"), item.get("reason")) for item in result["skipped"]},
+        )
+        sheets.spreadsheets.return_value.values.return_value.batchUpdate.assert_not_called()
+
     def test_warning_persistence_failure_does_not_block_text_processing(self):
         failing_fs = mock.MagicMock()
         failing_fs.collection.return_value.document.return_value.collection.return_value.document.return_value.set.side_effect = RuntimeError(
@@ -631,7 +709,60 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
             "Asset warning persistence failed: Firestore unavailable",
             retryable=False,
             recovery_status="asset_warning_persistence_failed",
+            record_key_suffix="asset_warning_persistence",
         )
+
+    def test_warning_fallback_failure_keeps_message_retryable(self):
+        failing_fs = mock.MagicMock()
+        failing_fs.collection.return_value.document.return_value.collection.return_value.document.return_value.set.side_effect = RuntimeError(
+            "Firestore unavailable"
+        )
+
+        with mock.patch.object(proc, "_fs", failing_fs), mock.patch.object(
+            proc, "_record_ai_processing_failure", return_value=False
+        ):
+            with self.assertRaises(proc.RetryableProcessingError):
+                proc._record_asset_extraction_warning(
+                    "user-1",
+                    "client-1",
+                    "thread-1",
+                    "message-1",
+                    [{"name": "dead.pdf", "method": "failed", "error": "404"}],
+                )
+
+    def test_warning_fallback_record_uses_distinct_cleanup_key(self):
+        fs = mock.MagicMock()
+        with mock.patch.object(proc, "_fs", fs):
+            self.assertTrue(
+                proc._record_ai_processing_failure(
+                    "user-1",
+                    "client-1",
+                    "thread-1",
+                    "message-1",
+                    "warning fallback",
+                    retryable=False,
+                    recovery_status="asset_warning_persistence_failed",
+                    record_key_suffix="asset_warning_persistence",
+                )
+            )
+            proc._clear_ai_processing_failure("user-1", "thread-1", "message-1")
+
+        nested_document = (
+            fs.collection.return_value.document.return_value.collection.return_value.document
+        )
+        document_calls = [call.args[0] for call in nested_document.call_args_list]
+        self.assertIn("thread-1__message-1__asset_warning_persistence", document_calls)
+        self.assertIn("thread-1__message-1", document_calls)
+
+    def test_asset_column_classifier_uses_default_and_custom_mappings(self):
+        self.assertTrue(cc.is_asset_column_name("Brochure"))
+        self.assertTrue(
+            cc.is_asset_column_name(
+                "Offering Materials",
+                {"mappings": {"flyer_link": "Offering Materials"}},
+            )
+        )
+        self.assertFalse(cc.is_asset_column_name("Total SF"))
 
     def test_usable_manifest_filters_failures_by_identity_not_value(self):
         failed = {"name": "same.pdf", "method": "failed", "error": "404"}

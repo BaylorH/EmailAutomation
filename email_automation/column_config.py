@@ -256,6 +256,7 @@ FORMULA_FIELDS = [k for k, v in CANONICAL_FIELDS.items() if v.get("is_formula")]
 
 # Fields we accept but never request
 NEVER_REQUEST_FIELDS = [k for k, v in CANONICAL_FIELDS.items() if v.get("never_request")]
+ASSET_CANONICAL_FIELDS = frozenset({"flyer_link", "floorplan"})
 
 # Legacy alias for backward compatibility
 REQUIRED_FOR_CLOSE = DEFAULT_REQUIRED_FOR_CLOSE
@@ -322,6 +323,29 @@ def get_field_aliases(canonical: str) -> List[str]:
     aliases = list(field.get("default_aliases", []))
     aliases.extend(field.get("legacy_aliases", []))
     return aliases
+
+
+def is_asset_column_name(
+    actual_name: str,
+    column_config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return whether a physical sheet column belongs to the asset pipeline."""
+    normalized = _normalized_column_name(actual_name)
+    if not normalized:
+        return False
+
+    mappings = column_config.get("mappings", {}) if isinstance(column_config, dict) else {}
+    for canonical in ASSET_CANONICAL_FIELDS:
+        configured_name = mappings.get(canonical)
+        if _normalized_column_name(configured_name) == normalized:
+            return True
+
+        field = CANONICAL_FIELDS.get(canonical, {})
+        known_names = [canonical, field.get("label"), *field.get("default_aliases", [])]
+        if normalized in {_normalized_column_name(name) for name in known_names if name}:
+            return True
+
+    return False
 
 
 def _normalized_column_name(name: str) -> str:

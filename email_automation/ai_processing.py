@@ -15,6 +15,7 @@ from .column_config import (
     get_column_config_error,
     find_notes_comment_column_index,
     REQUIRED_FOR_CLOSE,
+    is_asset_column_name,
 )
 from .notification_payloads import sanitize_new_property_referral_response
 from .openai_usage import track_openai_usage_safely
@@ -2489,6 +2490,7 @@ def apply_proposal_to_sheet(
     rownum: int,
     current_rowvals: List[str],
     proposal: dict,
+    column_config: Optional[dict] = None,
 ) -> dict:
     """
     Applies proposal['updates'] to the sheet row with AI write guards.
@@ -2540,8 +2542,8 @@ def apply_proposal_to_sheet(
 
             # Skip Flyer/Floorplan columns - these are handled directly via Drive upload
             # AI sometimes proposes local file:// paths from PDF metadata which we don't want
-            if key in ("flyer / link", "floorplan", "flyer/link", "flyer"):
-                skipped.append({"column": col_name, "reason": "handled-by-drive-upload"})
+            if is_asset_column_name(col_name, column_config):
+                skipped.append({"column": col_name, "reason": "handled-by-asset-pipeline"})
                 continue
 
             # Reject any file:// URLs - these are local paths that shouldn't be in the sheet
