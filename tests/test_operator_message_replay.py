@@ -7,7 +7,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
@@ -58,6 +58,10 @@ class _DocRef:
 
     def collection(self, name):
         return _CollectionRef(self._store, self._path + (name,))
+
+    @property
+    def id(self):
+        return self._path[-1]
 
     def get(self):
         self._store.events.append(("get", self._path))
@@ -544,11 +548,22 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.assertEqual("processed", self.fs.data[rfc_marker]["status"])
         self.assertNotIn(failure_path, self.fs.data)
         self.assertIn(unrelated_path, self.fs.data)
+        history_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailureHistory",
+            _failure_id(),
+        )
+        self.assertEqual("replayed", self.fs.data[history_path]["status"])
+        self.assertEqual(_failure_id(), self.fs.data[history_path]["sourceFailureId"])
 
         commits = [event for event in self.fs.events if event[0] == "batch_commit"]
         self.assertEqual(2, len(commits))
         final_paths = {path for _, path in commits[-1][1]}
-        self.assertEqual({graph_marker, rfc_marker, failure_path}, final_paths)
+        self.assertEqual(
+            {graph_marker, rfc_marker, failure_path, history_path},
+            final_paths,
+        )
 
     def test_apply_preserves_failure_when_durable_postcondition_is_missing(self):
         self.verify_postcondition.return_value = False
@@ -667,6 +682,7 @@ class OperatorReplayContractTests(unittest.TestCase):
             {"Authorization": "Bearer test-token"},
             self.fetch_message.return_value,
             allow_outbound_reply=False,
+            operator_replay_attempt_id=ANY,
         )
 
 
@@ -774,6 +790,51 @@ class OperatorReplayPostconditionTests(unittest.TestCase):
             )
 
 
+class OperatorReplayProcessorClaimTests(unittest.TestCase):
+    def test_processor_claim_requires_both_exact_message_markers(self):
+        from email_automation import processing
+
+        attempt_id = "attempt-123"
+        fs = MagicMock()
+        docs = {
+            b64url_id(GRAPH_MESSAGE_ID): {
+                "status": "operator_replay_in_progress",
+                "replayAttemptId": attempt_id,
+            },
+            b64url_id(INTERNET_MESSAGE_ID): {
+                "status": "operator_replay_in_progress",
+                "replayAttemptId": attempt_id,
+            },
+        }
+
+        def document(doc_id):
+            snapshot = MagicMock()
+            snapshot.exists = doc_id in docs
+            snapshot.to_dict.return_value = docs.get(doc_id, {})
+            ref = MagicMock()
+            ref.get.return_value = snapshot
+            return ref
+
+        fs.collection.return_value.document.return_value.collection.return_value.document.side_effect = document
+
+        with patch.object(processing, "_fs", fs):
+            processing._validate_operator_replay_claims(
+                BAYLOR_UID,
+                GRAPH_MESSAGE_ID,
+                INTERNET_MESSAGE_ID,
+                attempt_id,
+            )
+
+            docs[b64url_id(INTERNET_MESSAGE_ID)]["replayAttemptId"] = "wrong"
+            with self.assertRaisesRegex(processing.RetryableProcessingError, "claim"):
+                processing._validate_operator_replay_claims(
+                    BAYLOR_UID,
+                    GRAPH_MESSAGE_ID,
+                    INTERNET_MESSAGE_ID,
+                    attempt_id,
+                )
+
+
 def _cli_args(**overrides):
     values = {
         "--uid": BAYLOR_UID,
@@ -873,6 +934,8 @@ class OperatorReplayCliTests(unittest.TestCase):
         self.assertIn("DRY RUN", output)
         self.assertIn("verified", output)
         self.assertNotIn("secret-token-value", output)
+        self.assertNotIn(SENDER, output)
+        self.assertNotIn(OPERATOR_RECIPIENT, output)
 
     def test_apply_flag_is_the_only_mutation_switch(self):
         with patch.object(

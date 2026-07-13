@@ -27,8 +27,8 @@
 - Modify: `email_automation/operator_replay.py`
 - Modify: `tests/test_operator_message_replay.py`
 
-- [ ] Write failing tests proving one exact Graph fetch, one `process_inbox_message` call, both processed markers, and deletion of only the exact failure after success.
-- [ ] Add a failure test proving processing exceptions preserve the failure and processed markers.
+- [ ] Write failing tests proving one exact Graph fetch, one claim-consuming `process_inbox_message` call, both processed markers, and atomic movement of only the exact failure into resolved replay history after success.
+- [ ] Add a failure test proving processing exceptions preserve the active failure and both fail-closed replay preclaims.
 - [ ] Implement the exact-message callback under `run_with_user_lease`; do not call `refresh_and_process_user`, `scan_inbox_against_index`, outbox, pending response, or follow-up functions.
 - [ ] Run focused and adjacent processing/lease tests.
 

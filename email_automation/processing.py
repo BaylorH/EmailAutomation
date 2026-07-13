@@ -45,7 +45,8 @@ from .tour_scheduling import (
 from .outbound_safety import validate_outbound_body
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
-                   format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff)
+                   format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff,
+                   b64url_id)
 from .pending_responses import queue_pending_response, record_sent_unindexed_response
 from .sent_mail_guard import (
     SentMailGuardLookupError,
@@ -3616,12 +3617,42 @@ def _is_auto_reply_subject(
     return False
 
 
+def _validate_operator_replay_claims(
+    user_id: str,
+    graph_message_id: str,
+    internet_message_id: str,
+    attempt_id: str,
+) -> None:
+    """Require the durable two-message preclaim before operator replay effects."""
+    if not attempt_id:
+        raise RetryableProcessingError("Operator replay claim is missing")
+    user_ref = _fs.collection("users").document(user_id)
+    for message_id in (graph_message_id, internet_message_id):
+        if not message_id:
+            raise RetryableProcessingError("Operator replay claim message ID is missing")
+        snapshot = (
+            user_ref.collection("processedMessages")
+            .document(b64url_id(message_id))
+            .get()
+        )
+        claim = snapshot.to_dict() if getattr(snapshot, "exists", False) else {}
+        if (
+            not isinstance(claim, dict)
+            or claim.get("status") != "operator_replay_in_progress"
+            or claim.get("replayAttemptId") != attempt_id
+        ):
+            raise RetryableProcessingError(
+                "Operator replay claim does not match both exact message IDs"
+            )
+
+
 def process_inbox_message(
     user_id: str,
     headers: Dict[str, str],
     msg: Dict[str, Any],
     *,
     allow_outbound_reply: bool = True,
+    operator_replay_attempt_id: Optional[str] = None,
 ):
     """ENHANCED: Process a single inbox message with full pipeline including events."""
     if not allow_outbound_reply:
@@ -3637,6 +3668,18 @@ def process_inbox_message(
     sent_dt = msg.get("sentDateTime")
     body_preview = msg.get("bodyPreview", "")
     has_attachments = bool(msg.get("hasAttachments"))
+
+    if operator_replay_attempt_id:
+        if allow_outbound_reply:
+            raise RetryableProcessingError(
+                "Operator replay attempt cannot enable outbound replies"
+            )
+        _validate_operator_replay_claims(
+            user_id,
+            msg_id,
+            internet_message_id,
+            operator_replay_attempt_id,
+        )
     
     full_msg = {}
     # NEW: fetch full message body and normalize to plain text

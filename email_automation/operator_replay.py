@@ -418,6 +418,7 @@ def _complete_replay_claim(
     request: ReplayRequest,
     failure_ref,
     attempt_id: str,
+    failure: Dict[str, Any],
 ) -> None:
     batch = fs_client.batch()
     for message_id in (request.graph_message_id, request.internet_message_id):
@@ -430,6 +431,24 @@ def _complete_replay_claim(
             },
             merge=True,
         )
+    history_ref = (
+        _user_ref(fs_client, request.uid)
+        .collection("processingFailureHistory")
+        .document(failure_ref.id)
+    )
+    resolved_failure = dict(failure)
+    resolved_failure.update(
+        {
+            "status": "replayed",
+            "retryable": False,
+            "recoveryStatus": "replayed",
+            "replayAttemptId": attempt_id,
+            "sourceFailureId": failure_ref.id,
+            "resolvedAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+    )
+    batch.set(history_ref, resolved_failure, merge=False)
     batch.delete(failure_ref)
     batch.commit()
 
@@ -470,16 +489,11 @@ def replay_exact_message(
         fs_client = _fs
     if fetch_message is None:
         fetch_message = _fetch_exact_graph_message
-    if process_message is None:
+    default_process_message = process_message is None
+    if default_process_message:
         from .processing import process_inbox_message
 
-        def process_message(uid, graph_headers, message):
-            return process_inbox_message(
-                uid,
-                graph_headers,
-                message,
-                allow_outbound_reply=False,
-            )
+        process_message = process_inbox_message
     if find_existing_artifact is None:
         from .processing import _find_existing_retry_artifact_for_message
 
@@ -587,7 +601,16 @@ def replay_exact_message(
                 failure_ref,
             )
             try:
-                process_message(request.uid, headers, message)
+                if default_process_message:
+                    process_message(
+                        request.uid,
+                        headers,
+                        message,
+                        allow_outbound_reply=False,
+                        operator_replay_attempt_id=attempt_id,
+                    )
+                else:
+                    process_message(request.uid, headers, message)
             except Exception as exc:
                 failure_ref.set(
                     {
@@ -636,6 +659,7 @@ def replay_exact_message(
                 request,
                 failure_ref,
                 attempt_id,
+                failure,
             )
 
         result = ReplayResult(

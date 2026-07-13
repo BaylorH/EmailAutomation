@@ -125,6 +125,14 @@ def _request_from_args(args: argparse.Namespace) -> ReplayRequest:
     )
 
 
+def _safe_result_summary(result) -> dict:
+    data = result.to_dict()
+    data.pop("sender", None)
+    data.pop("operator_recipient", None)
+    data["approved_lane"] = "baylor_bp21"
+    return data
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     request = _request_from_args(args)
@@ -152,7 +160,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     mode = "APPLY" if args.apply else "DRY RUN"
     print(f"{mode}: exact-message replay {result.status}")
-    print(json.dumps(result.to_dict(), sort_keys=True))
+    print(json.dumps(_safe_result_summary(result), sort_keys=True))
     if not args.apply:
         print(
             "No message or campaign state mutation performed; the user lease was "
