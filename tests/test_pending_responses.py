@@ -13,6 +13,7 @@ os.environ.setdefault(
 
 from email_automation import pending_responses, processing
 from email_automation.campaign_safety import CampaignAutomationDecision
+from email_automation.column_config import get_default_column_config
 
 
 class FakeDocRef:
@@ -91,7 +92,7 @@ class PendingResponsesTests(unittest.TestCase):
             "threadId": "thread-active",
             "msgId": "message-2",
             "recipient": "bp21harrison@gmail.com",
-            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "responseBody": "Hi,\n\nCould you confirm the asking rent?",
             "clientId": "client-1",
             "attempts": 0,
         })
@@ -174,7 +175,10 @@ class PendingResponsesTests(unittest.TestCase):
             return_value=CampaignAutomationDecision(
                 state="allow",
                 reason="",
-                client_data={"status": "live"},
+                client_data={
+                    "status": "live",
+                    "columnConfig": get_default_column_config(),
+                },
                 metadata={"terminal": False, "stopKind": "none"},
             ),
             create=True,
@@ -202,7 +206,7 @@ class PendingResponsesTests(unittest.TestCase):
             "threadId": "thread-active",
             "msgId": "message-2",
             "recipient": "bp21harrison@gmail.com",
-            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "responseBody": "Hi,\n\nCould you confirm the asking rent?",
             "clientId": "client-1",
             "attempts": 1,
             "lastError": "Temporary failure",
@@ -226,7 +230,7 @@ class PendingResponsesTests(unittest.TestCase):
             "threadId": "thread-active",
             "msgId": "message-2",
             "recipient": "bp21harrison@gmail.com",
-            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "responseBody": "Hi,\n\nCould you confirm the asking rent?",
             "clientId": "client-1",
             "attempts": 1,
             "lastError": "Temporary failure",
@@ -288,12 +292,74 @@ class PendingResponsesTests(unittest.TestCase):
         self.assertIn("Unresolved outbound placeholder", dead_letter["failureReason"])
         self.assertIn("manual review", dead_letter["failureReason"])
 
+    def test_note_request_pending_response_moves_to_manual_review_before_graph(self):
+        active_doc = FakeDoc("thread-note-request", {
+            "threadId": "thread-note-request",
+            "msgId": "message-2",
+            "recipient": "bp21harrison@gmail.com",
+            "responseBody": "What about the brochure?",
+            "clientId": "client-1",
+            "attempts": 0,
+        })
+        fake_fs = FakeFirestore([active_doc])
+
+        def fail_send(**_kwargs):
+            raise AssertionError("Note request must stop before Graph retry")
+
+        with self._mock_clients_module(fake_fs), patch.object(
+            processing, "send_reply_in_thread", new=fail_send
+        ):
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertEqual([], states)
+        self.assertTrue(active_doc.reference.deleted)
+        self.campaign_decision.assert_called_once_with("uid-1", "client-1")
+        dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
+        self.assertIn("non-requestable", dead_letter["failureReason"])
+        self.assertIn("manual review", dead_letter["failureReason"])
+
+    def test_invalid_config_pending_response_moves_to_manual_review_before_graph(self):
+        active_doc = FakeDoc("thread-invalid-config", {
+            "threadId": "thread-invalid-config",
+            "msgId": "message-2",
+            "recipient": "bp21harrison@gmail.com",
+            "responseBody": "Could you confirm the asking rent?",
+            "clientId": "client-1",
+            "attempts": 0,
+        })
+        fake_fs = FakeFirestore([active_doc])
+        self.campaign_decision.return_value = CampaignAutomationDecision(
+            state="allow",
+            reason="",
+            client_data={"status": "live", "columnConfig": {"mappings": {}}},
+            metadata={"terminal": False, "stopKind": "none"},
+        )
+
+        def fail_send(**_kwargs):
+            raise AssertionError("Invalid config must stop before Graph retry")
+
+        with self._mock_clients_module(fake_fs), patch.object(
+            processing, "send_reply_in_thread", new=fail_send
+        ):
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertEqual([], states)
+        self.assertTrue(active_doc.reference.deleted)
+        self.campaign_decision.assert_called_once_with("uid-1", "client-1")
+        dead_letter = fake_fs.collections["deadLetterQueue"].add_calls[-1]
+        self.assertIn("invalid persisted columnConfig", dead_letter["failureReason"])
+        self.assertIn("manual review", dead_letter["failureReason"])
+
     def test_maintenance_pause_preserves_pending_response_without_sending(self):
         active_doc = FakeDoc("thread-maintenance", {
             "threadId": "thread-maintenance",
             "msgId": "message-2",
             "recipient": "bp21harrison@gmail.com",
-            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "responseBody": "Hi,\n\nCould you confirm the asking rent?",
             "clientId": "client-1",
             "attempts": 2,
             "lastError": "Temporary failure",
@@ -329,7 +395,7 @@ class PendingResponsesTests(unittest.TestCase):
             "threadId": "thread-unknown",
             "msgId": "message-2",
             "recipient": "bp21harrison@gmail.com",
-            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "responseBody": "Hi,\n\nCould you confirm the asking rent?",
             "clientId": "client-1",
             "attempts": pending_responses.MAX_RESPONSE_ATTEMPTS,
             "processingBy": "worker-stale",
@@ -372,7 +438,7 @@ class PendingResponsesTests(unittest.TestCase):
             "threadId": "thread-active",
             "msgId": "message-2",
             "recipient": "bp21harrison@gmail.com",
-            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "responseBody": "Hi,\n\nCould you confirm the asking rent?",
             "clientId": "client-1",
             "attempts": 1,
             "lastError": "Temporary failure",
@@ -411,7 +477,7 @@ class PendingResponsesTests(unittest.TestCase):
             "threadId": "thread-active",
             "msgId": "message-2",
             "recipient": "bp21harrison@gmail.com",
-            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "responseBody": "Hi,\n\nCould you confirm the asking rent?",
             "clientId": "client-1",
             "attempts": 1,
             "lastError": "Read timed out after Graph reply",
@@ -460,7 +526,7 @@ class PendingResponsesTests(unittest.TestCase):
             "threadId": "thread-active",
             "msgId": "message-2",
             "recipient": "bp21harrison@gmail.com",
-            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "responseBody": "Hi,\n\nCould you confirm the asking rent?",
             "clientId": "client-1",
             "attempts": 1,
             "lastError": "Read timed out after Graph reply",
@@ -510,7 +576,7 @@ class PendingResponsesTests(unittest.TestCase):
             "threadId": "thread-active",
             "msgId": "message-2",
             "recipient": "bp21harrison@gmail.com",
-            "responseBody": "Hi,\n\nCan you share the flyer?",
+            "responseBody": "Hi,\n\nCould you confirm the asking rent?",
             "clientId": "client-1",
             "attempts": 1,
             "lastError": "Read timed out after Graph reply",

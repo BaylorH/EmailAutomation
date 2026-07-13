@@ -582,11 +582,19 @@ def stage2_map(world):
     """MAP: resolve the roster's column headers to canonical fields via the REAL
     detect_column_mapping, then persist columnConfig on the client."""
     mapping = column_config.detect_column_mapping(HEADER, use_ai=False)
+    persisted_config = {
+        **mapping,
+        "customFields": {},
+    }
     world.fs.collection("users").document(USER_ID).collection("clients").document(CLIENT_ID).set(
-        {"columnMapping": mapping["mappings"], "extractionFields": mapping["extractionFields"]},
+        {
+            "columnMapping": mapping["mappings"],
+            "columnConfig": persisted_config,
+            "extractionFields": mapping["extractionFields"],
+        },
         merge=True,
     )
-    return mapping
+    return persisted_config
 
 
 def stage3_launch(world):
@@ -661,9 +669,16 @@ def stage6_classify(world, inbound):
          "subject": inbound["subject"], "timestamp": inbound["receivedDateTime"],
          "content": BROKER_REPLY_TEXT},
     ]
+    _sheet_id, persisted_config, extraction_fields = clients._get_client_config(
+        USER_ID,
+        CLIENT_ID,
+    )
     proposal = ai_processing.propose_sheet_updates(
         USER_ID, CLIENT_ID, BP21_TEST_RECIPIENT, SHEET_ID, HEADER, 3, world.row3,
-        world.thread_root, conversation=conversation, dry_run=True,
+        world.thread_root, conversation=conversation,
+        column_config=persisted_config,
+        extraction_fields=extraction_fields,
+        dry_run=True,
     )
     assert proposal is not None
     world.proposal = proposal

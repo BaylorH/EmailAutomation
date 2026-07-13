@@ -87,7 +87,7 @@ HEADER = [
     "Jill and Clients comments"
 ]
 
-# Note: "Rent/SF /Yr" is never requested, "Gross Rent" is a formula column (never written or requested)
+# Note: "Flyer / Link" is never requested, "Gross Rent" is a formula column (never written or requested)
 REQUIRED_FIELDS = REQUIRED_FIELDS_FOR_CLOSE
 
 # Sample properties from your sheet

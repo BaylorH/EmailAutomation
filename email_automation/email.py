@@ -43,6 +43,10 @@ from .campaign_safety import (
     get_client_automation_pause,
 )
 from .outbound_safety import validate_outbound_body
+from .column_config import (
+    get_column_config_error,
+    response_requests_nonrequestable_fields,
+)
 
 logger = logging.getLogger(__name__)
 _ORIGINAL_GET_CLIENT_AUTOMATION_PAUSE = get_client_automation_pause
@@ -61,6 +65,8 @@ EXACT_OUTBOX_ACTION_TYPES = {"tour_invite"}
 
 CAMPAIGN_LAUNCH_SOURCES = {"dashboard_new_campaign"}
 CAMPAIGN_LAUNCH_ACTION_TYPES = {"campaign_creation", "campaign_launch"}
+NEW_PROPERTY_OUTREACH_SOURCES = {"dashboard_new_property", "new_property_notification"}
+NEW_PROPERTY_OUTREACH_ACTION_TYPES = {"new_property_outreach", "accept_new_property"}
 
 # Unique worker ID for this process
 WORKER_ID = str(uuid.uuid4())[:8]
@@ -593,6 +599,81 @@ def _is_campaign_launch_outbox(data: dict) -> bool:
     source = str(data.get("source") or "").strip().lower()
     action_type = str(data.get("actionType") or "").strip().lower()
     return source in CAMPAIGN_LAUNCH_SOURCES or action_type in CAMPAIGN_LAUNCH_ACTION_TYPES
+
+
+def _is_initial_outreach_outbox(data: dict) -> bool:
+    """Identify campaign/new-property first touches, including legacy writes."""
+    if _is_tour_invite_outbox(data):
+        return False
+
+    source = str(data.get("source") or "").strip().lower()
+    action_type = str(data.get("actionType") or "").strip().lower()
+    if _is_campaign_launch_outbox(data):
+        return True
+    if source in NEW_PROPERTY_OUTREACH_SOURCES or action_type in NEW_PROPERTY_OUTREACH_ACTION_TYPES:
+        return True
+    if data.get("threadId") or data.get("replyToMessageId"):
+        return False
+
+    legacy_new_property = bool(
+        data.get("notificationId")
+        and data.get("forceScript") is True
+        and str(data.get("scriptSelectionMode") or "").strip().lower() == "exact"
+        and isinstance(data.get("property"), dict)
+    )
+    legacy_campaign_launch = bool(
+        data.get("clientId")
+        and data.get("rowNumber")
+        and data.get("subject")
+        and data.get("assignedEmails")
+    )
+    return legacy_new_property or legacy_campaign_launch
+
+
+def _is_outbox_thread_reply(data: dict) -> bool:
+    """Route explicit first-touch actions as outreach despite stale reply ids."""
+    return bool(
+        data.get("threadId")
+        and data.get("replyToMessageId")
+        and not _is_initial_outreach_outbox(data)
+    )
+
+
+def _dead_letter_invalid_initial_outreach_column_contract_if_needed(
+    user_id: str,
+    doc_ref,
+    data: dict,
+    body: str,
+) -> bool:
+    """Fail closed when first-touch copy violates the persisted column contract."""
+    if not _is_initial_outreach_outbox(data):
+        return False
+
+    client_id = str(data.get("clientId") or "").strip()
+    if not client_id:
+        reason = "Initial outreach has no clientId for persisted columnConfig validation"
+    else:
+        try:
+            decision = _read_client_automation_decision(user_id, client_id)
+            client_data = decision.client_data if decision else {}
+            column_config = (client_data or {}).get("columnConfig")
+            config_error = get_column_config_error(column_config)
+            if config_error:
+                reason = f"Initial outreach has invalid persisted columnConfig: {config_error}"
+            elif response_requests_nonrequestable_fields(body, column_config):
+                reason = "Initial outreach requests a non-requestable Note, Skip, or formula field"
+            else:
+                return False
+        except Exception as exc:
+            reason = f"Initial outreach columnConfig validation failed: {exc}"
+
+    _move_to_dead_letter(
+        user_id,
+        doc_ref,
+        data,
+        f"{reason}; manual review required before sending",
+    )
+    return True
 
 
 def _email_values_from_row(header: List[str], row_values: List[str]) -> List[str]:
@@ -3274,6 +3355,14 @@ def _send_multi_property_email(
             ):
                 print(f"   🛑 Blocked unresolved contact name for {recipient_email}; manual review required")
                 continue
+            if _dead_letter_invalid_initial_outreach_column_contract_if_needed(
+                user_id,
+                item['doc'].reference,
+                data,
+                script,
+            ):
+                print(f"   🛑 Blocked column-contract violation for {recipient_email}; manual review required")
+                continue
             if _dead_letter_unsafe_outbound_body_if_needed(user_id, item['doc'].reference, data, script):
                 print(f"   🛑 Blocked unsafe outbound body for {recipient_email}; manual review required")
                 continue
@@ -3660,6 +3749,36 @@ def _send_combined_property_email(
             )
             print(f"   🛑 Blocked unresolved contact name for combined {recipient_email}; manual review required")
             return
+        contract_blocked = []
+        for c in claimed:
+            if _dead_letter_invalid_initial_outreach_column_contract_if_needed(
+                user_id,
+                c["ref"],
+                c["data"],
+                script,
+            ):
+                contract_blocked.append(c)
+        if contract_blocked:
+            blocked_ids = {id(c) for c in contract_blocked}
+            for c in claimed:
+                if id(c) not in blocked_ids:
+                    _move_to_dead_letter(
+                        user_id,
+                        c["ref"],
+                        c["data"],
+                        "Combined initial outreach failed another row's column contract; manual review required before sending",
+                    )
+            _record_operation_state(
+                operation_states,
+                _outbox_send_operation_state(
+                    "error",
+                    doc_id=primary_doc_id,
+                    recipient=recipient_email,
+                    error="invalid_initial_outreach_column_contract",
+                ),
+            )
+            print(f"   🛑 Blocked combined column-contract violation for {recipient_email}; manual review required")
+            return
         if _dead_letter_unsafe_outbound_body_if_needed(user_id, primary["ref"], data0, script):
             for c in claimed[1:]:
                 _move_to_dead_letter(user_id, c["ref"], c["data"], "Unsafe outbound body in combined send; manual review required")
@@ -3875,7 +3994,7 @@ def _send_single_outbox_item(
     subject_override = data.get("subject")
 
     # Threading support: check if this is a reply to an existing thread
-    is_thread_reply = bool(thread_id and reply_to_msg_id)
+    is_thread_reply = _is_outbox_thread_reply(data)
 
     # SECURITY: threadId/replyToMessageId/clientId on the outbox doc are
     # client-supplied. Before ANY send (including Graph metadata preflights),
@@ -4187,6 +4306,15 @@ def _send_single_outbox_item(
                 recipient_contact_name_failure_reason,
             ):
                 print(f"   🛑 Blocked unresolved contact name for {recipient_email}; manual review required")
+                return
+
+            if _dead_letter_invalid_initial_outreach_column_contract_if_needed(
+                user_id,
+                d.reference,
+                data,
+                selected_script,
+            ):
+                print(f"   🛑 Blocked column-contract violation for {recipient_email}; manual review required")
                 return
 
             if _dead_letter_unsafe_outbound_body_if_needed(user_id, d.reference, data, selected_script):

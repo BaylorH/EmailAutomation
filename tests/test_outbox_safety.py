@@ -11,6 +11,7 @@ os.environ.setdefault(
 
 from email_automation import email as email_module
 from email_automation import notifications as notifications_module
+from email_automation.column_config import get_default_column_config
 
 
 class FakeDocRef:
@@ -305,15 +306,141 @@ class OutboxSafetyTests(unittest.TestCase):
     def setUp(self):
         # These tests isolate outbox behavior. Campaign policy is covered in
         # test_campaign_automation_pause; keep this fixture explicitly active.
+        self.client_data = {
+            "status": "live",
+            "columnConfig": get_default_column_config(),
+        }
         self._active_campaign = patch.object(
             email_module,
             "get_client_automation_pause",
-            return_value=(False, "", {"status": "live"}),
+            side_effect=lambda *_args: (False, "", self.client_data),
         )
         self._active_campaign.start()
 
     def tearDown(self):
         self._active_campaign.stop()
+
+    def test_initial_outreach_column_contract_allows_ask_only_launch(self):
+        doc_ref = FakeDocRef("ask-only-launch")
+        data = {
+            "clientId": "client-1",
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+        }
+
+        with patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter:
+            blocked = email_module._dead_letter_invalid_initial_outreach_column_contract_if_needed(
+                "uid-1",
+                doc_ref,
+                data,
+                "Could you confirm the asking rent and operating expenses?",
+            )
+
+        self.assertFalse(blocked)
+        move_to_dead_letter.assert_not_called()
+
+    def test_initial_outreach_column_contract_dead_letters_flyer_note_request(self):
+        doc_ref = FakeDocRef("flyer-note-launch")
+        data = {
+            "clientId": "client-1",
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+        }
+
+        with patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter:
+            blocked = email_module._dead_letter_invalid_initial_outreach_column_contract_if_needed(
+                "uid-1",
+                doc_ref,
+                data,
+                "Could you send the flyer or listing link?",
+            )
+
+        self.assertTrue(blocked)
+        move_to_dead_letter.assert_called_once()
+        self.assertIn("non-requestable", move_to_dead_letter.call_args.args[3])
+        self.assertIn("manual review", move_to_dead_letter.call_args.args[3])
+
+    def test_initial_outreach_column_contract_dead_letters_malformed_config(self):
+        # Do not invent an Ask set for old/incomplete shapes: missing mode data
+        # makes Skip semantics unknowable, so the operator must review it.
+        self.client_data["columnConfig"] = {"mappings": {}}
+        doc_ref = FakeDocRef("malformed-config-launch")
+        data = {
+            "clientId": "client-1",
+            "notificationId": "new-property-notification-1",
+            "forceScript": True,
+            "scriptSelectionMode": "exact",
+            "property": {"address": "100 New Property Way"},
+        }
+
+        with patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter:
+            blocked = email_module._dead_letter_invalid_initial_outreach_column_contract_if_needed(
+                "uid-1",
+                doc_ref,
+                data,
+                "Could you confirm the asking rent?",
+            )
+
+        self.assertTrue(blocked)
+        move_to_dead_letter.assert_called_once()
+        self.assertIn("invalid persisted columnConfig", move_to_dead_letter.call_args.args[3])
+
+    def test_explicit_initial_outreach_markers_override_stale_thread_metadata(self):
+        self.client_data["columnConfig"] = None
+        doc_ref = FakeDocRef("explicit-launch-with-stale-thread")
+        data = {
+            "clientId": "client-1",
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "threadId": "stale-thread-1",
+            "replyToMessageId": "stale-message-1",
+        }
+
+        with patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter:
+            blocked = email_module._dead_letter_invalid_initial_outreach_column_contract_if_needed(
+                "uid-1",
+                doc_ref,
+                data,
+                "Could you confirm the asking rent?",
+            )
+
+        self.assertTrue(blocked)
+        move_to_dead_letter.assert_called_once()
+        self.assertIn("invalid persisted columnConfig", move_to_dead_letter.call_args.args[3])
+
+    def test_explicit_initial_outreach_markers_route_away_from_reply_path(self):
+        self.assertFalse(email_module._is_outbox_thread_reply({
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "threadId": "stale-thread-1",
+            "replyToMessageId": "stale-message-1",
+        }))
+        self.assertTrue(email_module._is_outbox_thread_reply({
+            "source": "dashboard",
+            "threadId": "thread-1",
+            "replyToMessageId": "message-1",
+        }))
+
+    def test_initial_outreach_column_contract_does_not_classify_threaded_reply(self):
+        self.client_data["columnConfig"] = None
+        doc_ref = FakeDocRef("ordinary-dashboard-reply")
+        data = {
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "replyToMessageId": "message-1",
+            "source": "dashboard",
+        }
+
+        with patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter:
+            blocked = email_module._dead_letter_invalid_initial_outreach_column_contract_if_needed(
+                "uid-1",
+                doc_ref,
+                data,
+                "Thanks, here is the flyer you requested.",
+            )
+
+        self.assertFalse(blocked)
+        move_to_dead_letter.assert_not_called()
 
     def test_cancel_requested_item_is_deleted_without_sending(self):
         doc = FakeDoc({
@@ -2500,6 +2627,14 @@ class SendModeCombineTests(unittest.TestCase):
 
         stack.enter_context(patch("email_automation.clients._fs", FakeFirestore()))
         stack.enter_context(patch("email_automation.processing.is_contact_opted_out", return_value=None))
+        stack.enter_context(patch.object(
+            email_module,
+            "get_client_automation_pause",
+            return_value=(False, "", {
+                "status": "live",
+                "columnConfig": get_default_column_config(),
+            }),
+        ))
         p("_claim_outbox_item", return_value=True)
         p("_get_current_outbox_data", return_value={})
         p("_pause_client_outbox_item_if_needed", return_value=False)

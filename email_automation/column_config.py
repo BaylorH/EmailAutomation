@@ -18,6 +18,7 @@ CANONICAL FIELDS:
 """
 
 import json
+import re
 from typing import Dict, List, Optional, Any
 
 
@@ -130,7 +131,7 @@ CANONICAL_FIELDS = {
         "extraction_hints": "Base/asking rent per SF per YEAR. Output plain decimal (e.g., '8.50' not '$8.50/SF NNN')",
         "format": "currency",
         "extractable": True,
-        "never_request": True,  # We accept it if provided but never ask for it
+        "required_for_close": True,
         "ai_synonyms": ["asking", "base rent", "$/SF/yr", "rent per foot"],
     },
     "ops_ex_sf": {
@@ -219,7 +220,7 @@ CANONICAL_FIELDS = {
         "extraction_hints": "URLs to property flyers or listings",
         "format": "url",
         "extractable": True,
-        "required_for_close": True,
+        "never_request": True,
         "append_mode": True,
     },
     "floorplan": {
@@ -299,7 +300,8 @@ COLUMN_MODES = {
 def get_default_column_config() -> Dict[str, Any]:
     """
     Returns default column configuration using standard aliases.
-    This is used when a client doesn't have custom column mappings.
+    This is a canonical template for setup and tests. Persisted campaigns must
+    provide their own complete columnConfig rather than falling back to it.
     """
     return {
         "mappings": {
@@ -309,6 +311,7 @@ def get_default_column_config() -> Dict[str, Any]:
         "requiredFields": DEFAULT_REQUIRED_FOR_CLOSE.copy(),
         "formulaFields": FORMULA_FIELDS,
         "neverRequest": NEVER_REQUEST_FIELDS,
+        "extractionFields": EXTRACTABLE_FIELDS.copy(),
         "customFields": {},  # {columnHeader: {mode, description}}
     }
 
@@ -367,6 +370,8 @@ def get_default_mode_for_canonical(canonical: str) -> str:
 
     if field.get("is_formula"):
         return "skip"  # Formula fields should be skipped
+    elif field.get("never_request") and field.get("append_mode"):
+        return "note"
     elif field.get("never_request"):
         return "accept_only"
     elif field.get("required_for_close"):
@@ -377,6 +382,187 @@ def get_default_mode_for_canonical(canonical: str) -> str:
         return "note"
     else:
         return "skip"
+
+
+def get_column_config_error(column_config: Any) -> Optional[str]:
+    """Return a reason when a persisted campaign column contract is unsafe."""
+    if not isinstance(column_config, dict):
+        return "columnConfig must be an object"
+
+    list_fields = (
+        "extractionFields",
+        "requiredFields",
+        "formulaFields",
+        "neverRequest",
+    )
+    for name in list_fields:
+        values = column_config.get(name)
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            return f"columnConfig.{name} must be a list of strings"
+
+    mappings = column_config.get("mappings")
+    if not isinstance(mappings, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str) or not value.strip()
+        for key, value in mappings.items()
+    ):
+        return "columnConfig.mappings must map string keys to non-empty headers"
+
+    custom_fields = column_config.get("customFields")
+    if not isinstance(custom_fields, dict):
+        return "columnConfig.customFields must be an object"
+    for header, config in custom_fields.items():
+        if not isinstance(header, str) or not header.strip() or not isinstance(config, dict):
+            return "columnConfig.customFields entries must be objects keyed by non-empty headers"
+        if config.get("mode") not in COLUMN_MODES:
+            return f"columnConfig custom field {header!r} has an invalid mode"
+
+    extraction = set(column_config["extractionFields"])
+    required = set(column_config["requiredFields"])
+    formulas = set(column_config["formulaFields"])
+    never_request = set(column_config["neverRequest"])
+    mapped = set(mappings)
+
+    if not required <= extraction:
+        return "columnConfig.requiredFields must be included in extractionFields"
+    if not never_request <= extraction:
+        return "columnConfig.neverRequest must be included in extractionFields"
+    if (required & never_request) or (required & formulas):
+        return "columnConfig required fields cannot be Note or formula fields"
+    if not (extraction | formulas) <= mapped:
+        return "columnConfig configured fields must have mappings"
+
+    return None
+
+
+def get_non_requestable_field_terms(column_config: Dict[str, Any]) -> List[List[str]]:
+    """Return aliases grouped by each configured Note, Skip, or formula field."""
+    mappings = column_config["mappings"]
+    extraction = set(column_config["extractionFields"])
+    skipped_extractable = {
+        canonical
+        for canonical in mappings
+        if CANONICAL_FIELDS.get(canonical, {}).get("extractable")
+        and canonical not in extraction
+    }
+    non_requestable = (
+        set(column_config["neverRequest"])
+        | set(column_config["formulaFields"])
+        | skipped_extractable
+        | ({"listing_comments", "client_comments"} & set(mappings))
+    )
+
+    groups = []
+    for canonical in non_requestable:
+        field = CANONICAL_FIELDS.get(canonical, {})
+        terms = [mappings.get(canonical), field.get("label")]
+        if canonical in (
+            set(column_config["neverRequest"])
+            | set(column_config["formulaFields"])
+            | {"listing_comments", "client_comments"}
+        ):
+            terms.extend(field.get("default_aliases", []))
+            terms.extend(field.get("legacy_aliases", []))
+        normalized = list(dict.fromkeys(
+            term.strip().lower() for term in terms if isinstance(term, str) and term.strip()
+        ))
+        if normalized:
+            groups.append(normalized)
+
+    for header, config in column_config["customFields"].items():
+        if config.get("mode") in {"accept_only", "note", "skip"}:
+            terms = [header.strip().lower()]
+            terms.extend(_custom_field_paraphrase_terms(header))
+            groups.append(list(dict.fromkeys(terms)))
+
+    return groups
+
+
+_CUSTOM_FIELD_STOPWORDS = {
+    "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with",
+}
+_CUSTOM_FIELD_GENERIC_TOKENS = {
+    "column", "columns", "comment", "comments", "detail", "details", "field",
+    "fields", "info", "information", "note", "notes",
+}
+
+
+def _stem_custom_field_token(token: str) -> str:
+    if len(token) > 4 and token.endswith("ies"):
+        return f"{token[:-3]}y"
+    if len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _custom_field_paraphrase_terms(header: str) -> List[str]:
+    tokens = [
+        token
+        for token in re.findall(r"[a-z0-9]+", (header or "").lower())
+        if token not in _CUSTOM_FIELD_STOPWORDS
+        and token not in _CUSTOM_FIELD_GENERIC_TOKENS
+    ]
+    if len(tokens) < 2:
+        return []
+
+    raw_phrase = " ".join(tokens)
+    stemmed_phrase = " ".join(_stem_custom_field_token(token) for token in tokens)
+    return list(dict.fromkeys((raw_phrase, stemmed_phrase)))
+
+
+_FIELD_REQUEST_INTENT_RE = re.compile(
+    r"(?:"
+    r"\b(?:ask|request|need)\b"
+    r"|\bplease\b"
+    r"|^\s*(?:send|share|provide|confirm|attach|include|supply|forward)\b"
+    r"|\b(?:can|could|would|will|may)\s+(?:i|you|we|they)\b"
+    r"|^\s*any\s+chance\s+(?:that\s+)?(?:i|you|we|they)\s+can\b"
+    r"|^\s*do\s+you\s+know\b"
+    r"|^\s*would\s+it\s+be\s+possible\s+to\b"
+    r"|^\s*i\s+would\s+appreciate\b"
+    r"|^\s*(?:is|are|was|were)\b"
+    r"|^\s*(?:do|does|did)\s+(?:you|we|they)\s+have\b"
+    r"|^\s*what\s+about\b"
+    r"|\b(?:i\s+am|we\s+are|the\s+client\s+is|our\s+team\s+is)\s+interested\s+in\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def contains_column_field_term(text: str, term: str) -> bool:
+    """Match a configured field term as words, never inside another word."""
+    normalized = (term or "").strip()
+    if not normalized:
+        return False
+    pattern = re.escape(normalized).replace(r"\ ", r"\s+")
+    return bool(re.search(
+        rf"(?<![A-Za-z0-9]){pattern}(?![A-Za-z0-9])",
+        text or "",
+        re.IGNORECASE,
+    ))
+
+
+def response_requests_nonrequestable_fields(
+    response_body: str,
+    column_config: Optional[dict],
+) -> bool:
+    """Return True when request language targets a configured Note/Skip field."""
+    body = (response_body or "").strip()
+    if not body:
+        return False
+    if get_column_config_error(column_config):
+        return True
+
+    request_clauses = [
+        clause
+        for clause in re.split(r"[\n.!?;,]+", body)
+        if _FIELD_REQUEST_INTENT_RE.search(clause)
+    ]
+    return any(
+        contains_column_field_term(clause, term)
+        for terms in get_non_requestable_field_terms(column_config)
+        for term in terms
+        for clause in request_clauses
+    )
 
 
 def detect_column_mapping(headers: List[str], use_ai: bool = True) -> Dict[str, Any]:

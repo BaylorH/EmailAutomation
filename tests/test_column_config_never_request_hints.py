@@ -1,13 +1,8 @@
 """Regression test for FIX-17 / M35.
 
-When a field is in `neverRequest`, `build_column_rules_prompt` previously
-rendered only `<description>. Accept if provided but NEVER request.` and
-DROPPED the field's `extraction_hints`. GPT-5.2 read the bare never-request
-line as de-emphasis and skipped PDF-sourced asking rent (M35, rent NOT
-extracted in 3/3 live accept-new-property cases while every other spec from
-the SAME PDF text extracted). The fix renders the extraction hints alongside
-the never-request rule so the model still knows HOW to recognize/normalize the
-value it is allowed to accept.
+When a field is in `neverRequest`, `build_column_rules_prompt` must preserve
+its extraction hints. The model still needs to recognize and normalize values
+that it may accept even though it must never request them.
 """
 
 import unittest
@@ -20,28 +15,27 @@ from email_automation.column_config import (
 
 
 class NeverRequestRendersHintsTest(unittest.TestCase):
-    def _rent_line(self, prompt: str) -> str:
-        rent_col = CANONICAL_FIELDS["rent_sf_yr"]["default_aliases"][0]
+    def _flyer_line(self, prompt: str) -> str:
+        flyer_col = CANONICAL_FIELDS["flyer_link"]["default_aliases"][0]
         for line in prompt.splitlines():
-            if line.startswith(f'- "{rent_col}"'):
+            if line.startswith(f'- "{flyer_col}"'):
                 return line
-        self.fail(f"No rendered rule line for rent column {rent_col!r}:\n{prompt}")
+        self.fail(f"No rendered rule line for flyer column {flyer_col!r}:\n{prompt}")
 
     def test_never_request_line_includes_extraction_hints(self):
         config = get_default_column_config()
-        # Precondition: rent is a never-request field in the default config.
-        self.assertIn("rent_sf_yr", config["neverRequest"])
+        # Precondition: Flyer is a Note/never-request field in the default config.
+        self.assertIn("flyer_link", config["neverRequest"])
 
         prompt = build_column_rules_prompt(config)
-        rent_line = self._rent_line(prompt)
+        flyer_line = self._flyer_line(prompt)
 
         # The never-request rule must still be present...
-        self.assertIn("NEVER request", rent_line)
+        self.assertIn("NEVER request", flyer_line)
         # ...but the extraction hint text (HOW to recognize/normalize the value)
         # must NOT be dropped. This fragment lives only in extraction_hints,
         # not in the field description.
-        self.assertIn("Output plain decimal", rent_line)
-        self.assertIn("per SF per YEAR", rent_line)
+        self.assertIn("URLs to property flyers or listings", flyer_line)
 
     def test_all_never_request_extractable_fields_keep_their_hints(self):
         config = get_default_column_config()

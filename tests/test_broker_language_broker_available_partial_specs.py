@@ -132,7 +132,7 @@ class PartialSpecsKeepsRowOpen(unittest.TestCase):
             "Total SF": "30000", "Ops Ex /SF": "5", "Drive Ins": "2",
             "Docks": "4", "Ceiling Ht": "24", "Power": "1200A"})),
         ("sf+clear+docks", dict(**{"Total SF": "33000", "Ceiling Ht": "26", "Docks": "3"})),
-        ("only rent set (not required)", dict(**{"Rent/SF /Yr": "12.00"})),
+        ("only rent set", dict(**{"Rent/SF /Yr": "12.00"})),
         ("nothing filled", dict()),
     ]
 

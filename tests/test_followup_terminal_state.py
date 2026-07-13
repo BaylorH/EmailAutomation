@@ -14,6 +14,7 @@ os.environ.setdefault(
 
 from email_automation import followup
 from email_automation.campaign_safety import CampaignAutomationDecision
+from email_automation.column_config import get_default_column_config
 
 
 class FakeResponse:
@@ -319,7 +320,10 @@ class FollowupTerminalStateTests(unittest.TestCase):
             return_value=CampaignAutomationDecision(
                 state="allow",
                 reason="",
-                client_data={"status": "live"},
+                client_data={
+                    "status": "live",
+                    "columnConfig": get_default_column_config(),
+                },
                 metadata={"terminal": False, "stopKind": "none"},
             ),
             create=True,
@@ -332,6 +336,59 @@ class FollowupTerminalStateTests(unittest.TestCase):
         )
         self._optout_patch.start()
         self.addCleanup(self._optout_patch.stop)
+
+    def test_followup_blocks_note_field_request_before_graph(self):
+        self.campaign_decision.return_value = CampaignAutomationDecision(
+            state="allow",
+            reason="",
+            client_data={
+                "status": "live",
+                "columnConfig": get_default_column_config(),
+            },
+            metadata={"terminal": False, "stopKind": "none"},
+        )
+
+        with patch.object(requests, "get") as get, patch.object(requests, "post") as post:
+            sent = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                {"clientId": "client-1", "email": ["broker@example.com"]},
+                {"followUps": [{"message": "Is there a flyer available?"}]},
+                0,
+            )
+
+        self.assertFalse(sent)
+        get.assert_not_called()
+        post.assert_not_called()
+        self.assertTrue(followup._send_followup_email.guard_failed_closed)
+        self.assertIn("non-requestable", followup._send_followup_email.last_error)
+        self.assertIn("manual review", followup._send_followup_email.last_error)
+
+    def test_followup_blocks_incomplete_persisted_config_before_graph(self):
+        self.campaign_decision.return_value = CampaignAutomationDecision(
+            state="allow",
+            reason="",
+            client_data={"status": "live", "columnConfig": {"mappings": {}}},
+            metadata={"terminal": False, "stopKind": "none"},
+        )
+
+        with patch.object(requests, "get") as get, patch.object(requests, "post") as post:
+            sent = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                {"clientId": "client-1", "email": ["broker@example.com"]},
+                {"followUps": [{"message": "Could you confirm the asking rent?"}]},
+                0,
+            )
+
+        self.assertFalse(sent)
+        get.assert_not_called()
+        post.assert_not_called()
+        self.assertTrue(followup._send_followup_email.guard_failed_closed)
+        self.assertIn("invalid persisted columnConfig", followup._send_followup_email.last_error)
+        self.assertIn("manual review", followup._send_followup_email.last_error)
 
     def test_weekend_followup_window_defers_to_monday_business_start(self):
         sunday = datetime(2026, 6, 21, 17, 1, tzinfo=timezone.utc)
@@ -778,7 +835,10 @@ class FollowupTerminalStateTests(unittest.TestCase):
 
         self.campaign_decision.side_effect = [
             CampaignAutomationDecision(
-                state="allow", reason="", client_data={"status": "live"},
+                state="allow", reason="", client_data={
+                    "status": "live",
+                    "columnConfig": get_default_column_config(),
+                },
                 metadata={"terminal": False, "stopKind": "none"},
             ),
             CampaignAutomationDecision(
