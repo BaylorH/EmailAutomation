@@ -361,6 +361,8 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertIn("manual review", move_to_dead_letter.call_args.args[3])
 
     def test_initial_outreach_column_contract_dead_letters_malformed_config(self):
+        # Do not invent an Ask set for old/incomplete shapes: missing mode data
+        # makes Skip semantics unknowable, so the operator must review it.
         self.client_data["columnConfig"] = {"mappings": {}}
         doc_ref = FakeDocRef("malformed-config-launch")
         data = {
@@ -382,6 +384,42 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertTrue(blocked)
         move_to_dead_letter.assert_called_once()
         self.assertIn("invalid persisted columnConfig", move_to_dead_letter.call_args.args[3])
+
+    def test_explicit_initial_outreach_markers_override_stale_thread_metadata(self):
+        self.client_data["columnConfig"] = None
+        doc_ref = FakeDocRef("explicit-launch-with-stale-thread")
+        data = {
+            "clientId": "client-1",
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "threadId": "stale-thread-1",
+            "replyToMessageId": "stale-message-1",
+        }
+
+        with patch.object(email_module, "_move_to_dead_letter") as move_to_dead_letter:
+            blocked = email_module._dead_letter_invalid_initial_outreach_column_contract_if_needed(
+                "uid-1",
+                doc_ref,
+                data,
+                "Could you confirm the asking rent?",
+            )
+
+        self.assertTrue(blocked)
+        move_to_dead_letter.assert_called_once()
+        self.assertIn("invalid persisted columnConfig", move_to_dead_letter.call_args.args[3])
+
+    def test_explicit_initial_outreach_markers_route_away_from_reply_path(self):
+        self.assertFalse(email_module._is_outbox_thread_reply({
+            "source": "dashboard_new_campaign",
+            "actionType": "campaign_creation",
+            "threadId": "stale-thread-1",
+            "replyToMessageId": "stale-message-1",
+        }))
+        self.assertTrue(email_module._is_outbox_thread_reply({
+            "source": "dashboard",
+            "threadId": "thread-1",
+            "replyToMessageId": "message-1",
+        }))
 
     def test_initial_outreach_column_contract_does_not_classify_threaded_reply(self):
         self.client_data["columnConfig"] = None

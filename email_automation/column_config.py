@@ -448,14 +448,20 @@ def get_non_requestable_field_terms(column_config: Dict[str, Any]) -> List[List[
         set(column_config["neverRequest"])
         | set(column_config["formulaFields"])
         | skipped_extractable
+        | ({"listing_comments", "client_comments"} & set(mappings))
     )
 
     groups = []
     for canonical in non_requestable:
         field = CANONICAL_FIELDS.get(canonical, {})
         terms = [mappings.get(canonical), field.get("label")]
-        if canonical in set(column_config["neverRequest"]) | set(column_config["formulaFields"]):
+        if canonical in (
+            set(column_config["neverRequest"])
+            | set(column_config["formulaFields"])
+            | {"listing_comments", "client_comments"}
+        ):
             terms.extend(field.get("default_aliases", []))
+            terms.extend(field.get("legacy_aliases", []))
         normalized = list(dict.fromkeys(
             term.strip().lower() for term in terms if isinstance(term, str) and term.strip()
         ))
@@ -469,9 +475,17 @@ def get_non_requestable_field_terms(column_config: Dict[str, Any]) -> List[List[
     return groups
 
 
-_FIELD_REQUEST_CUE_RE = re.compile(
-    r"\b(?:ask|can|could|would|please|send|share|provide|confirm|need|attach|"
-    r"include|have|supply|forward)\b",
+_FIELD_REQUEST_INTENT_RE = re.compile(
+    r"(?:"
+    r"\b(?:ask|request|need)\b"
+    r"|\bplease\b"
+    r"|^\s*(?:send|share|provide|confirm|attach|include|supply|forward)\b"
+    r"|\b(?:can|could|would|will)\s+(?:you|we|they)\b"
+    r"|^\s*(?:is|are|was|were)\b"
+    r"|^\s*(?:do|does|did)\s+(?:you|we|they)\s+have\b"
+    r"|^\s*what\s+about\b"
+    r"|\b(?:i\s+am|we\s+are|the\s+client\s+is|our\s+team\s+is)\s+interested\s+in\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -503,7 +517,7 @@ def response_requests_nonrequestable_fields(
     request_clauses = [
         clause
         for clause in re.split(r"[\n.!?;,]+", body)
-        if _FIELD_REQUEST_CUE_RE.search(clause)
+        if _FIELD_REQUEST_INTENT_RE.search(clause)
     ]
     return any(
         contains_column_field_term(clause, term)

@@ -66,6 +66,8 @@ from email_automation import pending_responses
 from email_automation import processing as processing_module
 from email_automation.outbound_safety import validate_outbound_body
 from email_automation.ai_processing import _augment_events_with_deterministic_signals
+from email_automation.campaign_safety import CampaignAutomationDecision
+from email_automation.column_config import get_default_column_config
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +369,16 @@ class KarsenLaunchPlaceholderAndTourLeakComboTests(unittest.TestCase):
             "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
         }), \
              patch.object(processing_module, "send_reply_in_thread", new=recorder), \
+             patch.object(
+                 pending_responses,
+                 "get_client_automation_decision",
+                 return_value=CampaignAutomationDecision(
+                     state="allow",
+                     reason="",
+                     client_data={"columnConfig": get_default_column_config()},
+                     metadata={"terminal": False, "stopKind": "none"},
+                 ),
+             ), \
              patch("email_automation.sent_mail_guard.requests.get", fake_graph.get), \
              patch("email_automation.sent_mail_guard.exponential_backoff_request",
                    side_effect=lambda fn: fn()):
@@ -462,6 +474,16 @@ class KarsenLaunchPlaceholderAndTourLeakComboTests(unittest.TestCase):
             "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
         }), \
              patch.object(processing_module, "send_reply_in_thread", new=recorder), \
+             patch.object(
+                 pending_responses,
+                 "get_client_automation_decision",
+                 return_value=CampaignAutomationDecision(
+                     state="allow",
+                     reason="",
+                     client_data={"columnConfig": get_default_column_config()},
+                     metadata={"terminal": False, "stopKind": "none"},
+                 ),
+             ), \
              patch("email_automation.sent_mail_guard.requests.get", fake_graph.get), \
              patch("email_automation.sent_mail_guard.exponential_backoff_request",
                    side_effect=lambda fn: fn()):

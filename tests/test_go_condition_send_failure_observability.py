@@ -32,6 +32,7 @@ from email_automation import email as email_module
 from email_automation import followup as followup_module
 from email_automation import pending_responses
 from email_automation import processing as processing_module
+from email_automation.column_config import get_default_column_config
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +302,7 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
                 "threadId": "thread-1",
                 "msgId": "message-1",
                 "recipient": "broker@example.com",
-                "responseBody": "Hi,\n\nCan you share the flyer?",
+                "responseBody": "Hi,\n\nCould you confirm the asking rent?",
                 "clientId": "client-1",
                 "attempts": 0,
             },
@@ -326,7 +327,10 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
             pending_responses,
             "get_client_automation_decision",
             return_value=types.SimpleNamespace(
-                state="allow", reason="", metadata={"terminal": False}
+                state="allow",
+                reason="",
+                metadata={"terminal": False},
+                client_data={"columnConfig": get_default_column_config()},
             ),
         ), patch.dict(sys.modules, {
             "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
@@ -355,7 +359,7 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
                 "threadId": "thread-1",
                 "msgId": "message-1",
                 "recipient": "broker@example.com",
-                "responseBody": "Hi,\n\nCan you share the flyer?",
+                "responseBody": "Hi,\n\nCould you confirm the asking rent?",
                 "clientId": "client-1",
                 "attempts": 0,
             },
@@ -378,7 +382,10 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
             pending_responses,
             "get_client_automation_decision",
             return_value=types.SimpleNamespace(
-                state="allow", reason="", metadata={"terminal": False}
+                state="allow",
+                reason="",
+                metadata={"terminal": False},
+                client_data={"columnConfig": get_default_column_config()},
             ),
         ), patch.dict(sys.modules, {
             "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),

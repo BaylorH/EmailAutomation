@@ -12,6 +12,8 @@ from unittest.mock import patch
 import requests
 
 from email_automation import clients, followup
+from email_automation.campaign_safety import CampaignAutomationDecision
+from email_automation.column_config import get_default_column_config
 
 
 CLIENT_ID = "client-followup-placeholder"
@@ -174,6 +176,16 @@ class CoreFollowupsBadPlaceholderTests(unittest.TestCase):
 
         with patch.object(followup, "_fs", fake_fs), \
              patch.object(clients, "_fs", fake_fs), \
+             patch.object(
+                 followup,
+                 "get_client_automation_decision",
+                 return_value=CampaignAutomationDecision(
+                     state="allow",
+                     reason="",
+                     client_data={"columnConfig": get_default_column_config()},
+                     metadata={"terminal": False, "stopKind": "none"},
+                 ),
+             ), \
              patch.object(
                  followup,
                  "exponential_backoff_request",

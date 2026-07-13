@@ -603,7 +603,7 @@ def _is_campaign_launch_outbox(data: dict) -> bool:
 
 def _is_initial_outreach_outbox(data: dict) -> bool:
     """Identify campaign/new-property first touches, including legacy writes."""
-    if data.get("threadId") or data.get("replyToMessageId") or _is_tour_invite_outbox(data):
+    if _is_tour_invite_outbox(data):
         return False
 
     source = str(data.get("source") or "").strip().lower()
@@ -612,6 +612,8 @@ def _is_initial_outreach_outbox(data: dict) -> bool:
         return True
     if source in NEW_PROPERTY_OUTREACH_SOURCES or action_type in NEW_PROPERTY_OUTREACH_ACTION_TYPES:
         return True
+    if data.get("threadId") or data.get("replyToMessageId"):
+        return False
 
     legacy_new_property = bool(
         data.get("notificationId")
@@ -626,6 +628,15 @@ def _is_initial_outreach_outbox(data: dict) -> bool:
         and data.get("assignedEmails")
     )
     return legacy_new_property or legacy_campaign_launch
+
+
+def _is_outbox_thread_reply(data: dict) -> bool:
+    """Route explicit first-touch actions as outreach despite stale reply ids."""
+    return bool(
+        data.get("threadId")
+        and data.get("replyToMessageId")
+        and not _is_initial_outreach_outbox(data)
+    )
 
 
 def _dead_letter_invalid_initial_outreach_column_contract_if_needed(
@@ -3983,7 +3994,7 @@ def _send_single_outbox_item(
     subject_override = data.get("subject")
 
     # Threading support: check if this is a reply to an existing thread
-    is_thread_reply = bool(thread_id and reply_to_msg_id)
+    is_thread_reply = _is_outbox_thread_reply(data)
 
     # SECURITY: threadId/replyToMessageId/clientId on the outbox doc are
     # client-supplied. Before ANY send (including Graph metadata preflights),

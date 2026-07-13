@@ -45,6 +45,10 @@ from .campaign_safety import (
     stopped_followup_patch,
 )
 from .outbound_safety import validate_outbound_body
+from .column_config import (
+    get_column_config_error,
+    response_requests_nonrequestable_fields,
+)
 
 # Claim timeout for follow-up processing (prevent duplicate sends)
 FOLLOWUP_CLAIM_TIMEOUT_SECONDS = 60
@@ -123,6 +127,17 @@ def _get_followup_campaign_suppression():
 def _get_local_followup_campaign_suppression():
     """Return suppression produced by this execution context only."""
     return _get_followup_campaign_suppression()
+
+
+def _followup_column_contract_error(message: str, campaign_decision) -> Optional[str]:
+    client_data = getattr(campaign_decision, "client_data", None) or {}
+    column_config = client_data.get("columnConfig")
+    config_error = get_column_config_error(column_config)
+    if config_error:
+        return f"Follow-up has invalid persisted columnConfig: {config_error}"
+    if response_requests_nonrequestable_fields(message, column_config):
+        return "Follow-up requests a non-requestable Note, Skip, or formula field"
+    return None
 
 
 def _clear_followup_campaign_suppression() -> None:
@@ -709,6 +724,16 @@ def _send_followup_email(
         if not followup_message:
             followup_message = _get_default_followup_message(followup_index)
 
+        contract_error = _followup_column_contract_error(
+            followup_message,
+            campaign_decision,
+        )
+        if contract_error:
+            failure_reason = f"{contract_error}; manual review required before sending follow-up"
+            _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+            print(f"   🛑 {failure_reason}")
+            return False
+
         recipient_emails = thread_data.get("email", [])
         if not recipient_emails:
             print(f"   No recipient email for thread {thread_id[:20]}...")
@@ -1131,6 +1156,16 @@ def _send_followup_email(
             _set_followup_campaign_suppression(campaign_decision)
             _delete_graph_reply_draft(headers, reply_draft_id, base=base)
             print(f"   🛑 {_get_followup_send_outcome().error}")
+            return False
+        contract_error = _followup_column_contract_error(
+            followup_message,
+            campaign_decision,
+        )
+        if contract_error:
+            failure_reason = f"{contract_error}; manual review required before sending follow-up"
+            _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            print(f"   🛑 {failure_reason}")
             return False
 
         reply_resp = exponential_backoff_request(

@@ -163,17 +163,56 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
         )
 
     def test_independent_guard_rejects_actual_flyer_request(self):
-        body = "Could you please send the flyer or brochure?"
-
-        self.assertTrue(
-            processing._response_requests_nonrequestable_fields(body, self.config)
-        )
+        for body in (
+            "Could you please send the flyer or brochure?",
+            "Is there a flyer available?",
+            "What about the brochure?",
+            "Do you have the flyer?",
+            "We are interested in the flyer/listing link.",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(
+                    processing._response_requests_nonrequestable_fields(body, self.config)
+                )
 
     def test_independent_guard_allows_benign_listing_link_context(self):
         body = "Here is the link to the listing for context."
 
         self.assertFalse(
             processing._response_requests_nonrequestable_fields(body, self.config)
+        )
+
+    def test_independent_guard_allows_informational_offer_of_flyer(self):
+        body = "Happy to send over the flyer and asking rate whenever useful."
+
+        self.assertFalse(
+            processing._response_requests_nonrequestable_fields(body, self.config)
+        )
+
+    def test_independent_guard_rejects_configured_canonical_and_custom_notes(self):
+        for body in (
+            "What about the Listing Broker Comments?",
+            "Do you have the Client Comments?",
+            "We are interested in the Broker Context.",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(
+                    processing._response_requests_nonrequestable_fields(body, self.config)
+                )
+
+    def test_incomplete_legacy_shape_is_rejected_without_guessing_ask_fields(self):
+        incomplete = {
+            "mappings": self.config["mappings"],
+            "requiredFields": self.config["requiredFields"],
+            "formulaFields": self.config["formulaFields"],
+            "neverRequest": self.config["neverRequest"],
+        }
+
+        self.assertTrue(
+            processing._response_requests_nonrequestable_fields(
+                "Could you confirm the asking rent?",
+                incomplete,
+            )
         )
 
 

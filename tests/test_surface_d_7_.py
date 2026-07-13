@@ -419,6 +419,16 @@ class ReplyAllManualContinuationTests(unittest.TestCase):
 
         import email_automation.clients as clients_mod
         with mock.patch.object(clients_mod, "_fs", fake_fs), \
+             mock.patch.object(
+                 pending_mod,
+                 "get_client_automation_decision",
+                 return_value=SimpleNamespace(
+                     state="allow",
+                     reason="",
+                     metadata={"terminal": False},
+                     client_data={"columnConfig": get_default_column_config()},
+                 ),
+             ), \
              mock.patch.object(processing_mod, "send_reply_in_thread", send_spy), \
              mock.patch.object(pending_mod, "find_matching_sent_message_for_retry", return_value=None), \
              mock.patch.object(pending_mod, "find_sent_conversation_continuation_for_retry", return_value=continuation), \

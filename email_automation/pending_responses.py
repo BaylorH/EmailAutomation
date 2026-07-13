@@ -21,6 +21,10 @@ from .campaign_safety import (
     CAMPAIGN_AUTOMATION_BLOCKED,
     get_client_automation_decision,
 )
+from .column_config import (
+    get_column_config_error,
+    response_requests_nonrequestable_fields,
+)
 
 # Maximum retry attempts before giving up
 MAX_RESPONSE_ATTEMPTS = 5
@@ -38,9 +42,34 @@ def _preserve_pending_campaign_suppression(doc, decision) -> None:
     })
 
 
-def _gate_pending_response(user_id: str, doc, data: Dict[str, Any]) -> bool:
-    decision = get_client_automation_decision(user_id, data.get("clientId"))
+def _pending_response_column_contract_error(data: Dict[str, Any], decision) -> Optional[str]:
+    client_data = getattr(decision, "client_data", None) or {}
+    column_config = client_data.get("columnConfig")
+    config_error = get_column_config_error(column_config)
+    if config_error:
+        return f"Pending response has invalid persisted columnConfig: {config_error}"
+    if response_requests_nonrequestable_fields(data.get("responseBody"), column_config):
+        return "Pending response requests a non-requestable Note, Skip, or formula field"
+    return None
+
+
+def _gate_pending_response(
+    user_id: str,
+    doc,
+    data: Dict[str, Any],
+    decision=None,
+) -> bool:
+    decision = decision or get_client_automation_decision(user_id, data.get("clientId"))
     if decision.state == CAMPAIGN_AUTOMATION_ALLOW:
+        contract_error = _pending_response_column_contract_error(data, decision)
+        if contract_error:
+            _move_pending_response_to_dead_letter(
+                user_id,
+                doc,
+                data,
+                f"{contract_error}; manual review required before retry",
+            )
+            return True
         return False
     if decision.state == CAMPAIGN_AUTOMATION_BLOCKED and decision.metadata.get("terminal"):
         _move_pending_response_to_dead_letter(
@@ -176,7 +205,7 @@ def queue_pending_response(
     return doc_ref.id
 
 
-def get_pending_responses(user_id: str) -> list:
+def get_pending_responses(user_id: str, *, apply_send_gates: bool = True) -> list:
     """
     Get all pending responses that haven't exceeded max attempts.
     """
@@ -190,7 +219,14 @@ def get_pending_responses(user_id: str) -> list:
         data = doc.to_dict()
         attempts = data.get("attempts", 0)
 
-        if _gate_pending_response(user_id, doc, data):
+        if apply_send_gates and _gate_pending_response(user_id, doc, data):
+            continue
+
+        if not apply_send_gates:
+            valid.append({
+                "doc": doc,
+                "data": data,
+            })
             continue
 
         if attempts >= MAX_RESPONSE_ATTEMPTS:
@@ -257,7 +293,7 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
 
     operation_states: List[Dict[str, Any]] = []
 
-    pending = get_pending_responses(user_id)
+    pending = get_pending_responses(user_id, apply_send_gates=False)
 
     if not pending:
         return operation_states
@@ -277,8 +313,23 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
         print(f"  → Retrying response to {recipient} (attempt {attempts + 1}/{MAX_RESPONSE_ATTEMPTS})")
 
         try:
-            if _gate_pending_response(user_id, doc, data):
+            campaign_decision = get_client_automation_decision(
+                user_id,
+                data.get("clientId"),
+            )
+            if _gate_pending_response(
+                user_id,
+                doc,
+                data,
+                decision=campaign_decision,
+            ):
                 print("    ⏸️ Pending response suppressed by current campaign state")
+                continue
+
+            if attempts >= MAX_RESPONSE_ATTEMPTS:
+                reason = data.get("lastError") or f"Exceeded max attempts ({MAX_RESPONSE_ATTEMPTS})"
+                _move_pending_response_to_dead_letter(user_id, doc, data, reason)
+                print(f"    ☠️ Pending response exceeded max attempts ({MAX_RESPONSE_ATTEMPTS})")
                 continue
 
             body_validation = validate_outbound_body(response_body)
