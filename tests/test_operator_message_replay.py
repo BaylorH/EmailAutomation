@@ -278,7 +278,7 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.scheduler_lease_runner.assert_called_once()
         self.assertEqual(30 * 60, self.lease_runner.call_args.kwargs["ttl_seconds"])
         self.assertEqual(
-            10 * 60,
+            30 * 60,
             self.scheduler_lease_runner.call_args.kwargs["ttl_seconds"],
         )
 
@@ -690,6 +690,35 @@ class OperatorReplayContractTests(unittest.TestCase):
                 "operator_replay_in_progress",
                 self.fs.data[marker_path]["status"],
             )
+
+    def test_post_process_unreadable_artifact_marks_guard_failure_visible(self):
+        self.find_existing_artifact.side_effect = [
+            None,
+            {
+                "collection": "outbox",
+                "status": "guard_scan_failed",
+                "guardUnreadable": True,
+                "guardError": "exact artifact query unavailable",
+            },
+        ]
+
+        with self.assertRaisesRegex(operator_replay.ReplayRefused, "artifact guard"):
+            self.replay(apply=True)
+
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            _failure_id(),
+        )
+        self.assertEqual(
+            "operator_replay_guard_failed",
+            self.fs.data[failure_path]["recoveryStatus"],
+        )
+        self.assertEqual(
+            "exact artifact query unavailable",
+            self.fs.data[failure_path]["replayGuardError"],
+        )
 
     def test_failed_atomic_completion_leaves_preclaims_and_failure_visible(self):
         self.fs.fail_batch_commit_number = 2

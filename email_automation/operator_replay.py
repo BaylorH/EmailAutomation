@@ -26,7 +26,7 @@ APPROVED_OPERATOR_RECIPIENT = "baylor.freelance@outlook.com"
 APPROVED_BP21_LOCAL_PART = "bp21harrison"
 APPROVED_BP21_DOMAIN = "gmail.com"
 ALLOWED_THREAD_STATUSES = {"active", "paused"}
-REPLAY_SCHEDULER_LEASE_TTL_SECONDS = 10 * 60
+REPLAY_SCHEDULER_LEASE_TTL_SECONDS = 30 * 60
 REPLAY_USER_LEASE_TTL_SECONDS = 30 * 60
 
 
@@ -668,6 +668,21 @@ def replay_exact_message(
                 raise ReplayRefused(
                     "Post-processing artifact guard failed; replay evidence remains visible"
                 ) from exc
+            if post_process_artifact and post_process_artifact.get("guardUnreadable"):
+                failure_ref.set(
+                    {
+                        "recoveryStatus": "operator_replay_guard_failed",
+                        "replayErrorClass": "ArtifactGuardUnreadable",
+                        "replayGuardError": _clean(
+                            post_process_artifact.get("guardError")
+                        ),
+                        "updatedAt": SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+                raise ReplayRefused(
+                    "Post-processing artifact guard failed; replay evidence remains visible"
+                )
             if post_process_artifact:
                 failure_ref.set(
                     {
