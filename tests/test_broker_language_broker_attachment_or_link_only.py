@@ -646,6 +646,23 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
             )
         )
 
+    def test_matching_no_change_spec_allows_warning_recovery_after_partial_commit(self):
+        apply_result = {
+            "applied": [],
+            "skipped": [
+                {
+                    "column": "Total SF",
+                    "reason": "no-change",
+                    "oldValue": "18,500",
+                    "newValue": "18,500",
+                }
+            ],
+        }
+
+        self.assertTrue(
+            proc._sheet_updates_committed_non_asset_evidence(apply_result, {"mappings": {}})
+        )
+
     def test_apply_sheet_rejects_custom_mapped_asset_column(self):
         sheets = mock.MagicMock()
         column_config = {"mappings": {"flyer_link": "Offering Materials"}}

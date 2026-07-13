@@ -2579,7 +2579,12 @@ def apply_proposal_to_sheet(
 
             # 1) no-op
             if (old_val or "") == (new_val or ""):
-                skipped.append({"column": col_name, "reason": "no-change"})
+                skipped.append({
+                    "column": col_name,
+                    "reason": "no-change",
+                    "oldValue": old_val,
+                    "newValue": new_val,
+                })
                 continue
 
             # Check AI_META for write guards

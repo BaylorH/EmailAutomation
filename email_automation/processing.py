@@ -221,11 +221,26 @@ def _sheet_updates_committed_non_asset_evidence(
     """Return whether validated broker text was durably applied to the sheet."""
     if not isinstance(apply_result, dict) or not isinstance(apply_result.get("applied"), list):
         return False
-    return any(
+    applied_evidence = any(
         isinstance(update, dict)
         and bool((update.get("column") or "").strip())
         and not is_asset_column_name(update.get("column"), column_config)
         for update in apply_result["applied"]
+    )
+    if applied_evidence:
+        return True
+
+    skipped = apply_result.get("skipped")
+    if not isinstance(skipped, list):
+        return False
+    return any(
+        isinstance(update, dict)
+        and update.get("reason") == "no-change"
+        and bool((update.get("column") or "").strip())
+        and not is_asset_column_name(update.get("column"), column_config)
+        and str(update.get("oldValue") or "").strip() != ""
+        and str(update.get("oldValue")) == str(update.get("newValue"))
+        for update in skipped
     )
 
 
@@ -1144,7 +1159,10 @@ def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[
         try:
             data = doc.to_dict() or {}
             message_id = data.get("messageId")
-            if message_id and has_processed(user_id, message_id):
+            preserve_operator_warning = (
+                data.get("recoveryStatus") == "asset_warning_persistence_failed"
+            )
+            if message_id and has_processed(user_id, message_id) and not preserve_operator_warning:
                 doc.reference.delete()
                 result["cleared"] += 1
             else:

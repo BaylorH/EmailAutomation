@@ -249,26 +249,36 @@ class ProcessingRetryabilityTests(unittest.TestCase):
             "threadId": "thread-3",
             "retryable": True,
         }
+        warning_fallback_doc = MagicMock()
+        warning_fallback_doc.id = "thread-4__message-warning__asset_warning_persistence"
+        warning_fallback_doc.to_dict.return_value = {
+            "threadId": "thread-4",
+            "messageId": "message-warning",
+            "retryable": False,
+            "recoveryStatus": "asset_warning_persistence_failed",
+        }
 
         failures_collection = MagicMock()
         failures_collection.limit.return_value.stream.return_value = [
             processed_doc,
             retry_doc,
             missing_id_doc,
+            warning_fallback_doc,
         ]
         fake_fs = MagicMock()
         fake_fs.collection.return_value.document.return_value.collection.return_value = failures_collection
 
         def fake_has_processed(_user_id, message_id):
-            return message_id == "message-processed"
+            return message_id in {"message-processed", "message-warning"}
 
         with patch.object(processing, "_fs", fake_fs), patch.object(processing, "has_processed", side_effect=fake_has_processed):
             result = processing.reconcile_stale_processing_failures("uid-1")
 
-        self.assertEqual({"checked": 3, "cleared": 1, "retained": 2}, result)
+        self.assertEqual({"checked": 4, "cleared": 1, "retained": 3}, result)
         processed_doc.reference.delete.assert_called_once()
         retry_doc.reference.delete.assert_not_called()
         missing_id_doc.reference.delete.assert_not_called()
+        warning_fallback_doc.reference.delete.assert_not_called()
 
     def test_retry_processing_failures_processes_exact_graph_message_and_clears_success(self):
         failure_doc = MagicMock()
