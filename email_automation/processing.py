@@ -45,7 +45,8 @@ from .tour_scheduling import (
 from .outbound_safety import validate_outbound_body
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
-                   format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff)
+                   format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff,
+                   b64url_id)
 from .pending_responses import queue_pending_response, record_sent_unindexed_response
 from .sent_mail_guard import (
     SentMailGuardLookupError,
@@ -862,23 +863,39 @@ def _query_source_message_artifacts(
     candidates: set,
     fields: tuple,
     limit_per_query: int = 10,
+    *,
+    fail_closed_on_limit: bool = False,
 ) -> List[Any]:
     docs = []
     seen = set()
     where = getattr(collection_ref, "where", None)
     if not callable(where):
+        if fail_closed_on_limit:
+            raise RuntimeError(
+                "Exact source-message artifact query is unavailable"
+            )
         return docs
 
     for field in fields:
         for candidate in candidates:
-            query = collection_ref.where(filter=FieldFilter(field, "==", candidate)).limit(limit_per_query)
-            for doc in query.stream():
+            query_limit = limit_per_query + 1 if fail_closed_on_limit else limit_per_query
+            query = collection_ref.where(filter=FieldFilter(field, "==", candidate)).limit(query_limit)
+            query_docs = list(query.stream())
+            if fail_closed_on_limit and len(query_docs) > limit_per_query:
+                raise RuntimeError(
+                    "Exact source-message artifact query exceeded the safe result limit"
+                )
+            for doc in query_docs:
                 doc_id = getattr(doc, "id", None)
                 key = doc_id or id(doc)
                 if key in seen:
                     continue
                 seen.add(key)
                 docs.append(doc)
+                if fail_closed_on_limit and len(docs) > limit_per_query:
+                    raise RuntimeError(
+                        "Exact source-message artifact query exceeded the safe result limit"
+                    )
     return docs
 
 
@@ -897,7 +914,17 @@ def _candidate_artifact_docs(
     candidates: set,
     fields: tuple,
     thread_id: Optional[str],
+    *,
+    allow_broad_scan: bool = True,
 ) -> List[Any]:
+    if not allow_broad_scan:
+        return _query_source_message_artifacts(
+            collection_ref,
+            candidates,
+            fields,
+            fail_closed_on_limit=True,
+        )
+
     docs = _query_thread_artifacts(collection_ref, thread_id)
     if not docs and not thread_id:
         docs = _query_source_message_artifacts(collection_ref, candidates, fields)
@@ -967,6 +994,8 @@ def _scan_retry_artifact_collection(
     candidates: set,
     thread_id: Optional[str],
     include_terminal_outbox: bool = False,
+    *,
+    allow_broad_scan: bool = True,
 ) -> Optional[Dict[str, Any]]:
     try:
         docs = _candidate_artifact_docs(
@@ -974,6 +1003,7 @@ def _scan_retry_artifact_collection(
             candidates,
             PROCESSING_RETRY_SOURCE_MESSAGE_FIELDS,
             thread_id,
+            allow_broad_scan=allow_broad_scan,
         )
     except Exception as e:
         print(f"⚠️ Could not scan processing retry guard collection {collection_name}: {e}")
@@ -998,6 +1028,8 @@ def _find_existing_retry_artifact_for_message(
     message_id: str,
     client_id: Optional[str] = None,
     additional_message_ids: Optional[List[str]] = None,
+    *,
+    allow_broad_scan: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Find visible work already created for the broker message being replayed.
 
@@ -1031,6 +1063,7 @@ def _find_existing_retry_artifact_for_message(
             candidates,
             thread_id,
             include_terminal_outbox=include_terminal_outbox,
+            allow_broad_scan=allow_broad_scan,
         )
         if artifact:
             return artifact
@@ -1047,6 +1080,7 @@ def _find_existing_retry_artifact_for_message(
             candidates,
             thread_id,
             include_terminal_outbox=True,
+            allow_broad_scan=allow_broad_scan,
         )
         if artifact:
             return artifact
@@ -1143,6 +1177,10 @@ def _mark_processing_failure_blocked_by_manual_continuation(doc, sent_artifact: 
         print(f"⚠️ Could not mark processing failure blocked by manual continuation: {e}")
 
 
+def _is_operator_replay_recovery_status(value: Any) -> bool:
+    return str(value or "").strip().startswith("operator_replay_")
+
+
 def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[str, int]:
     """Clear failure markers for messages that are already marked processed.
 
@@ -1166,7 +1204,15 @@ def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[
             preserve_operator_warning = (
                 data.get("recoveryStatus") == "asset_warning_persistence_failed"
             )
-            if message_id and has_processed(user_id, message_id) and not preserve_operator_warning:
+            preserve_operator_replay = _is_operator_replay_recovery_status(
+                data.get("recoveryStatus")
+            )
+            if (
+                message_id
+                and not preserve_operator_warning
+                and not preserve_operator_replay
+                and has_processed(user_id, message_id)
+            ):
                 doc.reference.delete()
                 result["cleared"] += 1
             else:
@@ -1227,6 +1273,10 @@ def retry_processing_failures(
         thread_id = data.get("threadId")
         client_id = data.get("clientId")
         attempts = int(data.get("processingAttempts") or 0)
+
+        if _is_operator_replay_recovery_status(data.get("recoveryStatus")):
+            result["skipped"] += 1
+            continue
 
         if data.get("recoveryStatus") == "asset_warning_persistence_failed":
             result["skipped"] += 1
@@ -3616,8 +3666,46 @@ def _is_auto_reply_subject(
     return False
 
 
-def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, Any]):
+def _validate_operator_replay_claims(
+    user_id: str,
+    graph_message_id: str,
+    internet_message_id: str,
+    attempt_id: str,
+) -> None:
+    """Require the durable two-message preclaim before operator replay effects."""
+    if not attempt_id:
+        raise RetryableProcessingError("Operator replay claim is missing")
+    user_ref = _fs.collection("users").document(user_id)
+    for message_id in (graph_message_id, internet_message_id):
+        if not message_id:
+            raise RetryableProcessingError("Operator replay claim message ID is missing")
+        snapshot = (
+            user_ref.collection("processedMessages")
+            .document(b64url_id(message_id))
+            .get()
+        )
+        claim = snapshot.to_dict() if getattr(snapshot, "exists", False) else {}
+        if (
+            not isinstance(claim, dict)
+            or claim.get("status") != "operator_replay_in_progress"
+            or claim.get("replayAttemptId") != attempt_id
+        ):
+            raise RetryableProcessingError(
+                "Operator replay claim does not match both exact message IDs"
+            )
+
+
+def process_inbox_message(
+    user_id: str,
+    headers: Dict[str, str],
+    msg: Dict[str, Any],
+    *,
+    allow_outbound_reply: bool = True,
+    operator_replay_attempt_id: Optional[str] = None,
+):
     """ENHANCED: Process a single inbox message with full pipeline including events."""
+    if not allow_outbound_reply:
+        _reset_reply_send_outcome()
     msg_id = msg.get("id")
     subject = msg.get("subject", "")
     from_info = msg.get("from", {}).get("emailAddress", {})
@@ -3629,6 +3717,18 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
     sent_dt = msg.get("sentDateTime")
     body_preview = msg.get("bodyPreview", "")
     has_attachments = bool(msg.get("hasAttachments"))
+
+    if operator_replay_attempt_id:
+        if allow_outbound_reply:
+            raise RetryableProcessingError(
+                "Operator replay attempt cannot enable outbound replies"
+            )
+        _validate_operator_replay_claims(
+            user_id,
+            msg_id,
+            internet_message_id,
+            operator_replay_attempt_id,
+        )
     
     full_msg = {}
     # NEW: fetch full message body and normalize to plain text
@@ -4165,6 +4265,9 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                         "applied": apply_result,
                         "status": "applied",
                         "threadId": thread_id,
+                        "sourceGraphMessageId": msg_id,
+                        "sourceInternetMessageId": internet_message_id,
+                        "replayAttemptId": operator_replay_attempt_id,
                         "createdAt": SERVER_TIMESTAMP,
                         "fileIds": file_ids,
                         "proposalHash": applied_hash,
@@ -5396,6 +5499,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             print(f"   new_row_created: {new_row_created}")
             print(f"   new_property_pending_created: {new_property_pending_created}")
             print(f"   LLM response available: {bool(proposal.get('response_email'))}")
+
+            if not allow_outbound_reply:
+                _set_reply_send_outcome(outcome="suppressed_operator_replay_no_send")
+                print("⏭️ Operator replay extraction-only mode: outbound reply suppressed")
+                return
 
             try:
                 response_sent = False

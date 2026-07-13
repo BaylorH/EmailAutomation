@@ -397,3 +397,90 @@ def find_sent_conversation_continuation_for_retry(
     if last_error:
         raise SentMailGuardLookupError(str(last_error))
     return None
+
+
+def find_sent_recipient_continuation_for_retry(
+    headers: Dict[str, str],
+    *,
+    recipient: str,
+    sent_after: Optional[datetime],
+    base: str = "https://graph.microsoft.com/v1.0",
+    attempts: int = 2,
+) -> Optional[Dict[str, Any]]:
+    """Find any newer manual send to a recipient, even in a new conversation.
+
+    Exact operator recovery cannot assume a user continued through Outlook's
+    reply button. This metadata-only guard catches a fresh compose to the same
+    broker address without reading message bodies.
+    """
+    recipient = _normalize_email(recipient)
+    sent_after_utc = coerce_utc_datetime(sent_after)
+    if not recipient or not sent_after_utc:
+        raise SentMailGuardLookupError(
+            "recipient and sent_after are required for Sent Items recipient guard"
+        )
+
+    params = {
+        "$orderby": "sentDateTime desc",
+        "$top": "25",
+        "$select": (
+            "id,internetMessageId,conversationId,subject,toRecipients,"
+            "ccRecipients,bccRecipients,sentDateTime"
+        ),
+        "$filter": (
+            "sentDateTime ge "
+            f"{sent_after_utc.isoformat().replace('+00:00', 'Z')}"
+        ),
+    }
+
+    last_error: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            url = f"{base}/me/mailFolders/SentItems/messages"
+            request_params: Optional[Dict[str, str]] = params
+            while True:
+                response = exponential_backoff_request(
+                    lambda u=url, p=request_params: requests.get(
+                        u,
+                        headers=headers,
+                        params=p,
+                        timeout=30,
+                    )
+                )
+                if response.status_code != 200:
+                    last_error = RuntimeError(
+                        f"Sent Items recipient lookup returned HTTP {response.status_code}"
+                    )
+                    break
+
+                payload = response.json() or {}
+                for message in payload.get("value", []) or []:
+                    if recipient not in _message_recipients(message):
+                        continue
+                    sent_time = coerce_utc_datetime(message.get("sentDateTime"))
+                    if sent_time and sent_time < sent_after_utc:
+                        continue
+                    return _message_identity(message)
+
+                next_link = payload.get("@odata.nextLink")
+                if not next_link:
+                    return None
+                if not _same_graph_origin(base, next_link):
+                    last_error = RuntimeError(
+                        "Unexpected @odata.nextLink host from Graph API"
+                    )
+                    break
+                url = next_link
+                request_params = None
+        except Exception as exc:
+            last_error = exc
+            print(f"   ⚠️ Sent Items recipient continuation lookup failed: {exc}")
+
+        if attempt < attempts - 1:
+            import time
+
+            time.sleep(0.5 * (attempt + 1))
+
+    if last_error:
+        raise SentMailGuardLookupError(str(last_error))
+    return None
