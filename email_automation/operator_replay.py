@@ -492,6 +492,7 @@ def replay_exact_message(
         Callable[[ReplayRequest, Any, datetime, str], bool]
     ] = None,
     lease_runner: Optional[Callable[..., bool]] = None,
+    scheduler_lease_runner: Optional[Callable[..., bool]] = None,
 ) -> ReplayResult:
     """Preflight and optionally process exactly one failed inbox message.
 
@@ -528,10 +529,11 @@ def replay_exact_message(
         find_recipient_continuation = find_sent_recipient_continuation_for_retry
     if verify_postcondition is None:
         verify_postcondition = _verify_degraded_asset_postcondition
-    if lease_runner is None:
-        from .scheduler_lease import run_with_user_lease
+    if lease_runner is None or scheduler_lease_runner is None:
+        from .scheduler_lease import run_with_scheduler_lease, run_with_user_lease
 
-        lease_runner = run_with_user_lease
+        lease_runner = lease_runner or run_with_user_lease
+        scheduler_lease_runner = scheduler_lease_runner or run_with_scheduler_lease
 
     result: Optional[ReplayResult] = None
 
@@ -702,16 +704,25 @@ def replay_exact_message(
             thread_status=thread_status,
         )
 
-    acquired = lease_runner(
-        request.uid,
-        _under_lease,
+    def _under_scheduler_lease() -> None:
+        acquired = lease_runner(
+            request.uid,
+            _under_lease,
+            fs_client=fs_client,
+            ttl_seconds=30 * 60,
+        )
+        if not acquired:
+            raise ReplayRefused("The existing per-user lease is held; replay refused")
+
+    scheduler_acquired = scheduler_lease_runner(
+        _under_scheduler_lease,
         fs_client=fs_client,
         ttl_seconds=30 * 60,
     )
-    if not acquired:
-        raise ReplayRefused("The existing per-user lease is held; replay refused")
+    if not scheduler_acquired:
+        raise ReplayRefused("The global scheduler lease is held; replay refused")
     if result is None:
-        raise ReplayRefused("Per-user lease callback did not complete")
+        raise ReplayRefused("Replay lease callbacks did not complete")
     return result
 
 

@@ -4,7 +4,7 @@
 
 **Goal:** Safely replay one exact failed Baylor inbox message without running any other user or campaign work.
 
-**Architecture:** Add a narrow replay service function that validates UID, client, thread, Graph message ID, RFC message ID, sender, recipient, failure record, processed markers, and Sent Items state before invoking the existing single-message processor under the existing per-user lease. Recovery-artifact checks use exact source-message queries only. Completion requires fresh Sheet evidence stamped with the exact Graph ID, RFC ID, and replay attempt. Add a dry-run-first CLI that acquires the user's Graph token but never scans the inbox, outbox, pending responses, follow-ups, or any other failure.
+**Architecture:** Add a narrow replay service function that validates UID, client, thread, Graph message ID, RFC message ID, sender, recipient, failure record, processed markers, and Sent Items state before invoking the existing single-message processor while holding both the global scheduler lease and the nested per-user lease. Recovery-artifact checks use exact source-message queries only and fail closed if a targeted query is truncated. Completion requires fresh Sheet evidence stamped with the exact Graph ID, RFC ID, and replay attempt. Add a dry-run-first CLI that acquires the user's Graph token but never scans the inbox, outbox, pending responses, follow-ups, or any other failure.
 
 **Tech Stack:** Python, Firestore, Microsoft Graph, MSAL, existing EmailAutomation processing and lease helpers.
 

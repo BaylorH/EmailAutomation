@@ -225,6 +225,11 @@ def _lease_runs(uid, callback, **kwargs):
     return True
 
 
+def _scheduler_lease_runs(callback, **kwargs):
+    callback()
+    return True
+
+
 class OperatorReplayContractTests(unittest.TestCase):
     def setUp(self):
         self.fs = _FakeFirestore()
@@ -236,6 +241,7 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.find_recipient_continuation = MagicMock(return_value=None)
         self.verify_postcondition = MagicMock(return_value=True)
         self.lease_runner = MagicMock(side_effect=_lease_runs)
+        self.scheduler_lease_runner = MagicMock(side_effect=_scheduler_lease_runs)
 
     def replay(self, request=None, *, apply=False):
         return operator_replay.replay_exact_message(
@@ -250,6 +256,7 @@ class OperatorReplayContractTests(unittest.TestCase):
             find_recipient_continuation=self.find_recipient_continuation,
             verify_postcondition=self.verify_postcondition,
             lease_runner=self.lease_runner,
+            scheduler_lease_runner=self.scheduler_lease_runner,
         )
 
     def assert_refused(self, request=None, message=None):
@@ -268,6 +275,7 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.process_message.assert_not_called()
         self.find_continuation.assert_called_once()
         self.lease_runner.assert_called_once()
+        self.scheduler_lease_runner.assert_called_once()
 
     def test_refuses_any_identity_mismatch(self):
         cases = [
@@ -504,6 +512,14 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.assert_refused(message="lease")
         self.fetch_message.assert_not_called()
 
+    def test_refuses_when_global_scheduler_lease_is_held(self):
+        self.scheduler_lease_runner.side_effect = None
+        self.scheduler_lease_runner.return_value = False
+
+        self.assert_refused(message="global scheduler lease")
+        self.lease_runner.assert_not_called()
+        self.fetch_message.assert_not_called()
+
     def test_apply_processes_once_then_marks_both_ids_and_deletes_only_exact_failure(self):
         def record_process(*args, **kwargs):
             self.assertFalse(kwargs["allow_outbound_reply"])
@@ -689,6 +705,7 @@ class OperatorReplayContractTests(unittest.TestCase):
                 find_recipient_continuation=self.find_recipient_continuation,
                 verify_postcondition=self.verify_postcondition,
                 lease_runner=self.lease_runner,
+                scheduler_lease_runner=self.scheduler_lease_runner,
             )
 
         process_message.assert_called_once_with(
@@ -898,8 +915,10 @@ class OperatorReplayExactArtifactQueryTests(unittest.TestCase):
         from email_automation import processing
 
         collection = MagicMock()
+        query_builder = MagicMock()
         targeted_query = MagicMock()
-        collection.where.return_value.limit.return_value = targeted_query
+        collection.where.return_value = query_builder
+        query_builder.limit.return_value = targeted_query
         targeted_query.stream.return_value = []
 
         docs = processing._candidate_artifact_docs(
@@ -912,13 +931,31 @@ class OperatorReplayExactArtifactQueryTests(unittest.TestCase):
 
         self.assertEqual([], docs)
         collection.stream.assert_not_called()
+        expected_filters = {
+            (field, candidate)
+            for field in processing.PROCESSING_RETRY_SOURCE_MESSAGE_FIELDS
+            for candidate in {GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID}
+        }
+        actual_filters = {
+            (
+                call.kwargs["filter"].field_path,
+                call.kwargs["filter"].value,
+            )
+            for call in collection.where.call_args_list
+        }
+        self.assertEqual(expected_filters, actual_filters)
+        self.assertEqual(len(expected_filters), query_builder.limit.call_count)
+        for call in query_builder.limit.call_args_list:
+            self.assertEqual((11,), call.args)
 
     def test_exact_replay_guard_fails_closed_when_targeted_query_is_truncated(self):
         from email_automation import processing
 
         collection = MagicMock()
+        query_builder = MagicMock()
         targeted_query = MagicMock()
-        collection.where.return_value.limit.return_value = targeted_query
+        collection.where.return_value = query_builder
+        query_builder.limit.return_value = targeted_query
         targeted_query.stream.return_value = [
             SimpleNamespace(
                 id=f"artifact-{index}",
@@ -940,6 +977,10 @@ class OperatorReplayExactArtifactQueryTests(unittest.TestCase):
 
         self.assertTrue(artifact["guardUnreadable"])
         self.assertEqual("guard_scan_failed", artifact["status"])
+        first_filter = collection.where.call_args_list[0].kwargs["filter"]
+        self.assertIn(first_filter.field_path, processing.PROCESSING_RETRY_SOURCE_MESSAGE_FIELDS)
+        self.assertIn(first_filter.value, {GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID})
+        query_builder.limit.assert_called_once_with(11)
 
 
 class OperatorReplayProcessorClaimTests(unittest.TestCase):
