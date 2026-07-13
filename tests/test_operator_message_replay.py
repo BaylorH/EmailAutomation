@@ -1134,6 +1134,24 @@ class OperatorReplayProcessorClaimTests(unittest.TestCase):
                     attempt_id,
                 )
 
+            docs[b64url_id(INTERNET_MESSAGE_ID)]["replayAttemptId"] = attempt_id
+            for missing_message_id in (GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID):
+                with self.subTest(missing_message_id=missing_message_id):
+                    missing_claim = docs.pop(b64url_id(missing_message_id))
+                    try:
+                        with self.assertRaisesRegex(
+                            processing.RetryableProcessingError,
+                            "claim",
+                        ):
+                            processing._validate_operator_replay_claims(
+                                BAYLOR_UID,
+                                GRAPH_MESSAGE_ID,
+                                INTERNET_MESSAGE_ID,
+                                attempt_id,
+                            )
+                    finally:
+                        docs[b64url_id(missing_message_id)] = missing_claim
+
 
 def _cli_args(**overrides):
     values = {
