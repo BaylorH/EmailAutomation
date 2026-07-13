@@ -89,6 +89,8 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
         self.config["customFields"] = {
             "Broker Context": {"mode": "note", "description": "Context only"},
             "Internal Score": {"mode": "skip", "description": "Ignored"},
+            "Building Condition Notes": {"mode": "note", "description": "Condition context"},
+            "Condition Notes": {"mode": "note", "description": "Generic condition context"},
         }
 
     def test_accepts_request_for_missing_ask_field_only(self):
@@ -169,6 +171,11 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
             "What about the brochure?",
             "Do you have the flyer?",
             "We are interested in the flyer/listing link.",
+            "Any chance you can share the flyer?",
+            "Do you know the flyer?",
+            "Could I get the flyer?",
+            "Would it be possible to send the flyer?",
+            "I would appreciate a flyer.",
         ):
             with self.subTest(body=body):
                 self.assertTrue(
@@ -183,11 +190,18 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
         )
 
     def test_independent_guard_allows_informational_offer_of_flyer(self):
-        body = "Happy to send over the flyer and asking rate whenever useful."
-
-        self.assertFalse(
-            processing._response_requests_nonrequestable_fields(body, self.config)
-        )
+        for body in (
+            "Happy to send over the flyer and asking rate whenever useful.",
+            "Here is the flyer you asked for.",
+            "I know the flyer is available.",
+            "I could get the flyer from our files.",
+            "It would be possible to send the flyer later.",
+            "I appreciate the flyer you sent.",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    processing._response_requests_nonrequestable_fields(body, self.config)
+                )
 
     def test_independent_guard_rejects_configured_canonical_and_custom_notes(self):
         for body in (
@@ -199,6 +213,22 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
                 self.assertTrue(
                     processing._response_requests_nonrequestable_fields(body, self.config)
                 )
+
+    def test_custom_note_paraphrase_uses_distinctive_tokens(self):
+        self.assertTrue(
+            processing._response_requests_nonrequestable_fields(
+                "Could you share the building condition?",
+                self.config,
+            )
+        )
+
+    def test_custom_note_paraphrase_does_not_create_single_word_alias(self):
+        self.assertFalse(
+            processing._response_requests_nonrequestable_fields(
+                "Could you confirm the asking rent given the condition?",
+                self.config,
+            )
+        )
 
     def test_incomplete_legacy_shape_is_rejected_without_guessing_ask_fields(self):
         incomplete = {

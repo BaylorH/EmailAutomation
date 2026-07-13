@@ -470,9 +470,43 @@ def get_non_requestable_field_terms(column_config: Dict[str, Any]) -> List[List[
 
     for header, config in column_config["customFields"].items():
         if config.get("mode") in {"accept_only", "note", "skip"}:
-            groups.append([header.strip().lower()])
+            terms = [header.strip().lower()]
+            terms.extend(_custom_field_paraphrase_terms(header))
+            groups.append(list(dict.fromkeys(terms)))
 
     return groups
+
+
+_CUSTOM_FIELD_STOPWORDS = {
+    "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with",
+}
+_CUSTOM_FIELD_GENERIC_TOKENS = {
+    "column", "columns", "comment", "comments", "detail", "details", "field",
+    "fields", "info", "information", "note", "notes",
+}
+
+
+def _stem_custom_field_token(token: str) -> str:
+    if len(token) > 4 and token.endswith("ies"):
+        return f"{token[:-3]}y"
+    if len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _custom_field_paraphrase_terms(header: str) -> List[str]:
+    tokens = [
+        token
+        for token in re.findall(r"[a-z0-9]+", (header or "").lower())
+        if token not in _CUSTOM_FIELD_STOPWORDS
+        and token not in _CUSTOM_FIELD_GENERIC_TOKENS
+    ]
+    if len(tokens) < 2:
+        return []
+
+    raw_phrase = " ".join(tokens)
+    stemmed_phrase = " ".join(_stem_custom_field_token(token) for token in tokens)
+    return list(dict.fromkeys((raw_phrase, stemmed_phrase)))
 
 
 _FIELD_REQUEST_INTENT_RE = re.compile(
@@ -480,7 +514,11 @@ _FIELD_REQUEST_INTENT_RE = re.compile(
     r"\b(?:ask|request|need)\b"
     r"|\bplease\b"
     r"|^\s*(?:send|share|provide|confirm|attach|include|supply|forward)\b"
-    r"|\b(?:can|could|would|will)\s+(?:you|we|they)\b"
+    r"|\b(?:can|could|would|will)\s+(?:i|you|we|they)\b"
+    r"|^\s*any\s+chance\s+(?:that\s+)?(?:i|you|we|they)\s+can\b"
+    r"|^\s*do\s+you\s+know\b"
+    r"|^\s*would\s+it\s+be\s+possible\s+to\b"
+    r"|^\s*i\s+would\s+appreciate\b"
     r"|^\s*(?:is|are|was|were)\b"
     r"|^\s*(?:do|does|did)\s+(?:you|we|they)\s+have\b"
     r"|^\s*what\s+about\b"
