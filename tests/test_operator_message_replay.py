@@ -521,9 +521,12 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.fetch_message.assert_not_called()
 
     def test_apply_processes_once_then_marks_both_ids_and_deletes_only_exact_failure(self):
+        captured = {}
+
         def record_process(*args, **kwargs):
             self.assertFalse(kwargs["allow_outbound_reply"])
             replay_attempt_id = kwargs["operator_replay_attempt_id"]
+            captured["replayAttemptId"] = replay_attempt_id
             for message_id in (GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID):
                 marker_path = (
                     "users",
@@ -586,6 +589,14 @@ class OperatorReplayContractTests(unittest.TestCase):
         )
         self.assertEqual("replayed", self.fs.data[history_path]["status"])
         self.assertEqual(_failure_id(), self.fs.data[history_path]["sourceFailureId"])
+        self.assertFalse(self.fs.data[history_path]["retryable"])
+        self.assertEqual("replayed", self.fs.data[history_path]["recoveryStatus"])
+        self.assertEqual(
+            captured["replayAttemptId"],
+            self.fs.data[history_path]["replayAttemptId"],
+        )
+        self.assertEqual(CLIENT_ID, self.fs.data[history_path]["clientId"])
+        self.assertEqual(THREAD_ID, self.fs.data[history_path]["threadId"])
 
         commits = [event for event in self.fs.events if event[0] == "batch_commit"]
         self.assertEqual(2, len(commits))
@@ -981,6 +992,45 @@ class OperatorReplayExactArtifactQueryTests(unittest.TestCase):
         self.assertIn(first_filter.field_path, processing.PROCESSING_RETRY_SOURCE_MESSAGE_FIELDS)
         self.assertIn(first_filter.value, {GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID})
         query_builder.limit.assert_called_once_with(11)
+
+    def test_exact_replay_guard_fails_closed_on_aggregate_ambiguity(self):
+        from email_automation import processing
+
+        collection = MagicMock()
+        query_builders = []
+
+        def targeted_query(*, filter):
+            query_builder = MagicMock()
+            query = MagicMock()
+            query_builder.limit.return_value = query
+            index = len(query_builders)
+            query.stream.return_value = [
+                SimpleNamespace(
+                    id=f"aggregate-artifact-{index}",
+                    to_dict=lambda filter=filter: {
+                        "threadId": "different-thread",
+                        filter.field_path: filter.value,
+                    },
+                )
+            ]
+            query_builders.append(query_builder)
+            return query_builder
+
+        collection.where.side_effect = targeted_query
+
+        artifact = processing._scan_retry_artifact_collection(
+            collection,
+            "outbox",
+            {GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID},
+            THREAD_ID,
+            allow_broad_scan=False,
+        )
+
+        self.assertTrue(artifact["guardUnreadable"])
+        self.assertEqual("guard_scan_failed", artifact["status"])
+        self.assertEqual(11, len(query_builders))
+        for query_builder in query_builders:
+            query_builder.limit.assert_called_once_with(11)
 
 
 class OperatorReplayProcessorClaimTests(unittest.TestCase):

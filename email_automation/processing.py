@@ -888,6 +888,10 @@ def _query_source_message_artifacts(
                     continue
                 seen.add(key)
                 docs.append(doc)
+                if fail_closed_on_limit and len(docs) > limit_per_query:
+                    raise RuntimeError(
+                        "Exact source-message artifact query exceeded the safe result limit"
+                    )
     return docs
 
 
