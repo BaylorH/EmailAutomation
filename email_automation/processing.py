@@ -3616,8 +3616,16 @@ def _is_auto_reply_subject(
     return False
 
 
-def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, Any]):
+def process_inbox_message(
+    user_id: str,
+    headers: Dict[str, str],
+    msg: Dict[str, Any],
+    *,
+    allow_outbound_reply: bool = True,
+):
     """ENHANCED: Process a single inbox message with full pipeline including events."""
+    if not allow_outbound_reply:
+        _reset_reply_send_outcome()
     msg_id = msg.get("id")
     subject = msg.get("subject", "")
     from_info = msg.get("from", {}).get("emailAddress", {})
@@ -5396,6 +5404,11 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
             print(f"   new_row_created: {new_row_created}")
             print(f"   new_property_pending_created: {new_property_pending_created}")
             print(f"   LLM response available: {bool(proposal.get('response_email'))}")
+
+            if not allow_outbound_reply:
+                _set_reply_send_outcome(outcome="suppressed_operator_replay_no_send")
+                print("⏭️ Operator replay extraction-only mode: outbound reply suppressed")
+                return
 
             try:
                 response_sent = False

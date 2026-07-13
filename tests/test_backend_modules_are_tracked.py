@@ -26,6 +26,7 @@ SUPPORT_MODULES = {
     "email_automation/app_config.py": "process config / env loading, not a feature",
     "email_automation/logging.py": "logging infrastructure, not a feature",
     "email_automation/email_operations.py": "LEGACY disabled send path; kept dead and guarded by tests/test_legacy_email_operations_disabled.py",
+    "email_automation/operator_replay.py": "local, Baylor/BP21-only operator recovery utility; not deployed or normal-user callable",
 }
 
 

@@ -4,8 +4,9 @@ import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import StringIO
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -83,13 +84,46 @@ class _CollectionRef:
         return _DocRef(self._store, self._path + (doc_id,))
 
 
+class _Batch:
+    def __init__(self, store):
+        self._store = store
+        self._operations = []
+
+    def set(self, ref, payload, merge=False):
+        self._operations.append(("set", ref._path, deepcopy(payload), merge))
+
+    def delete(self, ref):
+        self._operations.append(("delete", ref._path, None, False))
+
+    def commit(self):
+        self._store.batch_commit_count += 1
+        if self._store.fail_batch_commit_number == self._store.batch_commit_count:
+            raise RuntimeError("atomic batch commit failed")
+        self._store.events.append(
+            ("batch_commit", tuple((operation, path) for operation, path, *_ in self._operations))
+        )
+        for operation, path, payload, merge in self._operations:
+            if operation == "set":
+                if merge and path in self._store.data:
+                    self._store.data[path].update(deepcopy(payload))
+                else:
+                    self._store.data[path] = deepcopy(payload)
+            else:
+                self._store.data.pop(path, None)
+
+
 class _FakeFirestore:
     def __init__(self):
         self.data = {}
         self.events = []
+        self.batch_commit_count = 0
+        self.fail_batch_commit_number = None
 
     def collection(self, name):
         return _CollectionRef(self, (name,))
+
+    def batch(self):
+        return _Batch(self)
 
 
 def _request(**overrides):
@@ -145,7 +179,7 @@ def _seed_valid_state(fs):
     fs.data[("users", BAYLOR_UID, "threads", THREAD_ID)] = {
         "clientId": CLIENT_ID,
         "status": "active",
-        "email": [SENDER],
+        "email": ["bp21harrison+avery@gmail.com"],
     }
     fs.data[("users", BAYLOR_UID, "processingFailures", _failure_id())] = {
         "clientId": CLIENT_ID,
@@ -153,6 +187,10 @@ def _seed_valid_state(fs):
         "messageId": INTERNET_MESSAGE_ID,
         "graphMessageId": GRAPH_MESSAGE_ID,
         "retryable": True,
+        "reason": (
+            "Broker asset extraction failed for 1 asset(s); leaving message "
+            "unprocessed for retry/manual review"
+        ),
         "createdAt": datetime(2026, 7, 12, 18, 1, tzinfo=timezone.utc),
     }
     canonical_id = normalize_message_id(INTERNET_MESSAGE_ID)
@@ -183,6 +221,8 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.process_message = MagicMock()
         self.find_existing_artifact = MagicMock(return_value=None)
         self.find_continuation = MagicMock(return_value=None)
+        self.find_recipient_continuation = MagicMock(return_value=None)
+        self.verify_postcondition = MagicMock(return_value=True)
         self.lease_runner = MagicMock(side_effect=_lease_runs)
 
     def replay(self, request=None, *, apply=False):
@@ -195,6 +235,8 @@ class OperatorReplayContractTests(unittest.TestCase):
             process_message=self.process_message,
             find_existing_artifact=self.find_existing_artifact,
             find_manual_continuation=self.find_continuation,
+            find_recipient_continuation=self.find_recipient_continuation,
+            verify_postcondition=self.verify_postcondition,
             lease_runner=self.lease_runner,
         )
 
@@ -288,6 +330,43 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.fs.data[failure_path]["graphMessageId"] = "wrong-graph"
         self.assert_refused(message="failure")
 
+    def test_legacy_asset_failure_without_graph_id_is_verified_then_backfilled_on_apply(self):
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            _failure_id(),
+        )
+        self.fs.data[failure_path].pop("graphMessageId")
+
+        result = self.replay()
+        self.assertEqual("verified", result.status)
+        self.assertNotIn("graphMessageId", self.fs.data[failure_path])
+
+        self.verify_postcondition.return_value = False
+        with self.assertRaisesRegex(operator_replay.ReplayRefused, "postcondition"):
+            self.replay(apply=True)
+        self.assertEqual(
+            GRAPH_MESSAGE_ID,
+            self.fs.data[failure_path]["graphMessageId"],
+        )
+        first_commit = [
+            event for event in self.fs.events if event[0] == "batch_commit"
+        ][0]
+        self.assertIn(("set", failure_path), first_commit[1])
+
+    def test_missing_failure_graph_id_is_refused_for_any_other_failure_type(self):
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            _failure_id(),
+        )
+        self.fs.data[failure_path].pop("graphMessageId")
+        self.fs.data[failure_path]["reason"] = "generic processing failure"
+
+        self.assert_refused(message="Graph message ID")
+
     def test_refuses_processed_graph_or_rfc_marker(self):
         for processed_id in (GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID):
             with self.subTest(processed_id=processed_id):
@@ -337,6 +416,24 @@ class OperatorReplayContractTests(unittest.TestCase):
         self.fs.data[conv_index_path]["threadId"] = "wrong-thread"
         self.assert_refused(message="conversation index")
 
+    def test_refuses_conflicting_in_reply_to_message_index(self):
+        outbound_id = "<outbound-root@example.test>"
+        self.fetch_message.return_value = _graph_message(
+            internetMessageHeaders=[
+                {"name": "In-Reply-To", "value": outbound_id},
+            ]
+        )
+        self.fs.data[
+            (
+                "users",
+                BAYLOR_UID,
+                "msgIndex",
+                b64url_id(normalize_message_id(outbound_id)),
+            )
+        ] = {"threadId": "wrong-thread"}
+
+        self.assert_refused(message="header message index")
+
     def test_refuses_sent_items_manual_continuation(self):
         self.find_continuation.return_value = {
             "id": "sent-message-after-failure",
@@ -345,6 +442,38 @@ class OperatorReplayContractTests(unittest.TestCase):
         }
 
         self.assert_refused(message="Sent Items")
+
+    def test_refuses_manual_continuation_sent_as_new_conversation_to_bp21(self):
+        self.find_recipient_continuation.return_value = {
+            "id": "manual-new-conversation",
+            "conversationId": "different-conversation",
+        }
+
+        self.assert_refused(message="recipient continuation")
+
+        self.find_recipient_continuation.assert_called_once()
+        self.assertEqual(
+            SENDER,
+            self.find_recipient_continuation.call_args.kwargs["recipient"],
+        )
+
+    def test_sent_items_guard_starts_from_earlier_inbound_time(self):
+        inbound_time = datetime(2026, 7, 12, 17, 55, tzinfo=timezone.utc)
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            _failure_id(),
+        )
+        self.fs.data[failure_path]["createdAt"] = inbound_time + timedelta(minutes=6)
+        self.fetch_message.return_value = _graph_message(
+            receivedDateTime=inbound_time.isoformat().replace("+00:00", "Z")
+        )
+
+        self.replay()
+
+        sent_after = self.find_continuation.call_args.kwargs["sent_after"]
+        self.assertEqual(inbound_time - timedelta(seconds=30), sent_after)
 
     def test_refuses_existing_recovery_or_outbound_artifact(self):
         self.find_existing_artifact.return_value = {
@@ -365,6 +494,17 @@ class OperatorReplayContractTests(unittest.TestCase):
 
     def test_apply_processes_once_then_marks_both_ids_and_deletes_only_exact_failure(self):
         def record_process(*args):
+            for message_id in (GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID):
+                marker_path = (
+                    "users",
+                    BAYLOR_UID,
+                    "processedMessages",
+                    b64url_id(message_id),
+                )
+                self.assertEqual(
+                    "operator_replay_in_progress",
+                    self.fs.data[marker_path]["status"],
+                )
             self.fs.events.append(("process", args[2]["id"]))
 
         self.process_message.side_effect = record_process
@@ -400,17 +540,82 @@ class OperatorReplayContractTests(unittest.TestCase):
         )
         self.assertIn(graph_marker, self.fs.data)
         self.assertIn(rfc_marker, self.fs.data)
+        self.assertEqual("processed", self.fs.data[graph_marker]["status"])
+        self.assertEqual("processed", self.fs.data[rfc_marker]["status"])
         self.assertNotIn(failure_path, self.fs.data)
         self.assertIn(unrelated_path, self.fs.data)
 
-        process_position = self.fs.events.index(("process", GRAPH_MESSAGE_ID))
-        graph_set_position = self.fs.events.index(("set", graph_marker))
-        rfc_set_position = self.fs.events.index(("set", rfc_marker))
-        delete_position = self.fs.events.index(("delete", failure_path))
-        self.assertLess(process_position, graph_set_position)
-        self.assertLess(process_position, rfc_set_position)
-        self.assertLess(graph_set_position, delete_position)
-        self.assertLess(rfc_set_position, delete_position)
+        commits = [event for event in self.fs.events if event[0] == "batch_commit"]
+        self.assertEqual(2, len(commits))
+        final_paths = {path for _, path in commits[-1][1]}
+        self.assertEqual({graph_marker, rfc_marker, failure_path}, final_paths)
+
+    def test_apply_preserves_failure_when_durable_postcondition_is_missing(self):
+        self.verify_postcondition.return_value = False
+
+        with self.assertRaisesRegex(operator_replay.ReplayRefused, "postcondition"):
+            self.replay(apply=True)
+
+        graph_marker = (
+            "users",
+            BAYLOR_UID,
+            "processedMessages",
+            b64url_id(GRAPH_MESSAGE_ID),
+        )
+        rfc_marker = (
+            "users",
+            BAYLOR_UID,
+            "processedMessages",
+            b64url_id(INTERNET_MESSAGE_ID),
+        )
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            _failure_id(),
+        )
+        self.assertEqual("operator_replay_in_progress", self.fs.data[graph_marker]["status"])
+        self.assertEqual("operator_replay_in_progress", self.fs.data[rfc_marker]["status"])
+        self.assertIn(failure_path, self.fs.data)
+
+    def test_apply_preserves_failure_when_processing_creates_recovery_artifact(self):
+        self.find_existing_artifact.side_effect = [
+            None,
+            {"collection": "pendingResponses", "id": "pending-after-process"},
+        ]
+
+        with self.assertRaisesRegex(operator_replay.ReplayRefused, "post-processing artifact"):
+            self.replay(apply=True)
+
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            _failure_id(),
+        )
+        self.assertIn(failure_path, self.fs.data)
+
+    def test_failed_atomic_completion_leaves_preclaims_and_failure_visible(self):
+        self.fs.fail_batch_commit_number = 2
+
+        with self.assertRaisesRegex(RuntimeError, "atomic batch commit failed"):
+            self.replay(apply=True)
+
+        for message_id in (GRAPH_MESSAGE_ID, INTERNET_MESSAGE_ID):
+            marker_path = (
+                "users",
+                BAYLOR_UID,
+                "processedMessages",
+                b64url_id(message_id),
+            )
+            self.assertEqual(
+                "operator_replay_in_progress",
+                self.fs.data[marker_path]["status"],
+            )
+        self.assertIn(
+            ("users", BAYLOR_UID, "processingFailures", _failure_id()),
+            self.fs.data,
+        )
 
     def test_processing_exception_preserves_failure_and_both_unprocessed_markers(self):
         self.process_message.side_effect = RuntimeError("asset extraction still broken")
@@ -436,9 +641,137 @@ class OperatorReplayContractTests(unittest.TestCase):
             "processingFailures",
             _failure_id(),
         )
-        self.assertNotIn(graph_marker, self.fs.data)
-        self.assertNotIn(rfc_marker, self.fs.data)
+        self.assertEqual("operator_replay_in_progress", self.fs.data[graph_marker]["status"])
+        self.assertEqual("operator_replay_in_progress", self.fs.data[rfc_marker]["status"])
         self.assertIn(failure_path, self.fs.data)
+
+    def test_default_processor_is_forced_into_no_reply_mode(self):
+        from email_automation import processing
+
+        with patch.object(processing, "process_inbox_message") as process_message:
+            operator_replay.replay_exact_message(
+                _request(),
+                {"Authorization": "Bearer test-token"},
+                apply=True,
+                fs_client=self.fs,
+                fetch_message=self.fetch_message,
+                find_existing_artifact=self.find_existing_artifact,
+                find_manual_continuation=self.find_continuation,
+                find_recipient_continuation=self.find_recipient_continuation,
+                verify_postcondition=self.verify_postcondition,
+                lease_runner=self.lease_runner,
+            )
+
+        process_message.assert_called_once_with(
+            BAYLOR_UID,
+            {"Authorization": "Bearer test-token"},
+            self.fetch_message.return_value,
+            allow_outbound_reply=False,
+        )
+
+
+class OperatorReplayPostconditionTests(unittest.TestCase):
+    def _firestore_with(self, warnings, changes):
+        fs = MagicMock()
+        user_ref = MagicMock()
+        fs.collection.return_value.document.return_value = user_ref
+        collections = {
+            "assetWarnings": MagicMock(),
+            "sheetChangeLog": MagicMock(),
+        }
+        collections["assetWarnings"].stream.return_value = [
+            SimpleNamespace(to_dict=lambda value=value: deepcopy(value))
+            for value in warnings
+        ]
+        collections["sheetChangeLog"].stream.return_value = [
+            SimpleNamespace(to_dict=lambda value=value: deepcopy(value))
+            for value in changes
+        ]
+        user_ref.collection.side_effect = lambda name: collections[name]
+        return fs
+
+    def test_postcondition_rejects_stale_warning_from_prior_attempt(self):
+        started = datetime(2026, 7, 12, 18, 0, tzinfo=timezone.utc)
+        stale = started - timedelta(minutes=10)
+        fresh = started + timedelta(seconds=1)
+        fs = self._firestore_with(
+            [{
+                "clientId": CLIENT_ID,
+                "threadId": THREAD_ID,
+                "messageId": INTERNET_MESSAGE_ID,
+                "status": "degraded_text_processed",
+                "updatedAt": stale,
+            }],
+            [{
+                "clientId": CLIENT_ID,
+                "threadId": THREAD_ID,
+                "status": "applied",
+                "applied": {"applied": [{"column": "Rent", "newValue": "12"}]},
+                "createdAt": fresh,
+            }],
+        )
+
+        with patch(
+            "email_automation.processing._get_reply_send_outcome",
+            return_value=SimpleNamespace(
+                error=None,
+                sent_but_unindexed=False,
+                outcome="suppressed_operator_replay_no_send",
+            ),
+        ):
+            verified = operator_replay._verify_degraded_asset_postcondition(
+                _request(), fs, started
+            )
+
+        self.assertFalse(verified)
+
+    def test_postcondition_requires_fresh_sheet_warning_and_no_send(self):
+        started = datetime(2026, 7, 12, 18, 0, tzinfo=timezone.utc)
+        fresh = started + timedelta(seconds=1)
+        fs = self._firestore_with(
+            [{
+                "clientId": CLIENT_ID,
+                "threadId": THREAD_ID,
+                "messageId": INTERNET_MESSAGE_ID,
+                "status": "degraded_text_processed",
+                "updatedAt": fresh,
+            }],
+            [{
+                "clientId": CLIENT_ID,
+                "threadId": THREAD_ID,
+                "status": "applied",
+                "applied": {"applied": [{"column": "Rent", "newValue": "12"}]},
+                "createdAt": fresh,
+            }],
+        )
+
+        with patch(
+            "email_automation.processing._get_reply_send_outcome",
+            return_value=SimpleNamespace(
+                error=None,
+                sent_but_unindexed=False,
+                outcome="suppressed_operator_replay_no_send",
+            ),
+        ):
+            self.assertTrue(
+                operator_replay._verify_degraded_asset_postcondition(
+                    _request(), fs, started
+                )
+            )
+
+        with patch(
+            "email_automation.processing._get_reply_send_outcome",
+            return_value=SimpleNamespace(
+                error=None,
+                sent_but_unindexed=False,
+                outcome="sent_indexed",
+            ),
+        ):
+            self.assertFalse(
+                operator_replay._verify_degraded_asset_postcondition(
+                    _request(), fs, started
+                )
+            )
 
 
 def _cli_args(**overrides):

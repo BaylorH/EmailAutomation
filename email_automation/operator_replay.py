@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import quote
+from uuid import uuid4
 
 import requests
 from google.cloud.firestore import SERVER_TIMESTAMP
 
 from .campaign_safety import get_client_automation_decision
-from .sent_mail_guard import sent_after_from_retry_data
-from .utils import b64url_id, exponential_backoff_request, normalize_message_id
+from .sent_mail_guard import coerce_utc_datetime, sent_after_from_retry_data
+from .utils import (
+    b64url_id,
+    exponential_backoff_request,
+    normalize_message_id,
+    parse_references_header,
+)
 
 
 APPROVED_BAYLOR_UID = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
@@ -72,6 +79,12 @@ def _is_bp21_sender(value: Any) -> bool:
     return domain == APPROVED_BP21_DOMAIN and (
         local_part == APPROVED_BP21_LOCAL_PART
         or local_part.startswith(f"{APPROVED_BP21_LOCAL_PART}+")
+    )
+
+
+def _is_legacy_asset_failure(failure: Dict[str, Any]) -> bool:
+    return _clean(failure.get("reason")).startswith(
+        "Broker asset extraction failed for "
     )
 
 
@@ -211,6 +224,8 @@ def _validate_failure(request: ReplayRequest, failure: Dict[str, Any]) -> None:
         if _clean(failure.get(field)) != value:
             raise ReplayRefused(f"Exact failure {field} does not match the request")
     recorded_graph_id = _clean(failure.get("graphMessageId"))
+    if not recorded_graph_id and not _is_legacy_asset_failure(failure):
+        raise ReplayRefused("Exact failure is missing its Graph message ID")
     if recorded_graph_id and recorded_graph_id != request.graph_message_id:
         raise ReplayRefused("Exact failure Graph message ID does not match the request")
     if failure.get("retryable") is not True:
@@ -236,9 +251,15 @@ def _validate_thread_and_indexes(
     participants = thread.get("email") or []
     if isinstance(participants, str):
         participants = [participants]
-    normalized_participants = {_normalize_email(value) for value in participants}
-    if normalized_participants and _normalize_email(request.sender) not in normalized_participants:
-        raise ReplayRefused("Exact thread sender does not match the requested BP21 sender")
+    normalized_participants = {
+        _normalize_email(value) for value in participants if _normalize_email(value)
+    }
+    if normalized_participants and not all(
+        _is_bp21_sender(value) for value in normalized_participants
+    ):
+        raise ReplayRefused(
+            "Exact thread participants do not stay inside the BP21 mailbox family"
+        )
 
     canonical_rfc_id = normalize_message_id(request.internet_message_id)
     msg_index = _read_required(
@@ -264,6 +285,155 @@ def _validate_thread_and_indexes(
     return thread_status
 
 
+def _validate_reply_header_indexes(
+    fs_client,
+    request: ReplayRequest,
+    message: Dict[str, Any],
+) -> None:
+    headers = {
+        _clean(item.get("name")).lower(): _clean(item.get("value"))
+        for item in message.get("internetMessageHeaders") or []
+        if isinstance(item, dict)
+    }
+    candidates = []
+    in_reply_to = headers.get("in-reply-to")
+    if in_reply_to:
+        candidates.append(in_reply_to)
+    candidates.extend(parse_references_header(headers.get("references", "")))
+
+    for message_id in dict.fromkeys(candidates):
+        canonical_id = normalize_message_id(message_id)
+        if not canonical_id:
+            continue
+        snapshot = (
+            _user_ref(fs_client, request.uid)
+            .collection("msgIndex")
+            .document(b64url_id(canonical_id))
+            .get()
+        )
+        if not getattr(snapshot, "exists", False):
+            continue
+        indexed = snapshot.to_dict() or {}
+        if _clean(indexed.get("threadId")) != request.thread_id:
+            raise ReplayRefused(
+                "A reply header message index points to a different thread"
+            )
+
+
+def _sent_items_search_start(
+    failure: Dict[str, Any],
+    message: Dict[str, Any],
+):
+    failure_start = sent_after_from_retry_data(failure)
+    received_at = coerce_utc_datetime(message.get("receivedDateTime"))
+    if not received_at:
+        return failure_start
+    return min(failure_start, received_at - timedelta(seconds=30))
+
+
+def _verify_degraded_asset_postcondition(
+    request: ReplayRequest,
+    fs_client,
+    attempt_started_at: datetime,
+) -> bool:
+    from .processing import _get_reply_send_outcome
+
+    send_outcome = _get_reply_send_outcome()
+    if (
+        send_outcome.error
+        or send_outcome.sent_but_unindexed
+        or send_outcome.outcome != "suppressed_operator_replay_no_send"
+    ):
+        return False
+
+    freshness_floor = attempt_started_at - timedelta(seconds=5)
+
+    def fresh_matching(collection_name: str, predicate) -> bool:
+        snapshots = (
+            _user_ref(fs_client, request.uid)
+            .collection(collection_name)
+            .stream()
+        )
+        for snapshot in snapshots:
+            data = snapshot.to_dict() or {}
+            updated_at = coerce_utc_datetime(
+                data.get("updatedAt") or data.get("createdAt")
+            )
+            if updated_at and updated_at >= freshness_floor and predicate(data):
+                return True
+        return False
+
+    warning_is_fresh = fresh_matching(
+        "assetWarnings",
+        lambda data: (
+            _clean(data.get("clientId")) == request.client_id
+            and _clean(data.get("threadId")) == request.thread_id
+            and _clean(data.get("messageId")) == request.internet_message_id
+            and data.get("status") == "degraded_text_processed"
+        ),
+    )
+    sheet_evidence_is_fresh = fresh_matching(
+        "sheetChangeLog",
+        lambda data: (
+            _clean(data.get("clientId")) == request.client_id
+            and _clean(data.get("threadId")) == request.thread_id
+            and data.get("status") == "applied"
+            and isinstance(data.get("applied"), dict)
+        ),
+    )
+    return warning_is_fresh and sheet_evidence_is_fresh
+
+
+def _begin_replay_claim(fs_client, request: ReplayRequest, failure_ref):
+    attempt_id = uuid4().hex
+    started_at = datetime.now(timezone.utc)
+    batch = fs_client.batch()
+    for message_id in (request.graph_message_id, request.internet_message_id):
+        batch.set(
+            _processed_ref(fs_client, request.uid, message_id),
+            {
+                "status": "operator_replay_in_progress",
+                "replayAttemptId": attempt_id,
+                "claimedAt": SERVER_TIMESTAMP,
+            },
+            merge=False,
+        )
+    batch.set(
+        failure_ref,
+        {
+            "recoveryStatus": "operator_replay_in_progress",
+            "replayAttemptId": attempt_id,
+            "graphMessageId": request.graph_message_id,
+            "replayStartedAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+    batch.commit()
+    return attempt_id, started_at
+
+
+def _complete_replay_claim(
+    fs_client,
+    request: ReplayRequest,
+    failure_ref,
+    attempt_id: str,
+) -> None:
+    batch = fs_client.batch()
+    for message_id in (request.graph_message_id, request.internet_message_id):
+        batch.set(
+            _processed_ref(fs_client, request.uid, message_id),
+            {
+                "status": "processed",
+                "replayAttemptId": attempt_id,
+                "processedAt": SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+    batch.delete(failure_ref)
+    batch.commit()
+
+
 def replay_exact_message(
     request: ReplayRequest,
     headers: Dict[str, str],
@@ -276,6 +446,12 @@ def replay_exact_message(
     ] = None,
     find_existing_artifact: Optional[Callable[..., Optional[Dict[str, Any]]]] = None,
     find_manual_continuation: Optional[Callable[..., Optional[Dict[str, Any]]]] = None,
+    find_recipient_continuation: Optional[
+        Callable[..., Optional[Dict[str, Any]]]
+    ] = None,
+    verify_postcondition: Optional[
+        Callable[[ReplayRequest, Any, datetime], bool]
+    ] = None,
     lease_runner: Optional[Callable[..., bool]] = None,
 ) -> ReplayResult:
     """Preflight and optionally process exactly one failed inbox message.
@@ -297,7 +473,13 @@ def replay_exact_message(
     if process_message is None:
         from .processing import process_inbox_message
 
-        process_message = process_inbox_message
+        def process_message(uid, graph_headers, message):
+            return process_inbox_message(
+                uid,
+                graph_headers,
+                message,
+                allow_outbound_reply=False,
+            )
     if find_existing_artifact is None:
         from .processing import _find_existing_retry_artifact_for_message
 
@@ -306,6 +488,12 @@ def replay_exact_message(
         from .sent_mail_guard import find_sent_conversation_continuation_for_retry
 
         find_manual_continuation = find_sent_conversation_continuation_for_retry
+    if find_recipient_continuation is None:
+        from .sent_mail_guard import find_sent_recipient_continuation_for_retry
+
+        find_recipient_continuation = find_sent_recipient_continuation_for_retry
+    if verify_postcondition is None:
+        verify_postcondition = _verify_degraded_asset_postcondition
     if lease_runner is None:
         from .scheduler_lease import run_with_user_lease
 
@@ -352,6 +540,7 @@ def replay_exact_message(
         thread_status = _validate_thread_and_indexes(
             fs_client, request, thread, message
         )
+        _validate_reply_header_indexes(fs_client, request, message)
 
         existing_artifact = find_existing_artifact(
             request.uid,
@@ -369,28 +558,85 @@ def replay_exact_message(
                 "An existing recovery artifact already targets this exact message"
             )
 
+        sent_after = _sent_items_search_start(failure, message)
         continuation = find_manual_continuation(
             headers,
             conversation_id=message.get("conversationId"),
-            sent_after=sent_after_from_retry_data(failure),
+            sent_after=sent_after,
         )
         if continuation:
             raise ReplayRefused(
                 "Sent Items shows a manual continuation or an uncertain continuation state"
             )
 
+        recipient_continuation = find_recipient_continuation(
+            headers,
+            recipient=request.sender,
+            sent_after=sent_after,
+        )
+        if recipient_continuation:
+            raise ReplayRefused(
+                "Sent Items shows a newer recipient continuation outside the exact thread"
+            )
+
         failure_id = f"{request.thread_id}__{request.internet_message_id}"
         if apply:
-            process_message(request.uid, headers, message)
-            for message_id in (
-                request.graph_message_id,
-                request.internet_message_id,
-            ):
-                _processed_ref(fs_client, request.uid, message_id).set(
-                    {"processedAt": SERVER_TIMESTAMP},
+            attempt_id, attempt_started_at = _begin_replay_claim(
+                fs_client,
+                request,
+                failure_ref,
+            )
+            try:
+                process_message(request.uid, headers, message)
+            except Exception as exc:
+                failure_ref.set(
+                    {
+                        "recoveryStatus": "operator_replay_failed",
+                        "replayErrorClass": type(exc).__name__,
+                        "updatedAt": SERVER_TIMESTAMP,
+                    },
                     merge=True,
                 )
-            failure_ref.delete()
+                raise
+            post_process_artifact = find_existing_artifact(
+                request.uid,
+                request.thread_id,
+                request.internet_message_id,
+                request.client_id,
+                additional_message_ids=[
+                    request.graph_message_id,
+                    request.internet_message_id,
+                    message.get("conversationId"),
+                ],
+            )
+            if post_process_artifact:
+                failure_ref.set(
+                    {
+                        "recoveryStatus": "operator_replay_blocked_artifact",
+                        "updatedAt": SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+                raise ReplayRefused(
+                    "A post-processing artifact requires manual review before completion"
+                )
+            if not verify_postcondition(request, fs_client, attempt_started_at):
+                failure_ref.set(
+                    {
+                        "recoveryStatus": "operator_replay_blocked_postcondition",
+                        "updatedAt": SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+                raise ReplayRefused(
+                    "Durable degraded-asset replay postcondition was not satisfied"
+                )
+            _complete_replay_claim(
+                fs_client,
+                request,
+                failure_ref,
+                attempt_id,
+            )
 
         result = ReplayResult(
             status="applied" if apply else "verified",
@@ -412,6 +658,7 @@ def replay_exact_message(
         request.uid,
         _under_lease,
         fs_client=fs_client,
+        ttl_seconds=30 * 60,
     )
     if not acquired:
         raise ReplayRefused("The existing per-user lease is held; replay refused")
