@@ -462,7 +462,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["email_automation/system_health.py", "email_automation/dead_letter_recovery.py", "email_automation/pending_responses.py"],
+        "backend": ["email_automation/system_health.py", "email_automation/dead_letter_recovery.py", "email_automation/pending_responses.py", "email_automation/operator_replay.py"],
         "frontend": ["src/components/EmailSchedulerButton.jsx", "src/components/HealthWidget.jsx"],
         "functions": [],
         "firestoreRules": []
