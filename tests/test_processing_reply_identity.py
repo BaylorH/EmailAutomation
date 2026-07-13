@@ -79,6 +79,37 @@ class ProcessingReplyIdentityTests(unittest.TestCase):
             "Hi,\n\nCould you confirm the clear height?",
         )
 
+    def test_llm_neutral_greeting_uses_resolved_contact_name(self):
+        body = "Hi,\n\nPerfect, thank you. This covers everything."
+
+        self.assertEqual(
+            processing._align_response_greeting(body, "Tram Kim"),
+            "Hi Tram,\n\nPerfect, thank you. This covers everything.",
+        )
+
+    def test_llm_neutral_greeting_stays_neutral_for_non_person_labels(self):
+        body = "Hi,\n\nPerfect, thank you. This covers everything."
+
+        for contact_name in (
+            "Leasing Team",
+            "CBRE",
+            "Kim, Tram",
+            "Acme Properties",
+            "Acme Holdings",
+            "Asset Manager",
+            "Jones Lang LaSalle",
+            "Managing Director",
+            "Principal Broker",
+            "Property Owner",
+            "Colliers International",
+            "Cushman Wakefield",
+        ):
+            with self.subTest(contact_name=contact_name):
+                self.assertEqual(
+                    processing._align_response_greeting(body, contact_name),
+                    body,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

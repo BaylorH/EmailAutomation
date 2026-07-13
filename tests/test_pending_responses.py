@@ -87,6 +87,30 @@ class FakeFirestore:
 
 
 class PendingResponsesTests(unittest.TestCase):
+    def test_successful_retry_rechecks_campaign_completion_after_deleting_pending_work(self):
+        pending_doc = FakeDoc("thread-final", {
+            "threadId": "thread-final",
+            "msgId": "message-final",
+            "recipient": "bp21harrison@gmail.com",
+            "responseBody": "Hi Ryan,\n\nThank you for letting me know.",
+            "clientId": "client-1",
+            "attempts": 0,
+        })
+        fake_fs = FakeFirestore([pending_doc])
+
+        with self._mock_clients_module(fake_fs), patch.object(
+            processing, "send_reply_in_thread", return_value=True
+        ), patch.object(
+            processing, "_maybe_mark_client_completed", return_value=True
+        ) as mark_client_completed:
+            states = pending_responses.process_pending_responses(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertTrue(pending_doc.reference.deleted)
+        self.assertEqual("healthy", states[0]["status"])
+        mark_client_completed.assert_called_once_with("uid-1", "client-1")
+
     def test_failed_send_without_local_outcome_keeps_current_retry(self):
         active_doc = FakeDoc("thread-active", {
             "threadId": "thread-active",

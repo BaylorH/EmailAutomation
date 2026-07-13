@@ -202,7 +202,18 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
 
         move_row = MagicMock(return_value=11)
         stop_threads = MagicMock(return_value=1)
-        send_reply = MagicMock(return_value=True)
+        call_trace = []
+
+        def fake_send_reply(*args, **kwargs):
+            call_trace.append("send")
+            return True
+
+        def fake_mark_client_completed(*args, **kwargs):
+            call_trace.append("complete")
+            return True
+
+        send_reply = MagicMock(side_effect=fake_send_reply)
+        mark_client_completed = MagicMock(side_effect=fake_mark_client_completed)
         thread_docs = thread_docs or {thread_id: thread_ref}
         patches = [
             patch.object(processing, "_fs", FakeFirestore(thread_ref, client_ref, thread_docs=thread_docs)),
@@ -252,7 +263,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             patch.object(processing, "update_thread_status", side_effect=fake_update_thread_status),
             patch.object(processing, "complete_threads_for_row", return_value=1),
             patch.object(processing, "_clear_thread_action_notifications"),
-            patch.object(processing, "_maybe_mark_client_completed"),
+            patch.object(processing, "_maybe_mark_client_completed", side_effect=mark_client_completed),
             patch.object(processing, "check_missing_required_fields", return_value=[]),
         ]
 
@@ -275,6 +286,8 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "moveRow": move_row,
             "stopThreads": stop_threads,
             "sendReply": send_reply,
+            "markClientCompleted": mark_client_completed,
+            "callTrace": call_trace,
             "threadRef": thread_ref,
         }
 
@@ -320,6 +333,37 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
                 and handled["notifId"] is None
                 for handled in result["handledEvents"]
             )
+        )
+
+    def test_property_unavailable_acknowledges_before_campaign_completion(self):
+        body = "Hi Baylor,\n\n951 E FM 646 is no longer available.\n\nBest,\nRyan"
+        thread_id = "thread-unavailable-final-row"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "contactName": "Ryan Young",
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+        })
+        proposal = {
+            "updates": [],
+            "events": [{"type": "property_unavailable", "reason": "no_longer_available"}],
+            "response_email": None,
+        }
+
+        result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body=body,
+            proposal=proposal,
+            thread_ref=thread_ref,
+            row_anchor="951 E FM 646",
+            contact_name="Ryan Young",
+        )
+
+        self.assertEqual(result["callTrace"], ["send", "complete"])
+        result["markClientCompleted"].assert_called_once_with(
+            "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
+            "client-1",
         )
 
     def test_tour_invite_alternate_reply_processes_schedule_decision_without_auto_send(self):

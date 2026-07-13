@@ -416,6 +416,9 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
             if sent:
                 print(f"    ✅ Successfully sent pending response!")
                 doc.reference.delete()
+                client_id = data.get("clientId")
+                if client_id:
+                    processing_module._maybe_mark_client_completed(user_id, client_id)
                 operation_states.append(
                     _pending_response_operation_state("healthy", recipient=recipient)
                 )
