@@ -226,6 +226,15 @@ def _proposal_has_non_asset_evidence(proposal: Optional[Dict[str, Any]]) -> bool
     return bool(updates or _proposal_events(proposal))
 
 
+def _without_extraction_failures(
+    manifest: List[Dict[str, Any]],
+    failures: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep manifest entries that are not the exact surfaced failure objects."""
+    failure_ids = {id(entry) for entry in failures}
+    return [entry for entry in manifest if id(entry) not in failure_ids]
+
+
 def _record_asset_extraction_warning(
     user_id: str,
     client_id: str,
@@ -270,6 +279,15 @@ def _record_asset_extraction_warning(
         }, merge=True)
     except Exception as exc:
         print(f"⚠️ Could not persist non-blocking asset extraction warning: {exc}")
+        _record_ai_processing_failure(
+            user_id,
+            client_id,
+            thread_id,
+            message_id,
+            f"Asset warning persistence failed: {exc}",
+            retryable=False,
+            recovery_status="asset_warning_persistence_failed",
+        )
 
 
 def _queue_response_retry_or_reconciliation(
@@ -470,18 +488,33 @@ def _find_recent_sent_message_for_conversation(
     return None
 
 
-def _record_ai_processing_failure(user_id: str, client_id: str, thread_id: str, message_id: str, reason: str):
+def _record_ai_processing_failure(
+    user_id: str,
+    client_id: str,
+    thread_id: str,
+    message_id: str,
+    reason: str,
+    *,
+    retryable: bool = True,
+    recovery_status: Optional[str] = None,
+):
     try:
         doc_id = f"{thread_id}__{message_id or int(time.time())}"
-        _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).set({
+        payload = {
             "clientId": client_id,
             "threadId": thread_id,
             "messageId": message_id,
             "reason": reason,
-            "retryable": True,
+            "retryable": retryable,
             "createdAt": SERVER_TIMESTAMP,
             "updatedAt": SERVER_TIMESTAMP,
-        }, merge=True)
+        }
+        if recovery_status:
+            payload["recoveryStatus"] = recovery_status
+        _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).set(
+            payload,
+            merge=True,
+        )
     except Exception as e:
         print(f"⚠️ Could not record AI processing failure: {e}")
 
@@ -4037,7 +4070,7 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     print(f"   📄 Categorized linked asset as flyer: {filename}")
 
         asset_failures = _extraction_failure_entries(pdf_manifest)
-        usable_pdf_manifest = [entry for entry in pdf_manifest if entry not in asset_failures]
+        usable_pdf_manifest = _without_extraction_failures(pdf_manifest, asset_failures)
 
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)

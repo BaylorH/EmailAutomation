@@ -493,6 +493,12 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
 
         self.assertIsNone(error)
         self.asset_warning_recorder.assert_called_once()
+        warning_args = self.asset_warning_recorder.call_args.args
+        self.assertEqual("client-1", warning_args[1])
+        self.assertEqual(self.THREAD_ID, warning_args[2])
+        self.assertEqual("<extraction-gate@example.test>", warning_args[3])
+        self.assertEqual("dead-flyer.pdf", warning_args[4][0]["name"])
+        self.assertEqual("404 Not Found", warning_args[4][0]["error"])
         send_reply.assert_not_called()
 
     def test_genuine_retryable_error_is_respected_control(self):
@@ -527,7 +533,9 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
             "Firestore unavailable"
         )
 
-        with mock.patch.object(proc, "_fs", failing_fs):
+        with mock.patch.object(proc, "_fs", failing_fs), mock.patch.object(
+            proc, "_record_ai_processing_failure"
+        ) as record_failure:
             proc._record_asset_extraction_warning(
                 "user-1",
                 "client-1",
@@ -535,6 +543,29 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
                 "message-1",
                 [{"name": "dead.pdf", "method": "failed", "error": "404"}],
             )
+
+        record_failure.assert_called_once_with(
+            "user-1",
+            "client-1",
+            "thread-1",
+            "message-1",
+            "Asset warning persistence failed: Firestore unavailable",
+            retryable=False,
+            recovery_status="asset_warning_persistence_failed",
+        )
+
+    def test_usable_manifest_filters_failures_by_identity_not_value(self):
+        failed = {"name": "same.pdf", "method": "failed", "error": "404"}
+        distinct_but_equal = dict(failed)
+        usable = {"name": "good.pdf", "method": "pdfplumber", "text": "18,500 SF"}
+
+        self.assertEqual(
+            [distinct_but_equal, usable],
+            proc._without_extraction_failures(
+                [failed, distinct_but_equal, usable],
+                [failed],
+            ),
+        )
 
 
 class TestWrongPropertyPdfNoDeterministicGuard(unittest.TestCase):
