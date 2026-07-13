@@ -278,7 +278,9 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
     USER_ID = "user-extraction-gate"
     THREAD_ID = "thread-extraction-gate"
 
-    def _drive_real_process_inbox_message(self, *, body, has_attachments, fh_patches):
+    def _drive_real_process_inbox_message(
+        self, *, body, has_attachments, fh_patches, proposal=None
+    ):
         """Run the REAL process_inbox_message (and the REAL file_handling
         manifest builders) with only external boundaries faked. Returns the
         exception it raised, or None if it completed silently."""
@@ -320,6 +322,8 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
         me_response.json.return_value = {"mail": "me@ourdomain.test"}
 
         send_reply = mock.MagicMock(return_value=True)
+        self.asset_warning_recorder = mock.MagicMock()
+        proposal = proposal or {"skip_response": True}
 
         patchers = [
             mock.patch.object(proc, "_fs", FakeFirestore(thread_ref, client_ref)),
@@ -362,7 +366,18 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
             # If the extraction failure is NOT surfaced, processing continues to
             # the proposal; skip_response makes that continuation terminate
             # cleanly with error=None (the historical silent-loss outcome).
-            mock.patch.object(proc, "propose_sheet_updates", return_value={"skip_response": True}),
+            mock.patch.object(proc, "propose_sheet_updates", return_value=proposal),
+            mock.patch.object(
+                proc,
+                "apply_proposal_to_sheet",
+                return_value={"applied": proposal.get("updates") or [], "skipped": []},
+            ),
+            mock.patch.object(proc, "add_client_notifications"),
+            mock.patch.object(
+                proc,
+                "_record_asset_extraction_warning",
+                side_effect=self.asset_warning_recorder,
+            ),
             mock.patch.object(proc, "_sheets_client", return_value=mock.MagicMock()),
             mock.patch.object(proc, "_get_first_tab_title", return_value="Sheet1"),
             mock.patch.object(proc, "check_missing_required_fields", return_value=[]),
@@ -448,11 +463,78 @@ class TestMarkProcessedGateOnExtractionFailure(unittest.TestCase):
             "the surfaced link-download error must keep the message unprocessed")
         send_reply.assert_not_called()
 
+    def test_broken_link_with_independent_specs_processes_text_and_records_warning(self):
+        fh_patches = [
+            mock.patch.object(fh, "fetch_pdf_attachments", return_value=[]),
+            mock.patch.object(
+                fh,
+                "_download_linked_asset",
+                side_effect=ValueError("404 Not Found"),
+            ),
+        ]
+        proposal = {
+            "updates": [
+                {"column": "Total SF", "value": "18,500"},
+                {"column": "Rent/SF/Yr", "value": "$12.50"},
+            ],
+            "events": [],
+            "skip_response": True,
+        }
+
+        error, send_reply = self._drive_real_process_inbox_message(
+            body=(
+                "The space is available. It is 18,500 SF at $12.50/SF/Yr. "
+                "The old flyer link is https://example.com/dead-flyer.pdf"
+            ),
+            has_attachments=False,
+            fh_patches=fh_patches,
+            proposal=proposal,
+        )
+
+        self.assertIsNone(error)
+        self.asset_warning_recorder.assert_called_once()
+        send_reply.assert_not_called()
+
     def test_genuine_retryable_error_is_respected_control(self):
         # Control: when an error DOES surface, the gate correctly keeps it unprocessed.
         self.assertFalse(
             proc._should_mark_processed_after_error(RuntimeError("graph 503")),
             "control: a surfaced error must keep the message unprocessed")
+
+
+class TestBrokenAssetGracefulDegradation(unittest.TestCase):
+    """A dead flyer link must not discard independently extracted broker facts."""
+
+    def test_sheet_updates_allow_text_processing_to_continue(self):
+        proposal = {
+            "updates": [
+                {"column": "Total SF", "value": "18,500"},
+                {"column": "Rent/SF/Yr", "value": "$12.50"},
+            ],
+            "events": [],
+        }
+
+        self.assertTrue(proc._proposal_has_non_asset_evidence(proposal))
+
+    def test_link_only_reply_remains_retryable(self):
+        proposal = {"updates": [], "events": [], "skip_response": True}
+
+        self.assertFalse(proc._proposal_has_non_asset_evidence(proposal))
+
+    def test_warning_persistence_failure_does_not_block_text_processing(self):
+        failing_fs = mock.MagicMock()
+        failing_fs.collection.return_value.document.return_value.collection.return_value.document.return_value.set.side_effect = RuntimeError(
+            "Firestore unavailable"
+        )
+
+        with mock.patch.object(proc, "_fs", failing_fs):
+            proc._record_asset_extraction_warning(
+                "user-1",
+                "client-1",
+                "thread-1",
+                "message-1",
+                [{"name": "dead.pdf", "method": "failed", "error": "404"}],
+            )
 
 
 class TestWrongPropertyPdfNoDeterministicGuard(unittest.TestCase):

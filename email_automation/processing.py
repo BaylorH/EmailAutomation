@@ -213,6 +213,65 @@ def _raise_on_extraction_failures(manifest: Optional[List[Dict[str, Any]]]) -> N
     )
 
 
+def _proposal_has_non_asset_evidence(proposal: Optional[Dict[str, Any]]) -> bool:
+    """Return whether broker-authored text produced a durable result without assets."""
+    if not isinstance(proposal, dict):
+        return False
+    updates = [
+        update
+        for update in (proposal.get("updates") or [])
+        if isinstance(update, dict)
+        and str(update.get("value") or update.get("newValue") or "").strip()
+    ]
+    return bool(updates or _proposal_events(proposal))
+
+
+def _record_asset_extraction_warning(
+    user_id: str,
+    client_id: str,
+    thread_id: str,
+    message_id: str,
+    failures: List[Dict[str, Any]],
+) -> None:
+    """Persist failed asset provenance when usable message text still commits."""
+    if not failures:
+        return
+    assets = [
+        {
+            "name": entry.get("name"),
+            "sourceUrl": entry.get("source_url"),
+            "sourceType": entry.get("source_type"),
+            "method": entry.get("method"),
+            "error": entry.get("error"),
+        }
+        for entry in failures
+    ]
+    warning_key = hashlib.sha256(
+        json.dumps(
+            {
+                "threadId": thread_id,
+                "messageId": message_id,
+                "assets": assets,
+            },
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    try:
+        _fs.collection("users").document(user_id).collection("assetWarnings").document(warning_key).set({
+            "clientId": client_id,
+            "threadId": thread_id,
+            "messageId": message_id,
+            "status": "degraded_text_processed",
+            "retryable": False,
+            "assets": assets,
+            "createdAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+        }, merge=True)
+    except Exception as exc:
+        print(f"⚠️ Could not persist non-blocking asset extraction warning: {exc}")
+
+
 def _queue_response_retry_or_reconciliation(
     user_id: str,
     thread_id: str,
@@ -3977,12 +4036,8 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
                     flyer_links.append(link)
                     print(f"   📄 Categorized linked asset as flyer: {filename}")
 
-        # SAFETY GATE: extraction failures surfaced by file_handling (failed PDF
-        # extraction, broken/protected broker links, manual-review file-share
-        # links) must keep this message UNPROCESSED. Continuing silently leaves
-        # error=None at the caller, the message gets marked processed, and the
-        # broker's attachment/link payload is lost with no retry or visibility.
-        _raise_on_extraction_failures(pdf_manifest)
+        asset_failures = _extraction_failure_entries(pdf_manifest)
+        usable_pdf_manifest = [entry for entry in pdf_manifest if entry not in asset_failures]
 
         # Step 2: test write
         write_message_order_test(user_id, thread_id, sheet_id)
@@ -3991,9 +4046,25 @@ def process_inbox_message(user_id: str, headers: Dict[str, str], msg: Dict[str, 
         # Pass column_config and extraction_fields for per-client AI configuration
         proposal = propose_sheet_updates(
             user_id, client_id, to_addr_lower, sheet_id, header, rownum, rowvals,
-            thread_id, pdf_manifest=pdf_manifest, url_texts=url_texts, contact_name=contact_name,
+            thread_id, pdf_manifest=usable_pdf_manifest, url_texts=url_texts, contact_name=contact_name,
             headers=headers, column_config=column_config, extraction_fields=extraction_fields
         )
+
+        if asset_failures:
+            if not _proposal_has_non_asset_evidence(proposal):
+                _raise_on_extraction_failures(asset_failures)
+            _record_asset_extraction_warning(
+                user_id,
+                client_id,
+                thread_id,
+                internet_message_id or msg_id,
+                asset_failures,
+            )
+            print(
+                f"⚠️ Continued with broker text after {len(asset_failures)} asset "
+                "extraction warning(s); provenance was saved for review"
+            )
+            pdf_manifest = usable_pdf_manifest
         
         if proposal:
             # Process updates
