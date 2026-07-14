@@ -6,6 +6,27 @@ from email_automation.column_config import get_default_column_config
 
 
 class ProcessingCompletionGuardTests(unittest.TestCase):
+    def test_close_event_defers_campaign_completion_for_pending_closing_reply(self):
+        proposal = {
+            "response_email": "Hi,\n\nThanks for the details.",
+            "skip_response": False,
+        }
+
+        self.assertTrue(
+            processing._should_defer_client_completion_for_closing_reply(proposal)
+        )
+
+    def test_close_event_does_not_defer_completion_without_a_sendable_reply(self):
+        for proposal in (
+            {"response_email": None},
+            {"response_email": ""},
+            {"response_email": "Hi,\n\nThanks.", "skip_response": True},
+        ):
+            with self.subTest(proposal=proposal):
+                self.assertFalse(
+                    processing._should_defer_client_completion_for_closing_reply(proposal)
+                )
+
     def test_closing_copy_does_not_satisfy_missing_field_response(self):
         body = "Thanks for sending this over. This covers everything I needed."
 
@@ -817,6 +838,63 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             threads_ref=FakeQuery([
                 FakeDoc("thread-1", {"clientId": "client-1", "status": "completed"}),
                 FakeDoc("thread-2", {"clientId": "client-1", "status": "active"}),
+            ]),
+            notifications_ref=FakeQuery([]),
+            outbox_ref=FakeQuery([]),
+            pending_responses_ref=FakeQuery([]),
+            dead_letter_ref=FakeQuery([]),
+        )
+
+        self.assertFalse(completed)
+        self.assertEqual([], client_ref.set_calls)
+
+    def test_does_not_overwrite_stopped_client_as_completed(self):
+        class FakeDoc:
+            def __init__(self, doc_id, data=None):
+                self.id = doc_id
+                self._data = dict(data or {})
+                self.set_calls = []
+
+            def to_dict(self):
+                return dict(self._data)
+
+            def get(self):
+                class Snapshot:
+                    exists = True
+
+                    def to_dict(inner_self):
+                        return dict(self._data)
+                return Snapshot()
+
+            def set(self, payload, merge=False):
+                self.set_calls.append((payload, merge))
+                self._data.update(payload)
+
+        class FakeQuery:
+            def __init__(self, docs):
+                self.docs = list(docs)
+                self.filters = []
+
+            def where(self, *, filter):
+                self.filters.append(filter)
+                return self
+
+            def stream(self):
+                docs = self.docs
+                for field_filter in self.filters:
+                    docs = [
+                        doc for doc in docs
+                        if doc.to_dict().get(field_filter.field_path) == field_filter.value
+                    ]
+                return docs
+
+        client_ref = FakeDoc("client-1", {"status": "stopped"})
+        completed = processing._maybe_mark_client_completed(
+            "uid-1",
+            "client-1",
+            client_ref=client_ref,
+            threads_ref=FakeQuery([
+                FakeDoc("thread-1", {"clientId": "client-1", "status": "completed"}),
             ]),
             notifications_ref=FakeQuery([]),
             outbox_ref=FakeQuery([]),

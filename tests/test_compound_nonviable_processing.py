@@ -366,6 +366,44 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "client-1",
         )
 
+    def test_close_conversation_sends_terminal_reply_before_campaign_completion(self):
+        body = (
+            "Hi Baylor,\n\nThe suite is 42,000 SF at $10.50/SF with $3.25/SF "
+            "operating expenses, two drive-ins, 24-foot clear height, and 480V "
+            "three-phase power.\n\nBest,\nTram"
+        )
+        thread_id = "thread-complete-final-row"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "contactName": "Tram Kim",
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+        })
+        proposal = {
+            "updates": [],
+            "events": [{"type": "close_conversation", "reason": "all_information_received"}],
+            "response_email": "Hi,\n\nPerfect, thank you. This covers everything I needed.",
+        }
+
+        result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body=body,
+            proposal=proposal,
+            thread_ref=thread_ref,
+            row_anchor="1561 Live Oak St",
+            contact_name="Tram Kim",
+        )
+
+        self.assertEqual(result["callTrace"], ["send", "complete"])
+        result["markClientCompleted"].assert_called_once_with(
+            "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
+            "client-1",
+        )
+        sent_body = result["sendReply"].call_args.args[2]
+        self.assertTrue(sent_body.startswith("Hi Tram,\n\n"))
+        self.assertNotIn("[NAME]", sent_body)
+
     def test_tour_invite_alternate_reply_processes_schedule_decision_without_auto_send(self):
         body = "Hi Baylor,\n\n10:15 AM does not work for us. Could we do 11:45 AM instead?\n\nBest,\nBP21"
         thread_id = "thread-tour-alt"

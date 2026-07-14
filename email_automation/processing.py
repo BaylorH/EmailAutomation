@@ -1822,7 +1822,7 @@ def _maybe_mark_client_completed(
         client_snapshot = client_ref.get()
         client_data = client_snapshot.to_dict() if getattr(client_snapshot, "exists", False) else {}
         status = str((client_data or {}).get("status") or "").strip().lower()
-        if status in {"archived", "deleted"}:
+        if status in {"stopping", "stopped", "archived", "deleted"}:
             return False
 
         thread_docs = list(
@@ -3135,11 +3135,21 @@ def _align_response_greeting(response_body: Optional[str], contact_name: Optiona
 
     expected = _build_greeting(contact_name)
     greeting_re = re.compile(
-        r"^(\s*)(?:hi|hello|hey|thanks|thank you)"
-        r"(?:\s+[a-z][a-z'’.-]*(?:\s+[a-z][a-z'’.-]*)?)?\s*(?:,|[-–—])",
+        r"^(\s*)(?:(?:hi|hello|hey)"
+        r"(?:\s+[a-z][a-z'’.-]*(?:\s+[a-z][a-z'’.-]*)?)?"
+        r"|(?:thanks|thank you)(?:\s+[a-z][a-z'’.-]*)?)"
+        r"\s*(?:,|[-–—])"
+        r"(?=\s*(?:\r?\n|$))",
         re.IGNORECASE,
     )
     return greeting_re.sub(lambda match: f"{match.group(1)}{expected}", response_body, count=1)
+
+
+def _should_defer_client_completion_for_closing_reply(proposal: Optional[Dict[str, Any]]) -> bool:
+    """Keep the campaign live until a prepared terminal reply reaches a send outcome."""
+    proposal = proposal or {}
+    response_email = proposal.get("response_email")
+    return bool(str(response_email or "").strip()) and not bool(proposal.get("skip_response"))
 
 
 def _mark_reply_sent_but_unindexed(reason: str) -> bool:
@@ -4221,6 +4231,7 @@ def process_inbox_message(
         new_row_created = False            # set true when we insert a new property row
         new_property_pending_created = False
         new_row_number = None              # track the newly created row number
+        defer_client_completion_for_closing_reply = False
 
         # NEW: Handle PDF attachments with enhanced extraction for current message only
         pdf_manifest = fetch_and_process_pdfs(headers, msg_id)
@@ -5125,7 +5136,11 @@ def process_inbox_message(
                             clear_row_highlight(sheet_id, rownum)
                         except Exception as e:
                             print(f"⚠️ Could not clear row highlight: {e}")
-                        _maybe_mark_client_completed(user_id, client_id)
+                        if _should_defer_client_completion_for_closing_reply(proposal):
+                            defer_client_completion_for_closing_reply = True
+                            print("   ⏳ Deferring campaign completion until the closing reply is resolved")
+                        else:
+                            _maybe_mark_client_completed(user_id, client_id)
 
                     except Exception as e:
                         print(f"❌ Failed to handle close_conversation: {e}")
@@ -5791,7 +5806,8 @@ To complete the property details, could you please provide:
                                     clear_row_highlight(sheet_id, rownum)
                                 except Exception as e:
                                     print(f"⚠️ Could not clear row highlight: {e}")
-                                _maybe_mark_client_completed(user_id, client_id)
+                                if not defer_client_completion_for_closing_reply:
+                                    _maybe_mark_client_completed(user_id, client_id)
                             else:
                                 response_sent = _handle_auto_response_send_failure(
                                     user_id, thread_id, msg_id, to_addr_lower, response_body, client_id,
@@ -5800,6 +5816,13 @@ To complete the property details, could you please provide:
                         
             except Exception as e:
                 print(f"❌ Failed to send automatic response: {e}")
+            finally:
+                if defer_client_completion_for_closing_reply:
+                    send_outcome = _get_reply_send_outcome()
+                    if send_outcome.campaign_suppression_kind == "terminal":
+                        print("⏹️ Campaign became terminal before closing reply; completion update skipped")
+                    else:
+                        _maybe_mark_client_completed(user_id, client_id)
         
         else:
             print("ℹ️ No proposal generated; nothing to apply.")
