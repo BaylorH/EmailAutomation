@@ -87,6 +87,14 @@ class ProcessingReplyIdentityTests(unittest.TestCase):
             "Hi Tram,\n\nPerfect, thank you. This covers everything.",
         )
 
+    def test_llm_thanks_sentence_is_not_rewritten_as_a_greeting(self):
+        body = "Thanks for confirming, the rent is noted.\n\nI have everything I need."
+
+        self.assertEqual(
+            processing._align_response_greeting(body, "Tram Kim"),
+            body,
+        )
+
     def test_llm_neutral_greeting_stays_neutral_for_non_person_labels(self):
         body = "Hi,\n\nPerfect, thank you. This covers everything."
 
