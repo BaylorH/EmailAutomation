@@ -422,6 +422,20 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             a._extract_total_sf_from_text("+/- 9,000 SF new free-standing building."),
             "9000")
 
+    def test_multi_suite_explicit_total_overrides_individual_suite_areas(self):
+        text = (
+            "Suite A is 5,200 SF and Suite C is 4,800 SF. "
+            "Together they provide 10,000 SF total."
+        )
+
+        self.assertEqual(a._extract_total_sf_from_text(text), "10000")
+
+    def test_single_suite_area_behavior_is_preserved(self):
+        self.assertEqual(
+            a._extract_total_sf_from_text("Suite C is 4,800 SF and is ready now."),
+            "4800",
+        )
+
     def test_s03_augment_writes_total_sf(self):
         header = ["Property Address", "Total SF"]
         rowvals = ["Prop", ""]

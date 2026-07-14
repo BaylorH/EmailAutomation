@@ -60,6 +60,12 @@ class CloudRunServiceSpecContractTests(unittest.TestCase):
         self.assertRegex(self.yaml_text, r'command:\s*\[\s*"gunicorn"\s*\]')
         self.assertIn("service:app", self.yaml_text)
 
+    def test_recycles_worker_after_each_request(self):
+        self.assertIn('"--max-requests=1"', self.yaml_text)
+
+    def test_has_two_gib_request_memory_headroom(self):
+        self.assertRegex(self.yaml_text, r"memory:\s*2Gi")
+
     def test_gunicorn_is_a_declared_dependency(self):
         active = {
             line.strip()

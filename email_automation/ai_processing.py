@@ -1336,6 +1336,14 @@ _TOTAL_SF_RE = re.compile(
     r"(?<![\w$/.])((?:\d{1,3}(?:,\d{3})+)|\d{4,})\s*(?:sf|sq\.?\s*ft|square\s*f(?:ee|oo)t)\b",
     re.IGNORECASE,
 )
+
+_EXPLICIT_TOTAL_SF_RE = re.compile(
+    r"(?:\btotal\b[^\d]{0,24}(\d{1,3}(?:,\d{3})+|\d{4,})\s*"
+    r"(?:sq\.?\s*ft\.?|square\s+feet|sf)\b"
+    r"|(\d{1,3}(?:,\d{3})+|\d{4,})\s*"
+    r"(?:sq\.?\s*ft\.?|square\s+feet|sf)\s*(?:in\s+)?total\b)",
+    re.IGNORECASE,
+)
 _MONTHLY_UNIT_RE = re.compile(r"(?:/\s*|\bper\s+)(?:mo|mos|month)\b|\bmonthly\b|\bpsf\s*/?\s*mo(?:nth)?\b", re.IGNORECASE)
 _ANNUAL_UNIT_RE = re.compile(r"(?:/\s*|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
 _HYPOTHETICAL_RENT_RE = re.compile(
@@ -1598,6 +1606,10 @@ def _extract_total_sf_from_text(text: str) -> Optional[str]:
     """Deterministic Total SF fallback; tolerates '+/- 9,000 SF' style approximations."""
     if not text:
         return None
+    explicit_total = _EXPLICIT_TOTAL_SF_RE.search(text)
+    if explicit_total:
+        raw_total = next(group for group in explicit_total.groups() if group)
+        return str(int(raw_total.replace(",", "")))
     for m in _TOTAL_SF_RE.finditer(text):
         raw = m.group(1).replace(",", "")
         try:
@@ -2264,6 +2276,54 @@ def _normalize_ai_meta_anchor(anchor: str) -> str:
     return " ".join((anchor or "").strip().lower().replace(",", " ").split())
 
 
+def _load_ai_meta_rows(sheets, spreadsheet_id: str) -> List[List[Any]]:
+    resp = _execute_with_retry(
+        sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range="AI_META!A:F",
+        ),
+        "read_ai_meta",
+    )
+    return resp.get("values", [])
+
+
+def _find_ai_meta_row(
+    rows: List[List[Any]],
+    rownum: int,
+    column: str,
+    row_anchor: str = None,
+) -> Optional[Dict]:
+    if len(rows) <= 1:
+        return None
+
+    for row in reversed(rows[1:]):
+        if len(row) < 2 or str(row[0]) != str(rownum) or row[1].lower() != column.lower():
+            continue
+        stored_anchor = row[5] if len(row) > 5 else ""
+        if stored_anchor and row_anchor:
+            if _normalize_ai_meta_anchor(stored_anchor) != _normalize_ai_meta_anchor(row_anchor):
+                print(
+                    f"⚠️ Ignoring AI_META row {rownum}/{column}: "
+                    f"anchor changed from '{stored_anchor}' to '{row_anchor}'"
+                )
+                continue
+        elif row_anchor and not stored_anchor:
+            print(
+                f"⚠️ Ignoring AI_META row {rownum}/{column}: "
+                f"missing row anchor for current row '{row_anchor}'"
+            )
+            continue
+        return {
+            "rowNumber": row[0],
+            "columnName": row[1],
+            "last_ai_value": row[2] if len(row) > 2 else None,
+            "last_ai_write_iso": row[3] if len(row) > 3 else None,
+            "human_override": row[4] if len(row) > 4 else False,
+            "rowAnchor": stored_anchor,
+        }
+    return None
+
+
 def _read_ai_meta_row(
     sheets,
     spreadsheet_id: str,
@@ -2274,49 +2334,12 @@ def _read_ai_meta_row(
     """Read AI_META record for specific row/column."""
     try:
         _ensure_ai_meta_tab(sheets, spreadsheet_id)
-
-        # Read all AI_META data
-        resp = _execute_with_retry(
-            sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id,
-                range="AI_META!A:F"
-            ),
-            "read_ai_meta"
+        return _find_ai_meta_row(
+            _load_ai_meta_rows(sheets, spreadsheet_id),
+            rownum,
+            column,
+            row_anchor=row_anchor,
         )
-
-        rows = resp.get("values", [])
-        if len(rows) <= 1:  # Only header or empty
-            return None
-        
-        # Find the newest matching row. AI_META is append-only, so older records
-        # for the same row/column can exist after retries or row moves.
-        for row in reversed(rows[1:]):  # Skip header
-            if len(row) >= 2 and str(row[0]) == str(rownum) and row[1].lower() == column.lower():
-                stored_anchor = row[5] if len(row) > 5 else ""
-                if stored_anchor and row_anchor:
-                    if _normalize_ai_meta_anchor(stored_anchor) != _normalize_ai_meta_anchor(row_anchor):
-                        print(
-                            f"⚠️ Ignoring AI_META row {rownum}/{column}: "
-                            f"anchor changed from '{stored_anchor}' to '{row_anchor}'"
-                        )
-                        continue
-                elif row_anchor and not stored_anchor:
-                    print(
-                        f"⚠️ Ignoring AI_META row {rownum}/{column}: "
-                        f"missing row anchor for current row '{row_anchor}'"
-                    )
-                    continue
-                return {
-                    "rowNumber": row[0],
-                    "columnName": row[1],
-                    "last_ai_value": row[2] if len(row) > 2 else None,
-                    "last_ai_write_iso": row[3] if len(row) > 3 else None,
-                    "human_override": row[4] if len(row) > 4 else False,
-                    "rowAnchor": stored_anchor,
-                }
-        
-        return None
-        
     except Exception as e:
         print(f"⚠️ Failed to read AI_META for row {rownum}, column {column}: {e}")
         return None
@@ -2329,10 +2352,12 @@ def _append_ai_meta(
     value: str,
     override: bool = False,
     row_anchor: str = None,
+    ensure_tab: bool = True,
 ):
     """Append new AI_META record."""
     try:
-        _ensure_ai_meta_tab(sheets, spreadsheet_id)
+        if ensure_tab:
+            _ensure_ai_meta_tab(sheets, spreadsheet_id)
 
         now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -2501,6 +2526,7 @@ def apply_proposal_to_sheet(
         tab_title = _get_first_tab_title(sheets, sheet_id)
         
         _ensure_ai_meta_tab(sheets, sheet_id)
+        ai_meta_rows = _load_ai_meta_rows(sheets, sheet_id)
 
         if not proposal or not isinstance(proposal.get("updates"), list):
             row_anchor = get_row_anchor(current_rowvals, header)
@@ -2588,7 +2614,12 @@ def apply_proposal_to_sheet(
                 continue
 
             # Check AI_META for write guards
-            meta = _read_ai_meta_row(sheets, sheet_id, rownum, col_name, row_anchor=row_anchor)
+            meta = _find_ai_meta_row(
+                ai_meta_rows,
+                rownum,
+                col_name,
+                row_anchor=row_anchor,
+            )
 
             # 2) prior AI write and human changed it
             if meta and meta.get("last_ai_value") is not None and str(old_val) != str(meta["last_ai_value"]):
@@ -2666,6 +2697,7 @@ def apply_proposal_to_sheet(
                 a["newValue"],
                 override=False,
                 row_anchor=row_anchor,
+                ensure_tab=False,
             )
 
         try:
@@ -2708,7 +2740,7 @@ def apply_proposal_to_sheet(
 
     except Exception as e:
         print(f"❌ Failed to apply proposal to sheet: {e}")
-        return {"applied": [], "skipped": [{"reason": f"exception: {e}"}]}
+        raise
 
 def propose_sheet_updates(uid: str,
                           client_id: str,

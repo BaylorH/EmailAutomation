@@ -53,10 +53,23 @@ _ORIGINAL_GET_CLIENT_AUTOMATION_PAUSE = get_client_automation_pause
 
 # Maximum retry attempts before moving to dead-letter queue
 MAX_OUTBOX_ATTEMPTS = 5
+# Four recipients require at most three 120-second pacing gaps, leaving request
+# headroom under the Cloud Run 540-second timeout for Graph scans and cleanup.
+DEFAULT_OUTBOX_RECIPIENTS_PER_RUN = 4
+OUTBOX_RECIPIENTS_PER_RUN_ENV = "SITESIFT_OUTBOX_RECIPIENTS_PER_RUN"
 # Maximum retries for indexing operations
 MAX_INDEX_RETRIES = 3
 # Claim timeout in seconds (if a claim is older than this, it's considered stale)
 CLAIM_TIMEOUT_SECONDS = 300  # 5 minutes
+
+
+def _resolve_outbox_recipients_per_run() -> int:
+    raw = os.environ.get(OUTBOX_RECIPIENTS_PER_RUN_ENV)
+    try:
+        value = int(raw) if raw is not None else DEFAULT_OUTBOX_RECIPIENTS_PER_RUN
+    except (TypeError, ValueError):
+        value = DEFAULT_OUTBOX_RECIPIENTS_PER_RUN
+    return max(1, min(value, DEFAULT_OUTBOX_RECIPIENTS_PER_RUN))
 
 # Outbox items from these dashboard flows already contain operator-reviewed body
 # copy. They must not be replaced by contact-history campaign fallback text.
@@ -2214,6 +2227,36 @@ def _must_process_outbox_item_individually(data: Dict[str, Any]) -> bool:
     )
 
 
+def _order_outbox_docs(docs: List[Any]) -> List[Any]:
+    """Deterministically order same-timestamp campaign launches by sheet row."""
+    def sort_key(doc):
+        data = doc.to_dict() or {}
+        created_at = data.get("createdAt")
+        if hasattr(created_at, "timestamp"):
+            created_at = created_at.timestamp()
+        elif not isinstance(created_at, (int, float, str)):
+            created_at = str(created_at or "")
+
+        source = str(data.get("source") or "")
+        is_campaign_launch = source in {
+            "dashboard_campaign_launch",
+            "dashboard_new_campaign",
+        }
+        try:
+            row_number = int(data.get("rowNumber")) if is_campaign_launch else 10**12
+        except (TypeError, ValueError):
+            row_number = 10**12
+
+        return (
+            str(created_at),
+            str(data.get("clientId") or ""),
+            row_number,
+            str(getattr(doc, "id", "")),
+        )
+
+    return sorted(docs, key=sort_key)
+
+
 def _get_current_outbox_data(doc_ref) -> Optional[Dict[str, Any]]:
     if not hasattr(doc_ref, "get"):
         return {}
@@ -3020,7 +3063,7 @@ def send_outboxes(
 
     outbox_ref = _fs.collection("users").document(user_id).collection("outbox")
     # Order by createdAt to send emails in the order they were queued (oldest first)
-    docs = list(outbox_ref.order_by("createdAt").stream())
+    docs = _order_outbox_docs(list(outbox_ref.order_by("createdAt").stream()))
 
     if not docs:
         print("📭 Outbox empty")
@@ -3060,7 +3103,15 @@ def send_outboxes(
     cap_day_key = _send_counter_day_key()
 
     # Process each unique recipient
-    recipients_list = list(email_groups.items())
+    all_recipients = list(email_groups.items())
+    recipient_limit = _resolve_outbox_recipients_per_run()
+    recipients_list = all_recipients[:recipient_limit]
+    deferred_count = len(all_recipients) - len(recipients_list)
+    if deferred_count:
+        print(
+            f"⏱️ Processing {len(recipients_list)} recipient(s) this request; "
+            f"leaving {deferred_count} queued for the next scoped run"
+        )
     for idx, (recipient_email, items) in enumerate(recipients_list):
         # Filter out items that have exceeded max attempts
         valid_items = []

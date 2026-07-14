@@ -23,6 +23,7 @@ class FakeValues:
     def __init__(self, ai_meta_rows=None):
         self.batch_update_calls = []
         self.append_calls = []
+        self.get_calls = []
         self.ai_meta_rows = ai_meta_rows or [
             [
                 "3",
@@ -35,6 +36,7 @@ class FakeValues:
         ]
 
     def get(self, spreadsheetId=None, range=None, **kwargs):
+        self.get_calls.append({"spreadsheetId": spreadsheetId, "range": range})
         if range and range.startswith("AI_META!"):
             return FakeRequest({
                 "values": [
@@ -67,11 +69,13 @@ class FakeSpreadsheets:
     def __init__(self, values):
         self._values = values
         self.batch_update_calls = []
+        self.get_calls = []
 
     def values(self):
         return self._values
 
     def get(self, spreadsheetId=None, **kwargs):
+        self.get_calls.append({"spreadsheetId": spreadsheetId})
         return FakeRequest({
             "sheets": [
                 {"properties": {"title": "Sheet1", "sheetId": 0}},
@@ -94,6 +98,32 @@ class FakeSheets:
 
 
 class AiMetaRowIdentityTests(unittest.TestCase):
+    def test_multi_field_apply_reads_ai_meta_only_once(self):
+        fake_sheets = FakeSheets(ai_meta_rows=[])
+        header = ["Property Address", "Total SF", "Power"]
+        proposal = {
+            "updates": [
+                {"column": "Total SF", "value": "10000", "confidence": 0.99},
+                {"column": "Power", "value": "800A 3-phase", "confidence": 0.99},
+            ]
+        }
+
+        with patch("email_automation.ai_processing._sheets_client", return_value=fake_sheets), \
+             patch("email_automation.ai_processing._get_first_tab_title", return_value="Sheet1"), \
+             patch("email_automation.sheet_operations._apply_gross_rent_formula_for_row", return_value=False):
+            apply_proposal_to_sheet(
+                "uid-1",
+                "client-1",
+                "sheet-1",
+                header,
+                3,
+                ["4402 Rex Rd", "", ""],
+                proposal,
+            )
+
+        self.assertEqual(1, len(fake_sheets.spreadsheets_api.get_calls))
+        self.assertEqual(1, len(fake_sheets.values_api.get_calls))
+
     def test_existing_ai_meta_tab_is_hidden_when_backend_touches_it(self):
         fake_sheets = FakeSheets()
 

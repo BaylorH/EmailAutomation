@@ -16,10 +16,11 @@
 - Modify: `email_automation/email.py`
 - Test: `tests/test_outbox_safety.py`
 
-- [ ] Add a test that gives `send_outboxes` same-timestamp exact campaign documents in shuffled document-ID order and expects row order 3, 4, 5.
-- [ ] Run the focused test and verify it fails with document-ID order.
-- [ ] Add a pure outbox sort key using `createdAt`, campaign `rowNumber`, and document ID.
-- [ ] Run `tests/test_outbox_safety.py` and verify it passes.
+- [x] Add a test that gives `send_outboxes` same-timestamp exact campaign documents in shuffled document-ID order and expects row order 3, 4, 5.
+- [x] Run the focused test and verify it fails with document-ID order.
+- [x] Add a pure outbox sort key using `createdAt`, campaign `rowNumber`, and document ID.
+- [x] Bound one request to four recipient groups so pacing stays under the 540-second request limit.
+- [x] Run `tests/test_outbox_safety.py` and verify it passes.
 
 ### Task 2: Visible, Retryable Sheet Apply Failures
 
@@ -27,10 +28,11 @@
 - Modify: `email_automation/ai_processing.py`
 - Test: `tests/test_processing_retryability.py`
 
-- [ ] Add a test whose real proposal apply reaches a fake batch update that raises a Google Sheets 429 and assert the exception escapes.
-- [ ] Run the test and verify it fails because the exception is converted to an empty apply result.
-- [ ] Remove the broad success-shaped exception return while retaining diagnostic logging.
-- [ ] Run the retryability and proposal-apply tests and verify they pass.
+- [x] Add a test whose real proposal apply reaches a fake batch update that raises a Google Sheets 429 and assert the exception escapes.
+- [x] Run the test and verify it fails because the exception is converted to an empty apply result.
+- [x] Remove the broad success-shaped exception return while retaining diagnostic logging.
+- [x] Reduce one multi-field apply to one AI_META metadata read and one full-tab read.
+- [x] Run the retryability and proposal-apply tests and verify they pass.
 
 ### Task 3: Explicit Multi-Suite Total
 
@@ -38,10 +40,10 @@
 - Modify: `email_automation/ai_processing.py`
 - Test: `tests/test_battery_ai_processing.py`
 
-- [ ] Add controls proving `Suite A is 5,200 SF and Suite C is 4,800 SF, 10,000 SF total` resolves to 10000 while ordinary single-suite extraction remains unchanged.
-- [ ] Run the focused tests and verify the multi-suite case fails with 5200 or 4800.
-- [ ] Add a conservative explicit-total matcher ahead of the generic first-area matcher.
-- [ ] Run the extraction battery and verify it passes.
+- [x] Add controls proving `Suite A is 5,200 SF and Suite C is 4,800 SF, 10,000 SF total` resolves to 10000 while ordinary single-suite extraction remains unchanged.
+- [x] Run the focused tests and verify the multi-suite case fails with 5200 or 4800.
+- [x] Add a conservative explicit-total matcher ahead of the generic first-area matcher.
+- [x] Run the extraction battery and verify it passes.
 
 ### Task 4: Request Memory Isolation and Headroom
 
@@ -51,9 +53,9 @@
 - Test: `tests/test_process_user_production_deploy_contract.py`
 - Test: `tests/test_ws_b_cloudrun_service_spec.py`
 
-- [ ] Add contract assertions for `--max-requests=1` and 2 GiB memory.
-- [ ] Run the deploy/spec tests and verify they fail against the current configuration.
-- [ ] Update the deploy command and service template without changing concurrency or timeout.
+- [x] Add contract assertions for `--max-requests=1` and 2 GiB memory.
+- [x] Run the deploy/spec tests and verify they fail against the current configuration.
+- [x] Update the deploy command and service template without changing concurrency or timeout.
 - [ ] Run deployment contract tests and the script dry-run.
 
 ### Task 5: Verification, Deploy, and Medium Rerun
@@ -62,7 +64,7 @@
 - Modify: `docs/superpowers/plans/2026-07-14-release-a-medium-recovery.md` checkboxes only as work completes.
 - Update via canonical vault helper: Mohr email automation project hub.
 
-- [ ] Run all focused suites and then the full backend suite.
+- [x] Run all focused suites and then the full backend suite.
 - [ ] Review the diff for recipient, scheduler-scope, failure-visibility, and retry regressions.
 - [ ] Commit and deploy through `scripts/deploy_process_user.sh --apply`, then prove immutable digest, revision config, health, and no-traffic/traffic cutover state.
 - [ ] Run a fresh Baylor-only 10-row campaign, process opt-out last, and capture Firestore, Sheet, Gmail, logs, and dashboard evidence.
