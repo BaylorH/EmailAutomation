@@ -3135,8 +3135,10 @@ def _align_response_greeting(response_body: Optional[str], contact_name: Optiona
 
     expected = _build_greeting(contact_name)
     greeting_re = re.compile(
-        r"^(\s*)(?:hi|hello|hey|thanks|thank you)"
-        r"(?:\s+[a-z][a-z'’.-]*(?:\s+[a-z][a-z'’.-]*)?)?\s*(?:,|[-–—])"
+        r"^(\s*)(?:(?:hi|hello|hey)"
+        r"(?:\s+[a-z][a-z'’.-]*(?:\s+[a-z][a-z'’.-]*)?)?"
+        r"|(?:thanks|thank you)(?:\s+[a-z][a-z'’.-]*)?)"
+        r"\s*(?:,|[-–—])"
         r"(?=\s*(?:\r?\n|$))",
         re.IGNORECASE,
     )

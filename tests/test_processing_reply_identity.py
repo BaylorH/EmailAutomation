@@ -71,6 +71,17 @@ class ProcessingReplyIdentityTests(unittest.TestCase):
             "Hi Neal,\n\nPerfect, thank you. This covers everything.",
         )
 
+    def test_llm_standalone_thanks_greeting_is_aligned_to_current_sender_name(self):
+        for body in (
+            "Thanks Jeff,\n\nPerfect, that covers everything.",
+            "Thank you Jeff,\n\nPerfect, that covers everything.",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    processing._align_response_greeting(body, "Neal King"),
+                    "Hi Neal,\n\nPerfect, that covers everything.",
+                )
+
     def test_llm_greeting_drops_stale_name_when_sender_name_unknown(self):
         body = "Hi Jeff,\n\nCould you confirm the clear height?"
 
@@ -88,12 +99,15 @@ class ProcessingReplyIdentityTests(unittest.TestCase):
         )
 
     def test_llm_thanks_sentence_is_not_rewritten_as_a_greeting(self):
-        body = "Thanks for confirming, the rent is noted.\n\nI have everything I need."
-
-        self.assertEqual(
-            processing._align_response_greeting(body, "Tram Kim"),
-            body,
-        )
+        for body in (
+            "Thanks for confirming, the rent is noted.\n\nI have everything I need.",
+            "Thanks for confirming,\nthe rent is noted.\n\nI have everything I need.",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    processing._align_response_greeting(body, "Tram Kim"),
+                    body,
+                )
 
     def test_llm_neutral_greeting_stays_neutral_for_non_person_labels(self):
         body = "Hi,\n\nPerfect, thank you. This covers everything."
