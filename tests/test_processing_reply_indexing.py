@@ -185,6 +185,50 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
         queue_retry.assert_not_called()
         record_reconciliation.assert_called_once()
 
+    def test_opted_out_recipient_suppression_is_not_queued_for_retry(self):
+        processing._reset_reply_send_outcome()
+        processing._set_reply_send_outcome(
+            error="All reply-all recipients opted out",
+            outcome="suppressed_recipient_optout",
+        )
+
+        with patch.object(processing, "queue_pending_response") as queue_retry, \
+                patch.object(processing, "record_sent_unindexed_response") as reconcile:
+            outcome = processing._queue_response_retry_or_reconciliation(
+                "uid-1",
+                "thread-1",
+                "msg-1",
+                "bp21harrison@gmail.com",
+                "Hi,\n\nThanks.",
+                "client-1",
+            )
+
+        self.assertEqual("recipient_suppressed", outcome)
+        queue_retry.assert_not_called()
+        reconcile.assert_not_called()
+
+    def test_opted_out_recipient_suppression_counts_as_handled(self):
+        processing._reset_reply_send_outcome()
+        processing._set_reply_send_outcome(
+            error="All reply-all recipients opted out",
+            outcome="suppressed_recipient_optout",
+        )
+
+        with patch.object(processing, "queue_pending_response") as queue_retry, \
+                patch.object(processing, "record_sent_unindexed_response") as reconcile:
+            handled = processing._handle_auto_response_send_failure(
+                "uid-1",
+                "thread-1",
+                "msg-1",
+                "bp21harrison@gmail.com",
+                "Hi,\n\nThanks.",
+                "client-1",
+            )
+
+        self.assertTrue(handled)
+        queue_retry.assert_not_called()
+        reconcile.assert_not_called()
+
     def test_auto_thread_reply_preserves_safe_cc_with_reply_all_draft(self):
         posts = []
         patch_payloads = []

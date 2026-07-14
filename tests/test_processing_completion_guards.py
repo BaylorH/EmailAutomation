@@ -1040,6 +1040,14 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
         self.assertEqual(value, "9.00")
 
+    def test_deterministic_rent_fallback_keeps_figure_first_rent_before_opex(self):
+        value = ai_processing._extract_rent_sf_yr_from_text(
+            "Forwarding the owner's confirmed current specs: 42,500 SF, "
+            "$12.75/SF/year asking rent, $3.95/SF operating expenses."
+        )
+
+        self.assertEqual(value, "12.75")
+
     def test_deterministic_rent_fallback_annualizes_monthly_asking_rent(self):
         value = ai_processing._extract_rent_sf_yr_from_text(
             "Asking rate: $1.25/SF/month NNN."

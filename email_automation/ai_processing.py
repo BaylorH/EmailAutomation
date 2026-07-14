@@ -1516,7 +1516,10 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
     annual_unit = re.compile(r"(?:/|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
 
     basis_patterns = (dollar_rate_basis, dollar_less_basis, cents_basis)
-    for pattern in (rent_context, dollar_per_sf, dollar_rate_basis, dollar_less_basis, cents_basis):
+    # Classify figure-local $/SF matches before the wider keyword-first pattern.
+    # Otherwise "...$12.75/SF asking rent, $3.95/SF operating expenses" lets
+    # "asking rent" reach across the comma and incorrectly bind to the OpEx figure.
+    for pattern in (dollar_per_sf, rent_context, dollar_rate_basis, dollar_less_basis, cents_basis):
         for match in pattern.finditer(text):
             # rent_context already required an explicit rent keyword, so trust it.
             # The keyword-less patterns must screen out non-rent cost figures
