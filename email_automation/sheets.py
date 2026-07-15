@@ -76,6 +76,26 @@ ASSET_LINK_COLUMN_ALIASES = {
 }
 
 
+class AssetLinkWriteError(RuntimeError):
+    """Expose partial asset writes so callers can reconcile before retrying."""
+
+    def __init__(
+        self,
+        canonical_column: str,
+        cause: Exception,
+        *,
+        applied_updates: Optional[dict[str, list[str]]] = None,
+        created_columns: Optional[list[str]] = None,
+    ) -> None:
+        super().__init__(f"Failed to write {canonical_column} links: {cause}")
+        self.canonical_column = canonical_column
+        self.applied_updates = {
+            column: list(values or [])
+            for column, values in (applied_updates or {}).items()
+        }
+        self.created_columns = list(created_columns or [])
+
+
 def _asset_header_base(value: str) -> str:
     normalized = re.sub(r"\s+", " ", str(value or "").strip().lower())
     return re.sub(r"\s+\d+$", "", normalized).strip()
@@ -362,9 +382,17 @@ def _append_links_to_asset_columns(
     canonical_column: str,
 ) -> dict[str, list[str]]:
     """Write unique asset links one per cell and keep the shared header current."""
+    applied: dict[str, list[str]] = {}
+    created_columns: list[str] = []
     try:
         tab_title = _get_first_tab_title(sheets, spreadsheet_id)
-        working_header = header if isinstance(header, list) else list(header or [])
+        live_header = _read_header_row2(sheets, spreadsheet_id, tab_title)
+        if isinstance(header, list):
+            if live_header:
+                header[:] = live_header
+            working_header = header
+        else:
+            working_header = list(live_header or header or [])
         columns = _asset_columns(working_header, canonical_column)
         existing: set[str] = set()
         blank_columns: list[tuple[int, str]] = []
@@ -400,7 +428,6 @@ def _append_links_to_asset_columns(
             print(f"ℹ️ All links already present in {canonical_column}")
             return {}
 
-        applied: dict[str, list[str]] = {}
         primary_label = columns[0][1] if columns else canonical_column
         suffix = 2
 
@@ -430,18 +457,40 @@ def _append_links_to_asset_columns(
                 )
                 working_header.append(column_label)
                 columns.append((col_idx, column_label))
+                created_columns.append(column_label)
                 print(f"📋 Created '{column_label}' column at {col_letter}")
 
             cell_range = f"{tab_title}!{_col_letter(col_idx)}{rownum}"
-            _execute_with_retry(
-                sheets.spreadsheets().values().update(
-                    spreadsheetId=spreadsheet_id,
-                    range=cell_range,
-                    valueInputOption="RAW",
-                    body={"values": [[link]]},
-                ),
-                "asset_link_update",
-            )
+            try:
+                _execute_with_retry(
+                    sheets.spreadsheets().values().update(
+                        spreadsheetId=spreadsheet_id,
+                        range=cell_range,
+                        valueInputOption="RAW",
+                        body={"values": [[link]]},
+                    ),
+                    "asset_link_update",
+                )
+            except Exception:
+                try:
+                    readback = _execute_with_retry(
+                        sheets.spreadsheets().values().get(
+                            spreadsheetId=spreadsheet_id,
+                            range=cell_range,
+                        ),
+                        "asset_link_failure_readback",
+                    )
+                    readback_values = readback.get("values", [])
+                    readback_value = (
+                        str(readback_values[0][0] or "").strip()
+                        if readback_values and readback_values[0]
+                        else ""
+                    )
+                    if readback_value == link:
+                        applied.setdefault(column_label, []).append(link)
+                except Exception:
+                    pass
+                raise
             applied.setdefault(column_label, []).append(link)
 
         print(f"🔗 Wrote {len(additions)} {canonical_column} link(s) to separate cells")
@@ -449,7 +498,12 @@ def _append_links_to_asset_columns(
 
     except Exception as e:
         print(f"❌ Failed to write {canonical_column} links: {e}")
-        return {}
+        raise AssetLinkWriteError(
+            canonical_column,
+            e,
+            applied_updates=applied,
+            created_columns=created_columns,
+        ) from e
 
 
 def append_links_to_flyer_link_column(

@@ -11,6 +11,8 @@ class FakeRequest:
         self.payload = payload
 
     def execute(self):
+        if isinstance(self.payload, Exception):
+            raise self.payload
         return self.payload
 
 
@@ -36,6 +38,8 @@ class FakeValues:
         else:
             self.service.cells[range] = value
         self.service.updates.append((range, value))
+        if range in self.service.fail_ranges:
+            return FakeRequest(RuntimeError(f"write failed for {range}"))
         return FakeRequest({})
 
 
@@ -56,6 +60,7 @@ class FakeSheetsService:
         self.headers = list(headers)
         self.cells = {}
         self.updates = []
+        self.fail_ranges = set()
         self.api = FakeSpreadsheets(self)
 
     def spreadsheets(self):
@@ -117,6 +122,68 @@ class AssetColumnRoutingTests(unittest.TestCase):
         self.assertEqual(["Property Address", "Flyers", "Flyers 2"], service.headers)
         self.assertEqual("https://drive.google.com/file/d/flyer-one/view", service.cells["FOR LEASE!B3"])
         self.assertEqual("https://drive.google.com/file/d/flyer-two/view", service.cells["FOR LEASE!C3"])
+
+    def test_new_asset_column_preserves_live_header_missing_from_snapshot(self):
+        service = FakeSheetsService(["Property Address", "Flyer"])
+        stale_header = list(service.headers)
+        service.headers.append("Manual Notes")
+
+        updates = sheets.append_links_to_floorplan_column(
+            service,
+            "sheet-1",
+            stale_header,
+            3,
+            ["https://drive.google.com/file/d/floorplan/view"],
+        )
+
+        self.assertEqual(
+            {"Floorplan": ["https://drive.google.com/file/d/floorplan/view"]},
+            updates,
+        )
+        self.assertEqual(
+            ["Property Address", "Flyer", "Manual Notes", "Floorplan"],
+            service.headers,
+        )
+        self.assertEqual("https://drive.google.com/file/d/floorplan/view", service.cells["FOR LEASE!D3"])
+
+    def test_partial_asset_write_raises_with_applied_updates(self):
+        service = FakeSheetsService(["Property Address", "Flyers"])
+        service.fail_ranges.add("FOR LEASE!C3")
+
+        with self.assertRaises(sheets.AssetLinkWriteError) as ctx:
+            sheets.append_links_to_flyer_link_column(
+                service,
+                "sheet-1",
+                list(service.headers),
+                3,
+                [
+                    "https://drive.google.com/file/d/flyer-one/view",
+                    "https://drive.google.com/file/d/flyer-two/view",
+                ],
+            )
+
+        self.assertEqual(
+            {
+                "Flyers": ["https://drive.google.com/file/d/flyer-one/view"],
+                "Flyers 2": ["https://drive.google.com/file/d/flyer-two/view"],
+            },
+            ctx.exception.applied_updates,
+        )
+        self.assertEqual(["Flyers 2"], ctx.exception.created_columns)
+        self.assertEqual("https://drive.google.com/file/d/flyer-one/view", service.cells["FOR LEASE!B3"])
+
+        service.fail_ranges.clear()
+        retry_updates = sheets.append_links_to_flyer_link_column(
+            service,
+            "sheet-1",
+            list(service.headers),
+            3,
+            [
+                "https://drive.google.com/file/d/flyer-one/view",
+                "https://drive.google.com/file/d/flyer-two/view",
+            ],
+        )
+        self.assertEqual({}, retry_updates)
 
     def test_existing_joined_links_are_deduped_but_never_appended(self):
         service = FakeSheetsService(["Property Address", "Flyer"])
@@ -181,6 +248,23 @@ class AssetColumnRoutingTests(unittest.TestCase):
             ),
         )
         self.assertEqual(["Property Address", "Flyer", "Floorplan"], service.headers)
+
+        image_only_service = FakeSheetsService(["Property Address", "Property Image"])
+        self.assertEqual(
+            {"Property Image": [candidate["url"]]},
+            sheets.write_property_image_columns(
+                image_only_service,
+                "sheet-1",
+                list(image_only_service.headers),
+                3,
+                {
+                    "Property Image": [candidate["url"]],
+                    "Property Image Source": [candidate["sourceLabel"]],
+                },
+            ),
+        )
+        self.assertEqual(["Property Address", "Property Image"], image_only_service.headers)
+        self.assertEqual(candidate["url"], image_only_service.cells["FOR LEASE!B3"])
 
 
 if __name__ == "__main__":
