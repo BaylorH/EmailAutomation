@@ -98,6 +98,30 @@ class AssetColumnRoutingTests(unittest.TestCase):
         self.assertNotIn("\n", service.cells["FOR LEASE!B3"])
         self.assertNotIn("\n", service.cells["FOR LEASE!C3"])
 
+    def test_single_flyer_uses_existing_plural_column_without_overflow(self):
+        service = FakeSheetsService(["Property Address", "Flyers", "Floorplan"])
+
+        updates = sheets.append_links_to_flyer_link_column(
+            service,
+            "sheet-1",
+            list(service.headers),
+            3,
+            ["https://drive.google.com/file/d/flyer/view"],
+        )
+
+        self.assertEqual(
+            {"Flyers": ["https://drive.google.com/file/d/flyer/view"]},
+            updates,
+        )
+        self.assertEqual(
+            ["Property Address", "Flyers", "Floorplan"],
+            service.headers,
+        )
+        self.assertEqual(
+            "https://drive.google.com/file/d/flyer/view",
+            service.cells["FOR LEASE!B3"],
+        )
+
     def test_multiple_flyers_are_written_one_link_per_cell(self):
         service = FakeSheetsService(["Property Address", "Flyers"])
 

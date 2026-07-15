@@ -217,7 +217,7 @@ CANONICAL_FIELDS = {
         "label": "Flyer / Link",
         "description": "Links to flyers or listings",
         "required_for_matching": False,
-        "default_aliases": ["flyer / link", "flyer/link", "flyer", "link", "links", "brochure", "listing link"],
+        "default_aliases": ["flyer / link", "flyer/link", "flyer", "flyers", "link", "links", "brochure", "listing link"],
         "extraction_hints": "URLs to property flyers or listings",
         "format": "url",
         "extractable": True,
