@@ -703,6 +703,97 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
         )
         sheets.spreadsheets.return_value.values.return_value.batchUpdate.assert_not_called()
 
+    def test_apply_sheet_rejects_plural_flyers_under_legacy_note_config(self):
+        sheets = mock.MagicMock()
+        column_config = {
+            "mappings": {},
+            "customFields": {
+                "Flyers": {
+                    "mode": "note",
+                    "description": "Extract value for Flyers",
+                }
+            },
+        }
+        with mock.patch.object(ai, "_sheets_client", return_value=sheets), mock.patch.object(
+            ai, "_get_first_tab_title", return_value="Sheet1"
+        ), mock.patch.object(ai, "_ensure_ai_meta_tab"), mock.patch.object(
+            ai, "_read_ai_meta_row", return_value=None
+        ), mock.patch.object(ai, "_append_ai_meta"), mock.patch.object(
+            ai, "_append_notes_to_comments"
+        ), mock.patch(
+            "email_automation.sheet_operations._apply_gross_rent_formula_for_row",
+            return_value=False,
+        ), mock.patch.object(ai, "_execute_with_retry", return_value={}):
+            result = ai.apply_proposal_to_sheet(
+                uid="user-1",
+                client_id="client-1",
+                sheet_id="sheet-1",
+                header=["Property Address", "Flyers"],
+                rownum=3,
+                current_rowvals=["912-930 Gemini St", ""],
+                proposal={
+                    "updates": [
+                        {
+                            "column": "Flyers",
+                            "value": "Attached flyer provided (broker-flyer.pdf).",
+                        }
+                    ]
+                },
+                column_config=column_config,
+            )
+
+        self.assertEqual([], result["applied"])
+        self.assertIn(
+            ("Flyers", "handled-by-asset-pipeline"),
+            {(item.get("column"), item.get("reason")) for item in result["skipped"]},
+        )
+        sheets.spreadsheets.return_value.values.return_value.batchUpdate.assert_not_called()
+
+    def test_apply_sheet_rejects_numbered_asset_columns(self):
+        sheets = mock.MagicMock()
+        column_config = {
+            "mappings": {},
+            "customFields": {
+                "Flyers 2": {"mode": "note", "description": "Second flyer"},
+                "Floorplan 3": {"mode": "note", "description": "Third floorplan"},
+            },
+        }
+        with mock.patch.object(ai, "_sheets_client", return_value=sheets), mock.patch.object(
+            ai, "_get_first_tab_title", return_value="Sheet1"
+        ), mock.patch.object(ai, "_ensure_ai_meta_tab"), mock.patch.object(
+            ai, "_read_ai_meta_row", return_value=None
+        ), mock.patch.object(ai, "_append_ai_meta"), mock.patch.object(
+            ai, "_append_notes_to_comments"
+        ), mock.patch(
+            "email_automation.sheet_operations._apply_gross_rent_formula_for_row",
+            return_value=False,
+        ), mock.patch.object(ai, "_execute_with_retry", return_value={}):
+            result = ai.apply_proposal_to_sheet(
+                uid="user-1",
+                client_id="client-1",
+                sheet_id="sheet-1",
+                header=["Property Address", "Flyers 2", "Floorplan 3"],
+                rownum=3,
+                current_rowvals=["912-930 Gemini St", "", ""],
+                proposal={
+                    "updates": [
+                        {"column": "Flyers 2", "value": "Second flyer attached."},
+                        {"column": "Floorplan 3", "value": "Third floorplan attached."},
+                    ]
+                },
+                column_config=column_config,
+            )
+
+        self.assertEqual([], result["applied"])
+        self.assertEqual(
+            {
+                ("Flyers 2", "handled-by-asset-pipeline"),
+                ("Floorplan 3", "handled-by-asset-pipeline"),
+            },
+            {(item.get("column"), item.get("reason")) for item in result["skipped"]},
+        )
+        sheets.spreadsheets.return_value.values.return_value.batchUpdate.assert_not_called()
+
     def test_no_change_logging_omits_existing_sheet_value(self):
         sheets = mock.MagicMock()
         output = io.StringIO()
@@ -828,6 +919,25 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
                 {"mappings": {"flyer_link": "Offering Materials"}},
             )
         )
+        self.assertTrue(
+            cc.is_asset_column_name(
+                "Offering Materials 2",
+                {"mappings": {"flyer_link": "Offering Materials"}},
+            )
+        )
+        legacy_config = {
+            "mappings": {},
+            "customFields": {
+                "Flyers": {
+                    "mode": "note",
+                    "description": "Extract value for Flyers",
+                }
+            },
+        }
+        self.assertTrue(cc.is_asset_column_name("Flyers", legacy_config))
+        self.assertTrue(cc.is_asset_column_name("Flyers 2", legacy_config))
+        self.assertTrue(cc.is_asset_column_name("Floorplan 3", legacy_config))
+        self.assertFalse(cc.is_asset_column_name("Flyers 1", legacy_config))
         self.assertFalse(cc.is_asset_column_name("Total SF"))
 
     def test_usable_manifest_filters_failures_by_identity_not_value(self):

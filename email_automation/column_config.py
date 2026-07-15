@@ -217,7 +217,7 @@ CANONICAL_FIELDS = {
         "label": "Flyer / Link",
         "description": "Links to flyers or listings",
         "required_for_matching": False,
-        "default_aliases": ["flyer / link", "flyer/link", "flyer", "link", "links", "brochure", "listing link"],
+        "default_aliases": ["flyer / link", "flyer/link", "flyer", "flyers", "link", "links", "brochure", "listing link"],
         "extraction_hints": "URLs to property flyers or listings",
         "format": "url",
         "extractable": True,
@@ -420,15 +420,20 @@ def is_asset_column_name(
     if not normalized:
         return False
 
+    candidate_names = {normalized}
+    numbered_match = re.fullmatch(r"(.+?)\s+(\d+)", normalized)
+    if numbered_match and int(numbered_match.group(2)) >= 2:
+        candidate_names.add(numbered_match.group(1).strip())
+
     mappings = column_config.get("mappings", {}) if isinstance(column_config, dict) else {}
     for canonical in ASSET_CANONICAL_FIELDS:
         configured_name = mappings.get(canonical)
-        if _normalized_column_name(configured_name) == normalized:
+        if _normalized_column_name(configured_name) in candidate_names:
             return True
 
         field = CANONICAL_FIELDS.get(canonical, {})
         known_names = [canonical, field.get("label"), *field.get("default_aliases", [])]
-        if normalized in {_normalized_column_name(name) for name in known_names if name}:
+        if candidate_names & {_normalized_column_name(name) for name in known_names if name}:
             return True
 
     return False
