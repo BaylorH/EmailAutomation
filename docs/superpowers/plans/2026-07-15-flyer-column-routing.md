@@ -210,8 +210,8 @@ git commit -m "fix: reserve plural flyer columns for assets"
 - [ ] **Step 1: Run the complete dashboard functions tests**
 
 ```bash
-cd /Users/baylorharrison/.config/superpowers/worktrees/email-admin-ui/codex-flyer-routing-20260715/functions
-node --test *.test.js
+cd /Users/baylorharrison/.config/superpowers/worktrees/email-admin-ui/codex-flyer-routing-20260715
+node --test functions/*.test.js
 ```
 
 Expected: zero failures.
@@ -250,6 +250,23 @@ Expected: only the design/plan, plural aliases, and focused regressions are pres
 - [ ] **Step 5: Request code review before deployment**
 
 Review for unintended alias collisions, legacy custom-field precedence, asset overwrite risk, and missing tests. Address actionable findings and rerun Steps 1-4.
+
+### Code Review Follow-Up: Reserve numbered asset-family columns
+
+The independent review identified that the attachment writer recognizes numbered
+asset-family headers such as `Flyers 2`, while the AI-write guard originally
+recognized only exact base aliases. The implementation must keep those definitions
+aligned.
+
+- [ ] Add regressions proving `Flyers 2`, `Floorplan 3`, and a numbered custom
+  mapping such as `Offering Materials 2` are asset columns, while `Flyers 1` is not.
+- [ ] Prove the real AI-write path skips text proposals targeting numbered flyer
+  and floorplan columns as `handled-by-asset-pipeline`.
+- [ ] In `is_asset_column_name`, compare both the normalized physical header and,
+  only when the suffix is an integer of at least 2, its unsuffixed base against
+  configured and canonical asset aliases.
+- [ ] Rerun the focused red-green tests, the 56-test worker safety suite, the
+  175-test dashboard Functions suite, and the production dashboard build.
 
 ### Task 4: Deploy and prove through the browser
 
