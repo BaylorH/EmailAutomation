@@ -48,7 +48,9 @@ import os
 from flask import Flask, jsonify, request
 
 from main import refresh_and_process_user
+from email_automation.clients import _fs
 from email_automation.scheduler_lease import run_with_user_lease
+from email_automation.worker_mailbox_readiness import read_worker_mailbox_readiness
 
 app = Flask(__name__)
 
@@ -94,13 +96,28 @@ def process_user():
         return jsonify({"status": "error", "error": "missing uid"}), 400
     uid = uid.strip()
 
+    readiness_result = {}
+
+    def process_ready_mailbox():
+        readiness = read_worker_mailbox_readiness(_fs, uid)
+        if not readiness.ready:
+            readiness_result["reason"] = readiness.reason
+            return
+        refresh_and_process_user(uid)
+
     try:
-        acquired = run_with_user_lease(uid, lambda: refresh_and_process_user(uid))
-    except Exception as e:  # noqa: BLE001 — any pipeline failure is a 500 so Tasks retries
+        acquired = run_with_user_lease(uid, process_ready_mailbox)
+    except Exception:  # noqa: BLE001 — any pipeline failure is a 500 so Tasks retries
         # Return 500 (not 200) so Cloud Tasks retries the delivery with backoff.
-        return jsonify({"status": "error", "error": str(e)}), 500
+        app.logger.error("process-user pipeline failed", extra={"uid": uid})
+        return jsonify({"status": "error", "error": "processing_failed"}), 500
 
     if acquired:
+        readiness_reason = readiness_result.get("reason")
+        if readiness_reason == "mailbox_readiness_unavailable":
+            return jsonify({"status": readiness_reason}), 503
+        if readiness_reason == "mailbox_not_ready":
+            return jsonify({"status": "blocked_mailbox_not_ready"}), 200
         return jsonify({"status": "processed", "uid": uid}), 200
     # A concurrent worker may already have taken its Firestore snapshot before
     # this request's outbox item was created. A non-2xx response keeps the Cloud

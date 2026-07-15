@@ -32,6 +32,9 @@ os.environ.setdefault(
 import service
 
 
+READY_MAILBOX = type("MailboxReadiness", (), {"ready": True, "reason": "ready"})()
+
+
 def _lease_runs(uid, fn, **kwargs):
     """Fake run_with_user_lease that acquires: run the callback, report processed."""
     fn()
@@ -46,6 +49,13 @@ def _lease_locked(uid, fn, **kwargs):
 class ProcessUserServiceTests(unittest.TestCase):
     def setUp(self):
         self.client = service.app.test_client()
+        self._readiness = patch.object(
+            service,
+            "read_worker_mailbox_readiness",
+            return_value=READY_MAILBOX,
+        )
+        self._readiness.start()
+        self.addCleanup(self._readiness.stop)
         # Auth disabled by default (env unset) unless a test opts in.
         os.environ.pop("PROCESS_USER_AUTH", None)
 
@@ -115,6 +125,63 @@ class ProcessUserServiceTests(unittest.TestCase):
         self.assertEqual("processed", second.get_json()["status"])
         refresh.assert_called_once_with("user-123")
 
+    def test_unready_mailbox_never_enters_the_pipeline_and_is_acknowledged(self):
+        unready = type(
+            "MailboxReadiness",
+            (),
+            {"ready": False, "reason": "mailbox_not_ready"},
+        )()
+        with patch.object(service, "read_worker_mailbox_readiness", return_value=unready), \
+                patch.object(service, "run_with_user_lease", side_effect=_lease_runs), \
+                patch.object(service, "refresh_and_process_user") as refresh:
+            resp = self.client.post("/process-user", json={"uid": "user-123"})
+
+        self.assertEqual(200, resp.status_code)
+        self.assertEqual("blocked_mailbox_not_ready", resp.get_json()["status"])
+        refresh.assert_not_called()
+
+    def test_queued_task_rechecks_mailbox_after_lease_acquisition_before_pipeline(self):
+        events = []
+        unready = type(
+            "MailboxReadiness",
+            (),
+            {"ready": False, "reason": "mailbox_not_ready"},
+        )()
+
+        def acquire_then_run(uid, fn, **kwargs):
+            events.append("lease_acquired")
+            fn()
+            return True
+
+        def read_after_enqueue(firestore_client, uid):
+            events.append("mailbox_rechecked")
+            return unready
+
+        with patch.object(service, "run_with_user_lease", side_effect=acquire_then_run), \
+                patch.object(service, "read_worker_mailbox_readiness", side_effect=read_after_enqueue), \
+                patch.object(service, "refresh_and_process_user") as refresh:
+            resp = self.client.post("/process-user", json={"uid": "user-123"})
+
+        self.assertEqual(200, resp.status_code)
+        self.assertEqual("blocked_mailbox_not_ready", resp.get_json()["status"])
+        self.assertEqual(["lease_acquired", "mailbox_rechecked"], events)
+        refresh.assert_not_called()
+
+    def test_mailbox_read_failure_is_retryable_and_never_enters_the_pipeline(self):
+        unavailable = type(
+            "MailboxReadiness",
+            (),
+            {"ready": False, "reason": "mailbox_readiness_unavailable"},
+        )()
+        with patch.object(service, "read_worker_mailbox_readiness", return_value=unavailable), \
+                patch.object(service, "run_with_user_lease", side_effect=_lease_runs), \
+                patch.object(service, "refresh_and_process_user") as refresh:
+            resp = self.client.post("/process-user", json={"uid": "user-123"})
+
+        self.assertEqual(503, resp.status_code)
+        self.assertEqual("mailbox_readiness_unavailable", resp.get_json()["status"])
+        refresh.assert_not_called()
+
     def test_missing_uid_returns_400(self):
         with patch.object(service, "run_with_user_lease", side_effect=_lease_runs), \
                 patch.object(service, "refresh_and_process_user") as refresh:
@@ -146,12 +213,20 @@ class ProcessUserServiceTests(unittest.TestCase):
         self.assertEqual(500, resp.status_code)
         body = resp.get_json()
         self.assertEqual("error", body["status"])
-        self.assertIn("graph exploded", body["error"])
+        self.assertEqual("processing_failed", body["error"])
+        self.assertNotIn("graph exploded", resp.get_data(as_text=True))
 
 
 class ProcessUserAuthTests(unittest.TestCase):
     def setUp(self):
         self.client = service.app.test_client()
+        self._readiness = patch.object(
+            service,
+            "read_worker_mailbox_readiness",
+            return_value=READY_MAILBOX,
+        )
+        self._readiness.start()
+        self.addCleanup(self._readiness.stop)
 
     def tearDown(self):
         os.environ.pop("PROCESS_USER_AUTH", None)

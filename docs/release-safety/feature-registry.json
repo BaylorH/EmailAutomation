@@ -908,7 +908,7 @@
       "releaseStatus": "later",
       "normalUserAccess": false,
       "ownerModules": {
-        "backend": ["email_automation/email.py", "email_automation/pending_responses.py"],
+        "backend": ["email_automation/email.py", "email_automation/pending_responses.py", "email_automation/worker_mailbox_readiness.py"],
         "frontend": [],
         "functions": ["functions/index.js"],
         "firestoreRules": []
