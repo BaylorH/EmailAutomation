@@ -159,7 +159,7 @@ class CorePropertyExtractionWrongRecipientTests(unittest.TestCase):
         self.assertEqual(1, len(fake_sheets.values_api.batch_update_calls))
         written = fake_sheets.values_api.batch_update_calls[0]["data"][0]
         self.assertEqual("Sheet1!C3", written["range"])
-        self.assertEqual([["6,000"]], written["values"])
+        self.assertEqual([[6000]], written["values"])
 
         # --- NEGATIVE CONTROL: identical inputs EXCEPT the AI_META anchor now
         # matches the current row (a genuine prior AI write on THIS property, since

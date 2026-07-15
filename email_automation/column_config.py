@@ -19,6 +19,7 @@ CANONICAL FIELDS:
 
 import json
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Any
 
 
@@ -325,6 +326,91 @@ def get_field_aliases(canonical: str) -> List[str]:
     return aliases
 
 
+def canonical_field_for_column(
+    actual_name: str,
+    column_config: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Resolve a physical sheet header to its canonical field definition."""
+    normalized = _normalized_column_name(actual_name)
+    if not normalized:
+        return None
+
+    mappings = column_config.get("mappings", {}) if isinstance(column_config, dict) else {}
+    for canonical, configured_name in mappings.items():
+        if _normalized_column_name(configured_name) == normalized:
+            return canonical
+
+    for canonical, field in CANONICAL_FIELDS.items():
+        known_names = [
+            canonical,
+            field.get("label"),
+            *field.get("default_aliases", []),
+            *field.get("legacy_aliases", []),
+        ]
+        if normalized in {
+            _normalized_column_name(name)
+            for name in known_names
+            if isinstance(name, str) and name.strip()
+        }:
+            return canonical
+    return None
+
+
+_SHEET_NUMBER_RE = re.compile(
+    r"^[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?$"
+)
+
+
+def coerce_sheet_value_for_column(
+    actual_name: str,
+    value: Any,
+    column_config: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Return a JSON numeric value for recognized number/currency columns."""
+    canonical = canonical_field_for_column(actual_name, column_config)
+    field_format = CANONICAL_FIELDS.get(canonical or "", {}).get("format")
+    if field_format not in {"number", "currency"} or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if not isinstance(value, str):
+        return value
+
+    candidate = value.strip()
+    if field_format == "currency" and candidate.startswith("$"):
+        candidate = candidate[1:].strip()
+    if not _SHEET_NUMBER_RE.fullmatch(candidate):
+        return value
+
+    try:
+        parsed = Decimal(candidate.replace(",", ""))
+    except InvalidOperation:
+        return value
+    return float(parsed) if "." in candidate else int(parsed)
+
+
+def sheet_values_equal_for_column(
+    actual_name: str,
+    left: Any,
+    right: Any,
+    column_config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Compare formatted and raw numeric values without false override flags."""
+    left_typed = coerce_sheet_value_for_column(actual_name, left, column_config)
+    right_typed = coerce_sheet_value_for_column(actual_name, right, column_config)
+    numeric_types = (int, float)
+    if (
+        isinstance(left_typed, numeric_types)
+        and not isinstance(left_typed, bool)
+        and isinstance(right_typed, numeric_types)
+        and not isinstance(right_typed, bool)
+    ):
+        return Decimal(str(left_typed)) == Decimal(str(right_typed))
+    left_text = "" if left is None else str(left)
+    right_text = "" if right is None else str(right)
+    return left_text == right_text
+
+
 def is_asset_column_name(
     actual_name: str,
     column_config: Optional[Dict[str, Any]] = None,
@@ -349,7 +435,8 @@ def is_asset_column_name(
 
 
 def _normalized_column_name(name: str) -> str:
-    return (name or "").strip().lower()
+    normalized = " ".join((name or "").strip().lower().split())
+    return re.sub(r"\s*/\s*", "/", normalized)
 
 
 def _find_header_index_for_aliases(header: List[str], aliases: List[str]) -> Optional[int]:
