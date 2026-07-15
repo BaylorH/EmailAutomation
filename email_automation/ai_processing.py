@@ -1872,17 +1872,23 @@ def _augment_proposal_with_deterministic_extractions(
             competing_pdf_rents.add(normalized_pdf_rent)
 
     trusted_pdf_total_sfs = []
+    competing_pdf_total_sfs = set()
     for pdf in (pdf_manifest or []):
         pdf_source = "\n".join((
             (pdf or {}).get("name") or "",
             (pdf or {}).get("text") or "",
         ))
         pdf_total_sf = _extract_total_sf_from_text((pdf or {}).get("text") or "")
-        if (
-            pdf_total_sf
-            and _attachment_can_supply_target_facts(pdf_source, target_anchor, fresh_text)
+        normalized_pdf_total_sf = _normalized_numeric_value(pdf_total_sf)
+        if pdf_total_sf and _attachment_can_supply_target_facts(
+            pdf_source, target_anchor, fresh_text
         ):
             trusted_pdf_total_sfs.append(pdf_total_sf)
+        elif (
+            _attachment_property_verdict(pdf_source, target_anchor) in {"competing", "mixed"}
+            and normalized_pdf_total_sf is not None
+        ):
+            competing_pdf_total_sfs.add(normalized_pdf_total_sf)
 
     # Validate model-proposed facts before any event-specific early return. A
     # terminal/new-property proposal must not carry an unsafe current-row write.
@@ -1925,6 +1931,11 @@ def _augment_proposal_with_deterministic_extractions(
             if normalized is not None
         }
         if trusted_total_sfs and proposed_total_sf not in trusted_total_sfs:
+            _remove_proposal_update(proposal, total_sf_col)
+        elif (
+            proposed_total_sf in competing_pdf_total_sfs
+            and proposed_total_sf not in trusted_total_sfs
+        ):
             _remove_proposal_update(proposal, total_sf_col)
         elif (
             proposed_total_sf in _component_sf_values(fresh_text)

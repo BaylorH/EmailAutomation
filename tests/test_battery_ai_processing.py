@@ -546,6 +546,32 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             )
         )
 
+    def test_mixed_property_attachment_cannot_preserve_competing_total_sf(self):
+        proposal = {
+            "updates": [{
+                "column": "Total SF",
+                "value": "45,000 SF",
+                "confidence": 0.9,
+            }],
+            "events": [{"type": "property_unavailable"}],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["123 Test Dr", ""],
+            ["Property Address", "Total SF"],
+            {"mappings": {"total_sf": "Total SF"}},
+            _conv("The 123 Test Dr property is unavailable; see attached."),
+            pdf_manifest=[{
+                "name": "portfolio flyer.pdf",
+                "text": (
+                    "Portfolio overview for 123 Test Dr. "
+                    "322 Spring Hill Dr - Total Building Size: 45,000 SF."
+                ),
+            }],
+        )
+
+        self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
     def test_fact_suppression_runs_before_terminal_event_early_return(self):
         proposal = {
             "updates": [{
