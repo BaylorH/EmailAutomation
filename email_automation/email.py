@@ -7,6 +7,7 @@ import uuid
 import logging
 from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
+from google.cloud import firestore
 from google.cloud.firestore import SERVER_TIMESTAMP, Increment
 from .utils import (
     GRAPH_SEND_MAX_RETRIES,
@@ -2306,6 +2307,58 @@ def _finalize_successful_outbox_item(
         audit_payload["partialSend"] = False
         audit_payload["remainingRecipients"] = []
     _update_action_audit(user_id, data.get("actionAuditId"), audit_payload)
+
+    source_dead_letter_id = str(data.get("sourceDeadLetterId") or "").strip()
+    if source_dead_letter_id:
+        try:
+            source_ref = (
+                _fs.collection("users").document(user_id)
+                .collection("deadLetterQueue").document(source_dead_letter_id)
+            )
+            @firestore.transactional
+            def reconcile_reviewed_reply(transaction):
+                source_snapshot = source_ref.get(transaction=transaction)
+                source_data = source_snapshot.to_dict() if getattr(source_snapshot, "exists", False) else {}
+                source_reason = " ".join(
+                    str(source_data.get(key) or "")
+                    for key in ("failureReason", "lastError")
+                ).lower()
+                source_statuses = {
+                    str(source_data.get("status") or "").strip().lower(),
+                    str(source_data.get("recoveryStatus") or "").strip().lower(),
+                }
+                resolved_statuses = {"acknowledged", "discarded", "reconciled", "requeued"}
+                matches_review = bool(
+                    source_data
+                    and source_data.get("source") == "pendingResponses"
+                    and not source_data.get("alreadySent")
+                    and source_data.get("clientId") == client_id
+                    and source_data.get("threadId") == data.get("threadId")
+                    and ("manual review" in source_reason or "automatic inbox replies are disabled" in source_reason)
+                    and not (source_statuses & resolved_statuses)
+                )
+                if not matches_review:
+                    return False
+
+                transaction.set(source_ref, {
+                    "status": "reconciled",
+                    "recoveryStatus": "reconciled",
+                    "resolution": "reviewed_reply_sent",
+                    "resolvedAt": SERVER_TIMESTAMP,
+                    "updatedAt": SERVER_TIMESTAMP,
+                    "resolvedByOutboxId": getattr(doc_ref, "id", None),
+                    "resolvedByActionAuditId": data.get("actionAuditId"),
+                }, merge=True)
+                return True
+
+            if not reconcile_reviewed_reply(_fs.transaction()):
+                raise ValueError("source dead-letter does not match this unresolved reply review")
+            print(f"   ✅ Resolved reviewed reply draft {source_dead_letter_id} after send")
+        except Exception as e:
+            # The send already succeeded. Keep finalization moving and leave the
+            # review visible for reconciliation instead of risking a duplicate.
+            print(f"   ⚠️ Could not resolve reviewed reply draft {source_dead_letter_id}: {e}")
+
     _mark_tour_invite_thread_sent(
         user_id,
         data,

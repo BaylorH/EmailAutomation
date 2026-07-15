@@ -34,7 +34,9 @@ class FakeFirestoreNode:
     def delete(self):
         self.root.deleted_paths.append(tuple(self.path))
 
-    def get(self):
+    def get(self, transaction=None):
+        if transaction is not None:
+            return transaction.get(self)
         data = self.root.seeded.get(tuple(self.path))
         return type(
             "Snapshot",
@@ -58,6 +60,9 @@ class FakeFirestore:
         self.deleted_paths = []
         self.set_calls = []
         self.add_calls = []
+        self.transactions_started = 0
+        self.version = 0
+        self.after_transaction_read = None
         self.seeded = {
             (
                 "collection", "users", "document", "uid-1",
@@ -70,6 +75,52 @@ class FakeFirestore:
 
     def collection(self, name):
         return FakeFirestoreNode(self, ["collection", name])
+
+    def transaction(self):
+        self.transactions_started += 1
+        return FakeTransaction(self)
+
+
+class FakeTransactionConflict(Exception):
+    pass
+
+
+class FakeTransaction:
+    def __init__(self, root):
+        self.root = root
+        self.read_version = None
+
+    def get(self, ref):
+        data = self.root.seeded.get(tuple(ref.path))
+        snapshot = type(
+            "Snapshot",
+            (),
+            {
+                "exists": data is not None,
+                "to_dict": lambda _self: dict(data or {}),
+            },
+        )()
+        self.read_version = self.root.version
+        mutation = self.root.after_transaction_read
+        if mutation is not None:
+            self.root.after_transaction_read = None
+            mutation(self.root, tuple(ref.path))
+            self.root.version += 1
+        return snapshot
+
+    def set(self, ref, data, merge=False):
+        if self.read_version != self.root.version:
+            raise FakeTransactionConflict("document changed after transactional read")
+        self.root.set_calls.append((tuple(ref.path), data, merge))
+
+
+def fake_transactional(callback):
+    def run(transaction):
+        try:
+            return callback(transaction)
+        except FakeTransactionConflict:
+            return callback(transaction.root.transaction())
+    return run
 
 
 class FakeResponse:
@@ -150,6 +201,121 @@ class BackendActionAuditTests(unittest.TestCase):
         self.assertEqual(audit_payload["internetMessageId"], "<internet-message-1@example.com>")
         self.assertEqual(audit_payload["sentThreadId"], "thread-graph-1")
         self.assertEqual(audit_payload["conversationId"], "conversation-graph-1")
+
+    def test_successful_reviewed_reply_resolves_its_dead_letter_after_send(self):
+        outbox_ref = FakeOutboxRef("outbox-reviewed-reply")
+        fake_fs = FakeFirestore()
+        fake_fs.seeded[(
+            "collection", "users", "document", "uid-1",
+            "collection", "deadLetterQueue", "document", "dead-review-1",
+        )] = {
+            "source": "pendingResponses",
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "failureReason": "Automatic inbox replies are disabled; manual review required before auto-reply",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), patch(
+            "email_automation.email.firestore.transactional",
+            fake_transactional,
+        ):
+            email_module._finalize_successful_outbox_item(
+                "uid-1",
+                outbox_ref,
+                {
+                    "clientId": "client-1",
+                    "threadId": "thread-1",
+                    "actionAuditId": "audit-review-1",
+                    "sourceDeadLetterId": "dead-review-1",
+                },
+            )
+
+        dead_letter_updates = [
+            call for call in fake_fs.set_calls
+            if call[0] == (
+                "collection", "users", "document", "uid-1",
+                "collection", "deadLetterQueue", "document", "dead-review-1",
+            )
+        ]
+        self.assertEqual(1, len(dead_letter_updates))
+        self.assertEqual("reconciled", dead_letter_updates[0][1]["status"])
+        self.assertEqual("reviewed_reply_sent", dead_letter_updates[0][1]["resolution"])
+        self.assertEqual("outbox-reviewed-reply", dead_letter_updates[0][1]["resolvedByOutboxId"])
+        self.assertTrue(dead_letter_updates[0][2])
+        self.assertEqual(1, fake_fs.transactions_started)
+
+    def test_successful_send_cannot_resolve_an_unrelated_dead_letter(self):
+        outbox_ref = FakeOutboxRef("outbox-unrelated-review")
+        fake_fs = FakeFirestore()
+        fake_fs.seeded[(
+            "collection", "users", "document", "uid-1",
+            "collection", "deadLetterQueue", "document", "dead-review-2",
+        )] = {
+            "source": "pendingResponses",
+            "clientId": "other-client",
+            "threadId": "other-thread",
+            "failureReason": "manual review required",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs), patch(
+            "email_automation.email.firestore.transactional",
+            fake_transactional,
+        ):
+            email_module._finalize_successful_outbox_item(
+                "uid-1",
+                outbox_ref,
+                {
+                    "clientId": "client-1",
+                    "threadId": "thread-1",
+                    "actionAuditId": "audit-review-2",
+                    "sourceDeadLetterId": "dead-review-2",
+                },
+            )
+
+        dead_letter_updates = [
+            call for call in fake_fs.set_calls
+            if call[0][-4:] == ("collection", "deadLetterQueue", "document", "dead-review-2")
+        ]
+        self.assertEqual([], dead_letter_updates)
+        self.assertTrue(outbox_ref.deleted)
+
+    def test_reviewed_reply_reconciliation_retries_a_mid_flight_state_change(self):
+        outbox_ref = FakeOutboxRef("outbox-concurrent-review")
+        fake_fs = FakeFirestore()
+        dead_letter_path = (
+            "collection", "users", "document", "uid-1",
+            "collection", "deadLetterQueue", "document", "dead-review-3",
+        )
+        fake_fs.seeded[dead_letter_path] = {
+            "source": "pendingResponses",
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "failureReason": "manual review required",
+        }
+
+        def discard_during_transaction(root, path):
+            root.seeded[path] = {**root.seeded[path], "status": "discarded"}
+
+        fake_fs.after_transaction_read = discard_during_transaction
+
+        with patch("email_automation.clients._fs", fake_fs), patch(
+            "email_automation.email.firestore.transactional",
+            fake_transactional,
+        ):
+            email_module._finalize_successful_outbox_item(
+                "uid-1",
+                outbox_ref,
+                {
+                    "clientId": "client-1",
+                    "threadId": "thread-1",
+                    "sourceDeadLetterId": "dead-review-3",
+                },
+            )
+
+        dead_letter_updates = [call for call in fake_fs.set_calls if call[0] == dead_letter_path]
+        self.assertEqual([], dead_letter_updates)
+        self.assertEqual(2, fake_fs.transactions_started)
+        self.assertTrue(outbox_ref.deleted)
 
     def test_successful_tour_invite_send_marks_thread_awaiting_confirmation(self):
         outbox_ref = FakeOutboxRef("outbox-tour")
