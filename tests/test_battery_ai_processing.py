@@ -539,7 +539,7 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             "322 Spring Hill Dr is asking $15.00/SF/yr."
         )
         self.assertFalse(
-            a._attachment_can_supply_target_facts(
+            a._attachment_can_supply_target_rent(
                 source,
                 "123 Test Dr, Boise",
                 "The 123 Test Dr property is available; see attached.",
@@ -565,6 +565,42 @@ class RentOpexSfExtractionTests(unittest.TestCase):
         )
         self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
 
+    def test_terminal_event_drops_total_sf_not_supported_by_explicit_total(self):
+        proposal = {
+            "updates": [{
+                "column": "Total SF",
+                "value": "11,000 SF",
+                "confidence": 0.9,
+            }],
+            "events": [{"type": "property_unavailable"}],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["123 Test Dr", ""],
+            ["Property Address", "Total SF"],
+            {"mappings": {"total_sf": "Total SF"}},
+            _conv("123 Test Dr has 10,000 SF total but is unavailable."),
+        )
+        self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
+    def test_terminal_event_drops_rent_not_supported_by_explicit_rent(self):
+        proposal = {
+            "updates": [{
+                "column": "Rent/SF /Yr",
+                "value": "$15/SF",
+                "confidence": 0.9,
+            }],
+            "events": [{"type": "property_unavailable"}],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["123 Test Dr", ""],
+            ["Property Address", "Rent/SF /Yr"],
+            {"mappings": {"rent_sf_yr": "Rent/SF /Yr"}},
+            _conv("123 Test Dr has asking rent of $12.75/SF/year but is unavailable."),
+        )
+        self.assertIsNone(a._proposal_update_for_column(out, "Rent/SF /Yr"))
+
     def test_same_number_different_street_attachment_is_not_target_property(self):
         self.assertFalse(
             a._attachment_can_supply_target_facts(
@@ -582,6 +618,12 @@ class RentOpexSfExtractionTests(unittest.TestCase):
                 "The 123 Test Dr property is available; see attached.",
             )
         )
+
+    def test_suite_number_is_not_parsed_as_a_street_address(self):
+        claims = a._street_claim_spans("Suite 100, 123 Test Dr")
+        self.assertEqual([a._claim_identity(claim) for claim in claims], [
+            ("123", ("test",), "drive"),
+        ])
 
     def test_target_flyer_ignores_brokerage_footer_address(self):
         proposal = {
@@ -655,6 +697,14 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             "Asking rate: $1.25/SF/month NNN."), "15.00")
         self.assertEqual(a._extract_rent_sf_yr_from_text(
             "Asking rent: $9.00/SF NNN, available next month."), "9.00")
+
+    def test_rent_does_not_inherit_monthly_unit_from_following_opex(self):
+        self.assertEqual(
+            a._extract_rent_sf_yr_from_text(
+                "$12.75/SF asking rent, $0.30/SF/month OpEx"
+            ),
+            "12.75",
+        )
 
     # R20 — recency/"now" preference: a current asking rate supersedes a stale
     # prior quote in the same line. First-match ordering returned the superseded

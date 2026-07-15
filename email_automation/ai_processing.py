@@ -1547,7 +1547,15 @@ def _extract_rent_sf_yr_from_text(text: str) -> Optional[str]:
                     continue
             # Cents figures are expressed in cents/SF; convert to dollars/SF.
             value = float(match.group(1)) / 100.0 if pattern is cents_basis else float(match.group(1))
-            unit_context = text[max(0, match.start() - 40): min(len(text), match.end() + 50)]
+            before_unit_context = text[max(0, match.start() - 40):match.start()]
+            prior_figure = list(_RENT_NUMERIC_VALUE_RE.finditer(before_unit_context))
+            if prior_figure:
+                before_unit_context = before_unit_context[prior_figure[-1].end():]
+            after_unit_context = text[match.end():min(len(text), match.end() + 50)]
+            next_figure = _RENT_NUMERIC_VALUE_RE.search(after_unit_context)
+            if next_figure:
+                after_unit_context = after_unit_context[:next_figure.start()]
+            unit_context = before_unit_context + match.group(0) + after_unit_context
             is_monthly = bool(monthly_unit.search(unit_context)) and not bool(annual_unit.search(unit_context))
             if pattern in basis_patterns and not is_monthly:
                 # A bare per-SF basis rate under ~$3 is a monthly figure (e.g.
@@ -1724,6 +1732,8 @@ def _street_claim_spans(text: str) -> List[tuple]:
                 names = tuple(
                     match.group(0) for match in tokens[index + 1:suffix_index]
                 )
+                if any(name.isdigit() for name in names):
+                    break
                 claims.append((
                     token_match.start(),
                     tokens[suffix_index].end(),
@@ -1861,6 +1871,19 @@ def _augment_proposal_with_deterministic_extractions(
         ):
             competing_pdf_rents.add(normalized_pdf_rent)
 
+    trusted_pdf_total_sfs = []
+    for pdf in (pdf_manifest or []):
+        pdf_source = "\n".join((
+            (pdf or {}).get("name") or "",
+            (pdf or {}).get("text") or "",
+        ))
+        pdf_total_sf = _extract_total_sf_from_text((pdf or {}).get("text") or "")
+        if (
+            pdf_total_sf
+            and _attachment_can_supply_target_facts(pdf_source, target_anchor, fresh_text)
+        ):
+            trusted_pdf_total_sfs.append(pdf_total_sf)
+
     # Validate model-proposed facts before any event-specific early return. A
     # terminal/new-property proposal must not carry an unsafe current-row write.
     existing_rent = _proposal_update_for_column(proposal, rent_col) if rent_col else None
@@ -1874,7 +1897,13 @@ def _augment_proposal_with_deterministic_extractions(
             )
             if normalized is not None
         }
-        if proposed_rent in competing_pdf_rents and proposed_rent not in trusted_rents:
+        if (
+            (trusted_rents and proposed_rent not in trusted_rents)
+            or (
+                proposed_rent in competing_pdf_rents
+                and proposed_rent not in trusted_rents
+            )
+        ):
             _remove_proposal_update(proposal, rent_col)
 
     total_sf_value = _extract_total_sf_from_text(fresh_text)
@@ -1884,7 +1913,20 @@ def _augment_proposal_with_deterministic_extractions(
     if existing_total_sf:
         proposed_total_sf = _normalized_numeric_value(existing_total_sf.get("value"))
         normalized_total_sf = _normalized_numeric_value(total_sf_value)
-        if (
+        trusted_total_sfs = {
+            normalized
+            for normalized in (
+                [normalized_total_sf]
+                + [
+                    _normalized_numeric_value(value)
+                    for value in trusted_pdf_total_sfs
+                ]
+            )
+            if normalized is not None
+        }
+        if trusted_total_sfs and proposed_total_sf not in trusted_total_sfs:
+            _remove_proposal_update(proposal, total_sf_col)
+        elif (
             proposed_total_sf in _component_sf_values(fresh_text)
             and proposed_total_sf != normalized_total_sf
         ):
@@ -2686,6 +2728,23 @@ def _append_ai_meta(
 
     except Exception as e:
         print(f"⚠️ Failed to append AI_META record: {e}")
+        raise
+
+
+def _ai_meta_confirms_value(
+    rows: List[List[Any]],
+    rownum: int,
+    column: str,
+    value: str,
+    row_anchor: str,
+) -> bool:
+    meta = _find_ai_meta_row(
+        rows,
+        rownum,
+        column,
+        row_anchor=row_anchor,
+    )
+    return bool(meta and str(meta.get("last_ai_value")) == str(value))
 
 def _normalize_comment_bullet(bullet: str) -> str:
     """Normalize a bullet fact for dedup comparison: lowercase, collapse
@@ -2820,23 +2879,23 @@ def apply_proposal_to_sheet(
     Applies proposal['updates'] to the sheet row with AI write guards.
     Returns {"applied":[...], "skipped":[...]} items with old/new values.
     """
+    if not proposal or not isinstance(proposal.get("updates"), list) or not proposal["updates"]:
+        row_anchor = get_row_anchor(current_rowvals, header)
+        return {
+            "applied": [],
+            "skipped": [{"reason": "no-updates"}],
+            "rowNumber": rownum,
+            "targetAnchor": row_anchor,
+            "rowSnapshotBefore": _build_row_snapshot(header, current_rowvals),
+            "rowSnapshotAfter": _build_row_snapshot(header, current_rowvals),
+        }
+
     try:
         sheets = _sheets_client()
         tab_title = _get_first_tab_title(sheets, sheet_id)
         
         _ensure_ai_meta_tab(sheets, sheet_id)
         ai_meta_rows = _load_ai_meta_rows(sheets, sheet_id)
-
-        if not proposal or not isinstance(proposal.get("updates"), list):
-            row_anchor = get_row_anchor(current_rowvals, header)
-            return {
-                "applied": [],
-                "skipped": [{"reason": "no-updates"}],
-                "rowNumber": rownum,
-                "targetAnchor": row_anchor,
-                "rowSnapshotBefore": _build_row_snapshot(header, current_rowvals),
-                "rowSnapshotAfter": _build_row_snapshot(header, current_rowvals),
-            }
 
         idx_map = _header_index_map(header)
         row_anchor = get_row_anchor(current_rowvals, header)
@@ -2974,8 +3033,26 @@ def apply_proposal_to_sheet(
             "apply_proposal_batch_update"
         )
 
-        # Update AI_META for each applied change
-        for a in applied:
+        def _rollback_unprotected(changes: List[dict]) -> None:
+            if not changes:
+                return
+            _execute_with_retry(
+                sheets.spreadsheets().values().batchUpdate(
+                    spreadsheetId=sheet_id,
+                    body={
+                        "valueInputOption": "RAW",
+                        "data": [
+                            {"range": change["range"], "values": [[change["oldValue"]]]}
+                            for change in changes
+                        ],
+                    },
+                ),
+                "rollback_unprotected_sheet_values",
+            )
+
+        # Append each guard record after the value batch. If the append response
+        # is lost, read back AI_META before deciding whether a rollback is needed.
+        for index, a in enumerate(applied):
             logger.debug(
                 "sheet.ai_meta_append",
                 extra={
@@ -2988,16 +3065,49 @@ def apply_proposal_to_sheet(
                     "source": "apply_proposal_to_sheet",
                 },
             )
-            _append_ai_meta(
-                sheets,
-                sheet_id,
-                rownum,
-                a["column"],
-                a["newValue"],
-                override=False,
-                row_anchor=row_anchor,
-                ensure_tab=False,
-            )
+            try:
+                _append_ai_meta(
+                    sheets,
+                    sheet_id,
+                    rownum,
+                    a["column"],
+                    a["newValue"],
+                    override=False,
+                    row_anchor=row_anchor,
+                    ensure_tab=False,
+                )
+            except Exception as meta_error:
+                try:
+                    latest_meta_rows = _load_ai_meta_rows(sheets, sheet_id)
+                except Exception as readback_error:
+                    # Without readback, no changed value may remain potentially
+                    # unguarded. Roll back this value and every later value.
+                    try:
+                        _rollback_unprotected(applied[index:])
+                    except Exception as rollback_error:
+                        raise RuntimeError(
+                            "AI_META append, readback, and rollback all failed"
+                        ) from rollback_error
+                    raise RuntimeError(
+                        "AI_META append outcome could not be reconciled"
+                    ) from readback_error
+
+                if _ai_meta_confirms_value(
+                    latest_meta_rows,
+                    rownum,
+                    a["column"],
+                    a["newValue"],
+                    row_anchor,
+                ):
+                    continue
+
+                try:
+                    _rollback_unprotected(applied[index:])
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        "AI_META append failed and sheet rollback failed"
+                    ) from rollback_error
+                raise meta_error
 
         try:
             from .sheet_operations import _apply_gross_rent_formula_for_row

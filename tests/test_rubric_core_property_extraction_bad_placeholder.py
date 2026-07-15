@@ -48,6 +48,9 @@ class FakeValues:
         self.batch_update_calls.append(body)
         return FakeRequest({})
 
+    def append(self, spreadsheetId=None, range=None, valueInputOption=None, body=None, **kwargs):
+        return FakeRequest({})
+
 
 class FakeSpreadsheets:
     def __init__(self, values):

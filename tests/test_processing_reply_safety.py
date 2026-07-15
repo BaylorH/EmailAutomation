@@ -286,7 +286,7 @@ class ProcessingReplySafetyTests(unittest.TestCase):
              patch("email_automation.email._source_message_reply_all_fallback", side_effect=lambda draft, _current_meta: draft), \
              patch("email_automation.email._reviewed_recipient_reply_all_fallback", side_effect=lambda draft, to_emails=None: draft), \
              patch("email_automation.email._filter_reply_all_draft_recipients", return_value=recipient_result), \
-             patch("email_automation.email._delete_graph_reply_draft"):
+             patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
             sent = processing.send_reply_in_thread(
                 user_id="uid-1",
                 headers={"Authorization": "Bearer token"},
@@ -302,6 +302,8 @@ class ProcessingReplySafetyTests(unittest.TestCase):
             processing.send_reply_in_thread.last_outcome,
         )
         self.assertIn("opted out", processing.send_reply_in_thread.last_error.lower())
+        delete_draft.assert_called_once()
+        self.assertEqual("draft-1", delete_draft.call_args.args[1])
 
     def test_tour_actions_default_allowlist_is_baylor_only(self):
         with patch.dict(os.environ, {}, clear=True):

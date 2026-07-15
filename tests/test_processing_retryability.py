@@ -90,7 +90,7 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         with patch.object(ai_processing, "_sheets_client", return_value=sheets), \
              patch.object(ai_processing, "_get_first_tab_title", return_value="Properties"), \
              patch.object(ai_processing, "_ensure_ai_meta_tab"), \
-             patch.object(ai_processing, "_read_ai_meta_row", return_value=None), \
+             patch.object(ai_processing, "_load_ai_meta_rows", return_value=[]), \
              patch.object(ai_processing, "_execute_with_retry", side_effect=quota_error):
             with self.assertRaises(HttpError) as raised:
                 ai_processing.apply_proposal_to_sheet(
