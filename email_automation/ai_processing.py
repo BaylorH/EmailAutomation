@@ -2998,7 +2998,7 @@ def apply_proposal_to_sheet(
                     "column": col_name,
                     "reason": "no-change",
                     "oldValue": old_val,
-                    "newValue": typed_new_val,
+                    "newValue": new_val,
                 })
                 continue
 

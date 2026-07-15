@@ -76,6 +76,16 @@ class NumericSheetValueTests(unittest.TestCase):
         self.assertEqual([], [item for item in result["skipped"] if item["reason"] == "human-override"])
         self.assertEqual([[16.0]], body["data"][0]["values"])
 
+    def test_no_change_audit_preserves_original_string_value(self):
+        result, body = self._apply(
+            header=["Property Address", "Rent/SF /Yr"],
+            rowvals=["123 Industrial Ave", "$15.00"],
+            update={"column": "Rent/SF /Yr", "value": "15.00", "confidence": 0.99},
+        )
+
+        self.assertIsNone(body)
+        self.assertEqual("15.00", result["skipped"][0]["newValue"])
+
 
 if __name__ == "__main__":
     unittest.main()
