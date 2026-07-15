@@ -1453,8 +1453,8 @@ def _skip_inbox_retry_after_manual_continuation(
 
 PDF_LINK_CHANGE_REASON = "Broker PDF attachment uploaded to Drive."
 PDF_LINK_COLUMN_ALIASES = {
-    "Flyer / Link": ("flyer / link", "flyer/link", "flyer"),
-    "Floorplan": ("floorplan", "floor plan"),
+    "Flyer / Link": ("flyer / link", "flyer/link", "flyer link", "flyer", "flyers", "brochure", "brochures"),
+    "Floorplan": ("floorplan", "floorplans", "floor plan", "floor plans", "floor plan / link", "floorplan / link"),
 }
 
 
@@ -5445,21 +5445,21 @@ def process_inbox_message(
                     property_image_updates_for_results: Dict[str, List[str]] = {}
 
                     if flyer_links:
-                        added_flyer_links = append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
-                        if added_flyer_links:
-                            pdf_link_updates_for_results["Flyer / Link"] = added_flyer_links
+                        flyer_updates = append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
+                        for column, added_flyer_links in flyer_updates.items():
+                            pdf_link_updates_for_results[column] = added_flyer_links
                             logger.debug(
                                 "sheet.ai_meta_append",
                                 extra={
                                     "spreadsheet_id": sheet_id,
                                     "rownum": rownum,
-                                    "column": "Flyer / Link",
+                                    "column": column,
                                     "value": "\n".join(added_flyer_links),
                                     "override": False,
                                     "source": "pdf_link_write",
                                 },
                             )
-                            _append_ai_meta(sheets, sheet_id, rownum, "Flyer / Link", "\n".join(added_flyer_links), override=False)
+                            _append_ai_meta(sheets, sheet_id, rownum, column, "\n".join(added_flyer_links), override=False)
                         print(f"   🔗 Applied {len(flyer_links)} flyer link(s) to current row")
 
                     # Delay between writes to avoid Google Sheets API rate limits
@@ -5468,21 +5468,21 @@ def process_inbox_message(
                         time.sleep(30)
 
                     if floorplan_links:
-                        added_floorplan_links = append_links_to_floorplan_column(sheets, sheet_id, header, rownum, floorplan_links)
-                        if added_floorplan_links:
-                            pdf_link_updates_for_results["Floorplan"] = added_floorplan_links
+                        floorplan_updates = append_links_to_floorplan_column(sheets, sheet_id, header, rownum, floorplan_links)
+                        for column, added_floorplan_links in floorplan_updates.items():
+                            pdf_link_updates_for_results[column] = added_floorplan_links
                             logger.debug(
                                 "sheet.ai_meta_append",
                                 extra={
                                     "spreadsheet_id": sheet_id,
                                     "rownum": rownum,
-                                    "column": "Floorplan",
+                                    "column": column,
                                     "value": "\n".join(added_floorplan_links),
                                     "override": False,
                                     "source": "pdf_link_write",
                                 },
                             )
-                            _append_ai_meta(sheets, sheet_id, rownum, "Floorplan", "\n".join(added_floorplan_links), override=False)
+                            _append_ai_meta(sheets, sheet_id, rownum, column, "\n".join(added_floorplan_links), override=False)
                         print(f"   📐 Applied {len(floorplan_links)} floorplan link(s) to current row")
 
                     property_image_updates = build_property_image_sheet_updates(
