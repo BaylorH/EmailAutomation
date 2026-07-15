@@ -605,11 +605,17 @@ def build_property_image_sheet_updates(
 ) -> Dict[str, List[str]]:
     if not candidate or not _clean(candidate.get("url")):
         return {}
+    if _header_index(header, PROPERTY_IMAGE_COLUMN) < 0:
+        return {}
     if _row_value(header, rowvals, PROPERTY_IMAGE_COLUMN):
         return {}
 
     updates = {PROPERTY_IMAGE_COLUMN: [_clean(candidate.get("url"))]}
     source_label = _clean(candidate.get("sourceLabel"))
-    if source_label and not _row_value(header, rowvals, PROPERTY_IMAGE_SOURCE_COLUMN):
+    if (
+        source_label
+        and _header_index(header, PROPERTY_IMAGE_SOURCE_COLUMN) >= 0
+        and not _row_value(header, rowvals, PROPERTY_IMAGE_SOURCE_COLUMN)
+    ):
         updates[PROPERTY_IMAGE_SOURCE_COLUMN] = [source_label]
     return updates

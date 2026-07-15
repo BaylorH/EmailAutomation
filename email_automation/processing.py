@@ -13,7 +13,7 @@ from urllib.parse import quote
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
-from .sheets import format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, append_links_to_floorplan_column, write_property_image_columns, is_floorplan_filename, _header_index_map, _find_row_by_email, clear_row_highlight, highlight_row, ROW_HIGHLIGHT_BLUE
+from .sheets import AssetLinkWriteError, format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, append_links_to_floorplan_column, write_property_image_columns, is_floorplan_filename, _header_index_map, _find_row_by_email, clear_row_highlight, highlight_row, ROW_HIGHLIGHT_BLUE
 from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move, stop_threads_for_row, complete_threads_for_row
 from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
                        dump_thread_from_firestore, has_processed, mark_processed, set_last_scan_iso,
@@ -1453,8 +1453,8 @@ def _skip_inbox_retry_after_manual_continuation(
 
 PDF_LINK_CHANGE_REASON = "Broker PDF attachment uploaded to Drive."
 PDF_LINK_COLUMN_ALIASES = {
-    "Flyer / Link": ("flyer / link", "flyer/link", "flyer"),
-    "Floorplan": ("floorplan", "floor plan"),
+    "Flyer / Link": ("flyer / link", "flyer/link", "flyer link", "flyer", "flyers", "brochure", "brochures"),
+    "Floorplan": ("floorplan", "floorplans", "floor plan", "floor plans", "floor plan / link", "floorplan / link"),
 }
 
 
@@ -1616,6 +1616,110 @@ def _store_pdf_link_sheet_change(
     except Exception as e:
         print(f"⚠️ Failed to store PDF link sheetChangeLog record: {e}")
         return None
+
+
+def _record_pdf_link_updates(
+    sheets,
+    user_id: str,
+    client_id: str,
+    sheet_id: str,
+    header: List[str],
+    rownum: int,
+    rowvals: List[str],
+    thread_id: str,
+    email: str,
+    pdf_manifest: List[Dict[str, Any]],
+    link_updates_by_column: Dict[str, List[str]],
+) -> None:
+    """Persist AI_META and sheetChangeLog evidence for applied asset links."""
+    for column, added_links in (link_updates_by_column or {}).items():
+        value = "\n".join(added_links or [])
+        if not value:
+            continue
+        logger.debug(
+            "sheet.ai_meta_append",
+            extra={
+                "spreadsheet_id": sheet_id,
+                "rownum": rownum,
+                "column": column,
+                "value": value,
+                "override": False,
+                "source": "pdf_link_write",
+            },
+        )
+        _append_ai_meta(sheets, sheet_id, rownum, column, value, override=False)
+
+    if link_updates_by_column:
+        _store_pdf_link_sheet_change(
+            user_id,
+            client_id,
+            sheet_id,
+            header,
+            rownum,
+            rowvals,
+            thread_id,
+            email,
+            pdf_manifest,
+            link_updates_by_column,
+        )
+
+
+def _raise_retryable_asset_link_write_failure(
+    error: AssetLinkWriteError,
+    sheets,
+    user_id: str,
+    client_id: str,
+    sheet_id: str,
+    header: List[str],
+    rownum: int,
+    rowvals: List[str],
+    thread_id: str,
+    message_id: str,
+    email: str,
+    pdf_manifest: List[Dict[str, Any]],
+    already_applied: Dict[str, List[str]],
+) -> None:
+    """Reconcile successful cells, expose the failure, and force a safe retry."""
+    reconciled = {
+        column: list(values or [])
+        for column, values in (already_applied or {}).items()
+    }
+    for column, values in error.applied_updates.items():
+        target = reconciled.setdefault(column, [])
+        for value in values:
+            if value not in target:
+                target.append(value)
+
+    if reconciled:
+        _record_pdf_link_updates(
+            sheets,
+            user_id,
+            client_id,
+            sheet_id,
+            header,
+            rownum,
+            rowvals,
+            thread_id,
+            email,
+            pdf_manifest,
+            reconciled,
+        )
+
+    _record_ai_processing_failure(
+        user_id,
+        client_id,
+        thread_id,
+        message_id,
+        str(error),
+        retryable=True,
+        recovery_status="asset_link_write_partial_failure",
+        metadata={
+            "appliedAssetLinks": reconciled,
+            "createdAssetColumns": error.created_columns,
+            "assetColumn": error.canonical_column,
+        },
+    )
+    raise RetryableProcessingError(str(error)) from error
 
 
 def _store_property_image_sheet_change(
@@ -5435,9 +5539,9 @@ def process_inbox_message(
                 new_property_pending_created=new_property_pending_created,
             )
             if pdf_manifest and not has_new_property_path:
+                pdf_link_updates_for_results: Dict[str, List[str]] = {}
                 try:
                     sheets = _sheets_client()
-                    pdf_link_updates_for_results: Dict[str, List[str]] = {}
                     property_image_candidate = select_property_image_candidate(
                         pdf_manifest,
                         address=row_anchor,
@@ -5445,21 +5549,9 @@ def process_inbox_message(
                     property_image_updates_for_results: Dict[str, List[str]] = {}
 
                     if flyer_links:
-                        added_flyer_links = append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
-                        if added_flyer_links:
-                            pdf_link_updates_for_results["Flyer / Link"] = added_flyer_links
-                            logger.debug(
-                                "sheet.ai_meta_append",
-                                extra={
-                                    "spreadsheet_id": sheet_id,
-                                    "rownum": rownum,
-                                    "column": "Flyer / Link",
-                                    "value": "\n".join(added_flyer_links),
-                                    "override": False,
-                                    "source": "pdf_link_write",
-                                },
-                            )
-                            _append_ai_meta(sheets, sheet_id, rownum, "Flyer / Link", "\n".join(added_flyer_links), override=False)
+                        flyer_updates = append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
+                        for column, added_flyer_links in flyer_updates.items():
+                            pdf_link_updates_for_results[column] = added_flyer_links
                         print(f"   🔗 Applied {len(flyer_links)} flyer link(s) to current row")
 
                     # Delay between writes to avoid Google Sheets API rate limits
@@ -5468,21 +5560,9 @@ def process_inbox_message(
                         time.sleep(30)
 
                     if floorplan_links:
-                        added_floorplan_links = append_links_to_floorplan_column(sheets, sheet_id, header, rownum, floorplan_links)
-                        if added_floorplan_links:
-                            pdf_link_updates_for_results["Floorplan"] = added_floorplan_links
-                            logger.debug(
-                                "sheet.ai_meta_append",
-                                extra={
-                                    "spreadsheet_id": sheet_id,
-                                    "rownum": rownum,
-                                    "column": "Floorplan",
-                                    "value": "\n".join(added_floorplan_links),
-                                    "override": False,
-                                    "source": "pdf_link_write",
-                                },
-                            )
-                            _append_ai_meta(sheets, sheet_id, rownum, "Floorplan", "\n".join(added_floorplan_links), override=False)
+                        floorplan_updates = append_links_to_floorplan_column(sheets, sheet_id, header, rownum, floorplan_links)
+                        for column, added_floorplan_links in floorplan_updates.items():
+                            pdf_link_updates_for_results[column] = added_floorplan_links
                         print(f"   📐 Applied {len(floorplan_links)} floorplan link(s) to current row")
 
                     property_image_updates = build_property_image_sheet_updates(
@@ -5527,7 +5607,8 @@ def process_inbox_message(
                             print(f"ℹ️ Skipped re-format after link append: {_e}")
 
                     if pdf_link_updates_for_results:
-                        _store_pdf_link_sheet_change(
+                        _record_pdf_link_updates(
+                            sheets,
                             user_id,
                             client_id,
                             sheet_id,
@@ -5552,6 +5633,22 @@ def process_inbox_message(
                             property_image_candidate,
                             property_image_updates_for_results,
                         )
+                except AssetLinkWriteError as e:
+                    _raise_retryable_asset_link_write_failure(
+                        e,
+                        sheets,
+                        user_id,
+                        client_id,
+                        sheet_id,
+                        header,
+                        rownum,
+                        rowvals,
+                        thread_id,
+                        internet_message_id or msg_id,
+                        to_addr_lower,
+                        pdf_manifest,
+                        pdf_link_updates_for_results,
+                    )
                 except Exception as e:
                     print(f"⚠️ Failed to write PDF link/property image metadata to sheet: {e}")
             elif pdf_manifest and has_new_property_path:

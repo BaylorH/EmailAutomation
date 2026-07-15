@@ -54,6 +54,61 @@ def _header_index_map(header: list[str]) -> dict:
     """Normalize headers for exact match regardless of spacing/case."""
     return {(h or "").strip().lower(): i for i, h in enumerate(header, start=1)}  # 1-based
 
+
+ASSET_LINK_COLUMN_ALIASES = {
+    "Flyer / Link": {
+        "flyer / link",
+        "flyer/link",
+        "flyer link",
+        "flyer",
+        "flyers",
+        "brochure",
+        "brochures",
+    },
+    "Floorplan": {
+        "floorplan",
+        "floorplans",
+        "floor plan",
+        "floor plans",
+        "floor plan / link",
+        "floorplan / link",
+    },
+}
+
+
+class AssetLinkWriteError(RuntimeError):
+    """Expose partial asset writes so callers can reconcile before retrying."""
+
+    def __init__(
+        self,
+        canonical_column: str,
+        cause: Exception,
+        *,
+        applied_updates: Optional[dict[str, list[str]]] = None,
+        created_columns: Optional[list[str]] = None,
+    ) -> None:
+        super().__init__(f"Failed to write {canonical_column} links: {cause}")
+        self.canonical_column = canonical_column
+        self.applied_updates = {
+            column: list(values or [])
+            for column, values in (applied_updates or {}).items()
+        }
+        self.created_columns = list(created_columns or [])
+
+
+def _asset_header_base(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    return re.sub(r"\s+\d+$", "", normalized).strip()
+
+
+def _asset_columns(header: list[str], canonical_column: str) -> list[tuple[int, str]]:
+    aliases = ASSET_LINK_COLUMN_ALIASES[canonical_column]
+    return [
+        (index, str(label or "").strip())
+        for index, label in enumerate(header or [], start=1)
+        if _asset_header_base(label) in aliases
+    ]
+
 def _col_letter(n: int) -> str:
     """1-indexed column number -> A1 letter (1->A)."""
     s = ""
@@ -317,160 +372,52 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
             "format_columns_batch_update"
         )
 
-def append_links_to_flyer_link_column(sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]) -> list[str]:
-    """Find/create Flyer / Link column and append unique links. Returns newly added links."""
+def _append_links_to_asset_columns(
+    sheets,
+    spreadsheet_id: str,
+    header: list[str],
+    rownum: int,
+    links: list[str],
+    *,
+    canonical_column: str,
+) -> dict[str, list[str]]:
+    """Write unique asset links one per cell and keep the shared header current."""
+    applied: dict[str, list[str]] = {}
+    created_columns: list[str] = []
     try:
         tab_title = _get_first_tab_title(sheets, spreadsheet_id)
-        idx_map = _header_index_map(header)
+        live_header = _read_header_row2(sheets, spreadsheet_id, tab_title)
+        if isinstance(header, list):
+            if live_header:
+                header[:] = live_header
+            working_header = header
+        else:
+            working_header = list(live_header or header or [])
+        columns = _asset_columns(working_header, canonical_column)
+        existing: set[str] = set()
+        blank_columns: list[tuple[int, str]] = []
 
-        # Find 'Flyer / Link' (case-insensitive, trimmed)
-        target_key = "flyer / link"
-        col_idx = None
-        for key, idx in idx_map.items():
-            if key == target_key:
-                col_idx = idx
-                break
-
-        # Create column if missing
-        if col_idx is None:
-            col_idx = len(header) + 1  # add at end
-            col_letter = _col_letter(col_idx)
-            _execute_with_retry(
-                sheets.spreadsheets().values().update(
+        for col_idx, column_label in columns:
+            cell_range = f"{tab_title}!{_col_letter(col_idx)}{rownum}"
+            resp = _execute_with_retry(
+                sheets.spreadsheets().values().get(
                     spreadsheetId=spreadsheet_id,
-                    range=f"{tab_title}!{col_letter}2",
-                    valueInputOption="RAW",
-                    body={"values": [["Flyer / Link"]]}
+                    range=cell_range,
                 ),
-                "append_links_create_column"
+                "asset_link_get_current",
             )
-            print(f"📋 Created 'Flyer / Link' column at {col_letter}")
-
-        # Cell range for this row/column
-        col_letter = _col_letter(col_idx)
-        cell_range = f"{tab_title}!{col_letter}{rownum}"
-
-        # Current cell value
-        resp = _execute_with_retry(
-            sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id,
-                range=cell_range
-            ),
-            "append_links_get_current"
-        )
-        current_value = ""
-        values = resp.get("values", [])
-        if values and values[0]:
-            current_value = values[0][0]
-
-        # Existing links (normalized by stripping whitespace)
-        existing_lines = [l.strip() for l in (current_value.splitlines() if current_value else []) if l.strip()]
-        existing = set(existing_lines)
-
-        # Clean + dedupe incoming links
-        additions = []
-        for raw in links or []:
-            if not raw:
-                continue
-            clean = raw.strip()
-            if not clean:
-                continue
-            if clean not in existing:
-                additions.append(clean)
-                existing.add(clean)
-
-        if not additions:
-            print("ℹ️ All links already present in Flyer / Link")
-            return []
-
-        # Build updated cell content (preserve prior order, append new)
-        updated_lines = existing_lines + additions
-        updated_value = "\n".join(updated_lines)
-
-        _execute_with_retry(
-            sheets.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range=cell_range,
-                valueInputOption="RAW",
-                body={"values": [[updated_value]]}
-            ),
-            "append_links_update"
-        )
-
-        print(f"🔗 Appended {len(additions)} new link(s) to Flyer / Link")
-        return additions
-
-    except Exception as e:
-        print(f"❌ Failed to append links to Flyer / Link column: {e}")
-        return []
-
-
-def append_links_to_floorplan_column(sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]) -> list[str]:
-    """Find/create Floorplan column and append unique links. Returns newly added links."""
-    try:
-        tab_title = _get_first_tab_title(sheets, spreadsheet_id)
-        idx_map = _header_index_map(header)
-
-        # Find 'Floorplan' (case-insensitive, trimmed)
-        target_key = "floorplan"
-        col_idx = None
-        for key, idx in idx_map.items():
-            if key == target_key or key == "floor plan":
-                col_idx = idx
-                break
-
-        # Create column if missing (insert after Flyer / Link if possible)
-        if col_idx is None:
-            flyer_idx = None
-            for key, idx in idx_map.items():
-                if key == "flyer / link":
-                    flyer_idx = idx
-                    break
-
-            if flyer_idx is not None:
-                col_idx = flyer_idx + 1  # Right after Flyer / Link
+            values = resp.get("values", [])
+            current_value = str(values[0][0] or "").strip() if values and values[0] else ""
+            if current_value:
+                existing.update(line.strip() for line in current_value.splitlines() if line.strip())
             else:
-                col_idx = len(header) + 1  # Add at end
+                blank_columns.append((col_idx, column_label))
 
-            col_letter = _col_letter(col_idx)
-            _execute_with_retry(
-                sheets.spreadsheets().values().update(
-                    spreadsheetId=spreadsheet_id,
-                    range=f"{tab_title}!{col_letter}2",
-                    valueInputOption="RAW",
-                    body={"values": [["Floorplan"]]}
-                ),
-                "append_floorplan_create_column"
-            )
-            print(f"📋 Created 'Floorplan' column at {col_letter}")
-
-        # Cell range for this row/column
-        col_letter = _col_letter(col_idx)
-        cell_range = f"{tab_title}!{col_letter}{rownum}"
-
-        # Current cell value
-        resp = _execute_with_retry(
-            sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id,
-                range=cell_range
-            ),
-            "append_floorplan_get_current"
-        )
-        current_value = ""
-        values = resp.get("values", [])
-        if values and values[0]:
-            current_value = values[0][0]
-
-        # Existing links (normalized by stripping whitespace)
-        existing_lines = [l.strip() for l in (current_value.splitlines() if current_value else []) if l.strip()]
-        existing = set(existing_lines)
-
-        # Clean + dedupe incoming links
-        additions = []
+        additions: list[str] = []
         for raw in links or []:
             if not raw:
                 continue
-            clean = raw.strip()
+            clean = str(raw).strip()
             if not clean:
                 continue
             if clean not in existing:
@@ -478,29 +425,111 @@ def append_links_to_floorplan_column(sheets, spreadsheet_id: str, header: list[s
                 existing.add(clean)
 
         if not additions:
-            print("ℹ️ All links already present in Floorplan")
-            return []
+            print(f"ℹ️ All links already present in {canonical_column}")
+            return {}
 
-        # Build updated cell content (preserve prior order, append new)
-        updated_lines = existing_lines + additions
-        updated_value = "\n".join(updated_lines)
+        primary_label = columns[0][1] if columns else canonical_column
+        suffix = 2
 
-        _execute_with_retry(
-            sheets.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range=cell_range,
-                valueInputOption="RAW",
-                body={"values": [[updated_value]]}
-            ),
-            "append_floorplan_update"
-        )
+        for link in additions:
+            if blank_columns:
+                col_idx, column_label = blank_columns.pop(0)
+            else:
+                col_idx = len(working_header) + 1
+                if not columns and not applied:
+                    column_label = canonical_column
+                else:
+                    used_labels = {str(label or "").strip().lower() for label in working_header}
+                    while f"{primary_label} {suffix}".lower() in used_labels:
+                        suffix += 1
+                    column_label = f"{primary_label} {suffix}"
+                    suffix += 1
 
-        print(f"📐 Appended {len(additions)} new link(s) to Floorplan")
-        return additions
+                col_letter = _col_letter(col_idx)
+                _execute_with_retry(
+                    sheets.spreadsheets().values().update(
+                        spreadsheetId=spreadsheet_id,
+                        range=f"{tab_title}!{col_letter}2",
+                        valueInputOption="RAW",
+                        body={"values": [[column_label]]},
+                    ),
+                    "asset_link_create_column",
+                )
+                working_header.append(column_label)
+                columns.append((col_idx, column_label))
+                created_columns.append(column_label)
+                print(f"📋 Created '{column_label}' column at {col_letter}")
+
+            cell_range = f"{tab_title}!{_col_letter(col_idx)}{rownum}"
+            try:
+                _execute_with_retry(
+                    sheets.spreadsheets().values().update(
+                        spreadsheetId=spreadsheet_id,
+                        range=cell_range,
+                        valueInputOption="RAW",
+                        body={"values": [[link]]},
+                    ),
+                    "asset_link_update",
+                )
+            except Exception:
+                try:
+                    readback = _execute_with_retry(
+                        sheets.spreadsheets().values().get(
+                            spreadsheetId=spreadsheet_id,
+                            range=cell_range,
+                        ),
+                        "asset_link_failure_readback",
+                    )
+                    readback_values = readback.get("values", [])
+                    readback_value = (
+                        str(readback_values[0][0] or "").strip()
+                        if readback_values and readback_values[0]
+                        else ""
+                    )
+                    if readback_value == link:
+                        applied.setdefault(column_label, []).append(link)
+                except Exception:
+                    pass
+                raise
+            applied.setdefault(column_label, []).append(link)
+
+        print(f"🔗 Wrote {len(additions)} {canonical_column} link(s) to separate cells")
+        return applied
 
     except Exception as e:
-        print(f"❌ Failed to append links to Floorplan column: {e}")
-        return []
+        print(f"❌ Failed to write {canonical_column} links: {e}")
+        raise AssetLinkWriteError(
+            canonical_column,
+            e,
+            applied_updates=applied,
+            created_columns=created_columns,
+        ) from e
+
+
+def append_links_to_flyer_link_column(
+    sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]
+) -> dict[str, list[str]]:
+    return _append_links_to_asset_columns(
+        sheets,
+        spreadsheet_id,
+        header,
+        rownum,
+        links,
+        canonical_column="Flyer / Link",
+    )
+
+
+def append_links_to_floorplan_column(
+    sheets, spreadsheet_id: str, header: list[str], rownum: int, links: list[str]
+) -> dict[str, list[str]]:
+    return _append_links_to_asset_columns(
+        sheets,
+        spreadsheet_id,
+        header,
+        rownum,
+        links,
+        canonical_column="Floorplan",
+    )
 
 
 def write_property_image_columns(
@@ -529,19 +558,7 @@ def write_property_image_columns(
             idx_map = _header_index_map(working_header)
             col_idx = idx_map.get(canonical_column.strip().lower())
             if col_idx is None:
-                col_idx = len(working_header) + 1
-                col_letter = _col_letter(col_idx)
-                _execute_with_retry(
-                    sheets.spreadsheets().values().update(
-                        spreadsheetId=spreadsheet_id,
-                        range=f"{tab_title}!{col_letter}2",
-                        valueInputOption="RAW",
-                        body={"values": [[canonical_column]]},
-                    ),
-                    "property_image_create_column",
-                )
-                working_header.append(canonical_column)
-                print(f"📋 Created '{canonical_column}' column at {col_letter}")
+                continue
 
             col_letter = _col_letter(col_idx)
             cell_range = f"{tab_title}!{col_letter}{rownum}"
