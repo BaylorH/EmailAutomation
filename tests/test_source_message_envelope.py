@@ -98,6 +98,8 @@ class SourceMessageEnvelopeTests(unittest.TestCase):
             msg,
         )
 
+        self.assertEqual(meta["replyToMessageId"], "graph-msg-1")
+        self.assertEqual(meta["sourceMessageId"], "graph-msg-1")
         self.assertEqual(meta["sourceGraphMessageId"], "graph-msg-1")
         self.assertEqual(meta["ccEmails"], ["baylor@manifoldengineering.ai"])
         self.assertEqual(meta["sourceMessage"]["cc"], ["baylor@manifoldengineering.ai"])

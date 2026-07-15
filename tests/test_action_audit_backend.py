@@ -202,6 +202,62 @@ class BackendActionAuditTests(unittest.TestCase):
         self.assertEqual(audit_payload["sentThreadId"], "thread-graph-1")
         self.assertEqual(audit_payload["conversationId"], "conversation-graph-1")
 
+    def test_successful_contact_redirect_stops_the_source_thread_after_send(self):
+        outbox_ref = FakeOutboxRef("outbox-contact-redirect")
+        fake_fs = FakeFirestore()
+        source_thread_path = (
+            "collection", "users", "document", "uid-1",
+            "collection", "threads", "document", "thread-wrong-contact",
+        )
+        fake_fs.seeded[source_thread_path] = {
+            "clientId": "client-1",
+            "status": "paused",
+            "followUpStatus": "waiting",
+            "followUpConfig.processingBy": "worker-1",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs):
+            email_module._finalize_successful_outbox_item(
+                "uid-1",
+                outbox_ref,
+                {
+                    "assignedEmails": ["redirect-target@example.com"],
+                    "clientId": "client-1",
+                    "threadId": "thread-wrong-contact",
+                    "actionAuditId": "audit-contact-redirect",
+                    "sourceThreadDisposition": "contact_redirected",
+                    "redirectContext": {
+                        "targetEmail": "redirect-target@example.com",
+                        "targetContactName": "Taylor Broker",
+                    },
+                    "resumeThreadOnSend": False,
+                },
+                send_result={
+                    "sentMessageIds": {
+                        "redirect-target@example.com": "graph-redirect-message",
+                    },
+                },
+            )
+
+        thread_updates = [
+            call for call in fake_fs.set_calls
+            if call[0] == source_thread_path
+        ]
+        self.assertEqual(1, len(thread_updates))
+        payload = thread_updates[0][1]
+        self.assertEqual("stopped", payload["status"])
+        self.assertEqual("stopped", payload["followUpStatus"])
+        self.assertEqual("contact_redirected", payload["statusReason"])
+        self.assertEqual("redirect-target@example.com", payload["redirectedToEmail"])
+        self.assertEqual("Taylor Broker", payload["redirectedToContactName"])
+        self.assertEqual("outbox-contact-redirect", payload["redirectedByOutboxId"])
+        self.assertEqual("audit-contact-redirect", payload["redirectedByActionAuditId"])
+        self.assertEqual("graph-redirect-message", payload["redirectedMessageId"])
+        self.assertIsNone(payload["followUpConfig.processingBy"])
+        self.assertIsNone(payload["followUpConfig.processingAt"])
+        self.assertEqual(email_module.SERVER_TIMESTAMP, payload["statusUpdatedAt"])
+        self.assertTrue(thread_updates[0][2])
+
     def test_successful_reviewed_reply_resolves_its_dead_letter_after_send(self):
         outbox_ref = FakeOutboxRef("outbox-reviewed-reply")
         fake_fs = FakeFirestore()

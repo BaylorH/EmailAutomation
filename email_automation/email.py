@@ -2383,7 +2383,69 @@ def _finalize_successful_outbox_item(
             print(f"   ⚠️ Could not delete action notification {notification_id}: {e}")
 
     thread_id = data.get("threadId")
-    if data.get("resumeThreadOnSend") and thread_id:
+    source_thread_disposition = str(data.get("sourceThreadDisposition") or "").strip().lower()
+    if source_thread_disposition == "contact_redirected" and thread_id:
+        # A Contact Redirect starts a new indexed conversation with the reviewed
+        # recipient. The source conversation must remain terminal after send.
+        try:
+            thread_ref = (
+                _fs.collection("users").document(user_id)
+                .collection("threads").document(thread_id)
+            )
+            snapshot = thread_ref.get()
+            redirect_block_reason = None
+            if not getattr(snapshot, "exists", False):
+                redirect_block_reason = "thread_not_found"
+            else:
+                thread = snapshot.to_dict() or {}
+                thread_client_id = str(thread.get("clientId") or "").strip()
+                status = str(thread.get("status") or "active").strip().lower()
+                if thread_client_id and thread_client_id != (client_id or ""):
+                    redirect_block_reason = "thread_client_mismatch"
+                elif status not in OPEN_THREAD_STATUSES:
+                    redirect_block_reason = f"thread_no_longer_open (status={status})"
+
+            if redirect_block_reason:
+                print(
+                    f"   ⏭️ Skipped source-thread redirect finalization for {thread_id[:20]}...: "
+                    f"{redirect_block_reason}"
+                )
+            else:
+                redirect_context = data.get("redirectContext") or {}
+                redirect_identity = _send_identity_payload(
+                    send_result,
+                    data.get("assignedEmails") or [],
+                )
+                redirect_payload = {
+                    "status": "stopped",
+                    "followUpStatus": "stopped",
+                    "statusReason": "contact_redirected",
+                    "redirectedToEmail": redirect_context.get("targetEmail")
+                    or ((data.get("assignedEmails") or [None])[0]),
+                    "redirectedToContactName": redirect_context.get("targetContactName")
+                    or data.get("contactName"),
+                    "redirectedByOutboxId": getattr(doc_ref, "id", None),
+                    "redirectedByActionAuditId": data.get("actionAuditId"),
+                    "redirectedAt": SERVER_TIMESTAMP,
+                    "statusUpdatedAt": SERVER_TIMESTAMP,
+                    "followUpConfig.processingBy": None,
+                    "followUpConfig.processingAt": None,
+                    "updatedAt": SERVER_TIMESTAMP,
+                }
+                redirect_identity_fields = {
+                    "redirectedMessageId": redirect_identity.get("sentMessageId"),
+                    "redirectedInternetMessageId": redirect_identity.get("internetMessageId"),
+                    "redirectedThreadId": redirect_identity.get("sentThreadId"),
+                    "redirectedConversationId": redirect_identity.get("conversationId"),
+                }
+                redirect_payload.update({
+                    key: value for key, value in redirect_identity_fields.items() if value
+                })
+                thread_ref.set(redirect_payload, merge=True)
+                print(f"   ⏹️ Stopped source thread {thread_id[:20]}... after Contact Redirect")
+        except Exception as e:
+            print(f"   ⚠️ Could not finalize redirected source thread {thread_id[:20]}...: {e}")
+    elif data.get("resumeThreadOnSend") and thread_id:
         # resumeThreadOnSend and threadId are client-supplied (InlineReplyComposer),
         # so re-check the thread's current state before flipping it active:
         # never resurrect a terminal (stopped/completed) thread and never touch a

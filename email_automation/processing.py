@@ -805,6 +805,7 @@ def _source_message_identity_meta(
 ) -> Dict[str, Any]:
     payload = {}
     if msg_id:
+        payload["replyToMessageId"] = msg_id
         payload["sourceMessageId"] = msg_id
         payload["sourceGraphMessageId"] = msg_id
     if internet_message_id:
