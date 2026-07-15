@@ -16,7 +16,9 @@ from .column_config import (
     get_column_config_error,
     find_notes_comment_column_index,
     REQUIRED_FOR_CLOSE,
+    coerce_sheet_value_for_column,
     is_asset_column_name,
+    sheet_values_equal_for_column,
 )
 from .notification_payloads import sanitize_new_property_referral_response
 from .openai_usage import track_openai_usage_safely
@@ -2755,7 +2757,14 @@ def _ai_meta_confirms_value(
         column,
         row_anchor=row_anchor,
     )
-    return bool(meta and str(meta.get("last_ai_value")) == str(value))
+    return bool(
+        meta
+        and sheet_values_equal_for_column(
+            column,
+            meta.get("last_ai_value"),
+            value,
+        )
+    )
 
 def _normalize_comment_bullet(bullet: str) -> str:
     """Normalize a bullet fact for dedup comparison: lowercase, collapse
@@ -2972,8 +2981,19 @@ def apply_proposal_to_sheet(
 
             old_val = current_rowvals[col_idx-1] if (col_idx-1) < len(current_rowvals) else ""
 
+            typed_new_val = coerce_sheet_value_for_column(
+                col_name,
+                new_val,
+                column_config,
+            )
+
             # 1) no-op
-            if (old_val or "") == (new_val or ""):
+            if sheet_values_equal_for_column(
+                col_name,
+                old_val,
+                typed_new_val,
+                column_config,
+            ):
                 skipped.append({
                     "column": col_name,
                     "reason": "no-change",
@@ -2991,7 +3011,16 @@ def apply_proposal_to_sheet(
             )
 
             # 2) prior AI write and human changed it
-            if meta and meta.get("last_ai_value") is not None and str(old_val) != str(meta["last_ai_value"]):
+            if (
+                meta
+                and meta.get("last_ai_value") is not None
+                and not sheet_values_equal_for_column(
+                    col_name,
+                    old_val,
+                    meta["last_ai_value"],
+                    column_config,
+                )
+            ):
                 skipped.append({"column": col_name, "reason": "human-override"})
                 continue
 
@@ -3010,7 +3039,7 @@ def apply_proposal_to_sheet(
                     continue
 
             # 4) otherwise proceed to write...
-            data_payload.append({"range": rng, "values": [[new_val]]})
+            data_payload.append({"range": rng, "values": [[typed_new_val]]})
             if (col_idx - 1) < len(row_after):
                 row_after[col_idx - 1] = new_val
             applied.append({

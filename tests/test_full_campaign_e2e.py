@@ -832,7 +832,7 @@ class FullCampaignE2ETests(unittest.TestCase):
         # the LLM's comma-formatted "18,500". Same value, canonical form.
         self.assertEqual("18500", applied["Total SF"]["newValue"])
         # the write really landed on row 3 of the fake grid
-        self.assertEqual("18500", world.grid[3][4])
+        self.assertEqual(18500, world.grid[3][4])
 
     def test_stage8_followup_withholds_after_broker_reply(self):
         world = World()

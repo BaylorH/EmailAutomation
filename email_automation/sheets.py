@@ -4,7 +4,12 @@ import random
 from typing import Optional, List, Dict, Any
 from googleapiclient.errors import HttpError
 from .clients import _sheets_client
-from .column_config import is_wrapped_notes_column
+from .column_config import (
+    CANONICAL_FIELDS,
+    canonical_field_for_column,
+    coerce_sheet_value_for_column,
+    is_wrapped_notes_column,
+)
 from .utils import _norm_txt, _normalize_email
 
 # Rate limit handling configuration
@@ -291,7 +296,8 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
     values_resp = _execute_with_retry(
         sheets.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"{tab_title}!A2:ZZZ"
+            range=f"{tab_title}!A2:ZZZ",
+            valueRenderOption="UNFORMATTED_VALUE",
         ),
         "format_columns_get_values"
     )
@@ -301,6 +307,7 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
 
     num_cols = max(len(hdr), len(header))
     requests = []
+    numeric_value_updates = []
 
     for c in range(num_cols):
         header_text = (hdr[c] if c < len(hdr) else (header[c] if c < len(header) else "")) or ""
@@ -317,6 +324,8 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
 
         auto_px = max_len * CHAR_PX + BASE_PADDING_PX + EXTRA_FUDGE_PX
         col_key = _norm(header_text)
+        canonical = canonical_field_for_column(header_text)
+        field = CANONICAL_FIELDS.get(canonical or "", {})
 
         # --- width/wrap policy by column type
         if col_key in LINK_KEYS:
@@ -350,6 +359,15 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
         })
 
         # 2) wrap strategy for DATA ONLY (row 3+); header row stays unwrapped
+        user_entered_format = {"wrapStrategy": wrap_mode}
+        format_fields = ["userEnteredFormat.wrapStrategy"]
+        if field.get("format") == "currency":
+            user_entered_format["numberFormat"] = {
+                "type": "CURRENCY",
+                "pattern": "$#,##0.00",
+            }
+            format_fields.append("userEnteredFormat.numberFormat")
+
         requests.append({
             "repeatCell": {
                 "range": {
@@ -358,10 +376,21 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
                     "startColumnIndex": c,
                     "endColumnIndex": c + 1
                 },
-                "cell": {"userEnteredFormat": {"wrapStrategy": wrap_mode}},
-                "fields": "userEnteredFormat.wrapStrategy"
+                "cell": {"userEnteredFormat": user_entered_format},
+                "fields": ",".join(format_fields),
             }
         })
+
+        if field.get("format") == "currency" and not field.get("is_formula"):
+            for rownum, row in enumerate(data, start=3):
+                if c >= len(row) or not isinstance(row[c], str):
+                    continue
+                typed_value = coerce_sheet_value_for_column(header_text, row[c])
+                if isinstance(typed_value, (int, float)) and not isinstance(typed_value, bool):
+                    numeric_value_updates.append({
+                        "range": f"{tab_title}!{_col_letter(c + 1)}{rownum}",
+                        "values": [[typed_value]],
+                    })
 
     if requests:
         _execute_with_retry(
@@ -370,6 +399,18 @@ def format_sheet_columns_autosize_with_exceptions(spreadsheet_id: str, header: l
                 body={"requests": requests}
             ),
             "format_columns_batch_update"
+        )
+
+    if numeric_value_updates:
+        _execute_with_retry(
+            sheets.spreadsheets().values().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "valueInputOption": "RAW",
+                    "data": numeric_value_updates,
+                },
+            ),
+            "format_columns_numeric_values",
         )
 
 def _append_links_to_asset_columns(
