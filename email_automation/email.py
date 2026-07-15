@@ -7,6 +7,7 @@ import uuid
 import logging
 from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
+from google.cloud import firestore
 from google.cloud.firestore import SERVER_TIMESTAMP, Increment
 from .utils import (
     GRAPH_SEND_MAX_RETRIES,
@@ -2314,27 +2315,32 @@ def _finalize_successful_outbox_item(
                 _fs.collection("users").document(user_id)
                 .collection("deadLetterQueue").document(source_dead_letter_id)
             )
-            source_snapshot = source_ref.get()
-            source_data = source_snapshot.to_dict() if getattr(source_snapshot, "exists", False) else {}
-            source_reason = " ".join(str(source_data.get(key) or "") for key in ("failureReason", "lastError")).lower()
-            source_statuses = {
-                str(source_data.get("status") or "").strip().lower(),
-                str(source_data.get("recoveryStatus") or "").strip().lower(),
-            }
-            resolved_statuses = {"acknowledged", "discarded", "reconciled", "requeued"}
-            matches_review = bool(
-                source_data
-                and source_data.get("source") == "pendingResponses"
-                and not source_data.get("alreadySent")
-                and source_data.get("clientId") == client_id
-                and source_data.get("threadId") == data.get("threadId")
-                and ("manual review" in source_reason or "automatic inbox replies are disabled" in source_reason)
-                and not (source_statuses & resolved_statuses)
-            )
-            if not matches_review:
-                raise ValueError("source dead-letter does not match this unresolved reply review")
+            @firestore.transactional
+            def reconcile_reviewed_reply(transaction):
+                source_snapshot = source_ref.get(transaction=transaction)
+                source_data = source_snapshot.to_dict() if getattr(source_snapshot, "exists", False) else {}
+                source_reason = " ".join(
+                    str(source_data.get(key) or "")
+                    for key in ("failureReason", "lastError")
+                ).lower()
+                source_statuses = {
+                    str(source_data.get("status") or "").strip().lower(),
+                    str(source_data.get("recoveryStatus") or "").strip().lower(),
+                }
+                resolved_statuses = {"acknowledged", "discarded", "reconciled", "requeued"}
+                matches_review = bool(
+                    source_data
+                    and source_data.get("source") == "pendingResponses"
+                    and not source_data.get("alreadySent")
+                    and source_data.get("clientId") == client_id
+                    and source_data.get("threadId") == data.get("threadId")
+                    and ("manual review" in source_reason or "automatic inbox replies are disabled" in source_reason)
+                    and not (source_statuses & resolved_statuses)
+                )
+                if not matches_review:
+                    return False
 
-            source_ref.set({
+                transaction.set(source_ref, {
                     "status": "reconciled",
                     "recoveryStatus": "reconciled",
                     "resolution": "reviewed_reply_sent",
@@ -2343,6 +2349,10 @@ def _finalize_successful_outbox_item(
                     "resolvedByOutboxId": getattr(doc_ref, "id", None),
                     "resolvedByActionAuditId": data.get("actionAuditId"),
                 }, merge=True)
+                return True
+
+            if not reconcile_reviewed_reply(_fs.transaction()):
+                raise ValueError("source dead-letter does not match this unresolved reply review")
             print(f"   ✅ Resolved reviewed reply draft {source_dead_letter_id} after send")
         except Exception as e:
             # The send already succeeded. Keep finalization moving and leave the
