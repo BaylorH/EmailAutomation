@@ -151,6 +151,76 @@ class BackendActionAuditTests(unittest.TestCase):
         self.assertEqual(audit_payload["sentThreadId"], "thread-graph-1")
         self.assertEqual(audit_payload["conversationId"], "conversation-graph-1")
 
+    def test_successful_reviewed_reply_resolves_its_dead_letter_after_send(self):
+        outbox_ref = FakeOutboxRef("outbox-reviewed-reply")
+        fake_fs = FakeFirestore()
+        fake_fs.seeded[(
+            "collection", "users", "document", "uid-1",
+            "collection", "deadLetterQueue", "document", "dead-review-1",
+        )] = {
+            "source": "pendingResponses",
+            "clientId": "client-1",
+            "threadId": "thread-1",
+            "failureReason": "Automatic inbox replies are disabled; manual review required before auto-reply",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs):
+            email_module._finalize_successful_outbox_item(
+                "uid-1",
+                outbox_ref,
+                {
+                    "clientId": "client-1",
+                    "threadId": "thread-1",
+                    "actionAuditId": "audit-review-1",
+                    "sourceDeadLetterId": "dead-review-1",
+                },
+            )
+
+        dead_letter_updates = [
+            call for call in fake_fs.set_calls
+            if call[0] == (
+                "collection", "users", "document", "uid-1",
+                "collection", "deadLetterQueue", "document", "dead-review-1",
+            )
+        ]
+        self.assertEqual(1, len(dead_letter_updates))
+        self.assertEqual("reconciled", dead_letter_updates[0][1]["status"])
+        self.assertEqual("reviewed_reply_sent", dead_letter_updates[0][1]["resolution"])
+        self.assertEqual("outbox-reviewed-reply", dead_letter_updates[0][1]["resolvedByOutboxId"])
+        self.assertTrue(dead_letter_updates[0][2])
+
+    def test_successful_send_cannot_resolve_an_unrelated_dead_letter(self):
+        outbox_ref = FakeOutboxRef("outbox-unrelated-review")
+        fake_fs = FakeFirestore()
+        fake_fs.seeded[(
+            "collection", "users", "document", "uid-1",
+            "collection", "deadLetterQueue", "document", "dead-review-2",
+        )] = {
+            "source": "pendingResponses",
+            "clientId": "other-client",
+            "threadId": "other-thread",
+            "failureReason": "manual review required",
+        }
+
+        with patch("email_automation.clients._fs", fake_fs):
+            email_module._finalize_successful_outbox_item(
+                "uid-1",
+                outbox_ref,
+                {
+                    "clientId": "client-1",
+                    "threadId": "thread-1",
+                    "actionAuditId": "audit-review-2",
+                    "sourceDeadLetterId": "dead-review-2",
+                },
+            )
+
+        dead_letter_updates = [
+            call for call in fake_fs.set_calls
+            if call[0][-4:] == ("collection", "deadLetterQueue", "document", "dead-review-2")
+        ]
+        self.assertEqual([], dead_letter_updates)
+        self.assertTrue(outbox_ref.deleted)
+
     def test_successful_tour_invite_send_marks_thread_awaiting_confirmation(self):
         outbox_ref = FakeOutboxRef("outbox-tour")
         fake_fs = FakeFirestore()
