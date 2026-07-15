@@ -303,6 +303,22 @@ class FakeSheetsClient:
 
 
 class OutboxSafetyTests(unittest.TestCase):
+    def test_same_timestamp_campaign_outbox_docs_sort_by_row_number(self):
+        created_at = "2026-07-14T14:06:29Z"
+        docs = [
+            FakeDoc({
+                "source": "dashboard_campaign_launch",
+                "clientId": "client-1",
+                "rowNumber": row_number,
+                "createdAt": created_at,
+            }, doc_id=doc_id)
+            for row_number, doc_id in ((4, "a-doc"), (3, "z-doc"), (5, "m-doc"))
+        ]
+
+        ordered = email_module._order_outbox_docs(docs)
+
+        self.assertEqual([3, 4, 5], [doc.to_dict()["rowNumber"] for doc in ordered])
+
     def setUp(self):
         # These tests isolate outbox behavior. Campaign policy is covered in
         # test_campaign_automation_pause; keep this fixture explicitly active.
@@ -528,6 +544,43 @@ class OutboxSafetyTests(unittest.TestCase):
         self.assertEqual(provider_calls, [1, 2])
         self.assertEqual(send_headers, ["Bearer fresh-token-1", "Bearer fresh-token-2"])
         sleep.assert_called_once_with(120)
+
+    def test_send_outboxes_bounds_each_request_to_four_recipients(self):
+        docs = [
+            FakeDoc({
+                "assignedEmails": [f"bp21harrison+batch-{row_number}@gmail.com"],
+                "script": f"Hi Broker {row_number}",
+                "clientId": "client-1",
+                "subject": f"{row_number} Batch Way",
+                "rowNumber": row_number,
+            }, doc_id=f"outbox-{row_number}")
+            for row_number in range(3, 8)
+        ]
+        sent_doc_ids = []
+
+        def record_single_send(_user_id, _headers, item, *_args, **_kwargs):
+            sent_doc_ids.append(item["doc"].id)
+
+        with patch.dict(os.environ, {}, clear=False), \
+             patch("email_automation.clients._fs", FakeFirestoreWithOutbox(docs)), \
+             patch.object(email_module, "_send_single_outbox_item", side_effect=record_single_send), \
+             patch.object(email_module.time, "sleep", return_value=None) as sleep:
+            os.environ.pop("SITESIFT_OUTBOX_RECIPIENTS_PER_RUN", None)
+            email_module.send_outboxes("uid-1", {"Authorization": "Bearer token"})
+
+        self.assertEqual(
+            ["outbox-3", "outbox-4", "outbox-5", "outbox-6"],
+            sent_doc_ids,
+        )
+        self.assertFalse(docs[-1].reference.deleted)
+        self.assertEqual(3, sleep.call_count)
+
+    def test_outbox_batch_override_cannot_exceed_lease_safe_ceiling(self):
+        with patch.dict(
+            os.environ,
+            {"SITESIFT_OUTBOX_RECIPIENTS_PER_RUN": "50"},
+        ):
+            self.assertEqual(4, email_module._resolve_outbox_recipients_per_run())
 
     def test_send_outboxes_resolves_structured_professional_signature_before_send(self):
         docs = [

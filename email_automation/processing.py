@@ -342,6 +342,9 @@ def _queue_response_retry_or_reconciliation(
     ):
         print("⏹️ Campaign stopped during auto-reply preparation; no retry was queued")
         return "campaign_stopped"
+    if send_outcome.outcome == "suppressed_recipient_optout":
+        print("⏭️ Reply recipient opted out; no retry was queued")
+        return "recipient_suppressed"
     if sent_but_unindexed:
         record_sent_unindexed_response(
             user_id,
@@ -390,7 +393,7 @@ def _handle_auto_response_send_failure(
         response_body,
         client_id,
     )
-    return outcome == "sent_unindexed"
+    return outcome in {"sent_unindexed", "recipient_suppressed"}
 
 
 def _parse_graph_datetime(value: str) -> Optional[datetime]:
@@ -3343,6 +3346,15 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         )
         recipient_payload = recipient_result["payload"]
         if not (recipient_payload["toRecipients"] or recipient_payload["ccRecipients"]):
+            opted_out = (recipient_result.get("skipped") or {}).get("optedOut") or []
+            if opted_out:
+                _set_reply_send_outcome(
+                    error="All safe reply-all recipients opted out",
+                    outcome="suppressed_recipient_optout",
+                )
+                print("   ⏭️ Reply suppressed because all safe recipients opted out")
+                _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+                return False
             _set_reply_send_outcome(
                 error="No safe reply-all recipients remained after filtering",
                 outcome="send_failed",

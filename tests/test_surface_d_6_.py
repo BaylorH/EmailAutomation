@@ -823,7 +823,7 @@ class InboxAutoReplyWrongRecipientTests(unittest.TestCase):
             "no Graph /send may be issued when no safe recipient remains",
         )
         self.assertTrue(res_b["deletes"], "the unsafe reply-all draft must be deleted")
-        self.assertEqual(res_b["outcome"], "send_failed")
+        self.assertEqual(res_b["outcome"], "suppressed_recipient_optout")
 
 
 if __name__ == "__main__":

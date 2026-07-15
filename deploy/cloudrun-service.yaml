@@ -59,6 +59,7 @@ spec:
             - "--bind=:8080"
             - "--workers=1"
             - "--threads=8"
+            - "--max-requests=1"
             - "--timeout=0"
             - "service:app"
           ports:
@@ -67,7 +68,7 @@ spec:
           resources:
             limits:
               cpu: "1"
-              memory: 1Gi
+              memory: 2Gi
           env:
             # --- Storage bucket (env-parameterized; defaults to historical
             #     value when unset — see app_config.py / firebase_helpers.py). ---

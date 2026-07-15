@@ -3,13 +3,16 @@ import os
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+from googleapiclient.errors import HttpError
+from httplib2 import Response
+
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "service-account.json"),
 )
 
-from email_automation import processing
+from email_automation import ai_processing, processing
 from email_automation.campaign_safety import CampaignAutomationDecision
 
 
@@ -76,6 +79,38 @@ class ProcessingRetryabilityTests(unittest.TestCase):
         )
         self.assertFalse(processing._should_mark_processed_after_error(ValueError("unexpected bug")))
         self.assertTrue(processing._should_mark_processed_after_error(None))
+
+    def test_sheet_apply_429_escapes_for_retryable_failure_recording(self):
+        quota_error = HttpError(
+            Response({"status": "429"}),
+            b'{"error":{"message":"read requests per minute exceeded"}}',
+        )
+        sheets = MagicMock()
+
+        with patch.object(ai_processing, "_sheets_client", return_value=sheets), \
+             patch.object(ai_processing, "_get_first_tab_title", return_value="Properties"), \
+             patch.object(ai_processing, "_ensure_ai_meta_tab"), \
+             patch.object(ai_processing, "_load_ai_meta_rows", return_value=[]), \
+             patch.object(ai_processing, "_execute_with_retry", side_effect=quota_error):
+            with self.assertRaises(HttpError) as raised:
+                ai_processing.apply_proposal_to_sheet(
+                    "uid-1",
+                    "client-1",
+                    "sheet-1",
+                    ["Property Address", "Total SF"],
+                    3,
+                    ["4402 Rex Rd", ""],
+                    {
+                        "updates": [{
+                            "column": "Total SF",
+                            "value": "10000",
+                            "confidence": 0.99,
+                            "reason": "Broker stated the total.",
+                        }]
+                    },
+                )
+
+        self.assertEqual(429, raised.exception.resp.status)
 
     def test_terminal_campaign_suppression_does_not_queue_auto_reply_retry(self):
         processing._reset_reply_send_outcome()

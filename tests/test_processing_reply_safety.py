@@ -247,6 +247,64 @@ class ProcessingReplySafetyTests(unittest.TestCase):
         self.assertNotIn("jill.ames@mohrpartners.com", html_body)
         self.assertNotIn("Mohr Partners, Inc.", html_body)
 
+    def test_send_reply_classifies_all_opted_out_recipients_as_suppressed(self):
+        def fake_post(url, **_kwargs):
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "draft-1",
+                    "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
+                    "ccRecipients": [],
+                })
+            raise AssertionError(f"Unexpected POST {url}")
+
+        current_meta = {
+            "conversationId": "conversation-1",
+            "subject": "RE: 100 Optout Way",
+        }
+        recipient_result = {
+            "payload": {"toRecipients": [], "ccRecipients": []},
+            "skipped": {
+                "optedOut": [{
+                    "email": "bp21harrison@gmail.com",
+                    "reason": "broker_opt_out",
+                }]
+            },
+        }
+
+        with patch.dict(os.environ, {"SITESIFT_AUTO_REPLY_ALLOWLIST": "uid-1"}), \
+             patch.object(processing, "get_client_automation_decision", return_value=CampaignAutomationDecision(
+                 state="allow", reason="", client_data={"status": "live"},
+                 metadata={"terminal": False, "stopKind": "none"},
+             )), \
+             patch("email_automation.clients._fs", FakeFirestore({
+                 "email": "baylor.freelance@outlook.com",
+             })), \
+             patch("requests.get", return_value=FakeResponse(200, current_meta)), \
+             patch("requests.post", side_effect=fake_post), \
+             patch("requests.patch", side_effect=AssertionError("Suppressed reply must not be patched")), \
+             patch("email_automation.email._hydrate_reply_all_draft_recipients", side_effect=lambda _headers, draft, base=None: draft), \
+             patch("email_automation.email._source_message_reply_all_fallback", side_effect=lambda draft, _current_meta: draft), \
+             patch("email_automation.email._reviewed_recipient_reply_all_fallback", side_effect=lambda draft, to_emails=None: draft), \
+             patch("email_automation.email._filter_reply_all_draft_recipients", return_value=recipient_result), \
+             patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
+            sent = processing.send_reply_in_thread(
+                user_id="uid-1",
+                headers={"Authorization": "Bearer token"},
+                body="Hi Avery,\n\nThanks for the update.",
+                current_msg_id="message-1",
+                recipient="bp21harrison@gmail.com",
+                thread_id="thread-1",
+            )
+
+        self.assertFalse(sent)
+        self.assertEqual(
+            "suppressed_recipient_optout",
+            processing.send_reply_in_thread.last_outcome,
+        )
+        self.assertIn("opted out", processing.send_reply_in_thread.last_error.lower())
+        delete_draft.assert_called_once()
+        self.assertEqual("draft-1", delete_draft.call_args.args[1])
+
     def test_tour_actions_default_allowlist_is_baylor_only(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertTrue(processing._tour_actions_allowed("NO7lVYVp6BaplKYEfMlWCgBnpdh2"))

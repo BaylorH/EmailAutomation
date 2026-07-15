@@ -422,6 +422,288 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             a._extract_total_sf_from_text("+/- 9,000 SF new free-standing building."),
             "9000")
 
+    def test_multi_suite_explicit_total_overrides_individual_suite_areas(self):
+        text = (
+            "Suite A is 5,200 SF and Suite C is 4,800 SF. "
+            "Together they provide 10,000 SF total."
+        )
+
+        self.assertEqual(a._extract_total_sf_from_text(text), "10000")
+
+    def test_single_suite_area_behavior_is_preserved(self):
+        self.assertEqual(
+            a._extract_total_sf_from_text("Suite C is 4,800 SF and is ready now."),
+            "4800",
+        )
+
+    def test_office_component_area_is_not_total_sf(self):
+        component_phrases = (
+            "The property has about 2000 sf of office.",
+            "Office area is 2,000 SF.",
+            "Total office area is 2,000 SF.",
+            "The office portion is 2,000 SF.",
+            "There is 2,000 SF dedicated to office.",
+            "Office comprises 2,000 SF.",
+            "About 2,000 SF is office.",
+            "The warehouse portion: 20,000 SF.",
+        )
+        for phrase in component_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(a._extract_total_sf_from_text(phrase))
+
+    def test_office_component_area_is_removed_from_model_total_sf_proposal(self):
+        for proposed_value in ("2000", "2000.0", "2,000 SF", "2K SF"):
+            with self.subTest(proposed_value=proposed_value):
+                proposal = {
+                    "updates": [{
+                        "column": "Total SF",
+                        "value": proposed_value,
+                        "confidence": 0.90,
+                        "reason": "The message states about 2,000 SF of office.",
+                    }],
+                    "events": [],
+                }
+
+                out = a._augment_proposal_with_deterministic_extractions(
+                    proposal,
+                    ["123 Test Dr", ""],
+                    ["Property Address", "Total SF"],
+                    {"mappings": {"total_sf": "Total SF"}},
+                    _conv("The property has about 2,000 SF of office."),
+                )
+
+                self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
+    def test_unrelated_attachment_rent_does_not_update_target_property(self):
+        header = ["Property Address", "City", "Rent/SF /Yr"]
+        rowvals = ["123 Test Dr", "Boise", ""]
+        cfg = {"mappings": {"rent_sf_yr": "Rent/SF /Yr"}}
+        for proposed_value in (
+            "15.00", "15", "15.0", "$15.00", "15.00/SF",
+            "$15.00/SF (36 months)", "15.00/SF, 3-year term", "15.00-15.50",
+            "3-year term at $15.00/SF",
+        ):
+            with self.subTest(proposed_value=proposed_value):
+                proposal = {
+                    "updates": [{
+                        "column": "Rent/SF /Yr",
+                        "value": proposed_value,
+                        "confidence": 0.88,
+                        "reason": "The attached brochure lists $15.00/SF/yr.",
+                    }],
+                    "events": [],
+                }
+
+                out = a._augment_proposal_with_deterministic_extractions(
+                    proposal,
+                    rowvals,
+                    header,
+                    cfg,
+                    _conv("The 123 Test Dr property is available. The attached flyer has the details."),
+                    pdf_manifest=[{
+                        "name": "Spring Hill Exec Park - Marketing_Brochure_2025.pdf",
+                        "text": (
+                            "322 Spring Hill Dr, Spring, TX 77386. "
+                            "LEASE RATE: $15.00 SF/yr (NNN)."
+                        ),
+                    }],
+                )
+
+                self.assertIsNone(a._proposal_update_for_column(out, "Rent/SF /Yr"))
+
+    def test_term_first_target_rent_is_not_confused_with_competing_pdf_rent(self):
+        proposal = {
+            "updates": [{
+                "column": "Rent/SF /Yr",
+                "value": "3-year term at $15/SF",
+                "confidence": 0.9,
+            }],
+            "events": [],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["123 Test Dr", "Boise", ""],
+            ["Property Address", "City", "Rent/SF /Yr"],
+            {"mappings": {"rent_sf_yr": "Rent/SF /Yr"}},
+            _conv("Asking rent for 123 Test Dr is $15/SF for a 3-year term."),
+            pdf_manifest=[{
+                "name": "322 Spring Hill Dr flyer.pdf",
+                "text": "322 Spring Hill Dr is asking $3/SF.",
+            }],
+        )
+        self.assertEqual("15.00", a._proposal_update_for_column(out, "Rent/SF /Yr")["value"])
+
+    def test_mixed_property_attachment_cannot_supply_target_rent(self):
+        source = (
+            "Portfolio overview for 123 Test Dr. "
+            "322 Spring Hill Dr is asking $15.00/SF/yr."
+        )
+        self.assertFalse(
+            a._attachment_can_supply_target_rent(
+                source,
+                "123 Test Dr, Boise",
+                "The 123 Test Dr property is available; see attached.",
+            )
+        )
+
+    def test_mixed_property_attachment_cannot_preserve_competing_total_sf(self):
+        proposal = {
+            "updates": [{
+                "column": "Total SF",
+                "value": "45,000 SF",
+                "confidence": 0.9,
+            }],
+            "events": [{"type": "property_unavailable"}],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["123 Test Dr", ""],
+            ["Property Address", "Total SF"],
+            {"mappings": {"total_sf": "Total SF"}},
+            _conv("The 123 Test Dr property is unavailable; see attached."),
+            pdf_manifest=[{
+                "name": "portfolio flyer.pdf",
+                "text": (
+                    "Portfolio overview for 123 Test Dr. "
+                    "322 Spring Hill Dr - Total Building Size: 45,000 SF."
+                ),
+            }],
+        )
+
+        self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
+    def test_fact_suppression_runs_before_terminal_event_early_return(self):
+        proposal = {
+            "updates": [{
+                "column": "Total SF",
+                "value": "2,000 SF",
+                "confidence": 0.9,
+                "reason": "Office component.",
+            }],
+            "events": [{"type": "property_unavailable"}],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["123 Test Dr", ""],
+            ["Property Address", "Total SF"],
+            {"mappings": {"total_sf": "Total SF"}},
+            _conv("The property is unavailable and has 2,000 SF of office."),
+        )
+        self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
+    def test_terminal_event_drops_total_sf_not_supported_by_explicit_total(self):
+        proposal = {
+            "updates": [{
+                "column": "Total SF",
+                "value": "11,000 SF",
+                "confidence": 0.9,
+            }],
+            "events": [{"type": "property_unavailable"}],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["123 Test Dr", ""],
+            ["Property Address", "Total SF"],
+            {"mappings": {"total_sf": "Total SF"}},
+            _conv("123 Test Dr has 10,000 SF total but is unavailable."),
+        )
+        self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
+    def test_terminal_event_drops_rent_not_supported_by_explicit_rent(self):
+        proposal = {
+            "updates": [{
+                "column": "Rent/SF /Yr",
+                "value": "$15/SF",
+                "confidence": 0.9,
+            }],
+            "events": [{"type": "property_unavailable"}],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["123 Test Dr", ""],
+            ["Property Address", "Rent/SF /Yr"],
+            {"mappings": {"rent_sf_yr": "Rent/SF /Yr"}},
+            _conv("123 Test Dr has asking rent of $12.75/SF/year but is unavailable."),
+        )
+        self.assertIsNone(a._proposal_update_for_column(out, "Rent/SF /Yr"))
+
+    def test_same_number_different_street_attachment_is_not_target_property(self):
+        self.assertFalse(
+            a._attachment_can_supply_target_facts(
+                "123 Other Ave, Boise, ID. Asking rent $15.00/SF/yr.",
+                "123 Test Dr, Boise",
+                "The 123 Test Dr property is available; see attached.",
+            )
+        )
+
+    def test_same_number_and_name_different_suffix_is_not_target_property(self):
+        self.assertFalse(
+            a._attachment_can_supply_target_facts(
+                "123 Test Ave, Boise, ID. Asking rent $15.00/SF/yr.",
+                "123 Test Dr, Boise",
+                "The 123 Test Dr property is available; see attached.",
+            )
+        )
+
+    def test_suite_number_is_not_parsed_as_a_street_address(self):
+        claims = a._street_claim_spans("Suite 100, 123 Test Dr")
+        self.assertEqual([a._claim_identity(claim) for claim in claims], [
+            ("123", ("test",), "drive"),
+        ])
+
+    def test_target_flyer_ignores_brokerage_footer_address(self):
+        proposal = {
+            "updates": [{"column": "Rent/SF /Yr", "value": "12", "confidence": 0.9}],
+            "events": [],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["123 Test Dr", "Boise", ""],
+            ["Property Address", "City", "Rent/SF /Yr"],
+            {"mappings": {"rent_sf_yr": "Rent/SF /Yr"}},
+            _conv("The 123 Test Dr property is available; see attached."),
+            pdf_manifest=[{
+                "name": "123 Test Dr flyer.pdf",
+                "text": (
+                    "123 Test Dr - asking rent $12/SF NNN. "
+                    "Brokerage office: 500 Main St, Boise, ID."
+                ),
+            }],
+        )
+        self.assertEqual("12.00", a._proposal_update_for_column(out, "Rent/SF /Yr")["value"])
+
+    def test_whole_building_description_remains_total_sf(self):
+        phrases = (
+            "A 20,000 SF warehouse is available.",
+            "The property is a 20,000 SF office building.",
+        )
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                self.assertEqual("20000", a._extract_total_sf_from_text(phrase))
+
+    def test_terminal_event_drops_component_when_real_total_is_also_present(self):
+        proposal = {
+            "updates": [{"column": "Total SF", "value": "2,000 SF", "confidence": 0.9}],
+            "events": [{"type": "property_unavailable"}],
+        }
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["123 Test Dr", ""],
+            ["Property Address", "Total SF"],
+            {"mappings": {"total_sf": "Total SF"}},
+            _conv("Total building area is 10,000 SF, including 2,000 SF of office."),
+        )
+        self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
+    def test_addressless_bound_flyer_can_contain_phone_and_zip_metadata(self):
+        self.assertTrue(
+            a._attachment_can_supply_target_facts(
+                "Call 208-555-1212. Boise, ID 83702. Asking rent $10.50/SF NNN.",
+                "2801 Pulaski Hwy",
+                "Here is information about 2801 Pulaski Hwy.",
+            )
+        )
+
     def test_s03_augment_writes_total_sf(self):
         header = ["Property Address", "Total SF"]
         rowvals = ["Prop", ""]
@@ -441,6 +723,14 @@ class RentOpexSfExtractionTests(unittest.TestCase):
             "Asking rate: $1.25/SF/month NNN."), "15.00")
         self.assertEqual(a._extract_rent_sf_yr_from_text(
             "Asking rent: $9.00/SF NNN, available next month."), "9.00")
+
+    def test_rent_does_not_inherit_monthly_unit_from_following_opex(self):
+        self.assertEqual(
+            a._extract_rent_sf_yr_from_text(
+                "$12.75/SF asking rent, $0.30/SF/month OpEx"
+            ),
+            "12.75",
+        )
 
     # R20 — recency/"now" preference: a current asking rate supersedes a stale
     # prior quote in the same line. First-match ordering returned the superseded
@@ -569,6 +859,60 @@ class FabricatedDoorCountTests(unittest.TestCase):
             proposal, _conv("Has 2 drive-in doors and 3 dock doors."), self.HEADER, self.CFG)
         cols = {u["column"] for u in out["updates"]}
         self.assertEqual(cols, {"Drive Ins", "Docks"})
+
+    def test_dimensioned_singular_drive_in_is_recovered_when_model_omits_it(self):
+        proposal = {"updates": [], "events": []}
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["123 Beta Blvd", ""],
+            ["Property Address", "Drive Ins"],
+            {"mappings": {"drive_ins": "Drive Ins"}},
+            _conv("It has 3 phase power and a 12x12 drive in door."),
+        )
+
+        self.assertEqual(
+            "1",
+            a._proposal_update_for_column(out, "Drive Ins")["value"],
+        )
+
+        guarded = a._suppress_fabricated_door_counts(
+            out,
+            _conv("It has 3 phase power and a 12x12 drive in door."),
+            ["Property Address", "Drive Ins"],
+            {"mappings": {"drive_ins": "Drive Ins"}},
+        )
+        self.assertEqual(
+            "1",
+            a._proposal_update_for_column(guarded, "Drive Ins")["value"],
+        )
+
+    def test_dimensioned_singular_drive_in_is_not_used_with_mixed_evidence(self):
+        proposal = {"updates": [], "events": []}
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["123 Beta Blvd", ""],
+            ["Property Address", "Drive Ins"],
+            {"mappings": {"drive_ins": "Drive Ins"}},
+            _conv("A 12x12 drive-in door plus two 10x10 drive-ins."),
+        )
+
+        self.assertIsNone(a._proposal_update_for_column(out, "Drive Ins"))
+
+    def test_dimensioned_singular_drive_in_requires_current_positive_fact(self):
+        phrases = (
+            "It does not have one 12x12 drive-in door.",
+            "It needs one 12x12 drive-in door.",
+            "One 12x12 drive-in door is proposed.",
+            "It may have one 12x12 drive-in door.",
+            "It used to have one 12x12 drive-in door.",
+            "It had one 12x12 drive-in door.",
+            "It will have one 12x12 drive-in door.",
+        )
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(
+                    a._extract_dimensioned_singular_drive_in_count(phrase)
+                )
 
     # D04 — word-number dock count ("Four dock-high doors") must be KEPT.
     def test_d04_word_number_dock_count_kept(self):
