@@ -3,6 +3,7 @@ import hashlib
 import logging
 import re
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Any
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import client, _sheets_client, _fs
@@ -19,6 +20,7 @@ from .column_config import (
 )
 from .notification_payloads import sanitize_new_property_referral_response
 from .openai_usage import track_openai_usage_safely
+from .property_images import STREET_SUFFIX_TOKENS
 from .tour_scheduling import looks_like_tour_only_unavailable
 from .outbound_safety import find_unresolved_placeholders
 
@@ -1344,6 +1346,19 @@ _EXPLICIT_TOTAL_SF_RE = re.compile(
     r"(?:sq\.?\s*ft\.?|square\s+feet|sf)\s*(?:in\s+)?total\b)",
     re.IGNORECASE,
 )
+_COMPONENT_SF_AFTER_RE = re.compile(
+    r"^\s*(?:of|is|as|dedicated\s+to|allocated\s+to|used\s+for|"
+    r"consisting\s+of)\s+(?:the\s+)?"
+    r"(?:office|warehouse|showroom|mezzanine|yard)\b",
+    re.IGNORECASE,
+)
+_COMPONENT_SF_BEFORE_RE = re.compile(
+    r"(?:office|warehouse|showroom|mezzanine|yard)"
+    r"(?:\s+(?:area|space|component|portion))?\s*"
+    r"(?:is|was|has|of|comprises?|contains?|totals?|:|=)?\s*"
+    r"(?:about|approximately|approx\.?|roughly)?\s*$",
+    re.IGNORECASE,
+)
 _MONTHLY_UNIT_RE = re.compile(r"(?:/\s*|\bper\s+)(?:mo|mos|month)\b|\bmonthly\b|\bpsf\s*/?\s*mo(?:nth)?\b", re.IGNORECASE)
 _ANNUAL_UNIT_RE = re.compile(r"(?:/\s*|\bper\s+)(?:yr|year|annum|annual|annually)\b", re.IGNORECASE)
 _HYPOTHETICAL_RENT_RE = re.compile(
@@ -1605,15 +1620,72 @@ def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
     return None
 
 
+def _sf_match_is_component(text: str, match: "re.Match") -> bool:
+    before = text[max(0, match.start() - 50):match.start()]
+    after = text[match.end():match.end() + 30]
+    return bool(
+        _COMPONENT_SF_BEFORE_RE.search(before)
+        or _COMPONENT_SF_AFTER_RE.search(after)
+    )
+
+
+_NUMERIC_VALUE_RE = re.compile(
+    r"(?<![\d.])\$?\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*([kK]?)(?![\d.])"
+)
+_RENT_NUMERIC_VALUE_RE = re.compile(
+    r"\$?\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*"
+    r"(?:(?:/|per\s+)?\s*(?:sf|psf|sq\.?\s*ft|square\s+foot)|a\s+foot)",
+    re.IGNORECASE,
+)
+
+
+def _normalized_numeric_value(value: Any) -> Optional[Decimal]:
+    match = _NUMERIC_VALUE_RE.search(str(value or ""))
+    if not match:
+        return None
+    try:
+        normalized = Decimal(match.group(1).replace(",", ""))
+        return normalized * 1000 if match.group(2) else normalized
+    except InvalidOperation:
+        return None
+
+
+def _normalized_rent_value(value: Any) -> Optional[Decimal]:
+    match = _RENT_NUMERIC_VALUE_RE.search(str(value or ""))
+    if match:
+        try:
+            return Decimal(match.group(1).replace(",", ""))
+        except InvalidOperation:
+            return None
+    return _normalized_numeric_value(value)
+
+
+def _component_sf_values(text: str) -> set[Decimal]:
+    values = set()
+    for match in _TOTAL_SF_RE.finditer(text or ""):
+        if _sf_match_is_component(text, match):
+            normalized = _normalized_numeric_value(match.group(1))
+            if normalized is not None:
+                values.add(normalized)
+    return values
+
+
 def _extract_total_sf_from_text(text: str) -> Optional[str]:
     """Deterministic Total SF fallback; tolerates '+/- 9,000 SF' style approximations."""
     if not text:
         return None
-    explicit_total = _EXPLICIT_TOTAL_SF_RE.search(text)
-    if explicit_total:
+    for explicit_total in _EXPLICIT_TOTAL_SF_RE.finditer(text):
+        area_match = _TOTAL_SF_RE.search(text, explicit_total.start(), explicit_total.end())
+        if area_match and _sf_match_is_component(text, area_match):
+            continue
         raw_total = next(group for group in explicit_total.groups() if group)
         return str(int(raw_total.replace(",", "")))
     for m in _TOTAL_SF_RE.finditer(text):
+        # A component area is not the whole property's leasable area. The model
+        # can reason over component facts, but this deterministic fallback must
+        # not turn "2,000 SF of office" into Total SF.
+        if _sf_match_is_component(text, m):
+            continue
         raw = m.group(1).replace(",", "")
         try:
             val = int(raw)
@@ -1622,6 +1694,131 @@ def _extract_total_sf_from_text(text: str) -> Optional[str]:
         if val >= 1000:
             return str(val)
     return None
+
+
+_STREET_SUFFIX_CANONICAL = {
+    "st": "street", "street": "street",
+    "ave": "avenue", "av": "avenue", "avenue": "avenue",
+    "rd": "road", "road": "road",
+    "blvd": "boulevard", "boulevard": "boulevard",
+    "dr": "drive", "drive": "drive",
+    "ln": "lane", "lane": "lane",
+    "ct": "court", "court": "court",
+    "pl": "place", "place": "place",
+    "hwy": "highway", "highway": "highway",
+    "fwy": "freeway", "freeway": "freeway",
+    "pkwy": "parkway", "parkway": "parkway",
+}
+
+
+def _street_claim_spans(text: str) -> List[tuple]:
+    tokens = list(re.finditer(r"[a-z0-9]+", (text or "").lower()))
+    claims = []
+    for index, token_match in enumerate(tokens):
+        number = token_match.group(0)
+        if not number.isdigit() or not 1 <= len(number) <= 6:
+            continue
+        for suffix_index in range(index + 2, min(index + 6, len(tokens))):
+            suffix = tokens[suffix_index].group(0)
+            if suffix in STREET_SUFFIX_TOKENS:
+                names = tuple(
+                    match.group(0) for match in tokens[index + 1:suffix_index]
+                )
+                claims.append((
+                    token_match.start(),
+                    tokens[suffix_index].end(),
+                    number,
+                    names,
+                    _STREET_SUFFIX_CANONICAL.get(suffix, suffix),
+                ))
+                break
+            if suffix.isdigit():
+                break
+    return claims
+
+
+def _claim_identity(claim: tuple) -> tuple:
+    return claim[2], claim[3], claim[4]
+
+
+def _target_street_identity(target_anchor: str) -> Optional[tuple]:
+    claims = _street_claim_spans((target_anchor or "").split(",", 1)[0])
+    return _claim_identity(claims[0]) if claims else None
+
+
+def _source_mentions_target_property(source_text: str, target_anchor: str) -> bool:
+    target_identity = _target_street_identity(target_anchor)
+    return bool(
+        target_identity
+        and any(
+            _claim_identity(claim) == target_identity
+            for claim in _street_claim_spans(source_text)
+        )
+    )
+
+
+def _attachment_property_verdict(source_text: str, target_anchor: str) -> str:
+    """Classify attachment text as target-bound, competing, or addressless."""
+    claims = _street_claim_spans(source_text)
+    if not claims:
+        return "addressless"
+    target_identity = _target_street_identity(target_anchor)
+    matches = [_claim_identity(claim) == target_identity for claim in claims]
+    if all(matches):
+        return "target"
+    if any(matches):
+        return "mixed"
+    return "competing"
+
+
+def _attachment_can_supply_target_facts(
+    source_text: str,
+    target_anchor: str,
+    fresh_text: str,
+) -> bool:
+    verdict = _attachment_property_verdict(source_text, target_anchor)
+    if verdict == "target":
+        return True
+    if verdict in {"competing", "mixed"}:
+        return False
+    return _source_mentions_target_property(fresh_text, target_anchor)
+
+
+_PDF_RENT_FIGURE_RE = re.compile(
+    r"\$?\s*\d{1,3}(?:\.\d+)?\s*(?:(?:/|per\s+)?\s*(?:sf|psf)|a\s+foot)",
+    re.IGNORECASE,
+)
+
+
+def _attachment_can_supply_target_rent(
+    source_text: str,
+    target_anchor: str,
+    fresh_text: str,
+) -> bool:
+    verdict = _attachment_property_verdict(source_text, target_anchor)
+    if verdict != "mixed":
+        return _attachment_can_supply_target_facts(source_text, target_anchor, fresh_text)
+    rent_match = _PDF_RENT_FIGURE_RE.search(source_text or "")
+    target_identity = _target_street_identity(target_anchor)
+    preceding_claims = [
+        claim for claim in _street_claim_spans(source_text)
+        if rent_match and claim[1] <= rent_match.start()
+    ]
+    return bool(
+        target_identity
+        and preceding_claims
+        and _claim_identity(preceding_claims[-1]) == target_identity
+    )
+
+
+def _remove_proposal_update(proposal: dict, column_name: Optional[str]) -> None:
+    if not column_name:
+        return
+    key = column_name.strip().lower()
+    proposal["updates"] = [
+        update for update in (proposal.get("updates") or [])
+        if (update.get("column") or "").strip().lower() != key
+    ]
 
 
 def _augment_proposal_with_deterministic_extractions(
@@ -1637,22 +1834,70 @@ def _augment_proposal_with_deterministic_extractions(
     if not proposal:
         return proposal
 
-    # LIVE break (900 Alt Suggest St): when the reply kills the current row
-    # (property_unavailable) and/or pitches an ALTERNATE property (new_property),
-    # the specs in the fresh message describe the alternate — mining them into
-    # the CURRENT row is a cross-property write ("1100 Fresh Listing Ave is
-    # 30,000 SF at $10.50" landed on the dying 900 row). The fallback is
-    # best-effort only, so skip it entirely for these proposals; the alternate's
-    # specs travel via the new-property approval flow instead.
+    mappings = (effective_config or {}).get("mappings", {})
+    # Only mine the broker's FRESH message; quoted history must not seed values.
+    fresh_text = _fresh_inbound_text(conversation)
+    target_anchor = get_row_anchor(rowvals, header)
+    rent_col = mappings.get("rent_sf_yr") or _find_header_name(header, "Rent/SF /Yr")
+    total_sf_col = mappings.get("total_sf") or _find_header_name(header, "Total SF")
+
+    fresh_rent = _extract_rent_sf_yr_from_text(fresh_text)
+    trusted_pdf_rents = []
+    competing_pdf_rents = set()
+    for pdf in (pdf_manifest or []):
+        pdf_source = "\n".join((
+            (pdf or {}).get("name") or "",
+            (pdf or {}).get("text") or "",
+        ))
+        pdf_rent = _extract_rent_sf_yr_from_text((pdf or {}).get("text") or "")
+        if not pdf_rent:
+            continue
+        normalized_pdf_rent = _normalized_rent_value(pdf_rent)
+        if _attachment_can_supply_target_rent(pdf_source, target_anchor, fresh_text):
+            trusted_pdf_rents.append(pdf_rent)
+        elif (
+            _attachment_property_verdict(pdf_source, target_anchor) in {"competing", "mixed"}
+            and normalized_pdf_rent is not None
+        ):
+            competing_pdf_rents.add(normalized_pdf_rent)
+
+    # Validate model-proposed facts before any event-specific early return. A
+    # terminal/new-property proposal must not carry an unsafe current-row write.
+    existing_rent = _proposal_update_for_column(proposal, rent_col) if rent_col else None
+    if existing_rent:
+        proposed_rent = _normalized_rent_value(existing_rent.get("value"))
+        trusted_rents = {
+            normalized
+            for normalized in (
+                [_normalized_rent_value(fresh_rent)]
+                + [_normalized_rent_value(value) for value in trusted_pdf_rents]
+            )
+            if normalized is not None
+        }
+        if proposed_rent in competing_pdf_rents and proposed_rent not in trusted_rents:
+            _remove_proposal_update(proposal, rent_col)
+
+    total_sf_value = _extract_total_sf_from_text(fresh_text)
+    existing_total_sf = (
+        _proposal_update_for_column(proposal, total_sf_col) if total_sf_col else None
+    )
+    if existing_total_sf:
+        proposed_total_sf = _normalized_numeric_value(existing_total_sf.get("value"))
+        normalized_total_sf = _normalized_numeric_value(total_sf_value)
+        if (
+            proposed_total_sf in _component_sf_values(fresh_text)
+            and proposed_total_sf != normalized_total_sf
+        ):
+            _remove_proposal_update(proposal, total_sf_col)
+
+    # LIVE break (900 Alt Suggest St): when the reply kills the current row or
+    # pitches an alternate property, do not mine fallback specs into this row.
     event_types = {
-        (e or {}).get("type") for e in (proposal.get("events") or [])
+        (event or {}).get("type") for event in (proposal.get("events") or [])
     }
     if event_types & {"new_property", "property_unavailable"}:
         return proposal
 
-    mappings = (effective_config or {}).get("mappings", {})
-    # Only mine the broker's FRESH message; quoted history must not seed values.
-    fresh_text = _fresh_inbound_text(conversation)
     def _fill(col_name: Optional[str], value: Optional[str], reason: str) -> None:
         # Resolve to the canonical sheet header spelling (#15 wrote canonical names;
         # #19's mapping values may be lowercase, e.g. "total sf" vs header "Total SF").
@@ -1671,18 +1916,15 @@ def _augment_proposal_with_deterministic_extractions(
             return
         proposal.setdefault("updates", []).append(update)
 
-    rent_value = _extract_rent_sf_yr_from_text(fresh_text)
-    if not rent_value:
+    rent_value = fresh_rent
+    if not rent_value and trusted_pdf_rents:
         # FIX-16 (M35, HEAD): the accept-new-property path passes rent only inside
         # the PDF manifest text (the inbound body is a synthetic stub), so scan the
         # manifest as a LAST resort when the fresh message carries no rent. This does
         # not prefer stale flyer pricing over an email rate — it only fills the gap.
-        for _pdf in (pdf_manifest or []):
-            rent_value = _extract_rent_sf_yr_from_text((_pdf or {}).get("text") or "")
-            if rent_value:
-                break
+        rent_value = trusted_pdf_rents[0]
     _fill(
-        mappings.get("rent_sf_yr") or _find_header_name(header, "Rent/SF /Yr"),
+        rent_col,
         rent_value,
         "Deterministic fallback parsed asking rent per SF per year from the latest broker message.",
     )
@@ -1692,9 +1934,14 @@ def _augment_proposal_with_deterministic_extractions(
         "Deterministic fallback parsed operating expenses per SF per year from the latest broker message.",
     )
     _fill(
-        mappings.get("total_sf") or _find_header_name(header, "Total SF"),
-        _extract_total_sf_from_text(fresh_text),
+        total_sf_col,
+        total_sf_value,
         "Deterministic fallback parsed total square footage from the latest broker message.",
+    )
+    _fill(
+        mappings.get("drive_ins") or _find_header_name(header, "Drive Ins"),
+        _extract_dimensioned_singular_drive_in_count(fresh_text),
+        "Deterministic fallback parsed one explicitly singular drive-in door from the latest broker message.",
     )
     # Loading counts are semantic: entity binding, current-vs-hypothetical state,
     # dimensions, subtotals, and multi-property attachments cannot be resolved by
@@ -1745,6 +1992,11 @@ def _has_explicit_feature_count(text: str, keyword_re: str) -> bool:
     """
     if not text:
         return False
+    if (
+        keyword_re == _DRIVE_IN_KW
+        and _extract_dimensioned_singular_drive_in_count(text)
+    ):
+        return True
     for m in re.finditer(keyword_re, text, re.IGNORECASE):
         lo, hi = m.start() - 16, m.end() + 16
         for nm in re.finditer(_FEATURE_COUNT_RE, text, re.IGNORECASE):
@@ -1773,6 +2025,28 @@ _DRIVE_IN_COUNT_RE = re.compile(
 _DOCK_COUNT_RE = re.compile(
     r"\b(\d{1,3}|" + _WORD_NUMBER_RE + r")\s*(?:x\s*)?"
     r"(?:dock[-\s]?high\s+doors?|loading\s+docks?|docks?\b(?:\s*doors?)?|dock\s+doors?)",
+    re.IGNORECASE,
+)
+_DIMENSIONED_SINGULAR_DRIVE_IN_RE = re.compile(
+    r"\b(?:a|one)\s+(?:\d{1,2}\s*[x×]\s*\d{1,2}\s*)"
+    r"(?:ft\.?\s*)?(?:drive[-\s]?in|grade[-\s]?level)\s+(?:door|ramp)\b",
+    re.IGNORECASE,
+)
+_NONCURRENT_FEATURE_BEFORE_RE = re.compile(
+    r"(?:does\s+not\s+have|doesn't\s+have|do\s+not\s+have|don't\s+have|"
+    r"is\s+not|without|needs?|would\s+need|could\s+(?:add|have)|"
+    r"plans?\s+for|proposed)\s*$",
+    re.IGNORECASE,
+)
+_NONCURRENT_FEATURE_AFTER_RE = re.compile(
+    r"^\s*(?:(?:is|was|would\s+be)\s+)?"
+    r"(?:proposed|planned|required|needed|possible|optional)\b",
+    re.IGNORECASE,
+)
+_CURRENT_FEATURE_BEFORE_RE = re.compile(
+    r"(?:\b(?:currently\s+)?(?:has|features|includes|offers)\b|"
+    r"\bwe\s+have\b|\bthere\s+(?:is|are)\b|\bequipped\s+with\b)"
+    r"[^.!?]{0,60}$",
     re.IGNORECASE,
 )
 
@@ -1858,6 +2132,28 @@ def _extract_drive_in_count_from_text(text: str) -> Optional[str]:
         return None
     m = _DRIVE_IN_COUNT_RE.search(text)
     return _parse_feature_count(m.group(1)) if m else None
+
+
+def _extract_dimensioned_singular_drive_in_count(text: str) -> Optional[str]:
+    """Return one only for an explicit singular dimensioned drive-in door."""
+    matches = list(_DIMENSIONED_SINGULAR_DRIVE_IN_RE.finditer(text or ""))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    before = (text or "")[max(0, match.start() - 45):match.start()]
+    after = (text or "")[match.end():match.end() + 35]
+    if _NONCURRENT_FEATURE_BEFORE_RE.search(before):
+        return None
+    if _NONCURRENT_FEATURE_AFTER_RE.search(after):
+        return None
+    sentence_before = re.split(r"[.!?\n]", before)[-1]
+    is_bare_fact_line = bool(re.fullmatch(r"\s*(?:[-*]\s*)?", sentence_before))
+    if not (_CURRENT_FEATURE_BEFORE_RE.search(before) or is_bare_fact_line):
+        return None
+    remaining = (text or "")[:match.start()] + " " + (text or "")[match.end():]
+    if re.search(_DRIVE_IN_KW, remaining, re.IGNORECASE):
+        return None
+    return "1"
 
 
 def _extract_dock_count_from_text(text: str) -> Optional[str]:
