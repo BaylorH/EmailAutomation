@@ -2795,6 +2795,15 @@ def _event_text(event: Dict[str, Any], key: str) -> str:
     return str((event or {}).get(key) or "").strip()
 
 
+_SENSITIVE_EVENT_RESPONSE_TYPES = {
+    "call_requested",
+    "needs_user_input",
+    "contact_optout",
+    "wrong_contact",
+    "tour_requested",
+}
+
+
 def _proposal_events(proposal: Dict[str, Any]) -> List[Dict[str, Any]]:
     raw_events = (proposal or {}).get("events") or []
     if not isinstance(raw_events, list):
@@ -2804,12 +2813,19 @@ def _proposal_events(proposal: Dict[str, Any]) -> List[Dict[str, Any]]:
     for event in raw_events:
         if not isinstance(event, dict):
             continue
-        event_type = _event_text(event, "type")
+        event_type = _event_text(event, "type").lower()
         if not event_type:
             continue
         normalized = dict(event)
         normalized["type"] = event_type
         normalized_events.append(normalized)
+
+    if any(
+        event["type"] in _SENSITIVE_EVENT_RESPONSE_TYPES
+        for event in normalized_events
+    ):
+        proposal["response_email"] = None
+        proposal["skip_response"] = True
     return normalized_events
 
 
@@ -2849,28 +2865,195 @@ _MISSING_FIELD_REQUEST_NEGATION_RE = re.compile(
 )
 
 
-def _missing_field_request_clauses(response_body: str) -> List[str]:
-    request_clauses = []
-    active_request_index = None
+_MISSING_FIELD_TARGET_REJECTION_RE = re.compile(
+    r"\b(?:receipt|contact|already|provided|attachment|attached|flyer)\b",
+    re.IGNORECASE,
+)
+
+_MISSING_FIELD_DECLARATIVE_RE = re.compile(
+    r"\b(?:is|are|was|were|has|have|had|covers?|includes?|included|contains?)\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_missing_field_request_target(value: str) -> str:
+    return re.sub(r"^[\s:,-]+|[\s.!?:,-]+$", "", value or "").strip()
+
+
+def _is_short_missing_field_target(value: str) -> bool:
+    target = _clean_missing_field_request_target(value)
+    if not target or len(target.split()) > 8:
+        return False
+    if _MISSING_FIELD_TARGET_REJECTION_RE.search(target):
+        return False
+    return not _MISSING_FIELD_DECLARATIVE_RE.search(target)
+
+
+def _is_missing_field_request_target(value: str) -> bool:
+    target = _clean_missing_field_request_target(value)
+    return bool(target) and not _MISSING_FIELD_TARGET_REJECTION_RE.search(target)
+
+
+def _is_explicit_missing_field_list_intro(line: str) -> bool:
+    if not (line or "").rstrip().endswith(":"):
+        return False
+    request_match = _MISSING_FIELD_REQUEST_INTENT_RE.search(line)
+    if not request_match:
+        return False
+    target = _clean_missing_field_request_target(line[request_match.end():])
+    if not target:
+        return True
+    if _MISSING_FIELD_TARGET_REJECTION_RE.search(target):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:following|list|details|information)\b",
+            target,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _missing_field_request_targets(response_body: str) -> List[str]:
+    request_targets = []
+    bullet_list_active = False
     for raw_line in (response_body or "").splitlines():
         line = raw_line.strip()
         if not line:
             continue
         if re.match(r"^[-*]\s+", line):
-            if active_request_index is not None:
-                request_clauses[active_request_index] += " " + re.sub(
-                    r"^[-*]\s+", "", line
+            bullet_target = re.sub(r"^[-*]\s+", "", line)
+            if bullet_list_active and _is_short_missing_field_target(bullet_target):
+                request_targets.append(
+                    _clean_missing_field_request_target(bullet_target)
                 )
             continue
 
-        active_request_index = None
-        for clause in re.split(r"(?<=[.!?;])\s+", line):
-            if _MISSING_FIELD_REQUEST_NEGATION_RE.search(clause):
-                continue
-            if _MISSING_FIELD_REQUEST_INTENT_RE.search(clause):
-                request_clauses.append(clause)
-                active_request_index = len(request_clauses) - 1
-    return request_clauses
+        bullet_list_active = _is_explicit_missing_field_list_intro(line)
+        if bullet_list_active:
+            continue
+
+        for sentence in re.split(r"(?<=[.!?])\s+", line):
+            inline_request_active = False
+            for clause in re.split(r"[,;]+", sentence):
+                clause = re.sub(
+                    r"^\s*(?:and|also)\s+", "", clause, flags=re.IGNORECASE
+                )
+                if _MISSING_FIELD_REQUEST_NEGATION_RE.search(clause):
+                    inline_request_active = False
+                    continue
+                request_match = _MISSING_FIELD_REQUEST_INTENT_RE.search(clause)
+                if request_match:
+                    target = _clean_missing_field_request_target(
+                        clause[request_match.end():]
+                    )
+                    inline_request_active = _is_missing_field_request_target(target)
+                    if inline_request_active:
+                        request_targets.append(target)
+                    continue
+                if inline_request_active and _is_short_missing_field_target(clause):
+                    request_targets.append(_clean_missing_field_request_target(clause))
+                else:
+                    inline_request_active = False
+    return request_targets
+
+
+def _configured_missing_field_key(
+    field: str,
+    column_config: Optional[dict],
+) -> Optional[str]:
+    key = re.sub(r"\s+", " ", (field or "").strip().lower())
+    mappings = (
+        column_config.get("mappings", {})
+        if isinstance(column_config, dict)
+        else {}
+    )
+    for canonical, actual_header in mappings.items():
+        actual_key = re.sub(r"\s+", " ", str(actual_header or "").strip().lower())
+        if actual_key == key:
+            return canonical
+    return None
+
+
+_MISSING_FIELD_ALIASES = {
+    "docks": [
+        "dock",
+        "docks",
+        "dock count",
+        "dock counts",
+        "dock door",
+        "dock doors",
+        "dock door count",
+        "loading dock",
+        "loading docks",
+        "loading dock door count",
+    ],
+    "drive_ins": [
+        "drive ins",
+        "drive-ins",
+        "drive-in",
+        "drive in",
+        "drive-in door",
+        "drive-in doors",
+        "drive in door",
+        "drive in doors",
+        "grade-level",
+        "grade level",
+    ],
+    "ceiling_ht": ["ceiling ht", "ceiling height", "clear height"],
+    "power": [
+        "power",
+        "electrical capacity",
+        "electrical service",
+        "amperage",
+        "amps",
+        "voltage",
+    ],
+    "rent_sf_yr": [
+        "rent/sf /yr",
+        "asking rent",
+        "rent per sf",
+        "rental rate",
+        "lease rate",
+    ],
+    "flyer_link": [
+        "flyer",
+        "brochure",
+        "marketing package",
+        "marketing link",
+    ],
+    "total_sf": ["total sf", "square footage", "building size"],
+}
+
+
+def _request_target_matches_missing_field(
+    target: str,
+    field: str,
+    column_config: Optional[dict],
+) -> bool:
+    canonical = _configured_missing_field_key(field, column_config)
+    if canonical == "ops_ex_sf":
+        if any(
+            _contains_field_term(target, term)
+            for term in ("ops ex", "opex", "operating expense", "operating expenses")
+        ):
+            return True
+        has_expense_context = bool(
+            re.search(
+                r"\b(?:expense|expenses|rate|rates|charge|charges|cost|costs)\b",
+                target,
+                re.IGNORECASE,
+            )
+        )
+        return has_expense_context and any(
+            _contains_field_term(target, term) for term in ("nnn", "cam")
+        )
+
+    aliases = _MISSING_FIELD_ALIASES.get(canonical or "")
+    if aliases is None:
+        exact_label = re.sub(r"\s+", " ", (field or "").strip().lower())
+        aliases = [exact_label]
+    return any(_contains_field_term(target, alias) for alias in aliases)
 
 
 def _response_mentions_missing_fields(
@@ -2884,88 +3067,31 @@ def _response_mentions_missing_fields(
         return False
     if _response_requests_nonrequestable_fields(body, column_config):
         return False
-    request_clauses = _missing_field_request_clauses(body)
-    if not request_clauses:
+    request_targets = _missing_field_request_targets(body)
+    if not request_targets:
         return False
 
-    aliases = {
-        "rail access": ["rail access", "rail-served", "rail served", "rail"],
-        "docks": [
-            "docks",
-            "dock count",
-            "dock counts",
-            "dock door",
-            "dock doors",
-            "loading dock",
-            "loading docks",
-        ],
-        "drive ins": [
-            "drive ins",
-            "drive-in",
-            "drive in",
-            "grade-level",
-            "grade level",
-            "door count",
-        ],
-        "drive-ins": [
-            "drive-ins",
-            "drive-in",
-            "drive in",
-            "grade-level",
-            "grade level",
-            "door count",
-        ],
-        "ceiling ht": ["ceiling ht", "ceiling height", "clear height"],
-        "power": [
-            "power",
-            "electrical capacity",
-            "electrical service",
-            "amperage",
-            "amps",
-            "voltage",
-        ],
-        "ops ex /sf": [
-            "ops ex",
-            "opex",
-            "operating expense",
-            "operating expenses",
-            "nnn",
-            "cam",
-        ],
-        "rent/sf /yr": [
-            "rent/sf /yr",
-            "asking rent",
-            "rent per sf",
-            "rental rate",
-            "lease rate",
-        ],
-        "flyer / link": [
-            "flyer",
-            "brochure",
-            "marketing package",
-            "marketing link",
-        ],
-        "total sf": ["total sf", "square footage", "building size"],
-    }
-
     for field in missing_fields:
-        key = re.sub(r"\s+", " ", (field or "").strip().lower())
-        candidates = aliases.get(key, [key])
         if not any(
-            _contains_field_term(clause, candidate)
-            for clause in request_clauses
-            for candidate in candidates
+            _request_target_matches_missing_field(target, field, column_config)
+            for target in request_targets
         ):
             return False
     return True
 
 
 def _sentence_case_missing_field_label(field: str) -> str:
-    first_token = field.split(maxsplit=1)[0]
-    token_letters = re.sub(r"[^A-Za-z]", "", first_token)
-    if len(token_letters) >= 2 and token_letters.isupper():
+    tokens = field.split()
+    first_token_letters = re.sub(r"[^A-Za-z]", "", tokens[0])
+    if len(first_token_letters) >= 2 and first_token_letters.isupper():
         return field
-    return field[:1].lower() + field[1:]
+    return " ".join(
+        token
+        if len(re.sub(r"[^A-Za-z]", "", token)) >= 2
+        and re.sub(r"[^A-Za-z]", "", token).isupper()
+        else token.lower()
+        for token in tokens
+    )
 
 
 def _build_missing_fields_response(
@@ -2979,7 +3105,7 @@ def _build_missing_fields_response(
     greeting = _build_greeting(contact_name)
     if len(fields) >= 3:
         field_list = "\n".join(f"- {field}" for field in fields)
-        request = f"Could you confirm the remaining property details?\n\n{field_list}"
+        request = f"Could you provide the following property details:\n\n{field_list}"
     else:
         natural_labels = {
             "ceiling ht": "clear height",
@@ -2987,6 +3113,8 @@ def _build_missing_fields_response(
             "drive-ins": "drive-in count",
             "ops ex /sf": "operating expenses per SF",
             "total sf": "total SF",
+            "nnn": "NNN charges",
+            "cam": "CAM charges",
         }
         natural_fields = [
             natural_labels.get(

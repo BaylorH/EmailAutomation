@@ -263,6 +263,36 @@ class BrokerVoicePolicyTests(unittest.TestCase):
 
                 self.assertIsNone(result["response_email"])
 
+    def test_shared_proposal_boundary_normalizes_sensitive_dispatch_and_blocks_reply(self):
+        variants = {
+            "needs_user_input": "  NEEDS_USER_INPUT  ",
+            "tour_requested": " Tour_Requested ",
+            "wrong_contact": " WRONG_CONTACT\t",
+            "contact_optout": "\nContact_OptOut ",
+            "call_requested": " Call_Requested ",
+        }
+
+        for event_type, raw_event_type in variants.items():
+            with self.subTest(event_type=event_type):
+                proposal = {
+                    "events": [
+                        {
+                            "type": raw_event_type,
+                            "reason": "preserved_reason",
+                            "question": "Preserve this payload",
+                        }
+                    ],
+                    "response_email": "Could you confirm the docks and power?",
+                }
+
+                events = processing._proposal_events(proposal)
+
+                self.assertEqual(event_type, events[0]["type"])
+                self.assertEqual("preserved_reason", events[0]["reason"])
+                self.assertEqual("Preserve this payload", events[0]["question"])
+                self.assertTrue(proposal.get("skip_response"))
+                self.assertIsNone(proposal["response_email"])
+
 
 class BrokerVoiceFallbackTests(unittest.TestCase):
     def test_missing_field_mention_without_request_intent_is_rejected(self):
@@ -323,6 +353,99 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
         self.assertFalse(
             processing._response_mentions_missing_fields(
                 "The docks and power are already in the attachment, right?",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_request_target_does_not_borrow_fields_from_attachment_context(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Could you confirm receipt, since the docks and power are already "
+                "in the attachment?",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_non_list_intro_does_not_turn_declarative_bullet_into_request(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Could you confirm receipt?\n- Docks and power are in the flyer.",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_rejected_receipt_intro_does_not_activate_field_bullets(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Could you confirm receipt and the following details:\n"
+                "- Docks\n"
+                "- Power",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_loading_dock_door_count_matches_docks_only(self):
+        body = "Could you confirm the loading dock door count?"
+
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Docks"],
+                get_default_column_config(),
+            )
+        )
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Drive Ins"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_drive_in_door_count_matches_drive_ins_only(self):
+        body = "Could you confirm the drive-in door count?"
+
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Drive Ins"],
+                get_default_column_config(),
+            )
+        )
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Docks"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_cam_contact_does_not_match_operating_expenses(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Could you confirm the CAM contact?",
+                ["Ops Ex /SF"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_cam_charges_match_operating_expenses(self):
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                "Could you confirm the CAM charges?",
+                ["Ops Ex /SF"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_explicit_short_target_list_requests_every_listed_field(self):
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                "Could you provide:\n- Docks\n- Power",
                 ["Docks", "Power"],
                 get_default_column_config(),
             )
@@ -424,6 +547,61 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
                 config,
             )
         )
+
+    def test_configured_header_variants_use_canonical_alias_groups(self):
+        scenarios = (
+            (
+                "docks",
+                "Loading Docks",
+                "Could you confirm the loading dock door count?",
+            ),
+            ("ops_ex_sf", "NNN", "Could you confirm the NNN charges?"),
+            ("ops_ex_sf", "CAM", "Could you confirm the CAM costs?"),
+            (
+                "drive_ins",
+                "Drive-In Doors",
+                "Could you confirm the drive-in door count?",
+            ),
+        )
+
+        for canonical, header, body in scenarios:
+            with self.subTest(header=header):
+                config = get_default_column_config()
+                config["mappings"][canonical] = header
+
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        [header],
+                        config,
+                    )
+                )
+
+    def test_configured_header_fallbacks_are_natural_and_pass_gate(self):
+        scenarios = (
+            ("docks", "Loading Docks", "loading docks"),
+            ("ops_ex_sf", "NNN", "NNN charges"),
+            ("ops_ex_sf", "CAM", "CAM charges"),
+            ("drive_ins", "Drive-In Doors", "drive-in doors"),
+        )
+
+        for canonical, header, expected_target in scenarios:
+            with self.subTest(header=header):
+                config = get_default_column_config()
+                config["mappings"][canonical] = header
+                body = processing._build_missing_fields_response(
+                    "Alex Morgan",
+                    [header],
+                )
+
+                self.assertIn(f"Could you confirm the {expected_target}?", body)
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        [header],
+                        config,
+                    )
+                )
 
     def test_looking_forward_cleanup_does_not_append_a_closing(self):
         body = processing._sanitize_missing_fields_response_body(
