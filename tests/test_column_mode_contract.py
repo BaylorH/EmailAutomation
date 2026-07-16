@@ -94,8 +94,12 @@ class BrokerReplyColumnModeValidationTests(unittest.TestCase):
         }
 
     def test_accepts_request_for_missing_ask_field_only(self):
-        body = "Thanks for the details. Could you also confirm the asking rent?"
+        body = processing._build_missing_fields_response(
+            "Alex",
+            ["Rent/SF /Yr"],
+        )
 
+        self.assertIn("rent", body.lower())
         self.assertTrue(
             processing._response_mentions_missing_fields(
                 body,
@@ -274,7 +278,15 @@ class AutomaticResponseScenarioValidationTests(unittest.TestCase):
         )
 
         self.assertNotIn("flyer", body.lower())
-        self.assertIn("other properties", body.lower())
+        self.assertNotIn("broker context", body.lower())
+        self.assertNotIn("internal score", body.lower())
+        self.assertIn("Hi Alex,", body)
+        self.assertIn("update", body.lower())
+        self.assertIn("relevant property", body.lower())
+        self.assertNotRegex(
+            body,
+            r"(?im)^\s*(best|best regards|regards|thanks)[,!]?\s*$",
+        )
 
     def test_scenario_4_uses_safe_completion_fallback(self):
         body = processing._select_automatic_response_body(
@@ -285,7 +297,16 @@ class AutomaticResponseScenarioValidationTests(unittest.TestCase):
         )
 
         self.assertNotIn("flyer", body.lower())
-        self.assertIn("everything we need", body.lower())
+        self.assertNotIn("broker context", body.lower())
+        self.assertNotIn("internal score", body.lower())
+        self.assertIn("Hi Alex,", body)
+        self.assertIn("review", body.lower())
+        self.assertIn("with the client", body.lower())
+        self.assertIn("questions", body.lower())
+        self.assertNotRegex(
+            body,
+            r"(?im)^\s*(best|best regards|regards|thanks)[,!]?\s*$",
+        )
 
     def test_scenario_keeps_llm_copy_with_benign_link_context(self):
         safe_llm_body = (

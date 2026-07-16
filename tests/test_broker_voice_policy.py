@@ -1,5 +1,6 @@
 import inspect
 import unittest
+from unittest.mock import Mock, patch
 
 from email_automation import ai_processing, processing
 from email_automation.ai_processing import build_response_email_rules
@@ -88,8 +89,80 @@ class BrokerVoicePolicyTests(unittest.TestCase):
         self.assertIn("OUTPUT ONLY valid JSON in this exact format", source)
         self.assertIn("build_response_email_rules()", source)
 
+    def test_assembled_output_contract_nulls_every_sensitive_event(self):
+        fake_response = Mock(
+            output_text=(
+                '{"updates": [], "events": [], "response_email": null, "notes": ""}'
+            )
+        )
+        with patch.object(
+            ai_processing.client.responses,
+            "create",
+            return_value=fake_response,
+        ) as create:
+            ai_processing.propose_sheet_updates(
+                "uid",
+                "client",
+                "broker@example.com",
+                "sheet",
+                ["Property Address", "Rent/SF /Yr", "Flyer / Link"],
+                3,
+                ["123 Main St", "", ""],
+                "thread",
+                conversation=[
+                    {
+                        "direction": "inbound",
+                        "from": "broker@example.com",
+                        "content": "The space is available.",
+                    }
+                ],
+                column_config=get_default_column_config(),
+                dry_run=True,
+            )
+
+        content = create.call_args.kwargs["input"][0]["content"]
+        prompt_text = next(
+            item["text"] for item in content if item.get("type") == "input_text"
+        )
+        contract_start = prompt_text.rindex('"response_email":')
+        contract_end = prompt_text.index('"notes":', contract_start)
+        response_contract = prompt_text[contract_start:contract_end]
+
+        for event_type in (
+            "call_requested",
+            "needs_user_input",
+            "contact_optout",
+            "wrong_contact",
+            "tour_requested",
+        ):
+            with self.subTest(event_type=event_type):
+                self.assertIn(event_type, response_contract)
+        self.assertNotIn("phone number provided", response_contract)
+
 
 class BrokerVoiceFallbackTests(unittest.TestCase):
+    def test_looking_forward_cleanup_does_not_append_a_closing(self):
+        body = processing._sanitize_missing_fields_response_body(
+            "Hi Alex,\n\n"
+            "Could you confirm the docks and power?\n\n"
+            "Looking forward to your response"
+        )
+
+        self.assertNotIn("Looking forward", body)
+        self.assertIn("docks", body.lower())
+        self.assertIn("power", body.lower())
+        self.assertNotRegex(
+            body,
+            r"(?im)^\s*(best|best regards|regards|thanks)[,!]?\s*$",
+        )
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
     def test_two_missing_fields_use_a_natural_sentence(self):
         body = processing._build_missing_fields_response(
             "Alex Morgan",

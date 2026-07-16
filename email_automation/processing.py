@@ -2889,6 +2889,15 @@ def _build_missing_fields_response(
     return f"{greeting}\n\n{request}"
 
 
+def _sanitize_missing_fields_response_body(response_body: str) -> str:
+    cleaned = (response_body or "").replace(
+        "Looking forward to your response", ""
+    ).replace(
+        "Looking forward to hearing from you", ""
+    )
+    return "\n".join(line for line in cleaned.split("\n") if line.strip()).strip()
+
+
 def _select_automatic_response_body(
     scenario: str,
     llm_response_email: Optional[str],
@@ -5861,12 +5870,7 @@ Could you please provide your phone number so I can give you a call?"""
                                 # Safety check: Remove "Looking forward to your response" phrases
                                 if "Looking forward to your response" in response_body or "Looking forward to hearing from you" in response_body:
                                     print(f"   ⚠️ LLM response contained 'Looking forward' phrase, removing it...")
-                                    response_body = response_body.replace("Looking forward to your response", "").replace("Looking forward to hearing from you", "")
-                                    # Clean up any double newlines
-                                    response_body = "\n".join(line for line in response_body.split("\n") if line.strip())
-                                    # Ensure it ends with a simple closing if needed
-                                    if response_body.strip() and not response_body.strip().endswith("Thanks") and not response_body.strip().endswith("Thanks."):
-                                        response_body = response_body.strip() + "\n\nThanks."
+                                    response_body = _sanitize_missing_fields_response_body(response_body)
                                 print(f"🤖 Using LLM-generated response for missing fields scenario")
                             else:
                                 if llm_response_email:
