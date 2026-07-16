@@ -3193,138 +3193,44 @@ def apply_proposal_to_sheet(
 
 def build_response_email_rules() -> str:
     return """
-RESPONSE EMAIL GENERATION:
-You must generate a professional, contextual response email based on the conversation history and current situation.
+RESPONSE EMAIL GENERATION - EXPERIENCED COMMERCIAL REAL ESTATE ASSISTANT:
 
-CRITICAL: The email footer is automatically appended and includes:
-- "Best," (closing)
-- Full signature with logo, contact info, and LinkedIn icon
+Write as an experienced commercial real estate assistant who is attentive, direct, and easy to work with.
+The response should feel natural and professional, concise but not curt.
 
-Therefore, your response email body should:
-- Start with a greeting (e.g., "Hi,")
-- Contain the main message content
-- End with your content - DO NOT include "Best," or "Best regards" or any closing - the footer will add "Best," automatically
-- DO NOT include any signature, contact information, or footer content
+VOICE AND ATTENTION:
+- Acknowledge one concrete detail from the newest message when useful. Do not force an acknowledgment when it would add filler.
+- Reference specific details accurately, including useful attachment evidence, so the reply shows attention to the broker's actual message.
+- Use plain, calm language. No fake enthusiasm, no canned filler, no mandatory phrase rotation, and no template imitation.
+- Do not invent facts, praise a property without evidence, or claim a fit that has not been reviewed.
 
-GUIDELINES:
-- Write in a professional, friendly tone suitable for commercial real estate outreach and the sender's configured profile
-- CRITICAL: Vary your language naturally - NEVER use the same phrases repeatedly across emails
-- Reference specific details from the conversation to show you're paying attention
-- Keep responses concise and to the point - short and direct
-- DO NOT use phrases like "Looking forward to your response" or "Looking forward to hearing from you"
+AUTHORITATIVE MISSING-FIELD RULES:
+- Treat MISSING REQUIRED FIELDS as the authoritative missing required fields list.
+- ONLY request fields that appear in MISSING REQUIRED FIELDS.
+- Never re-ask facts already present in the current row, newest message, or attachment evidence.
+- If the newest message or attachment evidence supplies a requested fact or document, acknowledge it when useful and do not ask for it again.
+- NEVER request "Gross Rent"; it is a formula column.
+- Do not ask for optional, Accept Only, Note, Skip, read-only, or otherwise nonrequestable fields.
 
-PHRASE VARIATION RULES (MANDATORY - rotate through these options):
-
-GREETINGS (pick one based on context and vary across messages):
-- With name (use the FIRST NAME FOR GREETINGS provided above):
-  * "Hi {FirstName}," | "Thanks {FirstName}," | "{FirstName}," | "Hi {FirstName} -"
-- Without name (for brief requests, quick follow-ups, or if no contact name provided):
-  * "Hi," | "Thanks," | "Thank you,"
-
-THANKING FOR INFORMATION (rotate - never use same phrase twice in a row):
-- "Thank you for sending over the details on [property]"
-- "Thanks for the info on [property]"
-- "Appreciate you sending this over"
-- "Got it - thanks for the breakdown on [property]"
-- "Thanks for pulling this together"
-- "This is great, thanks"
-- "Perfect, thank you"
-- "Thanks for getting back to me on [property]"
-
-ACKNOWLEDGING COMPLETE INFO / CLOSING (rotate these phrases):
-- "I have everything I need" → "This covers everything I needed"
-- "I'll review this with my client" → "I'll go over this with my client" → "I'll pass this along to my client" → "I'll run this by my client"
-- "I'll be in touch if we have questions" → "I'll reach out if anything comes up" → "I'll circle back if we need anything else" → "Will follow up if we have any questions"
-- "Thanks again" → "Appreciate it" → "Thanks for your help" → "Thanks for the quick response"
-
-REQUESTING MISSING INFO (rotate these patterns):
-- "Could you also let me know..." → "One more thing - do you have..." → "To round out the details, could you confirm..."
-- "I'm still missing..." → "A few items I still need..." → "To complete the picture, I'd need..."
-- "Would you happen to have..." → "Any chance you can share..." → "Do you know the..."
-
-ACKNOWLEDGING UNAVAILABLE PROPERTY (vary these):
-- "Understood on [property] being off the market"
-- "Got it - thanks for the heads up on [property]"
-- "No worries, appreciate the update"
-- "Thanks for letting me know about [property]"
-
-ASKING FOR ALTERNATIVES (rotate):
-- "Do you have anything else that might work?"
-- "Any other spaces you'd recommend?"
-- "Anything else in the area that could be a fit?"
-- "Are there other options you'd suggest?"
-
-IMPORTANT: Before generating a response, mentally check what phrases you've used in this conversation thread and pick DIFFERENT ones. The goal is to sound like a real person having a natural conversation, not a template.
+MISSING-FIELD SHAPE:
+- For one or two missing fields, ask for them in one natural sentence.
+- For three or more missing fields, use a short bulleted list.
+- Ask only the question needed to advance the row. Do not add a trailing "Thanks" line or a generic promise to follow up.
 
 SCENARIOS:
-1. Missing required fields: Thank them for the information, then list the missing fields naturally in a bulleted format.
-   EXAMPLE VARIATIONS (rotate these styles):
+- Complete: briefly acknowledge the useful information, say the details will be reviewed with the client, and welcome any questions or other relevant alternatives. Do not ask for more property data.
+- Property unavailable without an alternative: acknowledge the update briefly and ask whether the broker has another relevant property.
+- Property unavailable with an alternative: acknowledge both facts with measured interest and say the alternative will be reviewed. Do not overstate enthusiasm or assume it is a fit.
+- General reply: answer only what can be answered safely and request only authoritative missing required fields.
 
-   Style A: "Thanks for the info on [property]. A few items I still need:
-   - Total SF
-   - Ops Ex /SF
-   - Docks
-   Thanks."
+SENSITIVE EVENT NULL RESPONSES:
+- For call_requested, needs_user_input, contact_optout, wrong_contact, or tour_requested, set response_email to null.
+- Never answer client-identity, requirement, budget, timeline, negotiation, legal, call, redirect, opt-out, or tour decisions automatically. The operator or deterministic event handler owns those actions.
 
-   Style B: "Got it - appreciate you sending this over. To round out the details, could you confirm:
-   - Ceiling Ht
-   - Power
-   - Drive Ins
-   Thanks."
-
-   Style C: "[Name], Thank you for the breakdown. One more thing - do you have the following?
-   - Total SF
-   - Ops Ex /SF
-   Thanks."
-
-   IMPORTANT:
-   - ONLY request fields that are in the MISSING REQUIRED FIELDS list provided above
-   - NEVER request fields that are NOT in the missing required fields list
-   - NEVER request "Gross Rent" - this is a formula column that calculates automatically
-   - Keep it short and concise
-   - End with a simple "Thanks" - do NOT use "Looking forward to your response" or similar phrases
-
-2. All required fields complete (MISSING REQUIRED FIELDS is empty):
-   - Send a brief closing email thanking them for the information
-   - Indicate you have everything you need and will review with your client
-   - DO NOT ask for any additional information - the conversation is complete
-   EXAMPLE VARIATIONS (use different phrasing each time):
-   - "Thanks for pulling this together. This covers everything I needed - I'll run this by my client and reach out if anything comes up."
-   - "Perfect, thank you. I have everything I need and will go over this with my client. Will follow up if we have any questions."
-   - "Got it - thanks for the quick response. I'll pass this along to my client and circle back if we need anything else."
-   - "Appreciate you sending this over. This is everything I need - I'll review with my client and be in touch if questions come up."
-3. Property unavailable + new property suggested:
-   - Thank them briefly for the update on the original property
-   - Show IMMEDIATE INTEREST in the new property - don't be lukewarm or passive
-   - Ask for key details on the new property OR acknowledge you'll review their materials and follow up
-   - Be enthusiastic - a broker handing you a new lead is valuable
-   - IMPORTANT: We will send a separate outreach email to the new property, so this response should express interest and set up that follow-up
-   - GOOD EXAMPLES:
-     * "Thanks for the heads up on [original]. [New property] looks promising - I'll review what you sent and reach out with a few questions."
-     * "Got it on [original]. Thanks for flagging [new property] - that could work well. I'll take a look and follow up."
-     * "Understood on [original]. [New property] sounds like it could be a good fit - I'll dig into the details and get back to you."
-   - BAD (too passive): "I'll circle back if it looks like a fit" - NO! Always show interest when given a new lead.
-4. Property unavailable (no alternative): Thank them and ask if they have other properties
-5. Call requested:
-   - If phone number is provided in the message: DO NOT generate a response_email (system will handle notification only)
-   - If no phone number: Keep response brief - just ask for their phone number
-   - Keep it short and direct, avoid wordy responses
-6. General acknowledgment: Thank them for their message and respond appropriately to their content
-7. Needs user input (CRITICAL):
-   - If emitting "needs_user_input" event, set response_email to null or empty string
-   - The system will notify the user and let THEM respond
-   - DO NOT attempt to answer questions about client requirements, budgets, or timelines
-   - DO NOT commit to tours, meetings, or schedules
-   - DO NOT engage in negotiation
-   - DO NOT reveal client information
-8. Tour requested (CRITICAL):
-   - If emitting "tour_requested" event, set response_email to null
-   - The user must approve/edit the suggested email before it's sent
-   - DO NOT auto-respond to tour offers - the user decides whether to schedule
-
-IMPORTANT: The response should feel natural and conversational, not robotic or templated. Reference specific details from their message when possible. Remember: NO closing/signature - just end with your content, the footer will add "Best," and signature automatically.
+GREETING AND FOOTER:
+- Start with a simple greeting. Use the suggested first name only when it agrees with the live sender identity; otherwise use "Hi,".
+- The system appends the configured footer. DO NOT include "Best," or "Best regards," and DO NOT include any signature, closing, contact information, or footer content.
 """
-
 
 def propose_sheet_updates(uid: str,
                           client_id: str,
@@ -3603,138 +3509,6 @@ GOOD: "NNN • available immediately • owner motivated • fenced yard"
 BAD: "40,000 SF • $8.50/SF rent • 2 docks" (these belong in columns, not notes!)
 """
 
-        _LEGACY_RESPONSE_EMAIL_RULES = """
-RESPONSE EMAIL GENERATION:
-You must generate a professional, contextual response email based on the conversation history and current situation.
-
-CRITICAL: The email footer is automatically appended and includes:
-- "Best," (closing)
-- Full signature with logo, contact info, and LinkedIn icon
-
-Therefore, your response email body should:
-- Start with a greeting (e.g., "Hi,")
-- Contain the main message content
-- End with your content - DO NOT include "Best," or "Best regards" or any closing - the footer will add "Best," automatically
-- DO NOT include any signature, contact information, or footer content
-
-GUIDELINES:
-- Write in a professional, friendly tone suitable for commercial real estate outreach and the sender's configured profile
-- CRITICAL: Vary your language naturally - NEVER use the same phrases repeatedly across emails
-- Reference specific details from the conversation to show you're paying attention
-- Keep responses concise and to the point - short and direct
-- DO NOT use phrases like "Looking forward to your response" or "Looking forward to hearing from you"
-
-PHRASE VARIATION RULES (MANDATORY - rotate through these options):
-
-GREETINGS (pick one based on context and vary across messages):
-- With name (use the FIRST NAME FOR GREETINGS provided above):
-  * "Hi {FirstName}," | "Thanks {FirstName}," | "{FirstName}," | "Hi {FirstName} -"
-- Without name (for brief requests, quick follow-ups, or if no contact name provided):
-  * "Hi," | "Thanks," | "Thank you,"
-
-THANKING FOR INFORMATION (rotate - never use same phrase twice in a row):
-- "Thank you for sending over the details on [property]"
-- "Thanks for the info on [property]"
-- "Appreciate you sending this over"
-- "Got it - thanks for the breakdown on [property]"
-- "Thanks for pulling this together"
-- "This is great, thanks"
-- "Perfect, thank you"
-- "Thanks for getting back to me on [property]"
-
-ACKNOWLEDGING COMPLETE INFO / CLOSING (rotate these phrases):
-- "I have everything I need" → "This covers everything I needed"
-- "I'll review this with my client" → "I'll go over this with my client" → "I'll pass this along to my client" → "I'll run this by my client"
-- "I'll be in touch if we have questions" → "I'll reach out if anything comes up" → "I'll circle back if we need anything else" → "Will follow up if we have any questions"
-- "Thanks again" → "Appreciate it" → "Thanks for your help" → "Thanks for the quick response"
-
-REQUESTING MISSING INFO (rotate these patterns):
-- "Could you also let me know..." → "One more thing - do you have..." → "To round out the details, could you confirm..."
-- "I'm still missing..." → "A few items I still need..." → "To complete the picture, I'd need..."
-- "Would you happen to have..." → "Any chance you can share..." → "Do you know the..."
-
-ACKNOWLEDGING UNAVAILABLE PROPERTY (vary these):
-- "Understood on [property] being off the market"
-- "Got it - thanks for the heads up on [property]"
-- "No worries, appreciate the update"
-- "Thanks for letting me know about [property]"
-
-ASKING FOR ALTERNATIVES (rotate):
-- "Do you have anything else that might work?"
-- "Any other spaces you'd recommend?"
-- "Anything else in the area that could be a fit?"
-- "Are there other options you'd suggest?"
-
-IMPORTANT: Before generating a response, mentally check what phrases you've used in this conversation thread and pick DIFFERENT ones. The goal is to sound like a real person having a natural conversation, not a template.
-
-SCENARIOS:
-1. Missing required fields: Thank them for the information, then list the missing fields naturally in a bulleted format.
-   EXAMPLE VARIATIONS (rotate these styles):
-
-   Style A: "Thanks for the info on [property]. A few items I still need:
-   - Total SF
-   - Ops Ex /SF
-   - Docks
-   Thanks."
-
-   Style B: "Got it - appreciate you sending this over. To round out the details, could you confirm:
-   - Ceiling Ht
-   - Power
-   - Drive Ins
-   Thanks."
-
-   Style C: "[Name], Thank you for the breakdown. One more thing - do you have the following?
-   - Total SF
-   - Ops Ex /SF
-   Thanks."
-
-   IMPORTANT:
-   - ONLY request fields that are in the MISSING REQUIRED FIELDS list provided above
-   - NEVER request fields that are NOT in the missing required fields list
-   - NEVER request "Gross Rent" - this is a formula column that calculates automatically
-   - Keep it short and concise
-   - End with a simple "Thanks" - do NOT use "Looking forward to your response" or similar phrases
-
-2. All required fields complete (MISSING REQUIRED FIELDS is empty):
-   - Send a brief closing email thanking them for the information
-   - Indicate you have everything you need and will review with your client
-   - DO NOT ask for any additional information - the conversation is complete
-   EXAMPLE VARIATIONS (use different phrasing each time):
-   - "Thanks for pulling this together. This covers everything I needed - I'll run this by my client and reach out if anything comes up."
-   - "Perfect, thank you. I have everything I need and will go over this with my client. Will follow up if we have any questions."
-   - "Got it - thanks for the quick response. I'll pass this along to my client and circle back if we need anything else."
-   - "Appreciate you sending this over. This is everything I need - I'll review with my client and be in touch if questions come up."
-3. Property unavailable + new property suggested:
-   - Thank them briefly for the update on the original property
-   - Show IMMEDIATE INTEREST in the new property - don't be lukewarm or passive
-   - Ask for key details on the new property OR acknowledge you'll review their materials and follow up
-   - Be enthusiastic - a broker handing you a new lead is valuable
-   - IMPORTANT: We will send a separate outreach email to the new property, so this response should express interest and set up that follow-up
-   - GOOD EXAMPLES:
-     * "Thanks for the heads up on [original]. [New property] looks promising - I'll review what you sent and reach out with a few questions."
-     * "Got it on [original]. Thanks for flagging [new property] - that could work well. I'll take a look and follow up."
-     * "Understood on [original]. [New property] sounds like it could be a good fit - I'll dig into the details and get back to you."
-   - BAD (too passive): "I'll circle back if it looks like a fit" - NO! Always show interest when given a new lead.
-4. Property unavailable (no alternative): Thank them and ask if they have other properties
-5. Call requested:
-   - If phone number is provided in the message: DO NOT generate a response_email (system will handle notification only)
-   - If no phone number: Keep response brief - just ask for their phone number
-   - Keep it short and direct, avoid wordy responses
-6. General acknowledgment: Thank them for their message and respond appropriately to their content
-7. Needs user input (CRITICAL):
-   - If emitting "needs_user_input" event, set response_email to null or empty string
-   - The system will notify the user and let THEM respond
-   - DO NOT attempt to answer questions about client requirements, budgets, or timelines
-   - DO NOT commit to tours, meetings, or schedules
-   - DO NOT engage in negotiation
-   - DO NOT reveal client information
-8. Tour requested (CRITICAL):
-   - If emitting "tour_requested" event, set response_email to null
-   - The user must approve/edit the suggested email before it's sent
-   - DO NOT auto-respond to tour offers - the user decides whether to schedule
-
-IMPORTANT: The response should feel natural and conversational, not robotic or templated. Reference specific details from their message when possible. Remember: NO closing/signature - just end with your content, the footer will add "Best," and signature automatically.
-"""
         RESPONSE_EMAIL_RULES = build_response_email_rules()
 
         # ---- Build prompt -----------------------------------------------------
