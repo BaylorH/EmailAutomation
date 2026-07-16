@@ -310,7 +310,8 @@ class AutomaticResponseScenarioValidationTests(unittest.TestCase):
 
     def test_scenario_keeps_llm_copy_with_benign_link_context(self):
         safe_llm_body = (
-            "Thanks for the details. Here is the link to the listing I reviewed."
+            "Thanks for the details and the listing link. We'll review it with "
+            "the client. Feel free to send questions or other relevant properties."
         )
 
         body = processing._select_automatic_response_body(

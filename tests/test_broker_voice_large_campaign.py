@@ -90,7 +90,46 @@ class BrokerVoiceLargeCampaignFixtureTests(unittest.TestCase):
                 self.assertTrue(case["conversation"])
                 self.assertIsInstance(case.get("pdf_manifest", []), list)
                 self.assertIsInstance(case["offline_proposal"], dict)
-                self.assertIn(case["expect"]["response_mode"], {"send", "null"})
+                self.assertIn(
+                    case["expect"]["response_mode"],
+                    {"send", "null", "deterministic_fallback"},
+                )
+                for aliases in case["expect"].get("must_mention_any", []):
+                    self.assertIsInstance(aliases, list)
+                    self.assertGreaterEqual(len(aliases), 2)
+                    self.assertTrue(all(isinstance(alias, str) for alias in aliases))
+
+    def test_proposal_only_completed_rows_do_not_require_runtime_close_events(self):
+        by_scenario = {case["scenario"]: case for case in self.cases}
+
+        for scenario in (
+            "complete details",
+            "flyer attachment supplied",
+            "drive-in count supplied",
+        ):
+            with self.subTest(scenario=scenario):
+                case = by_scenario[scenario]
+                self.assertEqual([], case["expect"]["event_types"])
+                self.assertEqual([], case["offline_proposal"]["events"])
+
+    def test_missing_field_cases_define_semantic_acceptable_term_groups(self):
+        by_scenario = {case["scenario"]: case for case in self.cases}
+
+        for scenario in (
+            "partial details",
+            "one missing item",
+            "two missing items",
+            "four missing items",
+            "floorplan attachment supplied",
+        ):
+            with self.subTest(scenario=scenario):
+                self.assertTrue(by_scenario[scenario]["expect"]["must_mention_any"])
+
+        dock_aliases = by_scenario["two missing items"]["expect"][
+            "must_mention_any"
+        ][0]
+        self.assertIn("dock count", dock_aliases)
+        self.assertIn("number of dock-high doors", dock_aliases)
 
     def test_fixture_uses_only_reserved_example_test_recipients(self):
         recipients = [case["row"]["recipient"] for case in self.cases]
@@ -174,6 +213,40 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
             "one missing item", proposal, "missing_required_term"
         )
 
+    def test_semantic_missing_field_aliases_are_accepted(self):
+        proposal = self.broken_proposal("two missing items")
+        proposal["response_email"] = (
+            "Hi Morgan,\n\nCould you share the number of dock-high doors and "
+            "electrical service?"
+        )
+
+        result = grade_case(self.cases["two missing items"], proposal)
+
+        self.assertEqual(100, result["score"])
+        self.assertEqual([], result["vetoes"])
+
+    def test_unavailable_no_proposal_uses_explicit_deterministic_fallback(self):
+        case = self.cases["unavailable"]
+
+        result = grade_case(case, case["offline_proposal"])
+
+        self.assertEqual("deterministic_fallback", case["expect"]["response_mode"])
+        self.assertIsNone(case["offline_proposal"]["response_email"])
+        self.assertEqual(100, result["score"])
+        self.assertIsNone(result["raw_response"])
+        self.assertEqual("deterministic_fallback", result["effective_response_source"])
+        self.assertIn("another relevant property", result["effective_response"])
+
+    def test_fallback_expected_case_vetoes_an_unexpected_raw_model_response(self):
+        proposal = self.broken_proposal("unavailable")
+        proposal["response_email"] = self.cases["unavailable"]["expect"][
+            "deterministic_fallback"
+        ]
+
+        self.assert_named_veto(
+            "unavailable", proposal, "unexpected_raw_response"
+        )
+
     def test_forbidden_term_is_vetoed(self):
         proposal = self.broken_proposal("unavailable plus alternative")
         proposal["response_email"] += " This looks like a perfect fit."
@@ -229,6 +302,18 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
         self.assert_named_veto(
             "property issue", proposal, "sensitive_event_auto_response"
         )
+
+    def test_sensitive_event_cannot_gain_a_deterministic_fallback(self):
+        case = deepcopy(self.cases["property issue"])
+        case["expect"]["response_mode"] = "deterministic_fallback"
+        case["expect"]["deterministic_fallback"] = (
+            "Hi Sage, we will handle the roof issue."
+        )
+
+        result = grade_case(case, case["offline_proposal"])
+
+        self.assertIn("sensitive_event_auto_response", result["vetoes"])
+        self.assertLess(result["score"], 100)
 
 
 class BrokerVoiceLargeCampaignRunnerSafetyTests(unittest.TestCase):
@@ -295,6 +380,37 @@ class BrokerVoiceLargeCampaignRunnerSafetyTests(unittest.TestCase):
         self.assertIn("- Token usage: null", markdown)
         self.assertNotIn("- Token usage: None", markdown)
         self.assertIn("- Token note: Unavailable because no model call was made.", markdown)
+
+    def test_markdown_distinguishes_raw_null_from_effective_fallback(self):
+        markdown = _markdown_report(
+            {
+                "mode": "offline",
+                "summary": {
+                    "row_count": 1,
+                    "aggregate_score": 100,
+                    "veto_count": 0,
+                    "safety_veto_count": 0,
+                    "runtime_ms": 1,
+                    "token_usage": None,
+                    "token_usage_note": "Unavailable in offline mode.",
+                },
+                "rows": [
+                    {
+                        "row_id": "synthetic-row-09",
+                        "scenario": "unavailable",
+                        "score": 100,
+                        "vetoes": [],
+                        "runtime_ms": 1,
+                        "token_usage": None,
+                        "raw_response": None,
+                        "effective_response_source": "deterministic_fallback",
+                    }
+                ],
+            }
+        )
+
+        self.assertIn("| Raw proposal response | Effective response source |", markdown)
+        self.assertIn("| null | deterministic_fallback |", markdown)
 
     def test_direct_live_script_resolves_application_package_before_model_call(self):
         environment = {

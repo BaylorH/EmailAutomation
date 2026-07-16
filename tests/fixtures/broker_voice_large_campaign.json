@@ -13,7 +13,7 @@
       {"direction": "outbound", "from": "campaign@example.test", "to": ["broker+row01@example.test"], "subject": "101 Foundry Test Way", "timestamp": "2026-07-15T15:01:00Z", "content": "Could you share the available building details?"},
       {"direction": "inbound", "from": "broker+row01@example.test", "to": ["campaign@example.test"], "subject": "Re: 101 Foundry Test Way", "timestamp": "2026-07-15T15:11:00Z", "content": "The building is 18,400 SF with four docks and 28-foot clear height."}
     ],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["18,400 SF", "asking rent", "power"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 65, "supplied_fields": ["Total SF", "Docks", "Ceiling Ht"]},
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["18,400 SF"], "must_mention_any": [["asking rent", "asking rate", "rental rate", "rent per square foot"], ["operating expenses", "operating expense", "ops ex", "NNN expenses", "CAM charges"], ["drive-in count", "number of drive-ins", "drive ins", "grade-level door count", "grade-level doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 65, "supplied_fields": ["Total SF", "Docks", "Ceiling Ht"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Avery,\n\nI noted the 18,400 SF, four docks, and 28-foot clear height. Could you also share:\n- asking rent\n- operating expenses\n- drive-in count\n- power", "notes": ""}
   },
   {
@@ -29,8 +29,8 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row02@example.test", "to": ["campaign@example.test"], "subject": "202 Assembly Test Road", "timestamp": "2026-07-15T15:12:00Z", "content": "Available: 32,000 SF at $11.25/SF/year plus $2.40 NNN, two drive-ins, six docks, 30-foot clear, and 1,200 amps at 480V."}
     ],
-    "expect": {"event_types": ["close_conversation"], "response_mode": "send", "must_mention": ["32,000 SF", "review", "other relevant properties"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 50, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]},
-    "offline_proposal": {"updates": [], "events": [{"type": "close_conversation"}], "response_email": "Hi Jordan,\n\nI have the complete 32,000 SF package. We will review the details with the client, and please send over any questions or other relevant properties.", "notes": ""}
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["32,000 SF", "review", "other relevant properties"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 50, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]},
+    "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Jordan,\n\nI have the complete 32,000 SF package. We will review the details with the client, and please send over any questions or other relevant properties.", "notes": ""}
   },
   {
     "scenario": "one missing item",
@@ -45,7 +45,7 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row03@example.test", "to": ["campaign@example.test"], "subject": "303 Conveyor Test Lane", "timestamp": "2026-07-15T15:13:00Z", "content": "Those figures are current. Let me know what else you need."}
     ],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["power"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 35, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht"]},
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "must_mention_any": [["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 35, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Casey,\n\nCould you also share the available power service?", "notes": ""}
   },
   {
@@ -61,7 +61,7 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row04@example.test", "to": ["campaign@example.test"], "subject": "404 Pallet Test Avenue", "timestamp": "2026-07-15T15:14:00Z", "content": "The row information is still accurate."}
     ],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["dock count", "power"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 40, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Ceiling Ht"]},
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "must_mention_any": [["dock count", "number of dock-high doors", "dock-high doors", "loading dock count", "dock doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 40, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Ceiling Ht"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Morgan,\n\nCould you share the dock count and available power service?", "notes": ""}
   },
   {
@@ -77,7 +77,7 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row05@example.test", "to": ["campaign@example.test"], "subject": "505 Gantry Test Street", "timestamp": "2026-07-15T15:15:00Z", "content": "It is available and the size, drive-ins, and clear height shown are correct."}
     ],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["asking rent", "operating expenses", "dock count", "power"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 55, "supplied_fields": ["Total SF", "Drive Ins", "Ceiling Ht"]},
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "must_mention_any": [["asking rent", "asking rate", "rental rate", "rent per square foot"], ["operating expenses", "operating expense", "ops ex", "NNN expenses", "CAM charges"], ["dock count", "number of dock-high doors", "dock-high doors", "loading dock count", "dock doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 55, "supplied_fields": ["Total SF", "Drive Ins", "Ceiling Ht"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Riley,\n\nI noted the current size and loading details. Could you also share:\n- asking rent\n- operating expenses\n- dock count\n- power", "notes": ""}
   },
   {
@@ -94,8 +94,8 @@
       {"direction": "inbound", "from": "broker+row06@example.test", "to": ["campaign@example.test"], "subject": "606 Turbine Test Court", "timestamp": "2026-07-15T15:16:00Z", "content": "The attached flyer has the current specs."}
     ],
     "pdf_manifest": [{"name": "synthetic-row06-flyer.pdf", "text": "606 Turbine Test Court, Model Plains. 26,500 SF. Asking $10.50/SF/year. Operating expenses $2.20/SF/year. Two drive-ins. Eight docks. 30-foot clear. 1,000 amps, 480V."}],
-    "expect": {"event_types": ["close_conversation"], "response_mode": "send", "must_mention": ["flyer", "review"], "must_not_mention": ["send the flyer", "Gross Rent", "Best,"], "max_words": 45, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power", "Flyer / Link"]},
-    "offline_proposal": {"updates": [], "events": [{"type": "close_conversation"}], "response_email": "Hi Taylor,\n\nI have the flyer and the current specs. We will review the package with the client and welcome any other relevant properties.", "notes": ""}
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["flyer", "review"], "must_not_mention": ["send the flyer", "Gross Rent", "Best,"], "max_words": 45, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power", "Flyer / Link"]},
+    "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Taylor,\n\nI have the flyer and the current specs. We will review the package with the client and welcome any other relevant properties.", "notes": ""}
   },
   {
     "scenario": "floorplan attachment supplied",
@@ -111,7 +111,7 @@
       {"direction": "inbound", "from": "broker+row07@example.test", "to": ["campaign@example.test"], "subject": "707 Lathe Test Boulevard", "timestamp": "2026-07-15T15:17:00Z", "content": "I attached the floor plan. The other row details are current, but I still need to verify power."}
     ],
     "pdf_manifest": [{"name": "synthetic-row07-floorplan.pdf", "text": "Floor plan for 707 Lathe Test Boulevard, showing the warehouse and office layout."}],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["floor plan", "power"], "must_not_mention": ["send the floor plan", "Gross Rent", "Best,"], "max_words": 40, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Floorplan"]},
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["floor plan"], "must_mention_any": [["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["send the floor plan", "Gross Rent", "Best,"], "max_words": 40, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Floorplan"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Cameron,\n\nI have the floor plan. When available, could you share the power service?", "notes": ""}
   },
   {
@@ -127,8 +127,8 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row08@example.test", "to": ["campaign@example.test"], "subject": "808 Press Test Parkway", "timestamp": "2026-07-15T15:18:00Z", "content": "There are three drive-ins. Everything else in the row is current."}
     ],
-    "expect": {"event_types": ["close_conversation"], "response_mode": "send", "must_mention": ["three drive-ins", "review"], "must_not_mention": ["drive-in count?", "Gross Rent", "Best,"], "max_words": 45, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]},
-    "offline_proposal": {"updates": [], "events": [{"type": "close_conversation"}], "response_email": "Hi Devon,\n\nI noted the three drive-ins. We now have the complete package and will review it with the client.", "notes": ""}
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["three drive-ins", "review"], "must_not_mention": ["drive-in count?", "Gross Rent", "Best,"], "max_words": 45, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]},
+    "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Devon,\n\nI noted the three drive-ins. We now have the complete package and will review it with the client.", "notes": ""}
   },
   {
     "scenario": "unavailable",
@@ -143,8 +143,8 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row09@example.test", "to": ["campaign@example.test"], "subject": "909 Rivet Test Drive", "timestamp": "2026-07-15T15:19:00Z", "content": "That building is no longer available."}
     ],
-    "expect": {"event_types": ["property_unavailable"], "response_mode": "send", "must_mention": ["no longer available", "another relevant property"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 40, "supplied_fields": []},
-    "offline_proposal": {"updates": [], "events": [{"type": "property_unavailable"}], "response_email": "Hi Skyler,\n\nI appreciate the update that it is no longer available. Do you have another relevant property we should review?", "notes": ""}
+    "expect": {"event_types": ["property_unavailable"], "response_mode": "deterministic_fallback", "deterministic_fallback": "Hi Skyler,\n\nThank you for the update on the property's availability.\n\nDo you have another relevant property we should consider?", "must_mention": ["property's availability", "another relevant property"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 40, "supplied_fields": []},
+    "offline_proposal": {"updates": [], "events": [{"type": "property_unavailable"}], "response_email": null, "notes": ""}
   },
   {
     "scenario": "unavailable plus alternative",

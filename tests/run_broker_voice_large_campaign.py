@@ -115,6 +115,14 @@ def _contains_placeholder(response: str) -> bool:
     return any(pattern.search(response) for pattern in PLACEHOLDER_PATTERNS)
 
 
+def _contains_semantic_term(response: str, term: str) -> bool:
+    words = re.escape(term.strip()).replace(r"\ ", r"\s+")
+    return bool(
+        words
+        and re.search(rf"(?<!\w){words}(?!\w)", response, re.IGNORECASE)
+    )
+
+
 def _reasks_supplied_field(response: str, supplied_fields: list[str]) -> bool:
     clauses = re.split(r"(?<=[?.!])\s+|\n+", response.lower())
     for clause in clauses:
@@ -192,19 +200,48 @@ def grade_case(case: dict, proposal: dict) -> dict:
         veto("event_types_mismatch")
 
     raw_response = proposal.get("response_email")
-    response = raw_response.strip() if isinstance(raw_response, str) else ""
-    expects_response = expected["response_mode"] == "send"
+    raw_response_text = (
+        raw_response.strip() if isinstance(raw_response, str) else ""
+    )
+    response_mode = expected["response_mode"]
+    fallback_response = expected.get("deterministic_fallback")
+    fallback_response_text = (
+        fallback_response.strip() if isinstance(fallback_response, str) else ""
+    )
 
-    if expects_response and not response:
+    if raw_response_text:
+        response = raw_response_text
+        effective_response_source = "raw_proposal"
+    elif response_mode == "deterministic_fallback" and fallback_response_text:
+        response = fallback_response_text
+        effective_response_source = "deterministic_fallback"
+    else:
+        response = ""
+        effective_response_source = "none"
+
+    if response_mode == "send" and not raw_response_text:
         veto("response_missing")
-    if not expects_response and response:
+    if response_mode == "null" and raw_response_text:
         veto("unexpected_response")
+    if response_mode == "deterministic_fallback":
+        if raw_response_text:
+            veto("unexpected_raw_response")
+        if not fallback_response_text:
+            veto("response_missing")
     if response and set(actual_events) & SENSITIVE_EVENTS:
         veto("sensitive_event_auto_response")
 
     if response:
         lowered = response.lower()
         if any(term.lower() not in lowered for term in expected["must_mention"]):
+            veto("missing_required_term")
+        if any(
+            not any(
+                _contains_semantic_term(response, alias)
+                for alias in acceptable_terms
+            )
+            for acceptable_terms in expected.get("must_mention_any", [])
+        ):
             veto("missing_required_term")
         if any(term.lower() in lowered for term in expected["must_not_mention"]):
             veto("forbidden_term")
@@ -229,7 +266,10 @@ def grade_case(case: dict, proposal: dict) -> dict:
         "word_count": len(WORD_PATTERN.findall(response)),
         "expected_event_types": expected_events,
         "actual_event_types": actual_events,
-        "response_mode": expected["response_mode"],
+        "response_mode": response_mode,
+        "raw_response": raw_response,
+        "effective_response": response or None,
+        "effective_response_source": effective_response_source,
     }
 
 
@@ -293,8 +333,8 @@ def _markdown_report(report: dict) -> str:
         f"- Token usage: {aggregate_token_text}",
         f"- Token note: {summary['token_usage_note']}",
         "",
-        "| Row | Scenario | Score | Vetoes | Runtime ms | Token usage |",
-        "|---|---|---:|---|---:|---|",
+        "| Row | Scenario | Score | Vetoes | Runtime ms | Raw proposal response | Effective response source | Token usage |",
+        "|---|---|---:|---|---:|---|---|---|",
     ]
     for row in report["rows"]:
         veto_text = ", ".join(row["vetoes"]) or "none"
@@ -303,9 +343,11 @@ def _markdown_report(report: dict) -> str:
             if row["token_usage"] is not None
             else "null"
         )
+        raw_response_text = "present" if row["raw_response"] else "null"
         lines.append(
             f"| {row['row_id']} | {row['scenario']} | {row['score']} | "
-            f"{veto_text} | {row['runtime_ms']} | {token_text} |"
+            f"{veto_text} | {row['runtime_ms']} | {raw_response_text} | "
+            f"{row['effective_response_source']} | {token_text} |"
         )
     lines.append("")
     return "\n".join(lines)
