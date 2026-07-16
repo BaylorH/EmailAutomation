@@ -1,7 +1,9 @@
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -10,6 +12,7 @@ from unittest.mock import Mock, patch
 
 from tests.run_broker_voice_large_campaign import (
     SafetyError,
+    _markdown_report,
     _token_usage,
     grade_case,
     run_live_case,
@@ -20,6 +23,7 @@ from tests.run_broker_voice_large_campaign import (
 FIXTURE_PATH = (
     Path(__file__).parent / "fixtures" / "broker_voice_large_campaign.json"
 )
+RUNNER_PATH = Path(__file__).parent / "run_broker_voice_large_campaign.py"
 
 EXPECTED_SCENARIOS = {
     "partial details",
@@ -270,6 +274,56 @@ class BrokerVoiceLargeCampaignRunnerSafetyTests(unittest.TestCase):
         )
         self.assertIsNone(usage)
         self.assertIn("does not return provider usage", note)
+
+    def test_markdown_renders_unknown_aggregate_token_usage_as_literal_null(self):
+        markdown = _markdown_report(
+            {
+                "mode": "offline",
+                "summary": {
+                    "row_count": 0,
+                    "aggregate_score": 0,
+                    "veto_count": 0,
+                    "safety_veto_count": 0,
+                    "runtime_ms": 0,
+                    "token_usage": None,
+                    "token_usage_note": "Unavailable because no model call was made.",
+                },
+                "rows": [],
+            }
+        )
+
+        self.assertIn("- Token usage: null", markdown)
+        self.assertNotIn("- Token usage: None", markdown)
+        self.assertIn("- Token note: Unavailable because no model call was made.", markdown)
+
+    def test_direct_live_script_resolves_application_package_before_model_call(self):
+        environment = {
+            "FIRESTORE_EMULATOR_HOST": self.SAFE_ENV["FIRESTORE_EMULATOR_HOST"],
+            "GOOGLE_CLOUD_PROJECT": self.SAFE_ENV["GOOGLE_CLOUD_PROJECT"],
+            "SITESIFT_DISABLE_GRAPH_SENDS": self.SAFE_ENV[
+                "SITESIFT_DISABLE_GRAPH_SENDS"
+            ],
+        }
+        with tempfile.TemporaryDirectory() as output_dir:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(RUNNER_PATH),
+                    "--mode",
+                    "live-model",
+                    "--output",
+                    output_dir,
+                ],
+                cwd=RUNNER_PATH.parent.parent,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("No module named 'email_automation'", result.stderr)
+        self.assertIn("Missing required env vars", result.stderr)
 
     def test_live_case_rejects_unsafe_environment_before_application_import(self):
         with patch("builtins.__import__", wraps=__import__) as import_module:

@@ -237,6 +237,10 @@ def run_live_case(case: dict) -> dict:
     """Call only the dry-run proposal function after the safety gate passes."""
     enforce_safety()
 
+    repository_root = str(Path(__file__).resolve().parent.parent)
+    if repository_root not in sys.path:
+        sys.path.insert(0, repository_root)
+
     from email_automation.ai_processing import propose_sheet_updates
 
     row = case["row"]
@@ -276,6 +280,7 @@ def _load_cases() -> list[dict]:
 
 def _markdown_report(report: dict) -> str:
     summary = report["summary"]
+    aggregate_token_text = json.dumps(summary["token_usage"], sort_keys=True)
     lines = [
         "# Broker Voice Large Campaign Report",
         "",
@@ -285,7 +290,7 @@ def _markdown_report(report: dict) -> str:
         f"- Vetoes: {summary['veto_count']}",
         f"- Safety vetoes: {summary['safety_veto_count']}",
         f"- Runtime: {summary['runtime_ms']} ms",
-        f"- Token usage: {summary['token_usage']}",
+        f"- Token usage: {aggregate_token_text}",
         f"- Token note: {summary['token_usage_note']}",
         "",
         "| Row | Scenario | Score | Vetoes | Runtime ms | Token usage |",
