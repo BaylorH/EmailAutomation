@@ -1,4 +1,4 @@
-import inspect
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -81,13 +81,46 @@ class BrokerVoicePolicyTests(unittest.TestCase):
         self.assertIn("questions", self.rules_lower)
 
     def test_model_and_single_structured_call_contract_are_unchanged(self):
-        source = inspect.getsource(ai_processing.propose_sheet_updates)
+        fake_response = Mock(
+            output_text=(
+                '{"updates": [], "events": [], "response_email": null, "notes": ""}'
+            )
+        )
+        with patch.object(
+            ai_processing.client.responses,
+            "create",
+            return_value=fake_response,
+        ) as create:
+            ai_processing.propose_sheet_updates(
+                "uid",
+                "client",
+                "broker@example.com",
+                "sheet",
+                ["Property Address", "Rent/SF /Yr", "Flyer / Link"],
+                3,
+                ["123 Main St", "", ""],
+                "thread",
+                conversation=[
+                    {
+                        "direction": "inbound",
+                        "from": "broker@example.com",
+                        "content": "The space is available.",
+                    }
+                ],
+                column_config=get_default_column_config(),
+                dry_run=True,
+            )
 
-        self.assertEqual(1, source.count("client.responses.create("))
-        self.assertIn('model="gpt-5.2"', source)
-        self.assertIn("temperature=0.1", source)
-        self.assertIn("OUTPUT ONLY valid JSON in this exact format", source)
-        self.assertIn("build_response_email_rules()", source)
+        create.assert_called_once()
+        self.assertEqual("gpt-5.2", create.call_args.kwargs["model"])
+        self.assertEqual(0.1, create.call_args.kwargs["temperature"])
+        prompt_text = next(
+            item["text"]
+            for item in create.call_args.kwargs["input"][0]["content"]
+            if item.get("type") == "input_text"
+        )
+        self.assertIn("OUTPUT ONLY valid JSON in this exact format", prompt_text)
+        self.assertIn(build_response_email_rules().strip(), prompt_text)
 
     def test_assembled_output_contract_nulls_every_sensitive_event(self):
         fake_response = Mock(
@@ -139,8 +172,141 @@ class BrokerVoicePolicyTests(unittest.TestCase):
                 self.assertIn(event_type, response_contract)
         self.assertNotIn("phone number provided", response_contract)
 
+    def test_proposal_suppresses_model_reply_for_every_sensitive_event(self):
+        scenarios = {
+            "needs_user_input": (
+                "Who is your client?",
+                {"type": "needs_user_input", "reason": "confidential"},
+            ),
+            "tour_requested": (
+                "Would you like to tour the space Tuesday?",
+                {"type": "tour_requested", "question": "Tour Tuesday?"},
+            ),
+            "wrong_contact": (
+                "Wrong person. Contact Dana at dana@example.com.",
+                {
+                    "type": "wrong_contact",
+                    "reason": "wrong_person",
+                    "suggestedContact": "Dana",
+                    "suggestedEmail": "dana@example.com",
+                },
+            ),
+            "contact_optout": (
+                "Please remove me from your mailing list.",
+                {"type": "contact_optout", "reason": "unsubscribe"},
+            ),
+            "call_requested": (
+                "Let's hop on a call tomorrow.",
+                {"type": "call_requested", "reason": "call_request"},
+            ),
+        }
+
+        for event_type, (message, event) in scenarios.items():
+            with self.subTest(event_type=event_type):
+                fake_response = Mock(
+                    output_text=json.dumps(
+                        {
+                            "updates": [],
+                            "events": [event],
+                            "response_email": "Hi Alex, I can handle that.",
+                            "notes": "",
+                        }
+                    )
+                )
+                with patch.object(
+                    ai_processing.client.responses,
+                    "create",
+                    return_value=fake_response,
+                ):
+                    proposal = ai_processing.propose_sheet_updates(
+                        "uid",
+                        "client",
+                        "broker@example.com",
+                        "sheet",
+                        ["Property Address", "Rent/SF /Yr", "Flyer / Link"],
+                        3,
+                        ["123 Main St", "", ""],
+                        "thread",
+                        conversation=[
+                            {
+                                "direction": "inbound",
+                                "from": "broker@example.com",
+                                "content": message,
+                            }
+                        ],
+                        column_config=get_default_column_config(),
+                        dry_run=True,
+                    )
+
+                self.assertIn(event_type, [item["type"] for item in proposal["events"]])
+                self.assertIsNone(proposal["response_email"])
+
 
 class BrokerVoiceFallbackTests(unittest.TestCase):
+    def test_missing_field_mention_without_request_intent_is_rejected(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Hi Alex,\n\nThanks for sending the docks.",
+                ["Docks"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_polite_field_statement_without_request_intent_is_rejected(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Please note the docks and power are included below.",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_negated_field_request_is_rejected(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "We don't need you to send the docks or power.",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_request_for_only_one_of_two_missing_fields_is_rejected(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Hi Alex,\n\nCould you confirm the docks?",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_natural_request_for_every_missing_field_is_accepted(self):
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                "Hi Alex,\n\nCould you confirm the dock count and electrical service?",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_custom_missing_fields_are_all_required_in_request(self):
+        config = get_default_column_config()
+        config["customFields"] = {
+            "HVAC": {"mode": "ask_required", "description": "HVAC system"},
+            "TI Allowance": {
+                "mode": "ask_required",
+                "description": "Tenant improvement allowance",
+            },
+            "ESFR": {"mode": "ask_required", "description": "ESFR sprinklers"},
+        }
+
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                "Could you confirm the HVAC, TI allowance, and ESFR?",
+                ["HVAC", "TI Allowance", "ESFR"],
+                config,
+            )
+        )
+
     def test_looking_forward_cleanup_does_not_append_a_closing(self):
         body = processing._sanitize_missing_fields_response_body(
             "Hi Alex,\n\n"
@@ -163,6 +329,39 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
             )
         )
 
+    def test_looking_forward_cleanup_is_case_insensitive_with_terminal_punctuation(self):
+        variants = (
+            "looking forward to your response.",
+            "Looking Forward To Hearing From You!",
+            "LOOKING FORWARD TO YOUR RESPONSE...",
+        )
+
+        for phrase in variants:
+            with self.subTest(phrase=phrase):
+                body = processing._sanitize_missing_fields_response_body(
+                    "Hi Alex,\n\nCould you confirm the docks and power?\n\n" + phrase
+                )
+
+                self.assertNotIn("looking forward", body.lower())
+                self.assertNotRegex(body, r"(?m)^\s*[.!?,;:-]+\s*$")
+
+    def test_looking_forward_cleanup_removes_standalone_punctuation_debris(self):
+        body = processing._sanitize_missing_fields_response_body(
+            "Hi Alex,\n\n"
+            "Could you confirm the docks and power?\n\n"
+            "looking forward to hearing from you.\n"
+            "."
+        )
+
+        self.assertNotRegex(body, r"(?m)^\s*[.!?,;:-]+\s*$")
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
     def test_two_missing_fields_use_a_natural_sentence(self):
         body = processing._build_missing_fields_response(
             "Alex Morgan",
@@ -177,6 +376,21 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
         self.assertNotIn("To complete the property details", body)
         self.assertNotIn("Best,", body)
         self.assertNotIn("!", body)
+
+    def test_acronym_missing_fields_preserve_casing(self):
+        for field in ("HVAC", "TI Allowance", "ESFR"):
+            with self.subTest(field=field):
+                body = processing._build_missing_fields_response("Alex Morgan", [field])
+
+                self.assertIn(f"Could you confirm the {field}?", body)
+
+    def test_ordinary_missing_fields_remain_sentence_cased(self):
+        body = processing._build_missing_fields_response(
+            "Alex Morgan",
+            ["Docks", "Power"],
+        )
+
+        self.assertIn("Could you confirm the docks and power?", body)
 
     def test_one_missing_field_uses_a_natural_sentence(self):
         body = processing._build_missing_fields_response("Alex Morgan", ["Docks"])
@@ -208,11 +422,27 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
         self.assertNotIn("Best,", body)
         self.assertNotIn("!", body)
 
-    def test_missing_field_call_site_keeps_the_functional_gate(self):
-        source = inspect.getsource(processing.process_inbox_message)
+    def test_missing_field_selector_accepts_complete_model_request_and_sanitizes(self):
+        body = processing._select_missing_fields_response_body(
+            "Hi Alex,\n\nCould you confirm the docks and power?\n\n"
+            "looking forward to your response.",
+            ["Docks", "Power"],
+            get_default_column_config(),
+            "Alex Morgan",
+        )
 
-        self.assertIn("_response_mentions_missing_fields(", source)
-        self.assertIn("_build_missing_fields_response(", source)
+        self.assertIn("confirm the docks and power", body)
+        self.assertNotIn("looking forward", body.lower())
+
+    def test_missing_field_selector_replaces_partial_model_request(self):
+        body = processing._select_missing_fields_response_body(
+            "Hi Alex,\n\nCould you confirm the docks?",
+            ["Docks", "Power"],
+            get_default_column_config(),
+            "Alex Morgan",
+        )
+
+        self.assertIn("Could you confirm the docks and power?", body)
 
     def test_complete_fallback_reviews_with_client_and_welcomes_options(self):
         body = processing._select_automatic_response_body(

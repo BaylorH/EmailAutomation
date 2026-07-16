@@ -2824,16 +2824,64 @@ def _response_requests_nonrequestable_fields(
     return response_requests_nonrequestable_fields(response_body, column_config)
 
 
+_MISSING_FIELD_REQUEST_INTENT_RE = re.compile(
+    r"(?:"
+    r"\b(?:ask|request|need|confirm|provide|send|share|clarify|supply|forward)\b"
+    r"|\b(?:can|could|would|will|may)\s+(?:i|you|we|they)\b"
+    r"|\b(?:do|does|did)\s+(?:you|we|they)\s+(?:have|know)\b"
+    r"|\b(?:what|which|how\s+many)\b"
+    r"|\b(?:is|are)\s+there\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_MISSING_FIELD_REQUEST_NEGATION_RE = re.compile(
+    r"(?:"
+    r"\bno\s+need\b"
+    r"|\b(?:do|does|did)\s+not\s+need\b"
+    r"|\b(?:don'?t|doesn'?t|didn'?t)\s+need\b"
+    r"|\b(?:do\s+not|don'?t)\s+(?:send|provide|confirm|share|supply|forward)\b"
+    r"|\bnot\s+(?:asking|requesting)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _missing_field_request_text(response_body: str) -> str:
+    request_parts = []
+    bullet_request_active = False
+    for raw_line in (response_body or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r"^[-*]\s+", line):
+            if bullet_request_active:
+                request_parts.append(line)
+            continue
+
+        bullet_request_active = False
+        for clause in re.split(r"(?<=[.!?;])\s+", line):
+            if _MISSING_FIELD_REQUEST_NEGATION_RE.search(clause):
+                continue
+            if _MISSING_FIELD_REQUEST_INTENT_RE.search(clause) or clause.rstrip().endswith("?"):
+                request_parts.append(clause)
+                bullet_request_active = True
+    return "\n".join(request_parts)
+
+
 def _response_mentions_missing_fields(
     response_body: str,
     missing_fields: List[str],
     column_config: Optional[dict] = None,
 ) -> bool:
     """Accept only replies that request missing Ask fields and no Note/Skip fields."""
-    body = (response_body or "").lower()
+    body = (response_body or "").strip()
     if not body or not missing_fields:
         return False
     if _response_requests_nonrequestable_fields(body, column_config):
+        return False
+    request_text = _missing_field_request_text(body)
+    if not request_text:
         return False
 
     aliases = {
@@ -2851,9 +2899,9 @@ def _response_mentions_missing_fields(
     for field in missing_fields:
         key = (field or "").strip().lower()
         candidates = aliases.get(key, [part for part in re.split(r"[^a-z0-9]+", key) if len(part) > 2])
-        if any(_contains_field_term(body, candidate) for candidate in candidates):
-            return True
-    return False
+        if not any(_contains_field_term(request_text, candidate) for candidate in candidates):
+            return False
+    return True
 
 
 def _build_missing_fields_response(
@@ -2877,7 +2925,10 @@ def _build_missing_fields_response(
             "total sf": "total SF",
         }
         natural_fields = [
-            natural_labels.get(field.lower(), field[:1].lower() + field[1:])
+            natural_labels.get(
+                field.lower(),
+                field if re.match(r"^[A-Z]{2,}\b", field) else field[:1].lower() + field[1:],
+            )
             for field in fields
         ]
         if len(natural_fields) == 1:
@@ -2889,13 +2940,35 @@ def _build_missing_fields_response(
     return f"{greeting}\n\n{request}"
 
 
+_LOOKING_FORWARD_RESPONSE_RE = re.compile(
+    r"\blooking\s+forward\s+to\s+(?:your\s+response|hearing\s+from\s+you)\b"
+    r"[.!?,;:-]*",
+    re.IGNORECASE,
+)
+
+
 def _sanitize_missing_fields_response_body(response_body: str) -> str:
-    cleaned = (response_body or "").replace(
-        "Looking forward to your response", ""
-    ).replace(
-        "Looking forward to hearing from you", ""
-    )
-    return "\n".join(line for line in cleaned.split("\n") if line.strip()).strip()
+    cleaned = _LOOKING_FORWARD_RESPONSE_RE.sub("", response_body or "")
+    return "\n".join(
+        line
+        for line in cleaned.splitlines()
+        if line.strip() and not re.fullmatch(r"[.!?,;:-]+", line.strip())
+    ).strip()
+
+
+def _select_missing_fields_response_body(
+    llm_response_email: Optional[str],
+    missing_fields: List[str],
+    column_config: Optional[dict],
+    contact_name: Optional[str],
+) -> str:
+    if llm_response_email and _response_mentions_missing_fields(
+        llm_response_email,
+        missing_fields,
+        column_config,
+    ):
+        return _sanitize_missing_fields_response_body(llm_response_email)
+    return _build_missing_fields_response(contact_name, missing_fields)
 
 
 def _select_automatic_response_body(
@@ -5861,25 +5934,13 @@ Could you please provide your phone number so I can give you a call?"""
                         if missing_fields:
                             # Scenario 3: Thank you + request missing fields
                             # Use LLM-generated response if available, otherwise use template
-                            if llm_response_email and _response_mentions_missing_fields(
+                            response_body = _select_missing_fields_response_body(
                                 llm_response_email,
                                 missing_fields,
                                 column_config,
-                            ):
-                                response_body = llm_response_email
-                                # Safety check: Remove "Looking forward to your response" phrases
-                                if "Looking forward to your response" in response_body or "Looking forward to hearing from you" in response_body:
-                                    print(f"   ⚠️ LLM response contained 'Looking forward' phrase, removing it...")
-                                    response_body = _sanitize_missing_fields_response_body(response_body)
-                                print(f"🤖 Using LLM-generated response for missing fields scenario")
-                            else:
-                                if llm_response_email:
-                                    print("⚠️ Ignoring LLM response because it did not ask for the missing fields")
-                                response_body = _build_missing_fields_response(
-                                    contact_name,
-                                    missing_fields,
-                                )
-                            
+                                contact_name,
+                            )
+
                             sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                             if sent:
                                 print(f"📧 Sent thank you + missing fields request to: {to_addr_lower}")

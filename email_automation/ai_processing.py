@@ -2241,6 +2241,28 @@ def _suppress_updates_on_contact_optout(proposal: dict) -> dict:
     return proposal
 
 
+_SENSITIVE_EVENT_RESPONSE_TYPES = {
+    "call_requested",
+    "needs_user_input",
+    "contact_optout",
+    "wrong_contact",
+    "tour_requested",
+}
+
+
+def _suppress_response_for_sensitive_events(proposal: dict) -> dict:
+    if not proposal:
+        return proposal
+    event_types = {
+        (event or {}).get("type")
+        for event in (proposal.get("events") or [])
+        if isinstance(event, dict)
+    }
+    if event_types & _SENSITIVE_EVENT_RESPONSE_TYPES:
+        proposal["response_email"] = None
+    return proposal
+
+
 def _suppress_fabricated_door_counts(
     proposal: dict,
     conversation: List[dict],
@@ -3778,6 +3800,7 @@ OUTPUT ONLY valid JSON in this exact format:
             proposal,
             original_contact_email=email,
         )
+        proposal = _suppress_response_for_sensitive_events(proposal)
 
         # ---- Log + store in sheetChangeLog -----------------------------------
         print(f"\n🤖 OpenAI Proposal for {client_id}__{email}:")
