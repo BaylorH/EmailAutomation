@@ -2848,6 +2848,7 @@ _MISSING_FIELD_REQUEST_INTENT_RE = re.compile(
     r"(?:confirm|provide|send|share|clarify|supply|forward|tell)\b"
     r"|\b(?:do|does|did)\s+(?:you|we|they)\s+(?:have|know)\b"
     r"|^\s*(?:is|are)\s+there\b"
+    r"|^\s*what\s+(?:is|are)\b"
     r"|\b(?:i|we)\s+(?:still\s+)?need\b"
     r")",
     re.IGNORECASE,
@@ -2985,6 +2986,7 @@ _MISSING_FIELD_ALIASES = {
     "rent_sf_yr": [
         "rent/sf /yr",
         "asking rent",
+        "asking rate",
         "rent per sf",
         "rental rate",
         "lease rate",
@@ -3004,13 +3006,15 @@ _BUILT_IN_NUMERIC_SPEC_FIELD_KEYS = {
     "ceiling_ht",
     "power",
     "ops_ex_sf",
+    "rent_sf_yr",
     "total_sf",
 }
 
 _BUILT_IN_SPEC_PRESENCE_FRAMING_RE = re.compile(
     r"\b(?:whether|if|has|have|includes?|equipped|available|availability|"
-    r"sufficient|adequate|exists?)\b"
-    r"|\b(?:there\s+(?:is|are)|(?:is|are)\s+there)\b",
+    r"sufficient|adequate|exists?|contains?)\b"
+    r"|\bcomes?\s+with\b"
+    r"|\b(?:is|are)\s+there\b",
     re.IGNORECASE,
 )
 
@@ -3026,33 +3030,67 @@ def _is_presence_framed_built_in_spec_target(
 
 _MISSING_FIELD_VALUE_TARGET_PATTERNS = {
     "docks": re.compile(
-        r"\b(?:"
-        r"(?:loading\s+)?dock(?:\s+door)?\s+counts?"
-        r"|(?:number|count)\s+of\s+(?:loading\s+)?docks?"
-        r"|(?:number|count)\s+of\s+(?:loading\s+)?dock\s+"
-        r"(?:doors?|positions?)"
-        r"|(?:loading\s+)?dock\s+(?:doors|positions)"
-        r")\b",
-        re.IGNORECASE,
-    ),
-    "power": re.compile(
-        r"\b(?:"
-        r"(?:power|electrical)\s+(?:specs?|specifications?|capacity|service|"
-        r"amperage|voltage|phase|amps?)"
-        r"|amperage|voltage|amps?"
-        r"|(?:\d+|one|two|three)[ -]?phase\s+(?:power|electrical)"
-        r")\b",
+        r"(?:"
+        r"\b(?:loading\s+)?dock(?:\s+doors?)?\s+"
+        r"(?:counts?|numbers?|quantit(?:y|ies)|positions?)\b"
+        r"|\b(?:count|number|quantity)\s+of\s+(?:loading\s+)?"
+        r"(?:docks?|dock\s+doors?|dock\s+positions?)\b"
+        r"|\bhow\s+many\s+(?:loading\s+)?"
+        r"(?:docks?|dock\s+doors?|dock\s+positions?)\b"
+        r")",
         re.IGNORECASE,
     ),
     "drive_ins": re.compile(
-        r"\b(?:"
-        r"(?:drive[- ]ins?|grade[- ]level)\s+"
-        r"(?:doors|positions|(?:door\s+)?counts?)"
-        r"|(?:number|count)\s+of\s+(?:drive[- ]ins?|grade[- ]level\s+doors?)"
-        r")\b",
+        r"(?:"
+        r"\b(?:drive[- ]ins?|grade[- ]level)(?:\s+doors?)?\s+"
+        r"(?:counts?|numbers?|quantit(?:y|ies)|positions?)\b"
+        r"|\b(?:count|number|quantity)\s+of\s+"
+        r"(?:drive[- ]ins?|grade[- ]level)(?:\s+doors?)?\b"
+        r"|\bhow\s+many\s+(?:drive[- ]ins?|grade[- ]level)"
+        r"(?:\s+doors?)?\b"
+        r")",
         re.IGNORECASE,
     ),
 }
+
+_POWER_VALUE_TARGET_RE = re.compile(
+    r"(?:"
+    r"\b(?:power|electrical(?:\s+service)?)\s+"
+    r"(?:specs?|specifications?|capacity|amperage|amps?|voltage|volts?|kw|kva)\b"
+    r"|\belectrical\s+service\s+(?:size|rating)\b"
+    r"|\b(?:specs?|specifications?|capacity|amperage|amps?|voltage|volts?|"
+    r"kw|kva|size|rating)\s+of\s+(?:the\s+)?"
+    r"(?:power|electrical(?:\s+service)?)\b"
+    r"|\b(?:amperage|amps?|voltage|volts?|kw|kva)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_POWER_PHASE_VALUE_RE = re.compile(
+    r"(?:"
+    r"\b(?:\d+|one|two|three|single)[ -]?phase\s+"
+    r"(?:power|electrical(?:\s+service)?)\b"
+    r"|\b(?:power|electrical\s+service)\s+(?:is\s+)?"
+    r"(?:\d+|one|two|three|single)[ -]?phase\b"
+    r"|\belectrical\s+phase\b"
+    r"|\bphase\s+of\s+(?:the\s+)?electrical\s+service\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_POWER_PHASE_FORBIDDEN_CONTEXT_RE = re.compile(
+    r"\b(?:plan|schedule|construction|installation|permitting|report|"
+    r"development|project)\b",
+    re.IGNORECASE,
+)
+
+
+def _matches_power_value_target(target: str) -> bool:
+    if re.search(r"\bphase\b", target, re.IGNORECASE):
+        if _POWER_PHASE_FORBIDDEN_CONTEXT_RE.search(target):
+            return False
+        return bool(_POWER_PHASE_VALUE_RE.search(target))
+    return bool(_POWER_VALUE_TARGET_RE.search(target))
 
 
 def _request_target_matches_missing_field(
@@ -3063,6 +3101,8 @@ def _request_target_matches_missing_field(
     canonical = _configured_missing_field_key(field, column_config)
     if _is_presence_framed_built_in_spec_target(target, canonical):
         return False
+    if canonical == "power":
+        return _matches_power_value_target(target)
     value_target_pattern = _MISSING_FIELD_VALUE_TARGET_PATTERNS.get(canonical or "")
     if value_target_pattern is not None:
         return bool(value_target_pattern.search(target))
@@ -3135,6 +3175,7 @@ def _missing_field_response_label(field: str) -> str:
         "loading docks": "loading dock count",
         "drive ins": "drive-in count",
         "drive-ins": "drive-in count",
+        "drive-in doors": "drive-in door count",
         "ops ex /sf": "operating expenses per SF",
         "power": "power specifications",
         "total sf": "total SF",

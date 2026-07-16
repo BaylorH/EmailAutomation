@@ -490,13 +490,106 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
                     )
                 )
 
-    def test_power_phase_requires_electrical_or_numeric_context(self):
+    def test_docks_require_explicit_quantity_language(self):
+        for body in (
+            "Could you confirm the dock doors?",
+            "Could you confirm the loading dock doors?",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Docks"],
+                        get_default_column_config(),
+                    )
+                )
+
+        for body in (
+            "Could you confirm the quantity of loading dock doors?",
+            "Could you confirm the loading dock positions?",
+            "Could you confirm how many dock doors there are?",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Docks"],
+                        get_default_column_config(),
+                    )
+                )
+
+    def test_drive_ins_require_explicit_quantity_language(self):
+        for body in (
+            "Could you confirm the drive-in doors?",
+            "Could you confirm the grade-level doors?",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Drive Ins"],
+                        get_default_column_config(),
+                    )
+                )
+
+        for body in (
+            "Could you confirm the quantity of drive-in doors?",
+            "Could you confirm the grade-level door positions?",
+            "Could you confirm how many grade-level doors there are?",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Drive Ins"],
+                        get_default_column_config(),
+                    )
+                )
+
+    def test_power_requires_explicit_specification_language(self):
+        for body in (
+            "Could you confirm the electrical service?",
+            "Could you confirm the power?",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Power"],
+                        get_default_column_config(),
+                    )
+                )
+
+        for body in (
+            "Could you confirm the power specs?",
+            "Could you confirm the electrical capacity?",
+            "Could you confirm the amperage?",
+            "Could you confirm the amps?",
+            "Could you confirm the voltage?",
+            "Could you confirm the volts?",
+            "Could you confirm the kW?",
+            "Could you confirm the kVA?",
+            "Could you confirm the electrical service size?",
+            "Could you confirm the electrical service rating?",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Power"],
+                        get_default_column_config(),
+                    )
+                )
+
+    def test_power_phase_requires_exact_electrical_value_context(self):
         for body in (
             "Could you confirm the Phase I report?",
             "Could you confirm the development phase?",
             "Could you confirm the two-phase development plan?",
             "Could you confirm the 3-phase construction plan?",
             "Could you confirm the 3-phase construction plan with electrical permitting?",
+            "Could you confirm the 3-phase electrical construction plan?",
+            "Could you confirm the three-phase electrical installation schedule?",
         ):
             with self.subTest(body=body):
                 self.assertFalse(
@@ -511,12 +604,62 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
             "Could you confirm the 3-phase power?",
             "Could you confirm the three phase electrical service?",
             "Could you confirm the electrical phase?",
+            "Could you confirm the electrical service is three-phase?",
+            "Could you confirm the phase of the electrical service?",
         ):
             with self.subTest(body=body):
                 self.assertTrue(
                     processing._response_mentions_missing_fields(
                         body,
                         ["Power"],
+                        get_default_column_config(),
+                    )
+                )
+
+    def test_rent_presence_protection_follows_mapped_header(self):
+        for header in ("Rent/SF /Yr", "Rental Rate", "Rent"):
+            with self.subTest(header=header):
+                config = get_default_column_config()
+                config["mappings"]["rent_sf_yr"] = header
+
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        "Could you confirm whether the rental rate is available?",
+                        [header],
+                        config,
+                    )
+                )
+
+    def test_rent_value_targets_follow_mapped_header(self):
+        for header in ("Rent/SF /Yr", "Rental Rate", "Rent"):
+            with self.subTest(header=header):
+                config = get_default_column_config()
+                config["mappings"]["rent_sf_yr"] = header
+
+                for body in (
+                    "Could you confirm the asking rental rate?",
+                    "What is the asking rate?",
+                    "Could you provide the rent per SF?",
+                ):
+                    with self.subTest(header=header, body=body):
+                        self.assertTrue(
+                            processing._response_mentions_missing_fields(
+                                body,
+                                [header],
+                                config,
+                            )
+                        )
+
+    def test_presence_defense_rejects_comes_with_and_contains(self):
+        for body in (
+            "Could you confirm the property comes with a dock count?",
+            "Could you confirm the property contains a dock count?",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Docks"],
                         get_default_column_config(),
                     )
                 )
@@ -829,7 +972,7 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
             ("docks", "Loading Docks", "loading dock count"),
             ("ops_ex_sf", "NNN", "NNN charges"),
             ("ops_ex_sf", "CAM", "CAM charges"),
-            ("drive_ins", "Drive-In Doors", "drive-in doors"),
+            ("drive_ins", "Drive-In Doors", "drive-in door count"),
         )
 
         for canonical, header, expected_target in scenarios:
