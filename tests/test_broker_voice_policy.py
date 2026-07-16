@@ -25,6 +25,7 @@ class BrokerVoicePolicyTests(unittest.TestCase):
             "needs_user_input",
             "contact_optout",
             "wrong_contact",
+            "property_issue",
             "tour_requested",
         ):
             with self.subTest(event_type=event_type):
@@ -166,6 +167,7 @@ class BrokerVoicePolicyTests(unittest.TestCase):
             "needs_user_input",
             "contact_optout",
             "wrong_contact",
+            "property_issue",
             "tour_requested",
         ):
             with self.subTest(event_type=event_type):
@@ -198,6 +200,14 @@ class BrokerVoicePolicyTests(unittest.TestCase):
             "call_requested": (
                 "Let's hop on a call tomorrow.",
                 {"type": "call_requested", "reason": "call_request"},
+            ),
+            "property_issue": (
+                "There is water damage near the loading area.",
+                {
+                    "type": "property_issue",
+                    "issue": "water damage near loading area",
+                    "severity": "major",
+                },
             ),
         }
 
@@ -248,6 +258,7 @@ class BrokerVoicePolicyTests(unittest.TestCase):
             "wrong_contact": " Wrong_Contact ",
             "contact_optout": "CONTACT_OPTOUT ",
             "call_requested": " Call_Requested",
+            "property_issue": " Property_Issue ",
         }
 
         for event_type, raw_event_type in variants.items():
@@ -323,6 +334,7 @@ class BrokerVoicePolicyTests(unittest.TestCase):
             "wrong_contact": " WRONG_CONTACT\t",
             "contact_optout": "\nContact_OptOut ",
             "call_requested": " Call_Requested ",
+            "property_issue": " Property_Issue ",
         }
 
         for event_type, raw_event_type in variants.items():
@@ -1226,6 +1238,52 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
         self.assertIn("relevant", body.lower())
         self.assertNotIn("Best,", body)
         self.assertNotIn("!", body)
+
+    def test_complete_selector_accepts_a_warm_jill_like_model_close(self):
+        model_body = (
+            "Hi Alex,\n\nThank you for sending the details. We'll review them "
+            "with the client and follow up as needed. Please send any questions "
+            "or other relevant properties."
+        )
+
+        body = processing._select_automatic_response_body(
+            "complete",
+            model_body,
+            get_default_column_config(),
+            "Alex Morgan",
+        )
+
+        self.assertEqual(model_body, body)
+
+    def test_complete_selector_replaces_a_curt_model_close_with_warm_fallback(self):
+        body = processing._select_automatic_response_body(
+            "complete",
+            "Hi Alex,\n\nGot it, thanks.",
+            get_default_column_config(),
+            "Alex Morgan",
+        )
+
+        self.assertIn("Thank you for the details", body)
+        self.assertIn("review them with the client", body)
+        self.assertIn("questions or other relevant properties", body)
+
+    def test_complete_selector_still_rejects_nonrequestable_field_requests(self):
+        body = processing._select_automatic_response_body(
+            "complete",
+            (
+                "Hi Alex,\n\nThank you for the details. We'll review them with "
+                "the client. Please share the internal notes, and send any "
+                "questions or other relevant properties."
+            ),
+            {
+                "columnTypes": {"Internal Notes": "Note"},
+                "extractionFields": [],
+            },
+            "Alex Morgan",
+        )
+
+        self.assertNotIn("internal notes", body.lower())
+        self.assertIn("Thank you for the details", body)
 
     def test_unavailable_fallbacks_are_warm_without_fake_enthusiasm(self):
         for scenario in ("nonviable", "nonviable_with_alternative"):

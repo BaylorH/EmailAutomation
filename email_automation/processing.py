@@ -2800,6 +2800,7 @@ _SENSITIVE_EVENT_RESPONSE_TYPES = {
     "needs_user_input",
     "contact_optout",
     "wrong_contact",
+    "property_issue",
     "tour_requested",
 }
 
@@ -3250,18 +3251,53 @@ def _select_missing_fields_response_body(
     return _build_missing_fields_response(contact_name, missing_fields)
 
 
+_COMPLETE_CLOSE_ACK_RE = re.compile(
+    r"\b(?:thank(?:s| you)?|appreciat(?:e|ed)|acknowledg(?:e|ed)|received|got it|noted)\b",
+    re.IGNORECASE,
+)
+_COMPLETE_CLOSE_REVIEW_RE = re.compile(
+    r"\bwe(?:'ll| will| can| plan to)?\s+(?:review|follow up)\b",
+    re.IGNORECASE,
+)
+_COMPLETE_CLOSE_WELCOME_RE = re.compile(
+    r"\b(?:please\s+(?:send|share)|feel free(?:\s+to)?|you(?:'re| are) welcome to|"
+    r"let us know|reach out|send over)\b",
+    re.IGNORECASE,
+)
+_COMPLETE_CLOSE_WELCOME_OBJECT_RE = re.compile(
+    r"\bquestions?\b|\b(?:other|additional|alternative|relevant)\s+"
+    r"(?:properties|property|options|opportunities|fits)\b",
+    re.IGNORECASE,
+)
+
+
+def _complete_close_has_required_quality(response_body: str) -> bool:
+    return all(
+        pattern.search(response_body or "")
+        for pattern in (
+            _COMPLETE_CLOSE_ACK_RE,
+            _COMPLETE_CLOSE_REVIEW_RE,
+            _COMPLETE_CLOSE_WELCOME_RE,
+            _COMPLETE_CLOSE_WELCOME_OBJECT_RE,
+        )
+    )
+
+
 def _select_automatic_response_body(
     scenario: str,
     llm_response_email: Optional[str],
     column_config: Optional[dict],
     contact_name: Optional[str],
 ) -> str:
-    """Use LLM copy only when it does not request configured Note/Skip fields."""
+    """Use model copy only when field safety and scenario quality checks pass."""
     if llm_response_email and not _response_requests_nonrequestable_fields(
         llm_response_email,
         column_config,
     ):
-        return llm_response_email
+        if scenario != "complete" or _complete_close_has_required_quality(
+            llm_response_email
+        ):
+            return llm_response_email
 
     greeting = _build_greeting(contact_name)
     fallbacks = {

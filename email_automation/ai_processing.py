@@ -2263,6 +2263,7 @@ _SENSITIVE_EVENT_RESPONSE_TYPES = {
     "needs_user_input",
     "contact_optout",
     "wrong_contact",
+    "property_issue",
     "tour_requested",
 }
 
@@ -3262,7 +3263,7 @@ SCENARIOS:
 - General reply: answer only what can be answered safely and request only authoritative missing required fields.
 
 SENSITIVE EVENT NULL RESPONSES:
-- For call_requested, needs_user_input, contact_optout, wrong_contact, or tour_requested, set response_email to null.
+- For call_requested, needs_user_input, contact_optout, wrong_contact, property_issue, or tour_requested, set response_email to null.
 - Never answer client-identity, requirement, budget, timeline, negotiation, legal, call, redirect, opt-out, or tour decisions automatically. The operator or deterministic event handler owns those actions.
 
 GREETING AND FOOTER:
@@ -3492,6 +3493,7 @@ EVENTS DETECTION (analyze ONLY the LAST HUMAN message for these events):
   • Include "issue" field with the specific problem mentioned
   • Include "severity" field: "critical" (health/safety), "major" (significant repair), "minor" (cosmetic/inconvenience)
   • This event is IMPORTANT because it flags properties that may need additional consideration before proceeding
+  • Set response_email to null. The operator must review property issues before any response is sent.
 
 CRITICAL EXAMPLES:
 - "Below is the only current space we have" + URL = new_property event
@@ -3686,7 +3688,7 @@ OUTPUT ONLY valid JSON in this exact format:
       "severity": "<for property_issue: critical | major | minor>"
     }
   ],
-  "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation and reference specific details when useful. SET TO NULL whenever any of these events is emitted: call_requested, needs_user_input, contact_optout, wrong_contact, or tour_requested. The system will notify the user instead of auto-responding.>",
+  "response_email": "<Generate a professional response email body (plain text only). Start with greeting (e.g., 'Hi,'), include main message content, and end with your content - DO NOT include 'Best,' or any closing/signature as the footer will add 'Best,' and full signature automatically. Should be contextual to the conversation and reference specific details when useful. SET TO NULL whenever any of these events is emitted: call_requested, needs_user_input, contact_optout, wrong_contact, property_issue, or tour_requested. The system will notify the user instead of auto-responding.>",
   "notes": "<IMPORTANT: Capture contextual details NOT already in columns. NEVER repeat values being written to columns (rent amounts, SF, ops ex, docks, power, etc.). DO capture: lease type (NNN/gross), availability timing, landlord motivation (motivated/firm), building features (fenced yard, rail spur, sprinklered), parking/trailer context such as parking count or trailer parking, zoning, location context, divisibility, TI allowance, sublease terms. Format: terse fragments separated by ' • '. Example: 'NNN • available immediately • owner motivated • fenced yard • 30 parking spaces • near I-20'. Leave empty if no additional context beyond column data.>"
 }
 """)
