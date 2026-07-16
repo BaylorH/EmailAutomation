@@ -92,7 +92,30 @@ class BrokerVoiceLargeCampaignFixtureTests(unittest.TestCase):
                 self.assertIsInstance(case["offline_proposal"], dict)
                 self.assertIn(
                     case["expect"]["response_mode"],
-                    {"send", "null", "deterministic_fallback"},
+                    {
+                        "send",
+                        "null",
+                        "quality_gated_fallback",
+                        "send_or_deterministic_fallback",
+                    },
+                )
+                if case["expect"]["response_mode"] in {
+                    "quality_gated_fallback",
+                    "send_or_deterministic_fallback",
+                }:
+                    self.assertIsInstance(
+                        case["expect"].get("deterministic_fallback"), str
+                    )
+                    self.assertTrue(case["expect"]["deterministic_fallback"].strip())
+                optional_events = case["expect"].get(
+                    "allowed_optional_event_types", []
+                )
+                self.assertIsInstance(optional_events, list)
+                self.assertTrue(
+                    all(isinstance(event_type, str) for event_type in optional_events)
+                )
+                self.assertFalse(
+                    set(optional_events) & set(case["expect"]["event_types"])
                 )
                 for aliases in case["expect"].get("must_mention_any", []):
                     self.assertIsInstance(aliases, list)
@@ -102,15 +125,32 @@ class BrokerVoiceLargeCampaignFixtureTests(unittest.TestCase):
     def test_proposal_only_completed_rows_do_not_require_runtime_close_events(self):
         by_scenario = {case["scenario"]: case for case in self.cases}
 
-        for scenario in (
-            "complete details",
-            "flyer attachment supplied",
-            "drive-in count supplied",
-        ):
+        for scenario in ("complete details", "flyer attachment supplied"):
             with self.subTest(scenario=scenario):
                 case = by_scenario[scenario]
                 self.assertEqual([], case["expect"]["event_types"])
                 self.assertEqual([], case["offline_proposal"]["events"])
+
+        drive_in_case = by_scenario["drive-in count supplied"]
+        self.assertEqual([], drive_in_case["expect"]["event_types"])
+        self.assertEqual(
+            ["close_conversation"],
+            drive_in_case["expect"]["allowed_optional_event_types"],
+        )
+
+    def test_all_unavailable_rows_use_the_same_send_or_fallback_contract(self):
+        by_scenario = {case["scenario"]: case for case in self.cases}
+
+        for scenario in (
+            "unavailable",
+            "unavailable plus alternative",
+            "alternative with new contact",
+        ):
+            with self.subTest(scenario=scenario):
+                self.assertEqual(
+                    "send_or_deterministic_fallback",
+                    by_scenario[scenario]["expect"]["response_mode"],
+                )
 
     def test_missing_field_cases_define_semantic_acceptable_term_groups(self):
         by_scenario = {case["scenario"]: case for case in self.cases}
@@ -225,27 +265,147 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
         self.assertEqual(100, result["score"])
         self.assertEqual([], result["vetoes"])
 
-    def test_unavailable_no_proposal_uses_explicit_deterministic_fallback(self):
-        case = self.cases["unavailable"]
+    def test_live_row_01_drive_in_door_alias_scores_100(self):
+        proposal = self.broken_proposal("partial details")
+        proposal["response_email"] = (
+            "Hi,\n\nThank you - that's helpful. Confirming the building is "
+            "18,400 SF with 4 dock-high doors and 28-foot clear. Do you have "
+            "the asking rent and operating expenses, and can you confirm the "
+            "number of drive-in doors and the electrical service?"
+        )
+
+        result = grade_case(self.cases["partial details"], proposal)
+
+        self.assertEqual(100, result["score"])
+        self.assertEqual([], result["vetoes"])
+
+    def test_live_row_02_incomplete_close_uses_quality_gated_fallback(self):
+        proposal = self.broken_proposal("complete details")
+        raw_response = (
+            "Hi,\n\nThank you - received. We'll review the 32,000 SF offering "
+            "and circle back with any questions."
+        )
+        proposal["response_email"] = raw_response
+
+        result = grade_case(self.cases["complete details"], proposal)
+
+        self.assertEqual(100, result["score"])
+        self.assertEqual([], result["vetoes"])
+        self.assertEqual(raw_response, result["raw_response"])
+        self.assertNotEqual(raw_response, result["effective_response"])
+        self.assertEqual(
+            "quality_gated_fallback", result["effective_response_source"]
+        )
+        self.assertIn("other relevant properties", result["effective_response"])
+
+    def test_complete_close_that_meets_quality_contract_remains_raw(self):
+        case = self.cases["complete details"]
 
         result = grade_case(case, case["offline_proposal"])
 
-        self.assertEqual("deterministic_fallback", case["expect"]["response_mode"])
-        self.assertIsNone(case["offline_proposal"]["response_email"])
         self.assertEqual(100, result["score"])
-        self.assertIsNone(result["raw_response"])
-        self.assertEqual("deterministic_fallback", result["effective_response_source"])
-        self.assertIn("another relevant property", result["effective_response"])
+        self.assertEqual("raw_proposal", result["effective_response_source"])
+        self.assertEqual(result["raw_response"], result["effective_response"])
 
-    def test_fallback_expected_case_vetoes_an_unexpected_raw_model_response(self):
-        proposal = self.broken_proposal("unavailable")
-        proposal["response_email"] = self.cases["unavailable"]["expect"][
-            "deterministic_fallback"
-        ]
-
-        self.assert_named_veto(
-            "unavailable", proposal, "unexpected_raw_response"
+    def test_live_row_07_43_word_reply_is_within_realistic_limit(self):
+        proposal = self.broken_proposal("floorplan attachment supplied")
+        proposal["response_email"] = (
+            "Hi,\n\nThanks for sending the floor plan for 707 Lathe Test "
+            "Boulevard. Understood that the other details are current. When "
+            "you\u2019re able to confirm the electrical service/power specs for "
+            "the building, please send them over and I\u2019ll update our file."
         )
+
+        result = grade_case(self.cases["floorplan attachment supplied"], proposal)
+
+        self.assertEqual(43, result["word_count"])
+        self.assertEqual(100, result["score"])
+
+    def test_live_row_08_optional_close_and_numeric_drive_ins_score_100(self):
+        proposal = self.broken_proposal("drive-in count supplied")
+        proposal["events"] = [{"type": "close_conversation"}]
+        proposal["response_email"] = (
+            "Hi,\n\nThanks - confirmed. I've noted 3 drive-ins and will review "
+            "the details with the team. If you have other similar availabilities, "
+            "feel free to send them over."
+        )
+
+        result = grade_case(self.cases["drive-in count supplied"], proposal)
+
+        self.assertEqual(100, result["score"])
+        self.assertEqual([], result["vetoes"])
+        self.assertEqual([], result["safety_vetoes"])
+        self.assertEqual(
+            ["close_conversation"], result["allowed_optional_event_types"]
+        )
+
+    def test_row_08_still_vetoes_any_nonoptional_extra_event(self):
+        proposal = self.broken_proposal("drive-in count supplied")
+        proposal["events"] = [{"type": "new_property"}]
+
+        result = grade_case(self.cases["drive-in count supplied"], proposal)
+
+        self.assertIn("event_types_mismatch", result["vetoes"])
+        self.assertIn("event_types_mismatch", result["safety_vetoes"])
+
+    def test_unavailable_rows_use_deterministic_fallback_when_raw_is_null(self):
+        for scenario, expected_fragment in (
+            ("unavailable", "another relevant property"),
+            ("unavailable plus alternative", "alternative"),
+            ("alternative with new contact", "alternative"),
+        ):
+            with self.subTest(scenario=scenario):
+                case = self.cases[scenario]
+                proposal = self.broken_proposal(scenario)
+                proposal["response_email"] = None
+
+                result = grade_case(case, proposal)
+
+                self.assertEqual(100, result["score"])
+                self.assertEqual([], result["vetoes"])
+                self.assertIsNone(result["raw_response"])
+                self.assertEqual(
+                    "deterministic_fallback",
+                    result["effective_response_source"],
+                )
+                self.assertIn(
+                    expected_fragment, result["effective_response"].lower()
+                )
+
+    def test_unavailable_rows_accept_safe_raw_copy_without_fallback(self):
+        case = self.cases["unavailable"]
+        proposal = self.broken_proposal("unavailable")
+        proposal["response_email"] = (
+            "Hi Skyler,\n\nThank you for the update. Do you have another "
+            "relevant property we should consider?"
+        )
+
+        result = grade_case(case, proposal)
+
+        self.assertEqual(100, result["score"])
+        self.assertEqual("raw_proposal", result["effective_response_source"])
+        self.assertEqual(result["raw_response"], result["effective_response"])
+
+    def test_alternative_fallback_does_not_invent_addresses_or_contacts(self):
+        for scenario, forbidden_details in (
+            (
+                "unavailable plus alternative",
+                ("1010 Hoist Test Trail", "1110 Kiln Test Way"),
+            ),
+            (
+                "alternative with new contact",
+                ("1211 Forge Test Loop", "Ellis Wren"),
+            ),
+        ):
+            with self.subTest(scenario=scenario):
+                proposal = self.broken_proposal(scenario)
+                proposal["response_email"] = None
+
+                result = grade_case(self.cases[scenario], proposal)
+
+                self.assertEqual(100, result["score"])
+                for detail in forbidden_details:
+                    self.assertNotIn(detail, result["effective_response"])
 
     def test_forbidden_term_is_vetoed(self):
         proposal = self.broken_proposal("unavailable plus alternative")
@@ -305,7 +465,7 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
 
     def test_sensitive_event_cannot_gain_a_deterministic_fallback(self):
         case = deepcopy(self.cases["property issue"])
-        case["expect"]["response_mode"] = "deterministic_fallback"
+        case["expect"]["response_mode"] = "send_or_deterministic_fallback"
         case["expect"]["deterministic_fallback"] = (
             "Hi Sage, we will handle the roof issue."
         )

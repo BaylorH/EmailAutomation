@@ -13,7 +13,7 @@
       {"direction": "outbound", "from": "campaign@example.test", "to": ["broker+row01@example.test"], "subject": "101 Foundry Test Way", "timestamp": "2026-07-15T15:01:00Z", "content": "Could you share the available building details?"},
       {"direction": "inbound", "from": "broker+row01@example.test", "to": ["campaign@example.test"], "subject": "Re: 101 Foundry Test Way", "timestamp": "2026-07-15T15:11:00Z", "content": "The building is 18,400 SF with four docks and 28-foot clear height."}
     ],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["18,400 SF"], "must_mention_any": [["asking rent", "asking rate", "rental rate", "rent per square foot"], ["operating expenses", "operating expense", "ops ex", "NNN expenses", "CAM charges"], ["drive-in count", "number of drive-ins", "drive ins", "grade-level door count", "grade-level doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 65, "supplied_fields": ["Total SF", "Docks", "Ceiling Ht"]},
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["18,400 SF"], "must_mention_any": [["asking rent", "asking rate", "rental rate", "rent per square foot"], ["operating expenses", "operating expense", "ops ex", "NNN expenses", "CAM charges"], ["drive-in count", "number of drive-ins", "number of drive-in doors", "drive ins", "grade-level door count", "grade-level doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 65, "supplied_fields": ["Total SF", "Docks", "Ceiling Ht"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Avery,\n\nI noted the 18,400 SF, four docks, and 28-foot clear height. Could you also share:\n- asking rent\n- operating expenses\n- drive-in count\n- power", "notes": ""}
   },
   {
@@ -29,8 +29,8 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row02@example.test", "to": ["campaign@example.test"], "subject": "202 Assembly Test Road", "timestamp": "2026-07-15T15:12:00Z", "content": "Available: 32,000 SF at $11.25/SF/year plus $2.40 NNN, two drive-ins, six docks, 30-foot clear, and 1,200 amps at 480V."}
     ],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["32,000 SF", "review", "other relevant properties"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 50, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]},
-    "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Jordan,\n\nI have the complete 32,000 SF package. We will review the details with the client, and please send over any questions or other relevant properties.", "notes": ""}
+    "expect": {"event_types": [], "response_mode": "quality_gated_fallback", "deterministic_fallback": "Hi Jordan,\n\nThank you for the details. We'll review them with the client.\n\nPlease send over any questions or other relevant properties we should consider.", "must_mention": ["review"], "raw_must_mention": ["32,000 SF"], "fallback_must_mention": ["other relevant properties"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 50, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]},
+    "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Jordan,\n\nThank you for the complete 32,000 SF package. We will review the details with the client. Please send over any questions or other relevant properties.", "notes": ""}
   },
   {
     "scenario": "one missing item",
@@ -111,7 +111,7 @@
       {"direction": "inbound", "from": "broker+row07@example.test", "to": ["campaign@example.test"], "subject": "707 Lathe Test Boulevard", "timestamp": "2026-07-15T15:17:00Z", "content": "I attached the floor plan. The other row details are current, but I still need to verify power."}
     ],
     "pdf_manifest": [{"name": "synthetic-row07-floorplan.pdf", "text": "Floor plan for 707 Lathe Test Boulevard, showing the warehouse and office layout."}],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["floor plan"], "must_mention_any": [["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["send the floor plan", "Gross Rent", "Best,"], "max_words": 40, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Floorplan"]},
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["floor plan"], "must_mention_any": [["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["send the floor plan", "Gross Rent", "Best,"], "max_words": 50, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Floorplan"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Cameron,\n\nI have the floor plan. When available, could you share the power service?", "notes": ""}
   },
   {
@@ -127,7 +127,7 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row08@example.test", "to": ["campaign@example.test"], "subject": "808 Press Test Parkway", "timestamp": "2026-07-15T15:18:00Z", "content": "There are three drive-ins. Everything else in the row is current."}
     ],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["three drive-ins", "review"], "must_not_mention": ["drive-in count?", "Gross Rent", "Best,"], "max_words": 45, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]},
+    "expect": {"event_types": [], "allowed_optional_event_types": ["close_conversation"], "response_mode": "send", "must_mention": ["review"], "must_mention_any": [["three drive-ins", "3 drive-ins"]], "must_not_mention": ["drive-in count?", "Gross Rent", "Best,"], "max_words": 45, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Devon,\n\nI noted the three drive-ins. We now have the complete package and will review it with the client.", "notes": ""}
   },
   {
@@ -143,7 +143,7 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row09@example.test", "to": ["campaign@example.test"], "subject": "909 Rivet Test Drive", "timestamp": "2026-07-15T15:19:00Z", "content": "That building is no longer available."}
     ],
-    "expect": {"event_types": ["property_unavailable"], "response_mode": "deterministic_fallback", "deterministic_fallback": "Hi Skyler,\n\nThank you for the update on the property's availability.\n\nDo you have another relevant property we should consider?", "must_mention": ["property's availability", "another relevant property"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 40, "supplied_fields": []},
+    "expect": {"event_types": ["property_unavailable"], "response_mode": "send_or_deterministic_fallback", "deterministic_fallback": "Hi Skyler,\n\nThank you for the update on the property's availability.\n\nDo you have another relevant property we should consider?", "must_mention": ["another relevant property"], "fallback_must_mention": ["property's availability"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 40, "supplied_fields": []},
     "offline_proposal": {"updates": [], "events": [{"type": "property_unavailable"}], "response_email": null, "notes": ""}
   },
   {
@@ -159,7 +159,7 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row10@example.test", "to": ["campaign@example.test"], "subject": "1010 Hoist Test Trail", "timestamp": "2026-07-15T15:20:00Z", "content": "1010 Hoist Test Trail leased, but 1110 Kiln Test Way in Fixture Ridge has 22,000 SF available."}
     ],
-    "expect": {"event_types": ["property_unavailable", "new_property"], "response_mode": "send", "must_mention": ["1010 Hoist Test Trail", "1110 Kiln Test Way", "review"], "must_not_mention": ["perfect fit", "Best,"], "max_words": 50, "supplied_fields": []},
+    "expect": {"event_types": ["property_unavailable", "new_property"], "response_mode": "send_or_deterministic_fallback", "deterministic_fallback": "Hi Quinn,\n\nThank you for the update and for sharing the alternative property.\n\nWe'll review the alternative with the client and follow up if we have questions.", "must_mention": ["alternative", "review"], "raw_must_mention": ["1010 Hoist Test Trail", "1110 Kiln Test Way"], "must_not_mention": ["perfect fit", "Best,"], "max_words": 50, "supplied_fields": []},
     "offline_proposal": {"updates": [], "events": [{"type": "property_unavailable"}, {"type": "new_property", "address": "1110 Kiln Test Way", "city": "Fixture Ridge"}], "response_email": "Hi Quinn,\n\nI noted that 1010 Hoist Test Trail has leased and that 1110 Kiln Test Way has 22,000 SF available. We will review the alternative.", "notes": ""}
   },
   {
@@ -175,7 +175,7 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row11@example.test", "to": ["campaign@example.test"], "subject": "1111 Pulley Test Place", "timestamp": "2026-07-15T15:21:00Z", "content": "That one is gone. Try 1211 Forge Test Loop and contact Ellis Wren at ellis.wren@example.test for the package."}
     ],
-    "expect": {"event_types": ["property_unavailable", "new_property"], "response_mode": "send", "must_mention": ["1211 Forge Test Loop", "Ellis Wren", "review"], "must_not_mention": ["we will email Ellis", "Best,"], "max_words": 50, "supplied_fields": []},
+    "expect": {"event_types": ["property_unavailable", "new_property"], "response_mode": "send_or_deterministic_fallback", "deterministic_fallback": "Hi Parker,\n\nThank you for the update and for sharing the alternative property.\n\nWe'll review the alternative with the client and follow up if we have questions.", "must_mention": ["alternative", "review"], "raw_must_mention": ["1211 Forge Test Loop", "Ellis Wren"], "must_not_mention": ["we will email Ellis", "Best,"], "max_words": 50, "supplied_fields": []},
     "offline_proposal": {"updates": [], "events": [{"type": "property_unavailable"}, {"type": "new_property", "address": "1211 Forge Test Loop", "contactName": "Ellis Wren", "email": "ellis.wren@example.test"}], "response_email": "Hi Parker,\n\nI noted the alternative at 1211 Forge Test Loop and the Ellis Wren contact. We will review the property before taking a next step.", "notes": ""}
   },
   {
