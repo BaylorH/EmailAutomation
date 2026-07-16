@@ -241,6 +241,28 @@ class BrokerVoicePolicyTests(unittest.TestCase):
                 self.assertIn(event_type, [item["type"] for item in proposal["events"]])
                 self.assertIsNone(proposal["response_email"])
 
+    def test_sensitive_event_suppression_normalizes_event_type_text(self):
+        variants = {
+            "needs_user_input": "  NEEDS_USER_INPUT  ",
+            "tour_requested": "\tTour_Requested\n",
+            "wrong_contact": " Wrong_Contact ",
+            "contact_optout": "CONTACT_OPTOUT ",
+            "call_requested": " Call_Requested",
+        }
+
+        for event_type, raw_event_type in variants.items():
+            with self.subTest(event_type=event_type):
+                proposal = {
+                    "events": [{"type": raw_event_type}],
+                    "response_email": "Hi Alex, I can handle that.",
+                }
+
+                result = ai_processing._suppress_response_for_sensitive_events(
+                    proposal
+                )
+
+                self.assertIsNone(result["response_email"])
+
 
 class BrokerVoiceFallbackTests(unittest.TestCase):
     def test_missing_field_mention_without_request_intent_is_rejected(self):
@@ -288,6 +310,78 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
             )
         )
 
+    def test_bare_what_statement_is_not_request_intent(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "What you sent covers the docks and power",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_attachment_tag_question_is_not_request_intent(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "The docks and power are already in the attachment, right?",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_explicit_confirmation_request_is_accepted(self):
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                "Could you confirm the docks and power?",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_do_you_know_request_with_precise_aliases_is_accepted(self):
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                "Do you know the dock count and electrical capacity?",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_operating_hours_statement_does_not_match_ops_ex(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Operating hours are 8-5",
+                ["Ops Ex /SF"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_grade_statement_does_not_match_drive_ins(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "The grade of the property is excellent",
+                ["Drive Ins"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_operating_hours_request_does_not_match_ops_ex(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Could you confirm the operating hours?",
+                ["Ops Ex /SF"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_property_grade_request_does_not_match_drive_ins(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Could you confirm the grade of the property?",
+                ["Drive Ins"],
+                get_default_column_config(),
+            )
+        )
+
     def test_custom_missing_fields_are_all_required_in_request(self):
         config = get_default_column_config()
         config["customFields"] = {
@@ -303,6 +397,30 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
             processing._response_mentions_missing_fields(
                 "Could you confirm the HVAC, TI allowance, and ESFR?",
                 ["HVAC", "TI Allowance", "ESFR"],
+                config,
+            )
+        )
+
+    def test_custom_missing_field_requires_its_exact_normalized_label(self):
+        config = get_default_column_config()
+        config["customFields"] = {
+            "Building Condition": {
+                "mode": "ask_required",
+                "description": "Current building condition",
+            }
+        }
+
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Could you confirm the building?",
+                ["Building Condition"],
+                config,
+            )
+        )
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                "Could you confirm the building condition?",
+                ["Building Condition"],
                 config,
             )
         )
@@ -378,19 +496,25 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
         self.assertNotIn("!", body)
 
     def test_acronym_missing_fields_preserve_casing(self):
-        for field in ("HVAC", "TI Allowance", "ESFR"):
+        for field in ("A/C", "R&D Budget", "HVAC", "TI Allowance", "ESFR"):
             with self.subTest(field=field):
                 body = processing._build_missing_fields_response("Alex Morgan", [field])
 
                 self.assertIn(f"Could you confirm the {field}?", body)
 
     def test_ordinary_missing_fields_remain_sentence_cased(self):
-        body = processing._build_missing_fields_response(
-            "Alex Morgan",
-            ["Docks", "Power"],
-        )
+        expected_labels = {
+            "Docks": "docks",
+            "Ceiling Ht": "clear height",
+        }
 
-        self.assertIn("Could you confirm the docks and power?", body)
+        for field, expected_label in expected_labels.items():
+            with self.subTest(field=field):
+                body = processing._build_missing_fields_response(
+                    "Alex Morgan", [field]
+                )
+
+                self.assertIn(f"Could you confirm the {expected_label}?", body)
 
     def test_one_missing_field_uses_a_natural_sentence(self):
         body = processing._build_missing_fields_response("Alex Morgan", ["Docks"])

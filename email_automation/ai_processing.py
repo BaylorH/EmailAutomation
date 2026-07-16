@@ -2254,7 +2254,7 @@ def _suppress_response_for_sensitive_events(proposal: dict) -> dict:
     if not proposal:
         return proposal
     event_types = {
-        (event or {}).get("type")
+        str((event or {}).get("type", "")).strip().lower()
         for event in (proposal.get("events") or [])
         if isinstance(event, dict)
     }
