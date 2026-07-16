@@ -140,6 +140,7 @@
     "expected_updates": [{"column": "Drive Ins", "value": "3"}],
     "forbidden_update_columns": ["Property Address", "City", "Email"],
     "event_payloads": [],
+    "optional_event_payloads": [{"type": "close_conversation", "any_of": [{"one_of": {"reason": ["all_info_gathered", "all_information_gathered", "all_required_fields_received", "complete_details_received"]}}, {"must_mention_any": {"notes": [["all required property details", "all required details", "all property details", "complete package"]]}}]}],
     "row": {
       "id": "synthetic-row-08",
       "number": 10,

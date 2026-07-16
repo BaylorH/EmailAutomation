@@ -43,6 +43,7 @@ SAFETY_VETOES = {
     "unexpected_update",
     "unexpected_response",
 }
+IGNORABLE_EVENT_METADATA_FIELDS = {"schemaVersion"}
 
 FIELD_ALIASES = {
     "Total SF": ("total sf", "square footage", "building size"),
@@ -210,24 +211,19 @@ def _grade_updates(case: dict, proposal: dict, veto) -> tuple[list, list]:
     return raw_updates, list(actual_by_column.values())
 
 
-def _event_payload_matches(actual: dict, expected: dict) -> bool:
-    if not isinstance(actual, dict) or not isinstance(expected, dict):
-        return False
-    if _normalize_value(actual.get("type")) != _normalize_value(expected.get("type")):
-        return False
-
-    for field, expected_value in expected.get("equals", {}).items():
+def _event_conditions_match(actual: dict, conditions: dict) -> bool:
+    for field, expected_value in conditions.get("equals", {}).items():
         if _normalize_value(actual.get(field)) != _normalize_value(expected_value):
             return False
 
-    for field, accepted_values in expected.get("one_of", {}).items():
+    for field, accepted_values in conditions.get("one_of", {}).items():
         actual_value = _normalize_value(actual.get(field))
         if actual_value not in {
             _normalize_value(value) for value in accepted_values
         }:
             return False
 
-    for field, semantic_groups in expected.get("must_mention_any", {}).items():
+    for field, semantic_groups in conditions.get("must_mention_any", {}).items():
         actual_value = str(actual.get(field) or "")
         if any(
             not any(
@@ -240,13 +236,103 @@ def _event_payload_matches(actual: dict, expected: dict) -> bool:
     return True
 
 
-def _event_payloads_match(actual_events: list, expected_events: list) -> bool:
+def _event_contract_fields(expected: dict) -> set[str]:
+    fields = {"type"}
+    for conditions in [expected, *expected.get("any_of", [])]:
+        for key in ("equals", "one_of", "must_mention_any"):
+            fields.update(conditions.get(key, {}))
+    fields.update(
+        set(expected.get("ignored_fields", []))
+        & IGNORABLE_EVENT_METADATA_FIELDS
+    )
+    return fields
+
+
+def _alternative_field_matches(actual: dict, field: str, alternatives: list[dict]) -> bool:
+    for conditions in alternatives:
+        for condition_name in ("equals", "one_of", "must_mention_any"):
+            field_conditions = conditions.get(condition_name, {})
+            if field not in field_conditions:
+                continue
+            if _event_conditions_match(
+                actual,
+                {condition_name: {field: field_conditions[field]}},
+            ):
+                return True
+    return False
+
+
+def _has_nonempty_payload_value(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return True
+
+
+def _event_payload_matches(actual: dict, expected: dict) -> bool:
+    if not isinstance(actual, dict) or not isinstance(expected, dict):
+        return False
+    if _normalize_value(actual.get("type")) != _normalize_value(expected.get("type")):
+        return False
+    if not _event_conditions_match(actual, expected):
+        return False
+
+    alternatives = expected.get("any_of", [])
+    if alternatives and not any(
+        _event_conditions_match(actual, conditions)
+        for conditions in alternatives
+    ):
+        return False
+
+    alternative_fields = {
+        field
+        for conditions in alternatives
+        for condition_name in ("equals", "one_of", "must_mention_any")
+        for field in conditions.get(condition_name, {})
+    }
+    if any(
+        _has_nonempty_payload_value(actual.get(field))
+        and not _alternative_field_matches(actual, field, alternatives)
+        for field in alternative_fields
+    ):
+        return False
+
+    allowed_fields = _event_contract_fields(expected)
+    return not any(
+        field not in allowed_fields and _has_nonempty_payload_value(value)
+        for field, value in actual.items()
+    )
+
+
+def _event_payloads_match(
+    actual_events: list,
+    expected_events: list,
+    optional_events: list,
+) -> bool:
     if len(actual_events) < len(expected_events):
         return False
-    return all(
+    if not all(
         _event_payload_matches(actual, expected)
         for actual, expected in zip(actual_events, expected_events)
-    )
+    ):
+        return False
+
+    for actual in actual_events[len(expected_events):]:
+        matching_contracts = [
+            expected
+            for expected in optional_events
+            if _normalize_value(expected.get("type"))
+            == _normalize_value(actual.get("type"))
+        ]
+        if not any(
+            _event_payload_matches(actual, expected)
+            for expected in matching_contracts
+        ):
+            return False
+    return True
 
 
 def _contains_placeholder(response: str) -> bool:
@@ -521,6 +607,7 @@ def grade_case(
     if not _event_payloads_match(
         actual_event_payloads,
         case.get("event_payloads", []),
+        case.get("optional_event_payloads", []),
     ):
         veto("event_payload_mismatch")
 

@@ -95,6 +95,9 @@ class BrokerVoiceLargeCampaignFixtureTests(unittest.TestCase):
                 self.assertIsInstance(case["offline_proposal"], dict)
                 self.assertIsInstance(case["expected_updates"], list)
                 self.assertIsInstance(case["event_payloads"], list)
+                self.assertIsInstance(
+                    case.get("optional_event_payloads", []), list
+                )
                 self.assertIsInstance(case["forbidden_update_columns"], list)
                 self.assertEqual(
                     case["expect"]["event_types"],
@@ -117,6 +120,13 @@ class BrokerVoiceLargeCampaignFixtureTests(unittest.TestCase):
                 )
                 self.assertFalse(
                     set(optional_events) & set(case["expect"]["event_types"])
+                )
+                self.assertEqual(
+                    optional_events,
+                    [
+                        event["type"]
+                        for event in case.get("optional_event_payloads", [])
+                    ],
                 )
                 for aliases in case["expect"].get("must_mention_any", []):
                     self.assertIsInstance(aliases, list)
@@ -404,6 +414,46 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
                     "event_payload_mismatch",
                 )
 
+    def test_referral_event_rejects_unsupported_fabricated_city(self):
+        proposal = self.broken_proposal("alternative with new contact")
+        proposal["events"][1]["city"] = "Fabricated City"
+
+        self.assert_named_veto(
+            "alternative with new contact",
+            proposal,
+            "event_payload_mismatch",
+        )
+
+    def test_event_contract_cannot_ignore_behavioral_fields(self):
+        case = deepcopy(self.cases["alternative with new contact"])
+        case["event_payloads"][1]["ignored_fields"] = ["city"]
+        proposal = deepcopy(case["offline_proposal"])
+        proposal["events"][1]["city"] = "Fabricated City"
+
+        result = grade_case(case, proposal)
+
+        self.assertIn("event_payload_mismatch", result["vetoes"])
+
+    def test_event_contract_can_explicitly_ignore_schema_version_metadata(self):
+        case = deepcopy(self.cases["wrong contact"])
+        case["event_payloads"][0]["ignored_fields"] = ["schemaVersion"]
+        proposal = deepcopy(case["offline_proposal"])
+        proposal["events"][0]["schemaVersion"] = "1"
+
+        result = grade_case(case, proposal)
+
+        self.assertNotIn("event_payload_mismatch", result["vetoes"])
+
+    def test_wrong_contact_event_rejects_unsupported_suggested_phone(self):
+        proposal = self.broken_proposal("wrong contact")
+        proposal["events"][0]["suggestedPhone"] = "+1 555 010 9999"
+
+        self.assert_named_veto(
+            "wrong contact",
+            proposal,
+            "event_payload_mismatch",
+        )
+
     def test_grade_reports_raw_updates_and_complete_events(self):
         case = self.cases["alternative with new contact"]
         proposal = case["offline_proposal"]
@@ -520,7 +570,9 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
 
     def test_live_row_08_optional_close_and_numeric_drive_ins_score_100(self):
         proposal = self.broken_proposal("drive-in count supplied")
-        proposal["events"] = [{"type": "close_conversation"}]
+        proposal["events"] = [
+            {"type": "close_conversation", "reason": "all_info_gathered"}
+        ]
         proposal["response_email"] = (
             "Hi,\n\nThanks - confirmed. I've noted 3 drive-ins and will review "
             "the details with the team. If you have other similar availabilities, "
@@ -535,6 +587,61 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
         self.assertEqual(
             ["close_conversation"], result["allowed_optional_event_types"]
         )
+
+    def test_row_08_optional_close_accepts_evidence_backed_notes(self):
+        proposal = self.broken_proposal("drive-in count supplied")
+        proposal["events"] = [
+            {
+                "type": "close_conversation",
+                "notes": "All required property details have been received.",
+            }
+        ]
+
+        result = grade_case(self.cases["drive-in count supplied"], proposal)
+
+        self.assertEqual(100, result["score"])
+        self.assertEqual([], result["vetoes"])
+
+    def test_row_08_optional_close_rejects_wrong_terminal_reason(self):
+        proposal = self.broken_proposal("drive-in count supplied")
+        proposal["events"] = [
+            {"type": "close_conversation", "reason": "not_interested"}
+        ]
+
+        result = grade_case(self.cases["drive-in count supplied"], proposal)
+
+        self.assertIn("event_payload_mismatch", result["vetoes"])
+        self.assertIn("event_payload_mismatch", result["safety_vetoes"])
+
+    def test_row_08_optional_close_rejects_valid_reason_with_fabricated_notes(self):
+        proposal = self.broken_proposal("drive-in count supplied")
+        proposal["events"] = [
+            {
+                "type": "close_conversation",
+                "reason": "all_info_gathered",
+                "notes": "The broker approved a lease that was never discussed.",
+            }
+        ]
+
+        result = grade_case(self.cases["drive-in count supplied"], proposal)
+
+        self.assertIn("event_payload_mismatch", result["vetoes"])
+        self.assertIn("event_payload_mismatch", result["safety_vetoes"])
+
+    def test_row_08_optional_close_rejects_valid_notes_with_wrong_reason(self):
+        proposal = self.broken_proposal("drive-in count supplied")
+        proposal["events"] = [
+            {
+                "type": "close_conversation",
+                "reason": "not_interested",
+                "notes": "All required property details have been received.",
+            }
+        ]
+
+        result = grade_case(self.cases["drive-in count supplied"], proposal)
+
+        self.assertIn("event_payload_mismatch", result["vetoes"])
+        self.assertIn("event_payload_mismatch", result["safety_vetoes"])
 
     def test_row_08_still_vetoes_any_nonoptional_extra_event(self):
         proposal = self.broken_proposal("drive-in count supplied")

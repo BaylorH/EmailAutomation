@@ -1257,6 +1257,64 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
         self.assertIn("Thanks for confirming the dock count", body)
         self.assertIn("Could you share the power specifications?", body)
 
+    def test_missing_field_selector_rejects_polite_reask_of_supplied_field(self):
+        model_body = (
+            "Hi Alex,\n\nCould you share the power specifications? Would you "
+            "mind confirming the dock count as well?"
+        )
+
+        body = processing._select_missing_fields_response_body(
+            model_body,
+            ["Power"],
+            get_default_column_config(),
+            "Alex Morgan",
+        )
+
+        self.assertNotEqual(model_body, body)
+        self.assertIn("power specifications", body.lower())
+        self.assertNotIn("dock", body.lower())
+
+    def test_missing_field_selector_rejects_related_indirect_reasks(self):
+        reasks = (
+            "Would it be possible to share the dock count as well?",
+            "Do you mind providing the dock count as well?",
+            "Might you share the dock count as well?",
+        )
+
+        for reask in reasks:
+            with self.subTest(reask=reask):
+                model_body = (
+                    "Hi Alex,\n\nCould you share the power specifications? "
+                    f"{reask}"
+                )
+                body = processing._select_missing_fields_response_body(
+                    model_body,
+                    ["Power"],
+                    get_default_column_config(),
+                    "Alex Morgan",
+                )
+
+                self.assertNotEqual(model_body, body)
+                self.assertNotIn("dock", body.lower())
+
+    def test_missing_field_selector_accepts_indirect_missing_request_after_ack(self):
+        model_body = (
+            "Hi Alex,\n\nThanks for confirming the dock count. Would it be "
+            "possible to share the power specifications?"
+        )
+
+        body = processing._select_missing_fields_response_body(
+            model_body,
+            ["Power"],
+            get_default_column_config(),
+            "Alex Morgan",
+        )
+
+        self.assertIn("Thanks for confirming the dock count", body)
+        self.assertIn(
+            "Would it be possible to share the power specifications?", body
+        )
+
     def test_missing_field_selector_accepts_request_for_only_missing_field(self):
         model_body = "Hi Alex,\n\nCould you share the power specifications?"
 
@@ -1317,6 +1375,24 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
             "Hi Alex,\n\nThank you for the details. We'll review them with the "
             "client and follow up. Please confirm the dock count, and feel free "
             "to send questions or other relevant properties."
+        )
+
+        body = processing._select_automatic_response_body(
+            "complete",
+            model_body,
+            get_default_column_config(),
+            "Alex Morgan",
+        )
+
+        self.assertNotEqual(model_body, body)
+        self.assertNotIn("dock", body.lower())
+        self.assertIn("questions or other relevant properties", body)
+
+    def test_complete_selector_rejects_polite_reask_of_supplied_field(self):
+        model_body = (
+            "Hi Alex,\n\nThank you for the details. We'll review them with the "
+            "client and follow up. Would you mind confirming the dock count as "
+            "well? Please send any questions or other relevant properties."
         )
 
         body = processing._select_automatic_response_body(
