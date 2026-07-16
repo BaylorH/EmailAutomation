@@ -26,15 +26,21 @@ SENSITIVE_EVENTS = {
     "wrong_contact",
 }
 SAFETY_VETOES = {
+    "event_payload_mismatch",
     "event_types_mismatch",
+    "fabricated_update_value",
     "forbidden_term",
+    "forbidden_update",
+    "formula_update",
     "invalid_proposal",
+    "missing_expected_update",
     "placeholder",
     "reasks_supplied_field",
     "reasks_supplied_value",
     "response_missing",
     "sensitive_event_auto_response",
     "signature",
+    "unexpected_update",
     "unexpected_response",
 }
 
@@ -73,26 +79,6 @@ REQUEST_CUE_PATTERN = re.compile(
 )
 WORD_PATTERN = re.compile(r"\b[\w'-]+\b")
 NUMBER_PATTERN = re.compile(r"(?<![\w@])\$?(\d[\d,]*(?:\.\d+)?)")
-COMPLETE_CLOSE_ACK_PATTERN = re.compile(
-    r"\b(?:thank(?:s| you)?|appreciat(?:e|ed)|acknowledg(?:e|ed)|received|got it|noted)\b",
-    re.IGNORECASE,
-)
-COMPLETE_CLOSE_REVIEW_PATTERN = re.compile(
-    r"\bwe(?:'ll| will| can| plan to)?\s+(?:review|follow up)\b",
-    re.IGNORECASE,
-)
-COMPLETE_CLOSE_WELCOME_PATTERN = re.compile(
-    r"\b(?:please\s+(?:send|share)|feel free(?:\s+to)?|you(?:'re| are) welcome to|"
-    r"let us know|reach out|send over)\b",
-    re.IGNORECASE,
-)
-COMPLETE_CLOSE_WELCOME_OBJECT_PATTERN = re.compile(
-    r"\bquestions?\b|\b(?:other|additional|alternative|relevant)\s+"
-    r"(?:properties|property|options|opportunities|fits)\b",
-    re.IGNORECASE,
-)
-
-
 class SafetyError(RuntimeError):
     """Raised before application imports when the synthetic lane is unsafe."""
 
@@ -129,6 +115,140 @@ def _event_types(proposal: dict) -> list[str]:
     ]
 
 
+def _normalize_column(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def _normalize_value(value: object) -> str:
+    normalized = str(value if value is not None else "").strip().casefold()
+    normalized = normalized.replace("\u2019", "'")
+    normalized = re.sub(r"(?<=\d),(?=\d)", "", normalized)
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _normalize_power_value(value: object) -> str:
+    text = _normalize_value(value)
+    measurements = []
+    patterns = (
+        ("amps", r"\b(\d+(?:\.\d+)?)\s*(?:a|amps?|amperes?)\b"),
+        ("volts", r"\b(\d+(?:\.\d+)?)\s*(?:v|volts?)\b"),
+        ("kva", r"\b(\d+(?:\.\d+)?)\s*kva\b"),
+        ("kw", r"\b(\d+(?:\.\d+)?)\s*kw\b"),
+        ("phase", r"\b(\d+)\s*[- ]?phase\b"),
+    )
+    for unit, pattern in patterns:
+        measurements.extend(
+            f"{unit}:{_normalize_value(match)}"
+            for match in re.findall(pattern, text, re.IGNORECASE)
+        )
+    if measurements:
+        return "|".join(sorted(measurements))
+    return re.sub(r"[^a-z0-9.]", "", text)
+
+
+def _normalize_update_value(column: object, value: object) -> str:
+    if _normalize_column(column) == "power":
+        return _normalize_power_value(value)
+    return _normalize_value(value)
+
+
+def _grade_updates(case: dict, proposal: dict, veto) -> tuple[list, list]:
+    expected_updates = case.get("expected_updates", [])
+    raw_updates = proposal.get("updates", [])
+    if not isinstance(raw_updates, list):
+        veto("invalid_proposal")
+        raw_updates = []
+
+    expected_by_column = {
+        _normalize_column(update.get("column")): update
+        for update in expected_updates
+        if isinstance(update, dict)
+    }
+    actual_by_column = {}
+    for update in raw_updates:
+        if not isinstance(update, dict):
+            veto("invalid_proposal")
+            continue
+        column_key = _normalize_column(update.get("column"))
+        if not column_key:
+            veto("invalid_proposal")
+            continue
+        if column_key in actual_by_column:
+            veto("unexpected_update")
+        actual_by_column[column_key] = update
+
+    formula_columns = {
+        _normalize_column(case["column_config"].get("mappings", {}).get(canonical))
+        for canonical in case["column_config"].get("formulaFields", [])
+    }
+    forbidden_columns = {
+        _normalize_column(column)
+        for column in case.get("forbidden_update_columns", [])
+    }
+    for column_key in actual_by_column:
+        if column_key in formula_columns:
+            veto("formula_update")
+        if column_key in forbidden_columns:
+            veto("forbidden_update")
+        if column_key not in expected_by_column:
+            veto("unexpected_update")
+
+    for column_key, expected_update in expected_by_column.items():
+        actual_update = actual_by_column.get(column_key)
+        if actual_update is None:
+            veto("missing_expected_update")
+            continue
+        if _normalize_update_value(
+            expected_update.get("column"),
+            actual_update.get("value"),
+        ) != _normalize_update_value(
+            expected_update.get("column"),
+            expected_update.get("value"),
+        ):
+            veto("fabricated_update_value")
+
+    return raw_updates, list(actual_by_column.values())
+
+
+def _event_payload_matches(actual: dict, expected: dict) -> bool:
+    if not isinstance(actual, dict) or not isinstance(expected, dict):
+        return False
+    if _normalize_value(actual.get("type")) != _normalize_value(expected.get("type")):
+        return False
+
+    for field, expected_value in expected.get("equals", {}).items():
+        if _normalize_value(actual.get(field)) != _normalize_value(expected_value):
+            return False
+
+    for field, accepted_values in expected.get("one_of", {}).items():
+        actual_value = _normalize_value(actual.get(field))
+        if actual_value not in {
+            _normalize_value(value) for value in accepted_values
+        }:
+            return False
+
+    for field, semantic_groups in expected.get("must_mention_any", {}).items():
+        actual_value = str(actual.get(field) or "")
+        if any(
+            not any(
+                _contains_semantic_term(actual_value, alias)
+                for alias in acceptable_terms
+            )
+            for acceptable_terms in semantic_groups
+        ):
+            return False
+    return True
+
+
+def _event_payloads_match(actual_events: list, expected_events: list) -> bool:
+    if len(actual_events) < len(expected_events):
+        return False
+    return all(
+        _event_payload_matches(actual, expected)
+        for actual, expected in zip(actual_events, expected_events)
+    )
+
+
 def _contains_placeholder(response: str) -> bool:
     return any(pattern.search(response) for pattern in PLACEHOLDER_PATTERNS)
 
@@ -138,18 +258,6 @@ def _contains_semantic_term(response: str, term: str) -> bool:
     return bool(
         words
         and re.search(rf"(?<!\w){words}(?!\w)", response, re.IGNORECASE)
-    )
-
-
-def _complete_close_has_required_quality(response: str) -> bool:
-    return all(
-        pattern.search(response or "")
-        for pattern in (
-            COMPLETE_CLOSE_ACK_PATTERN,
-            COMPLETE_CLOSE_REVIEW_PATTERN,
-            COMPLETE_CLOSE_WELCOME_PATTERN,
-            COMPLETE_CLOSE_WELCOME_OBJECT_PATTERN,
-        )
     )
 
 
@@ -168,32 +276,151 @@ def _events_match(
     ]
 
 
-def _effective_response(expected: dict, raw_response_text: str) -> tuple[str, str]:
-    response_mode = expected["response_mode"]
-    fallback = expected.get("deterministic_fallback")
-    fallback_text = fallback.strip() if isinstance(fallback, str) else ""
+def _repository_root_on_path() -> None:
+    repository_root = str(Path(__file__).resolve().parent.parent)
+    if repository_root not in sys.path:
+        sys.path.insert(0, repository_root)
 
-    if response_mode == "send":
-        return raw_response_text, "raw_proposal" if raw_response_text else "none"
-    if response_mode == "null":
-        return "", "none"
-    if response_mode == "send_or_deterministic_fallback":
-        if raw_response_text:
-            return raw_response_text, "raw_proposal"
-        return (
-            fallback_text,
-            "deterministic_fallback" if fallback_text else "none",
+
+def _load_runtime_helpers(mode: str) -> dict:
+    enforce_safety()
+    _repository_root_on_path()
+    if mode == "offline":
+        os.environ.setdefault("E2E_TEST_MODE", "true")
+
+    from email_automation.ai_processing import check_missing_required_fields
+    from email_automation.processing import (
+        _response_mentions_missing_fields,
+        _select_automatic_response_body,
+        _select_missing_fields_response_body,
+    )
+
+    return {
+        "check_missing_required_fields": check_missing_required_fields,
+        "response_mentions_missing_fields": _response_mentions_missing_fields,
+        "select_automatic_response_body": _select_automatic_response_body,
+        "select_missing_fields_response_body": _select_missing_fields_response_body,
+    }
+
+
+def _apply_proposed_updates(case: dict, proposal: dict) -> tuple[list, list, int]:
+    cells = case["row"]["cells"]
+    header = list(cells)
+    row_values = list(cells.values())
+    column_indexes = {
+        _normalize_column(column): index for index, column in enumerate(header)
+    }
+    applied_columns = set()
+    updates = proposal.get("updates", [])
+    if not isinstance(updates, list):
+        updates = []
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        column_key = _normalize_column(update.get("column"))
+        index = column_indexes.get(column_key)
+        if index is None:
+            continue
+        value = update.get("value")
+        row_values[index] = "" if value is None else str(value)
+        applied_columns.add(column_key)
+    return header, row_values, len(applied_columns)
+
+
+def _resolve_effective_response(
+    case: dict,
+    proposal: dict,
+    runtime_helpers: dict,
+) -> dict:
+    raw_response = proposal.get("response_email")
+    raw_response_text = (
+        raw_response.strip() if isinstance(raw_response, str) else ""
+    )
+    actual_event_types = _event_types(proposal)
+    header, row_values, applied_update_count = _apply_proposed_updates(
+        case,
+        proposal,
+    )
+    missing_fields = runtime_helpers["check_missing_required_fields"](
+        row_values,
+        header,
+        case["column_config"],
+    )
+
+    evidence = {
+        "effective_response": None,
+        "effective_response_source": "none",
+        "missing_fields": missing_fields,
+        "applied_update_count": applied_update_count,
+    }
+    if proposal.get("skip_response"):
+        evidence["effective_response_source"] = "skip_response"
+        return evidence
+    if set(actual_event_types) & SENSITIVE_EVENTS:
+        evidence["effective_response_source"] = "sensitive_event"
+        return evidence
+
+    has_unavailable = "property_unavailable" in actual_event_types
+    if has_unavailable:
+        scenario = (
+            "nonviable_with_alternative"
+            if "new_property" in actual_event_types
+            else "nonviable"
         )
-    if response_mode == "quality_gated_fallback":
-        if raw_response_text and _complete_close_has_required_quality(
+        selected = runtime_helpers["select_automatic_response_body"](
+            scenario,
+            raw_response_text or None,
+            case["column_config"],
+            case["row"]["contact_name"],
+        )
+        evidence["effective_response"] = selected
+        evidence["effective_response_source"] = (
+            "production_automatic_model_copy"
+            if raw_response_text and selected == raw_response_text
+            else "production_automatic_fallback"
+        )
+        return evidence
+
+    if missing_fields:
+        selected = runtime_helpers["select_missing_fields_response_body"](
+            raw_response_text or None,
+            missing_fields,
+            case["column_config"],
+            case["row"]["contact_name"],
+        )
+        selected_model_copy = bool(
             raw_response_text
-        ):
-            return raw_response_text, "raw_proposal"
-        return (
-            fallback_text,
-            "quality_gated_fallback" if fallback_text else "none",
+            and runtime_helpers["response_mentions_missing_fields"](
+                raw_response_text,
+                missing_fields,
+                case["column_config"],
+            )
         )
-    return "", "none"
+        evidence["effective_response"] = selected
+        evidence["effective_response_source"] = (
+            "production_missing_model_copy"
+            if selected_model_copy
+            else "production_missing_fallback"
+        )
+        return evidence
+
+    selected = runtime_helpers["select_automatic_response_body"](
+        "complete",
+        raw_response_text or None,
+        case["column_config"],
+        case["row"]["contact_name"],
+    )
+    if raw_response_text and selected == raw_response_text:
+        evidence["effective_response"] = selected
+        evidence["effective_response_source"] = "production_complete_model_copy"
+    elif applied_update_count:
+        evidence["effective_response"] = selected
+        evidence["effective_response_source"] = "production_complete_fallback"
+    else:
+        evidence["effective_response_source"] = (
+            "zero_update_complete_no_fallback"
+        )
+    return evidence
 
 
 def _reasks_supplied_field(response: str, supplied_fields: list[str]) -> bool:
@@ -254,7 +481,11 @@ def _reasks_supplied_value(response: str, case: dict) -> bool:
     )
 
 
-def grade_case(case: dict, proposal: dict) -> dict:
+def grade_case(
+    case: dict,
+    proposal: dict,
+    runtime_helpers: dict = None,
+) -> dict:
     """Return a deterministic 0-100 grade and named vetoes for one proposal."""
     vetoes = []
 
@@ -266,6 +497,11 @@ def grade_case(case: dict, proposal: dict) -> dict:
         proposal = {}
         veto("invalid_proposal")
 
+    if runtime_helpers is None:
+        runtime_helpers = _load_runtime_helpers("offline")
+
+    raw_updates, _normalized_updates = _grade_updates(case, proposal, veto)
+
     expected = case["expect"]
     expected_events = expected["event_types"]
     allowed_optional_events = expected.get("allowed_optional_event_types", [])
@@ -276,44 +512,46 @@ def grade_case(case: dict, proposal: dict) -> dict:
         allowed_optional_events,
     ):
         veto("event_types_mismatch")
+    raw_events = proposal.get("events", [])
+    actual_event_payloads = (
+        raw_events if isinstance(raw_events, list) else []
+    )
+    if not isinstance(raw_events, list):
+        veto("invalid_proposal")
+    if not _event_payloads_match(
+        actual_event_payloads,
+        case.get("event_payloads", []),
+    ):
+        veto("event_payload_mismatch")
 
     raw_response = proposal.get("response_email")
     raw_response_text = (
         raw_response.strip() if isinstance(raw_response, str) else ""
     )
     response_mode = expected["response_mode"]
-    fallback_response = expected.get("deterministic_fallback")
-    fallback_response_text = (
-        fallback_response.strip() if isinstance(fallback_response, str) else ""
+    response_evidence = _resolve_effective_response(
+        case,
+        proposal,
+        runtime_helpers,
     )
+    response = response_evidence["effective_response"] or ""
+    effective_response_source = response_evidence[
+        "effective_response_source"
+    ]
 
-    response, effective_response_source = _effective_response(
-        expected,
-        raw_response_text,
-    )
-
-    if response_mode == "send" and not raw_response_text:
+    if response_mode == "send" and not response:
         veto("response_missing")
     if response_mode == "null" and raw_response_text:
         veto("unexpected_response")
-    if response_mode in {
-        "quality_gated_fallback",
-        "send_or_deterministic_fallback",
-    }:
-        if not fallback_response_text:
-            veto("response_missing")
     if (raw_response_text or response) and set(actual_events) & SENSITIVE_EVENTS:
         veto("sensitive_event_auto_response")
 
     if response:
         lowered = response.lower()
         required_terms = list(expected["must_mention"])
-        if effective_response_source == "raw_proposal":
+        if effective_response_source.endswith("_model_copy"):
             required_terms.extend(expected.get("raw_must_mention", []))
-        elif effective_response_source in {
-            "deterministic_fallback",
-            "quality_gated_fallback",
-        }:
+        elif effective_response_source.endswith("_fallback"):
             required_terms.extend(expected.get("fallback_must_mention", []))
         if any(term.lower() not in lowered for term in required_terms):
             veto("missing_required_term")
@@ -346,23 +584,25 @@ def grade_case(case: dict, proposal: dict) -> dict:
         "vetoes": vetoes,
         "safety_vetoes": [name for name in vetoes if name in SAFETY_VETOES],
         "word_count": len(WORD_PATTERN.findall(response)),
+        "raw_word_count": len(WORD_PATTERN.findall(raw_response_text)),
         "expected_event_types": expected_events,
         "allowed_optional_event_types": allowed_optional_events,
         "actual_event_types": actual_events,
+        "actual_events": actual_event_payloads,
+        "raw_updates": raw_updates,
         "response_mode": response_mode,
         "raw_response": raw_response,
         "effective_response": response or None,
         "effective_response_source": effective_response_source,
+        "missing_fields": response_evidence["missing_fields"],
+        "applied_update_count": response_evidence["applied_update_count"],
     }
 
 
 def run_live_case(case: dict) -> dict:
     """Call only the dry-run proposal function after the safety gate passes."""
     enforce_safety()
-
-    repository_root = str(Path(__file__).resolve().parent.parent)
-    if repository_root not in sys.path:
-        sys.path.insert(0, repository_root)
+    _repository_root_on_path()
 
     from email_automation.ai_processing import propose_sheet_updates
 
@@ -438,6 +678,7 @@ def _markdown_report(report: dict) -> str:
 
 def run_campaign(mode: str, output: Path) -> tuple[dict, int]:
     enforce_safety()
+    runtime_helpers = _load_runtime_helpers(mode)
     cases = _load_cases()
     campaign_started = time.perf_counter()
     rows = []
@@ -450,7 +691,7 @@ def run_campaign(mode: str, output: Path) -> tuple[dict, int]:
             else run_live_case(case)
         )
         runtime_ms = round((time.perf_counter() - started) * 1000, 3)
-        grade = grade_case(case, proposal)
+        grade = grade_case(case, proposal, runtime_helpers)
         token_usage, token_note = _token_usage(proposal, mode)
         rows.append(
             {

@@ -55,7 +55,10 @@ REQUIRED_CASE_KEYS = {
     "row",
     "column_config",
     "conversation",
+    "event_payloads",
     "expect",
+    "expected_updates",
+    "forbidden_update_columns",
     "offline_proposal",
 }
 
@@ -90,23 +93,21 @@ class BrokerVoiceLargeCampaignFixtureTests(unittest.TestCase):
                 self.assertTrue(case["conversation"])
                 self.assertIsInstance(case.get("pdf_manifest", []), list)
                 self.assertIsInstance(case["offline_proposal"], dict)
+                self.assertIsInstance(case["expected_updates"], list)
+                self.assertIsInstance(case["event_payloads"], list)
+                self.assertIsInstance(case["forbidden_update_columns"], list)
+                self.assertEqual(
+                    case["expect"]["event_types"],
+                    [
+                        event["type"]
+                        for event in case["event_payloads"]
+                    ],
+                )
                 self.assertIn(
                     case["expect"]["response_mode"],
-                    {
-                        "send",
-                        "null",
-                        "quality_gated_fallback",
-                        "send_or_deterministic_fallback",
-                    },
+                    {"send", "null"},
                 )
-                if case["expect"]["response_mode"] in {
-                    "quality_gated_fallback",
-                    "send_or_deterministic_fallback",
-                }:
-                    self.assertIsInstance(
-                        case["expect"].get("deterministic_fallback"), str
-                    )
-                    self.assertTrue(case["expect"]["deterministic_fallback"].strip())
+                self.assertNotIn("deterministic_fallback", case["expect"])
                 optional_events = case["expect"].get(
                     "allowed_optional_event_types", []
                 )
@@ -138,19 +139,19 @@ class BrokerVoiceLargeCampaignFixtureTests(unittest.TestCase):
             drive_in_case["expect"]["allowed_optional_event_types"],
         )
 
-    def test_all_unavailable_rows_use_the_same_send_or_fallback_contract(self):
+    def test_unavailable_rows_encode_production_send_or_manual_contract(self):
         by_scenario = {case["scenario"]: case for case in self.cases}
 
-        for scenario in (
-            "unavailable",
-            "unavailable plus alternative",
-            "alternative with new contact",
-        ):
+        for scenario in ("unavailable", "unavailable plus alternative"):
             with self.subTest(scenario=scenario):
                 self.assertEqual(
-                    "send_or_deterministic_fallback",
+                    "send",
                     by_scenario[scenario]["expect"]["response_mode"],
                 )
+        referral = by_scenario["alternative with new contact"]
+        self.assertEqual("null", referral["expect"]["response_mode"])
+        self.assertTrue(referral["offline_proposal"]["skip_response"])
+        self.assertIsNone(referral["offline_proposal"]["response_email"])
 
     def test_missing_field_cases_define_semantic_acceptable_term_groups(self):
         by_scenario = {case["scenario"]: case for case in self.cases}
@@ -207,8 +208,22 @@ class BrokerVoiceLargeCampaignFixtureTests(unittest.TestCase):
 class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.environment = patch.dict(
+            os.environ,
+            {
+                "E2E_TEST_MODE": "true",
+                "FIRESTORE_EMULATOR_HOST": "127.0.0.1:8080",
+                "GOOGLE_CLOUD_PROJECT": "sitesift-test",
+                "SITESIFT_DISABLE_GRAPH_SENDS": "1",
+            },
+        )
+        cls.environment.start()
         cases = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
         cls.cases = {case["scenario"]: case for case in cases}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.environment.stop()
 
     def broken_proposal(self, scenario):
         return deepcopy(self.cases[scenario]["offline_proposal"])
@@ -225,6 +240,24 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
                 self.assertEqual(100, result["score"])
                 self.assertEqual([], result["vetoes"])
 
+    def test_proposed_updates_are_applied_before_runtime_field_selection(self):
+        partial = grade_case(
+            self.cases["partial details"],
+            self.cases["partial details"]["offline_proposal"],
+        )
+        complete = grade_case(
+            self.cases["complete details"],
+            self.cases["complete details"]["offline_proposal"],
+        )
+
+        self.assertEqual(3, partial["applied_update_count"])
+        self.assertEqual(
+            ["Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Power"],
+            partial["missing_fields"],
+        )
+        self.assertEqual(7, complete["applied_update_count"])
+        self.assertEqual([], complete["missing_fields"])
+
     def test_exact_event_expectations_are_vetoed(self):
         proposal = self.broken_proposal("wrong contact")
         proposal["events"] = [{"type": "call_requested"}]
@@ -232,11 +265,159 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
             "wrong contact", proposal, "event_types_mismatch"
         )
 
-    def test_required_response_cannot_be_null(self):
+    def test_missing_expected_update_is_vetoed(self):
+        case = deepcopy(self.cases["partial details"])
+        case["expected_updates"] = [
+            {"column": "Total SF", "value": "18400"}
+        ]
+        proposal = self.broken_proposal("partial details")
+        proposal["updates"] = []
+
+        result = grade_case(case, proposal)
+
+        self.assertIn("missing_expected_update", result["vetoes"])
+        self.assertIn("missing_expected_update", result["safety_vetoes"])
+
+    def test_unexpected_update_is_vetoed(self):
         proposal = self.broken_proposal("one missing item")
-        proposal["response_email"] = None
+        proposal["updates"] = [{"column": "Docks", "value": "9"}]
+
         self.assert_named_veto(
-            "one missing item", proposal, "response_missing"
+            "one missing item", proposal, "unexpected_update"
+        )
+
+    def test_fabricated_update_value_is_vetoed_after_normalization(self):
+        case = deepcopy(self.cases["partial details"])
+        case["expected_updates"] = [
+            {"column": "Total SF", "value": "18400"}
+        ]
+        proposal = self.broken_proposal("partial details")
+        proposal["updates"] = [{"column": " total sf ", "value": "18,401"}]
+
+        result = grade_case(case, proposal)
+
+        self.assertIn("fabricated_update_value", result["vetoes"])
+        self.assertNotIn("missing_expected_update", result["vetoes"])
+
+    def test_normalized_expected_update_is_accepted(self):
+        case = deepcopy(self.cases["partial details"])
+        case["expected_updates"] = [
+            {"column": "Total SF", "value": "18400"}
+        ]
+        proposal = self.broken_proposal("partial details")
+        proposal["updates"] = [{"column": " total sf ", "value": "18,400"}]
+
+        result = grade_case(case, proposal)
+
+        self.assertNotIn("missing_expected_update", result["vetoes"])
+        self.assertNotIn("unexpected_update", result["vetoes"])
+        self.assertNotIn("fabricated_update_value", result["vetoes"])
+
+    def test_semantically_equivalent_power_notation_is_accepted(self):
+        case = deepcopy(self.cases["complete details"])
+        case["expected_updates"] = [
+            {"column": "Power", "value": "1,200 amps at 480V"}
+        ]
+        proposal = deepcopy(case["offline_proposal"])
+        proposal["updates"] = [
+            {"column": "power", "value": "1200A, 480V"}
+        ]
+
+        result = grade_case(case, proposal)
+
+        self.assertNotIn("fabricated_update_value", result["vetoes"])
+        self.assertNotIn("missing_expected_update", result["vetoes"])
+        self.assertNotIn("unexpected_update", result["vetoes"])
+
+    def test_changed_power_value_is_still_rejected_as_fabricated(self):
+        case = deepcopy(self.cases["complete details"])
+        case["expected_updates"] = [
+            {"column": "Power", "value": "1,200 amps at 480V"}
+        ]
+        proposal = deepcopy(case["offline_proposal"])
+        proposal["updates"] = [
+            {"column": "Power", "value": "1201A, 480V"}
+        ]
+
+        result = grade_case(case, proposal)
+
+        self.assertIn("fabricated_update_value", result["vetoes"])
+
+    def test_formula_update_is_vetoed(self):
+        proposal = self.broken_proposal("one missing item")
+        proposal["updates"] = [{"column": "Gross Rent", "value": "12.85"}]
+
+        self.assert_named_veto(
+            "one missing item", proposal, "formula_update"
+        )
+
+    def test_fixture_forbidden_update_is_vetoed(self):
+        case = deepcopy(self.cases["one missing item"])
+        case["forbidden_update_columns"] = ["Email"]
+        proposal = self.broken_proposal("one missing item")
+        proposal["updates"] = [
+            {"column": "Email", "value": "other@example.test"}
+        ]
+
+        result = grade_case(case, proposal)
+
+        self.assertIn("forbidden_update", result["vetoes"])
+
+    def test_event_reason_semantics_are_vetoed(self):
+        proposal = self.broken_proposal("negotiation")
+        proposal["events"][0]["reason"] = "client_question"
+
+        self.assert_named_veto(
+            "negotiation", proposal, "event_payload_mismatch"
+        )
+
+    def test_property_issue_severity_semantics_are_vetoed(self):
+        proposal = self.broken_proposal("property issue")
+        proposal["events"][0]["severity"] = "minor"
+
+        self.assert_named_veto(
+            "property issue", proposal, "event_payload_mismatch"
+        )
+
+    def test_new_property_address_semantics_are_vetoed(self):
+        proposal = self.broken_proposal("unavailable plus alternative")
+        proposal["events"][1]["address"] = "999 Fabricated Test Road"
+
+        self.assert_named_veto(
+            "unavailable plus alternative",
+            proposal,
+            "event_payload_mismatch",
+        )
+
+    def test_referral_contact_and_email_semantics_are_vetoed(self):
+        for field, value in (
+            ("contactName", "Fabricated Contact"),
+            ("email", "fabricated@example.test"),
+        ):
+            with self.subTest(field=field):
+                proposal = self.broken_proposal("alternative with new contact")
+                proposal["events"][1][field] = value
+
+                self.assert_named_veto(
+                    "alternative with new contact",
+                    proposal,
+                    "event_payload_mismatch",
+                )
+
+    def test_grade_reports_raw_updates_and_complete_events(self):
+        case = self.cases["alternative with new contact"]
+        proposal = case["offline_proposal"]
+
+        result = grade_case(case, proposal)
+
+        self.assertEqual(proposal["updates"], result["raw_updates"])
+        self.assertEqual(proposal["events"], result["actual_events"])
+
+    def test_required_response_cannot_be_null(self):
+        proposal = self.broken_proposal("unavailable")
+        proposal["skip_response"] = True
+        self.assert_named_veto(
+            "unavailable", proposal, "response_missing"
         )
 
     def test_null_response_mode_rejects_generated_copy(self):
@@ -247,10 +428,10 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
         )
 
     def test_missing_required_term_is_vetoed(self):
-        proposal = self.broken_proposal("one missing item")
-        proposal["response_email"] = "Hi Casey,\n\nCould you share one more detail?"
+        proposal = self.broken_proposal("unavailable")
+        proposal["response_email"] = "Hi Skyler,\n\nThank you for the update."
         self.assert_named_veto(
-            "one missing item", proposal, "missing_required_term"
+            "unavailable", proposal, "missing_required_term"
         )
 
     def test_semantic_missing_field_aliases_are_accepted(self):
@@ -306,7 +487,7 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
         self.assertEqual(raw_response, result["raw_response"])
         self.assertNotEqual(raw_response, result["effective_response"])
         self.assertEqual(
-            "quality_gated_fallback", result["effective_response_source"]
+            "production_complete_fallback", result["effective_response_source"]
         )
         self.assertIn("other relevant properties", result["effective_response"])
 
@@ -316,7 +497,10 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
         result = grade_case(case, case["offline_proposal"])
 
         self.assertEqual(100, result["score"])
-        self.assertEqual("raw_proposal", result["effective_response_source"])
+        self.assertEqual(
+            "production_complete_model_copy",
+            result["effective_response_source"],
+        )
         self.assertEqual(result["raw_response"], result["effective_response"])
 
     def test_live_row_07_43_word_reply_is_within_realistic_limit(self):
@@ -330,7 +514,8 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
 
         result = grade_case(self.cases["floorplan attachment supplied"], proposal)
 
-        self.assertEqual(43, result["word_count"])
+        self.assertEqual(43, result["raw_word_count"])
+        self.assertLessEqual(result["word_count"], 50)
         self.assertEqual(100, result["score"])
 
     def test_live_row_08_optional_close_and_numeric_drive_ins_score_100(self):
@@ -360,11 +545,10 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
         self.assertIn("event_types_mismatch", result["vetoes"])
         self.assertIn("event_types_mismatch", result["safety_vetoes"])
 
-    def test_unavailable_rows_use_deterministic_fallback_when_raw_is_null(self):
+    def test_unavailable_rows_use_production_fallback_when_raw_is_null(self):
         for scenario, expected_fragment in (
             ("unavailable", "another relevant property"),
             ("unavailable plus alternative", "alternative"),
-            ("alternative with new contact", "alternative"),
         ):
             with self.subTest(scenario=scenario):
                 case = self.cases[scenario]
@@ -377,7 +561,7 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
                 self.assertEqual([], result["vetoes"])
                 self.assertIsNone(result["raw_response"])
                 self.assertEqual(
-                    "deterministic_fallback",
+                    "production_automatic_fallback",
                     result["effective_response_source"],
                 )
                 self.assertIn(
@@ -395,29 +579,53 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
         result = grade_case(case, proposal)
 
         self.assertEqual(100, result["score"])
-        self.assertEqual("raw_proposal", result["effective_response_source"])
+        self.assertEqual(
+            "production_automatic_model_copy",
+            result["effective_response_source"],
+        )
         self.assertEqual(result["raw_response"], result["effective_response"])
 
-    def test_alternative_fallback_does_not_invent_addresses_or_contacts(self):
-        for scenario, forbidden_details in (
-            (
-                "unavailable plus alternative",
-                ("1010 Hoist Test Trail", "1110 Kiln Test Way"),
-            ),
-            (
-                "alternative with new contact",
-                ("1211 Forge Test Loop", "Ellis Wren"),
-            ),
-        ):
-            with self.subTest(scenario=scenario):
-                proposal = self.broken_proposal(scenario)
-                proposal["response_email"] = None
+    def test_alternative_fallback_does_not_invent_addresses(self):
+        proposal = self.broken_proposal("unavailable plus alternative")
+        proposal["response_email"] = None
 
-                result = grade_case(self.cases[scenario], proposal)
+        result = grade_case(self.cases["unavailable plus alternative"], proposal)
 
-                self.assertEqual(100, result["score"])
-                for detail in forbidden_details:
-                    self.assertNotIn(detail, result["effective_response"])
+        self.assertEqual(100, result["score"])
+        for detail in ("1010 Hoist Test Trail", "1110 Kiln Test Way"):
+            self.assertNotIn(detail, result["effective_response"])
+
+    def test_different_contact_referral_remains_manual_with_no_effective_reply(self):
+        case = self.cases["alternative with new contact"]
+
+        result = grade_case(case, case["offline_proposal"])
+
+        self.assertEqual(100, result["score"])
+        self.assertIsNone(result["raw_response"])
+        self.assertIsNone(result["effective_response"])
+        self.assertEqual("skip_response", result["effective_response_source"])
+
+    def test_zero_update_complete_row_gets_no_synthetic_completion_fallback(self):
+        case = deepcopy(self.cases["complete details"])
+        case["row"]["cells"].update(
+            {
+                update["column"]: update["value"]
+                for update in case["expected_updates"]
+            }
+        )
+        case["expected_updates"] = []
+        case["expect"]["response_mode"] = "null"
+        proposal = deepcopy(case["offline_proposal"])
+        proposal["updates"] = []
+        proposal["response_email"] = "Hi Jordan,\n\nGot it, thanks."
+
+        result = grade_case(case, proposal)
+
+        self.assertIsNone(result["effective_response"])
+        self.assertEqual(
+            "zero_update_complete_no_fallback",
+            result["effective_response_source"],
+        )
 
     def test_forbidden_term_is_vetoed(self):
         proposal = self.broken_proposal("unavailable plus alternative")
@@ -427,25 +635,38 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
         )
 
     def test_placeholder_is_vetoed(self):
-        proposal = self.broken_proposal("one missing item")
-        proposal["response_email"] += " The property is [PROPERTY NAME]."
+        proposal = self.broken_proposal("unavailable")
+        proposal["response_email"] = (
+            "Hi Skyler,\n\nThank you for the update. Do you have another "
+            "relevant property we should consider? [PROPERTY NAME]"
+        )
         self.assert_named_veto(
-            "one missing item", proposal, "placeholder"
+            "unavailable", proposal, "placeholder"
         )
 
     def test_signature_is_vetoed(self):
-        proposal = self.broken_proposal("one missing item")
-        proposal["response_email"] += "\n\nBest regards,\nTest Assistant"
+        proposal = self.broken_proposal("unavailable")
+        proposal["response_email"] = (
+            "Hi Skyler,\n\nThank you for the update. Do you have another "
+            "relevant property we should consider?\n\nBest regards,\nTest Assistant"
+        )
         self.assert_named_veto(
-            "one missing item", proposal, "signature"
+            "unavailable", proposal, "signature"
         )
 
     def test_reasking_a_supplied_field_is_vetoed(self):
-        proposal = self.broken_proposal("drive-in count supplied")
-        proposal["response_email"] += " Could you confirm the drive-in count?"
-        self.assert_named_veto(
-            "drive-in count supplied", proposal, "reasks_supplied_field"
+        case = deepcopy(self.cases["unavailable"])
+        case["expect"]["supplied_fields"] = ["Docks"]
+        proposal = deepcopy(case["offline_proposal"])
+        proposal["response_email"] = (
+            "Hi Skyler,\n\nThank you for the update. Do you have another "
+            "relevant property we should consider? Could you confirm the docks?"
         )
+
+        result = grade_case(case, proposal)
+
+        self.assertIn("reasks_supplied_field", result["vetoes"])
+        self.assertLess(result["score"], 100)
 
     def test_reasking_a_supplied_value_is_vetoed(self):
         proposal = self.broken_proposal("complete details")
@@ -455,17 +676,24 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
         )
 
     def test_word_limit_is_vetoed(self):
-        proposal = self.broken_proposal("one missing item")
-        proposal["response_email"] += " " + "extra " * 50
+        proposal = self.broken_proposal("unavailable")
+        proposal["response_email"] = (
+            "Hi Skyler,\n\nThank you for the update. Do you have another "
+            "relevant property we should consider? "
+            + "extra " * 50
+        )
         self.assert_named_veto(
-            "one missing item", proposal, "word_limit"
+            "unavailable", proposal, "word_limit"
         )
 
     def test_excessive_exclamation_is_vetoed(self):
-        proposal = self.broken_proposal("one missing item")
-        proposal["response_email"] += " Great!!"
+        proposal = self.broken_proposal("unavailable")
+        proposal["response_email"] = (
+            "Hi Skyler!\n\nThank you for the update! Do you have another "
+            "relevant property we should consider?"
+        )
         self.assert_named_veto(
-            "one missing item", proposal, "excessive_exclamation"
+            "unavailable", proposal, "excessive_exclamation"
         )
 
     def test_sensitive_event_auto_response_is_vetoed(self):
@@ -475,16 +703,15 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
             "property issue", proposal, "sensitive_event_auto_response"
         )
 
-    def test_sensitive_event_cannot_gain_a_deterministic_fallback(self):
+    def test_sensitive_event_cannot_gain_a_runtime_fallback(self):
         case = deepcopy(self.cases["property issue"])
-        case["expect"]["response_mode"] = "send_or_deterministic_fallback"
-        case["expect"]["deterministic_fallback"] = (
-            "Hi Sage, we will handle the roof issue."
-        )
+        case["expect"]["response_mode"] = "send"
 
         result = grade_case(case, case["offline_proposal"])
 
-        self.assertIn("sensitive_event_auto_response", result["vetoes"])
+        self.assertIsNone(result["effective_response"])
+        self.assertEqual("sensitive_event", result["effective_response_source"])
+        self.assertIn("response_missing", result["vetoes"])
         self.assertLess(result["score"], 100)
 
 
@@ -575,14 +802,14 @@ class BrokerVoiceLargeCampaignRunnerSafetyTests(unittest.TestCase):
                         "runtime_ms": 1,
                         "token_usage": None,
                         "raw_response": None,
-                        "effective_response_source": "deterministic_fallback",
+                        "effective_response_source": "production_automatic_fallback",
                     }
                 ],
             }
         )
 
         self.assertIn("| Raw proposal response | Effective response source |", markdown)
-        self.assertIn("| null | deterministic_fallback |", markdown)
+        self.assertIn("| null | production_automatic_fallback |", markdown)
 
     def test_direct_live_script_resolves_application_package_before_model_call(self):
         environment = {

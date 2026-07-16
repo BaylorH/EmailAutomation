@@ -1,6 +1,9 @@
 [
   {
     "scenario": "partial details",
+    "expected_updates": [{"column": "Total SF", "value": "18400"}, {"column": "Docks", "value": "4"}, {"column": "Ceiling Ht", "value": "28"}],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [],
     "row": {
       "id": "synthetic-row-01",
       "number": 3,
@@ -13,11 +16,14 @@
       {"direction": "outbound", "from": "campaign@example.test", "to": ["broker+row01@example.test"], "subject": "101 Foundry Test Way", "timestamp": "2026-07-15T15:01:00Z", "content": "Could you share the available building details?"},
       {"direction": "inbound", "from": "broker+row01@example.test", "to": ["campaign@example.test"], "subject": "Re: 101 Foundry Test Way", "timestamp": "2026-07-15T15:11:00Z", "content": "The building is 18,400 SF with four docks and 28-foot clear height."}
     ],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["18,400 SF"], "must_mention_any": [["asking rent", "asking rate", "rental rate", "rent per square foot"], ["operating expenses", "operating expense", "ops ex", "NNN expenses", "CAM charges"], ["drive-in count", "number of drive-ins", "number of drive-in doors", "drive ins", "grade-level door count", "grade-level doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 65, "supplied_fields": ["Total SF", "Docks", "Ceiling Ht"]},
-    "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Avery,\n\nI noted the 18,400 SF, four docks, and 28-foot clear height. Could you also share:\n- asking rent\n- operating expenses\n- drive-in count\n- power", "notes": ""}
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "must_mention_any": [["asking rent", "asking rate", "rental rate", "rent per square foot", "rent/sf /yr"], ["operating expenses", "operating expense", "ops ex", "NNN expenses", "CAM charges"], ["drive-in count", "number of drive-ins", "number of drive-in doors", "drive ins", "grade-level door count", "grade-level doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 65, "supplied_fields": ["Total SF", "Docks", "Ceiling Ht"]},
+    "offline_proposal": {"updates": [{"column": "Total SF", "value": "18400"}, {"column": "Docks", "value": "4"}, {"column": "Ceiling Ht", "value": "28"}], "events": [], "response_email": "Hi Avery,\n\nI noted the 18,400 SF, four docks, and 28-foot clear height. Could you also share:\n- asking rent\n- operating expenses\n- drive-in count\n- power", "notes": ""}
   },
   {
     "scenario": "complete details",
+    "expected_updates": [{"column": "Total SF", "value": "32000"}, {"column": "Rent/SF /Yr", "value": "11.25"}, {"column": "Ops Ex /SF", "value": "2.40"}, {"column": "Drive Ins", "value": "2"}, {"column": "Docks", "value": "6"}, {"column": "Ceiling Ht", "value": "30"}, {"column": "Power", "value": "1,200 amps at 480V"}],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [],
     "row": {
       "id": "synthetic-row-02",
       "number": 4,
@@ -29,11 +35,14 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row02@example.test", "to": ["campaign@example.test"], "subject": "202 Assembly Test Road", "timestamp": "2026-07-15T15:12:00Z", "content": "Available: 32,000 SF at $11.25/SF/year plus $2.40 NNN, two drive-ins, six docks, 30-foot clear, and 1,200 amps at 480V."}
     ],
-    "expect": {"event_types": [], "response_mode": "quality_gated_fallback", "deterministic_fallback": "Hi Jordan,\n\nThank you for the details. We'll review them with the client.\n\nPlease send over any questions or other relevant properties we should consider.", "must_mention": ["review"], "raw_must_mention": ["32,000 SF"], "fallback_must_mention": ["other relevant properties"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 50, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]},
-    "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Jordan,\n\nThank you for the complete 32,000 SF package. We will review the details with the client. Please send over any questions or other relevant properties.", "notes": ""}
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["review"], "raw_must_mention": ["32,000 SF"], "fallback_must_mention": ["other relevant properties"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 50, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]},
+    "offline_proposal": {"updates": [{"column": "Total SF", "value": "32000"}, {"column": "Rent/SF /Yr", "value": "11.25"}, {"column": "Ops Ex /SF", "value": "2.40"}, {"column": "Drive Ins", "value": "2"}, {"column": "Docks", "value": "6"}, {"column": "Ceiling Ht", "value": "30"}, {"column": "Power", "value": "1,200 amps at 480V"}], "events": [], "response_email": "Hi Jordan,\n\nThank you for the complete 32,000 SF package. We will review the details with the client. Please send over any questions or other relevant properties.", "notes": ""}
   },
   {
     "scenario": "one missing item",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [],
     "row": {
       "id": "synthetic-row-03",
       "number": 5,
@@ -50,6 +59,9 @@
   },
   {
     "scenario": "two missing items",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [],
     "row": {
       "id": "synthetic-row-04",
       "number": 6,
@@ -66,6 +78,9 @@
   },
   {
     "scenario": "four missing items",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [],
     "row": {
       "id": "synthetic-row-05",
       "number": 7,
@@ -77,11 +92,14 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row05@example.test", "to": ["campaign@example.test"], "subject": "505 Gantry Test Street", "timestamp": "2026-07-15T15:15:00Z", "content": "It is available and the size, drive-ins, and clear height shown are correct."}
     ],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "must_mention_any": [["asking rent", "asking rate", "rental rate", "rent per square foot"], ["operating expenses", "operating expense", "ops ex", "NNN expenses", "CAM charges"], ["dock count", "number of dock-high doors", "dock-high door count", "dock-high doors", "loading dock count", "dock doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 55, "supplied_fields": ["Total SF", "Drive Ins", "Ceiling Ht"]},
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "must_mention_any": [["asking rent", "asking rate", "rental rate", "rent per square foot", "rent/sf /yr"], ["operating expenses", "operating expense", "ops ex", "NNN expenses", "CAM charges"], ["dock count", "number of dock-high doors", "dock-high door count", "dock-high doors", "loading dock count", "dock doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 55, "supplied_fields": ["Total SF", "Drive Ins", "Ceiling Ht"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Riley,\n\nI noted the current size and loading details. Could you also share:\n- asking rent\n- operating expenses\n- dock count\n- power", "notes": ""}
   },
   {
     "scenario": "flyer attachment supplied",
+    "expected_updates": [{"column": "Total SF", "value": "26500"}, {"column": "Rent/SF /Yr", "value": "10.50"}, {"column": "Ops Ex /SF", "value": "2.20"}, {"column": "Drive Ins", "value": "2"}, {"column": "Docks", "value": "8"}, {"column": "Ceiling Ht", "value": "30"}, {"column": "Power", "value": "1,000 amps, 480V"}],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [],
     "row": {
       "id": "synthetic-row-06",
       "number": 8,
@@ -94,11 +112,14 @@
       {"direction": "inbound", "from": "broker+row06@example.test", "to": ["campaign@example.test"], "subject": "606 Turbine Test Court", "timestamp": "2026-07-15T15:16:00Z", "content": "The attached flyer has the current specs."}
     ],
     "pdf_manifest": [{"name": "synthetic-row06-flyer.pdf", "text": "606 Turbine Test Court, Model Plains. 26,500 SF. Asking $10.50/SF/year. Operating expenses $2.20/SF/year. Two drive-ins. Eight docks. 30-foot clear. 1,000 amps, 480V."}],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["flyer", "review"], "must_not_mention": ["send the flyer", "Gross Rent", "Best,"], "max_words": 45, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power", "Flyer / Link"]},
-    "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Taylor,\n\nI have the flyer and the current specs. We will review the package with the client and welcome any other relevant properties.", "notes": ""}
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["review"], "raw_must_mention": ["flyer"], "must_not_mention": ["send the flyer", "Gross Rent", "Best,"], "max_words": 45, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power", "Flyer / Link"]},
+    "offline_proposal": {"updates": [{"column": "Total SF", "value": "26500"}, {"column": "Rent/SF /Yr", "value": "10.50"}, {"column": "Ops Ex /SF", "value": "2.20"}, {"column": "Drive Ins", "value": "2"}, {"column": "Docks", "value": "8"}, {"column": "Ceiling Ht", "value": "30"}, {"column": "Power", "value": "1,000 amps, 480V"}], "events": [], "response_email": "Hi Taylor,\n\nI have the flyer and the current specs. We will review the package with the client and welcome any other relevant properties.", "notes": ""}
   },
   {
     "scenario": "floorplan attachment supplied",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [],
     "row": {
       "id": "synthetic-row-07",
       "number": 9,
@@ -111,11 +132,14 @@
       {"direction": "inbound", "from": "broker+row07@example.test", "to": ["campaign@example.test"], "subject": "707 Lathe Test Boulevard", "timestamp": "2026-07-15T15:17:00Z", "content": "I attached the floor plan. The other row details are current, but I still need to verify power."}
     ],
     "pdf_manifest": [{"name": "synthetic-row07-floorplan.pdf", "text": "Floor plan for 707 Lathe Test Boulevard, showing the warehouse and office layout."}],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": ["floor plan"], "must_mention_any": [["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["send the floor plan", "Gross Rent", "Best,"], "max_words": 50, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Floorplan"]},
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "raw_must_mention": ["floor plan"], "must_mention_any": [["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["send the floor plan", "Gross Rent", "Best,"], "max_words": 50, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Floorplan"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Cameron,\n\nI have the floor plan. When available, could you share the power service?", "notes": ""}
   },
   {
     "scenario": "drive-in count supplied",
+    "expected_updates": [{"column": "Drive Ins", "value": "3"}],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [],
     "row": {
       "id": "synthetic-row-08",
       "number": 10,
@@ -127,11 +151,14 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row08@example.test", "to": ["campaign@example.test"], "subject": "808 Press Test Parkway", "timestamp": "2026-07-15T15:18:00Z", "content": "There are three drive-ins. Everything else in the row is current."}
     ],
-    "expect": {"event_types": [], "allowed_optional_event_types": ["close_conversation"], "response_mode": "send", "must_mention": ["review"], "must_mention_any": [["three drive-ins", "3 drive-ins"]], "must_not_mention": ["drive-in count?", "Gross Rent", "Best,"], "max_words": 45, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]},
-    "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Devon,\n\nI noted the three drive-ins. We now have the complete package and will review it with the client.", "notes": ""}
+    "expect": {"event_types": [], "allowed_optional_event_types": ["close_conversation"], "response_mode": "send", "must_mention": ["review"], "must_not_mention": ["drive-in count?", "Gross Rent", "Best,"], "max_words": 45, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]},
+    "offline_proposal": {"updates": [{"column": "Drive Ins", "value": "3"}], "events": [], "response_email": "Hi Devon,\n\nI noted the three drive-ins. We now have the complete package and will review it with the client.", "notes": ""}
   },
   {
     "scenario": "unavailable",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "property_unavailable", "one_of": {"reason": ["no_longer_available", "unavailable"]}}],
     "row": {
       "id": "synthetic-row-09",
       "number": 11,
@@ -143,11 +170,14 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row09@example.test", "to": ["campaign@example.test"], "subject": "909 Rivet Test Drive", "timestamp": "2026-07-15T15:19:00Z", "content": "That building is no longer available."}
     ],
-    "expect": {"event_types": ["property_unavailable"], "response_mode": "send_or_deterministic_fallback", "deterministic_fallback": "Hi Skyler,\n\nThank you for the update on the property's availability.\n\nDo you have another relevant property we should consider?", "must_mention": ["another relevant property"], "fallback_must_mention": ["property's availability"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 40, "supplied_fields": []},
-    "offline_proposal": {"updates": [], "events": [{"type": "property_unavailable"}], "response_email": null, "notes": ""}
+    "expect": {"event_types": ["property_unavailable"], "response_mode": "send", "must_mention": ["another relevant property"], "fallback_must_mention": ["property's availability"], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 40, "supplied_fields": []},
+    "offline_proposal": {"updates": [], "events": [{"type": "property_unavailable", "reason": "no_longer_available"}], "response_email": null, "notes": ""}
   },
   {
     "scenario": "unavailable plus alternative",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "property_unavailable", "one_of": {"reason": ["leased", "no_longer_available"]}}, {"type": "new_property", "equals": {"address": "1110 Kiln Test Way", "city": "Fixture Ridge"}}],
     "row": {
       "id": "synthetic-row-10",
       "number": 12,
@@ -159,11 +189,14 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row10@example.test", "to": ["campaign@example.test"], "subject": "1010 Hoist Test Trail", "timestamp": "2026-07-15T15:20:00Z", "content": "1010 Hoist Test Trail leased, but 1110 Kiln Test Way in Fixture Ridge has 22,000 SF available."}
     ],
-    "expect": {"event_types": ["property_unavailable", "new_property"], "response_mode": "send_or_deterministic_fallback", "deterministic_fallback": "Hi Quinn,\n\nThank you for the update and for sharing the alternative property.\n\nWe'll review the alternative with the client and follow up if we have questions.", "must_mention": ["alternative", "review"], "raw_must_mention": ["1010 Hoist Test Trail", "1110 Kiln Test Way"], "must_not_mention": ["perfect fit", "Best,"], "max_words": 50, "supplied_fields": []},
-    "offline_proposal": {"updates": [], "events": [{"type": "property_unavailable"}, {"type": "new_property", "address": "1110 Kiln Test Way", "city": "Fixture Ridge"}], "response_email": "Hi Quinn,\n\nI noted that 1010 Hoist Test Trail has leased and that 1110 Kiln Test Way has 22,000 SF available. We will review the alternative.", "notes": ""}
+    "expect": {"event_types": ["property_unavailable", "new_property"], "response_mode": "send", "must_mention": ["alternative", "review"], "raw_must_mention": ["1010 Hoist Test Trail", "1110 Kiln Test Way"], "must_not_mention": ["perfect fit", "Best,"], "max_words": 50, "supplied_fields": []},
+    "offline_proposal": {"updates": [], "events": [{"type": "property_unavailable", "reason": "leased"}, {"type": "new_property", "address": "1110 Kiln Test Way", "city": "Fixture Ridge"}], "response_email": "Hi Quinn,\n\nI noted that 1010 Hoist Test Trail has leased and that 1110 Kiln Test Way has 22,000 SF available. We will review the alternative.", "notes": ""}
   },
   {
     "scenario": "alternative with new contact",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "property_unavailable", "one_of": {"reason": ["gone", "no_longer_available", "unavailable"]}}, {"type": "new_property", "equals": {"address": "1211 Forge Test Loop", "contactName": "Ellis Wren", "email": "ellis.wren@example.test"}}],
     "row": {
       "id": "synthetic-row-11",
       "number": 13,
@@ -175,11 +208,14 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row11@example.test", "to": ["campaign@example.test"], "subject": "1111 Pulley Test Place", "timestamp": "2026-07-15T15:21:00Z", "content": "That one is gone. Try 1211 Forge Test Loop and contact Ellis Wren at ellis.wren@example.test for the package."}
     ],
-    "expect": {"event_types": ["property_unavailable", "new_property"], "response_mode": "send_or_deterministic_fallback", "deterministic_fallback": "Hi Parker,\n\nThank you for the update and for sharing the alternative property.\n\nWe'll review the alternative with the client and follow up if we have questions.", "must_mention": ["alternative", "review"], "raw_must_mention": ["1211 Forge Test Loop", "Ellis Wren"], "must_not_mention": ["we will email Ellis", "Best,"], "max_words": 50, "supplied_fields": []},
-    "offline_proposal": {"updates": [], "events": [{"type": "property_unavailable"}, {"type": "new_property", "address": "1211 Forge Test Loop", "contactName": "Ellis Wren", "email": "ellis.wren@example.test"}], "response_email": "Hi Parker,\n\nI noted the alternative at 1211 Forge Test Loop and the Ellis Wren contact. We will review the property before taking a next step.", "notes": ""}
+    "expect": {"event_types": ["property_unavailable", "new_property"], "response_mode": "null", "must_mention": [], "must_not_mention": [], "max_words": 0, "supplied_fields": []},
+    "offline_proposal": {"updates": [], "events": [{"type": "property_unavailable", "reason": "no_longer_available"}, {"type": "new_property", "address": "1211 Forge Test Loop", "contactName": "Ellis Wren", "email": "ellis.wren@example.test"}], "response_email": null, "skip_response": true, "notes": ""}
   },
   {
     "scenario": "wrong contact",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "wrong_contact", "equals": {"reason": "no_longer_handles", "suggestedContact": "River Ash", "suggestedEmail": "river.ash@example.test"}}],
     "row": {
       "id": "synthetic-row-12",
       "number": 14,
@@ -196,6 +232,9 @@
   },
   {
     "scenario": "explicit call request",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "call_requested", "one_of": {"reason": ["call_request", "call_request_phrase"]}}],
     "row": {
       "id": "synthetic-row-13",
       "number": 15,
@@ -212,6 +251,9 @@
   },
   {
     "scenario": "tour offer",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "tour_requested", "must_mention_any": {"question": [["Tuesday", "Wednesday"], ["afternoon", "tour"]]}}],
     "row": {
       "id": "synthetic-row-14",
       "number": 16,
@@ -228,6 +270,9 @@
   },
   {
     "scenario": "tour time reply",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "tour_requested", "must_mention_any": {"question": [["Thursday"], ["2:00", "2 PM"], ["attendee", "attend", "who will attend"]]}}],
     "row": {
       "id": "synthetic-row-15",
       "number": 17,
@@ -245,6 +290,9 @@
   },
   {
     "scenario": "negotiation",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "needs_user_input", "equals": {"reason": "negotiation"}, "must_mention_any": {"question": [["seven-year", "seven years", "7-year"], ["9.75", "$9.75"]]}}],
     "row": {
       "id": "synthetic-row-16",
       "number": 18,
@@ -261,6 +309,9 @@
   },
   {
     "scenario": "client requirement question",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "needs_user_input", "equals": {"reason": "client_question"}, "must_mention_any": {"question": [["outdoor storage"], ["rail", "rail service"]]}}],
     "row": {
       "id": "synthetic-row-17",
       "number": 19,
@@ -277,6 +328,9 @@
   },
   {
     "scenario": "client identity question",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "needs_user_input", "equals": {"reason": "confidential"}, "must_mention_any": {"question": [["client", "identity"], ["occupant", "company"]]}}],
     "row": {
       "id": "synthetic-row-18",
       "number": 20,
@@ -293,6 +347,9 @@
   },
   {
     "scenario": "legal/LOI question",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "needs_user_input", "equals": {"reason": "legal_contract"}, "must_mention_any": {"question": [["LOI", "letter of intent"], ["indemnity", "legal language"]]}}],
     "row": {
       "id": "synthetic-row-19",
       "number": 21,
@@ -309,6 +366,9 @@
   },
   {
     "scenario": "property issue",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "property_issue", "equals": {"severity": "major"}, "must_mention_any": {"issue": [["roof leak", "roof"], ["two west loading dock positions", "two dock positions", "loading dock"]]}}],
     "row": {
       "id": "synthetic-row-20",
       "number": 22,
@@ -325,6 +385,9 @@
   },
   {
     "scenario": "opt-out",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "contact_optout", "equals": {"reason": "do_not_contact"}}],
     "row": {
       "id": "synthetic-row-21",
       "number": 23,
@@ -341,6 +404,9 @@
   },
   {
     "scenario": "ambiguous",
+    "expected_updates": [],
+    "forbidden_update_columns": ["Property Address", "City", "Email"],
+    "event_payloads": [{"type": "needs_user_input", "equals": {"reason": "unclear"}, "must_mention_any": {"question": [["clarify", "which"], ["number", "condition"]]}}],
     "row": {
       "id": "synthetic-row-22",
       "number": 24,
