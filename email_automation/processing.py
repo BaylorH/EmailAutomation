@@ -3033,18 +3033,18 @@ _MISSING_FIELD_VALUE_TARGET_PATTERNS = {
     "docks": re.compile(
         r"(?:"
         r"\b(?:loading\s+)?dock(?:\s+doors?)?\s+"
-        r"(?:counts?|quantit(?:y|ies)|positions?)\b"
+        r"(?:counts?|quantit(?:y|ies)|positions)\b"
         r"|\b(?:count|number|quantity)\s+of\s+(?:loading\s+)?"
-        r"(?:docks?|dock\s+doors?|dock\s+positions?)\b"
+        r"(?:docks|dock\s+doors?|dock\s+positions)\b"
         r"|\bhow\s+many\s+(?:loading\s+)?"
-        r"(?:docks?|dock\s+doors?|dock\s+positions?)\b"
+        r"(?:docks|dock\s+doors?|dock\s+positions)\b"
         r")",
         re.IGNORECASE,
     ),
     "drive_ins": re.compile(
         r"(?:"
         r"\b(?:drive[- ]ins?|grade[- ]level)(?:\s+doors?)?\s+"
-        r"(?:counts?|numbers?|quantit(?:y|ies)|positions?)\b"
+        r"(?:counts?|quantit(?:y|ies)|positions)\b"
         r"|\b(?:count|number|quantity)\s+of\s+"
         r"(?:drive[- ]ins?|grade[- ]level)(?:\s+doors?)?\b"
         r"|\bhow\s+many\s+(?:drive[- ]ins?|grade[- ]level)"

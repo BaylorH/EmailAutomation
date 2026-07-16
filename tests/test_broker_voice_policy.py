@@ -506,7 +506,10 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
 
         for body in (
             "Could you confirm the quantity of loading dock doors?",
+            "Could you confirm the dock positions?",
             "Could you confirm the loading dock positions?",
+            "Could you confirm the number of dock doors?",
+            "Could you confirm how many dock positions there are?",
             "Could you confirm how many dock doors there are?",
         ):
             with self.subTest(body=body):
@@ -535,7 +538,9 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
         for body in (
             "Could you confirm the quantity of drive-in doors?",
             "Could you confirm the grade-level door positions?",
+            "Could you confirm the number of drive-in doors?",
             "Could you confirm how many grade-level doors there are?",
+            "Could you confirm the drive-in door count?",
         ):
             with self.subTest(body=body):
                 self.assertTrue(
@@ -742,16 +747,24 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
                     )
                 )
 
-    def test_dock_identifier_language_does_not_request_a_dock_quantity(self):
-        for body in (
-            "What is the dock number?",
-            "Could you confirm the dock number for the appointment?",
-        ):
-            with self.subTest(body=body):
+    def test_singular_identifier_language_does_not_request_a_door_quantity(self):
+        scenarios = (
+            ("What is the dock number?", "Docks"),
+            ("Could you confirm the dock number for the appointment?", "Docks"),
+            ("What is the dock position?", "Docks"),
+            ("Could you confirm the dock position for the appointment?", "Docks"),
+            ("Could you confirm the number of dock position?", "Docks"),
+            ("Could you confirm how many dock position there are?", "Docks"),
+            ("What is the drive-in number?", "Drive Ins"),
+            ("Could you confirm the grade-level door number?", "Drive Ins"),
+        )
+
+        for body, field in scenarios:
+            with self.subTest(body=body, field=field):
                 self.assertFalse(
                     processing._response_mentions_missing_fields(
                         body,
-                        ["Docks"],
+                        [field],
                         get_default_column_config(),
                     )
                 )
