@@ -664,6 +664,44 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
                     )
                 )
 
+    def test_reverse_presence_grammar_is_rejected_for_every_built_in(self):
+        scenarios = (
+            ("Could you confirm there is a dock count?", "Docks"),
+            ("Could you confirm there is a drive-in door count?", "Drive Ins"),
+            ("Could you confirm there is electrical capacity?", "Power"),
+            ("Could you confirm there is a clear height?", "Ceiling Ht"),
+            ("Could you confirm there is total square footage?", "Total SF"),
+            ("Could you confirm there are operating expenses?", "Ops Ex /SF"),
+            ("Could you confirm there is a rental rate?", "Rent/SF /Yr"),
+        )
+
+        for body, field in scenarios:
+            with self.subTest(field=field):
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        [field],
+                        get_default_column_config(),
+                    )
+                )
+
+    def test_reverse_presence_grammar_remains_valid_for_custom_booleans(self):
+        config = get_default_column_config()
+        config["customFields"] = {
+            "Rail Access": {
+                "mode": "ask_required",
+                "description": "Rail access",
+            }
+        }
+
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                "Could you confirm there is rail access?",
+                ["Rail Access"],
+                config,
+            )
+        )
+
     def test_have_question_does_not_request_numeric_specs(self):
         self.assertFalse(
             processing._response_mentions_missing_fields(
@@ -693,9 +731,24 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
             "Could you confirm the dock count?",
             "Could you confirm the number of loading docks?",
             "Could you confirm the dock door count?",
+            "Could you confirm how many dock doors there are?",
         ):
             with self.subTest(body=body):
                 self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Docks"],
+                        get_default_column_config(),
+                    )
+                )
+
+    def test_dock_identifier_language_does_not_request_a_dock_quantity(self):
+        for body in (
+            "What is the dock number?",
+            "Could you confirm the dock number for the appointment?",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
                     processing._response_mentions_missing_fields(
                         body,
                         ["Docks"],
@@ -969,10 +1022,19 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
 
     def test_configured_header_fallbacks_are_natural_and_pass_gate(self):
         scenarios = (
+            ("docks", "Dock Doors", "dock count"),
+            ("docks", "Loading Dock Doors", "number of loading docks"),
             ("docks", "Loading Docks", "loading dock count"),
+            ("power", "Electrical Service", "electrical service specifications"),
+            ("power", "Power Service", "power specifications"),
+            ("drive_ins", "Grade-Level Doors", "grade-level door count"),
             ("ops_ex_sf", "NNN", "NNN charges"),
             ("ops_ex_sf", "CAM", "CAM charges"),
             ("drive_ins", "Drive-In Doors", "drive-in door count"),
+            ("ceiling_ht", "Clear Height", "clear height"),
+            ("total_sf", "Building Size", "building size"),
+            ("ops_ex_sf", "Operating Expenses", "operating expenses"),
+            ("rent_sf_yr", "Rental Rate", "rental rate"),
         )
 
         for canonical, header, expected_target in scenarios:

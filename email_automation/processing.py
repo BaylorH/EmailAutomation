@@ -3014,7 +3014,8 @@ _BUILT_IN_SPEC_PRESENCE_FRAMING_RE = re.compile(
     r"\b(?:whether|if|has|have|includes?|equipped|available|availability|"
     r"sufficient|adequate|exists?|contains?)\b"
     r"|\bcomes?\s+with\b"
-    r"|\b(?:is|are)\s+there\b",
+    r"|\b(?:is|are)\s+there\b"
+    r"|^\s*(?:that\s+)?there\s+(?:is|are)\b",
     re.IGNORECASE,
 )
 
@@ -3032,7 +3033,7 @@ _MISSING_FIELD_VALUE_TARGET_PATTERNS = {
     "docks": re.compile(
         r"(?:"
         r"\b(?:loading\s+)?dock(?:\s+doors?)?\s+"
-        r"(?:counts?|numbers?|quantit(?:y|ies)|positions?)\b"
+        r"(?:counts?|quantit(?:y|ies)|positions?)\b"
         r"|\b(?:count|number|quantity)\s+of\s+(?:loading\s+)?"
         r"(?:docks?|dock\s+doors?|dock\s+positions?)\b"
         r"|\bhow\s+many\s+(?:loading\s+)?"
@@ -3172,12 +3173,17 @@ def _missing_field_response_label(field: str) -> str:
     natural_labels = {
         "ceiling ht": "clear height",
         "docks": "dock count",
+        "dock doors": "dock count",
         "loading docks": "loading dock count",
+        "loading dock doors": "number of loading docks",
         "drive ins": "drive-in count",
         "drive-ins": "drive-in count",
         "drive-in doors": "drive-in door count",
+        "grade-level doors": "grade-level door count",
         "ops ex /sf": "operating expenses per SF",
         "power": "power specifications",
+        "electrical service": "electrical service specifications",
+        "power service": "power specifications",
         "total sf": "total SF",
         "nnn": "NNN charges",
         "cam": "CAM charges",
