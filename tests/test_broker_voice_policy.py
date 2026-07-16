@@ -402,6 +402,84 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
             )
         )
 
+    def test_presence_or_sufficiency_rejects_recognized_value_aliases(self):
+        scenarios = (
+            (
+                "Could you confirm whether the property has dock doors and electrical service?",
+                ["Docks", "Power"],
+            ),
+            (
+                "Could you confirm whether the building has sufficient clear height?",
+                ["Ceiling Ht"],
+            ),
+            (
+                "Could you confirm whether the property has grade-level doors?",
+                ["Drive Ins"],
+            ),
+        )
+
+        for body, missing_fields in scenarios:
+            with self.subTest(body=body):
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        missing_fields,
+                        get_default_column_config(),
+                    )
+                )
+
+    def test_explicit_value_targets_remain_accepted(self):
+        scenarios = (
+            ("Could you confirm the dock door count?", ["Docks"]),
+            (
+                "Could you confirm the electrical service specifications?",
+                ["Power"],
+            ),
+            ("Could you confirm the electrical capacity?", ["Power"]),
+            ("Could you confirm the exact clear height?", ["Ceiling Ht"]),
+            (
+                "Could you confirm the number of grade-level doors?",
+                ["Drive Ins"],
+            ),
+        )
+
+        for body, missing_fields in scenarios:
+            with self.subTest(body=body):
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        missing_fields,
+                        get_default_column_config(),
+                    )
+                )
+
+    def test_power_phase_requires_electrical_or_numeric_context(self):
+        for body in (
+            "Could you confirm the Phase I report?",
+            "Could you confirm the development phase?",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Power"],
+                        get_default_column_config(),
+                    )
+                )
+
+        for body in (
+            "Could you confirm the 3-phase power?",
+            "Could you confirm the electrical phase?",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Power"],
+                        get_default_column_config(),
+                    )
+                )
+
     def test_have_question_does_not_request_numeric_specs(self):
         self.assertFalse(
             processing._response_mentions_missing_fields(

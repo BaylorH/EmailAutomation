@@ -2992,6 +2992,29 @@ _MISSING_FIELD_ALIASES = {
     "total_sf": ["total sf", "square footage", "building size"],
 }
 
+_PRESENCE_SENSITIVE_MISSING_FIELD_KEYS = {
+    "docks",
+    "drive_ins",
+    "ceiling_ht",
+    "power",
+    "rent_sf_yr",
+    "ops_ex_sf",
+    "total_sf",
+}
+
+_MISSING_FIELD_PRESENCE_OR_SUFFICIENCY_TARGET_RE = re.compile(
+    r"(?:"
+    r"\bsufficient\b"
+    r"|\bwhether\b[^.!?]*(?:"
+    r"\b(?:has|have)\b"
+    r"|\b(?:is|are)\s+equipped\s+with\b"
+    r"|\bthere\s+(?:is|are)\b"
+    r")"
+    r"|^\s*(?:does|do)\b[^.!?]*\bhave\b"
+    r")",
+    re.IGNORECASE,
+)
+
 _MISSING_FIELD_VALUE_TARGET_PATTERNS = {
     "docks": re.compile(
         r"\b(?:"
@@ -3007,7 +3030,8 @@ _MISSING_FIELD_VALUE_TARGET_PATTERNS = {
         r"\b(?:"
         r"(?:power|electrical)\s+(?:specs?|specifications?|capacity|service|"
         r"amperage|voltage|phase|amps?)"
-        r"|amperage|voltage|phase|amps?"
+        r"|amperage|voltage|amps?"
+        r"|(?:\d+|one|two|three)[ -]?phase(?:\s+power)?"
         r")\b",
         re.IGNORECASE,
     ),
@@ -3028,6 +3052,11 @@ def _request_target_matches_missing_field(
     column_config: Optional[dict],
 ) -> bool:
     canonical = _configured_missing_field_key(field, column_config)
+    if (
+        canonical in _PRESENCE_SENSITIVE_MISSING_FIELD_KEYS
+        and _MISSING_FIELD_PRESENCE_OR_SUFFICIENCY_TARGET_RE.search(target)
+    ):
+        return False
     value_target_pattern = _MISSING_FIELD_VALUE_TARGET_PATTERNS.get(canonical or "")
     if value_target_pattern is not None:
         return bool(value_target_pattern.search(target))
