@@ -2838,7 +2838,7 @@ def _response_mentions_missing_fields(
 
     aliases = {
         "rail access": ["rail"],
-        "docks": ["dock"],
+        "docks": ["dock", "docks"],
         "drive ins": ["drive", "grade"],
         "drive-ins": ["drive", "grade"],
         "ceiling ht": ["ceiling", "clear height"],
@@ -2854,6 +2854,39 @@ def _response_mentions_missing_fields(
         if any(_contains_field_term(body, candidate) for candidate in candidates):
             return True
     return False
+
+
+def _build_missing_fields_response(
+    contact_name: Optional[str],
+    missing_fields: List[str],
+) -> str:
+    fields = [str(field).strip() for field in (missing_fields or []) if str(field).strip()]
+    if not fields:
+        raise ValueError("missing_fields must contain at least one field")
+
+    greeting = _build_greeting(contact_name)
+    if len(fields) >= 3:
+        field_list = "\n".join(f"- {field}" for field in fields)
+        request = f"Could you confirm the remaining property details?\n\n{field_list}"
+    else:
+        natural_labels = {
+            "ceiling ht": "clear height",
+            "drive ins": "drive-in count",
+            "drive-ins": "drive-in count",
+            "ops ex /sf": "operating expenses per SF",
+            "total sf": "total SF",
+        }
+        natural_fields = [
+            natural_labels.get(field.lower(), field[:1].lower() + field[1:])
+            for field in fields
+        ]
+        if len(natural_fields) == 1:
+            field_phrase = natural_fields[0]
+        else:
+            field_phrase = f"{natural_fields[0]} and {natural_fields[1]}"
+        request = f"Could you confirm the {field_phrase}?"
+
+    return f"{greeting}\n\n{request}"
 
 
 def _select_automatic_response_body(
@@ -2873,19 +2906,19 @@ def _select_automatic_response_body(
     fallbacks = {
         "nonviable_with_alternative": f"""{greeting}
 
-Thank you for letting me know that property is no longer available, and thanks for suggesting the alternative property.
+Thank you for the update and for sharing the alternative property.
 
-I'll review the new property details and get back to you if I have any questions.""",
+We'll review the alternative with the client and follow up if we have questions.""",
         "nonviable": f"""{greeting}
 
-Thank you for letting me know that property is no longer available.
+Thank you for the update on the property's availability.
 
-Do you have any other properties that might be a good fit for our requirements?""",
+Do you have another relevant property we should consider?""",
         "complete": f"""{greeting}
 
-Thank you for providing all the requested information! We now have everything we need for your property details.
+Thank you for the details. We'll review them with the client.
 
-We'll be in touch if we need any additional information.""",
+Please send over any questions or other relevant properties we should consider.""",
     }
     if scenario not in fallbacks:
         raise ValueError(f"Unknown automatic response scenario: {scenario}")
@@ -5838,15 +5871,10 @@ Could you please provide your phone number so I can give you a call?"""
                             else:
                                 if llm_response_email:
                                     print("⚠️ Ignoring LLM response because it did not ask for the missing fields")
-                                greeting = _build_greeting(contact_name)
-                                field_list = "\n".join(f"- {field}" for field in missing_fields)
-                                response_body = f"""{greeting}
-
-Thank you for the information!
-
-To complete the property details, could you please provide:
-
-{field_list}"""
+                                response_body = _build_missing_fields_response(
+                                    contact_name,
+                                    missing_fields,
+                                )
                             
                             sent = send_reply_in_thread(user_id, headers, response_body, msg_id, to_addr_lower, thread_id)
                             if sent:

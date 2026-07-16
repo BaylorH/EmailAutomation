@@ -1,8 +1,9 @@
 import inspect
 import unittest
 
-from email_automation import ai_processing
+from email_automation import ai_processing, processing
 from email_automation.ai_processing import build_response_email_rules
+from email_automation.column_config import get_default_column_config
 
 
 class BrokerVoicePolicyTests(unittest.TestCase):
@@ -86,6 +87,89 @@ class BrokerVoicePolicyTests(unittest.TestCase):
         self.assertIn("temperature=0.1", source)
         self.assertIn("OUTPUT ONLY valid JSON in this exact format", source)
         self.assertIn("build_response_email_rules()", source)
+
+
+class BrokerVoiceFallbackTests(unittest.TestCase):
+    def test_two_missing_fields_use_a_natural_sentence(self):
+        body = processing._build_missing_fields_response(
+            "Alex Morgan",
+            ["Docks", "Power"],
+        )
+
+        self.assertIn("Hi Alex,", body)
+        self.assertIn("docks", body.lower())
+        self.assertIn("power", body.lower())
+        self.assertNotRegex(body, r"(?m)^- ")
+        self.assertNotIn("Thank you for the information!", body)
+        self.assertNotIn("To complete the property details", body)
+        self.assertNotIn("Best,", body)
+        self.assertNotIn("!", body)
+
+    def test_one_missing_field_uses_a_natural_sentence(self):
+        body = processing._build_missing_fields_response("Alex Morgan", ["Docks"])
+
+        self.assertIn("docks", body.lower())
+        self.assertNotRegex(body, r"(?m)^- ")
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                ["Docks"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_three_missing_fields_use_bullets_and_pass_the_functional_gate(self):
+        missing_fields = ["Docks", "Power", "Ceiling Ht"]
+        body = processing._build_missing_fields_response("Alex Morgan", missing_fields)
+
+        for field in missing_fields:
+            with self.subTest(field=field):
+                self.assertIn(f"- {field}", body)
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                body,
+                missing_fields,
+                get_default_column_config(),
+            )
+        )
+        self.assertNotIn("Best,", body)
+        self.assertNotIn("!", body)
+
+    def test_missing_field_call_site_keeps_the_functional_gate(self):
+        source = inspect.getsource(processing.process_inbox_message)
+
+        self.assertIn("_response_mentions_missing_fields(", source)
+        self.assertIn("_build_missing_fields_response(", source)
+
+    def test_complete_fallback_reviews_with_client_and_welcomes_options(self):
+        body = processing._select_automatic_response_body(
+            "complete",
+            None,
+            None,
+            "Alex Morgan",
+        )
+
+        self.assertIn("review", body.lower())
+        self.assertIn("with the client", body.lower())
+        self.assertIn("questions", body.lower())
+        self.assertIn("relevant", body.lower())
+        self.assertNotIn("Best,", body)
+        self.assertNotIn("!", body)
+
+    def test_unavailable_fallbacks_are_warm_without_fake_enthusiasm(self):
+        for scenario in ("nonviable", "nonviable_with_alternative"):
+            with self.subTest(scenario=scenario):
+                body = processing._select_automatic_response_body(
+                    scenario,
+                    None,
+                    None,
+                    "Alex Morgan",
+                )
+
+                self.assertIn("Hi Alex,", body)
+                self.assertIn("update", body.lower())
+                self.assertNotIn("Best,", body)
+                self.assertNotIn("!", body)
 
 
 if __name__ == "__main__":
