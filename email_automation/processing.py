@@ -3132,6 +3132,56 @@ def _request_target_matches_missing_field(
     return any(_contains_field_term(target, alias) for alias in aliases)
 
 
+def _configured_requestable_fields(column_config: Optional[dict]) -> List[str]:
+    if not isinstance(column_config, dict) or get_column_config_error(column_config):
+        return []
+
+    mappings = column_config.get("mappings", {})
+    excluded = set(column_config.get("formulaFields", [])) | set(
+        column_config.get("neverRequest", [])
+    )
+    fields = [
+        mappings[canonical]
+        for canonical in column_config.get("extractionFields", [])
+        if canonical in mappings and canonical not in excluded
+    ]
+    fields.extend(
+        header
+        for header, config in column_config.get("customFields", {}).items()
+        if isinstance(config, dict)
+        and config.get("mode") in {"ask_required", "ask_optional"}
+    )
+    return fields
+
+
+def _response_requests_fields_outside(
+    response_body: str,
+    allowed_fields: List[str],
+    column_config: Optional[dict],
+) -> bool:
+    request_targets = _missing_field_request_targets(response_body)
+    if not request_targets:
+        return False
+
+    allowed_keys = {
+        _configured_missing_field_key(field, column_config)
+        or re.sub(r"\s+", " ", str(field or "").strip().lower())
+        for field in (allowed_fields or [])
+    }
+    for field in _configured_requestable_fields(column_config):
+        field_key = _configured_missing_field_key(field, column_config) or re.sub(
+            r"\s+", " ", str(field or "").strip().lower()
+        )
+        if field_key in allowed_keys:
+            continue
+        if any(
+            _request_target_matches_missing_field(target, field, column_config)
+            for target in request_targets
+        ):
+            return True
+    return False
+
+
 def _response_mentions_missing_fields(
     response_body: str,
     missing_fields: List[str],
@@ -3142,6 +3192,8 @@ def _response_mentions_missing_fields(
     if not body or not missing_fields:
         return False
     if _response_requests_nonrequestable_fields(body, column_config):
+        return False
+    if _response_requests_fields_outside(body, missing_fields, column_config):
         return False
     request_targets = _missing_field_request_targets(body)
     if not request_targets:
@@ -3294,9 +3346,15 @@ def _select_automatic_response_body(
         llm_response_email,
         column_config,
     ):
-        if scenario != "complete" or _complete_close_has_required_quality(
-            llm_response_email
-        ):
+        complete_is_safe = scenario != "complete" or (
+            not _response_requests_fields_outside(
+                llm_response_email,
+                [],
+                column_config,
+            )
+            and _complete_close_has_required_quality(llm_response_email)
+        )
+        if complete_is_safe:
             return llm_response_email
 
     greeting = _build_greeting(contact_name)

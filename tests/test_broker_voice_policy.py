@@ -1224,6 +1224,51 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
 
         self.assertIn("Could you confirm the dock count and power specifications?", body)
 
+    def test_missing_field_selector_rejects_request_for_already_supplied_field(self):
+        model_body = (
+            "Hi Alex,\n\nThanks for the details. Could you confirm the power "
+            "specifications and the dock count?"
+        )
+
+        body = processing._select_missing_fields_response_body(
+            model_body,
+            ["Power"],
+            get_default_column_config(),
+            "Alex Morgan",
+        )
+
+        self.assertNotEqual(model_body, body)
+        self.assertIn("power specifications", body.lower())
+        self.assertNotIn("dock", body.lower())
+
+    def test_missing_field_selector_accepts_acknowledgment_of_supplied_field(self):
+        model_body = (
+            "Hi Alex,\n\nThanks for confirming the dock count. Could you share "
+            "the power specifications?"
+        )
+
+        body = processing._select_missing_fields_response_body(
+            model_body,
+            ["Power"],
+            get_default_column_config(),
+            "Alex Morgan",
+        )
+
+        self.assertIn("Thanks for confirming the dock count", body)
+        self.assertIn("Could you share the power specifications?", body)
+
+    def test_missing_field_selector_accepts_request_for_only_missing_field(self):
+        model_body = "Hi Alex,\n\nCould you share the power specifications?"
+
+        body = processing._select_missing_fields_response_body(
+            model_body,
+            ["Power"],
+            get_default_column_config(),
+            "Alex Morgan",
+        )
+
+        self.assertIn("Could you share the power specifications?", body)
+
     def test_complete_fallback_reviews_with_client_and_welcomes_options(self):
         body = processing._select_automatic_response_body(
             "complete",
@@ -1265,6 +1310,24 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
 
         self.assertIn("Thank you for the details", body)
         self.assertIn("review them with the client", body)
+        self.assertIn("questions or other relevant properties", body)
+
+    def test_complete_selector_rejects_reask_of_already_supplied_field(self):
+        model_body = (
+            "Hi Alex,\n\nThank you for the details. We'll review them with the "
+            "client and follow up. Please confirm the dock count, and feel free "
+            "to send questions or other relevant properties."
+        )
+
+        body = processing._select_automatic_response_body(
+            "complete",
+            model_body,
+            get_default_column_config(),
+            "Alex Morgan",
+        )
+
+        self.assertNotEqual(model_body, body)
+        self.assertNotIn("dock", body.lower())
         self.assertIn("questions or other relevant properties", body)
 
     def test_complete_selector_still_rejects_nonrequestable_field_requests(self):
