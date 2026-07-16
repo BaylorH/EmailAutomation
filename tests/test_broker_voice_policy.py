@@ -387,7 +387,7 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
     def test_natural_request_for_every_missing_field_is_accepted(self):
         self.assertTrue(
             processing._response_mentions_missing_fields(
-                "Hi Alex,\n\nCould you confirm the dock count and electrical service?",
+                "Hi Alex,\n\nCould you confirm the dock count and power specifications?",
                 ["Docks", "Power"],
                 get_default_column_config(),
             )
@@ -414,6 +414,7 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
     def test_dock_availability_and_appointment_do_not_request_dock_count(self):
         for body in (
             "Could you confirm the loading dock availability?",
+            "Could you confirm the loading dock door availability?",
             "Could you confirm the dock appointment time?",
         ):
             with self.subTest(body=body):
@@ -545,26 +546,53 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
     def test_explicit_short_target_list_requests_every_listed_field(self):
         self.assertTrue(
             processing._response_mentions_missing_fields(
-                "Could you provide:\n- Docks\n- Power",
+                "Could you provide:\n- Dock door count\n- Power specs",
                 ["Docks", "Power"],
                 get_default_column_config(),
             )
         )
 
-    def test_explicit_confirmation_request_is_accepted(self):
-        self.assertTrue(
-            processing._response_mentions_missing_fields(
-                "Could you confirm the docks and power?",
-                ["Docks", "Power"],
-                get_default_column_config(),
-            )
-        )
+    def test_bare_dock_and_power_targets_are_rejected(self):
+        for body in (
+            "Could you confirm whether the property is equipped with docks and power?",
+            "Could you confirm whether there are docks and power?",
+            "Could you confirm the docks and power?",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Docks", "Power"],
+                        get_default_column_config(),
+                    )
+                )
 
     def test_do_you_know_request_with_precise_aliases_is_accepted(self):
         self.assertTrue(
             processing._response_mentions_missing_fields(
-                "Do you know the dock count and electrical capacity?",
+                "Could you share the number of loading docks and electrical capacity?",
                 ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_drive_in_target_requires_count_or_door_context(self):
+        for body in (
+            "Could you confirm the drive-in?",
+            "Could you confirm the drive-in door availability?",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Drive Ins"],
+                        get_default_column_config(),
+                    )
+                )
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                "Could you confirm the grade-level door count?",
+                ["Drive Ins"],
                 get_default_column_config(),
             )
         )
@@ -679,7 +707,7 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
 
     def test_configured_header_fallbacks_are_natural_and_pass_gate(self):
         scenarios = (
-            ("docks", "Loading Docks", "loading docks"),
+            ("docks", "Loading Docks", "loading dock count"),
             ("ops_ex_sf", "NNN", "NNN charges"),
             ("ops_ex_sf", "CAM", "CAM charges"),
             ("drive_ins", "Drive-In Doors", "drive-in doors"),
@@ -706,12 +734,12 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
     def test_looking_forward_cleanup_does_not_append_a_closing(self):
         body = processing._sanitize_missing_fields_response_body(
             "Hi Alex,\n\n"
-            "Could you confirm the docks and power?\n\n"
+            "Could you confirm the dock count and power specifications?\n\n"
             "Looking forward to your response"
         )
 
         self.assertNotIn("Looking forward", body)
-        self.assertIn("docks", body.lower())
+        self.assertIn("dock count", body.lower())
         self.assertIn("power", body.lower())
         self.assertNotRegex(
             body,
@@ -735,7 +763,8 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
         for phrase in variants:
             with self.subTest(phrase=phrase):
                 body = processing._sanitize_missing_fields_response_body(
-                    "Hi Alex,\n\nCould you confirm the docks and power?\n\n" + phrase
+                    "Hi Alex,\n\nCould you confirm the dock count and power specifications?\n\n"
+                    + phrase
                 )
 
                 self.assertNotIn("looking forward", body.lower())
@@ -744,7 +773,7 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
     def test_looking_forward_cleanup_removes_standalone_punctuation_debris(self):
         body = processing._sanitize_missing_fields_response_body(
             "Hi Alex,\n\n"
-            "Could you confirm the docks and power?\n\n"
+            "Could you confirm the dock count and power specifications?\n\n"
             "looking forward to hearing from you.\n"
             "."
         )
@@ -765,8 +794,8 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
         )
 
         self.assertIn("Hi Alex,", body)
-        self.assertIn("docks", body.lower())
-        self.assertIn("power", body.lower())
+        self.assertIn("dock count", body.lower())
+        self.assertIn("power specifications", body.lower())
         self.assertNotRegex(body, r"(?m)^- ")
         self.assertNotIn("Thank you for the information!", body)
         self.assertNotIn("To complete the property details", body)
@@ -782,7 +811,7 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
 
     def test_ordinary_missing_fields_remain_sentence_cased(self):
         expected_labels = {
-            "Docks": "docks",
+            "Docks": "dock count",
             "Ceiling Ht": "clear height",
         }
 
@@ -797,7 +826,7 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
     def test_one_missing_field_uses_a_natural_sentence(self):
         body = processing._build_missing_fields_response("Alex Morgan", ["Docks"])
 
-        self.assertIn("docks", body.lower())
+        self.assertIn("dock count", body.lower())
         self.assertNotRegex(body, r"(?m)^- ")
         self.assertTrue(
             processing._response_mentions_missing_fields(
@@ -811,9 +840,9 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
         missing_fields = ["Docks", "Power", "Ceiling Ht"]
         body = processing._build_missing_fields_response("Alex Morgan", missing_fields)
 
-        for field in missing_fields:
-            with self.subTest(field=field):
-                self.assertIn(f"- {field}", body)
+        for target in ("Dock count", "Power specifications", "Clear height"):
+            with self.subTest(target=target):
+                self.assertIn(f"- {target}", body)
         self.assertTrue(
             processing._response_mentions_missing_fields(
                 body,
@@ -826,25 +855,25 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
 
     def test_missing_field_selector_accepts_complete_model_request_and_sanitizes(self):
         body = processing._select_missing_fields_response_body(
-            "Hi Alex,\n\nCould you confirm the docks and power?\n\n"
+            "Hi Alex,\n\nCould you confirm the dock count and power specifications?\n\n"
             "looking forward to your response.",
             ["Docks", "Power"],
             get_default_column_config(),
             "Alex Morgan",
         )
 
-        self.assertIn("confirm the docks and power", body)
+        self.assertIn("confirm the dock count and power specifications", body)
         self.assertNotIn("looking forward", body.lower())
 
     def test_missing_field_selector_replaces_partial_model_request(self):
         body = processing._select_missing_fields_response_body(
-            "Hi Alex,\n\nCould you confirm the docks?",
+            "Hi Alex,\n\nCould you confirm the dock count?",
             ["Docks", "Power"],
             get_default_column_config(),
             "Alex Morgan",
         )
 
-        self.assertIn("Could you confirm the docks and power?", body)
+        self.assertIn("Could you confirm the dock count and power specifications?", body)
 
     def test_complete_fallback_reviews_with_client_and_welcomes_options(self):
         body = processing._select_automatic_response_body(

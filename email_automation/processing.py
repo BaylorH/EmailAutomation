@@ -2875,22 +2875,6 @@ _MISSING_FIELD_DECLARATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_NON_BOOLEAN_MISSING_FIELD_KEYS = {
-    "docks",
-    "drive_ins",
-    "ceiling_ht",
-    "power",
-    "rent_sf_yr",
-    "ops_ex_sf",
-    "total_sf",
-}
-
-_MISSING_FIELD_PRESENCE_OR_SUFFICIENCY_RE = re.compile(
-    r"\b(?:has|have|includes?|included|contains?|sufficient|availability|available)\b",
-    re.IGNORECASE,
-)
-
-
 def _clean_missing_field_request_target(value: str) -> str:
     return re.sub(r"^[\s:,-]+|[\s.!?:,-]+$", "", value or "").strip()
 
@@ -2991,36 +2975,7 @@ def _configured_missing_field_key(
 
 
 _MISSING_FIELD_ALIASES = {
-    "docks": [
-        "docks",
-        "dock count",
-        "dock counts",
-        "dock doors",
-        "dock door count",
-        "loading docks",
-        "loading dock door count",
-    ],
-    "drive_ins": [
-        "drive ins",
-        "drive-ins",
-        "drive-in",
-        "drive in",
-        "drive-in door",
-        "drive-in doors",
-        "drive in door",
-        "drive in doors",
-        "grade-level",
-        "grade level",
-    ],
     "ceiling_ht": ["ceiling ht", "ceiling height", "clear height"],
-    "power": [
-        "power",
-        "electrical capacity",
-        "electrical service",
-        "amperage",
-        "amps",
-        "voltage",
-    ],
     "rent_sf_yr": [
         "rent/sf /yr",
         "asking rent",
@@ -3037,6 +2992,35 @@ _MISSING_FIELD_ALIASES = {
     "total_sf": ["total sf", "square footage", "building size"],
 }
 
+_MISSING_FIELD_VALUE_TARGET_PATTERNS = {
+    "docks": re.compile(
+        r"\b(?:"
+        r"(?:loading\s+)?dock(?:\s+door)?\s+counts?"
+        r"|(?:number|count)\s+of\s+(?:loading\s+)?docks?"
+        r"|(?:number|count)\s+of\s+(?:loading\s+)?dock\s+"
+        r"(?:doors?|positions?)"
+        r"|(?:loading\s+)?dock\s+(?:doors|positions)"
+        r")\b",
+        re.IGNORECASE,
+    ),
+    "power": re.compile(
+        r"\b(?:"
+        r"(?:power|electrical)\s+(?:specs?|specifications?|capacity|service|"
+        r"amperage|voltage|phase|amps?)"
+        r"|amperage|voltage|phase|amps?"
+        r")\b",
+        re.IGNORECASE,
+    ),
+    "drive_ins": re.compile(
+        r"\b(?:"
+        r"(?:drive[- ]ins?|grade[- ]level)\s+"
+        r"(?:doors|positions|(?:door\s+)?counts?)"
+        r"|(?:number|count)\s+of\s+(?:drive[- ]ins?|grade[- ]level\s+doors?)"
+        r")\b",
+        re.IGNORECASE,
+    ),
+}
+
 
 def _request_target_matches_missing_field(
     target: str,
@@ -3044,11 +3028,9 @@ def _request_target_matches_missing_field(
     column_config: Optional[dict],
 ) -> bool:
     canonical = _configured_missing_field_key(field, column_config)
-    if (
-        canonical in _NON_BOOLEAN_MISSING_FIELD_KEYS
-        and _MISSING_FIELD_PRESENCE_OR_SUFFICIENCY_RE.search(target)
-    ):
-        return False
+    value_target_pattern = _MISSING_FIELD_VALUE_TARGET_PATTERNS.get(canonical or "")
+    if value_target_pattern is not None:
+        return bool(value_target_pattern.search(target))
     if canonical == "ops_ex_sf":
         if any(
             _contains_field_term(target, term)
@@ -3111,6 +3093,25 @@ def _sentence_case_missing_field_label(field: str) -> str:
     )
 
 
+def _missing_field_response_label(field: str) -> str:
+    natural_labels = {
+        "ceiling ht": "clear height",
+        "docks": "dock count",
+        "loading docks": "loading dock count",
+        "drive ins": "drive-in count",
+        "drive-ins": "drive-in count",
+        "ops ex /sf": "operating expenses per SF",
+        "power": "power specifications",
+        "total sf": "total SF",
+        "nnn": "NNN charges",
+        "cam": "CAM charges",
+    }
+    return natural_labels.get(
+        field.lower(),
+        _sentence_case_missing_field_label(field),
+    )
+
+
 def _build_missing_fields_response(
     contact_name: Optional[str],
     missing_fields: List[str],
@@ -3120,26 +3121,13 @@ def _build_missing_fields_response(
         raise ValueError("missing_fields must contain at least one field")
 
     greeting = _build_greeting(contact_name)
+    natural_fields = [_missing_field_response_label(field) for field in fields]
     if len(fields) >= 3:
-        field_list = "\n".join(f"- {field}" for field in fields)
+        field_list = "\n".join(
+            f"- {field[:1].upper()}{field[1:]}" for field in natural_fields
+        )
         request = f"Could you provide the following property details:\n\n{field_list}"
     else:
-        natural_labels = {
-            "ceiling ht": "clear height",
-            "drive ins": "drive-in count",
-            "drive-ins": "drive-in count",
-            "ops ex /sf": "operating expenses per SF",
-            "total sf": "total SF",
-            "nnn": "NNN charges",
-            "cam": "CAM charges",
-        }
-        natural_fields = [
-            natural_labels.get(
-                field.lower(),
-                _sentence_case_missing_field_label(field),
-            )
-            for field in fields
-        ]
         if len(natural_fields) == 1:
             field_phrase = natural_fields[0]
         else:
