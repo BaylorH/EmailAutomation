@@ -263,6 +263,59 @@ class BrokerVoicePolicyTests(unittest.TestCase):
 
                 self.assertIsNone(result["response_email"])
 
+    def test_mixed_case_optout_removes_updates_through_proposal_pipeline(self):
+        fake_response = Mock(
+            output_text=json.dumps(
+                {
+                    "updates": [
+                        {
+                            "column": "Total SF",
+                            "value": "12000",
+                            "confidence": 0.95,
+                            "reason": "stated in newest message",
+                        }
+                    ],
+                    "events": [
+                        {
+                            "type": "  CONTACT_OPTOUT  ",
+                            "reason": "unsubscribe",
+                        }
+                    ],
+                    "response_email": "Hi Alex, thanks for the update.",
+                    "notes": "",
+                }
+            )
+        )
+
+        with patch.object(
+            ai_processing.client.responses,
+            "create",
+            return_value=fake_response,
+        ):
+            proposal = ai_processing.propose_sheet_updates(
+                "uid",
+                "client",
+                "broker@example.com",
+                "sheet",
+                ["Property Address", "Total SF", "Flyer / Link"],
+                3,
+                ["123 Main St", "", ""],
+                "thread",
+                conversation=[
+                    {
+                        "direction": "inbound",
+                        "from": "broker@example.com",
+                        "content": "The total area is 12,000 SF.",
+                    }
+                ],
+                column_config=get_default_column_config(),
+                dry_run=True,
+            )
+
+        self.assertEqual([], proposal["updates"])
+        self.assertIsNone(proposal["response_email"])
+        self.assertEqual("contact_optout", proposal["events"][0]["type"])
+
     def test_shared_proposal_boundary_normalizes_sensitive_dispatch_and_blocks_reply(self):
         variants = {
             "needs_user_input": "  NEEDS_USER_INPUT  ",
@@ -339,6 +392,53 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
                 get_default_column_config(),
             )
         )
+
+    def test_presence_or_sufficiency_question_does_not_request_numeric_specs(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Could you confirm whether the space includes docks and sufficient power?",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_have_question_does_not_request_numeric_specs(self):
+        self.assertFalse(
+            processing._response_mentions_missing_fields(
+                "Does it have docks and power?",
+                ["Docks", "Power"],
+                get_default_column_config(),
+            )
+        )
+
+    def test_dock_availability_and_appointment_do_not_request_dock_count(self):
+        for body in (
+            "Could you confirm the loading dock availability?",
+            "Could you confirm the dock appointment time?",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Docks"],
+                        get_default_column_config(),
+                    )
+                )
+
+    def test_numeric_dock_targets_request_dock_count(self):
+        for body in (
+            "Could you confirm the dock count?",
+            "Could you confirm the number of loading docks?",
+            "Could you confirm the dock door count?",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(
+                    processing._response_mentions_missing_fields(
+                        body,
+                        ["Docks"],
+                        get_default_column_config(),
+                    )
+                )
 
     def test_bare_what_statement_is_not_request_intent(self):
         self.assertFalse(

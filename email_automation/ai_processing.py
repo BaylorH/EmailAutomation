@@ -945,6 +945,22 @@ _EVENT_QUOTE_SIGNALS = {
 }
 
 
+def _normalized_event_type(event: dict) -> str:
+    if not isinstance(event, dict):
+        return ""
+    return str(event.get("type", "")).strip().lower()
+
+
+def _normalize_proposal_event_types(proposal: dict) -> dict:
+    """Normalize model event types once while preserving every payload field."""
+    if not proposal:
+        return proposal
+    for event in proposal.get("events") or []:
+        if isinstance(event, dict):
+            event["type"] = _normalized_event_type(event)
+    return proposal
+
+
 def _event_is_quote_only(event: dict, fresh_lower: str, quoted_lower: str) -> bool:
     """True when an LLM event's supporting signal is present in quoted history but
     absent from the broker's fresh message — i.e., it bled in from a prior thread.
@@ -953,7 +969,7 @@ def _event_is_quote_only(event: dict, fresh_lower: str, quoted_lower: str) -> bo
     located in the quoted tail AND is missing from the fresh text. If neither
     region carries a recognizable signal, the event is left untouched.
     """
-    etype = (event or {}).get("type")
+    etype = _normalized_event_type(event)
 
     if etype == "new_property":
         addr = re.sub(r"\[tbd\]", "", (event.get("address") or "").lower()).strip()
@@ -1948,7 +1964,8 @@ def _augment_proposal_with_deterministic_extractions(
     # LIVE break (900 Alt Suggest St): when the reply kills the current row or
     # pitches an alternate property, do not mine fallback specs into this row.
     event_types = {
-        (event or {}).get("type") for event in (proposal.get("events") or [])
+        _normalized_event_type(event)
+        for event in (proposal.get("events") or [])
     }
     if event_types & {"new_property", "property_unavailable"}:
         return proposal
@@ -2235,7 +2252,7 @@ def _suppress_updates_on_contact_optout(proposal: dict) -> dict:
     if not proposal:
         return proposal
     events = proposal.get("events") or []
-    if any((e or {}).get("type") == "contact_optout" for e in events):
+    if any(_normalized_event_type(event) == "contact_optout" for event in events):
         proposal["updates"] = []
         proposal["response_email"] = None
     return proposal
@@ -2254,9 +2271,8 @@ def _suppress_response_for_sensitive_events(proposal: dict) -> dict:
     if not proposal:
         return proposal
     event_types = {
-        str((event or {}).get("type", "")).strip().lower()
+        _normalized_event_type(event)
         for event in (proposal.get("events") or [])
-        if isinstance(event, dict)
     }
     if event_types & _SENSITIVE_EVENT_RESPONSE_TYPES:
         proposal["response_email"] = None
@@ -3760,6 +3776,7 @@ OUTPUT ONLY valid JSON in this exact format:
         proposal.setdefault("updates", [])
         proposal.setdefault("events", [])
         proposal.setdefault("response_email", None)  # LLM-generated response email
+        proposal = _normalize_proposal_event_types(proposal)
         # Flyer/linked-PDF text is evidence for extraction + the fabricated-count
         # guard: a count stated only in the flyer is REAL, not invented.
         _evidence_extra_texts = [

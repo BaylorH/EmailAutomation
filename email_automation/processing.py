@@ -2875,6 +2875,21 @@ _MISSING_FIELD_DECLARATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NON_BOOLEAN_MISSING_FIELD_KEYS = {
+    "docks",
+    "drive_ins",
+    "ceiling_ht",
+    "power",
+    "rent_sf_yr",
+    "ops_ex_sf",
+    "total_sf",
+}
+
+_MISSING_FIELD_PRESENCE_OR_SUFFICIENCY_RE = re.compile(
+    r"\b(?:has|have|includes?|included|contains?|sufficient|availability|available)\b",
+    re.IGNORECASE,
+)
+
 
 def _clean_missing_field_request_target(value: str) -> str:
     return re.sub(r"^[\s:,-]+|[\s.!?:,-]+$", "", value or "").strip()
@@ -2977,14 +2992,11 @@ def _configured_missing_field_key(
 
 _MISSING_FIELD_ALIASES = {
     "docks": [
-        "dock",
         "docks",
         "dock count",
         "dock counts",
-        "dock door",
         "dock doors",
         "dock door count",
-        "loading dock",
         "loading docks",
         "loading dock door count",
     ],
@@ -3032,6 +3044,11 @@ def _request_target_matches_missing_field(
     column_config: Optional[dict],
 ) -> bool:
     canonical = _configured_missing_field_key(field, column_config)
+    if (
+        canonical in _NON_BOOLEAN_MISSING_FIELD_KEYS
+        and _MISSING_FIELD_PRESENCE_OR_SUFFICIENCY_RE.search(target)
+    ):
+        return False
     if canonical == "ops_ex_sf":
         if any(
             _contains_field_term(target, term)
