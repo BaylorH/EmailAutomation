@@ -402,19 +402,31 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
             )
         )
 
-    def test_presence_or_sufficiency_rejects_recognized_value_aliases(self):
+    def test_categorical_presence_framing_rejects_built_in_spec_targets(self):
         scenarios = (
             (
-                "Could you confirm whether the property has dock doors and electrical service?",
+                "Could you confirm whether the property includes dock doors and electrical service?",
                 ["Docks", "Power"],
             ),
             (
-                "Could you confirm whether the building has sufficient clear height?",
+                "Could you confirm whether dock doors and electrical service are available?",
+                ["Docks", "Power"],
+            ),
+            (
+                "Could you confirm if the property has dock doors and electrical service?",
+                ["Docks", "Power"],
+            ),
+            (
+                "Could you confirm if the clear height is sufficient?",
                 ["Ceiling Ht"],
             ),
             (
-                "Could you confirm whether the property has grade-level doors?",
+                "Could you confirm whether grade-level doors exist?",
                 ["Drive Ins"],
+            ),
+            (
+                "Are there dock doors and electrical service?",
+                ["Docks", "Power"],
             ),
         )
 
@@ -427,6 +439,31 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
                         get_default_column_config(),
                     )
                 )
+
+    def test_custom_fields_keep_presence_style_request_support(self):
+        config = get_default_column_config()
+        config["customFields"] = {
+            "ESFR": {"mode": "ask_required", "description": "ESFR sprinklers"},
+            "Rail Access": {
+                "mode": "ask_required",
+                "description": "Rail access",
+            },
+        }
+
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                "Could you confirm whether the building has ESFR and rail access?",
+                ["ESFR", "Rail Access"],
+                config,
+            )
+        )
+        self.assertTrue(
+            processing._response_mentions_missing_fields(
+                "Is there rail access?",
+                ["Rail Access"],
+                config,
+            )
+        )
 
     def test_explicit_value_targets_remain_accepted(self):
         scenarios = (
@@ -457,6 +494,9 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
         for body in (
             "Could you confirm the Phase I report?",
             "Could you confirm the development phase?",
+            "Could you confirm the two-phase development plan?",
+            "Could you confirm the 3-phase construction plan?",
+            "Could you confirm the 3-phase construction plan with electrical permitting?",
         ):
             with self.subTest(body=body):
                 self.assertFalse(
@@ -469,6 +509,7 @@ class BrokerVoiceFallbackTests(unittest.TestCase):
 
         for body in (
             "Could you confirm the 3-phase power?",
+            "Could you confirm the three phase electrical service?",
             "Could you confirm the electrical phase?",
         ):
             with self.subTest(body=body):

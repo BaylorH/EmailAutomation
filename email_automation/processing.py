@@ -2946,6 +2946,12 @@ def _missing_field_request_targets(response_body: str) -> List[str]:
                     target = _clean_missing_field_request_target(
                         clause[request_match.end():]
                     )
+                    if re.fullmatch(
+                        r"\s*(?:is|are)\s+there\b",
+                        request_match.group(0),
+                        re.IGNORECASE,
+                    ):
+                        target = f"{request_match.group(0).strip()} {target}"
                     inline_request_active = _is_missing_field_request_target(target)
                     if inline_request_active:
                         request_targets.append(target)
@@ -2992,28 +2998,31 @@ _MISSING_FIELD_ALIASES = {
     "total_sf": ["total sf", "square footage", "building size"],
 }
 
-_PRESENCE_SENSITIVE_MISSING_FIELD_KEYS = {
+_BUILT_IN_NUMERIC_SPEC_FIELD_KEYS = {
     "docks",
     "drive_ins",
     "ceiling_ht",
     "power",
-    "rent_sf_yr",
     "ops_ex_sf",
     "total_sf",
 }
 
-_MISSING_FIELD_PRESENCE_OR_SUFFICIENCY_TARGET_RE = re.compile(
-    r"(?:"
-    r"\bsufficient\b"
-    r"|\bwhether\b[^.!?]*(?:"
-    r"\b(?:has|have)\b"
-    r"|\b(?:is|are)\s+equipped\s+with\b"
-    r"|\bthere\s+(?:is|are)\b"
-    r")"
-    r"|^\s*(?:does|do)\b[^.!?]*\bhave\b"
-    r")",
+_BUILT_IN_SPEC_PRESENCE_FRAMING_RE = re.compile(
+    r"\b(?:whether|if|has|have|includes?|equipped|available|availability|"
+    r"sufficient|adequate|exists?)\b"
+    r"|\b(?:there\s+(?:is|are)|(?:is|are)\s+there)\b",
     re.IGNORECASE,
 )
+
+
+def _is_presence_framed_built_in_spec_target(
+    target: str,
+    canonical: Optional[str],
+) -> bool:
+    return bool(
+        canonical in _BUILT_IN_NUMERIC_SPEC_FIELD_KEYS
+        and _BUILT_IN_SPEC_PRESENCE_FRAMING_RE.search(target)
+    )
 
 _MISSING_FIELD_VALUE_TARGET_PATTERNS = {
     "docks": re.compile(
@@ -3031,7 +3040,7 @@ _MISSING_FIELD_VALUE_TARGET_PATTERNS = {
         r"(?:power|electrical)\s+(?:specs?|specifications?|capacity|service|"
         r"amperage|voltage|phase|amps?)"
         r"|amperage|voltage|amps?"
-        r"|(?:\d+|one|two|three)[ -]?phase(?:\s+power)?"
+        r"|(?:\d+|one|two|three)[ -]?phase\s+(?:power|electrical)"
         r")\b",
         re.IGNORECASE,
     ),
@@ -3052,10 +3061,7 @@ def _request_target_matches_missing_field(
     column_config: Optional[dict],
 ) -> bool:
     canonical = _configured_missing_field_key(field, column_config)
-    if (
-        canonical in _PRESENCE_SENSITIVE_MISSING_FIELD_KEYS
-        and _MISSING_FIELD_PRESENCE_OR_SUFFICIENCY_TARGET_RE.search(target)
-    ):
+    if _is_presence_framed_built_in_spec_target(target, canonical):
         return False
     value_target_pattern = _MISSING_FIELD_VALUE_TARGET_PATTERNS.get(canonical or "")
     if value_target_pattern is not None:
