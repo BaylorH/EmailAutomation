@@ -61,7 +61,7 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row04@example.test", "to": ["campaign@example.test"], "subject": "404 Pallet Test Avenue", "timestamp": "2026-07-15T15:14:00Z", "content": "The row information is still accurate."}
     ],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "must_mention_any": [["dock count", "number of dock-high doors", "dock-high doors", "loading dock count", "dock doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 40, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Ceiling Ht"]},
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "must_mention_any": [["dock count", "number of dock-high doors", "dock-high door count", "dock-high doors", "loading dock count", "dock doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 40, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Ceiling Ht"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Morgan,\n\nCould you share the dock count and available power service?", "notes": ""}
   },
   {
@@ -77,7 +77,7 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row05@example.test", "to": ["campaign@example.test"], "subject": "505 Gantry Test Street", "timestamp": "2026-07-15T15:15:00Z", "content": "It is available and the size, drive-ins, and clear height shown are correct."}
     ],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "must_mention_any": [["asking rent", "asking rate", "rental rate", "rent per square foot"], ["operating expenses", "operating expense", "ops ex", "NNN expenses", "CAM charges"], ["dock count", "number of dock-high doors", "dock-high doors", "loading dock count", "dock doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 55, "supplied_fields": ["Total SF", "Drive Ins", "Ceiling Ht"]},
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "must_mention_any": [["asking rent", "asking rate", "rental rate", "rent per square foot"], ["operating expenses", "operating expense", "ops ex", "NNN expenses", "CAM charges"], ["dock count", "number of dock-high doors", "dock-high door count", "dock-high doors", "loading dock count", "dock doors"], ["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 55, "supplied_fields": ["Total SF", "Drive Ins", "Ceiling Ht"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Riley,\n\nI noted the current size and loading details. Could you also share:\n- asking rent\n- operating expenses\n- dock count\n- power", "notes": ""}
   },
   {

@@ -265,6 +265,18 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
         self.assertEqual(100, result["score"])
         self.assertEqual([], result["vetoes"])
 
+    def test_singular_dock_high_door_count_alias_is_accepted(self):
+        proposal = self.broken_proposal("four missing items")
+        proposal["response_email"] = (
+            "Hi,\n\nCould you share the asking rent, operating expenses, "
+            "dock-high door count, and electrical service?"
+        )
+
+        result = grade_case(self.cases["four missing items"], proposal)
+
+        self.assertEqual(100, result["score"])
+        self.assertEqual([], result["vetoes"])
+
     def test_live_row_01_drive_in_door_alias_scores_100(self):
         proposal = self.broken_proposal("partial details")
         proposal["response_email"] = (
