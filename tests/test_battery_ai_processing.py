@@ -119,6 +119,10 @@ class RentOpexSfExtractionTests(unittest.TestCase):
                             "total_sf": "Total SF"}}
         return header, cfg
 
+    def _night_hdr_cfg_with_city(self):
+        header, cfg = self._night_hdr_cfg()
+        return [header[0], "City", *header[1:]], cfg
+
     def test_augmenter_skips_specs_when_new_property_event(self):
         # "900 under LOI ... but 1100 Fresh Listing Ave is 30,000 SF at $10.50"
         # — the specs belong to the ALTERNATE; nothing may land on the 900 row.
@@ -155,6 +159,310 @@ class RentOpexSfExtractionTests(unittest.TestCase):
         dk = a._proposal_update_for_column(out, "Loading Docks")
         self.assertIsNone(di)
         self.assertIsNone(dk)
+
+    def test_matching_attachment_supplies_total_sf_when_message_only_references_flyer(self):
+        header, cfg = self._night_hdr_cfg()
+        proposal = {"updates": [], "events": []}
+        out = a._augment_proposal_with_deterministic_extractions(
+            proposal,
+            ["606 Turbine Test Court", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("All the specs for 606 Turbine Test Court are in the attached flyer."),
+            pdf_manifest=[{
+                "name": "606 Turbine Test Court flyer.pdf",
+                "text": "606 Turbine Test Court, Model Plains. 26,500 SF.",
+            }],
+        )
+
+        self.assertEqual(
+            "26500",
+            a._proposal_update_for_column(out, "Total SF")["value"],
+        )
+
+    def test_decimal_rate_does_not_make_single_property_attachment_mixed(self):
+        source = (
+            "synthetic-row06-flyer.pdf\n"
+            "606 Turbine Test Court, Model Plains. 26,500 SF. "
+            "Asking $10.50/SF/year. Operating expenses $2.20/SF/year. "
+            "Two drive-ins."
+        )
+
+        self.assertEqual(
+            "target",
+            a._attachment_property_verdict(
+                source,
+                "606 Turbine Test Court, Model Plains",
+            ),
+        )
+
+    def test_leading_dot_rate_does_not_make_single_property_attachment_mixed(self):
+        source = (
+            "606 Turbine Test Court, Model Plains. 26,500 SF. "
+            "Operating expenses $.20/SF/year. Two drive-ins."
+        )
+
+        self.assertEqual(
+            "target",
+            a._attachment_property_verdict(
+                source,
+                "606 Turbine Test Court, Model Plains",
+            ),
+        )
+
+    def test_same_street_in_different_city_cannot_supply_total_sf(self):
+        header, cfg = self._night_hdr_cfg_with_city()
+        out = a._augment_proposal_with_deterministic_extractions(
+            {"updates": [], "events": []},
+            ["123 Main St", "Boise", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("The attached flyer has the current specs."),
+            pdf_manifest=[{
+                "name": "123 Main St flyer.pdf",
+                "text": "123 Main St, Dallas. 45,000 SF.",
+            }],
+        )
+
+        self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
+    def test_same_street_with_city_state_zip_cannot_supply_total_sf(self):
+        header, cfg = self._night_hdr_cfg_with_city()
+        out = a._augment_proposal_with_deterministic_extractions(
+            {"updates": [], "events": []},
+            ["123 Main St", "Boise", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("The attached flyer has the current specs."),
+            pdf_manifest=[{
+                "name": "123 Main St flyer.pdf",
+                "text": "123 Main St, Dallas TX 75201. 45,000 SF.",
+            }],
+        )
+
+        self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
+    def test_same_street_with_unpunctuated_city_state_zip_cannot_supply_total_sf(self):
+        header, cfg = self._night_hdr_cfg_with_city()
+        out = a._augment_proposal_with_deterministic_extractions(
+            {"updates": [], "events": []},
+            ["123 Main St", "Boise", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("The attached flyer has the current specs."),
+            pdf_manifest=[{
+                "name": "123 Main St flyer.pdf",
+                "text": "123 Main St Dallas TX 75201. 45,000 SF.",
+            }],
+        )
+
+        self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
+    def test_same_street_with_dash_or_newline_city_cannot_supply_total_sf(self):
+        header, cfg = self._night_hdr_cfg_with_city()
+        for separator in (" - ", "\n"):
+            with self.subTest(separator=repr(separator)):
+                out = a._augment_proposal_with_deterministic_extractions(
+                    {"updates": [], "events": []},
+                    ["123 Main St", "Boise", "", "", "", "", ""],
+                    header,
+                    cfg,
+                    _conv("The attached flyer has the current specs."),
+                    pdf_manifest=[{
+                        "name": "123 Main St flyer.pdf",
+                        "text": f"123 Main St{separator}Dallas TX 75201. 45,000 SF.",
+                    }],
+                )
+
+                self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
+    def test_suite_in_row_address_does_not_replace_city_identity(self):
+        header, cfg = self._night_hdr_cfg_with_city()
+        out = a._augment_proposal_with_deterministic_extractions(
+            {"updates": [], "events": []},
+            ["123 Main St, Suite 200", "Boise", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("The attached flyer has the current specs."),
+            pdf_manifest=[{
+                "name": "123 Main St Suite 200 flyer.pdf",
+                "text": "123 Main St, Suite 200, Dallas TX 75201. 45,000 SF.",
+            }],
+        )
+
+        self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
+    def test_suite_in_matching_attachment_preserves_target_city_match(self):
+        self.assertEqual(
+            "target",
+            a._attachment_property_verdict(
+                "123 Main St, Suite 200, Boise ID 83702. 45,000 SF.",
+                "123 Main St, Suite 200, Boise",
+            ),
+        )
+
+    def test_different_suite_same_city_cannot_supply_total_or_rent(self):
+        header, cfg = self._night_hdr_cfg_with_city()
+        out = a._augment_proposal_with_deterministic_extractions(
+            {"updates": [{"column": "Rent/SF /Yr", "value": "15"}], "events": []},
+            ["123 Main St, Suite 200", "Boise", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("The attached flyer has the current specs."),
+            pdf_manifest=[{
+                "name": "123 Main St Suite 300 flyer.pdf",
+                "text": "123 Main St, Suite 300, Boise ID 83702. 45,000 SF. Asking $15/SF/year.",
+            }],
+        )
+
+        self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+        self.assertIsNone(a._proposal_update_for_column(out, "Rent/SF /Yr"))
+
+    def test_mixed_suite_attachment_cannot_supply_wrong_suite_rent(self):
+        self.assertFalse(a._attachment_can_supply_target_rent(
+            (
+                "123 Main St, Suite 200, Boise ID 83702. Overview only. "
+                "123 Main St, Suite 300, Boise ID 83702. Asking $15/SF/year."
+            ),
+            "123 Main St, Suite 200, Boise",
+            "The attached comparison has current pricing.",
+        ))
+
+    def test_city_prefix_collisions_are_not_exact_city_matches(self):
+        cases = (
+            ("123 Main St, Dallas Center, IA 50063. 45,000 SF.", "123 Main St, Dallas"),
+            ("123 Main St, St. Louis Park, MN 55416. 45,000 SF.", "123 Main St, St. Louis"),
+        )
+        for source, target in cases:
+            with self.subTest(source=source, target=target):
+                self.assertEqual("competing", a._attachment_property_verdict(source, target))
+
+    def test_unpunctuated_suite_wrong_city_is_not_target_property(self):
+        sources = (
+            "123 Main St Suite 200 Dallas TX 75201. 45,000 SF.",
+            "123 Main St - Suite 200, Dallas TX 75201. 45,000 SF.",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(
+                    "competing",
+                    a._attachment_property_verdict(source, "123 Main St, Suite 200, Boise"),
+                )
+
+    def test_comma_narrative_heading_remains_target_bound(self):
+        self.assertEqual(
+            "target",
+            a._attachment_property_verdict(
+                "123 Main St, Available now. 45,000 SF. Asking $15/SF/year.",
+                "123 Main St, Boise",
+            ),
+        )
+
+    def test_saint_and_st_city_aliases_match_exactly(self):
+        self.assertEqual(
+            "target",
+            a._attachment_property_verdict(
+                "123 Main St, Saint Louis, MO 63101. 45,000 SF.",
+                "123 Main St, St. Louis",
+            ),
+        )
+
+    def test_target_suite_rejects_late_or_omitted_unit_identity(self):
+        sources = (
+            "123 Main St, Boise ID 83702, Suite 300. 45,000 SF. Asking $15/SF/year.",
+            "123 Main St, Boise ID 83702. 45,000 SF. Asking $15/SF/year.",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(
+                    "competing",
+                    a._attachment_property_verdict(source, "123 Main St, Suite 200, Boise"),
+                )
+
+    def test_common_unit_spellings_preserve_same_suite_match(self):
+        cases = (
+            ("123 Main St, Ste. 200, Boise ID 83702. 45,000 SF.", "123 Main St, Ste. 200, Boise"),
+            ("123 Main St, Unit #200, Boise ID 83702. 45,000 SF.", "123 Main St, Unit #200, Boise"),
+        )
+        for source, target in cases:
+            with self.subTest(source=source, target=target):
+                self.assertEqual("target", a._attachment_property_verdict(source, target))
+
+    def test_common_flyer_headings_are_not_treated_as_cities(self):
+        for heading in ("Highlights", "Executive summary", "Industrial opportunity"):
+            with self.subTest(heading=heading):
+                self.assertEqual(
+                    "target",
+                    a._attachment_property_verdict(
+                        f"123 Main St, {heading}. 45,000 SF. Asking $15/SF/year.",
+                        "123 Main St, Boise",
+                    ),
+                )
+
+    def test_dotted_same_city_attachment_remains_target_bound(self):
+        self.assertEqual(
+            "target",
+            a._attachment_property_verdict(
+                "123 Main St, St. Louis, MO 63101. 45,000 SF.",
+                "123 Main St, St. Louis",
+            ),
+        )
+
+    def test_mixed_same_street_cities_do_not_supply_wrong_city_rent(self):
+        header, cfg = self._night_hdr_cfg_with_city()
+        out = a._augment_proposal_with_deterministic_extractions(
+            {"updates": [], "events": []},
+            ["123 Main St", "Boise", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("The attached comparison has the current pricing."),
+            pdf_manifest=[{
+                "name": "comparison.pdf",
+                "text": (
+                    "123 Main St, Boise. Overview only. "
+                    "123 Main St, Dallas. Asking $15/SF/year."
+                ),
+            }],
+        )
+
+        self.assertIsNone(a._proposal_update_for_column(out, "Rent/SF /Yr"))
+
+    def test_conflicting_target_pdf_totals_fail_closed_regardless_of_order(self):
+        header, cfg = self._night_hdr_cfg_with_city()
+        manifests = [
+            {"name": "building.pdf", "text": "606 Turbine Test Court, Model Plains. 100,000 SF."},
+            {"name": "suite.pdf", "text": "606 Turbine Test Court, Model Plains. 25,000 SF."},
+        ]
+        for pdf_manifest in (manifests, list(reversed(manifests))):
+            with self.subTest(order=[pdf["name"] for pdf in pdf_manifest]):
+                out = a._augment_proposal_with_deterministic_extractions(
+                    {"updates": [{"column": "Total SF", "value": "100000"}], "events": []},
+                    ["606 Turbine Test Court", "Model Plains", "", "", "", "", ""],
+                    header,
+                    cfg,
+                    _conv("The attached PDFs have the current specs."),
+                    pdf_manifest=pdf_manifest,
+                )
+                self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
+
+    def test_terminal_event_drops_pdf_total_that_conflicts_with_fresh_total(self):
+        header, cfg = self._night_hdr_cfg_with_city()
+        out = a._augment_proposal_with_deterministic_extractions(
+            {
+                "updates": [{"column": "Total SF", "value": "100000"}],
+                "events": [{"type": "property_unavailable", "reason": "leased"}],
+            },
+            ["606 Turbine Test Court", "Model Plains", "", "", "", "", ""],
+            header,
+            cfg,
+            _conv("The property is leased. The correct total was 30,000 SF."),
+            pdf_manifest=[
+                {"name": "building.pdf", "text": "606 Turbine Test Court, Model Plains. 100,000 SF."},
+                {"name": "suite.pdf", "text": "606 Turbine Test Court, Model Plains. 25,000 SF."},
+            ],
+        )
+
+        self.assertIsNone(a._proposal_update_for_column(out, "Total SF"))
 
     def _run_loading_precedence_replay(
         self, broker_body, flyer_text, model_updates, docks_header="Docks",
@@ -653,24 +961,28 @@ class RentOpexSfExtractionTests(unittest.TestCase):
 
     def test_target_flyer_ignores_brokerage_footer_address(self):
         proposal = {
-            "updates": [{"column": "Rent/SF /Yr", "value": "12", "confidence": 0.9}],
+            "updates": [
+                {"column": "Rent/SF /Yr", "value": "12", "confidence": 0.9},
+                {"column": "Total SF", "value": "45000", "confidence": 0.9},
+            ],
             "events": [],
         }
         out = a._augment_proposal_with_deterministic_extractions(
             proposal,
-            ["123 Test Dr", "Boise", ""],
-            ["Property Address", "City", "Rent/SF /Yr"],
-            {"mappings": {"rent_sf_yr": "Rent/SF /Yr"}},
+            ["123 Test Dr", "Boise", "", ""],
+            ["Property Address", "City", "Rent/SF /Yr", "Total SF"],
+            {"mappings": {"rent_sf_yr": "Rent/SF /Yr", "total_sf": "Total SF"}},
             _conv("The 123 Test Dr property is available; see attached."),
             pdf_manifest=[{
                 "name": "123 Test Dr flyer.pdf",
                 "text": (
-                    "123 Test Dr - asking rent $12/SF NNN. "
+                    "123 Test Dr - 45,000 SF at asking rent $12/SF NNN. "
                     "Brokerage office: 500 Main St, Boise, ID."
                 ),
             }],
         )
         self.assertEqual("12.00", a._proposal_update_for_column(out, "Rent/SF /Yr")["value"])
+        self.assertEqual("45000", a._proposal_update_for_column(out, "Total SF")["value"])
 
     def test_whole_building_description_remains_total_sf(self):
         phrases = (

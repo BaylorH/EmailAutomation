@@ -59,7 +59,41 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
 
         self.assertIn("Monday at 2:00 PM", body)
         self.assertIn("Wednesday at 10:00 AM", body)
+        self.assertIn("checking those options against my schedule", body)
+        self.assertNotIn("would work on my end", body)
         self.assertNotIn("[Day/Time option", body)
+
+    def test_tour_notification_ignores_model_schedule_claims_and_placeholders(self):
+        body = processing._select_tour_notification_suggested_email(
+            "Both times work for us. Attendees: [Your Name] and [Client Name].",
+            contact_name="Devin",
+            recipient_email="devin@example.com",
+            question="Tuesday at 2:00 PM or Wednesday at 1:00 PM?",
+        )
+
+        self.assertIn("Tuesday at 2:00 PM", body)
+        self.assertIn("Wednesday at 1:00 PM", body)
+        self.assertIn("checking those options against my schedule", body)
+        self.assertNotIn("Both times work", body)
+        self.assertNotIn("[Your Name]", body)
+        self.assertNotIn("[Client Name]", body)
+
+    def test_tour_notification_uses_fresh_broker_times_not_model_question(self):
+        question = processing._select_tour_evidence_question(
+            "I can show it Tuesday or Wednesday afternoon.",
+            "Tuesday at 2:00 PM or Wednesday at 3:00 PM?",
+        )
+        body = processing._select_tour_notification_suggested_email(
+            "Tuesday at 2:00 PM works for us.",
+            contact_name="Devin",
+            recipient_email="devin@example.com",
+            question=question,
+        )
+
+        self.assertIn("Tuesday", body)
+        self.assertIn("Wednesday afternoon", body)
+        self.assertNotIn("2:00 PM", body)
+        self.assertNotIn("3:00 PM", body)
 
     def test_default_tour_suggested_email_without_times_asks_for_windows(self):
         body = processing._build_default_tour_suggested_email("Devin", "Tour requested")
@@ -94,11 +128,9 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             ),
         )
 
-        self.assertIn("Tuesday, June 23 at 2:00 PM CT would work on my end.", body)
-        self.assertIn(
-            "If that time is no longer available, Thursday, June 25 at 11:30 AM CT could also work.",
-            body,
-        )
+        self.assertIn("Tuesday, June 23 at 2:00 PM CT", body)
+        self.assertIn("Thursday, June 25 at 11:30 AM CT", body)
+        self.assertIn("checking those options against my schedule", body)
         self.assertIn("Please plan for about 30 minutes on site.", body)
         self.assertNotIn("(about 30 minutes on site could also work", body)
 

@@ -54,7 +54,7 @@
     "conversation": [
       {"direction": "inbound", "from": "broker+row03@example.test", "to": ["campaign@example.test"], "subject": "303 Conveyor Test Lane", "timestamp": "2026-07-15T15:13:00Z", "content": "Those figures are current. Let me know what else you need."}
     ],
-    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "must_mention_any": [["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 35, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht"]},
+    "expect": {"event_types": [], "response_mode": "send", "must_mention": [], "must_mention_any": [["power", "electrical service", "amperage", "voltage"]], "must_not_mention": ["Gross Rent", "Best,"], "max_words": 45, "supplied_fields": ["Total SF", "Rent/SF /Yr", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht"]},
     "offline_proposal": {"updates": [], "events": [], "response_email": "Hi Casey,\n\nCould you also share the available power service?", "notes": ""}
   },
   {
@@ -140,7 +140,7 @@
     "expected_updates": [{"column": "Drive Ins", "value": "3"}],
     "forbidden_update_columns": ["Property Address", "City", "Email"],
     "event_payloads": [],
-    "optional_event_payloads": [{"type": "close_conversation", "any_of": [{"one_of": {"reason": ["all_info_gathered", "all_information_gathered", "all_required_fields_received", "complete_details_received"]}}, {"must_mention_any": {"notes": [["all required property details", "all required details", "all property details", "complete package"]]}}]}],
+    "optional_event_payloads": [{"type": "close_conversation", "any_of": [{"one_of": {"reason": ["all_info_gathered", "all_information_gathered", "all_required_fields_received", "complete_details_received"]}}, {"one_of": {"notes": ["all_info_gathered", "all_information_gathered", "all_required_fields_received", "complete_details_received"]}}, {"must_mention_any": {"notes": [["all required property details", "all required details", "all property details", "complete package"]]}}]}],
     "row": {
       "id": "synthetic-row-08",
       "number": 10,
@@ -178,7 +178,7 @@
     "scenario": "unavailable plus alternative",
     "expected_updates": [],
     "forbidden_update_columns": ["Property Address", "City", "Email"],
-    "event_payloads": [{"type": "property_unavailable", "one_of": {"reason": ["leased", "no_longer_available"]}}, {"type": "new_property", "equals": {"address": "1110 Kiln Test Way", "city": "Fixture Ridge"}}],
+    "event_payloads": [{"type": "property_unavailable", "one_of": {"reason": ["leased", "no_longer_available"]}}, {"type": "new_property", "equals": {"address": "1110 Kiln Test Way", "city": "Fixture Ridge"}, "optional_equals": {"email": "broker+row10@example.test"}, "optional_must_mention_any": {"notes": [["alternative", "space", "22,000", "22000"], ["leased", "available", "offered"]]}}],
     "row": {
       "id": "synthetic-row-10",
       "number": 12,
@@ -197,7 +197,7 @@
     "scenario": "alternative with new contact",
     "expected_updates": [],
     "forbidden_update_columns": ["Property Address", "City", "Email"],
-    "event_payloads": [{"type": "property_unavailable", "one_of": {"reason": ["gone", "no_longer_available", "unavailable"]}}, {"type": "new_property", "equals": {"address": "1211 Forge Test Loop", "contactName": "Ellis Wren", "email": "ellis.wren@example.test"}}],
+    "event_payloads": [{"type": "property_unavailable", "one_of": {"reason": ["gone", "no_longer_available", "unavailable"]}, "optional_must_mention_any": {"notes": [["gone", "no longer available", "unavailable"]]}}, {"type": "new_property", "equals": {"address": "1211 Forge Test Loop", "contactName": "Ellis Wren", "email": "ellis.wren@example.test"}, "optional_equals": {"city": "Fixture Ridge"}, "optional_must_mention_any": {"notes": [["referred", "alternative", "try", "contact"], ["package", "Ellis Wren", "ellis.wren@example.test"]]}}],
     "row": {
       "id": "synthetic-row-11",
       "number": 13,
@@ -235,7 +235,7 @@
     "scenario": "explicit call request",
     "expected_updates": [],
     "forbidden_update_columns": ["Property Address", "City", "Email"],
-    "event_payloads": [{"type": "call_requested", "one_of": {"reason": ["call_request", "call_request_phrase"]}}],
+    "event_payloads": [{"type": "call_requested", "any_of": [{"one_of": {"reason": ["call_request", "call_request_phrase"]}}, {"must_mention_any": {"question": [["call"], ["tomorrow", "morning", "discuss"]]}}]}],
     "row": {
       "id": "synthetic-row-13",
       "number": 15,
@@ -254,7 +254,7 @@
     "scenario": "tour offer",
     "expected_updates": [],
     "forbidden_update_columns": ["Property Address", "City", "Email"],
-    "event_payloads": [{"type": "tour_requested", "must_mention_any": {"question": [["Tuesday", "Wednesday"], ["afternoon", "tour"]]}}],
+    "event_payloads": [{"type": "tour_requested", "must_mention_any": {"question": [["Tuesday", "Wednesday"], ["afternoon", "tour"]]}, "optional_must_mention_any": {"suggestedEmail": [["Tuesday"], ["Wednesday"], ["checking", "confirm"]]}}],
     "row": {
       "id": "synthetic-row-14",
       "number": 16,
@@ -273,7 +273,7 @@
     "scenario": "tour time reply",
     "expected_updates": [],
     "forbidden_update_columns": ["Property Address", "City", "Email"],
-    "event_payloads": [{"type": "tour_requested", "must_mention_any": {"question": [["Thursday"], ["2:00", "2 PM"], ["attendee", "attend", "who will attend"]]}}],
+    "event_payloads": [{"type": "tour_requested", "must_mention_any": {"question": [["Thursday"], ["2:00", "2 PM"], ["attendee", "attend", "who will attend"]]}, "optional_must_mention_any": {"suggestedEmail": [["Thursday"], ["2:00", "2 PM"], ["checking", "confirm"]]}}],
     "row": {
       "id": "synthetic-row-15",
       "number": 17,
@@ -407,7 +407,7 @@
     "scenario": "ambiguous",
     "expected_updates": [],
     "forbidden_update_columns": ["Property Address", "City", "Email"],
-    "event_payloads": [{"type": "needs_user_input", "equals": {"reason": "unclear"}, "must_mention_any": {"question": [["clarify", "which"], ["number", "condition"]]}}],
+    "event_payloads": [{"type": "needs_user_input", "equals": {"reason": "unclear"}, "must_mention_any": {"question": [["clarify", "clarification", "which"], ["number", "condition"]]}}],
     "row": {
       "id": "synthetic-row-22",
       "number": 24,

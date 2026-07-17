@@ -424,6 +424,22 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
             "event_payload_mismatch",
         )
 
+    def test_runtime_skipped_asset_update_is_not_graded_as_applied(self):
+        proposal = self.broken_proposal("floorplan attachment supplied")
+        proposal["updates"] = [{
+            "column": "Floorplan",
+            "value": "synthetic-row07-floorplan.pdf",
+            "confidence": 0.72,
+        }]
+
+        result = grade_case(
+            self.cases["floorplan attachment supplied"],
+            proposal,
+        )
+
+        self.assertNotIn("unexpected_update", result["vetoes"])
+        self.assertEqual(0, result["applied_update_count"])
+
     def test_event_contract_cannot_ignore_behavioral_fields(self):
         case = deepcopy(self.cases["alternative with new contact"])
         case["event_payloads"][1]["ignored_fields"] = ["city"]
@@ -443,6 +459,50 @@ class BrokerVoiceLargeCampaignGraderTests(unittest.TestCase):
         result = grade_case(case, proposal)
 
         self.assertNotIn("event_payload_mismatch", result["vetoes"])
+
+    def test_tour_grading_uses_fresh_message_and_effective_safe_draft(self):
+        case = deepcopy(self.cases["tour offer"])
+        proposal = deepcopy(case["offline_proposal"])
+        proposal["events"][0]["question"] = (
+            "Tuesday at 2:00 PM or Wednesday at 3:00 PM?"
+        )
+        proposal["events"][0]["suggestedEmail"] = (
+            "Both times work for us. Attendees: [Your Name]."
+        )
+
+        result = grade_case(case, proposal)
+        effective_event = result["actual_events"][0]
+
+        self.assertNotIn("event_payload_mismatch", result["vetoes"])
+        self.assertEqual(case["conversation"][-1]["content"], effective_event["question"])
+        self.assertNotIn("2:00 PM", effective_event["suggestedEmail"])
+        self.assertNotIn("3:00 PM", effective_event["suggestedEmail"])
+        self.assertNotIn("[Your Name]", effective_event["suggestedEmail"])
+
+    def test_non_tour_contract_cannot_ignore_suggested_email(self):
+        case = deepcopy(self.cases["explicit call request"])
+        case["event_payloads"][0]["ignored_fields"] = ["suggestedEmail"]
+        proposal = deepcopy(case["offline_proposal"])
+        proposal["events"][0]["suggestedEmail"] = "Fabricated follow-up draft"
+
+        result = grade_case(case, proposal)
+
+        self.assertIn("event_payload_mismatch", result["vetoes"])
+
+    def test_optional_new_property_notes_are_validated_when_present(self):
+        case = deepcopy(self.cases["unavailable plus alternative"])
+        case["event_payloads"][1]["optional_must_mention_any"] = {
+            "notes": [["22,000", "22000"], ["available"]],
+        }
+        proposal = deepcopy(case["offline_proposal"])
+        proposal["events"][1]["notes"] = "22,000 SF available"
+
+        valid = grade_case(case, proposal)
+        proposal["events"][1]["notes"] = "Broker approved a lease"
+        invalid = grade_case(case, proposal)
+
+        self.assertNotIn("event_payload_mismatch", valid["vetoes"])
+        self.assertIn("event_payload_mismatch", invalid["vetoes"])
 
     def test_wrong_contact_event_rejects_unsupported_suggested_phone(self):
         proposal = self.broken_proposal("wrong contact")

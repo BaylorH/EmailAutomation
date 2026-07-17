@@ -1738,11 +1738,17 @@ _STREET_SUFFIX_CANONICAL = {
 
 
 def _street_claim_spans(text: str) -> List[tuple]:
-    tokens = list(re.finditer(r"[a-z0-9]+", (text or "").lower()))
+    normalized_text = (text or "").lower()
+    tokens = list(re.finditer(r"[a-z0-9]+", normalized_text))
     claims = []
     for index, token_match in enumerate(tokens):
         number = token_match.group(0)
         if not number.isdigit() or not 1 <= len(number) <= 6:
+            continue
+        # Do not treat the fractional token in a decimal rate (for example the
+        # "20" in "$2.20/SF/year") as a street number when a later word happens
+        # to be a street suffix such as "drive".
+        if token_match.start() > 0 and normalized_text[token_match.start() - 1] == ".":
             continue
         for suffix_index in range(index + 2, min(index + 6, len(tokens))):
             suffix = tokens[suffix_index].group(0)
@@ -1774,12 +1780,117 @@ def _target_street_identity(target_anchor: str) -> Optional[tuple]:
     return _claim_identity(claims[0]) if claims else None
 
 
+_US_STATE_CODES = frozenset({
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi",
+    "id", "il", "in", "ia", "ks", "ky", "la", "me", "md", "ma", "mi",
+    "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj", "nm", "ny", "nc",
+    "nd", "oh", "ok", "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut",
+    "vt", "va", "wa", "wv", "wi", "wy", "dc",
+})
+_NON_LOCATION_LEADS = frozenset({
+    "asking", "available", "availability", "brokerage", "building", "contact",
+    "current", "currently", "executive", "for", "highlights", "industrial",
+    "lease", "offering", "opportunity", "overview", "property", "sale", "see",
+    "summary",
+})
+_UNIT_TOKEN_RE = re.compile(
+    r"(?:^|[ ,\n-])(?:(?:suite|ste)\.?\s*#?|unit\s*#?|#)\s*([a-z0-9-]+)\b",
+    re.IGNORECASE,
+)
+_CLAIM_UNIT_RE = re.compile(
+    r"^[ \t]*(?:,|-|\n)?[ \t]*(?:(?:suite|ste)\.?\s*#?|unit\s*#?|#)"
+    r"\s*([a-z0-9-]+)\b[ \t]*(,)?",
+    re.IGNORECASE,
+)
+
+
+def _normalize_city_identity(value) -> tuple:
+    tokens = value if isinstance(value, tuple) else re.findall(
+        r"[a-z0-9]+", str(value or "").lower()
+    )
+    return tuple("saint" if token in {"st", "saint"} else token for token in tokens)
+
+
+def _target_city_identity(target_anchor: str) -> tuple:
+    parts = (target_anchor or "").rsplit(",", 1)
+    if len(parts) < 2:
+        return ()
+    if _UNIT_TOKEN_RE.search(parts[1]):
+        return ()
+    return _normalize_city_identity(parts[1])
+
+
+def _target_unit_identity(target_anchor: str) -> Optional[str]:
+    match = _UNIT_TOKEN_RE.search(target_anchor or "")
+    return match.group(1).lower() if match else None
+
+
+def _claim_unit_identity(source_text: str, claim: tuple) -> Optional[str]:
+    match = _UNIT_TOKEN_RE.search((source_text or "")[claim[1]:claim[1] + 120])
+    return match.group(1).lower() if match else None
+
+
+def _claim_location_identity(source_text: str, claim: tuple) -> tuple:
+    tail = (source_text or "")[claim[1]:]
+    unit_match = _CLAIM_UNIT_RE.match(tail)
+    unit = unit_match.group(1).lower() if unit_match else None
+    remainder = tail[unit_match.end():] if unit_match else tail
+    comma_delimited = bool(re.match(r"^[ \t]*,", remainder))
+    if unit_match and unit_match.group(2):
+        comma_delimited = True
+
+    location = re.sub(r"^[ \t\n,-]+", "", remainder[:120])
+    location = re.sub(r"\bst\.[ \t]+", "saint ", location, flags=re.IGNORECASE)
+    token_matches = list(re.finditer(r"[a-z0-9]+", location.lower()))
+    for index, token_match in enumerate(token_matches[:7]):
+        if token_match.group(0) not in _US_STATE_CODES or index == 0:
+            continue
+        following = location[token_match.end():]
+        if not re.match(r"^[ \t]*(?:\d{5}(?:-\d{4})?\b|[.,;:]|$)", following):
+            continue
+        city = _normalize_city_identity(tuple(
+            match.group(0) for match in token_matches[:index]
+        ))
+        return unit, city
+
+    if not comma_delimited:
+        return unit, ()
+    city_segment = re.split(r"[,.;:\n]", location, maxsplit=1)[0]
+    city = _normalize_city_identity(city_segment)
+    if not city or city[0] in _NON_LOCATION_LEADS or len(city) > 5:
+        return unit, ()
+    return unit, city
+
+
+def _claim_city_verdict(source_text: str, claim: tuple, target_anchor: str) -> str:
+    target_city = _target_city_identity(target_anchor)
+    if not target_city:
+        return "unknown"
+    _, location_city = _claim_location_identity(source_text, claim)
+    if not location_city:
+        return "unknown"
+    return "match" if location_city == target_city else "mismatch"
+
+
+def _claim_matches_target_property(
+    source_text: str,
+    claim: tuple,
+    target_anchor: str,
+) -> bool:
+    if _claim_identity(claim) != _target_street_identity(target_anchor):
+        return False
+    target_unit = _target_unit_identity(target_anchor)
+    claim_unit = _claim_unit_identity(source_text, claim)
+    if target_unit and target_unit != claim_unit:
+        return False
+    return _claim_city_verdict(source_text, claim, target_anchor) != "mismatch"
+
+
 def _source_mentions_target_property(source_text: str, target_anchor: str) -> bool:
-    target_identity = _target_street_identity(target_anchor)
     return bool(
-        target_identity
+        _target_street_identity(target_anchor)
         and any(
-            _claim_identity(claim) == target_identity
+            _claim_matches_target_property(source_text, claim, target_anchor)
             for claim in _street_claim_spans(source_text)
         )
     )
@@ -1790,8 +1901,10 @@ def _attachment_property_verdict(source_text: str, target_anchor: str) -> str:
     claims = _street_claim_spans(source_text)
     if not claims:
         return "addressless"
-    target_identity = _target_street_identity(target_anchor)
-    matches = [_claim_identity(claim) == target_identity for claim in claims]
+    matches = [
+        _claim_matches_target_property(source_text, claim, target_anchor)
+        for claim in claims
+    ]
     if all(matches):
         return "target"
     if any(matches):
@@ -1835,7 +1948,44 @@ def _attachment_can_supply_target_rent(
     return bool(
         target_identity
         and preceding_claims
-        and _claim_identity(preceding_claims[-1]) == target_identity
+        and _claim_matches_target_property(
+            source_text,
+            preceding_claims[-1],
+            target_anchor,
+        )
+    )
+
+
+def _first_total_sf_match(source_text: str):
+    for match in _TOTAL_SF_RE.finditer(source_text or ""):
+        if _sf_match_is_component(source_text, match):
+            continue
+        normalized = _normalized_numeric_value(match.group(1))
+        if normalized is not None and normalized >= 1000:
+            return match
+    return None
+
+
+def _attachment_can_supply_target_total_sf(
+    source_text: str,
+    target_anchor: str,
+    fresh_text: str,
+) -> bool:
+    verdict = _attachment_property_verdict(source_text, target_anchor)
+    if verdict != "mixed":
+        return _attachment_can_supply_target_facts(source_text, target_anchor, fresh_text)
+    total_match = _first_total_sf_match(source_text)
+    preceding_claims = [
+        claim for claim in _street_claim_spans(source_text)
+        if total_match and claim[1] <= total_match.start()
+    ]
+    return bool(
+        preceding_claims
+        and _claim_matches_target_property(
+            source_text,
+            preceding_claims[-1],
+            target_anchor,
+        )
     )
 
 
@@ -1898,7 +2048,7 @@ def _augment_proposal_with_deterministic_extractions(
         ))
         pdf_total_sf = _extract_total_sf_from_text((pdf or {}).get("text") or "")
         normalized_pdf_total_sf = _normalized_numeric_value(pdf_total_sf)
-        if pdf_total_sf and _attachment_can_supply_target_facts(
+        if pdf_total_sf and _attachment_can_supply_target_total_sf(
             pdf_source, target_anchor, fresh_text
         ):
             trusted_pdf_total_sfs.append(pdf_total_sf)
@@ -1931,23 +2081,38 @@ def _augment_proposal_with_deterministic_extractions(
             _remove_proposal_update(proposal, rent_col)
 
     total_sf_value = _extract_total_sf_from_text(fresh_text)
+    trusted_pdf_total_sf_values = {
+        normalized
+        for normalized in (
+            _normalized_numeric_value(value) for value in trusted_pdf_total_sfs
+        )
+        if normalized is not None
+    }
+    trusted_pdf_total_sf = (
+        trusted_pdf_total_sfs[0]
+        if len(trusted_pdf_total_sf_values) == 1
+        else None
+    )
     existing_total_sf = (
         _proposal_update_for_column(proposal, total_sf_col) if total_sf_col else None
     )
+    if (
+        existing_total_sf
+        and len(trusted_pdf_total_sf_values) > 1
+        and _normalized_numeric_value(total_sf_value) is None
+    ):
+        _remove_proposal_update(proposal, total_sf_col)
+        existing_total_sf = None
     if existing_total_sf:
         proposed_total_sf = _normalized_numeric_value(existing_total_sf.get("value"))
         normalized_total_sf = _normalized_numeric_value(total_sf_value)
-        trusted_total_sfs = {
-            normalized
-            for normalized in (
-                [normalized_total_sf]
-                + [
-                    _normalized_numeric_value(value)
-                    for value in trusted_pdf_total_sfs
-                ]
-            )
-            if normalized is not None
-        }
+        trusted_total_sfs = (
+            {normalized_total_sf}
+            if normalized_total_sf is not None
+            else trusted_pdf_total_sf_values
+            if len(trusted_pdf_total_sf_values) == 1
+            else set()
+        )
         if trusted_total_sfs and proposed_total_sf not in trusted_total_sfs:
             _remove_proposal_update(proposal, total_sf_col)
         elif (
@@ -2007,8 +2172,8 @@ def _augment_proposal_with_deterministic_extractions(
     )
     _fill(
         total_sf_col,
-        total_sf_value,
-        "Deterministic fallback parsed total square footage from the latest broker message.",
+        total_sf_value or trusted_pdf_total_sf,
+        "Deterministic fallback parsed total square footage from the broker's matched evidence.",
     )
     _fill(
         mappings.get("drive_ins") or _find_header_name(header, "Drive Ins"),

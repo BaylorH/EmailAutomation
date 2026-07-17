@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -44,6 +45,12 @@ SAFETY_VETOES = {
     "unexpected_response",
 }
 IGNORABLE_EVENT_METADATA_FIELDS = {"schemaVersion"}
+EVENT_CONDITION_KEYS = ("equals", "one_of", "must_mention_any")
+OPTIONAL_EVENT_CONDITION_KEYS = (
+    "optional_equals",
+    "optional_one_of",
+    "optional_must_mention_any",
+)
 
 FIELD_ALIASES = {
     "Total SF": ("total sf", "square footage", "building size"),
@@ -153,6 +160,15 @@ def _normalize_update_value(column: object, value: object) -> str:
     return _normalize_value(value)
 
 
+def _runtime_skipped_asset_columns(case: dict) -> set[str]:
+    mappings = case.get("column_config", {}).get("mappings", {})
+    return {
+        _normalize_column(mappings.get(canonical))
+        for canonical in ("flyer_link", "floorplan")
+        if mappings.get(canonical)
+    }
+
+
 def _grade_updates(case: dict, proposal: dict, veto) -> tuple[list, list]:
     expected_updates = case.get("expected_updates", [])
     raw_updates = proposal.get("updates", [])
@@ -166,6 +182,7 @@ def _grade_updates(case: dict, proposal: dict, veto) -> tuple[list, list]:
         if isinstance(update, dict)
     }
     actual_by_column = {}
+    runtime_skipped_asset_columns = _runtime_skipped_asset_columns(case)
     for update in raw_updates:
         if not isinstance(update, dict):
             veto("invalid_proposal")
@@ -173,6 +190,8 @@ def _grade_updates(case: dict, proposal: dict, veto) -> tuple[list, list]:
         column_key = _normalize_column(update.get("column"))
         if not column_key:
             veto("invalid_proposal")
+            continue
+        if column_key in runtime_skipped_asset_columns:
             continue
         if column_key in actual_by_column:
             veto("unexpected_update")
@@ -233,13 +252,43 @@ def _event_conditions_match(actual: dict, conditions: dict) -> bool:
             for acceptable_terms in semantic_groups
         ):
             return False
+
+    for field, expected_value in conditions.get("optional_equals", {}).items():
+        if _has_nonempty_payload_value(actual.get(field)) and (
+            _normalize_value(actual.get(field)) != _normalize_value(expected_value)
+        ):
+            return False
+
+    for field, accepted_values in conditions.get("optional_one_of", {}).items():
+        if not _has_nonempty_payload_value(actual.get(field)):
+            continue
+        actual_value = _normalize_value(actual.get(field))
+        if actual_value not in {
+            _normalize_value(value) for value in accepted_values
+        }:
+            return False
+
+    for field, semantic_groups in conditions.get(
+        "optional_must_mention_any", {}
+    ).items():
+        if not _has_nonempty_payload_value(actual.get(field)):
+            continue
+        actual_value = str(actual.get(field) or "")
+        if any(
+            not any(
+                _contains_semantic_term(actual_value, alias)
+                for alias in acceptable_terms
+            )
+            for acceptable_terms in semantic_groups
+        ):
+            return False
     return True
 
 
 def _event_contract_fields(expected: dict) -> set[str]:
     fields = {"type"}
     for conditions in [expected, *expected.get("any_of", [])]:
-        for key in ("equals", "one_of", "must_mention_any"):
+        for key in (*EVENT_CONDITION_KEYS, *OPTIONAL_EVENT_CONDITION_KEYS):
             fields.update(conditions.get(key, {}))
     fields.update(
         set(expected.get("ignored_fields", []))
@@ -250,7 +299,7 @@ def _event_contract_fields(expected: dict) -> set[str]:
 
 def _alternative_field_matches(actual: dict, field: str, alternatives: list[dict]) -> bool:
     for conditions in alternatives:
-        for condition_name in ("equals", "one_of", "must_mention_any"):
+        for condition_name in (*EVENT_CONDITION_KEYS, *OPTIONAL_EVENT_CONDITION_KEYS):
             field_conditions = conditions.get(condition_name, {})
             if field not in field_conditions:
                 continue
@@ -290,7 +339,7 @@ def _event_payload_matches(actual: dict, expected: dict) -> bool:
     alternative_fields = {
         field
         for conditions in alternatives
-        for condition_name in ("equals", "one_of", "must_mention_any")
+        for condition_name in (*EVENT_CONDITION_KEYS, *OPTIONAL_EVENT_CONDITION_KEYS)
         for field in conditions.get(condition_name, {})
     }
     if any(
@@ -379,6 +428,8 @@ def _load_runtime_helpers(mode: str) -> dict:
         _response_mentions_missing_fields,
         _select_automatic_response_body,
         _select_missing_fields_response_body,
+        _select_tour_evidence_question,
+        _select_tour_notification_suggested_email,
     )
 
     return {
@@ -386,7 +437,44 @@ def _load_runtime_helpers(mode: str) -> dict:
         "response_mentions_missing_fields": _response_mentions_missing_fields,
         "select_automatic_response_body": _select_automatic_response_body,
         "select_missing_fields_response_body": _select_missing_fields_response_body,
+        "select_tour_evidence_question": _select_tour_evidence_question,
+        "select_tour_notification_suggested_email": (
+            _select_tour_notification_suggested_email
+        ),
     }
+
+
+def _runtime_effective_events(
+    case: dict,
+    proposal: dict,
+    runtime_helpers: dict,
+) -> list[dict]:
+    raw_events = proposal.get("events", [])
+    if not isinstance(raw_events, list):
+        return []
+    inbound_messages = [
+        message for message in case.get("conversation", [])
+        if message.get("direction") == "inbound"
+    ]
+    fresh_message = inbound_messages[-1].get("content", "") if inbound_messages else ""
+    events = deepcopy(raw_events)
+    for event in events:
+        if not isinstance(event, dict) or _normalize_value(event.get("type")) != "tour_requested":
+            continue
+        question = runtime_helpers["select_tour_evidence_question"](
+            fresh_message,
+            event.get("question", ""),
+        )
+        event["question"] = question
+        event["suggestedEmail"] = runtime_helpers[
+            "select_tour_notification_suggested_email"
+        ](
+            event.get("suggestedEmail", ""),
+            contact_name=case["row"]["contact_name"],
+            recipient_email=case["row"]["recipient"],
+            question=question,
+        )
+    return events
 
 
 def _apply_proposed_updates(case: dict, proposal: dict) -> tuple[list, list, int]:
@@ -404,6 +492,8 @@ def _apply_proposed_updates(case: dict, proposal: dict) -> tuple[list, list, int
         if not isinstance(update, dict):
             continue
         column_key = _normalize_column(update.get("column"))
+        if column_key in _runtime_skipped_asset_columns(case):
+            continue
         index = column_indexes.get(column_key)
         if index is None:
             continue
@@ -591,7 +681,12 @@ def grade_case(
     expected = case["expect"]
     expected_events = expected["event_types"]
     allowed_optional_events = expected.get("allowed_optional_event_types", [])
-    actual_events = _event_types(proposal)
+    actual_event_payloads = _runtime_effective_events(
+        case,
+        proposal,
+        runtime_helpers,
+    )
+    actual_events = _event_types({"events": actual_event_payloads})
     if not _events_match(
         actual_events,
         expected_events,
@@ -599,9 +694,6 @@ def grade_case(
     ):
         veto("event_types_mismatch")
     raw_events = proposal.get("events", [])
-    actual_event_payloads = (
-        raw_events if isinstance(raw_events, list) else []
-    )
     if not isinstance(raw_events, list):
         veto("invalid_proposal")
     if not _event_payloads_match(

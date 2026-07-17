@@ -2272,20 +2272,43 @@ def _build_tour_fallback_suggested_email(contact_name: str = "", recipient_email
     )
 
 
+def _select_tour_notification_suggested_email(
+    model_suggested_email: str = "",
+    *,
+    contact_name: str = "",
+    recipient_email: str = "",
+    question: str = "",
+) -> str:
+    """Build a safe holding draft without trusting model-made schedule claims."""
+    del model_suggested_email
+    return _build_tour_fallback_suggested_email(
+        contact_name=contact_name,
+        recipient_email=recipient_email,
+        question=question,
+    )
+
+
+def _select_tour_evidence_question(
+    tour_message_text: str = "",
+    model_question: str = "",
+) -> str:
+    """Prefer the fresh broker message over model-authored event wording."""
+    fresh_question = _clean_tour_signal_text(tour_message_text)
+    if fresh_question:
+        return fresh_question
+    return _clean_tour_signal_text(model_question)
+
+
 def _build_default_tour_suggested_email(broker_name: str, question: str = "") -> str:
     greeting_name = (broker_name or "there").strip()
     time_options = _extract_tour_time_options(question)
     duration_sentence = _extract_tour_duration_sentence(question)
 
     if time_options:
-        primary = time_options[0]
-        alternate = time_options[1] if len(time_options) > 1 else None
-        timing_sentence = f"{primary} would work on my end."
-        if alternate:
-            timing_sentence += f" If that time is no longer available, {alternate} could also work."
+        timing_sentence = f"I saw the options you shared: {', '.join(time_options)}."
         if duration_sentence:
             timing_sentence += f"\n\n{duration_sentence}"
-        follow_up = "Could you please confirm what works best?"
+        follow_up = "I'm checking those options against my schedule and will confirm the best time shortly."
     else:
         timing_sentence = "Could you let me know what tour windows are available?"
         follow_up = "Once I have a few options, I can confirm the best fit."
@@ -5122,9 +5145,10 @@ def process_inbox_message(
 
                         tour_message_text = _clean_tour_signal_text(_text_for_ai or _full_text)
                         clean_event = dict(event)
-                        clean_event["question"] = _clean_tour_signal_text(
-                            event.get("question") or tour_message_text
-                        ) or tour_message_text
+                        clean_event["question"] = _select_tour_evidence_question(
+                            tour_message_text,
+                            event.get("question") or "",
+                        )
                         tour_reply_classification = _classify_tour_invite_reply(
                             tour_message_text,
                             event=clean_event,
@@ -5154,7 +5178,12 @@ def process_inbox_message(
                             continue
 
                         question = clean_event.get("question") or "Tour requested"
-                        suggested_email = clean_event.get("suggestedEmail", "")
+                        suggested_email = _select_tour_notification_suggested_email(
+                            clean_event.get("suggestedEmail", ""),
+                            contact_name=contact_name,
+                            recipient_email=to_addr_lower,
+                            question=question,
+                        )
                         reason = "tour_requested"
                         details = "Tour/showing offered - review and approve response"
 
