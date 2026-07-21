@@ -18,9 +18,17 @@ BASE_DELAY_SECONDS = 1.0
 MAX_DELAY_SECONDS = 60.0
 
 
+def is_retryable_sheets_error(error: Exception) -> bool:
+    """Return whether Google Sheets reported a temporary HTTP failure."""
+    if not isinstance(error, HttpError):
+        return False
+    status = getattr(error.resp, "status", None)
+    return status == 429 or (isinstance(status, int) and 500 <= status < 600)
+
+
 def _execute_with_retry(request, operation_name: str = "Sheets API"):
     """
-    Execute a Google Sheets API request with exponential backoff retry on rate limits.
+    Execute a Google Sheets API request with backoff for temporary HTTP failures.
 
     Args:
         request: The prepared API request (before .execute())
@@ -36,20 +44,26 @@ def _execute_with_retry(request, operation_name: str = "Sheets API"):
         try:
             return request.execute()
         except HttpError as e:
-            if e.resp.status == 429:
-                # Rate limit hit - calculate backoff with jitter
+            if is_retryable_sheets_error(e):
                 delay = min(BASE_DELAY_SECONDS * (2 ** attempt), MAX_DELAY_SECONDS)
                 jitter = random.uniform(0, delay * 0.25)
                 total_delay = delay + jitter
 
                 if attempt < MAX_RETRIES - 1:
-                    print(f"⏳ Rate limit hit on {operation_name}, retrying in {total_delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    print(
+                        f"⏳ Temporary Sheets HTTP {e.resp.status} on {operation_name}, "
+                        f"retrying in {total_delay:.1f}s "
+                        f"(attempt {attempt + 1}/{MAX_RETRIES})"
+                    )
                     time.sleep(total_delay)
                 else:
-                    print(f"❌ Rate limit exceeded for {operation_name} after {MAX_RETRIES} attempts")
+                    print(
+                        f"❌ Temporary Sheets HTTP {e.resp.status} persisted for "
+                        f"{operation_name} after {MAX_RETRIES} attempts"
+                    )
                     raise
             else:
-                # Non-rate-limit error, don't retry
+                # Permanent client/auth errors need operator review, not retries.
                 raise
 
     # Should not reach here, but just in case
@@ -652,17 +666,22 @@ def is_floorplan_filename(filename: str) -> bool:
         return False
 
     name_lower = filename.lower()
-    floorplan_patterns = [
+    strong_floorplan_patterns = [
         "floor plan", "floorplan", "floor-plan", "floor_plan",
         "layout",
         "site plan", "siteplan", "site-plan", "site_plan",
         "sealed",      # Sealed architectural drawings
         "blueprint",
-        "bldg",        # Building abbreviation (e.g., "Sealed Bldg C")
         "building plan"
     ]
+    if any(pattern in name_lower for pattern in strong_floorplan_patterns):
+        return True
 
-    return any(pattern in name_lower for pattern in floorplan_patterns)
+    # Explicit document labels are stronger than a generic "Bldg" token.
+    if any(label in name_lower for label in ("brochure", "flyer", "marketing")):
+        return False
+
+    return "bldg" in name_lower
 
 
 # ─────────────────────────────────────────────────────────────────────────────

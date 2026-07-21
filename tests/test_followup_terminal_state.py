@@ -528,6 +528,59 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertIsNone(update["followUpConfig.pausedAt"])
         self.assertIn("followUpConfig.nextFollowUpAt", update)
 
+    def test_auto_response_does_not_restart_exhausted_followups(self):
+        thread_ref = FakeThreadRef({
+            "status": "active",
+            "followUpStatus": "max_reached",
+            "hasInboundReply": True,
+            "followUpConfig": {
+                "enabled": True,
+                "currentFollowUpIndex": 0,
+                "followUps": [
+                    {"waitTime": 1, "waitUnit": "days", "message": "Only follow-up"},
+                ],
+            },
+        })
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)):
+            result = followup.schedule_followup_after_auto_response("uid-1", "thread-1")
+
+        self.assertFalse(result)
+        self.assertEqual(thread_ref.updates, [])
+
+    def test_auto_response_does_not_restart_pending_terminal_followups(self):
+        thread_ref = FakeThreadRef({
+            "status": "active",
+            "followUpStatus": "stopped",
+            "pendingTerminalReason": "requirements_mismatch",
+            "followUpConfig": {
+                "enabled": True,
+                "currentFollowUpIndex": 0,
+                "followUps": [
+                    {"waitTime": 1, "waitUnit": "days", "message": "Follow-up"},
+                ],
+            },
+        })
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)):
+            result = followup.schedule_followup_after_auto_response("uid-1", "thread-1")
+
+        self.assertFalse(result)
+        self.assertEqual(thread_ref.updates, [])
+
+    def test_pending_terminal_decision_blocks_followup_send(self):
+        reason = followup._followup_terminal_block_reason(
+            {
+                "status": "active",
+                "followUpStatus": "waiting",
+                "pendingTerminalReason": "requirements_mismatch",
+            },
+            {"enabled": True, "currentFollowUpIndex": 0, "followUps": [{}]},
+            0,
+        )
+
+        self.assertIn("requirements_mismatch", reason)
+
     def test_followup_blocks_malformed_recipient_before_graph_send(self):
         outbound = FakeMessageDoc({
             "direction": "outbound",

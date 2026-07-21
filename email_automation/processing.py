@@ -21,7 +21,14 @@ from .messaging import (save_message, save_thread_root, index_message_id, index_
                        is_event_handled, mark_event_handled, build_event_key,
                        update_thread_status, get_thread_status, THREAD_STATUS)
 from .logging import write_message_order_test
-from .ai_processing import propose_sheet_updates, apply_proposal_to_sheet, get_row_anchor, check_missing_required_fields, _append_ai_meta
+from .ai_processing import (
+    _append_ai_meta,
+    _source_mentions_target_property,
+    apply_proposal_to_sheet,
+    check_missing_required_fields,
+    get_row_anchor,
+    propose_sheet_updates,
+)
 from .file_handling import fetch_and_process_linked_assets, fetch_and_process_pdfs, upload_pdf_to_drive
 from .notifications import (
     write_notification,
@@ -2188,6 +2195,30 @@ def _should_skip_processing_for_terminal_thread(
     return False
 
 
+def _late_reply_after_followup_exhaustion_patch(
+    thread_data: Optional[Dict[str, Any]],
+    *,
+    message_text: str,
+    has_attachments: bool,
+) -> Optional[Dict[str, Any]]:
+    """Reactivate inbound processing without restarting exhausted follow-ups."""
+    data = thread_data or {}
+    if (
+        data.get("status") != THREAD_STATUS["stopped"]
+        or data.get("statusReason") != "max_followups_reached"
+        or (_is_no_new_reply_text(message_text) and not has_attachments)
+    ):
+        return None
+    return {
+        "status": THREAD_STATUS["active"],
+        "statusReason": "late_reply_after_max_followups",
+        "followUpStatus": "max_reached",
+        "hasInboundReply": True,
+        "lastInboundAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+    }
+
+
 def _extract_tour_time_options(question: str) -> List[str]:
     text = str(question or "").strip()
     if not text or text.lower() == "tour requested":
@@ -2901,7 +2932,10 @@ def _format_event_property(event: Dict[str, Any]) -> str:
 
 
 def _build_property_unavailable_comment(current_date: str, found_keyword: str, events: List[Dict[str, Any]]) -> str:
-    base = f"[{current_date}] Property marked unavailable - contact said: '{found_keyword}'"
+    if found_keyword == "requirements_mismatch":
+        base = f"[{current_date}] Property does not meet client requirements"
+    else:
+        base = f"[{current_date}] Property marked unavailable - contact said: '{found_keyword}'"
     new_property_events = [event for event in (events or []) if event.get("type") == "new_property"]
 
     alternates = []
@@ -2918,6 +2952,137 @@ def _build_property_unavailable_comment(current_date: str, found_keyword: str, e
         return base
 
     return f"{base} ({'; '.join(alternates)})"
+
+
+def _nonviable_status_reason(event: Dict[str, Any]) -> str:
+    return _event_text(event or {}, "reason") or "property_unavailable"
+
+
+def _pending_nonviable_followup_patch(
+    events: List[Dict[str, Any]],
+    *,
+    row_anchor: str,
+    message_text: str,
+) -> Optional[Dict[str, Any]]:
+    """Stop follow-up eligibility before retryable sheet work begins."""
+    for event in (events or []):
+        if (event or {}).get("type") != "property_unavailable":
+            continue
+        if not _property_unavailable_event_applies_to_row(
+            event,
+            row_anchor=row_anchor,
+            message_text=message_text,
+            unavailable_keywords=PROPERTY_UNAVAILABLE_KEYWORDS,
+        ):
+            continue
+        return {
+            "followUpStatus": "stopped",
+            "followUpConfig.nextFollowUpAt": None,
+            "followUpConfig.processingBy": None,
+            "followUpConfig.processingAt": None,
+            "pendingTerminalReason": _nonviable_status_reason(event),
+            "pendingTerminalAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+    return None
+
+
+_PROPERTY_ANCHOR_STOPWORDS = {
+    "adjacent", "building", "built", "city", "development", "location",
+    "new", "newly", "park", "property", "tbd", "the", "to", "town",
+}
+
+
+def _attachment_source_text(attachment: Dict[str, Any]) -> str:
+    return "\n".join((
+        str((attachment or {}).get("name") or ""),
+        str((attachment or {}).get("text") or ""),
+    ))
+
+
+def _attachment_matches_event_property(
+    attachment: Dict[str, Any],
+    event: Dict[str, Any],
+) -> bool:
+    event_anchor = ", ".join(
+        value for value in (
+            _event_text(event, "address"),
+            _event_text(event, "city"),
+        ) if value
+    )
+    source = _attachment_source_text(attachment)
+    if event_anchor and _source_mentions_target_property(source, event_anchor):
+        return True
+
+    anchor_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", event_anchor.lower())
+        if len(token) >= 3 and token not in _PROPERTY_ANCHOR_STOPWORDS
+    }
+    source_tokens = set(re.findall(r"[a-z0-9]+", source.lower()))
+    return len(anchor_tokens & source_tokens) >= 2
+
+
+def _partition_property_attachments(
+    pdf_manifest: List[Dict[str, Any]],
+    *,
+    current_anchor: str,
+    events: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[List[Dict[str, Any]]]]:
+    """Partition assets between the current row and pending replacement rows."""
+    new_property_events = [
+        event for event in (events or [])
+        if (event or {}).get("type") == "new_property"
+    ]
+    if not new_property_events:
+        if any(
+            (event or {}).get("type") == "needs_user_input"
+            and (event or {}).get("reason") == "multi_property_attachment"
+            for event in (events or [])
+        ):
+            return [
+                attachment for attachment in (pdf_manifest or [])
+                if _source_mentions_target_property(
+                    _attachment_source_text(attachment),
+                    current_anchor,
+                )
+            ], []
+        return list(pdf_manifest or []), []
+
+    current_assets: List[Dict[str, Any]] = []
+    event_assets: List[List[Dict[str, Any]]] = [[] for _ in new_property_events]
+    for attachment in (pdf_manifest or []):
+        source = _attachment_source_text(attachment)
+        if _source_mentions_target_property(source, current_anchor):
+            current_assets.append(attachment)
+            continue
+
+        matched_index = next((
+            index for index, event in enumerate(new_property_events)
+            if _attachment_matches_event_property(attachment, event)
+        ), None)
+        if matched_index is None:
+            # In a replacement-property reply, an unresolved asset is safer on
+            # the pending replacement than on the established current row.
+            matched_index = 0
+        event_assets[matched_index].append(attachment)
+
+    return current_assets, event_assets
+
+
+def _categorize_property_asset_links(
+    pdf_manifest: List[Dict[str, Any]],
+) -> tuple[List[str], List[str]]:
+    flyer_links: List[str] = []
+    floorplan_links: List[str] = []
+    for attachment in (pdf_manifest or []):
+        link = attachment.get("drive_link")
+        if not link:
+            continue
+        if is_floorplan_filename(attachment.get("name", "")):
+            floorplan_links.append(link)
+        else:
+            flyer_links.append(link)
+    return flyer_links, floorplan_links
 
 
 def _has_new_property_path(
@@ -4149,6 +4314,20 @@ def process_inbox_message(
             thread_data["statusReason"] = "manual_continuation_resumed"
             thread_status = THREAD_STATUS["active"]
 
+    late_reply_patch = _late_reply_after_followup_exhaustion_patch(
+        thread_data,
+        message_text=_text_for_ai,
+        has_attachments=has_attachments,
+    )
+    if late_reply_patch and not client_denied:
+        thread_ref.set(late_reply_patch, merge=True)
+        thread_data.update(late_reply_patch)
+        thread_status = THREAD_STATUS["active"]
+        print(
+            f"↩️ Reactivated thread {thread_id[:20]}... for a broker reply received "
+            "after follow-ups were exhausted"
+        )
+
     # Terminal threads keep late replies for history but must not generate new AI work or auto-replies,
     # except when the user approved a same-contact replacement property in this email thread.
     replacement_context = _active_replacement_context(thread_data, _full_text)
@@ -4162,6 +4341,8 @@ def process_inbox_message(
             "status": THREAD_STATUS["active"],
             "followUpStatus": "waiting",
             "statusReason": "same_contact_replacement_reply",
+            "pendingTerminalReason": None,
+            "pendingTerminalAt": None,
             "updatedAt": SERVER_TIMESTAMP,
         }
         thread_ref.set(thread_patch, merge=True)
@@ -4503,6 +4684,19 @@ def process_inbox_message(
             row_anchor = get_row_anchor(rowvals, header)
 
             events = _order_events_for_processing(_proposal_events(proposal))
+            current_pdf_manifest, new_property_pdf_groups = _partition_property_attachments(
+                pdf_manifest,
+                current_anchor=row_anchor,
+                events=events,
+            )
+            new_property_events = [
+                event for event in events
+                if (event or {}).get("type") == "new_property"
+            ]
+            new_property_pdf_by_event = {
+                id(event): new_property_pdf_groups[index]
+                for index, event in enumerate(new_property_events)
+            }
             # Deterministic stale-event skip: with terminalizing events ordered
             # last, an informational event (tour/call/question) for a row this
             # SAME proposal is about to kill must still be skipped — precompute
@@ -4517,6 +4711,17 @@ def process_inbox_message(
                 )
                 for e in events
             )
+            pending_nonviable_patch = _pending_nonviable_followup_patch(
+                events,
+                row_anchor=row_anchor,
+                message_text=_full_text,
+            )
+            if pending_nonviable_patch:
+                thread_ref.update(pending_nonviable_patch)
+                thread_data.update(pending_nonviable_patch)
+                print(
+                    "🛑 Follow-up eligibility stopped before non-viable sheet work"
+                )
             print(f"\n{'='*60}")
             print(f"📋 EVENT PROCESSING: {len(events)} event(s) detected by AI")
             print(f"{'='*60}")
@@ -4842,6 +5047,8 @@ def process_inbox_message(
                         mark_event_handled(user_id, thread_id, event_key, msg_id, None)
                         continue
 
+                    terminal_reason = _nonviable_status_reason(event)
+
                     # Check if row is already below NON-VIABLE divider - if so, skip processing
                     try:
                         tab_title = _get_first_tab_title(sheets, sheet_id)
@@ -4854,13 +5061,18 @@ def process_inbox_message(
                                 user_id,
                                 rownum,
                                 client_id=client_id,
-                                reason="property_unavailable",
+                                reason=terminal_reason,
                             )
-                            update_thread_status(user_id, thread_id, THREAD_STATUS["stopped"], "property_unavailable")
+                            update_thread_status(
+                                user_id,
+                                thread_id,
+                                THREAD_STATUS["stopped"],
+                                terminal_reason,
+                            )
                             unavailable_thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
                             unavailable_thread_ref.set({
                                 "nonViableAt": SERVER_TIMESTAMP,
-                                "nonViableReason": event.get("reason") or "already_below_nonviable",
+                                "nonViableReason": terminal_reason,
                                 "followUpStatus": "stopped",
                                 "updatedAt": SERVER_TIMESTAMP,
                             }, merge=True)
@@ -4884,6 +5096,11 @@ def process_inbox_message(
 
                     # Find keyword for logging purposes (optional - AI already detected unavailability)
                     found_keyword = next((kw for kw in PROPERTY_UNAVAILABLE_KEYWORDS if kw in message_content), "AI-detected unavailability")
+                    comment_reason = (
+                        terminal_reason
+                        if terminal_reason == "requirements_mismatch"
+                        else found_keyword
+                    )
                     print(f"🔍 Processing property_unavailable event (trigger: '{found_keyword}')")
 
                     try:
@@ -4898,15 +5115,20 @@ def process_inbox_message(
                                 user_id,
                                 new_rownum,
                                 client_id=client_id,
-                                reason="property_unavailable",
+                                reason=terminal_reason,
                             )
                             if stopped_thread_count == 0:
-                                update_thread_status(user_id, thread_id, THREAD_STATUS["stopped"], "property_unavailable")
+                                update_thread_status(
+                                    user_id,
+                                    thread_id,
+                                    THREAD_STATUS["stopped"],
+                                    terminal_reason,
+                                )
                             unavailable_thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
                             unavailable_thread_ref.set({
                                 "rowNumber": new_rownum,
                                 "nonViableAt": SERVER_TIMESTAMP,
-                                "nonViableReason": found_keyword,
+                                "nonViableReason": terminal_reason,
                                 "followUpStatus": "stopped",
                                 "updatedAt": SERVER_TIMESTAMP,
                             }, merge=True)
@@ -4923,7 +5145,7 @@ def process_inbox_message(
                                     # Create comment explaining why property was marked unviable.
                                     unavailable_comment = _build_property_unavailable_comment(
                                         current_date,
-                                        found_keyword,
+                                        comment_reason,
                                         events,
                                     )
                                     
@@ -4978,7 +5200,11 @@ def process_inbox_message(
                                 thread_id=thread_id,
                                 row_number=new_rownum,
                                 row_anchor=row_anchor,
-                                meta={"address": event.get("address", ""), "city": event.get("city", "")},
+                                meta={
+                                    "address": event.get("address", ""),
+                                    "city": event.get("city", ""),
+                                    "reason": terminal_reason,
+                                },
                                 dedupe_key=f"property_unavailable:{thread_id}:{new_rownum}:moved"
                             )
                             mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
@@ -4998,6 +5224,7 @@ def process_inbox_message(
 
                 elif event_type == "new_property":
                     try:
+                        event_pdf_manifest = new_property_pdf_by_event.get(id(event), [])
                         address = _event_text(event, "address")
                         city = _event_text(event, "city")
                         # AI can provide specific email for new property contact (different from current sender)
@@ -5099,7 +5326,7 @@ def process_inbox_message(
 
                         # Create ACTION_NEEDED notification for approval (no row created yet)
                         property_image_candidate = select_property_image_candidate(
-                            pdf_manifest,
+                            event_pdf_manifest,
                             address=address,
                             city=city,
                             source_url=link,
@@ -5137,7 +5364,7 @@ def process_inbox_message(
                                 # Client criteria for AI email generation on frontend
                                 "clientCriteria": client_criteria,
                                 # PDF links to be applied to new row when created
-                                "pdfLinks": [p.get('drive_link') for p in (pdf_manifest or []) if p.get('drive_link')],
+                                "pdfLinks": [p.get('drive_link') for p in event_pdf_manifest if p.get('drive_link')],
                                 # Full PDF manifest for AI extraction when new property row is created
                                 # Includes extracted text so we can pre-fill columns
                                 "pdfManifest": [
@@ -5151,7 +5378,7 @@ def process_inbox_message(
                                         "property_image_source_type": p.get("property_image_source_type"),
                                         "property_image_meta": p.get("property_image_meta"),
                                     }
-                                    for p in (pdf_manifest or [])
+                                    for p in event_pdf_manifest
                                 ],
                                 # Hosted property image previews for the eventual new row.
                                 # This intentionally excludes raw extracted images/base64.
@@ -5532,39 +5759,40 @@ def process_inbox_message(
                     except Exception as e:
                         print(f"❌ Failed to handle property_issue: {e}")
 
-            # DEFERRED PDF LINK WRITING: Only write to current row if NOT a new_property scenario
-            # If new_property was detected, the PDFs belong to the new property, not this row
             has_new_property_path = _has_new_property_path(
                 events,
                 new_row_created=new_row_created,
                 new_property_pending_created=new_property_pending_created,
             )
-            if pdf_manifest and not has_new_property_path:
+            current_flyer_links, current_floorplan_links = _categorize_property_asset_links(
+                current_pdf_manifest
+            )
+            if current_pdf_manifest:
                 pdf_link_updates_for_results: Dict[str, List[str]] = {}
                 try:
                     sheets = _sheets_client()
                     property_image_candidate = select_property_image_candidate(
-                        pdf_manifest,
+                        current_pdf_manifest,
                         address=row_anchor,
                     )
                     property_image_updates_for_results: Dict[str, List[str]] = {}
 
-                    if flyer_links:
-                        flyer_updates = append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, flyer_links)
+                    if current_flyer_links:
+                        flyer_updates = append_links_to_flyer_link_column(sheets, sheet_id, header, rownum, current_flyer_links)
                         for column, added_flyer_links in flyer_updates.items():
                             pdf_link_updates_for_results[column] = added_flyer_links
-                        print(f"   🔗 Applied {len(flyer_links)} flyer link(s) to current row")
+                        print(f"   🔗 Applied {len(current_flyer_links)} flyer link(s) to current row")
 
                     # Delay between writes to avoid Google Sheets API rate limits
-                    if flyer_links and floorplan_links:
+                    if current_flyer_links and current_floorplan_links:
                         print("   ⏳ Waiting 30s before next sheet write to avoid rate limits...")
                         time.sleep(30)
 
-                    if floorplan_links:
-                        floorplan_updates = append_links_to_floorplan_column(sheets, sheet_id, header, rownum, floorplan_links)
+                    if current_floorplan_links:
+                        floorplan_updates = append_links_to_floorplan_column(sheets, sheet_id, header, rownum, current_floorplan_links)
                         for column, added_floorplan_links in floorplan_updates.items():
                             pdf_link_updates_for_results[column] = added_floorplan_links
-                        print(f"   📐 Applied {len(floorplan_links)} floorplan link(s) to current row")
+                        print(f"   📐 Applied {len(current_floorplan_links)} floorplan link(s) to current row")
 
                     property_image_updates = build_property_image_sheet_updates(
                         header,
@@ -5599,7 +5827,7 @@ def process_inbox_message(
                             print("   🖼️ Applied hosted property image preview to current row")
 
                     # Re-read header in case we just created columns
-                    if flyer_links or floorplan_links or property_image_updates_for_results:
+                    if current_flyer_links or current_floorplan_links or property_image_updates_for_results:
                         try:
                             tab_title = _get_first_tab_title(sheets, sheet_id)
                             header = _read_header_row2(sheets, sheet_id, tab_title)
@@ -5618,7 +5846,7 @@ def process_inbox_message(
                             rowvals,
                             thread_id,
                             to_addr_lower,
-                            pdf_manifest,
+                            current_pdf_manifest,
                             pdf_link_updates_for_results,
                         )
                     if property_image_updates_for_results:
@@ -5647,13 +5875,13 @@ def process_inbox_message(
                         thread_id,
                         internet_message_id or msg_id,
                         to_addr_lower,
-                        pdf_manifest,
+                        current_pdf_manifest,
                         pdf_link_updates_for_results,
                     )
                 except Exception as e:
                     print(f"⚠️ Failed to write PDF link/property image metadata to sheet: {e}")
             elif pdf_manifest and has_new_property_path:
-                print(f"   ℹ️ Skipping PDF link write to old row - PDFs belong to new property path")
+                print("   ℹ️ Attachment links were preserved with pending replacement properties")
 
             # Update the message record with attachment info so frontend can display links
             if pdf_manifest and internet_message_id:

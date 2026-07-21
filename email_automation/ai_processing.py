@@ -287,6 +287,24 @@ def _latest_inbound_text(conversation: List[dict]) -> str:
     return ""
 
 
+def _looks_like_access_remediation(text: str) -> bool:
+    latest_text = _strip_quoted_history(text or "").lower()
+    return bool(
+        re.search(
+            r"\b(?:dock|door|opening)\b.{0,55}\b"
+            r"(?:can|could|may|might|possible\s+to)\b.{0,35}\b"
+            r"(?:ramp(?:ed)?|convert(?:ed)?|modify|add(?:ed)?|install(?:ed)?)\b",
+            latest_text,
+        )
+        or re.search(
+            r"\b(?:can|could|may|might|possible\s+to)\b.{0,35}\b"
+            r"(?:ramp(?:ed)?|convert(?:ed)?|modify|add(?:ed)?|install(?:ed)?)\b"
+            r".{0,45}\b(?:dock|door|drive[-\s]?in|grade[-\s]?level)\b",
+            latest_text,
+        )
+    )
+
+
 def _looks_like_requirements_mismatch_nonviable(text: str) -> bool:
     """Detect broker replies saying the property fails the client's physical
     requirements (office-heavy, not a true warehouse, no drive-in / grade-level
@@ -378,7 +396,10 @@ def _looks_like_requirements_mismatch_nonviable(text: str) -> bool:
     )
 
     physical_mismatch = (
-        office_mismatch or warehouse_mismatch or access_mismatch or height_mismatch
+        office_mismatch
+        or warehouse_mismatch
+        or (access_mismatch and not _looks_like_access_remediation(latest_text))
+        or height_mismatch
     )
 
     return bool(fit_rejection or physical_mismatch)
@@ -1105,6 +1126,31 @@ def _augment_events_with_deterministic_signals(
         sender_name=sender_name,
         contact_name=contact_name,
     )
+    if (
+        _looks_like_access_remediation(latest_text)
+        and not _looks_like_requirements_mismatch_nonviable(latest_text)
+    ):
+        removed_terminal = any(
+            (event or {}).get("type") == "property_unavailable"
+            and str((event or {}).get("reason") or "").strip() == "requirements_mismatch"
+            for event in events
+        )
+        if removed_terminal:
+            events = [
+                event for event in events
+                if not (
+                    (event or {}).get("type") == "property_unavailable"
+                    and str((event or {}).get("reason") or "").strip()
+                    == "requirements_mismatch"
+                )
+            ]
+            if not any((event or {}).get("type") == "needs_user_input" for event in events):
+                events.append({
+                    "type": "needs_user_input",
+                    "reason": "access_remediation_requires_review",
+                    "question": latest_text_raw[:500],
+                })
+            proposal["response_email"] = None
     proposal["events"] = events
 
     # A physical non-fit (office-heavy / not-a-warehouse / no drive-in / below-spec
@@ -1612,7 +1658,12 @@ def _extract_ops_ex_sf_from_text(text: str) -> Optional[str]:
             if annual >= 0.01:
                 return f"{annual:.2f}"
 
-    for m in _OPS_EX_RE.finditer(text):
+    matches = list(_OPS_EX_RE.finditer(text))
+    # An explicit keyword-first figure ("OPEX $4", "CAM is $3") is more
+    # authoritative than an earlier rent figure whose trailing NNN merely names
+    # the lease basis ("$14 NNN, OPEX $4").
+    matches.sort(key=lambda match: match.group(2) is None)
+    for m in matches:
         if _HYPOTHETICAL_RENT_RE.search(text[max(0, m.start() - 40): m.end()]):
             continue
         # Skip a rent-basis line ("Rent $0.82 NNN") so the rent figure is never
@@ -1760,13 +1811,27 @@ def _target_street_identity(target_anchor: str) -> Optional[tuple]:
 
 def _source_mentions_target_property(source_text: str, target_anchor: str) -> bool:
     target_identity = _target_street_identity(target_anchor)
-    return bool(
+    if bool(
         target_identity
         and any(
             _claim_identity(claim) == target_identity
             for claim in _street_claim_spans(source_text)
         )
-    )
+    ):
+        return True
+
+    # Some architectural PDFs expose a completely reversed address in their
+    # text layer (for example "RD AZALP GNILRETS 002"). Treat that exact
+    # reversed street anchor as target evidence instead of losing the permit.
+    street_tokens = re.findall(r"[a-z0-9]+", (target_anchor or "").split(",", 1)[0].lower())
+    if len(street_tokens) < 3:
+        return False
+    normalized_anchor = " ".join(street_tokens)
+    normalized_source = " ".join(re.findall(r"[a-z0-9]+", (source_text or "").lower()))
+    if normalized_anchor in normalized_source:
+        return True
+    reversed_anchor = " ".join(token[::-1] for token in reversed(street_tokens))
+    return reversed_anchor in normalized_source
 
 
 def _attachment_property_verdict(source_text: str, target_anchor: str) -> str:
@@ -1821,6 +1886,114 @@ def _attachment_can_supply_target_rent(
         and preceding_claims
         and _claim_identity(preceding_claims[-1]) == target_identity
     )
+
+
+_CURRENT_PROPERTY_AFFIRMATION_RE = re.compile(
+    r"\b(?:yes[,\s]+)?this\s+(?:space|property|unit|building)\b",
+    re.IGNORECASE,
+)
+
+
+def _suppress_cross_property_current_row_updates(
+    proposal: dict,
+    conversation: List[dict],
+    target_anchor: str,
+) -> dict:
+    """Keep alternate-property facts from being applied to the current row."""
+    if not proposal:
+        return proposal
+
+    events = proposal.get("events") or []
+    event_types = {(event or {}).get("type") for event in events}
+    if "property_unavailable" in event_types:
+        proposal["updates"] = []
+        return proposal
+    if "new_property" not in event_types:
+        return proposal
+
+    fresh_text = _fresh_inbound_text(conversation)
+    if _CURRENT_PROPERTY_AFFIRMATION_RE.search(fresh_text):
+        return proposal
+    if _source_mentions_target_property(fresh_text, target_anchor):
+        return proposal
+
+    target_identity = _target_street_identity(target_anchor)
+    competing_claim_present = bool(
+        target_identity
+        and any(
+            _claim_identity(claim) != target_identity
+            for claim in _street_claim_spans(fresh_text)
+        )
+    )
+    if competing_claim_present:
+        proposal["updates"] = []
+    return proposal
+
+
+_OFFERED_PROPERTY_LANGUAGE_RE = re.compile(
+    r"\b(?:i|we)\s+have\b|\b(?:another|alternative|other)\s+"
+    r"(?:building|property|space|suite|unit)\b|\b\d+\s+buildings?\b",
+    re.IGNORECASE,
+)
+_ROUTE_ADDRESS_RE = re.compile(
+    r"\b\d{1,6}\s+(?:[a-z]+\s+){0,3}(?:sc|us|fm|sr)[-\s]?\d+\b",
+    re.IGNORECASE,
+)
+
+
+def _suppress_competing_attachment_updates(
+    proposal: dict,
+    conversation: List[dict],
+    target_anchor: str,
+    pdf_manifest: List[dict],
+) -> dict:
+    """Escalate an offered off-row brochure when the model misses its property event."""
+    if not proposal or not pdf_manifest:
+        return proposal
+    if any((event or {}).get("type") == "new_property" for event in proposal.get("events") or []):
+        return proposal
+
+    fresh_text = _fresh_inbound_text(conversation)
+    if not _OFFERED_PROPERTY_LANGUAGE_RE.search(fresh_text):
+        return proposal
+
+    sources = [
+        "\n".join((
+            str((pdf or {}).get("name") or ""),
+            str((pdf or {}).get("text") or ""),
+        ))
+        for pdf in pdf_manifest
+    ]
+    if any(_source_mentions_target_property(source, target_anchor) for source in sources):
+        return proposal
+    explicitly_other = any(
+        _attachment_property_verdict(source, target_anchor) == "competing"
+        or _ROUTE_ADDRESS_RE.search(source)
+        for source in sources
+    )
+    if not explicitly_other:
+        return proposal
+
+    proposal["updates"] = []
+    proposal["events"] = [
+        event for event in (proposal.get("events") or [])
+        if (event or {}).get("type") != "tour_requested"
+    ]
+    if not any(
+        (event or {}).get("type") == "needs_user_input"
+        and (event or {}).get("reason") == "multi_property_attachment"
+        for event in proposal["events"]
+    ):
+        proposal["events"].append({
+            "type": "needs_user_input",
+            "reason": "multi_property_attachment",
+            "question": (
+                "The broker offered multiple properties or suites in an attachment, "
+                "but the details could not be bound safely to one row."
+            ),
+        })
+    proposal["response_email"] = None
+    return proposal
 
 
 def _remove_proposal_update(proposal: dict, column_name: Optional[str]) -> None:
@@ -3266,6 +3439,11 @@ DOCUMENT SELECTION & EXTRACTION (strict):
   it as an additional property (then you may emit a new_property event).
 - If a brochure lists multiple options (e.g., Building C & D), pick the option that most clearly matches the TARGET
   PROPERTY/suite. If ambiguous, SKIP that field rather than guessing.
+- If the LAST HUMAN message offers multiple buildings/suites that are not the TARGET PROPERTY, emit one new_property
+  event per distinct qualifying option. Include the building/suite label in each event address and keep each option's
+  own SF, rent, and notes together. Never write an aggregate brochure value or another option's value to the TARGET row.
+- If the offered options cannot be bound safely to distinct buildings/suites, emit needs_user_input with reason
+  "multi_property_attachment" and do not propose TARGET-row updates.
 
 FIELD MINING HINTS:
 - Rent/SF /Yr: look for "$14/SF NNN", "Asking: $15.00/sf/yr (NNN)".
@@ -3867,6 +4045,17 @@ OUTPUT ONLY valid JSON in this exact format:
         proposal = sanitize_new_property_referral_response(
             proposal,
             original_contact_email=email,
+        )
+        proposal = _suppress_cross_property_current_row_updates(
+            proposal,
+            conversation,
+            target_anchor,
+        )
+        proposal = _suppress_competing_attachment_updates(
+            proposal,
+            conversation,
+            target_anchor,
+            pdf_manifest or [],
         )
 
         # ---- Log + store in sheetChangeLog -----------------------------------

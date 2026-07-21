@@ -1,4 +1,5 @@
 import os
+import inspect
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
@@ -9,6 +10,7 @@ os.environ.setdefault(
 import unittest
 
 from email_automation.messaging import THREAD_STATUS
+from email_automation import processing
 from email_automation.processing import _should_skip_processing_for_terminal_thread
 
 
@@ -80,6 +82,66 @@ class ReplyAllCcTerminalStateTest(unittest.TestCase):
                 message_text="Good news -- 456 Oak Avenue is available now, cc leasing@agency.com too.",
             ),
             "stopped-but-reactivated (active replacement) thread must NOT be treated as terminal",
+        )
+
+    def test_late_reply_after_followup_exhaustion_is_reactivated_for_processing(self):
+        thread_data = {
+            "status": THREAD_STATUS["stopped"],
+            "statusReason": "max_followups_reached",
+            "followUpStatus": "max_reached",
+        }
+
+        self.assertTrue(
+            _should_skip_processing_for_terminal_thread(
+                THREAD_STATUS["stopped"],
+                thread_data=thread_data,
+                message_text="The property is available, but it does not meet the power requirement.",
+            ),
+            "a stopped thread remains terminal until the late-reply gate explicitly reactivates it",
+        )
+
+        patch_builder = getattr(
+            processing,
+            "_late_reply_after_followup_exhaustion_patch",
+            None,
+        )
+        self.assertIsNotNone(patch_builder)
+        patch = patch_builder(
+            thread_data,
+            message_text="The property is available, but it does not meet the power requirement.",
+            has_attachments=False,
+        )
+        self.assertEqual(patch["status"], THREAD_STATUS["active"])
+        self.assertEqual(patch["statusReason"], "late_reply_after_max_followups")
+        self.assertEqual(patch["followUpStatus"], "max_reached")
+        self.assertTrue(patch["hasInboundReply"])
+
+        parameters = inspect.signature(patch_builder).parameters
+        self.assertIn("message_text", parameters)
+        self.assertIn("has_attachments", parameters)
+        self.assertIsNone(
+            patch_builder(
+                thread_data,
+                message_text="",
+                has_attachments=False,
+            ),
+            "an empty/quoted-only message must not reopen an exhausted thread",
+        )
+        self.assertTrue(
+            _should_skip_processing_for_terminal_thread(
+                THREAD_STATUS["stopped"],
+                thread_data=thread_data,
+                message_text="",
+            ),
+            "an empty/quoted-only message must remain terminal after the reactivation gate declines it",
+        )
+        self.assertIsNotNone(
+            patch_builder(
+                thread_data,
+                message_text="",
+                has_attachments=True,
+            ),
+            "a late attachment is substantive broker evidence and must be processed",
         )
 
 
