@@ -439,7 +439,12 @@ def _followup_terminal_block_reason(
     status = str((thread_data or {}).get("status") or "").strip().lower()
     followup_status = str((thread_data or {}).get("followUpStatus") or "").strip().lower()
     status_reason = str((thread_data or {}).get("statusReason") or "").strip().lower()
+    pending_terminal_reason = str(
+        (thread_data or {}).get("pendingTerminalReason") or ""
+    ).strip().lower()
 
+    if pending_terminal_reason:
+        return f"the thread has a pending terminal decision: {pending_terminal_reason}"
     if (thread_data or {}).get("hasInboundReply"):
         return "the broker has already replied"
     if status in {"stopped", "completed", "archived", "action_needed", "paused"}:
@@ -1252,7 +1257,11 @@ def schedule_followup_after_auto_response(user_id: str, thread_id: str) -> bool:
             return False
 
         thread_data = thread_doc.to_dict() or {}
+        if thread_data.get("pendingTerminalReason"):
+            return False
         if thread_data.get("status") in {"completed", "stopped"}:
+            return False
+        if thread_data.get("followUpStatus") == "max_reached":
             return False
 
         followup_config = thread_data.get("followUpConfig", {})

@@ -31,6 +31,8 @@ import os
 import unittest
 from unittest import mock
 
+from googleapiclient.errors import HttpError
+
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
     "GOOGLE_APPLICATION_CREDENTIALS",
@@ -186,9 +188,13 @@ class _FakeOutboxDocRef:
     def __init__(self, doc_id):
         self.id = doc_id
         self.deleted = False
+        self.set_calls = []
 
     def delete(self):
         self.deleted = True
+
+    def set(self, data, merge=False):
+        self.set_calls.append((data, merge))
 
 
 def _lower_keys(mapping):
@@ -341,6 +347,46 @@ class UploadMappingWrongRecipientTests(unittest.TestCase):
         diverted, dead_letter = self._run_guard("broker@example.com")
         self.assertFalse(diverted, "on-row recipient must pass the mapping guard")
         dead_letter.assert_not_called()
+
+    def test_transient_sheet_verification_error_retries_without_dead_letter(self):
+        data = {
+            "source": "dashboard_new_campaign",
+            "clientId": "client-1",
+            "rowNumber": self.ROW_NUM,
+            "attempts": 0,
+        }
+        response = mock.Mock(status=500, reason="Internal error encountered")
+        transient_error = HttpError(
+            response,
+            b'{"error":{"message":"Internal error encountered"}}',
+        )
+        doc_ref = _FakeOutboxDocRef("outbox-transient")
+
+        with mock.patch.object(
+            email_mod,
+            "_campaign_sheet_header_and_row",
+            side_effect=transient_error,
+        ), mock.patch.object(email_mod, "_move_to_dead_letter") as dead_letter, mock.patch.object(
+            email_mod,
+            "_mark_outbox_action_audit_retrying",
+        ) as mark_retrying:
+            handled = email_mod._dead_letter_campaign_recipient_row_mismatch_if_needed(
+                "user-1",
+                doc_ref,
+                data,
+                "broker@example.com",
+            )
+
+        self.assertTrue(handled)
+        dead_letter.assert_not_called()
+        self.assertEqual(len(doc_ref.set_calls), 1)
+        retry_patch, merge = doc_ref.set_calls[0]
+        self.assertTrue(merge)
+        self.assertEqual(retry_patch["status"], "retrying")
+        self.assertEqual(retry_patch["attempts"], 1)
+        self.assertIsNone(retry_patch["processingBy"])
+        self.assertIsNone(retry_patch["processingAt"])
+        mark_retrying.assert_called_once()
 
 
 class UploadMappingTerminalStateTests(unittest.TestCase):

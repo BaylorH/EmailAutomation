@@ -21,7 +21,15 @@ from .utils import (
 )
 from .messaging import save_thread_root, save_message, index_message_id, index_conversation_id, lookup_thread_by_message_id
 from .clients import _get_sheet_id_or_fail, _sheets_client
-from .sheets import _find_row_by_email, _get_first_tab_title, _read_header_row2, _header_index_map, _execute_with_retry, highlight_row
+from .sheets import (
+    _execute_with_retry,
+    _find_row_by_email,
+    _get_first_tab_title,
+    _header_index_map,
+    _read_header_row2,
+    highlight_row,
+    is_retryable_sheets_error,
+)
 from .notifications import delete_notification_and_decrement_counters
 from .utils import normalize_message_id
 from .sent_mail_guard import (
@@ -915,6 +923,30 @@ def _dead_letter_campaign_recipient_row_mismatch_if_needed(
         )
         row_emails = _email_values_from_row(header, row_values)
     except Exception as exc:
+        if is_retryable_sheets_error(exc):
+            new_attempts = int(data.get("attempts") or 0) + 1
+            error_msg = (
+                f"Temporary sheet verification failure for row {row_number}: {exc}"
+            )[:1500]
+            if new_attempts < MAX_OUTBOX_ATTEMPTS:
+                doc_ref.set(
+                    {
+                        "attempts": new_attempts,
+                        "lastError": error_msg,
+                        "status": "retrying",
+                        "processingBy": None,
+                        "processingAt": None,
+                    },
+                    merge=True,
+                )
+                _mark_outbox_action_audit_retrying(
+                    user_id,
+                    doc_ref,
+                    data,
+                    new_attempts,
+                    error_msg,
+                )
+                return True
         _move_to_dead_letter(
             user_id,
             doc_ref,
