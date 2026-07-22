@@ -1,0 +1,212 @@
+{
+  "schemaVersion": 1,
+  "catalogId": "sitesift-legacy-shadow-v1",
+  "cases": [
+    {
+      "caseId": "aligned-available-update",
+      "policyCaseId": "available-missing-facts",
+      "provenance": {"kind": "legacy_test_contract", "sourceRef": "tests/standalone_test.py"},
+      "bindings": {"currentEntity": "target", "eventEntities": [], "recipientRelation": "absent"},
+      "legacyProposal": {
+        "updates": [{"column": "Availability", "valueKind": "text"}],
+        "events": [],
+        "responseDraft": true,
+        "skipResponse": false
+      },
+      "expected": {"disposition": "deferred_surface", "severity": "warning", "discrepancyCodes": ["outbound_surface_deferred"]}
+    },
+    {
+      "caseId": "aligned-explicit-unavailable",
+      "policyCaseId": "explicit-unavailable",
+      "provenance": {"kind": "legacy_test_contract", "sourceRef": "tests/test_compound_nonviable_processing.py"},
+      "bindings": {"currentEntity": "target", "eventEntities": ["target"], "recipientRelation": "absent"},
+      "legacyProposal": {
+        "updates": [{"column": "Availability", "valueKind": "text"}],
+        "events": [{"type": "property_unavailable", "reason": "no_longer_available"}],
+        "responseDraft": true,
+        "skipResponse": false
+      },
+      "expected": {"disposition": "deferred_surface", "severity": "warning", "discrepancyCodes": ["outbound_surface_deferred", "row_move_surface_deferred"]}
+    },
+    {
+      "caseId": "tour-only-terminalization-risk",
+      "policyCaseId": "tour-only-unavailable-near-miss",
+      "provenance": {"kind": "historical_probe", "sourceRef": "tests/test_broker_language_broker_tour_unavailable.py"},
+      "bindings": {"currentEntity": "target", "eventEntities": ["target"], "recipientRelation": "absent"},
+      "legacyProposal": {
+        "updates": [],
+        "events": [{"type": "property_unavailable", "reason": "model_misclassification"}],
+        "responseDraft": false,
+        "skipResponse": true
+      },
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_terminalizes_nonterminal"]}
+    },
+    {
+      "caseId": "fit-market-conflation-risk",
+      "policyCaseId": "hard-occupancy-miss",
+      "provenance": {"kind": "synthetic_boundary", "sourceRef": "synthetic/fit-market-conflation"},
+      "bindings": {"currentEntity": "target", "eventEntities": ["target"], "recipientRelation": "absent"},
+      "legacyProposal": {
+        "updates": [
+          {"column": "Availability", "valueKind": "text"},
+          {"column": "Occupancy Date", "valueKind": "text"}
+        ],
+        "events": [{"type": "property_unavailable", "reason": "no_longer_available"}],
+        "responseDraft": true,
+        "skipResponse": false
+      },
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_market_fit_conflation", "outbound_surface_deferred", "row_move_surface_deferred"]}
+    },
+    {
+      "caseId": "backup-offer-terminalization-risk",
+      "policyCaseId": "accepting-backups",
+      "provenance": {"kind": "synthetic_boundary", "sourceRef": "synthetic/backup-offer-terminalization"},
+      "bindings": {"currentEntity": "target", "eventEntities": ["target"], "recipientRelation": "absent"},
+      "legacyProposal": {
+        "updates": [],
+        "events": [{"type": "property_unavailable", "reason": "under_loi"}],
+        "responseDraft": false,
+        "skipResponse": true
+      },
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_bypasses_required_review", "legacy_terminalizes_nonterminal"]}
+    },
+    {
+      "caseId": "split-suite-missing-sibling-update",
+      "policyCaseId": "split-suite-mixed",
+      "provenance": {"kind": "synthetic_boundary", "sourceRef": "synthetic/split-suite-single-row"},
+      "bindings": {"currentEntity": "suite_a", "eventEntities": ["suite_a"], "recipientRelation": "absent"},
+      "legacyProposal": {
+        "updates": [{"column": "Availability", "valueKind": "text"}],
+        "events": [{"type": "property_unavailable", "reason": "no_longer_available"}],
+        "responseDraft": false,
+        "skipResponse": true
+      },
+      "expected": {"disposition": "new_policy_gap", "severity": "release_blocker", "discrepancyCodes": ["legacy_missing_policy_fact", "row_move_surface_deferred"]}
+    },
+    {
+      "caseId": "alternate-property-wrong-row-risk",
+      "policyCaseId": "alternate-property-isolation",
+      "provenance": {"kind": "historical_probe", "sourceRef": "tests/test_colleague_redirect_guard.py"},
+      "bindings": {"currentEntity": "target", "eventEntities": ["target", "alternate"], "recipientRelation": "same"},
+      "legacyProposal": {
+        "updates": [
+          {"column": "Availability", "valueKind": "text"},
+          {"column": "Rent/SF/Yr", "valueKind": "number"}
+        ],
+        "events": [
+          {"type": "property_unavailable", "reason": "no_longer_available"},
+          {"type": "new_property", "reason": "alternate_suggested"}
+        ],
+        "responseDraft": true,
+        "skipResponse": false
+      },
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_unplanned_fact_mutation", "outbound_surface_deferred", "row_move_surface_deferred"]}
+    },
+    {
+      "caseId": "complete-closeout-aligned",
+      "policyCaseId": "complete-required-facts",
+      "provenance": {"kind": "legacy_test_contract", "sourceRef": "tests/test_compound_nonviable_processing.py"},
+      "bindings": {"currentEntity": "target", "eventEntities": ["target"], "recipientRelation": "absent"},
+      "legacyProposal": {
+        "updates": [
+          {"column": "Total SF", "valueKind": "number"},
+          {"column": "Rent/SF/Yr", "valueKind": "number"},
+          {"column": "Ops Ex / SF", "valueKind": "number"}
+        ],
+        "events": [{"type": "close_conversation", "reason": "all_information_received"}],
+        "responseDraft": true,
+        "skipResponse": false
+      },
+      "expected": {"disposition": "deferred_surface", "severity": "warning", "discrepancyCodes": ["outbound_surface_deferred"]}
+    },
+    {
+      "caseId": "out-of-office-policy-improvement",
+      "policyCaseId": "out-of-office-return",
+      "provenance": {"kind": "historical_probe", "sourceRef": "tests/test_out_of_office_wrong_contact_guard.py"},
+      "bindings": {"currentEntity": "contact", "eventEntities": [], "recipientRelation": "absent"},
+      "legacyProposal": {"updates": [], "events": [], "responseDraft": false, "skipResponse": true},
+      "expected": {"disposition": "expected_improvement", "severity": "info", "discrepancyCodes": ["policy_adds_waiting_state"]}
+    },
+    {
+      "caseId": "redirect-held-for-approval",
+      "policyCaseId": "redirect-requires-approval",
+      "provenance": {"kind": "legacy_test_contract", "sourceRef": "tests/test_colleague_redirect_guard.py"},
+      "bindings": {"currentEntity": "contact", "eventEntities": ["contact"], "recipientRelation": "different"},
+      "legacyProposal": {
+        "updates": [],
+        "events": [{"type": "wrong_contact", "reason": "wrong_person"}],
+        "responseDraft": false,
+        "skipResponse": true
+      },
+      "expected": {"disposition": "equivalent", "severity": "none", "discrepancyCodes": []}
+    },
+    {
+      "caseId": "forwarded-redirect-auto-draft-risk",
+      "policyCaseId": "redirect-requires-approval",
+      "provenance": {"kind": "synthetic_boundary", "sourceRef": "synthetic/forwarded-redirect-auto-draft"},
+      "bindings": {"currentEntity": "contact", "eventEntities": ["contact"], "recipientRelation": "different"},
+      "legacyProposal": {
+        "updates": [],
+        "events": [{"type": "wrong_contact", "reason": "forwarded"}],
+        "responseDraft": true,
+        "skipResponse": false
+      },
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_automatic_outbound_during_review"]}
+    },
+    {
+      "caseId": "opt-out-plus-call-held",
+      "policyCaseId": "opt-out-plus-call",
+      "provenance": {"kind": "legacy_test_contract", "sourceRef": "tests/test_battery_ai_processing.py"},
+      "bindings": {"currentEntity": "contact", "eventEntities": ["contact", "contact"], "recipientRelation": "absent"},
+      "legacyProposal": {
+        "updates": [],
+        "events": [
+          {"type": "call_requested", "reason": "broker_requested_call"},
+          {"type": "contact_optout", "reason": "do_not_contact"}
+        ],
+        "responseDraft": true,
+        "skipResponse": true
+      },
+      "expected": {"disposition": "deferred_surface", "severity": "warning", "discrepancyCodes": ["row_move_surface_deferred"]}
+    },
+    {
+      "caseId": "conflicting-availability-auto-mutation-risk",
+      "policyCaseId": "conflicting-availability",
+      "provenance": {"kind": "synthetic_boundary", "sourceRef": "synthetic/conflicting-availability-auto-mutation"},
+      "bindings": {"currentEntity": "target", "eventEntities": [], "recipientRelation": "absent"},
+      "legacyProposal": {
+        "updates": [{"column": "Availability", "valueKind": "text"}],
+        "events": [],
+        "responseDraft": false,
+        "skipResponse": true
+      },
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_bypasses_required_review", "legacy_unplanned_fact_mutation"]}
+    },
+    {
+      "caseId": "unsupported-hard-requirement-review-bypass",
+      "policyCaseId": "unsupported-hard-requirement",
+      "provenance": {"kind": "synthetic_boundary", "sourceRef": "synthetic/unsupported-hard-requirement"},
+      "bindings": {"currentEntity": "target", "eventEntities": [], "recipientRelation": "absent"},
+      "legacyProposal": {
+        "updates": [{"column": "Availability", "valueKind": "text"}],
+        "events": [],
+        "responseDraft": true,
+        "skipResponse": false
+      },
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_automatic_outbound_during_review", "legacy_bypasses_required_review"]}
+    },
+    {
+      "caseId": "unavailable-without-terminal-event",
+      "policyCaseId": "explicit-unavailable",
+      "provenance": {"kind": "synthetic_boundary", "sourceRef": "synthetic/missing-terminal-event"},
+      "bindings": {"currentEntity": "target", "eventEntities": [], "recipientRelation": "absent"},
+      "legacyProposal": {
+        "updates": [{"column": "Availability", "valueKind": "text"}],
+        "events": [],
+        "responseDraft": false,
+        "skipResponse": true
+      },
+      "expected": {"disposition": "new_policy_gap", "severity": "release_blocker", "discrepancyCodes": ["legacy_missing_terminal_freeze", "legacy_missing_terminal_status"]}
+    }
+  ]
+}
