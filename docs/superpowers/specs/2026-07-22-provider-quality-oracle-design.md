@@ -39,15 +39,17 @@ Recorded candidate-validation replay covers all 29 cases, including the previous
 
 Provider pass criteria are:
 
-- exact semantic equality against the provider case's complete accepted-claim set after every proposed claim passes the unchanged deterministic validator;
+- inclusion of every required semantic claim from the provider case after every proposed claim passes the unchanged deterministic validator;
 - exact review category and evidence-index equality;
 - no malformed or validator-rejected provider candidate;
 - complete independent transport accounting;
 - no proposal or outcome variance across repeats.
 
-Semantic equality preserves evidence index, subject, predicate, value, actor role, polarity, modality, unit, effective date, and correction linkage. It intentionally ignores only the exact contiguous `evidenceText` span and the precise accepted confidence number: multiple validator-approved excerpts can support the same fact, and the prompt's `0.99` instruction conflicts with older accepted fixture confidence values between `0.95` and `0.98`. The fixture's full accepted digests remain unchanged and continue to govern deterministic candidate validation; this provider comparator prevents harmless quote or confidence variants from masquerading as model-quality failures.
+Required semantic matching preserves evidence index, subject, predicate, value, actor role, polarity, modality, unit, effective date, and correction linkage, while treating numerically equal integer/float representations as equivalent. It intentionally ignores only the exact contiguous `evidenceText` span and the precise accepted confidence number: multiple validator-approved excerpts can support the same fact, and the prompt's `0.99` instruction conflicts with older accepted fixture confidence values between `0.95` and `0.98`. The fixture's full accepted digests remain unchanged and continue to govern deterministic candidate validation.
 
-The report adds only sorted safe mismatch codes and the provider-quality fixture hash. Allowed mismatch codes distinguish missing/unexpected claims, missing/unexpected reviews, review-binding errors, invalid review categories, and rejected provider candidates. Raw evidence, addresses, emails, model prose, claim values, and review prose remain absent.
+Additional claims are permitted only after they pass the same deterministic evidence, entity, freshness, actor, predicate, and conflict validators. The source candidate catalog proves required behavior, but it does not prove that every other validator-approved claim is wrong; treating its union as an exhaustive output list would repeat the candidate-oracle mistake. Redundant valid claims remain visible for the later deterministic policy layer to turn into no-ops. Missing required claims, rejected candidates, wrong reviews, or semantic replacements still fail.
+
+The report adds only sorted safe mismatch codes and the provider-quality fixture hash. Allowed mismatch codes distinguish missing required claims, missing/unexpected reviews, review-binding errors, invalid review categories, rejected provider candidates, and fixed-field semantic differences. Raw evidence, addresses, emails, model prose, claim values, and review prose remain absent.
 
 ## Failure And Cost Policy
 

@@ -333,6 +333,7 @@ class _ProviderQualityRecordedAdapter:
         rejected_candidate_case="",
         detail_mismatch_case="",
         nonsemantic_variation_case="",
+        additional_accepted_claim_case="",
     ):
         self._provider_cases = {
             case.case_id: case for case in provider_catalog.cases
@@ -346,6 +347,7 @@ class _ProviderQualityRecordedAdapter:
         self._rejected_candidate_case = rejected_candidate_case
         self._detail_mismatch_case = detail_mismatch_case
         self._nonsemantic_variation_case = nonsemantic_variation_case
+        self._additional_accepted_claim_case = additional_accepted_claim_case
         self.calls = 0
 
     def propose(self, *, case_id, request, evidence, entities):
@@ -411,6 +413,17 @@ class _ProviderQualityRecordedAdapter:
                 if item.evidence_id == target["evidenceId"]
             )
             target["confidence"] = 0.91
+            numeric = next(
+                (
+                    claim
+                    for claim in model_claims
+                    if isinstance(claim["value"], int)
+                    and not isinstance(claim["value"], bool)
+                ),
+                None,
+            )
+            if numeric is not None:
+                numeric["value"] = float(numeric["value"])
         if case_id == self._rejected_candidate_case:
             rejected = next(
                 source.claims[index]
@@ -420,6 +433,30 @@ class _ProviderQualityRecordedAdapter:
                 if index not in source.expected["acceptedClaimIndexes"]
             )
             model_claims.append(materialize(rejected))
+        if case_id == self._additional_accepted_claim_case:
+            target = next(item for item in entities if item.relationship == "target")
+            target_evidence = next(
+                item
+                for item in evidence
+                if item.evidence_id in target.evidence_ids
+                and target.label in item.content
+            )
+            model_claims.append(
+                {
+                    "evidenceId": target_evidence.evidence_id,
+                    "subjectEntityId": target.entity_id,
+                    "predicate": "identity",
+                    "value": target.label,
+                    "evidenceText": target.label,
+                    "actorRole": target_evidence.actor.role.value,
+                    "polarity": "positive",
+                    "modality": "asserted",
+                    "confidence": 0.99,
+                    "unit": None,
+                    "effectiveAt": None,
+                    "supersedesClaimId": None,
+                }
+            )
         reviews = [
             {
                 "evidenceId": evidence[item.evidence_index].evidence_id,
@@ -891,6 +928,39 @@ class ReplayExecutionTests(unittest.TestCase):
         )
         self.assertEqual((), complete.quality_mismatch_codes)
         self.assertEqual((), complete.claim_mismatch_field_counts)
+
+    def test_provider_quality_allows_additional_validator_accepted_claims(self):
+        telemetry = _MutableTelemetry()
+        adapter = _ProviderQualityRecordedAdapter(
+            self.provider_quality_catalog,
+            self.claim_catalog,
+            telemetry,
+            additional_accepted_claim_case="complete-property-facts",
+        )
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=self.claim_catalog,
+            provider_quality_catalog=self.provider_quality_catalog,
+            adapter=adapter,
+            identity=self._identity(
+                adapter,
+                repeats=1,
+                evaluation_profile="provider_quality",
+                evaluation_fixture_hash=self.provider_quality_catalog.manifest_hash,
+                case_count=len(self.provider_quality_catalog.cases),
+            ),
+            telemetry=telemetry,
+        )
+
+        self.assertTrue(report.passed)
+        complete = next(
+            item
+            for item in report.results
+            if item.case_id == "complete-property-facts"
+        )
+        self.assertEqual(14, complete.accepted_claim_count)
+        self.assertEqual((), complete.quality_mismatch_codes)
 
     def test_dirty_source_can_pass_evaluation_but_not_reproducible_gate(self):
         adapter = self._adapter()

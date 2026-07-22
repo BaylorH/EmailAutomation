@@ -1049,14 +1049,25 @@ def _actual_claim_outcome(
 def _provider_quality_claim_outcome(
     items: tuple[dict[str, object], ...],
 ) -> tuple[str, ...]:
+    def semantic_json(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {str(key): semantic_json(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [semantic_json(item) for item in value]
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+
     return tuple(
         sorted(
             _digest(
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key not in {"evidenceText", "confidence"}
-                }
+                semantic_json(
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if key not in {"evidenceText", "confidence"}
+                    }
+                )
             )
             for item in items
         )
@@ -1200,11 +1211,10 @@ def _provider_quality_mismatches(
     mismatches = set(review_parse_mismatches)
     expected_claims = set(expected_claim_digests)
     actual_claims = set(actual_claim_digests)
-    if expected_claims - actual_claims:
+    missing_claims = expected_claims - actual_claims
+    if missing_claims:
         mismatches.add("missing_expected_claims")
-    if actual_claims - expected_claims:
-        mismatches.add("unexpected_claims")
-    if expected_claims != actual_claims:
+    if missing_claims:
         if expected_predicate_counts == actual_predicate_counts:
             mismatches.add("claim_detail_mismatch")
         else:
