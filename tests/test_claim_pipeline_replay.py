@@ -331,6 +331,7 @@ class _ProviderQualityRecordedAdapter:
         invalid_review_category_case="",
         wrong_review_evidence_case="",
         rejected_candidate_case="",
+        detail_mismatch_case="",
     ):
         self._provider_cases = {
             case.case_id: case for case in provider_catalog.cases
@@ -342,6 +343,7 @@ class _ProviderQualityRecordedAdapter:
         self._invalid_review_category_case = invalid_review_category_case
         self._wrong_review_evidence_case = wrong_review_evidence_case
         self._rejected_candidate_case = rejected_candidate_case
+        self._detail_mismatch_case = detail_mismatch_case
         self.calls = 0
 
     def propose(self, *, case_id, request, evidence, entities):
@@ -396,6 +398,13 @@ class _ProviderQualityRecordedAdapter:
         model_claims = list(claims.values())
         if case_id == self._missing_claim_case and model_claims:
             model_claims.pop()
+        if case_id == self._detail_mismatch_case and model_claims:
+            target = model_claims[0]
+            target["evidenceText"] = next(
+                item.content
+                for item in evidence
+                if item.evidence_id == target["evidenceId"]
+            )
         if case_id == self._rejected_candidate_case:
             rejected = next(
                 source.claims[index]
@@ -754,6 +763,10 @@ class ReplayExecutionTests(unittest.TestCase):
             {item.case_id for item in report.results},
         )
         self.assertTrue(all(not item.quality_mismatch_codes for item in report.results))
+        complete = next(
+            item for item in report.results if item.case_id == "complete-property-facts"
+        )
+        self.assertEqual(13, sum(dict(complete.accepted_predicate_counts).values()))
 
     def test_provider_quality_reports_only_safe_mismatch_categories(self):
         scenarios = (
@@ -780,6 +793,10 @@ class ReplayExecutionTests(unittest.TestCase):
                     )
                 },
                 "provider_candidate_rejected",
+            ),
+            (
+                {"detail_mismatch_case": "complete-property-facts"},
+                "claim_detail_mismatch",
             ),
         )
 

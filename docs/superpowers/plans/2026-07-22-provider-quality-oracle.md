@@ -28,6 +28,12 @@
 ### Task 4: Verify And Measure
 
 - [x] Run fixture, replay, provider, CLI, isolation, compilation, focused, full, and diff-integrity checks.
-- [ ] Commit a clean implementation checkpoint and rerun the clean recorded three-repeat replay.
-- [ ] Run one clean 19-call provider repeat and record exact quality, calls, tokens, latency, and cost.
+- [x] Commit a clean implementation checkpoint and rerun the clean recorded three-repeat replay.
+- [x] Run one clean 19-call provider repeat and record exact quality, calls, tokens, latency, and cost.
 - [ ] Run the 57-call variance gate only if the one-repeat quality gate passes unchanged.
+
+### Measured Checkpoint
+
+Backend `dfdb830` passed the clean recorded gate with 57/57 interpretation and 87/87 candidate-validation outcomes. Its clean provider-quality run completed exactly 19/19 billed calls with complete usage, zero transport errors, 36,833 input tokens, 4,388 output tokens, 61,023 ms aggregate latency, and 125,889 micro-USD. Six of 19 complete-request cases passed. The 57-call variance run was stopped. The failure report remained privacy-safe and contained no raw addresses, email identifiers, claim values, or review prose.
+
+The next iteration adds predicate-count and exact-detail mismatch classes before another paid run. Accepted claim digests, complete request groups, and review expectations remain unchanged.

@@ -537,6 +537,7 @@ class ReplayCaseResult:
     proposal_digest: str
     outcome_digest: str
     accepted_claim_count: int
+    accepted_predicate_counts: tuple[tuple[str, int], ...]
     issue_codes: tuple[str, ...]
     quality_mismatch_codes: tuple[str, ...]
     passed: bool
@@ -551,6 +552,7 @@ class ReplayCaseResult:
             "proposalDigest": self.proposal_digest,
             "outcomeDigest": self.outcome_digest,
             "acceptedClaimCount": self.accepted_claim_count,
+            "acceptedPredicateCounts": dict(self.accepted_predicate_counts),
             "issueCodes": list(self.issue_codes),
             "qualityMismatchCodes": list(self.quality_mismatch_codes),
             "passed": self.passed,
@@ -932,6 +934,39 @@ def _claim_oracle(case) -> tuple[str, ...]:
     return tuple(case.expected["acceptedClaimDigests"])
 
 
+def _string_counts(values: tuple[str, ...]) -> tuple[tuple[str, int], ...]:
+    counts = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return tuple(sorted(counts.items()))
+
+
+def _accepted_predicate_counts(claims: tuple[Claim, ...]) -> tuple[tuple[str, int], ...]:
+    return _string_counts(
+        tuple(item.predicate.value for item in claims)
+    )
+
+
+def _provider_expected_predicate_counts(
+    evaluation_case: object,
+    claim_by_id: Mapping[str, object],
+) -> tuple[tuple[str, int], ...]:
+    predicates_by_digest = {}
+    for source_case_id in evaluation_case.source_claim_case_ids:
+        source_case = claim_by_id[source_case_id]
+        for index in source_case.expected["acceptedClaimIndexes"]:
+            raw = source_case.claims[index]
+            predicates_by_digest[_digest(_plain_json(raw))] = raw["predicate"]
+    expected_digests = set(evaluation_case.expected_claim_digests)
+    return _string_counts(
+        tuple(
+            predicate
+            for digest, predicate in predicates_by_digest.items()
+            if digest in expected_digests
+        )
+    )
+
+
 def _actual_claim_outcome(
     claims: tuple[Claim, ...],
     evidence: tuple[EvidenceEnvelope, ...],
@@ -1064,6 +1099,8 @@ def _provider_quality_mismatches(
     expected_claim_digests: tuple[str, ...],
     expected_reviews: tuple[ProviderReviewExpectation, ...],
     actual_claim_digests: tuple[str, ...],
+    expected_predicate_counts: tuple[tuple[str, int], ...],
+    actual_predicate_counts: tuple[tuple[str, int], ...],
     actual_reviews: tuple[ProviderReviewExpectation, ...],
     review_parse_mismatches: tuple[str, ...],
     issue_codes: tuple[str, ...],
@@ -1075,6 +1112,11 @@ def _provider_quality_mismatches(
         mismatches.add("missing_expected_claims")
     if actual_claims - expected_claims:
         mismatches.add("unexpected_claims")
+    if expected_claims != actual_claims:
+        if expected_predicate_counts == actual_predicate_counts:
+            mismatches.add("claim_detail_mismatch")
+        else:
+            mismatches.add("claim_predicate_count_mismatch")
 
     expected_review_set = set(expected_reviews)
     actual_review_set = set(actual_reviews)
@@ -1226,6 +1268,7 @@ def _adapter_failure_result(
         proposal_digest=digest,
         outcome_digest=digest,
         accepted_claim_count=0,
+        accepted_predicate_counts=(),
         issue_codes=(),
         quality_mismatch_codes=(),
         passed=False,
@@ -1418,6 +1461,7 @@ def run_claim_replay(
             proposal_digests[case_id].add(proposal_digest)
             outcome_digests[case_id].add(outcome_digest)
             issue_codes = tuple(sorted(item.code for item in extracted.issues))
+            actual_predicate_counts = _accepted_predicate_counts(extracted.claims)
             actual_claim_outcome = _actual_claim_outcome(
                 extracted.claims,
                 normalized.evidence,
@@ -1433,6 +1477,11 @@ def run_claim_replay(
                     expected_claim_digests=evaluation_case.expected_claim_digests,
                     expected_reviews=evaluation_case.expected_reviews,
                     actual_claim_digests=actual_claim_outcome,
+                    expected_predicate_counts=_provider_expected_predicate_counts(
+                        evaluation_case,
+                        claim_by_id,
+                    ),
+                    actual_predicate_counts=actual_predicate_counts,
                     actual_reviews=actual_reviews,
                     review_parse_mismatches=review_parse_mismatches,
                     issue_codes=issue_codes,
@@ -1457,6 +1506,7 @@ def run_claim_replay(
                     proposal_digest=proposal_digest,
                     outcome_digest=outcome_digest,
                     accepted_claim_count=len(extracted.claims),
+                    accepted_predicate_counts=actual_predicate_counts,
                     issue_codes=issue_codes,
                     quality_mismatch_codes=quality_mismatch_codes,
                     passed=passed,
