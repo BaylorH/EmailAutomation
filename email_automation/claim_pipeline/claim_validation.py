@@ -48,6 +48,11 @@ _RENT_WORDS = re.compile(r"\b(?:rent|rental|asking|base\s+rate)\b", re.IGNORECAS
 _OPEX_WORDS = re.compile(
     r"\b(?:op\s*ex|opex|operating\s+expenses?|cam|nnn)\b", re.IGNORECASE
 )
+_REMEDIATION_WORDS = re.compile(
+    r"\b(?:repair(?:ed|ing|s)?|remediat(?:e|ed|ing|ion)|fix(?:ed|ing|es)?|"
+    r"replace(?:d|ment|s|ing)?|correct(?:ed|ing|s)?|resolve(?:d|s|ing)?)\b",
+    re.IGNORECASE,
+)
 _NUMBER = re.compile(r"(?<![A-Za-z0-9])(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)")
 _SF_WORDS = re.compile(r"(?:\bSF\b|sq\.?\s*ft|square\s+feet|square\s+foot)", re.IGNORECASE)
 _YEAR_WORDS = re.compile(r"(?:/\s*yr\b|per\s+year|annual(?:ly)?|\byearly\b)", re.IGNORECASE)
@@ -636,6 +641,14 @@ def _validate_predicate(claim: Claim) -> None:
             _fail("invalid_predicate_value", "Predicate requires non-empty text.")
         if value.strip().casefold() not in claim.evidence_text.casefold():
             _fail("predicate_evidence_mismatch", "Claim value is absent from evidence.")
+        if (
+            predicate is ClaimPredicate.REMEDIATION
+            and not _REMEDIATION_WORDS.search(claim.evidence_text)
+        ):
+            _fail(
+                "predicate_evidence_mismatch",
+                "Remediation claim lacks an explicit repair action.",
+            )
         return
 
     _fail("invalid_predicate_value", "Predicate has no deterministic validator.")

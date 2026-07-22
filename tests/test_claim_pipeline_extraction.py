@@ -970,6 +970,27 @@ class PredicateValidationTests(unittest.TestCase):
             tuple(i.code for i in result.issues),
         )
 
+    def test_remediation_requires_an_explicit_repair_action(self):
+        evidence = _evidence("The roof leak remains under discussion.")
+        entity = _entity()
+        result = _extract(
+            (evidence,),
+            (entity,),
+            _proposal(
+                evidence,
+                entity,
+                predicate="remediation",
+                value="roof leak",
+                evidenceText="roof leak",
+            ),
+        )
+
+        self.assertEqual((), result.claims)
+        self.assertEqual(
+            ("predicate_evidence_mismatch",),
+            tuple(i.code for i in result.issues),
+        )
+
     def test_explicit_identity_mapping_and_remediation_are_accepted(self):
         entity = _entity()
         identity_evidence = _evidence("Contact Alex Broker at alex@example.com.")

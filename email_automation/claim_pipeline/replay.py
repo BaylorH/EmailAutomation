@@ -1060,17 +1060,19 @@ def _provider_quality_claim_outcome(
             return int(value)
         return value
 
+    def semantic_claim(item: dict[str, object]) -> object:
+        normalized = {
+            key: value
+            for key, value in item.items()
+            if key not in {"evidenceText", "confidence"}
+        }
+        if normalized.get("predicate") in {"remediation", "correction"}:
+            normalized["value"] = "validated_text_span"
+        return semantic_json(normalized)
+
     return tuple(
         sorted(
-            _digest(
-                semantic_json(
-                    {
-                        key: value
-                        for key, value in item.items()
-                        if key not in {"evidenceText", "confidence"}
-                    }
-                )
-            )
+            _digest(semantic_claim(item))
             for item in items
         )
     )

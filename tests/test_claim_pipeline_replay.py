@@ -334,6 +334,7 @@ class _ProviderQualityRecordedAdapter:
         detail_mismatch_case="",
         nonsemantic_variation_case="",
         additional_accepted_claim_case="",
+        text_value_span_variation_case="",
     ):
         self._provider_cases = {
             case.case_id: case for case in provider_catalog.cases
@@ -348,6 +349,7 @@ class _ProviderQualityRecordedAdapter:
         self._detail_mismatch_case = detail_mismatch_case
         self._nonsemantic_variation_case = nonsemantic_variation_case
         self._additional_accepted_claim_case = additional_accepted_claim_case
+        self._text_value_span_variation_case = text_value_span_variation_case
         self.calls = 0
 
     def propose(self, *, case_id, request, evidence, entities):
@@ -424,6 +426,10 @@ class _ProviderQualityRecordedAdapter:
             )
             if numeric is not None:
                 numeric["value"] = float(numeric["value"])
+        if case_id == self._text_value_span_variation_case:
+            for claim in model_claims:
+                if claim["predicate"] in {"remediation", "correction"}:
+                    claim["value"] = claim["evidenceText"]
         if case_id == self._rejected_candidate_case:
             rejected = next(
                 source.claims[index]
@@ -989,6 +995,37 @@ class ReplayExecutionTests(unittest.TestCase):
         )
         self.assertEqual(14, complete.accepted_claim_count)
         self.assertEqual((), complete.quality_mismatch_codes)
+
+    def test_provider_quality_accepts_valid_text_span_values(self):
+        for case_id in ("workflow-intents-and-referral", "broker-corrects-prior-rent"):
+            with self.subTest(case_id=case_id):
+                telemetry = _MutableTelemetry()
+                adapter = _ProviderQualityRecordedAdapter(
+                    self.provider_quality_catalog,
+                    self.claim_catalog,
+                    telemetry,
+                    text_value_span_variation_case=case_id,
+                )
+                report = run_claim_replay(
+                    interpretation_catalog=self.interpretation_catalog,
+                    claim_catalog=self.claim_catalog,
+                    provider_quality_catalog=self.provider_quality_catalog,
+                    adapter=adapter,
+                    identity=self._identity(
+                        adapter,
+                        repeats=1,
+                        evaluation_profile="provider_quality",
+                        evaluation_fixture_hash=(
+                            self.provider_quality_catalog.manifest_hash
+                        ),
+                        case_count=len(self.provider_quality_catalog.cases),
+                    ),
+                    telemetry=telemetry,
+                )
+
+                self.assertTrue(report.passed)
+                result = next(item for item in report.results if item.case_id == case_id)
+                self.assertEqual((), result.quality_mismatch_codes)
 
     def test_dirty_source_can_pass_evaluation_but_not_reproducible_gate(self):
         adapter = self._adapter()

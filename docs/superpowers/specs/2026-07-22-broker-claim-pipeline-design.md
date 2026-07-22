@@ -182,6 +182,7 @@ Deterministic validators reject or downgrade claims when:
 - quoted history is presented as a fresh instruction;
 - an attachment describes a different address or suite;
 - a correction lacks a resolvable earlier claim;
+- remediation text lacks an explicit repair, replace, fix, resolve, or remediation action;
 - the extracted value conflicts with an explicit value in the same fresh evidence;
 - prompt-injection-like text attempts to instruct the system.
 
