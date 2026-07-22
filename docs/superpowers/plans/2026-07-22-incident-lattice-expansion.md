@@ -61,5 +61,5 @@
 
 - [x] Run fixture, replay, isolation, compilation, JSON, diff, and full backend verification.
 - [x] Run adversarial review for decorative coverage, common-mode oracles, prior-claim ordering, privacy leakage, and scope overstatement.
-- [ ] Commit only the isolated backend checkpoint; do not push, deploy, or touch production.
-- [ ] Record exact evidence and set the pinned-provider adapter as the next gate.
+- [x] Commit only the isolated backend checkpoint; do not push, deploy, or touch production.
+- [x] Record exact evidence and set the pinned-provider adapter as the next gate.
