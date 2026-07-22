@@ -109,16 +109,22 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
         self.assertNotIn("state a concise reason", PINNED_PROMPT)
 
     def test_prompt_defines_complete_source_and_workflow_claim_rules(self):
-        self.assertEqual("sitesift-claim-proposal-2026-07-22-v4", PINNED_PROMPT_ID)
+        self.assertEqual("sitesift-claim-proposal-2026-07-22-v5", PINNED_PROMPT_ID)
         required_rules = (
             "emit every distinct supported claim",
-            "may support only an identity claim",
-            "Resolved attachment or link evidence",
+            "Do not emit any claim from quoted, forwarded, or historical evidence",
+            "Identity claims are allowed only from fresh attachment or link evidence",
+            "never for the seeded target",
+            "For a suite identity, value must be the exact Suite",
             "Never emit a claim from signature evidence",
             "do not emit any claim from that ambiguous evidence",
-            "boolean true with requested modality",
+            "do not emit a candidate; emit one insufficient_evidence review item",
+            "opt_out, call_request, tour_request, and information_request use value true",
+            "referral uses an object containing only explicit name, email, or phone values",
+            "remediation uses the exact supported remediation phrase",
+            "return_date uses an ISO date and the same effectiveAt date",
             "emit each one as a separate claim",
-            "both the corrected domain claim and a correction claim",
+            "correction claim carries the exact phrase that negates or replaces the old value",
         )
         for rule in required_rules:
             with self.subTest(rule=rule):

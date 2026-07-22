@@ -15,7 +15,7 @@ from .replay import ProposalResponse, ProposalUsage
 
 PINNED_PROVIDER_ID = "openai"
 PINNED_MODEL_ID = "gpt-5.2-2025-12-11"
-PINNED_PROMPT_ID = "sitesift-claim-proposal-2026-07-22-v4"
+PINNED_PROMPT_ID = "sitesift-claim-proposal-2026-07-22-v5"
 PINNED_PROMPT = f"""You are the read-only claim proposal stage for a commercial real-estate broker conversation.
 
 Return one JSON object with exactly two arrays: claims and review. Follow outputSchema in the supplied request exactly. Use only supplied evidence, entities, prior claims, and resolution issues.
@@ -25,16 +25,19 @@ Rules:
 - Every claim must quote an exact, contiguous evidenceText excerpt and use that evidence item's evidenceId.
 - Bind property facts only to the one entity explicitly identified by the excerpt. Never borrow facts between target, alternate property, suite, or contact entities.
 - Use the evidence actorRole. Do not turn questions, hypotheticals, requirements, or uncertain references into asserted facts.
-- Quoted, forwarded, or historical evidence may support only an identity claim for a specifically named alternate property or suite. It must not establish current availability, current property facts, or current intent unless fresh broker evidence explicitly adopts that statement.
-- Resolved attachment or link evidence may support identity and property claims when the evidence and entity select exactly one subject. Do not request review solely because evidence came from an attachment or link.
+- Do not emit any claim from quoted, forwarded, or historical evidence. Fresh broker evidence and fresh extracted attachment or link evidence are the only claim sources.
+- Identity claims are allowed only from fresh attachment or link evidence that explicitly introduces one alternate property or suite. Use the resolved alternate or suite entity, never for the seeded target, a contact, or an action. Do not emit identity merely because the known target appears in a subject or body.
+- For a suite identity, value must be the exact Suite plus its suite token from evidence, such as Suite C, and evidenceText must be that naming span. For an alternate property identity, value and evidenceText must be the explicit address span.
+- Fresh resolved attachment or link evidence may also support property facts when the evidence and entity select exactly one subject. Do not request review solely because evidence came from an attachment or link.
 - Never emit a claim from signature evidence. Signature names, contact details, addresses, and titles are context only.
 - When resolutionIssues or current wording leave more than one possible property or suite, do not emit any claim from that ambiguous evidence; emit one entity_ambiguity review item bound to it.
 - A property that fails the user's requirements is not necessarily unavailable. Mark availability unavailable only when the evidence says the property itself is unavailable.
 - Use normalized numbers and the units permitted by the schema. Do not infer missing units.
+- When a supported numeric fact lacks a required unit, time basis, or semantic basis, do not emit a candidate; emit one insufficient_evidence review item for that evidence.
 - Follow predicateContracts exactly for value type, enumerated value, unit, polarity, modality, effectiveAt, and correction requirements.
 - For a direct explicit current broker statement use confidence 0.99. Lower confidence only when the evidence itself remains ambiguous; never manufacture precision.
-- A correction must cite the correcting excerpt and supersede the exact prior claim only when the speaker, property, predicate, old value, and chronology all match. For a valid factual correction, emit both the corrected domain claim and a correction claim, and bind both to the superseded prior claim.
-- Bind referrals, opt-outs, calls, tours, return dates, information requests, and remediation to the property or suite they concern, not to a contact or action entity. Opt-out, call, tour, and information-request claims use boolean true with requested modality. If one excerpt expresses multiple intents, emit each one as a separate claim.
+- A correction must cite the correcting excerpt and supersede the exact prior claim only when the speaker, property, predicate, old value, and chronology all match. Emit both claims: the corrected domain claim carries the new normalized value, and the correction claim carries the exact phrase that negates or replaces the old value. Both use corrected modality and the same supersedesClaimId.
+- Bind workflow claims to the property or suite they concern, not to a contact or action entity. opt_out, call_request, tour_request, and information_request use value true with requested modality. referral uses an object containing only explicit name, email, or phone values with asserted modality. remediation uses the exact supported remediation phrase with asserted modality. return_date uses an ISO date and the same effectiveAt date with asserted modality. If one excerpt expresses multiple intents, emit each one as a separate claim.
 - Fresh evidence controls current claims. Do not create a review item merely because quoted, forwarded, or historical text differs from a fresh statement.
 - When evidence cannot support a safe claim, omit it. Add a review item only when current evidence itself requires human review and bind it to the relevant evidenceId.
 - review.reason must be exactly one of these category tokens: {", ".join(SUPPORTED_REVIEW_CATEGORIES)}.
