@@ -50,6 +50,8 @@
 
 ### Measured checkpoint
 
-The independently observed one-repeat run used 28/28 billed calls, 51,873 input tokens, 8,437 output tokens, 106,636 ms aggregate latency, and 135,110 micro-USD. Usage was complete and the redacted report contained no raw addresses or email identifiers. Four of 28 cases passed the exact provider-quality outcome gate. The three-repeat variance run was not authorized by this result.
+The clean, independently observed one-repeat run at backend `e7e2279` used 28/28 billed calls, 51,873 input tokens, 8,570 output tokens, 121,613 ms aggregate latency, and 145,036 micro-USD. Usage was complete, there were zero transport errors, and the redacted report contained no raw addresses or email identifiers. Four of 28 cases passed the exact provider-quality outcome gate. The three-repeat variance run was not authorized by this result.
 
 The run also disproved the assumption that the candidate-validation issue oracle can double as a provider-quality oracle: several fixtures intentionally contain malformed proposals so the validator can reject them, while a good provider should omit those proposals. Accepted claim digests remain authoritative. Before another paid run, provider review/omission outcomes must move into an explicit separately hashed fixture, and the report needs safe mismatch categories.
+
+**Standing blocker:** The provisional provider-quality issue expectations are inferred from validator outcomes. They are useful for exposing the oracle-design problem, but they are not a valid final quality oracle. Task 4 remains open until the explicit provider fixture is independently reviewed and the one-repeat quality gate passes without weakening accepted claim digests.
