@@ -108,6 +108,22 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
         self.assertIn("review.reason", PINNED_PROMPT)
         self.assertNotIn("state a concise reason", PINNED_PROMPT)
 
+    def test_prompt_defines_complete_source_and_workflow_claim_rules(self):
+        self.assertEqual("sitesift-claim-proposal-2026-07-22-v4", PINNED_PROMPT_ID)
+        required_rules = (
+            "emit every distinct supported claim",
+            "may support only an identity claim",
+            "Resolved attachment or link evidence",
+            "Never emit a claim from signature evidence",
+            "do not emit any claim from that ambiguous evidence",
+            "boolean true with requested modality",
+            "emit each one as a separate claim",
+            "both the corrected domain claim and a correction claim",
+        )
+        for rule in required_rules:
+            with self.subTest(rule=rule):
+                self.assertIn(rule, PINNED_PROMPT)
+
     def test_adapter_rejects_context_that_does_not_match_request(self):
         transport = _FakeTransport('{"claims":[],"review":[]}')
         adapter = PinnedProviderProposalAdapter(transport)
