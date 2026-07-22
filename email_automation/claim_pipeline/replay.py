@@ -538,6 +538,7 @@ class ReplayCaseResult:
     outcome_digest: str
     accepted_claim_count: int
     accepted_predicate_counts: tuple[tuple[str, int], ...]
+    claim_mismatch_field_counts: tuple[tuple[str, int], ...]
     issue_codes: tuple[str, ...]
     quality_mismatch_codes: tuple[str, ...]
     passed: bool
@@ -553,6 +554,7 @@ class ReplayCaseResult:
             "outcomeDigest": self.outcome_digest,
             "acceptedClaimCount": self.accepted_claim_count,
             "acceptedPredicateCounts": dict(self.accepted_predicate_counts),
+            "claimMismatchFieldCounts": dict(self.claim_mismatch_field_counts),
             "issueCodes": list(self.issue_codes),
             "qualityMismatchCodes": list(self.quality_mismatch_codes),
             "passed": self.passed,
@@ -967,47 +969,120 @@ def _provider_expected_predicate_counts(
     )
 
 
-def _actual_claim_outcome(
+def _provider_expected_claim_items(
+    evaluation_case: object,
+    claim_by_id: Mapping[str, object],
+) -> tuple[dict[str, object], ...]:
+    items_by_digest = {}
+    for source_case_id in evaluation_case.source_claim_case_ids:
+        source_case = claim_by_id[source_case_id]
+        for index in source_case.expected["acceptedClaimIndexes"]:
+            item = _plain_json(source_case.claims[index])
+            items_by_digest[_digest(item)] = item
+    return tuple(
+        sorted(
+            (
+                item
+                for digest, item in items_by_digest.items()
+                if digest in set(evaluation_case.expected_claim_digests)
+            ),
+            key=_canonical_json,
+        )
+    )
+
+
+def _actual_claim_items(
     claims: tuple[Claim, ...],
     evidence: tuple[EvidenceEnvelope, ...],
     entities: tuple[EntityRef, ...],
     prior_claims: tuple[Claim, ...],
-) -> tuple[str, ...]:
+) -> tuple[dict[str, object], ...]:
     evidence_indexes = {item.evidence_id: index for index, item in enumerate(evidence)}
     entities_by_id = {item.entity_id: item for item in entities}
     prior_indexes = {
         item.claim_id: f"prior:{index}" for index, item in enumerate(prior_claims)
     }
-    digests = []
+    items = []
     for claim in claims:
         entity = entities_by_id[claim.subject_entity_id]
         supersedes = prior_indexes.get(
             claim.supersedes_claim_id,
             claim.supersedes_claim_id,
         )
-        digests.append(
-            _digest(
-                {
-                    "evidenceIndex": evidence_indexes[claim.evidence_id],
-                    "subject": {
-                        "relationship": entity.relationship,
-                        "suite": entity.suite,
-                        "canonicalAddress": entity.canonical_address,
-                    },
-                    "predicate": claim.predicate.value,
-                    "value": _plain_json(claim.value),
-                    "evidenceText": claim.evidence_text,
-                    "actorRole": claim.actor_role.value,
-                    "polarity": claim.polarity.value,
-                    "modality": claim.modality.value,
-                    "confidence": claim.confidence,
-                    "unit": claim.unit,
-                    "effectiveAt": claim.effective_at,
-                    "supersedesClaimId": supersedes,
-                }
-            )
+        items.append(
+            {
+                "evidenceIndex": evidence_indexes[claim.evidence_id],
+                "subject": {
+                    "relationship": entity.relationship,
+                    "suite": entity.suite,
+                    "canonicalAddress": entity.canonical_address,
+                },
+                "predicate": claim.predicate.value,
+                "value": _plain_json(claim.value),
+                "evidenceText": claim.evidence_text,
+                "actorRole": claim.actor_role.value,
+                "polarity": claim.polarity.value,
+                "modality": claim.modality.value,
+                "confidence": claim.confidence,
+                "unit": claim.unit,
+                "effectiveAt": claim.effective_at,
+                "supersedesClaimId": supersedes,
+            }
         )
-    return tuple(sorted(digests))
+    return tuple(sorted(items, key=_canonical_json))
+
+
+def _actual_claim_outcome(
+    claims: tuple[Claim, ...],
+    evidence: tuple[EvidenceEnvelope, ...],
+    entities: tuple[EntityRef, ...],
+    prior_claims: tuple[Claim, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            _digest(item)
+            for item in _actual_claim_items(claims, evidence, entities, prior_claims)
+        )
+    )
+
+
+def _provider_claim_mismatch_field_counts(
+    expected_items: tuple[dict[str, object], ...],
+    actual_items: tuple[dict[str, object], ...],
+) -> tuple[tuple[str, int], ...]:
+    fields = (
+        "evidenceIndex",
+        "subject",
+        "value",
+        "evidenceText",
+        "actorRole",
+        "polarity",
+        "modality",
+        "confidence",
+        "unit",
+        "effectiveAt",
+        "supersedesClaimId",
+    )
+    counts = {}
+    predicates = sorted(
+        {item["predicate"] for item in expected_items}
+        | {item["predicate"] for item in actual_items}
+    )
+    for predicate in predicates:
+        expected = tuple(
+            item for item in expected_items if item["predicate"] == predicate
+        )
+        actual = tuple(item for item in actual_items if item["predicate"] == predicate)
+        if len(expected) != len(actual):
+            continue
+        for field in (
+            field
+            for expected_item, actual_item in zip(expected, actual)
+            for field in fields
+            if expected_item[field] != actual_item[field]
+        ):
+            counts[field] = counts.get(field, 0) + 1
+    return tuple(sorted(counts.items()))
 
 
 def _issue_outcome(
@@ -1269,6 +1344,7 @@ def _adapter_failure_result(
         outcome_digest=digest,
         accepted_claim_count=0,
         accepted_predicate_counts=(),
+        claim_mismatch_field_counts=(),
         issue_codes=(),
         quality_mismatch_codes=(),
         passed=False,
@@ -1462,11 +1538,14 @@ def run_claim_replay(
             outcome_digests[case_id].add(outcome_digest)
             issue_codes = tuple(sorted(item.code for item in extracted.issues))
             actual_predicate_counts = _accepted_predicate_counts(extracted.claims)
-            actual_claim_outcome = _actual_claim_outcome(
+            actual_claim_items = _actual_claim_items(
                 extracted.claims,
                 normalized.evidence,
                 resolved.entities,
                 request.prior_claims,
+            )
+            actual_claim_outcome = tuple(
+                sorted(_digest(item) for item in actual_claim_items)
             )
             if identity.evaluation_profile == "provider_quality":
                 actual_reviews, review_parse_mismatches = _provider_review_outcome(
@@ -1486,9 +1565,21 @@ def run_claim_replay(
                     review_parse_mismatches=review_parse_mismatches,
                     issue_codes=issue_codes,
                 )
+                claim_mismatch_field_counts = (
+                    _provider_claim_mismatch_field_counts(
+                        _provider_expected_claim_items(
+                            evaluation_case,
+                            claim_by_id,
+                        ),
+                        actual_claim_items,
+                    )
+                    if "claim_detail_mismatch" in quality_mismatch_codes
+                    else ()
+                )
                 passed = not quality_mismatch_codes
             else:
                 quality_mismatch_codes = ()
+                claim_mismatch_field_counts = ()
                 passed = (
                     _claim_oracle(source_case) == actual_claim_outcome
                     and _expected_issue_outcome(source_case)
@@ -1507,6 +1598,7 @@ def run_claim_replay(
                     outcome_digest=outcome_digest,
                     accepted_claim_count=len(extracted.claims),
                     accepted_predicate_counts=actual_predicate_counts,
+                    claim_mismatch_field_counts=claim_mismatch_field_counts,
                     issue_codes=issue_codes,
                     quality_mismatch_codes=quality_mismatch_codes,
                     passed=passed,

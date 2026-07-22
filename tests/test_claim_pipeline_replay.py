@@ -835,6 +835,21 @@ class ReplayExecutionTests(unittest.TestCase):
                         for code in item.quality_mismatch_codes
                     },
                 )
+
+                if expected_code == "claim_detail_mismatch":
+                    failed = next(
+                        item
+                        for item in report.results
+                        if item.case_id == "complete-property-facts"
+                    )
+                    self.assertEqual(
+                        (("evidenceText", 1),),
+                        failed.claim_mismatch_field_counts,
+                    )
+                    self.assertEqual(
+                        {"evidenceText": 1},
+                        failed.to_dict()["claimMismatchFieldCounts"],
+                    )
                 serialized = json.dumps(report.to_dict(), sort_keys=True)
                 self.assertNotIn("private free-form reason", serialized)
 
