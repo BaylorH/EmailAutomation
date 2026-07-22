@@ -151,6 +151,23 @@ class EvidenceSegmentationTests(unittest.TestCase):
             result.evidence[2].freshness,
         )
 
+    def test_forwarded_subject_is_historical_evidence(self):
+        for subject in (
+            "Fwd: Please stop emailing me",
+            "RE: Fwd: The property is available",
+            "Re: RE: FW: another option",
+        ):
+            with self.subTest(subject=subject):
+                result = normalize_message_evidence(
+                    raw_message(subject=subject, body="Please review.")
+                )
+
+                self.assertEqual(EvidenceSource.SUBJECT, result.evidence[0].source_kind)
+                self.assertEqual(
+                    EvidenceFreshness.FORWARDED,
+                    result.evidence[0].freshness,
+                )
+
     def test_apple_forwarded_message_is_not_treated_as_fresh(self):
         body = (
             "This may be useful.\n\n"

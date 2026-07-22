@@ -1,0 +1,416 @@
+{
+  "schemaVersion": 1,
+  "catalogId": "claim-interpretation-lattice-v1",
+  "cases": [
+    {
+      "caseId": "fresh-suite-availability",
+      "interpretationCaseId": "fresh-reply-over-quoted-stale-history",
+      "claims": [
+        {
+          "evidenceIndex": 1,
+          "subject": {"relationship": "suite_of_target", "suite": "B", "canonicalAddress": "123 industrial avenue"},
+          "predicate": "availability",
+          "value": "available",
+          "evidenceText": "Suite B is available",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.99,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [{"predicate": "availability", "value": "available", "relationship": "suite_of_target", "suite": "B"}], "issueCodes": []}
+    },
+    {
+      "caseId": "quoted-alternate-is-historical",
+      "interpretationCaseId": "fresh-reply-over-quoted-stale-history",
+      "claims": [
+        {
+          "evidenceIndex": 2,
+          "subject": {"relationship": "alternate", "suite": "", "canonicalAddress": "999 other road"},
+          "predicate": "availability",
+          "value": "available",
+          "evidenceText": "999 Other Road was available",
+          "actorRole": "unknown",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.88,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [], "issueCodes": ["historical_instruction"]}
+    },
+    {
+      "caseId": "forwarded-alternate-is-historical",
+      "interpretationCaseId": "forwarded-different-property",
+      "claims": [
+        {
+          "evidenceIndex": 2,
+          "subject": {"relationship": "alternate", "suite": "", "canonicalAddress": "999 other road"},
+          "predicate": "availability",
+          "value": "available",
+          "evidenceText": "999 Other Road is available",
+          "actorRole": "unknown",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.9,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [], "issueCodes": ["historical_instruction"]}
+    },
+    {
+      "caseId": "fresh-link-identifies-alternate",
+      "interpretationCaseId": "forwarded-different-property",
+      "claims": [
+        {
+          "evidenceIndex": 3,
+          "subject": {"relationship": "alternate", "suite": "", "canonicalAddress": "999 other road"},
+          "predicate": "identity",
+          "value": "999 Other Road",
+          "evidenceText": "999 Other Road",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.96,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [{"predicate": "identity", "value": "999 Other Road", "relationship": "alternate", "suite": ""}], "issueCodes": []}
+    },
+    {
+      "caseId": "split-suite-a-unavailable",
+      "interpretationCaseId": "split-suite-statuses",
+      "claims": [
+        {
+          "evidenceIndex": 1,
+          "subject": {"relationship": "suite_of_target", "suite": "A", "canonicalAddress": "123 industrial avenue"},
+          "predicate": "availability",
+          "value": "unavailable",
+          "evidenceText": "Suite A is leased",
+          "actorRole": "broker",
+          "polarity": "negative",
+          "modality": "asserted",
+          "confidence": 0.99,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [{"predicate": "availability", "value": "unavailable", "relationship": "suite_of_target", "suite": "A"}], "issueCodes": []}
+    },
+    {
+      "caseId": "split-suite-b-available",
+      "interpretationCaseId": "split-suite-statuses",
+      "claims": [
+        {
+          "evidenceIndex": 1,
+          "subject": {"relationship": "suite_of_target", "suite": "B", "canonicalAddress": "123 industrial avenue"},
+          "predicate": "availability",
+          "value": "available",
+          "evidenceText": "Suite B remains available",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.99,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [{"predicate": "availability", "value": "available", "relationship": "suite_of_target", "suite": "B"}], "issueCodes": []}
+    },
+    {
+      "caseId": "split-suite-cannot-terminalize-target",
+      "interpretationCaseId": "split-suite-statuses",
+      "claims": [
+        {
+          "evidenceIndex": 1,
+          "subject": {"relationship": "target", "suite": "", "canonicalAddress": "123 industrial avenue"},
+          "predicate": "availability",
+          "value": "unavailable",
+          "evidenceText": "Suite A is leased",
+          "actorRole": "broker",
+          "polarity": "negative",
+          "modality": "asserted",
+          "confidence": 0.9,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [], "issueCodes": ["subject_evidence_mismatch"]}
+    },
+    {
+      "caseId": "alternate-attachment-cannot-identify-target",
+      "interpretationCaseId": "wrong-property-attachment",
+      "claims": [
+        {
+          "evidenceIndex": 2,
+          "subject": {"relationship": "target", "suite": "", "canonicalAddress": "123 industrial avenue"},
+          "predicate": "identity",
+          "value": "999 Other Road",
+          "evidenceText": "999 Other Road",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.97,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [], "issueCodes": ["subject_evidence_mismatch"]}
+    },
+    {
+      "caseId": "alternate-attachment-identifies-alternate",
+      "interpretationCaseId": "wrong-property-attachment",
+      "claims": [
+        {
+          "evidenceIndex": 2,
+          "subject": {"relationship": "alternate", "suite": "", "canonicalAddress": "999 other road"},
+          "predicate": "identity",
+          "value": "999 Other Road",
+          "evidenceText": "999 Other Road",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.97,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [{"predicate": "identity", "value": "999 Other Road", "relationship": "alternate", "suite": ""}], "issueCodes": []}
+    },
+    {
+      "caseId": "link-only-alternate-availability",
+      "interpretationCaseId": "link-only-alternate-property",
+      "claims": [
+        {
+          "evidenceIndex": 1,
+          "subject": {"relationship": "alternate", "suite": "", "canonicalAddress": "999 other road"},
+          "predicate": "availability",
+          "value": "available",
+          "evidenceText": "999 Other Road is available",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.96,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [{"predicate": "availability", "value": "available", "relationship": "alternate", "suite": ""}], "issueCodes": []}
+    },
+    {
+      "caseId": "ambiguous-alternate-needs-review",
+      "interpretationCaseId": "ambiguous-other-building",
+      "claims": [
+        {
+          "evidenceIndex": 1,
+          "subject": {"relationship": "target", "suite": "", "canonicalAddress": "123 industrial avenue"},
+          "predicate": "availability",
+          "value": "conditional",
+          "evidenceText": "The other building may be a fit",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "possible",
+          "confidence": 0.55,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [], "issueCodes": ["unresolved_entity_context"]}
+    },
+    {
+      "caseId": "target-alias-availability",
+      "interpretationCaseId": "target-alias-with-signature-contact",
+      "claims": [
+        {
+          "evidenceIndex": 1,
+          "subject": {"relationship": "target", "suite": "", "canonicalAddress": "123 industrial avenue"},
+          "predicate": "availability",
+          "value": "available",
+          "evidenceText": "123 Industrial Ave remains available",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.99,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [{"predicate": "availability", "value": "available", "relationship": "target", "suite": ""}], "issueCodes": []}
+    },
+    {
+      "caseId": "attachment-suite-identity",
+      "interpretationCaseId": "attachment-only-reply",
+      "claims": [
+        {
+          "evidenceIndex": 0,
+          "subject": {"relationship": "suite_of_target", "suite": "C", "canonicalAddress": "123 industrial avenue"},
+          "predicate": "identity",
+          "value": "Suite C",
+          "evidenceText": "Suite C",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.98,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [{"predicate": "identity", "value": "Suite C", "relationship": "suite_of_target", "suite": "C"}], "issueCodes": []}
+    },
+    {
+      "caseId": "multiple-alternates-block-claim",
+      "interpretationCaseId": "multiple-property-candidates",
+      "claims": [
+        {
+          "evidenceIndex": 1,
+          "subject": {"relationship": "alternate", "suite": "", "canonicalAddress": "999 other road"},
+          "predicate": "identity",
+          "value": "999 Other Road",
+          "evidenceText": "999 Other Road",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.8,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [], "issueCodes": ["unresolved_entity_context"]}
+    },
+    {
+      "caseId": "child-suite-inherits-alternate-subject",
+      "interpretationCaseId": "child-suite-inherits-alternate-parent",
+      "claims": [
+        {
+          "evidenceIndex": 2,
+          "subject": {"relationship": "suite_of_alternate", "suite": "200", "canonicalAddress": "999 other road"},
+          "predicate": "identity",
+          "value": "Suite 200",
+          "evidenceText": "Suite 200",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.95,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [{"predicate": "identity", "value": "Suite 200", "relationship": "suite_of_alternate", "suite": "200"}], "issueCodes": []}
+    },
+    {
+      "caseId": "requirements-language-is-not-unavailability",
+      "interpretationCaseId": "ordinary-prose-does-not-fabricate-entities",
+      "claims": [
+        {
+          "evidenceIndex": 1,
+          "subject": {"relationship": "target", "suite": "", "canonicalAddress": "123 industrial avenue"},
+          "predicate": "availability",
+          "value": "unavailable",
+          "evidenceText": "space requirement is 20,000 SF",
+          "actorRole": "broker",
+          "polarity": "negative",
+          "modality": "asserted",
+          "confidence": 0.92,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [], "issueCodes": ["predicate_evidence_mismatch"]}
+    },
+    {
+      "caseId": "unit-price-without-time-basis-is-not-rent",
+      "interpretationCaseId": "ordinary-prose-does-not-fabricate-entities",
+      "claims": [
+        {
+          "evidenceIndex": 1,
+          "subject": {"relationship": "target", "suite": "", "canonicalAddress": "123 industrial avenue"},
+          "predicate": "rent",
+          "value": 14,
+          "evidenceText": "unit pricing is $14/SF",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.92,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [], "issueCodes": ["invalid_predicate_unit"]}
+    },
+    {
+      "caseId": "directional-alias-target-availability",
+      "interpretationCaseId": "directional-target-alias",
+      "claims": [
+        {
+          "evidenceIndex": 1,
+          "subject": {"relationship": "target", "suite": "", "canonicalAddress": "123 north main street"},
+          "predicate": "availability",
+          "value": "available",
+          "evidenceText": "123 North Main Street is available",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.99,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"accepted": [{"predicate": "availability", "value": "available", "relationship": "target", "suite": ""}], "issueCodes": []}
+    },
+    {
+      "caseId": "valid-no-claim-output",
+      "interpretationCaseId": "attachment-extraction-failure-visible",
+      "claims": [],
+      "review": [],
+      "expected": {"accepted": [], "issueCodes": []}
+    },
+    {
+      "caseId": "explicit-model-review-output",
+      "interpretationCaseId": "ordinary-prose-does-not-fabricate-entities",
+      "claims": [],
+      "review": [{"evidenceIndex": 1, "reason": "pricing basis is ambiguous"}],
+      "expected": {"accepted": [], "issueCodes": ["model_requested_review"]}
+    }
+  ]
+}

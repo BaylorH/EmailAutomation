@@ -73,6 +73,21 @@ from .interpretation_fixtures import (
     InterpretationFixtureValidationError,
     load_interpretation_fixture_catalog,
 )
+from .extraction import (
+    CLAIM_EXTRACTION_SCHEMA_VERSION,
+    ClaimExtractionIssue,
+    ClaimExtractionRequest,
+    ClaimExtractionResult,
+    build_claim_extraction_request,
+    extract_claims,
+)
+from .claim_fixtures import (
+    CLAIM_FIXTURE_SCHEMA_VERSION,
+    ClaimFixtureCase,
+    ClaimFixtureCatalog,
+    ClaimFixtureValidationError,
+    load_claim_fixture_catalog,
+)
 
 __all__ = [
     "ActionPlan",
@@ -82,6 +97,14 @@ __all__ = [
     "ApprovalClass",
     "CampaignContract",
     "Claim",
+    "CLAIM_EXTRACTION_SCHEMA_VERSION",
+    "CLAIM_FIXTURE_SCHEMA_VERSION",
+    "ClaimExtractionIssue",
+    "ClaimExtractionRequest",
+    "ClaimExtractionResult",
+    "ClaimFixtureCase",
+    "ClaimFixtureCatalog",
+    "ClaimFixtureValidationError",
     "ClaimModality",
     "ClaimPolarity",
     "ClaimPredicate",
@@ -124,10 +147,13 @@ __all__ = [
     "RawMessageEvidence",
     "ResolutionIssue",
     "canonicalize_address",
+    "build_claim_extraction_request",
+    "extract_claims",
     "extract_addresses",
     "extract_suites",
     "load_fixture_catalog",
     "load_interpretation_fixture_catalog",
+    "load_claim_fixture_catalog",
     "normalize_message_evidence",
     "parse_pipeline_mode",
     "resolve_entities",

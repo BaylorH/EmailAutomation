@@ -14,6 +14,7 @@ ALLOWED_IMPORT_PREFIXES = (
     "__future__",
     "collections.abc",
     "dataclasses",
+    "datetime",
     "email_automation.claim_pipeline",
     "enum",
     "hashlib",
@@ -84,6 +85,14 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
 
     def test_interpretation_api_is_exposed_at_package_boundary(self):
         expected_names = {
+            "CLAIM_EXTRACTION_SCHEMA_VERSION",
+            "CLAIM_FIXTURE_SCHEMA_VERSION",
+            "ClaimExtractionIssue",
+            "ClaimExtractionRequest",
+            "ClaimExtractionResult",
+            "ClaimFixtureCase",
+            "ClaimFixtureCatalog",
+            "ClaimFixtureValidationError",
             "EntityMatch",
             "EntityResolutionResult",
             "EntitySeed",
@@ -97,9 +106,12 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             "RawMessageEvidence",
             "ResolutionIssue",
             "canonicalize_address",
+            "build_claim_extraction_request",
+            "extract_claims",
             "extract_addresses",
             "extract_suites",
             "load_interpretation_fixture_catalog",
+            "load_claim_fixture_catalog",
             "normalize_message_evidence",
             "resolve_entities",
         }

@@ -430,6 +430,9 @@ class Claim(_JsonContract):
     unit: Optional[str] = None
     effective_at: Optional[str] = None
     supersedes_claim_id: Optional[str] = None
+    campaign_id: str = ""
+    actor_email: str = ""
+    observed_at: str = ""
 
     def __post_init__(self) -> None:
         for label in ("tenant_id", "claim_id", "evidence_id", "subject_entity_id", "evidence_text"):
@@ -440,6 +443,12 @@ class Claim(_JsonContract):
         _require_enum("claim actor_role", self.actor_role, ActorRole)
         _require_enum("claim polarity", self.polarity, ClaimPolarity)
         _require_enum("claim modality", self.modality, ClaimModality)
+        for label in ("campaign_id", "actor_email", "observed_at"):
+            if not isinstance(getattr(self, label), str):
+                raise TypeError(f"claim {label} must be text")
+        object.__setattr__(self, "campaign_id", self.campaign_id.strip())
+        object.__setattr__(self, "actor_email", self.actor_email.strip().casefold())
+        object.__setattr__(self, "observed_at", self.observed_at.strip())
         object.__setattr__(self, "value", _freeze_json(self.value))
         expected_claim_id = _stable_id(
             "claim",
@@ -456,6 +465,9 @@ class Claim(_JsonContract):
                 "unit": self.unit,
                 "effective_at": self.effective_at,
                 "supersedes_claim_id": self.supersedes_claim_id,
+                "campaign_id": self.campaign_id,
+                "actor_email": self.actor_email,
+                "observed_at": self.observed_at,
             },
         )
         if self.claim_id != expected_claim_id:
@@ -478,8 +490,14 @@ class Claim(_JsonContract):
         unit: Optional[str] = None,
         effective_at: Optional[str] = None,
         supersedes_claim_id: Optional[str] = None,
+        campaign_id: str = "",
+        actor_email: str = "",
+        observed_at: str = "",
     ) -> "Claim":
         frozen_value = _freeze_json(value)
+        normalized_campaign = str(campaign_id or "").strip()
+        normalized_actor_email = str(actor_email or "").strip().casefold()
+        normalized_observed_at = str(observed_at or "").strip()
         claim_id = _stable_id(
             "claim",
             {
@@ -495,6 +513,9 @@ class Claim(_JsonContract):
                 "unit": unit,
                 "effective_at": effective_at,
                 "supersedes_claim_id": supersedes_claim_id,
+                "campaign_id": normalized_campaign,
+                "actor_email": normalized_actor_email,
+                "observed_at": normalized_observed_at,
             },
         )
         return cls(
@@ -512,6 +533,9 @@ class Claim(_JsonContract):
             unit=unit,
             effective_at=effective_at,
             supersedes_claim_id=supersedes_claim_id,
+            campaign_id=normalized_campaign,
+            actor_email=normalized_actor_email,
+            observed_at=normalized_observed_at,
         )
 
 

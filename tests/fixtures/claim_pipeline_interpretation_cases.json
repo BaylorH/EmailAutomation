@@ -94,7 +94,7 @@
       "expected": {
         "sourceCounts": {"subject": 1, "fresh_body": 1, "forwarded_body": 1, "link": 1},
         "evidenceSequence": [
-          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "Fwd: another option", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "subject", "freshness": "forwarded", "location": "subject", "content": "Fwd: another option", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
           {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "This may be useful.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
           {"sourceKind": "forwarded_body", "freshness": "forwarded", "location": "body:lines-3-7", "content": "---------- Forwarded message ---------\nFrom: Pat Broker <pat@example.com>\nSubject: 999 Other Road\n\n999 Other Road is available.", "parentIndex": 1, "actorEmail": "pat@example.com", "actorRole": "unknown"},
           {"sourceKind": "link", "freshness": "fresh", "location": "link:https://example.com/999", "content": "Listing for 999 Other Road", "parentIndex": 1, "actorEmail": "alex@example.com", "actorRole": "broker"}

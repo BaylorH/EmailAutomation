@@ -30,7 +30,10 @@ _ORIGINAL_DIVIDER = re.compile(
 _GMAIL_QUOTE_START = re.compile(r"^On\s.+\swrote:\s*$", re.IGNORECASE)
 _OUTLOOK_FROM = re.compile(r"^From:\s*.+", re.IGNORECASE)
 _OUTLOOK_SENT = re.compile(r"^Sent:\s*.+", re.IGNORECASE)
-_FORWARDED_SUBJECT = re.compile(r"^(?:fw|fwd):", re.IGNORECASE)
+_FORWARDED_SUBJECT = re.compile(
+    r"^(?:(?:re)\s*:\s*)*(?:fw|fwd)\s*:",
+    re.IGNORECASE,
+)
 _HISTORY_ACTOR = re.compile(
     r"^From:\s*(?P<name>.*?)\s*<(?P<email>[^>\s]+)>\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -369,6 +372,7 @@ def _envelope(
     content: str,
     parent_evidence_id: Optional[str] = None,
     actor: Optional[Actor] = None,
+    freshness: Optional[EvidenceFreshness] = None,
 ) -> EvidenceEnvelope:
     return EvidenceEnvelope.create(
         tenant_id=raw.tenant_id,
@@ -379,7 +383,7 @@ def _envelope(
         direction=raw.direction,
         actor=actor or raw.actor,
         observed_at=raw.observed_at,
-        freshness=_freshness(source_kind),
+        freshness=freshness or _freshness(source_kind),
         parent_evidence_id=parent_evidence_id,
         campaign_id=raw.campaign_id,
     )
@@ -402,12 +406,18 @@ def normalize_message_evidence(raw: RawMessageEvidence) -> EvidenceNormalization
 
     evidence: list[EvidenceEnvelope] = []
     if raw.subject.strip():
+        subject_freshness = (
+            EvidenceFreshness.FORWARDED
+            if _FORWARDED_SUBJECT.match(raw.subject.strip())
+            else EvidenceFreshness.FRESH
+        )
         evidence.append(
             _envelope(
                 raw,
                 source_kind=EvidenceSource.SUBJECT,
                 location="subject",
                 content=raw.subject.strip(),
+                freshness=subject_freshness,
             )
         )
 

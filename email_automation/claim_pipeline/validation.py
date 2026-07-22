@@ -145,11 +145,17 @@ def validate_claim_bundle(
     evidence: Iterable[EvidenceEnvelope],
     entities: Iterable[EntityRef],
     claims: Iterable[Claim],
+    known_claim_ids: Iterable[str] = (),
 ) -> None:
     """Validate provenance and subject bindings without performing side effects."""
     evidence_by_id = _unique_by_id(evidence, "evidence_id", "evidence")
     entities_by_id = _unique_by_id(entities, "entity_id", "entity")
     claims_by_id = _unique_by_id(claims, "claim_id", "claim")
+    known_ids = {
+        str(claim_id or "").strip()
+        for claim_id in known_claim_ids
+        if str(claim_id or "").strip()
+    }
 
     for envelope in evidence_by_id.values():
         _require_tenant(tenant_id, envelope.tenant_id, "evidence")
@@ -185,10 +191,25 @@ def validate_claim_bundle(
             raise ContractViolation(
                 f"claim {claim.claim_id} actor role does not match evidence actor"
             )
+        if claim.campaign_id and claim.campaign_id != envelope.campaign_id:
+            raise ContractViolation(
+                f"claim {claim.claim_id} campaign does not match evidence campaign"
+            )
+        if claim.actor_email and claim.actor_email != envelope.actor.email.strip().casefold():
+            raise ContractViolation(
+                f"claim {claim.claim_id} actor identity does not match evidence actor"
+            )
+        if claim.observed_at and claim.observed_at != envelope.observed_at:
+            raise ContractViolation(
+                f"claim {claim.claim_id} chronology does not match evidence chronology"
+            )
         if claim.supersedes_claim_id:
             if claim.supersedes_claim_id == claim.claim_id:
                 raise ContractViolation(f"claim {claim.claim_id} cannot supersede itself")
-            if claim.supersedes_claim_id not in claims_by_id:
+            if (
+                claim.supersedes_claim_id not in claims_by_id
+                and claim.supersedes_claim_id not in known_ids
+            ):
                 raise ContractViolation(
                     f"claim {claim.claim_id} supersedes unknown claim "
                     f"{claim.supersedes_claim_id}"
