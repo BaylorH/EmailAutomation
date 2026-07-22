@@ -10,6 +10,7 @@ from email_automation.claim_pipeline.interpretation_fixtures import (
 )
 from email_automation.claim_pipeline.provider_replay import (
     PINNED_MODEL_ID,
+    PINNED_PROMPT,
     PINNED_PROMPT_HASH,
     PINNED_PROMPT_ID,
     PINNED_PROVIDER_ID,
@@ -100,6 +101,12 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
         self.assertNotIn("expected", instructions.casefold())
         self.assertEqual(request.to_dict(), json.loads(payload))
         self.assertEqual('{"claims":[],"review":[]}', response.model_output)
+
+    def test_prompt_constrains_review_reasons_to_safe_category_tokens(self):
+        self.assertIn("entity_ambiguity", PINNED_PROMPT)
+        self.assertIn("insufficient_evidence", PINNED_PROMPT)
+        self.assertIn("review.reason", PINNED_PROMPT)
+        self.assertNotIn("state a concise reason", PINNED_PROMPT)
 
     def test_adapter_rejects_context_that_does_not_match_request(self):
         transport = _FakeTransport('{"claims":[],"review":[]}')

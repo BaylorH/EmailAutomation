@@ -1,0 +1,140 @@
+{
+  "schemaVersion": 1,
+  "catalogId": "provider-quality-lattice-v1",
+  "claimFixtureHash": "676e3b1b4208bb676069bf5d282d086d9b35980f19f099a49305ec059a987097",
+  "cases": [
+    {
+      "caseId": "fresh-reply-over-quoted-stale-history",
+      "interpretationCaseId": "fresh-reply-over-quoted-stale-history",
+      "sourceClaimCaseIds": ["fresh-suite-availability", "quoted-alternate-is-historical"],
+      "expectedClaimDigests": ["2123c0909511b6ee3c22a63d18909cd2227382386a737688c1fe0978d2c239d5"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "outlook-original-message-history",
+      "interpretationCaseId": "outlook-original-message-history",
+      "sourceClaimCaseIds": ["outlook-fresh-suite-b-availability"],
+      "expectedClaimDigests": ["043efbb5c2b3f68caa0ca2fb21b4f99935a08acf5a2da781ae87602574866747"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "forwarded-different-property",
+      "interpretationCaseId": "forwarded-different-property",
+      "sourceClaimCaseIds": ["forwarded-alternate-is-historical", "fresh-link-identifies-alternate"],
+      "expectedClaimDigests": ["83e396c7933041f931eaaf0631b076d52f6499ae4ee116b579bcc9bf39b291df"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "split-suite-statuses",
+      "interpretationCaseId": "split-suite-statuses",
+      "sourceClaimCaseIds": ["split-suite-a-unavailable", "split-suite-b-available", "split-suite-cannot-terminalize-target", "split-suite-combined-statuses"],
+      "expectedClaimDigests": ["043efbb5c2b3f68caa0ca2fb21b4f99935a08acf5a2da781ae87602574866747", "3b3a8dd8da4353dcdc1758839e514ea0620c430e3ef554d180186cb773a8178c"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "wrong-property-attachment",
+      "interpretationCaseId": "wrong-property-attachment",
+      "sourceClaimCaseIds": ["alternate-attachment-cannot-identify-target", "alternate-attachment-identifies-alternate"],
+      "expectedClaimDigests": ["8f56249410e70e750bcdd943ba9dea750e64629210e44c4b9511686f170d6828"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "attachment-extraction-failure-visible",
+      "interpretationCaseId": "attachment-extraction-failure-visible",
+      "sourceClaimCaseIds": ["valid-no-claim-output"],
+      "expectedClaimDigests": [],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "link-only-alternate-property",
+      "interpretationCaseId": "link-only-alternate-property",
+      "sourceClaimCaseIds": ["link-only-alternate-availability"],
+      "expectedClaimDigests": ["4ab01c6b318b87709743c0f3be6667e152008507c10cf837602056fdbca12d2f"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "ambiguous-other-building",
+      "interpretationCaseId": "ambiguous-other-building",
+      "sourceClaimCaseIds": ["ambiguous-alternate-needs-review"],
+      "expectedClaimDigests": [],
+      "expectedReviews": [{"category": "entity_ambiguity", "evidenceIndex": 1}]
+    },
+    {
+      "caseId": "target-alias-with-signature-contact",
+      "interpretationCaseId": "target-alias-with-signature-contact",
+      "sourceClaimCaseIds": ["target-alias-availability"],
+      "expectedClaimDigests": ["005083ed17a385e8e181cbbc28bd6e6c4c94699b021d51e4c47ad73aecf94a17"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "attachment-only-reply",
+      "interpretationCaseId": "attachment-only-reply",
+      "sourceClaimCaseIds": ["attachment-suite-identity"],
+      "expectedClaimDigests": ["db18242c0550982eac375b2b5f8c1a15110ed1db31db57f57057234dc2c4bbcb"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "multiple-property-candidates",
+      "interpretationCaseId": "multiple-property-candidates",
+      "sourceClaimCaseIds": ["multiple-alternates-block-claim"],
+      "expectedClaimDigests": [],
+      "expectedReviews": [{"category": "entity_ambiguity", "evidenceIndex": 1}]
+    },
+    {
+      "caseId": "child-suite-inherits-alternate-parent",
+      "interpretationCaseId": "child-suite-inherits-alternate-parent",
+      "sourceClaimCaseIds": ["child-suite-inherits-alternate-subject"],
+      "expectedClaimDigests": ["aa3822822fd0fc089df1b41d676bc9756b1cb29c7fcdcda8cd3622dce67720f9"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "ordinary-prose-does-not-fabricate-entities",
+      "interpretationCaseId": "ordinary-prose-does-not-fabricate-entities",
+      "sourceClaimCaseIds": ["explicit-model-review-output", "requirements-language-is-not-unavailability", "unit-price-without-time-basis-is-not-rent"],
+      "expectedClaimDigests": [],
+      "expectedReviews": [{"category": "insufficient_evidence", "evidenceIndex": 1}]
+    },
+    {
+      "caseId": "directional-target-alias",
+      "interpretationCaseId": "directional-target-alias",
+      "sourceClaimCaseIds": ["directional-alias-target-availability"],
+      "expectedClaimDigests": ["8f0d9a5f8611abd12d8c52136df66eeda1ed373f4a60e55e468e5147ac5fab56"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "complete-property-facts",
+      "interpretationCaseId": "complete-property-facts",
+      "sourceClaimCaseIds": ["complete-property-facts-accepted", "complete-property-facts-rejected-near-misses"],
+      "expectedClaimDigests": ["35b8c9a4b74456a7dc64e4ca5eaf73fdbc62c991ca57cabb6dc8be745e2b12eb", "69c7499dafc8b0b11c5f2dd7f81afd528e7c4d66da7c805e221ed1d8d785cec7", "7a83b12ef53b2db7d8afe8f9746d0a73ef54b7147e73a51b2cde8536436c76ad", "81dcd76740d30f7a75ff72c5052f53a16bb0a87ca8c1a23b1a3f0e6f540e9a59", "85932ea27240c34f3ce635ef5980033ba1a9dd14a80f0580c4858fea69a9432d", "a1f088b5a82055dce8da443337c79b5c70f725579782050302cd0d72b96b2a66", "a9b357062043d9a4a0044acd07cfe63793af8dc22da11aa3caffb8e4fb387e6c", "b12ab1b30207cddc66152d9b6c10864365d4a4aad570062008b58b364be199c6", "dd15bd4b23c78f09a2bb9f020b2632d36ff07424928fa8078fad672264b6fa7a", "e5de99cb3c089013af75471e58b312d5a85c9e858d4cb7c9be6c8de5ea143bbf", "e6c257876a5eb4e63cf4d5c6a8bc3bf0f42bb7dccf932da0dfced4f9be694401", "f27362d569994bf94e344a936976f2060e4dc8df028cce5a84971fb8e72b6c2e", "f540a34d335528d35d8b624320bf0878b5d6f58264a0fd1677475adfad806d95"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "workflow-intents-and-referral",
+      "interpretationCaseId": "workflow-intents-and-referral",
+      "sourceClaimCaseIds": ["workflow-intents-accepted", "workflow-intents-rejected-near-misses"],
+      "expectedClaimDigests": ["005f44901328ccea7cb215c53c0b891ce85bbfdb64d46e0ddd69912e351c86fc", "3fd1e84f0ab06f62790b0fe37394ac040cf310ca4495bdd07eb4869642d94b7f", "613c219830977e22e6bd3981f810fac0fc9caee8050c33f88cfdfa19adcf8fa0", "6cf80c252c532fceb13a841c3306cbd3d6010f582991e488036d823e5ad1c931", "9eff839f8d7e97dc85be9db5b44546c786bf14b2e180597325445688013ec1f7", "e34d45325d5dd0ef3746d34e5f2302735303bc8c89071e24a6a3cf16ef1fd9db", "f743e82fdf107fe6a6d2722792ae6aebf06810d00e09e6a06dacb1504960a681"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "broker-corrects-prior-rent",
+      "interpretationCaseId": "broker-corrects-prior-rent",
+      "sourceClaimCaseIds": ["broker-correction-accepted"],
+      "expectedClaimDigests": ["9d651165089e68a18ea9911c28156cd7f7dde5c1e9f283e4c0abb6e7e19f9144", "f56b56661594c93d7076569e2e893997384a75587729cab76b301a0a6e07ee1c"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "repeated-brochure-request",
+      "interpretationCaseId": "repeated-brochure-request",
+      "sourceClaimCaseIds": ["repeated-information-request-accepted"],
+      "expectedClaimDigests": ["b4bf1f6ddce4c87dae27ad01936bfb1e97bedb0835e91c4cc6772ec51ed8b0b5"],
+      "expectedReviews": []
+    },
+    {
+      "caseId": "target-unavailable-stop-followups",
+      "interpretationCaseId": "target-unavailable-stop-followups",
+      "sourceClaimCaseIds": ["target-terminal-signals-accepted"],
+      "expectedClaimDigests": ["7d77591414e561a4471403403c4d82bbc52a05903f22efaad14ca1b237a84e43", "925a7a5af7ad35a82e564fa60759b6fc818a133da4f82c00f5021b1da8b63ba8"],
+      "expectedReviews": []
+    }
+  ]
+}

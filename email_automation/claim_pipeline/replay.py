@@ -35,6 +35,11 @@ from .extraction import (
     extract_claims,
 )
 from .interpretation_fixtures import InterpretationFixtureCatalog
+from .provider_quality_fixtures import (
+    SUPPORTED_REVIEW_CATEGORIES,
+    ProviderQualityFixtureCatalog,
+    ProviderReviewExpectation,
+)
 
 
 MAX_REPLAY_REPEATS = 10
@@ -121,6 +126,7 @@ class ReplayIdentity:
     dependency_lock_hash: str
     interpretation_fixture_hash: str
     claim_fixture_hash: str
+    evaluation_fixture_hash: str
     extraction_schema_version: int
     provider_id: str
     model_id: str
@@ -149,6 +155,9 @@ class ReplayIdentity:
             ),
             "claim_fixture_hash": _sha256(
                 self.claim_fixture_hash, "claim_fixture_hash"
+            ),
+            "evaluation_fixture_hash": _sha256(
+                self.evaluation_fixture_hash, "evaluation_fixture_hash"
             ),
             "extraction_schema_version": _positive_int(
                 self.extraction_schema_version, "extraction_schema_version"
@@ -205,6 +214,7 @@ class ReplayIdentity:
         dependency_lock_hash: str,
         interpretation_fixture_hash: str,
         claim_fixture_hash: str,
+        evaluation_fixture_hash: str,
         extraction_schema_version: int,
         provider_id: str,
         model_id: str,
@@ -229,6 +239,9 @@ class ReplayIdentity:
                 interpretation_fixture_hash, "interpretation_fixture_hash"
             ),
             "claim_fixture_hash": _sha256(claim_fixture_hash, "claim_fixture_hash"),
+            "evaluation_fixture_hash": _sha256(
+                evaluation_fixture_hash, "evaluation_fixture_hash"
+            ),
             "extraction_schema_version": _positive_int(
                 extraction_schema_version, "extraction_schema_version"
             ),
@@ -281,6 +294,7 @@ class ReplayIdentity:
             "dependencyLockHash": self.dependency_lock_hash,
             "interpretationFixtureHash": self.interpretation_fixture_hash,
             "claimFixtureHash": self.claim_fixture_hash,
+            "evaluationFixtureHash": self.evaluation_fixture_hash,
             "extractionSchemaVersion": self.extraction_schema_version,
             "providerId": self.provider_id,
             "modelId": self.model_id,
@@ -524,6 +538,7 @@ class ReplayCaseResult:
     outcome_digest: str
     accepted_claim_count: int
     issue_codes: tuple[str, ...]
+    quality_mismatch_codes: tuple[str, ...]
     passed: bool
     error_code: str
     usage: ProposalUsage
@@ -537,6 +552,7 @@ class ReplayCaseResult:
             "outcomeDigest": self.outcome_digest,
             "acceptedClaimCount": self.accepted_claim_count,
             "issueCodes": list(self.issue_codes),
+            "qualityMismatchCodes": list(self.quality_mismatch_codes),
             "passed": self.passed,
             "errorCode": self.error_code,
             "usage": self.usage.to_dict(),
@@ -616,6 +632,7 @@ def _validate_replay_inputs(
     *,
     interpretation_catalog: InterpretationFixtureCatalog,
     claim_catalog: ClaimFixtureCatalog,
+    provider_quality_catalog: ProviderQualityFixtureCatalog | None,
     adapter: ProposalAdapter,
     identity: ReplayIdentity,
 ) -> dict[str, object]:
@@ -632,7 +649,23 @@ def _validate_replay_inputs(
         raise ValueError("replay identity claim fixture hash does not match")
     if identity.extraction_schema_version != CLAIM_EXTRACTION_SCHEMA_VERSION:
         raise ValueError("replay identity extraction schema does not match")
-    if identity.case_count != len(claim_catalog.cases):
+    if identity.evaluation_profile == "provider_quality":
+        if provider_quality_catalog is None:
+            raise ValueError("provider quality replay requires its expectation catalog")
+        _report_safe_id(
+            provider_quality_catalog.catalog_id,
+            "provider quality catalog_id",
+        )
+        expected_evaluation_hash = provider_quality_catalog.manifest_hash
+        expected_case_count = len(provider_quality_catalog.cases)
+    else:
+        if provider_quality_catalog is not None:
+            raise ValueError("candidate replay cannot use a provider quality catalog")
+        expected_evaluation_hash = claim_catalog.manifest_hash
+        expected_case_count = len(claim_catalog.cases)
+    if identity.evaluation_fixture_hash != expected_evaluation_hash:
+        raise ValueError("replay identity evaluation fixture hash does not match")
+    if identity.case_count != expected_case_count:
         raise ValueError("replay identity case count does not match")
     if identity.interpretation_case_count != len(interpretation_catalog.cases):
         raise ValueError("replay identity interpretation case count does not match")
@@ -988,21 +1021,75 @@ def _expected_issue_outcome(case) -> tuple[dict[str, object], ...]:
     )
 
 
-def _provider_expected_issue_outcome(case) -> tuple[dict[str, object], ...]:
-    expected = []
-    for item in case.expected["issues"]:
-        if item["code"] == "model_requested_review":
-            expected.append(_plain_json(item))
-        elif item["code"] == "unresolved_entity_context":
-            expected.append(
-                {
-                    "code": "model_requested_review",
-                    "candidateIndex": item["candidateIndex"],
-                    "evidenceIndexes": _plain_json(item["evidenceIndexes"]),
-                    "entities": [],
-                }
+def _provider_review_outcome(
+    model_output: object,
+    evidence: tuple[EvidenceEnvelope, ...],
+) -> tuple[tuple[ProviderReviewExpectation, ...], tuple[str, ...]]:
+    if isinstance(model_output, str):
+        try:
+            model_output = json.loads(model_output)
+        except json.JSONDecodeError:
+            return (), ("invalid_provider_output",)
+    if not isinstance(model_output, Mapping):
+        return (), ("invalid_provider_output",)
+    raw_reviews = model_output.get("review")
+    if not isinstance(raw_reviews, list):
+        return (), ("invalid_provider_output",)
+    evidence_indexes = {item.evidence_id: index for index, item in enumerate(evidence)}
+    reviews = []
+    mismatch_codes = set()
+    for item in raw_reviews:
+        if not isinstance(item, Mapping) or set(item) != {"evidenceId", "reason"}:
+            mismatch_codes.add("invalid_provider_output")
+            continue
+        category = item.get("reason")
+        if category not in SUPPORTED_REVIEW_CATEGORIES:
+            mismatch_codes.add("invalid_review_category")
+            continue
+        evidence_index = evidence_indexes.get(item.get("evidenceId"))
+        if evidence_index is None:
+            mismatch_codes.add("review_binding_mismatch")
+            continue
+        reviews.append(
+            ProviderReviewExpectation(
+                category=category,
+                evidence_index=evidence_index,
             )
-    return tuple(sorted(expected, key=_canonical_json))
+        )
+    return tuple(sorted(reviews)), tuple(sorted(mismatch_codes))
+
+
+def _provider_quality_mismatches(
+    *,
+    expected_claim_digests: tuple[str, ...],
+    expected_reviews: tuple[ProviderReviewExpectation, ...],
+    actual_claim_digests: tuple[str, ...],
+    actual_reviews: tuple[ProviderReviewExpectation, ...],
+    review_parse_mismatches: tuple[str, ...],
+    issue_codes: tuple[str, ...],
+) -> tuple[str, ...]:
+    mismatches = set(review_parse_mismatches)
+    expected_claims = set(expected_claim_digests)
+    actual_claims = set(actual_claim_digests)
+    if expected_claims - actual_claims:
+        mismatches.add("missing_expected_claims")
+    if actual_claims - expected_claims:
+        mismatches.add("unexpected_claims")
+
+    expected_review_set = set(expected_reviews)
+    actual_review_set = set(actual_reviews)
+    expected_categories = sorted(item.category for item in expected_reviews)
+    actual_categories = sorted(item.category for item in actual_reviews)
+    if expected_categories == actual_categories and expected_review_set != actual_review_set:
+        mismatches.add("review_binding_mismatch")
+    else:
+        if expected_review_set - actual_review_set:
+            mismatches.add("missing_expected_reviews")
+        if actual_review_set - expected_review_set:
+            mismatches.add("unexpected_reviews")
+    if any(code != "model_requested_review" for code in issue_codes):
+        mismatches.add("provider_candidate_rejected")
+    return tuple(sorted(mismatches))
 
 
 def _proposal_digest(model_output: object) -> str:
@@ -1140,6 +1227,7 @@ def _adapter_failure_result(
         outcome_digest=digest,
         accepted_claim_count=0,
         issue_codes=(),
+        quality_mismatch_codes=(),
         passed=False,
         error_code=error_code,
         usage=usage
@@ -1180,6 +1268,7 @@ def run_claim_replay(
     *,
     interpretation_catalog: InterpretationFixtureCatalog,
     claim_catalog: ClaimFixtureCatalog,
+    provider_quality_catalog: ProviderQualityFixtureCatalog | None = None,
     adapter: ProposalAdapter,
     identity: ReplayIdentity,
     telemetry: ProviderTelemetry | None = None,
@@ -1189,19 +1278,32 @@ def run_claim_replay(
     interpretation_by_id = _validate_replay_inputs(
         interpretation_catalog=interpretation_catalog,
         claim_catalog=claim_catalog,
+        provider_quality_catalog=provider_quality_catalog,
         adapter=adapter,
         identity=identity,
     )
+    claim_by_id = {case.case_id: case for case in claim_catalog.cases}
+    if identity.evaluation_profile == "provider_quality":
+        assert provider_quality_catalog is not None
+        replay_cases = tuple(
+            (
+                case,
+                claim_by_id[case.source_claim_case_ids[0]],
+            )
+            for case in provider_quality_catalog.cases
+        )
+    else:
+        replay_cases = tuple((case, case) for case in claim_catalog.cases)
     interpretation_results: list[InterpretationReplayResult] = []
     results: list[ReplayCaseResult] = []
     interpretation_digests: dict[str, set[str]] = {
         case.case_id: set() for case in interpretation_catalog.cases
     }
     proposal_digests: dict[str, set[str]] = {
-        case.case_id: set() for case in claim_catalog.cases
+        case.case_id: set() for case, _ in replay_cases
     }
     outcome_digests: dict[str, set[str]] = {
-        case.case_id: set() for case in claim_catalog.cases
+        case.case_id: set() for case, _ in replay_cases
     }
 
     for repeat_index in range(identity.repeats):
@@ -1217,8 +1319,9 @@ def run_claim_replay(
                     passed=actual == _expected_interpretation_outcome(case),
                 )
             )
-        for case in claim_catalog.cases:
-            source = interpretation_by_id[case.interpretation_case_id]
+        for evaluation_case, source_case in replay_cases:
+            case_id = evaluation_case.case_id
+            source = interpretation_by_id[source_case.interpretation_case_id]
             normalized = normalize_message_evidence(source.message)
             resolved = resolve_entities(
                 tenant_id=source.message.tenant_id,
@@ -1228,7 +1331,7 @@ def run_claim_replay(
             )
             prior_claims = tuple(
                 _prior_claim_from_fixture(raw, normalized.evidence, resolved.entities)
-                for raw in case.prior_claims
+                for raw in source_case.prior_claims
             )
             request = build_claim_extraction_request(
                 tenant_id=source.message.tenant_id,
@@ -1241,7 +1344,7 @@ def run_claim_replay(
             telemetry_before = telemetry.snapshot() if telemetry is not None else None
             try:
                 response = adapter.propose(
-                    case_id=case.case_id,
+                    case_id=case_id,
                     request=request,
                     evidence=normalized.evidence,
                     entities=resolved.entities,
@@ -1255,14 +1358,14 @@ def run_claim_replay(
                     declared=None,
                 )
                 failed = _adapter_failure_result(
-                    case_id=case.case_id,
+                    case_id=case_id,
                     repeat_index=repeat_index,
                     request_id=request.request_id,
                     error_code=telemetry_error or safe_error,
                     usage=observed_usage,
                 )
-                proposal_digests[case.case_id].add(failed.proposal_digest)
-                outcome_digests[case.case_id].add(failed.outcome_digest)
+                proposal_digests[case_id].add(failed.proposal_digest)
+                outcome_digests[case_id].add(failed.outcome_digest)
                 results.append(failed)
                 continue
             if not isinstance(response, ProposalResponse):
@@ -1273,14 +1376,14 @@ def run_claim_replay(
                     declared=None,
                 )
                 failed = _adapter_failure_result(
-                    case_id=case.case_id,
+                    case_id=case_id,
                     repeat_index=repeat_index,
                     request_id=request.request_id,
                     error_code=telemetry_error or "adapter_invalid_response",
                     usage=observed_usage,
                 )
-                proposal_digests[case.case_id].add(failed.proposal_digest)
-                outcome_digests[case.case_id].add(failed.outcome_digest)
+                proposal_digests[case_id].add(failed.proposal_digest)
+                outcome_digests[case_id].add(failed.outcome_digest)
                 results.append(failed)
                 continue
             observed_usage, telemetry_error = _reconciled_case_usage(
@@ -1291,14 +1394,14 @@ def run_claim_replay(
             )
             if telemetry_error:
                 failed = _adapter_failure_result(
-                    case_id=case.case_id,
+                    case_id=case_id,
                     repeat_index=repeat_index,
                     request_id=request.request_id,
                     error_code=telemetry_error,
                     usage=observed_usage,
                 )
-                proposal_digests[case.case_id].add(failed.proposal_digest)
-                outcome_digests[case.case_id].add(failed.outcome_digest)
+                proposal_digests[case_id].add(failed.proposal_digest)
+                outcome_digests[case_id].add(failed.outcome_digest)
                 results.append(failed)
                 continue
             extracted = extract_claims(
@@ -1312,35 +1415,50 @@ def run_claim_replay(
             )
             proposal_digest = _proposal_digest(response.model_output)
             outcome_digest = _outcome_digest(extracted.claims, extracted.issues)
-            proposal_digests[case.case_id].add(proposal_digest)
-            outcome_digests[case.case_id].add(outcome_digest)
+            proposal_digests[case_id].add(proposal_digest)
+            outcome_digests[case_id].add(outcome_digest)
             issue_codes = tuple(sorted(item.code for item in extracted.issues))
-            passed = (
-                _claim_oracle(case)
-                == _actual_claim_outcome(
-                    extracted.claims,
-                    normalized.evidence,
-                    resolved.entities,
-                    request.prior_claims,
-                )
-                and (
-                    _provider_expected_issue_outcome(case)
-                    if identity.evaluation_profile == "provider_quality"
-                    else _expected_issue_outcome(case)
-                )
-                == _issue_outcome(
-                    extracted.issues, normalized.evidence, resolved.entities
-                )
+            actual_claim_outcome = _actual_claim_outcome(
+                extracted.claims,
+                normalized.evidence,
+                resolved.entities,
+                request.prior_claims,
             )
+            if identity.evaluation_profile == "provider_quality":
+                actual_reviews, review_parse_mismatches = _provider_review_outcome(
+                    response.model_output,
+                    normalized.evidence,
+                )
+                quality_mismatch_codes = _provider_quality_mismatches(
+                    expected_claim_digests=evaluation_case.expected_claim_digests,
+                    expected_reviews=evaluation_case.expected_reviews,
+                    actual_claim_digests=actual_claim_outcome,
+                    actual_reviews=actual_reviews,
+                    review_parse_mismatches=review_parse_mismatches,
+                    issue_codes=issue_codes,
+                )
+                passed = not quality_mismatch_codes
+            else:
+                quality_mismatch_codes = ()
+                passed = (
+                    _claim_oracle(source_case) == actual_claim_outcome
+                    and _expected_issue_outcome(source_case)
+                    == _issue_outcome(
+                        extracted.issues,
+                        normalized.evidence,
+                        resolved.entities,
+                    )
+                )
             results.append(
                 ReplayCaseResult(
-                    case_id=case.case_id,
+                    case_id=case_id,
                     repeat_index=repeat_index,
                     request_id=request.request_id,
                     proposal_digest=proposal_digest,
                     outcome_digest=outcome_digest,
                     accepted_claim_count=len(extracted.claims),
                     issue_codes=issue_codes,
+                    quality_mismatch_codes=quality_mismatch_codes,
                     passed=passed,
                     error_code="",
                     usage=observed_usage,

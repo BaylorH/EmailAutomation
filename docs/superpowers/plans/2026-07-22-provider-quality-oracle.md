@@ -8,26 +8,26 @@
 
 ### Task 1: Define And Validate The Provider Catalog
 
-- [ ] Write failing tests for exact schema, source-case partitioning, request equivalence, fixture-hash binding, claim-union equality, review categories, evidence indexes, and immutability.
-- [ ] Add the provider-quality fixture loader and the 18-case sanitized expectation catalog.
-- [ ] Prove every one of the 28 validator cases belongs to exactly one provider request.
+- [x] Write failing tests for exact schema, source-case partitioning, request equivalence, fixture-hash binding, claim-union equality, review categories, evidence indexes, and immutability.
+- [x] Add the provider-quality fixture loader and the 19-case sanitized expectation catalog.
+- [x] Prove every one of the 29 validator cases belongs to exactly one provider request and every interpretation case has claim-quality coverage.
 
 ### Task 2: Separate Candidate And Provider Evaluation
 
-- [ ] Write failing tests proving provider mode uses 18 complete request expectations while recorded mode still uses all 28 candidate cases.
-- [ ] Add the provider-quality fixture hash to replay identity.
-- [ ] Replace validator-issue translation with exact claim/review evaluation against the provider catalog.
-- [ ] Add privacy-safe mismatch codes and reject all provider candidates that fail deterministic validation.
+- [x] Write failing tests proving provider mode uses 19 complete request expectations while recorded mode still uses all 29 candidate cases.
+- [x] Add the provider-quality fixture hash to replay identity.
+- [x] Replace validator-issue translation with exact claim/review evaluation against the provider catalog.
+- [x] Add privacy-safe mismatch codes and reject all provider candidates that fail deterministic validation.
 
 ### Task 3: Constrain Provider Review Output
 
-- [ ] Write failing prompt/adapter tests for exact supported review category tokens.
-- [ ] Update the pinned prompt revision and hash without exposing expected case outputs.
-- [ ] Verify malformed or free-form review reasons fail visibly and safely.
+- [x] Write failing prompt/adapter tests for exact supported review category tokens.
+- [x] Update the pinned prompt revision and hash without exposing expected case outputs.
+- [x] Verify malformed or free-form review reasons fail visibly and safely.
 
 ### Task 4: Verify And Measure
 
-- [ ] Run fixture, replay, provider, CLI, isolation, compilation, focused, full, and diff-integrity checks.
+- [x] Run fixture, replay, provider, CLI, isolation, compilation, focused, full, and diff-integrity checks.
 - [ ] Commit a clean implementation checkpoint and rerun the clean recorded three-repeat replay.
-- [ ] Run one clean 18-call provider repeat and record exact quality, calls, tokens, latency, and cost.
-- [ ] Run the 54-call variance gate only if the one-repeat quality gate passes unchanged.
+- [ ] Run one clean 19-call provider repeat and record exact quality, calls, tokens, latency, and cost.
+- [ ] Run the 57-call variance gate only if the one-repeat quality gate passes unchanged.

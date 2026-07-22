@@ -12,7 +12,7 @@ The claim fixture catalog is a validator test suite, not a set of independent mo
 
 1. Translate selected validator issue codes into provider issue codes. This is the current provisional approach and is rejected because candidate indexes and attack-specific errors do not exist in provider input.
 2. Keep all 28 provider calls and hand-author a second expectation for each duplicate request. This can work, but wastes calls and permits duplicated requests to drift into contradictory expectations.
-3. Group request-equivalent validator cases into one explicit provider-quality case. This is selected because it preserves all candidate tests, gives the provider one complete extraction target per distinct request, and reduces a three-repeat run from 84 to 54 calls.
+3. Group request-equivalent validator cases into one explicit provider-quality case. This is selected because it preserves all candidate tests, gives the provider one complete extraction target per distinct request, and reduces a three-repeat run from 87 to 57 calls.
 
 ## Catalog Contract
 
@@ -35,7 +35,7 @@ The provider prompt requires the review `reason` field to contain exactly one su
 
 ## Replay Behavior
 
-Recorded candidate-validation replay remains unchanged over all 28 cases. Provider-quality replay uses the new 18-case catalog and the representative source case only to construct the sanitized request; expected outputs are never sent to the model.
+Recorded candidate-validation replay covers all 29 cases, including the previously missing Outlook fresh-over-quoted claim case. Provider-quality replay uses the new 19-case catalog and the representative source case only to construct the sanitized request; expected outputs are never sent to the model.
 
 Provider pass criteria are:
 
@@ -49,7 +49,7 @@ The report adds only sorted safe mismatch codes and the provider-quality fixture
 
 ## Failure And Cost Policy
 
-The first paid gate is one clean 18-call repeat. Any semantic failure stops the three-repeat run. The 54-call variance gate runs only after one repeat passes without changing candidate claim digests. Provider/model/prompt/runtime/fixture identity, attempts, billed calls, token usage, latency, and micro-USD remain exact and independently reconciled.
+The first paid gate is one clean 19-call repeat. Any semantic failure stops the three-repeat run. The 57-call variance gate runs only after one repeat passes without changing candidate claim digests. Provider/model/prompt/runtime/fixture identity, attempts, billed calls, token usage, latency, and micro-USD remain exact and independently reconciled.
 
 ## Verification
 

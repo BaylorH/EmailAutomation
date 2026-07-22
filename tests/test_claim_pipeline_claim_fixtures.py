@@ -304,6 +304,17 @@ class ClaimFixtureTests(unittest.TestCase):
                     sorted(item.code for item in result.issues),
                 )
 
+    def test_every_interpretation_case_has_claim_quality_coverage(self):
+        claim_catalog = load_claim_fixture_catalog(CLAIM_FIXTURE_PATH)
+        interpretation_catalog = load_interpretation_fixture_catalog(
+            INTERPRETATION_FIXTURE_PATH
+        )
+
+        self.assertEqual(
+            {case.case_id for case in interpretation_catalog.cases},
+            {case.interpretation_case_id for case in claim_catalog.cases},
+        )
+
     def test_unknown_keys_and_duplicate_case_ids_are_rejected(self):
         raw = json.loads(CLAIM_FIXTURE_PATH.read_text(encoding="utf-8"))
         mutations = (

@@ -9,13 +9,14 @@ from typing import Protocol
 
 from .contracts import EntityRef, EvidenceEnvelope
 from .extraction import ClaimExtractionRequest, PREDICATE_OUTPUT_CONTRACTS
+from .provider_quality_fixtures import SUPPORTED_REVIEW_CATEGORIES
 from .replay import ProposalResponse, ProposalUsage
 
 
 PINNED_PROVIDER_ID = "openai"
 PINNED_MODEL_ID = "gpt-5.2-2025-12-11"
-PINNED_PROMPT_ID = "sitesift-claim-proposal-2026-07-22-v2"
-PINNED_PROMPT = """You are the read-only claim proposal stage for a commercial real-estate broker conversation.
+PINNED_PROMPT_ID = "sitesift-claim-proposal-2026-07-22-v3"
+PINNED_PROMPT = f"""You are the read-only claim proposal stage for a commercial real-estate broker conversation.
 
 Return one JSON object with exactly two arrays: claims and review. Follow outputSchema in the supplied request exactly. Use only supplied evidence, entities, prior claims, and resolution issues.
 
@@ -30,7 +31,9 @@ Rules:
 - A correction must cite the correcting excerpt and supersede the exact prior claim only when the speaker, property, predicate, old value, and chronology all match.
 - Requests, referrals, opt-outs, calls, tours, return dates, and information requests must stay scoped to the entity and wording that expressed them.
 - Fresh evidence controls current claims. Do not create a review item merely because quoted, forwarded, or historical text differs from a fresh statement.
-- When evidence cannot support a safe claim, omit it. Add a review item only when current evidence itself requires human review; bind it to the relevant evidenceId and state a concise reason.
+- When evidence cannot support a safe claim, omit it. Add a review item only when current evidence itself requires human review and bind it to the relevant evidenceId.
+- review.reason must be exactly one of these category tokens: {", ".join(SUPPORTED_REVIEW_CATEGORIES)}.
+- Use entity_ambiguity when current evidence or resolutionIssues cannot select one property or suite. Use insufficient_evidence when a current statement names a supported fact but omits a required unit, time basis, or other semantic basis. Do not review merely because quoted, forwarded, or historical text was omitted.
 - Never include commentary, markdown, email drafts, actions, or fields outside the schema.
 """
 PINNED_PROMPT_HASH = hashlib.sha256(

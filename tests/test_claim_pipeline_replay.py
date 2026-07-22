@@ -12,6 +12,9 @@ from email_automation.claim_pipeline.claim_fixtures import load_claim_fixture_ca
 from email_automation.claim_pipeline.interpretation_fixtures import (
     load_interpretation_fixture_catalog,
 )
+from email_automation.claim_pipeline.provider_quality_fixtures import (
+    load_provider_quality_fixture_catalog,
+)
 from email_automation.claim_pipeline.extraction import CLAIM_EXTRACTION_SCHEMA_VERSION
 from email_automation.claim_pipeline.replay import (
     MAX_REPLAY_CALLS,
@@ -29,6 +32,9 @@ CLAIM_FIXTURE_PATH = FIXTURE_ROOT / "claim_pipeline_claim_cases.json"
 INTERPRETATION_FIXTURE_PATH = (
     FIXTURE_ROOT / "claim_pipeline_interpretation_cases.json"
 )
+PROVIDER_QUALITY_FIXTURE_PATH = (
+    FIXTURE_ROOT / "claim_pipeline_provider_quality_cases.json"
+)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPLAY_SCRIPT = REPO_ROOT / "scripts" / "run_claim_pipeline_replay.py"
 
@@ -43,6 +49,7 @@ class ReplayContractTests(unittest.TestCase):
             "dependency_lock_hash": "b" * 64,
             "interpretation_fixture_hash": "c" * 64,
             "claim_fixture_hash": "d" * 64,
+            "evaluation_fixture_hash": "d" * 64,
             "extraction_schema_version": 1,
             "provider_id": "recorded",
             "model_id": "fixture-output-v1",
@@ -74,6 +81,7 @@ class ReplayContractTests(unittest.TestCase):
                 "dependencyLockHash",
                 "interpretationFixtureHash",
                 "claimFixtureHash",
+                "evaluationFixtureHash",
                 "extractionSchemaVersion",
                 "providerId",
                 "modelId",
@@ -306,12 +314,146 @@ class _AdapterWrapper:
         return result
 
 
+class _ProviderQualityRecordedAdapter:
+    provider_id = "test-provider"
+    model_id = "fixture-provider-v1"
+    prompt_id = "fixture-provider-prompt-v1"
+    prompt_hash = "9" * 64
+
+    def __init__(
+        self,
+        provider_catalog,
+        claim_catalog,
+        telemetry,
+        *,
+        missing_claim_case="",
+        unexpected_review_case="",
+        invalid_review_category_case="",
+        wrong_review_evidence_case="",
+        rejected_candidate_case="",
+    ):
+        self._provider_cases = {
+            case.case_id: case for case in provider_catalog.cases
+        }
+        self._claim_cases = {case.case_id: case for case in claim_catalog.cases}
+        self._telemetry = telemetry
+        self._missing_claim_case = missing_claim_case
+        self._unexpected_review_case = unexpected_review_case
+        self._invalid_review_category_case = invalid_review_category_case
+        self._wrong_review_evidence_case = wrong_review_evidence_case
+        self._rejected_candidate_case = rejected_candidate_case
+        self.calls = 0
+
+    def propose(self, *, case_id, request, evidence, entities):
+        def plain(value):
+            if hasattr(value, "items"):
+                return {key: plain(item) for key, item in value.items()}
+            if isinstance(value, tuple):
+                return [plain(item) for item in value]
+            return value
+
+        self.calls += 1
+        case = self._provider_cases[case_id]
+        entity_by_key = {
+            (item.relationship, item.suite, item.canonical_address): item
+            for item in entities
+        }
+
+        def materialize(raw):
+            subject = raw["subject"]
+            entity = entity_by_key[
+                (
+                    subject["relationship"],
+                    subject["suite"],
+                    subject["canonicalAddress"],
+                )
+            ]
+            claim = {
+                key: plain(value)
+                for key, value in raw.items()
+                if key not in {"evidenceIndex", "subject"}
+            }
+            supersedes = claim["supersedesClaimId"]
+            if isinstance(supersedes, str) and supersedes.startswith("prior:"):
+                claim["supersedesClaimId"] = request.prior_claims[
+                    int(supersedes.removeprefix("prior:"))
+                ].claim_id
+            claim.update(
+                {
+                    "evidenceId": evidence[raw["evidenceIndex"]].evidence_id,
+                    "subjectEntityId": entity.entity_id,
+                }
+            )
+            return claim
+
+        claims = {}
+        for source_case_id in case.source_claim_case_ids:
+            source = self._claim_cases[source_case_id]
+            for index in source.expected["acceptedClaimIndexes"]:
+                raw = source.claims[index]
+                claim = materialize(raw)
+                claims[json.dumps(claim, sort_keys=True)] = claim
+        model_claims = list(claims.values())
+        if case_id == self._missing_claim_case and model_claims:
+            model_claims.pop()
+        if case_id == self._rejected_candidate_case:
+            rejected = next(
+                source.claims[index]
+                for source_case_id in case.source_claim_case_ids
+                for source in (self._claim_cases[source_case_id],)
+                for index in range(len(source.claims))
+                if index not in source.expected["acceptedClaimIndexes"]
+            )
+            model_claims.append(materialize(rejected))
+        reviews = [
+            {
+                "evidenceId": evidence[item.evidence_index].evidence_id,
+                "reason": item.category,
+            }
+            for item in case.expected_reviews
+        ]
+        if case_id == self._unexpected_review_case:
+            reviews.append(
+                {
+                    "evidenceId": evidence[0].evidence_id,
+                    "reason": "insufficient_evidence",
+                }
+            )
+        if case_id == self._invalid_review_category_case and reviews:
+            reviews[0]["reason"] = "private free-form reason"
+        if case_id == self._wrong_review_evidence_case and reviews:
+            reviews[0]["evidenceId"] = next(
+                item.evidence_id
+                for item in evidence
+                if item.evidence_id != reviews[0]["evidenceId"]
+            )
+        usage = ProposalUsage(
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=7,
+            cost_microusd=3,
+            provider_calls=1,
+            provider_billed=True,
+            usage_complete=True,
+        )
+        self._telemetry.record(usage)
+        return ProposalResponse(
+            model_output={"claims": model_claims, "review": reviews},
+            usage=usage,
+        )
+
+
 class ReplayExecutionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.claim_catalog = load_claim_fixture_catalog(CLAIM_FIXTURE_PATH)
         cls.interpretation_catalog = load_interpretation_fixture_catalog(
             INTERPRETATION_FIXTURE_PATH
+        )
+        cls.provider_quality_catalog = load_provider_quality_fixture_catalog(
+            PROVIDER_QUALITY_FIXTURE_PATH,
+            claim_catalog=cls.claim_catalog,
+            interpretation_catalog=cls.interpretation_catalog,
         )
 
     def _adapter(self, **kwargs):
@@ -327,7 +469,13 @@ class ReplayExecutionTests(unittest.TestCase):
         repeats=3,
         source_tree_dirty=False,
         evaluation_profile="candidate_validation",
+        evaluation_fixture_hash=None,
+        case_count=None,
     ):
+        if evaluation_fixture_hash is None:
+            evaluation_fixture_hash = self.claim_catalog.manifest_hash
+        if case_count is None:
+            case_count = len(self.claim_catalog.cases)
         return ReplayIdentity.create(
             code_revision="a" * 40,
             source_tree_hash="f" * 64,
@@ -336,6 +484,7 @@ class ReplayExecutionTests(unittest.TestCase):
             dependency_lock_hash="b" * 64,
             interpretation_fixture_hash=self.interpretation_catalog.manifest_hash,
             claim_fixture_hash=self.claim_catalog.manifest_hash,
+            evaluation_fixture_hash=evaluation_fixture_hash,
             extraction_schema_version=CLAIM_EXTRACTION_SCHEMA_VERSION,
             provider_id=adapter.provider_id,
             model_id=adapter.model_id,
@@ -343,7 +492,7 @@ class ReplayExecutionTests(unittest.TestCase):
             prompt_hash=adapter.prompt_hash,
             evaluation_profile=evaluation_profile,
             repeats=repeats,
-            case_count=len(self.claim_catalog.cases),
+            case_count=case_count,
             interpretation_case_count=len(self.interpretation_catalog.cases),
         )
 
@@ -575,39 +724,102 @@ class ReplayExecutionTests(unittest.TestCase):
         self.assertFalse(failed.usage.usage_complete)
         self.assertFalse(report.passed)
 
-    def test_provider_quality_does_not_require_model_to_emit_attack_candidates(self):
-        case_id = "unit-price-without-time-basis-is-not-rent"
-        usage = ProposalUsage(
-            input_tokens=1,
-            output_tokens=1,
-            latency_ms=1,
-            cost_microusd=1,
-            provider_calls=1,
-            provider_billed=True,
-            usage_complete=True,
-        )
+    def test_provider_quality_uses_one_complete_case_per_unique_request(self):
         telemetry = _MutableTelemetry()
-        adapter = self._adapter(
-            provider_id="test-provider",
-            usage=usage,
-            telemetry=telemetry,
-            empty_case=case_id,
+        adapter = _ProviderQualityRecordedAdapter(
+            self.provider_quality_catalog,
+            self.claim_catalog,
+            telemetry,
         )
-
         report = run_claim_replay(
             interpretation_catalog=self.interpretation_catalog,
             claim_catalog=self.claim_catalog,
+            provider_quality_catalog=self.provider_quality_catalog,
             adapter=adapter,
             identity=self._identity(
                 adapter,
                 repeats=1,
                 evaluation_profile="provider_quality",
+                evaluation_fixture_hash=self.provider_quality_catalog.manifest_hash,
+                case_count=len(self.provider_quality_catalog.cases),
             ),
             telemetry=telemetry,
         )
 
-        target = next(item for item in report.results if item.case_id == case_id)
-        self.assertTrue(target.passed)
+        self.assertTrue(report.passed)
+        self.assertEqual(19, adapter.calls)
+        self.assertEqual(19, len(report.results))
+        self.assertEqual(
+            {case.case_id for case in self.interpretation_catalog.cases},
+            {item.case_id for item in report.results},
+        )
+        self.assertTrue(all(not item.quality_mismatch_codes for item in report.results))
+
+    def test_provider_quality_reports_only_safe_mismatch_categories(self):
+        scenarios = (
+            (
+                {"missing_claim_case": "fresh-reply-over-quoted-stale-history"},
+                "missing_expected_claims",
+            ),
+            (
+                {"unexpected_review_case": "fresh-reply-over-quoted-stale-history"},
+                "unexpected_reviews",
+            ),
+            (
+                {"invalid_review_category_case": "ambiguous-other-building"},
+                "invalid_review_category",
+            ),
+            (
+                {"wrong_review_evidence_case": "ambiguous-other-building"},
+                "review_binding_mismatch",
+            ),
+            (
+                {
+                    "rejected_candidate_case": (
+                        "ordinary-prose-does-not-fabricate-entities"
+                    )
+                },
+                "provider_candidate_rejected",
+            ),
+        )
+
+        for adapter_options, expected_code in scenarios:
+            with self.subTest(expected_code=expected_code):
+                telemetry = _MutableTelemetry()
+                adapter = _ProviderQualityRecordedAdapter(
+                    self.provider_quality_catalog,
+                    self.claim_catalog,
+                    telemetry,
+                    **adapter_options,
+                )
+                report = run_claim_replay(
+                    interpretation_catalog=self.interpretation_catalog,
+                    claim_catalog=self.claim_catalog,
+                    provider_quality_catalog=self.provider_quality_catalog,
+                    adapter=adapter,
+                    identity=self._identity(
+                        adapter,
+                        repeats=1,
+                        evaluation_profile="provider_quality",
+                        evaluation_fixture_hash=(
+                            self.provider_quality_catalog.manifest_hash
+                        ),
+                        case_count=len(self.provider_quality_catalog.cases),
+                    ),
+                    telemetry=telemetry,
+                )
+
+                self.assertFalse(report.passed)
+                self.assertIn(
+                    expected_code,
+                    {
+                        code
+                        for item in report.results
+                        for code in item.quality_mismatch_codes
+                    },
+                )
+                serialized = json.dumps(report.to_dict(), sort_keys=True)
+                self.assertNotIn("private free-form reason", serialized)
 
     def test_dirty_source_can_pass_evaluation_but_not_reproducible_gate(self):
         adapter = self._adapter()
@@ -697,6 +909,7 @@ class ReplayExecutionTests(unittest.TestCase):
             dependency_lock_hash="b" * 64,
             interpretation_fixture_hash=self.interpretation_catalog.manifest_hash,
             claim_fixture_hash="f" * 64,
+            evaluation_fixture_hash=self.claim_catalog.manifest_hash,
             extraction_schema_version=CLAIM_EXTRACTION_SCHEMA_VERSION,
             provider_id=adapter.provider_id,
             model_id=adapter.model_id,
@@ -713,6 +926,48 @@ class ReplayExecutionTests(unittest.TestCase):
                 claim_catalog=self.claim_catalog,
                 adapter=adapter,
                 identity=identity,
+            )
+        self.assertEqual(0, adapter.calls)
+
+    def test_evaluation_fixture_hash_mismatch_is_rejected_before_adapter_call(self):
+        adapter = self._adapter()
+
+        with self.assertRaisesRegex(ValueError, "evaluation fixture hash"):
+            run_claim_replay(
+                interpretation_catalog=self.interpretation_catalog,
+                claim_catalog=self.claim_catalog,
+                adapter=adapter,
+                identity=self._identity(
+                    adapter,
+                    repeats=1,
+                    evaluation_fixture_hash="0" * 64,
+                ),
+            )
+        self.assertEqual(0, adapter.calls)
+
+    def test_provider_profile_requires_explicit_quality_catalog(self):
+        telemetry = _MutableTelemetry()
+        adapter = _ProviderQualityRecordedAdapter(
+            self.provider_quality_catalog,
+            self.claim_catalog,
+            telemetry,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires its expectation catalog"):
+            run_claim_replay(
+                interpretation_catalog=self.interpretation_catalog,
+                claim_catalog=self.claim_catalog,
+                adapter=adapter,
+                identity=self._identity(
+                    adapter,
+                    repeats=1,
+                    evaluation_profile="provider_quality",
+                    evaluation_fixture_hash=(
+                        self.provider_quality_catalog.manifest_hash
+                    ),
+                    case_count=len(self.provider_quality_catalog.cases),
+                ),
+                telemetry=telemetry,
             )
         self.assertEqual(0, adapter.calls)
 
@@ -1045,11 +1300,11 @@ class ReplayCliTests(unittest.TestCase):
         self.assertEqual(current_sha, payload["identity"]["codeRevision"])
         self.assertRegex(payload["identity"]["sourceTreeHash"], r"^[0-9a-f]{64}$")
         self.assertIsInstance(payload["identity"]["sourceTreeDirty"], bool)
-        self.assertEqual(28, payload["identity"]["caseCount"])
+        self.assertEqual(29, payload["identity"]["caseCount"])
         self.assertEqual(19, payload["identity"]["interpretationCaseCount"])
-        self.assertEqual(84, payload["identity"]["plannedCalls"])
+        self.assertEqual(87, payload["identity"]["plannedCalls"])
         self.assertEqual(57, payload["identity"]["plannedInterpretations"])
-        self.assertEqual(84, payload["summary"]["resultCount"])
+        self.assertEqual(87, payload["summary"]["resultCount"])
         self.assertEqual(57, payload["summary"]["interpretationResultCount"])
         self.assertEqual(0, payload["summary"]["providerBilledCalls"])
         self.assertEqual(0, payload["summary"]["totalTokens"])
@@ -1111,7 +1366,7 @@ class ReplayCliTests(unittest.TestCase):
             "openai",
             "--allow-provider-calls",
             "--repeats",
-            "4",
+            "5",
             env=environment,
         )
 
@@ -1131,6 +1386,9 @@ class ReplayCliTests(unittest.TestCase):
             "tests/fixtures/claim_pipeline_interpretation_cases.json", relative
         )
         self.assertIn("tests/fixtures/claim_pipeline_claim_cases.json", relative)
+        self.assertIn(
+            "tests/fixtures/claim_pipeline_provider_quality_cases.json", relative
+        )
         self.assertNotIn("service-account.json", relative)
         self.assertTrue(
             all(
@@ -1142,6 +1400,7 @@ class ReplayCliTests(unittest.TestCase):
                     "requirements.lock",
                     "tests/fixtures/claim_pipeline_interpretation_cases.json",
                     "tests/fixtures/claim_pipeline_claim_cases.json",
+                    "tests/fixtures/claim_pipeline_provider_quality_cases.json",
                 }
                 for value in relative
             )

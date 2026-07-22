@@ -93,6 +93,30 @@
       "expected": {"acceptedClaimIndexes": [], "acceptedClaimDigests": [], "issues": [{"code": "historical_instruction", "candidateIndex": 0, "evidenceIndexes": [2], "entities": [{"relationship": "alternate", "suite": "", "canonicalAddress": "999 other road"}]}]}
     },
     {
+      "caseId": "outlook-fresh-suite-b-availability",
+      "interpretationCaseId": "outlook-original-message-history",
+      "priorClaims": [],
+      "coverage": {"predicateOutcomes":[{"predicate":"availability","outcome":"accepted"}],"incidentDimensions":[]},
+      "claims": [
+        {
+          "evidenceIndex": 1,
+          "subject": {"relationship": "suite_of_target", "suite": "B", "canonicalAddress": "123 industrial avenue"},
+          "predicate": "availability",
+          "value": "available",
+          "evidenceText": "Suite B remains available",
+          "actorRole": "broker",
+          "polarity": "positive",
+          "modality": "asserted",
+          "confidence": 0.99,
+          "unit": null,
+          "effectiveAt": null,
+          "supersedesClaimId": null
+        }
+      ],
+      "review": [],
+      "expected": {"acceptedClaimIndexes": [0], "acceptedClaimDigests": ["043efbb5c2b3f68caa0ca2fb21b4f99935a08acf5a2da781ae87602574866747"], "issues": []}
+    },
+    {
       "caseId": "forwarded-alternate-is-historical",
       "interpretationCaseId": "forwarded-different-property",
       "priorClaims": [],

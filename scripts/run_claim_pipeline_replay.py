@@ -32,6 +32,9 @@ from email_automation.claim_pipeline.replay import (
 from email_automation.claim_pipeline.provider_replay import (
     PinnedProviderProposalAdapter,
 )
+from email_automation.claim_pipeline.provider_quality_fixtures import (
+    load_provider_quality_fixture_catalog,
+)
 
 
 INTERPRETATION_FIXTURE_PATH = (
@@ -39,6 +42,9 @@ INTERPRETATION_FIXTURE_PATH = (
 )
 CLAIM_FIXTURE_PATH = (
     REPO_ROOT / "tests" / "fixtures" / "claim_pipeline_claim_cases.json"
+)
+PROVIDER_QUALITY_FIXTURE_PATH = (
+    REPO_ROOT / "tests" / "fixtures" / "claim_pipeline_provider_quality_cases.json"
 )
 DEPENDENCY_LOCK_PATH = REPO_ROOT / "requirements.lock"
 OPENAI_TRANSPORT_PATH = REPO_ROOT / "scripts" / "claim_pipeline_openai_transport.py"
@@ -65,6 +71,7 @@ def _replay_surface_paths() -> tuple[Path, ...]:
         OPENAI_TRANSPORT_PATH,
         INTERPRETATION_FIXTURE_PATH,
         CLAIM_FIXTURE_PATH,
+        PROVIDER_QUALITY_FIXTURE_PATH,
         DEPENDENCY_LOCK_PATH,
     }
     return tuple(sorted(paths, key=lambda path: path.relative_to(REPO_ROOT).as_posix()))
@@ -124,13 +131,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         INTERPRETATION_FIXTURE_PATH
     )
     claim_catalog = load_claim_fixture_catalog(CLAIM_FIXTURE_PATH)
+    provider_quality_catalog = load_provider_quality_fixture_catalog(
+        PROVIDER_QUALITY_FIXTURE_PATH,
+        claim_catalog=claim_catalog,
+        interpretation_catalog=interpretation_catalog,
+    )
     telemetry = None
     if args.provider == "recorded":
         adapter = RecordedProposalAdapter(claim_catalog)
+        evaluation_fixture_hash = claim_catalog.manifest_hash
+        case_count = len(claim_catalog.cases)
+        active_provider_quality_catalog = None
     else:
         if not args.allow_provider_calls:
             parser.error("OpenAI replay requires --allow-provider-calls")
-        planned_calls = args.repeats * len(claim_catalog.cases)
+        planned_calls = args.repeats * len(provider_quality_catalog.cases)
         if planned_calls > MAX_PROVIDER_REPLAY_CALLS:
             parser.error(
                 f"OpenAI replay is capped at {MAX_PROVIDER_REPLAY_CALLS} calls"
@@ -145,6 +160,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except (TypeError, ValueError) as exc:
             parser.error(str(exc))
         adapter = PinnedProviderProposalAdapter(telemetry)
+        evaluation_fixture_hash = provider_quality_catalog.manifest_hash
+        case_count = len(provider_quality_catalog.cases)
+        active_provider_quality_catalog = provider_quality_catalog
     identity = ReplayIdentity.create(
         code_revision=_git("rev-parse", "HEAD").decode("ascii").strip(),
         source_tree_hash=_source_tree_hash(),
@@ -153,6 +171,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dependency_lock_hash=_file_hash(DEPENDENCY_LOCK_PATH),
         interpretation_fixture_hash=interpretation_catalog.manifest_hash,
         claim_fixture_hash=claim_catalog.manifest_hash,
+        evaluation_fixture_hash=evaluation_fixture_hash,
         extraction_schema_version=CLAIM_EXTRACTION_SCHEMA_VERSION,
         provider_id=adapter.provider_id,
         model_id=adapter.model_id,
@@ -162,12 +181,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "provider_quality" if args.provider == "openai" else "candidate_validation"
         ),
         repeats=args.repeats,
-        case_count=len(claim_catalog.cases),
+        case_count=case_count,
         interpretation_case_count=len(interpretation_catalog.cases),
     )
     report = run_claim_replay(
         interpretation_catalog=interpretation_catalog,
         claim_catalog=claim_catalog,
+        provider_quality_catalog=active_provider_quality_catalog,
         adapter=adapter,
         identity=identity,
         telemetry=telemetry,
