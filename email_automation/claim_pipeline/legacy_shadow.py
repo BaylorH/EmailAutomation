@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
 from .contracts import (
@@ -22,7 +24,10 @@ from .contracts import (
     EntityType,
     ExecutionScope,
 )
-from .legacy_shadow_fixtures import LegacyShadowFixtureCase
+from .legacy_shadow_fixtures import (
+    LegacyShadowFixtureCase,
+    LegacyShadowFixtureCatalog,
+)
 from .policy import PolicyEvaluationRequest, evaluate_policy
 from .policy_fixtures import PolicyFixtureCase
 
@@ -161,6 +166,182 @@ class LegacyShadowCaseResult:
             "discrepancies": [item.to_dict() for item in self.discrepancies],
             "legacyProjectionDigest": self.legacy_projection_digest,
             "policyResultDigest": self.policy_result_digest,
+            "resultDigest": self.result_digest,
+        }
+
+
+_REPORT_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+_MAX_SHADOW_REPEATS = 10
+
+
+def _validated_hash(value: object, label: str, length: int) -> str:
+    cleaned = str(value or "").strip().lower()
+    if len(cleaned) != length or any(
+        character not in "0123456789abcdef" for character in cleaned
+    ):
+        raise ValueError(f"{label} must be a {length}-character hexadecimal digest")
+    return cleaned
+
+
+def _validated_report_id(value: object, label: str) -> str:
+    cleaned = str(value or "").strip()
+    if not _REPORT_SAFE_ID.fullmatch(cleaned):
+        raise ValueError(f"{label} must be a report-safe identifier")
+    return cleaned
+
+
+def _positive_int(value: object, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+@dataclass(frozen=True)
+class LegacyShadowIdentity:
+    identity_id: str
+    code_revision: str
+    source_tree_hash: str
+    source_tree_dirty: bool
+    python_version: str
+    dependency_lock_hash: str
+    policy_fixture_hash: str
+    legacy_fixture_hash: str
+    repeats: int
+    case_count: int
+    planned_comparisons: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_tree_dirty, bool):
+            raise ValueError("source_tree_dirty must be boolean")
+        normalized = {
+            "codeRevision": _validated_hash(
+                self.code_revision, "code_revision", 40
+            ),
+            "sourceTreeHash": _validated_hash(
+                self.source_tree_hash, "source_tree_hash", 64
+            ),
+            "sourceTreeDirty": self.source_tree_dirty,
+            "pythonVersion": _validated_report_id(
+                self.python_version, "python_version"
+            ),
+            "dependencyLockHash": _validated_hash(
+                self.dependency_lock_hash, "dependency_lock_hash", 64
+            ),
+            "policyFixtureHash": _validated_hash(
+                self.policy_fixture_hash, "policy_fixture_hash", 64
+            ),
+            "legacyFixtureHash": _validated_hash(
+                self.legacy_fixture_hash, "legacy_fixture_hash", 64
+            ),
+            "repeats": _positive_int(self.repeats, "repeats"),
+            "caseCount": _positive_int(self.case_count, "case_count"),
+        }
+        if normalized["repeats"] > _MAX_SHADOW_REPEATS:
+            raise ValueError(f"repeats cannot exceed {_MAX_SHADOW_REPEATS}")
+        planned = normalized["repeats"] * normalized["caseCount"]
+        if self.planned_comparisons != planned:
+            raise ValueError("planned_comparisons does not match identity fields")
+        expected_id = f"legacy_shadow_identity_{_digest({**normalized, 'plannedComparisons': planned})[:24]}"
+        if self.identity_id != expected_id:
+            raise ValueError("legacy shadow identity does not match its fields")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        code_revision: str,
+        source_tree_hash: str,
+        source_tree_dirty: bool,
+        python_version: str,
+        dependency_lock_hash: str,
+        policy_fixture_hash: str,
+        legacy_fixture_hash: str,
+        repeats: int,
+        case_count: int,
+    ) -> "LegacyShadowIdentity":
+        normalized = {
+            "codeRevision": _validated_hash(code_revision, "code_revision", 40),
+            "sourceTreeHash": _validated_hash(
+                source_tree_hash, "source_tree_hash", 64
+            ),
+            "sourceTreeDirty": source_tree_dirty,
+            "pythonVersion": _validated_report_id(
+                python_version, "python_version"
+            ),
+            "dependencyLockHash": _validated_hash(
+                dependency_lock_hash, "dependency_lock_hash", 64
+            ),
+            "policyFixtureHash": _validated_hash(
+                policy_fixture_hash, "policy_fixture_hash", 64
+            ),
+            "legacyFixtureHash": _validated_hash(
+                legacy_fixture_hash, "legacy_fixture_hash", 64
+            ),
+            "repeats": _positive_int(repeats, "repeats"),
+            "caseCount": _positive_int(case_count, "case_count"),
+        }
+        if not isinstance(source_tree_dirty, bool):
+            raise ValueError("source_tree_dirty must be boolean")
+        if normalized["repeats"] > _MAX_SHADOW_REPEATS:
+            raise ValueError(f"repeats cannot exceed {_MAX_SHADOW_REPEATS}")
+        planned = normalized["repeats"] * normalized["caseCount"]
+        identity_id = f"legacy_shadow_identity_{_digest({**normalized, 'plannedComparisons': planned})[:24]}"
+        return cls(
+            identity_id=identity_id,
+            code_revision=normalized["codeRevision"],
+            source_tree_hash=normalized["sourceTreeHash"],
+            source_tree_dirty=source_tree_dirty,
+            python_version=normalized["pythonVersion"],
+            dependency_lock_hash=normalized["dependencyLockHash"],
+            policy_fixture_hash=normalized["policyFixtureHash"],
+            legacy_fixture_hash=normalized["legacyFixtureHash"],
+            repeats=normalized["repeats"],
+            case_count=normalized["caseCount"],
+            planned_comparisons=planned,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "identityId": self.identity_id,
+            "codeRevision": self.code_revision,
+            "sourceTreeHash": self.source_tree_hash,
+            "sourceTreeDirty": self.source_tree_dirty,
+            "pythonVersion": self.python_version,
+            "dependencyLockHash": self.dependency_lock_hash,
+            "policyFixtureHash": self.policy_fixture_hash,
+            "legacyFixtureHash": self.legacy_fixture_hash,
+            "repeats": self.repeats,
+            "caseCount": self.case_count,
+            "plannedComparisons": self.planned_comparisons,
+        }
+
+
+@dataclass(frozen=True)
+class LegacyShadowReport:
+    identity: LegacyShadowIdentity
+    passed: bool
+    case_results: tuple[LegacyShadowCaseResult, ...]
+    repeat_digests: tuple[str, ...]
+    disposition_counts: Mapping[str, int]
+    release_blocker_case_count: int
+    discrepancy_count: int
+    expectation_mismatch_case_ids: tuple[str, ...]
+    result_digest: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "identity": self.identity.to_dict(),
+            "passed": self.passed,
+            "cases": [item.to_dict() for item in self.case_results],
+            "repeatDigests": list(self.repeat_digests),
+            "summary": {
+                "dispositionCounts": dict(self.disposition_counts),
+                "releaseBlockerCaseCount": self.release_blocker_case_count,
+                "discrepancyCount": self.discrepancy_count,
+                "expectationMismatchCaseIds": list(
+                    self.expectation_mismatch_case_ids
+                ),
+            },
             "resultDigest": self.result_digest,
         }
 
@@ -665,4 +846,102 @@ def compare_legacy_case(
         legacy_projection_digest=projection.projection_digest,
         policy_result_digest=policy_result.result_digest,
         result_digest=_digest(identity),
+    )
+
+
+def run_legacy_shadow(
+    *,
+    policy_catalog: Any,
+    shadow_catalog: LegacyShadowFixtureCatalog,
+    identity: LegacyShadowIdentity,
+) -> LegacyShadowReport:
+    if identity.policy_fixture_hash != policy_catalog.manifest_hash:
+        raise ValueError("identity policy fixture hash does not match catalog")
+    if identity.legacy_fixture_hash != shadow_catalog.manifest_hash:
+        raise ValueError("identity legacy fixture hash does not match catalog")
+    if identity.case_count != len(shadow_catalog.cases):
+        raise ValueError("identity case count does not match shadow catalog")
+
+    policy_cases = {case.case_id: case for case in policy_catalog.cases}
+    expected_by_id = {case.case_id: case.expected for case in shadow_catalog.cases}
+    repeat_digests = []
+    canonical_results: tuple[LegacyShadowCaseResult, ...] | None = None
+    for repeat_index in range(identity.repeats):
+        source_cases = (
+            shadow_catalog.cases
+            if repeat_index % 2 == 0
+            else tuple(reversed(shadow_catalog.cases))
+        )
+        results = tuple(
+            sorted(
+                (
+                    compare_legacy_case(
+                        case,
+                        policy_cases[case.policy_case_id],
+                    )
+                    for case in source_cases
+                ),
+                key=lambda item: item.case_id,
+            )
+        )
+        repeat_digests.append(_digest([item.to_dict() for item in results]))
+        if canonical_results is None:
+            canonical_results = results
+
+    if canonical_results is None:
+        raise ValueError("legacy shadow produced no results")
+
+    mismatches = []
+    for result in canonical_results:
+        expected = expected_by_id[result.case_id]
+        if (
+            result.disposition != expected.disposition
+            or result.severity != expected.severity
+            or tuple(item.code for item in result.discrepancies)
+            != expected.discrepancy_codes
+        ):
+            mismatches.append(result.case_id)
+
+    disposition_counts: dict[str, int] = {}
+    for result in canonical_results:
+        disposition_counts[result.disposition] = (
+            disposition_counts.get(result.disposition, 0) + 1
+        )
+    ordered_counts = MappingProxyType(dict(sorted(disposition_counts.items())))
+    release_blockers = sum(
+        result.severity == "release_blocker" for result in canonical_results
+    )
+    discrepancy_count = sum(
+        len(result.discrepancies) for result in canonical_results
+    )
+    repeat_stable = len(set(repeat_digests)) == 1
+    has_unclassified = any(
+        discrepancy.code == "unclassified_difference"
+        for result in canonical_results
+        for discrepancy in result.discrepancies
+    )
+    mismatch_ids = tuple(sorted(mismatches))
+    passed = not mismatch_ids and repeat_stable and not has_unclassified
+    report_payload = {
+        "identity": identity.to_dict(),
+        "passed": passed,
+        "cases": [item.to_dict() for item in canonical_results],
+        "repeatDigests": repeat_digests,
+        "summary": {
+            "dispositionCounts": dict(ordered_counts),
+            "releaseBlockerCaseCount": release_blockers,
+            "discrepancyCount": discrepancy_count,
+            "expectationMismatchCaseIds": list(mismatch_ids),
+        },
+    }
+    return LegacyShadowReport(
+        identity=identity,
+        passed=passed,
+        case_results=canonical_results,
+        repeat_digests=tuple(repeat_digests),
+        disposition_counts=ordered_counts,
+        release_blocker_case_count=release_blockers,
+        discrepancy_count=discrepancy_count,
+        expectation_mismatch_case_ids=mismatch_ids,
+        result_digest=_digest(report_payload),
     )

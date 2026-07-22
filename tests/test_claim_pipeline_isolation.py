@@ -148,6 +148,29 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             {name for name in expected_names if not hasattr(claim_pipeline, name)},
         )
 
+    def test_legacy_shadow_api_is_exposed_at_package_boundary(self):
+        expected_names = {
+            "LEGACY_SHADOW_FIXTURE_SCHEMA_VERSION",
+            "LegacyActionAttempt",
+            "LegacyProjection",
+            "LegacyShadowCaseResult",
+            "LegacyShadowDiscrepancy",
+            "LegacyShadowFixtureCase",
+            "LegacyShadowFixtureCatalog",
+            "LegacyShadowFixtureValidationError",
+            "LegacyShadowIdentity",
+            "LegacyShadowReport",
+            "compare_legacy_case",
+            "load_legacy_shadow_fixture_catalog",
+            "project_legacy_proposal",
+            "run_legacy_shadow",
+        }
+
+        self.assertEqual(
+            set(),
+            {name for name in expected_names if not hasattr(claim_pipeline, name)},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
