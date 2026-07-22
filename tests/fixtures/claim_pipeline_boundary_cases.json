@@ -1,0 +1,280 @@
+{
+  "schemaVersion": 2,
+  "catalogId": "fdr004-stage-oracles-v2",
+  "cases": [
+    {
+      "caseId": "late-availability-hard-occupancy",
+      "dimensions": ["time", "effective_contract", "qualification", "commit_state"],
+      "contract": {"hardRequirements": {"occupancyBy": "2026-09-01"}},
+      "evidence": [{"sourceKind": "fresh_body", "actorRole": "broker", "subject": "target_property", "text": "The building is available January 1, 2027."}],
+      "expected": {
+        "evidenceCount": 1,
+        "entities": [{"entityKey": "target_property", "entityType": "target_property", "relationship": "target"}],
+        "claims": [
+          {"subject": "target_property", "predicate": "availability", "value": "available", "polarity": "positive", "modality": "asserted", "evidenceIndex": 0},
+          {"subject": "target_property", "predicate": "occupancy_date", "value": "2027-01-01", "polarity": "positive", "modality": "asserted", "evidenceIndex": 0}
+        ],
+        "decisions": [{"subject": "target_property", "marketState": "available", "fitState": "nonviable", "completenessState": "not_applicable", "conversationState": "terminal_intent", "reviewClass": "automatic"}],
+        "actions": [
+          {"actionType": "fact_update", "target": "target_property", "approvalClass": "automatic"},
+          {"actionType": "status_transition", "target": "target_property", "approvalClass": "automatic"},
+          {"actionType": "followup_freeze", "target": "target_property", "approvalClass": "automatic"}
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "short-term-hard-minimum",
+      "dimensions": ["effective_contract", "qualification", "action_boundary"],
+      "contract": {"hardRequirements": {"minimumTermMonths": 60}},
+      "evidence": [{"sourceKind": "fresh_body", "actorRole": "broker", "subject": "target_property", "text": "Only a 24-month term is available."}],
+      "expected": {
+        "evidenceCount": 1,
+        "entities": [{"entityKey": "target_property", "entityType": "target_property", "relationship": "target"}],
+        "claims": [{"subject": "target_property", "predicate": "term", "value": 24, "polarity": "positive", "modality": "asserted", "evidenceIndex": 0}],
+        "decisions": [{"subject": "target_property", "marketState": "available", "fitState": "nonviable", "completenessState": "not_applicable", "conversationState": "terminal_intent", "reviewClass": "automatic"}],
+        "actions": [
+          {"actionType": "fact_update", "target": "target_property", "approvalClass": "automatic"},
+          {"actionType": "followup_freeze", "target": "target_property", "approvalClass": "automatic"}
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "definite-funded-remediation",
+      "dimensions": ["qualification", "time", "effective_contract"],
+      "contract": {"hardRequirements": {"driveIns": 1, "occupancyBy": "2026-10-01"}},
+      "evidence": [{"sourceKind": "fresh_body", "actorRole": "broker", "subject": "target_property", "text": "The landlord will fund and install one drive-in door by September 1."}],
+      "expected": {
+        "evidenceCount": 1,
+        "entities": [{"entityKey": "target_property", "entityType": "target_property", "relationship": "target"}],
+        "claims": [
+          {"subject": "target_property", "predicate": "remediation", "value": {"driveIns": 1, "funded": true, "by": "2026-09-01"}, "polarity": "positive", "modality": "asserted", "evidenceIndex": 0}
+        ],
+        "decisions": [{"subject": "target_property", "marketState": "available", "fitState": "conditional", "completenessState": "incomplete", "conversationState": "active", "reviewClass": "automatic"}],
+        "actions": [{"actionType": "fact_update", "target": "target_property", "approvalClass": "automatic"}],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "tentative-remediation-needs-review",
+      "dimensions": ["qualification", "action_boundary"],
+      "contract": {"hardRequirements": {"driveIns": 1}},
+      "evidence": [{"sourceKind": "fresh_body", "actorRole": "broker", "subject": "target_property", "text": "The owner may consider adding a drive-in, subject to approval and cost."}],
+      "expected": {
+        "evidenceCount": 1,
+        "entities": [{"entityKey": "target_property", "entityType": "target_property", "relationship": "target"}],
+        "claims": [{"subject": "target_property", "predicate": "remediation", "value": {"driveIns": 1}, "polarity": "positive", "modality": "possible", "evidenceIndex": 0}],
+        "decisions": [{"subject": "target_property", "marketState": "available", "fitState": "review", "completenessState": "blocked", "conversationState": "review", "reviewClass": "human_required"}],
+        "actions": [{"actionType": "review_item", "target": "target_property", "approvalClass": "human_required"}],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "under-contract-accepting-backups",
+      "dimensions": ["qualification", "commit_state", "action_boundary"],
+      "contract": {},
+      "evidence": [{"sourceKind": "fresh_body", "actorRole": "broker", "subject": "target_property", "text": "It is under contract, but the owner is accepting backup offers."}],
+      "expected": {
+        "evidenceCount": 1,
+        "entities": [{"entityKey": "target_property", "entityType": "target_property", "relationship": "target"}],
+        "claims": [{"subject": "target_property", "predicate": "asking_status", "value": "accepting_backups", "polarity": "positive", "modality": "conditional", "evidenceIndex": 0}],
+        "decisions": [{"subject": "target_property", "marketState": "conditional", "fitState": "review", "completenessState": "blocked", "conversationState": "review", "reviewClass": "human_required"}],
+        "actions": [{"actionType": "review_item", "target": "target_property", "approvalClass": "human_required"}],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "split-suite-availability",
+      "dimensions": ["subject_binding", "qualification", "commit_state"],
+      "contract": {"suiteRepresentation": "separate"},
+      "evidence": [{"sourceKind": "fresh_body", "actorRole": "broker", "subject": "building", "text": "Suite A is leased. Suite B remains available."}],
+      "expected": {
+        "evidenceCount": 1,
+        "entities": [
+          {"entityKey": "suite_a", "entityType": "suite", "relationship": "target_component"},
+          {"entityKey": "suite_b", "entityType": "suite", "relationship": "target_component"}
+        ],
+        "claims": [
+          {"subject": "suite_a", "predicate": "availability", "value": "unavailable", "polarity": "negative", "modality": "asserted", "evidenceIndex": 0},
+          {"subject": "suite_b", "predicate": "availability", "value": "available", "polarity": "positive", "modality": "asserted", "evidenceIndex": 0}
+        ],
+        "decisions": [
+          {"subject": "suite_a", "marketState": "unavailable", "fitState": "nonviable", "completenessState": "not_applicable", "conversationState": "terminal_intent", "reviewClass": "automatic"},
+          {"subject": "suite_b", "marketState": "available", "fitState": "review", "completenessState": "incomplete", "conversationState": "active", "reviewClass": "human_required"}
+        ],
+        "actions": [
+          {"actionType": "fact_update", "target": "suite_a", "approvalClass": "automatic"},
+          {"actionType": "fact_update", "target": "suite_b", "approvalClass": "automatic"},
+          {"actionType": "review_item", "target": "suite_b", "approvalClass": "human_required"}
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "out-of-office-return-date",
+      "dimensions": ["actor_authority", "time", "action_boundary"],
+      "contract": {"outOfOfficePolicy": "wait_for_return"},
+      "evidence": [{"sourceKind": "fresh_body", "actorRole": "system", "subject": "contact", "text": "I am out of office and will return July 29."}],
+      "expected": {
+        "evidenceCount": 1,
+        "entities": [{"entityKey": "contact", "entityType": "contact", "relationship": "broker_contact"}],
+        "claims": [{"subject": "contact", "predicate": "return_date", "value": "2026-07-29", "polarity": "positive", "modality": "asserted", "evidenceIndex": 0}],
+        "decisions": [{"subject": "contact", "marketState": "unknown", "fitState": "review", "completenessState": "blocked", "conversationState": "waiting_broker", "reviewClass": "automatic"}],
+        "actions": [{"actionType": "status_transition", "target": "contact", "approvalClass": "automatic"}],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "out-of-office-backup-contact",
+      "dimensions": ["actor_authority", "subject_binding", "action_boundary"],
+      "contract": {"redirectPolicy": "approval_required"},
+      "evidence": [{"sourceKind": "fresh_body", "actorRole": "system", "subject": "contact", "text": "For urgent matters contact Pat at pat@example.com."}],
+      "expected": {
+        "evidenceCount": 1,
+        "entities": [{"entityKey": "contact", "entityType": "contact", "relationship": "broker_contact"}],
+        "claims": [{"subject": "contact", "predicate": "referral", "value": "pat@example.com", "polarity": "positive", "modality": "asserted", "evidenceIndex": 0}],
+        "decisions": [{"subject": "contact", "marketState": "unknown", "fitState": "review", "completenessState": "blocked", "conversationState": "review", "reviewClass": "human_required"}],
+        "actions": [{"actionType": "recipient_change", "target": "contact", "approvalClass": "human_required"}],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "stop-emailing-and-call",
+      "dimensions": ["actor_authority", "action_boundary", "commit_state"],
+      "contract": {"callPolicy": "approval_required"},
+      "evidence": [{"sourceKind": "fresh_body", "actorRole": "broker", "subject": "contact", "text": "Stop emailing me. Call my office if this is important."}],
+      "expected": {
+        "evidenceCount": 1,
+        "entities": [{"entityKey": "contact", "entityType": "contact", "relationship": "broker_contact"}],
+        "claims": [
+          {"subject": "contact", "predicate": "opt_out", "value": true, "polarity": "positive", "modality": "asserted", "evidenceIndex": 0},
+          {"subject": "contact", "predicate": "call_request", "value": true, "polarity": "positive", "modality": "requested", "evidenceIndex": 0}
+        ],
+        "decisions": [{"subject": "contact", "marketState": "unknown", "fitState": "review", "completenessState": "not_applicable", "conversationState": "terminal_intent", "reviewClass": "human_required"}],
+        "actions": [
+          {"actionType": "followup_freeze", "target": "contact", "approvalClass": "automatic"},
+          {"actionType": "call_request", "target": "contact", "approvalClass": "human_required"}
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "alternate-property-attachment-binding",
+      "dimensions": ["evidence_source", "subject_binding", "action_boundary"],
+      "contract": {"alternatePolicy": "review"},
+      "evidence": [
+        {"sourceKind": "fresh_body", "actorRole": "broker", "subject": "target_property", "text": "The target is leased, but see the attached alternative."},
+        {"sourceKind": "attachment", "actorRole": "broker", "subject": "alternate_property", "text": "900 Replacement Rd - 12,000 SF - $14.00 NNN"}
+      ],
+      "expected": {
+        "evidenceCount": 2,
+        "entities": [
+          {"entityKey": "target_property", "entityType": "target_property", "relationship": "target"},
+          {"entityKey": "alternate_property", "entityType": "property", "relationship": "alternate"}
+        ],
+        "claims": [
+          {"subject": "target_property", "predicate": "availability", "value": "unavailable", "polarity": "negative", "modality": "asserted", "evidenceIndex": 0},
+          {"subject": "alternate_property", "predicate": "identity", "value": "900 Replacement Rd", "polarity": "positive", "modality": "asserted", "evidenceIndex": 1},
+          {"subject": "alternate_property", "predicate": "total_sf", "value": 12000, "polarity": "positive", "modality": "asserted", "evidenceIndex": 1},
+          {"subject": "alternate_property", "predicate": "rent", "value": 14.0, "polarity": "positive", "modality": "asserted", "evidenceIndex": 1}
+        ],
+        "decisions": [
+          {"subject": "target_property", "marketState": "unavailable", "fitState": "nonviable", "completenessState": "not_applicable", "conversationState": "terminal_intent", "reviewClass": "automatic"},
+          {"subject": "alternate_property", "marketState": "available", "fitState": "review", "completenessState": "incomplete", "conversationState": "review", "reviewClass": "human_required"}
+        ],
+        "actions": [
+          {"actionType": "fact_update", "target": "target_property", "approvalClass": "automatic"},
+          {"actionType": "alternate_property_proposal", "target": "alternate_property", "approvalClass": "human_required"}
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "broker-correction-supersedes-rent",
+      "dimensions": ["evidence_source", "actor_authority", "qualification"],
+      "contract": {},
+      "evidence": [
+        {"sourceKind": "quoted_body", "actorRole": "broker", "subject": "target_property", "text": "The rent is $12.00 NNN."},
+        {"sourceKind": "fresh_body", "actorRole": "broker", "subject": "target_property", "text": "Correction: the rent is $13.50 NNN, not $12.00."}
+      ],
+      "expected": {
+        "evidenceCount": 2,
+        "entities": [{"entityKey": "target_property", "entityType": "target_property", "relationship": "target"}],
+        "claims": [
+          {"subject": "target_property", "predicate": "rent", "value": 12.0, "polarity": "positive", "modality": "asserted", "evidenceIndex": 0},
+          {"subject": "target_property", "predicate": "rent", "value": 13.5, "polarity": "positive", "modality": "corrected", "evidenceIndex": 1, "supersedesClaimIndex": 0}
+        ],
+        "decisions": [{"subject": "target_property", "marketState": "unknown", "fitState": "review", "completenessState": "incomplete", "conversationState": "active", "reviewClass": "automatic"}],
+        "actions": [{"actionType": "fact_update", "target": "target_property", "approvalClass": "automatic"}],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "user-revises-occupancy-requirement",
+      "dimensions": ["evidence_source", "actor_authority", "time", "effective_contract"],
+      "contract": {"hardRequirements": {"occupancyBy": "2027-02-01"}, "version": 2},
+      "evidence": [
+        {"sourceKind": "manual_outbound", "actorRole": "user", "subject": "campaign", "text": "The client can now wait until February 1, 2027."},
+        {"sourceKind": "fresh_body", "actorRole": "broker", "subject": "target_property", "text": "The space is available January 1, 2027."}
+      ],
+      "expected": {
+        "evidenceCount": 2,
+        "entities": [
+          {"entityKey": "campaign", "entityType": "campaign", "relationship": "effective_contract"},
+          {"entityKey": "target_property", "entityType": "target_property", "relationship": "target"}
+        ],
+        "claims": [
+          {"subject": "campaign", "predicate": "occupancy_date", "value": "2027-02-01", "polarity": "positive", "modality": "corrected", "evidenceIndex": 0},
+          {"subject": "target_property", "predicate": "occupancy_date", "value": "2027-01-01", "polarity": "positive", "modality": "asserted", "evidenceIndex": 1},
+          {"subject": "target_property", "predicate": "availability", "value": "available", "polarity": "positive", "modality": "asserted", "evidenceIndex": 1}
+        ],
+        "decisions": [{"subject": "target_property", "marketState": "available", "fitState": "viable", "completenessState": "incomplete", "conversationState": "active", "reviewClass": "automatic"}],
+        "actions": [{"actionType": "fact_update", "target": "target_property", "approvalClass": "automatic"}],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "complete-facts-terminal-ack",
+      "dimensions": ["evidence_source", "subject_binding", "action_boundary", "commit_state"],
+      "contract": {"requiredFields": ["total_sf", "rent", "operating_expenses"]},
+      "evidence": [{"sourceKind": "attachment", "actorRole": "broker", "subject": "target_property", "text": "10,000 SF; $15.00 rent; $3.25 operating expenses."}],
+      "expected": {
+        "evidenceCount": 1,
+        "entities": [{"entityKey": "target_property", "entityType": "target_property", "relationship": "target"}],
+        "claims": [
+          {"subject": "target_property", "predicate": "total_sf", "value": 10000, "polarity": "positive", "modality": "asserted", "evidenceIndex": 0},
+          {"subject": "target_property", "predicate": "rent", "value": 15.0, "polarity": "positive", "modality": "asserted", "evidenceIndex": 0},
+          {"subject": "target_property", "predicate": "operating_expenses", "value": 3.25, "polarity": "positive", "modality": "asserted", "evidenceIndex": 0}
+        ],
+        "decisions": [{"subject": "target_property", "marketState": "available", "fitState": "viable", "completenessState": "complete", "conversationState": "terminal_intent", "reviewClass": "automatic"}],
+        "actions": [
+          {"actionType": "fact_update", "target": "target_property", "approvalClass": "automatic"},
+          {"actionType": "status_transition", "target": "target_property", "approvalClass": "automatic"}
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "hostile-response-pauses-email",
+      "dimensions": ["actor_authority", "qualification", "action_boundary", "commit_state"],
+      "contract": {"hostileResponsePolicy": "pause_and_review"},
+      "evidence": [{"sourceKind": "fresh_body", "actorRole": "broker", "subject": "contact", "text": "Do not send me another automated message. Have a person call me."}],
+      "expected": {
+        "evidenceCount": 1,
+        "entities": [{"entityKey": "contact", "entityType": "contact", "relationship": "broker_contact"}],
+        "claims": [
+          {"subject": "contact", "predicate": "opt_out", "value": true, "polarity": "positive", "modality": "asserted", "evidenceIndex": 0},
+          {"subject": "contact", "predicate": "call_request", "value": true, "polarity": "positive", "modality": "requested", "evidenceIndex": 0}
+        ],
+        "decisions": [{"subject": "contact", "marketState": "unknown", "fitState": "review", "completenessState": "blocked", "conversationState": "review", "reviewClass": "human_required"}],
+        "actions": [
+          {"actionType": "followup_freeze", "target": "contact", "approvalClass": "automatic"},
+          {"actionType": "review_item", "target": "contact", "approvalClass": "human_required"},
+          {"actionType": "call_request", "target": "contact", "approvalClass": "human_required"}
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    }
+  ]
+}
