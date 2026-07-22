@@ -1,0 +1,480 @@
+{
+  "schemaVersion": 3,
+  "catalogId": "claim-pipeline-interpretation-v1",
+  "cases": [
+    {
+      "caseId": "fresh-reply-over-quoted-stale-history",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-1",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T12:00:00Z",
+        "subject": "RE: 123 Industrial Ave",
+        "body": "Suite B is available.\n\nOn Tue, Jul 21, 2026 at 9:30 AM Pat Broker <pat@example.com> wrote:\n> 999 Other Road was available.",
+        "signature": "",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1, "quoted_body": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Ave", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "Suite B is available.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "quoted_body", "freshness": "quoted", "location": "body:lines-3-4", "content": "On Tue, Jul 21, 2026 at 9:30 AM Pat Broker <pat@example.com> wrote:\n> 999 Other Road was available.", "parentIndex": 1, "actorEmail": "pat@example.com", "actorRole": "unknown"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0]},
+          {"entityType": "suite", "label": "123 Industrial Ave - Suite B", "canonicalAddress": "123 industrial avenue", "suite": "B", "relationship": "suite_of_target", "evidenceIndexes": [1]},
+          {"entityType": "property", "label": "999 Other Road", "canonicalAddress": "999 other road", "suite": "", "relationship": "alternate", "evidenceIndexes": [2]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1]},
+          {"entityType": "contact", "label": "pat@example.com", "canonicalAddress": "pat@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [2]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "outlook-original-message-history",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-2",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T12:05:00Z",
+        "subject": "RE: 123 Industrial Ave",
+        "body": "123 Industrial Ave Suite B remains available.\n\n-----Original Message-----\nFrom: Pat Broker <pat@example.com>\nSent: Monday, July 20, 2026 9:15 AM\nTo: Alex User <alex@example.com>\nSubject: RE: 123 Industrial Ave\n\n123 Industrial Ave Suite A was leased.",
+        "signature": "",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1, "quoted_body": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Ave", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "123 Industrial Ave Suite B remains available.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "quoted_body", "freshness": "quoted", "location": "body:lines-3-9", "content": "-----Original Message-----\nFrom: Pat Broker <pat@example.com>\nSent: Monday, July 20, 2026 9:15 AM\nTo: Alex User <alex@example.com>\nSubject: RE: 123 Industrial Ave\n\n123 Industrial Ave Suite A was leased.", "parentIndex": 1, "actorEmail": "pat@example.com", "actorRole": "unknown"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0, 1, 2]},
+          {"entityType": "suite", "label": "123 Industrial Ave - Suite A", "canonicalAddress": "123 industrial avenue", "suite": "A", "relationship": "suite_of_target", "evidenceIndexes": [2]},
+          {"entityType": "suite", "label": "123 Industrial Ave - Suite B", "canonicalAddress": "123 industrial avenue", "suite": "B", "relationship": "suite_of_target", "evidenceIndexes": [1]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1]},
+          {"entityType": "contact", "label": "pat@example.com", "canonicalAddress": "pat@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [2]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "forwarded-different-property",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-3",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T12:10:00Z",
+        "subject": "Fwd: another option",
+        "body": "This may be useful.\n\n---------- Forwarded message ---------\nFrom: Pat Broker <pat@example.com>\nSubject: 999 Other Road\n\n999 Other Road is available.",
+        "signature": "",
+        "external": [
+          {"sourceKind": "link", "location": "link:https://example.com/999", "content": "Listing for 999 Other Road", "error": ""}
+        ]
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1, "forwarded_body": 1, "link": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "Fwd: another option", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "This may be useful.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "forwarded_body", "freshness": "forwarded", "location": "body:lines-3-7", "content": "---------- Forwarded message ---------\nFrom: Pat Broker <pat@example.com>\nSubject: 999 Other Road\n\n999 Other Road is available.", "parentIndex": 1, "actorEmail": "pat@example.com", "actorRole": "unknown"},
+          {"sourceKind": "link", "freshness": "fresh", "location": "link:https://example.com/999", "content": "Listing for 999 Other Road", "parentIndex": 1, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": []},
+          {"entityType": "property", "label": "999 Other Road", "canonicalAddress": "999 other road", "suite": "", "relationship": "alternate", "evidenceIndexes": [2, 3]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1, 3]},
+          {"entityType": "contact", "label": "pat@example.com", "canonicalAddress": "pat@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [2]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "split-suite-statuses",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-4",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T12:15:00Z",
+        "subject": "RE: 123 Industrial Ave",
+        "body": "Suite A is leased. Suite B remains available.",
+        "signature": "",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Ave", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "Suite A is leased. Suite B remains available.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0]},
+          {"entityType": "suite", "label": "123 Industrial Ave - Suite A", "canonicalAddress": "123 industrial avenue", "suite": "A", "relationship": "suite_of_target", "evidenceIndexes": [1]},
+          {"entityType": "suite", "label": "123 Industrial Ave - Suite B", "canonicalAddress": "123 industrial avenue", "suite": "B", "relationship": "suite_of_target", "evidenceIndexes": [1]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "wrong-property-attachment",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-5",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T12:20:00Z",
+        "subject": "RE: 123 Industrial Ave",
+        "body": "Attached is another option.",
+        "signature": "",
+        "external": [
+          {"sourceKind": "attachment", "location": "attachment:flyer.pdf", "content": "Flyer for 999 Other Road", "error": ""}
+        ]
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1, "attachment": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Ave", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "Attached is another option.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "attachment", "freshness": "fresh", "location": "attachment:flyer.pdf", "content": "Flyer for 999 Other Road", "parentIndex": 1, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0]},
+          {"entityType": "property", "label": "999 Other Road", "canonicalAddress": "999 other road", "suite": "", "relationship": "alternate", "evidenceIndexes": [2]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1, 2]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "attachment-extraction-failure-visible",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-6",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T12:25:00Z",
+        "subject": "RE: 123 Industrial Ave",
+        "body": "",
+        "signature": "",
+        "external": [
+          {"sourceKind": "attachment", "location": "attachment:locked.pdf", "content": "", "error": "encrypted_pdf"}
+        ]
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Ave", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [
+          {"sourceKind": "attachment", "location": "attachment:locked.pdf", "reason": "encrypted_pdf", "parentIndex": 0}
+        ],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "link-only-alternate-property",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-7",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T12:30:00Z",
+        "subject": "",
+        "body": "See this option.",
+        "signature": "",
+        "external": [
+          {"sourceKind": "link", "location": "link:https://example.com/listing", "content": "999 Other Road is available", "error": ""}
+        ]
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"fresh_body": 1, "link": 1},
+        "evidenceSequence": [
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "See this option.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "link", "freshness": "fresh", "location": "link:https://example.com/listing", "content": "999 Other Road is available", "parentIndex": 0, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": []},
+          {"entityType": "property", "label": "999 Other Road", "canonicalAddress": "999 other road", "suite": "", "relationship": "alternate", "evidenceIndexes": [1]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "ambiguous-other-building",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-8",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T12:35:00Z",
+        "subject": "RE: 123 Industrial Ave",
+        "body": "The other building may be a fit.",
+        "signature": "",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Ave", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "The other building may be a fit.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1]}
+        ],
+        "issues": [
+          {"code": "ambiguous_alternate", "evidenceIndexes": [1]}
+        ]
+      }
+    },
+    {
+      "caseId": "target-alias-with-signature-contact",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-9",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T12:40:00Z",
+        "subject": "RE: 123 Industrial Avenue",
+        "body": "123 Industrial Ave remains available.",
+        "signature": "Alex Broker\nalex@example.com",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave", "123 Industrial Avenue"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1, "signature": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Avenue", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "123 Industrial Ave remains available.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "signature", "freshness": "fresh", "location": "signature", "content": "Alex Broker\nalex@example.com", "parentIndex": 1, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0, 1]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1, 2]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "attachment-only-reply",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-10",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T12:45:00Z",
+        "subject": "",
+        "body": "",
+        "signature": "",
+        "external": [
+          {"sourceKind": "attachment", "location": "attachment:floorplan.pdf", "content": "123 Industrial Ave Suite C floor plan", "error": ""}
+        ]
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"attachment": 1},
+        "evidenceSequence": [
+          {"sourceKind": "attachment", "freshness": "fresh", "location": "attachment:floorplan.pdf", "content": "123 Industrial Ave Suite C floor plan", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0]},
+          {"entityType": "suite", "label": "123 Industrial Ave - Suite C", "canonicalAddress": "123 industrial avenue", "suite": "C", "relationship": "suite_of_target", "evidenceIndexes": [0]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "multiple-property-candidates",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-11",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T12:50:00Z",
+        "subject": "RE: alternate options",
+        "body": "999 Other Road or 456 Market Street could work.",
+        "signature": "",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: alternate options", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "999 Other Road or 456 Market Street could work.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": []},
+          {"entityType": "property", "label": "999 Other Road", "canonicalAddress": "999 other road", "suite": "", "relationship": "alternate", "evidenceIndexes": [1]},
+          {"entityType": "property", "label": "456 Market Street", "canonicalAddress": "456 market street", "suite": "", "relationship": "alternate", "evidenceIndexes": [1]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1]}
+        ],
+        "issues": [
+          {"code": "multiple_property_candidates", "evidenceIndexes": [1]}
+        ]
+      }
+    },
+    {
+      "caseId": "child-suite-inherits-alternate-parent",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-12",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T12:55:00Z",
+        "subject": "RE: alternate option",
+        "body": "999 Other Road is another option.",
+        "signature": "",
+        "external": [
+          {"sourceKind": "attachment", "location": "attachment:floorplan.pdf", "content": "Suite 200 floor plan", "error": ""}
+        ]
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1, "attachment": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: alternate option", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "999 Other Road is another option.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "attachment", "freshness": "fresh", "location": "attachment:floorplan.pdf", "content": "Suite 200 floor plan", "parentIndex": 1, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": []},
+          {"entityType": "property", "label": "999 Other Road", "canonicalAddress": "999 other road", "suite": "", "relationship": "alternate", "evidenceIndexes": [1]},
+          {"entityType": "suite", "label": "999 Other Road - Suite 200", "canonicalAddress": "999 other road", "suite": "200", "relationship": "suite_of_alternate", "evidenceIndexes": [2]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1, 2]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "ordinary-prose-does-not-fabricate-entities",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-13",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T13:00:00Z",
+        "subject": "RE: 123 Industrial Ave",
+        "body": "The building has 10 parking spaces on Industrial Road. The suite includes warehouse lighting, the unit pricing is $14/SF, and the space requirement is 20,000 SF.",
+        "signature": "",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Ave", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "The building has 10 parking spaces on Industrial Road. The suite includes warehouse lighting, the unit pricing is $14/SF, and the space requirement is 20,000 SF.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "directional-target-alias",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-14",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T13:05:00Z",
+        "subject": "RE: 123 N Main St",
+        "body": "123 North Main Street is available.",
+        "signature": "",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 N Main St", "canonicalAddress": "123 N Main Street", "suite": "", "relationship": "target", "aliases": ["123 N Main St"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 N Main St", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "123 North Main Street is available.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 N Main St", "canonicalAddress": "123 north main street", "suite": "", "relationship": "target", "evidenceIndexes": [0, 1]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1]}
+        ],
+        "issues": []
+      }
+    }
+  ]
+}

@@ -260,6 +260,7 @@ class EvidenceEnvelope(_JsonContract):
     observed_at: str
     freshness: EvidenceFreshness
     parent_evidence_id: Optional[str] = None
+    campaign_id: str = ""
 
     def __post_init__(self) -> None:
         for label in (
@@ -274,20 +275,23 @@ class EvidenceEnvelope(_JsonContract):
         _require_enum("evidence source_kind", self.source_kind, EvidenceSource)
         _require_enum("evidence direction", self.direction, Direction)
         _require_enum("evidence freshness", self.freshness, EvidenceFreshness)
+        if not isinstance(self.campaign_id, str):
+            raise TypeError("campaign_id must be a string")
+        object.__setattr__(self, "campaign_id", self.campaign_id.strip())
         expected_content_hash = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
         if self.content_hash != expected_content_hash:
             raise ValueError("evidence content hash does not match content")
-        expected_evidence_id = _stable_id(
-            "evidence",
-            {
-                "tenant_id": self.tenant_id,
-                "message_id": self.message_id,
-                "source_kind": self.source_kind,
-                "location": self.location,
-                "content_hash": self.content_hash,
-                "parent_evidence_id": self.parent_evidence_id,
-            },
-        )
+        identity = {
+            "tenant_id": self.tenant_id,
+            "message_id": self.message_id,
+            "source_kind": self.source_kind,
+            "location": self.location,
+            "content_hash": self.content_hash,
+            "parent_evidence_id": self.parent_evidence_id,
+        }
+        if self.campaign_id:
+            identity["campaign_id"] = self.campaign_id
+        expected_evidence_id = _stable_id("evidence", identity)
         if self.evidence_id != expected_evidence_id:
             raise ValueError("evidence identity does not match its source fields")
 
@@ -305,19 +309,20 @@ class EvidenceEnvelope(_JsonContract):
         observed_at: str,
         freshness: EvidenceFreshness,
         parent_evidence_id: Optional[str] = None,
+        campaign_id: str = "",
     ) -> "EvidenceEnvelope":
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        evidence_id = _stable_id(
-            "evidence",
-            {
-                "tenant_id": tenant_id,
-                "message_id": message_id,
-                "source_kind": source_kind,
-                "location": location,
-                "content_hash": content_hash,
-                "parent_evidence_id": parent_evidence_id,
-            },
-        )
+        identity = {
+            "tenant_id": tenant_id,
+            "message_id": message_id,
+            "source_kind": source_kind,
+            "location": location,
+            "content_hash": content_hash,
+            "parent_evidence_id": parent_evidence_id,
+        }
+        if str(campaign_id or "").strip():
+            identity["campaign_id"] = str(campaign_id).strip()
+        evidence_id = _stable_id("evidence", identity)
         return cls(
             tenant_id=tenant_id,
             evidence_id=evidence_id,
@@ -331,6 +336,7 @@ class EvidenceEnvelope(_JsonContract):
             observed_at=observed_at,
             freshness=freshness,
             parent_evidence_id=parent_evidence_id,
+            campaign_id=campaign_id,
         )
 
 
