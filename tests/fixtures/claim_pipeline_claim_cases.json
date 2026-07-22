@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "catalogId": "claim-interpretation-lattice-v1",
   "cases": [
     {
@@ -22,7 +22,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [{"predicate": "availability", "value": "available", "relationship": "suite_of_target", "suite": "B"}], "issueCodes": []}
+      "expected": {"acceptedClaimIndexes": [0], "issues": []}
     },
     {
       "caseId": "quoted-alternate-is-historical",
@@ -44,7 +44,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [], "issueCodes": ["historical_instruction"]}
+      "expected": {"acceptedClaimIndexes": [], "issues": [{"code": "historical_instruction", "candidateIndex": 0, "evidenceIndexes": [2], "entities": [{"relationship": "alternate", "suite": "", "canonicalAddress": "999 other road"}]}]}
     },
     {
       "caseId": "forwarded-alternate-is-historical",
@@ -66,7 +66,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [], "issueCodes": ["historical_instruction"]}
+      "expected": {"acceptedClaimIndexes": [], "issues": [{"code": "historical_instruction", "candidateIndex": 0, "evidenceIndexes": [2], "entities": [{"relationship": "alternate", "suite": "", "canonicalAddress": "999 other road"}]}]}
     },
     {
       "caseId": "fresh-link-identifies-alternate",
@@ -88,7 +88,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [{"predicate": "identity", "value": "999 Other Road", "relationship": "alternate", "suite": ""}], "issueCodes": []}
+      "expected": {"acceptedClaimIndexes": [0], "issues": []}
     },
     {
       "caseId": "split-suite-a-unavailable",
@@ -110,7 +110,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [{"predicate": "availability", "value": "unavailable", "relationship": "suite_of_target", "suite": "A"}], "issueCodes": []}
+      "expected": {"acceptedClaimIndexes": [0], "issues": []}
     },
     {
       "caseId": "split-suite-b-available",
@@ -132,7 +132,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [{"predicate": "availability", "value": "available", "relationship": "suite_of_target", "suite": "B"}], "issueCodes": []}
+      "expected": {"acceptedClaimIndexes": [0], "issues": []}
     },
     {
       "caseId": "split-suite-cannot-terminalize-target",
@@ -154,7 +154,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [], "issueCodes": ["subject_evidence_mismatch"]}
+      "expected": {"acceptedClaimIndexes": [], "issues": [{"code": "subject_evidence_mismatch", "candidateIndex": 0, "evidenceIndexes": [1], "entities": [{"relationship": "target", "suite": "", "canonicalAddress": "123 industrial avenue"}]}]}
     },
     {
       "caseId": "alternate-attachment-cannot-identify-target",
@@ -176,7 +176,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [], "issueCodes": ["subject_evidence_mismatch"]}
+      "expected": {"acceptedClaimIndexes": [], "issues": [{"code": "subject_evidence_mismatch", "candidateIndex": 0, "evidenceIndexes": [2], "entities": [{"relationship": "target", "suite": "", "canonicalAddress": "123 industrial avenue"}]}]}
     },
     {
       "caseId": "alternate-attachment-identifies-alternate",
@@ -198,7 +198,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [{"predicate": "identity", "value": "999 Other Road", "relationship": "alternate", "suite": ""}], "issueCodes": []}
+      "expected": {"acceptedClaimIndexes": [0], "issues": []}
     },
     {
       "caseId": "link-only-alternate-availability",
@@ -220,7 +220,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [{"predicate": "availability", "value": "available", "relationship": "alternate", "suite": ""}], "issueCodes": []}
+      "expected": {"acceptedClaimIndexes": [0], "issues": []}
     },
     {
       "caseId": "ambiguous-alternate-needs-review",
@@ -242,7 +242,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [], "issueCodes": ["unresolved_entity_context"]}
+      "expected": {"acceptedClaimIndexes": [], "issues": [{"code": "unresolved_entity_context", "candidateIndex": 0, "evidenceIndexes": [1], "entities": [{"relationship": "target", "suite": "", "canonicalAddress": "123 industrial avenue"}]}]}
     },
     {
       "caseId": "target-alias-availability",
@@ -264,7 +264,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [{"predicate": "availability", "value": "available", "relationship": "target", "suite": ""}], "issueCodes": []}
+      "expected": {"acceptedClaimIndexes": [0], "issues": []}
     },
     {
       "caseId": "attachment-suite-identity",
@@ -286,7 +286,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [{"predicate": "identity", "value": "Suite C", "relationship": "suite_of_target", "suite": "C"}], "issueCodes": []}
+      "expected": {"acceptedClaimIndexes": [0], "issues": []}
     },
     {
       "caseId": "multiple-alternates-block-claim",
@@ -308,7 +308,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [], "issueCodes": ["unresolved_entity_context"]}
+      "expected": {"acceptedClaimIndexes": [], "issues": [{"code": "unresolved_entity_context", "candidateIndex": 0, "evidenceIndexes": [1], "entities": [{"relationship": "alternate", "suite": "", "canonicalAddress": "999 other road"}]}]}
     },
     {
       "caseId": "child-suite-inherits-alternate-subject",
@@ -330,7 +330,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [{"predicate": "identity", "value": "Suite 200", "relationship": "suite_of_alternate", "suite": "200"}], "issueCodes": []}
+      "expected": {"acceptedClaimIndexes": [0], "issues": []}
     },
     {
       "caseId": "requirements-language-is-not-unavailability",
@@ -352,7 +352,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [], "issueCodes": ["predicate_evidence_mismatch"]}
+      "expected": {"acceptedClaimIndexes": [], "issues": [{"code": "predicate_evidence_mismatch", "candidateIndex": 0, "evidenceIndexes": [1], "entities": [{"relationship": "target", "suite": "", "canonicalAddress": "123 industrial avenue"}]}]}
     },
     {
       "caseId": "unit-price-without-time-basis-is-not-rent",
@@ -374,7 +374,7 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [], "issueCodes": ["invalid_predicate_unit"]}
+      "expected": {"acceptedClaimIndexes": [], "issues": [{"code": "invalid_predicate_unit", "candidateIndex": 0, "evidenceIndexes": [1], "entities": [{"relationship": "target", "suite": "", "canonicalAddress": "123 industrial avenue"}]}]}
     },
     {
       "caseId": "directional-alias-target-availability",
@@ -396,21 +396,21 @@
         }
       ],
       "review": [],
-      "expected": {"accepted": [{"predicate": "availability", "value": "available", "relationship": "target", "suite": ""}], "issueCodes": []}
+      "expected": {"acceptedClaimIndexes": [0], "issues": []}
     },
     {
       "caseId": "valid-no-claim-output",
       "interpretationCaseId": "attachment-extraction-failure-visible",
       "claims": [],
       "review": [],
-      "expected": {"accepted": [], "issueCodes": []}
+      "expected": {"acceptedClaimIndexes": [], "issues": []}
     },
     {
       "caseId": "explicit-model-review-output",
       "interpretationCaseId": "ordinary-prose-does-not-fabricate-entities",
       "claims": [],
       "review": [{"evidenceIndex": 1, "reason": "pricing basis is ambiguous"}],
-      "expected": {"accepted": [], "issueCodes": ["model_requested_review"]}
+      "expected": {"acceptedClaimIndexes": [], "issues": [{"code": "model_requested_review", "candidateIndex": 0, "evidenceIndexes": [1], "entities": []}]}
     }
   ]
 }

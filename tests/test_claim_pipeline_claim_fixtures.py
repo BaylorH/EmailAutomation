@@ -109,16 +109,16 @@ class ClaimFixtureTests(unittest.TestCase):
                 )
                 expected_claims = sorted(
                     (
-                        item["predicate"],
-                        item["value"],
-                        item["relationship"],
-                        item["suite"],
+                        case.claims[index]["predicate"],
+                        case.claims[index]["value"],
+                        case.claims[index]["subject"]["relationship"],
+                        case.claims[index]["subject"]["suite"],
                     )
-                    for item in case.expected["accepted"]
+                    for index in case.expected["acceptedClaimIndexes"]
                 )
                 self.assertEqual(expected_claims, actual_claims)
                 self.assertEqual(
-                    sorted(case.expected["issueCodes"]),
+                    sorted(item["code"] for item in case.expected["issues"]),
                     sorted(item.code for item in result.issues),
                 )
 

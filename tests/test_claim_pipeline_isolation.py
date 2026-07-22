@@ -103,7 +103,12 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             "InterpretationFixtureCase",
             "InterpretationFixtureCatalog",
             "InterpretationFixtureValidationError",
+            "InterpretationReplayResult",
             "RawMessageEvidence",
+            "RecordedProposalAdapter",
+            "ReplayCaseResult",
+            "ReplayIdentity",
+            "ReplayReport",
             "ResolutionIssue",
             "canonicalize_address",
             "build_claim_extraction_request",
@@ -114,6 +119,7 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             "load_claim_fixture_catalog",
             "normalize_message_evidence",
             "resolve_entities",
+            "run_claim_replay",
         }
 
         self.assertEqual(

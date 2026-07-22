@@ -13,7 +13,7 @@ from typing import Any, Mapping, Tuple
 from .contracts import ActorRole, ClaimModality, ClaimPolarity, ClaimPredicate
 
 
-CLAIM_FIXTURE_SCHEMA_VERSION = 1
+CLAIM_FIXTURE_SCHEMA_VERSION = 2
 _ROOT_KEYS = frozenset({"schemaVersion", "catalogId", "cases"})
 _CASE_KEYS = frozenset(
     {"caseId", "interpretationCaseId", "claims", "review", "expected"}
@@ -36,8 +36,10 @@ _CLAIM_KEYS = frozenset(
 )
 _SUBJECT_KEYS = frozenset({"relationship", "suite", "canonicalAddress"})
 _REVIEW_KEYS = frozenset({"evidenceIndex", "reason"})
-_EXPECTED_KEYS = frozenset({"accepted", "issueCodes"})
-_ACCEPTED_KEYS = frozenset({"predicate", "value", "relationship", "suite"})
+_EXPECTED_KEYS = frozenset({"acceptedClaimIndexes", "issues"})
+_EXPECTED_ISSUE_KEYS = frozenset(
+    {"code", "candidateIndex", "evidenceIndexes", "entities"}
+)
 
 
 class ClaimFixtureValidationError(ValueError):
@@ -128,21 +130,53 @@ def _validate_review(raw: object, label: str) -> None:
     _text(raw["reason"], f"{label} reason")
 
 
-def _validate_expected(raw: object, label: str) -> None:
+def _validate_expected(raw: object, label: str, claim_count: int) -> None:
     _exact_keys(raw, _EXPECTED_KEYS, label)
-    if not isinstance(raw["accepted"], list):
-        raise ClaimFixtureValidationError(f"{label} accepted must be a list")
-    for index, item in enumerate(raw["accepted"]):
-        item_label = f"{label} accepted {index}"
-        _exact_keys(item, _ACCEPTED_KEYS, item_label)
-        _enum(item["predicate"], ClaimPredicate, f"{item_label} predicate")
-        _validate_json(item["value"], f"{item_label} value")
-        _text(item["relationship"], f"{item_label} relationship")
-        _text(item["suite"], f"{item_label} suite", allow_empty=True)
-    if not isinstance(raw["issueCodes"], list):
-        raise ClaimFixtureValidationError(f"{label} issueCodes must be a list")
-    for index, item in enumerate(raw["issueCodes"]):
-        _text(item, f"{label} issueCodes {index}")
+    accepted = raw["acceptedClaimIndexes"]
+    if not isinstance(accepted, list):
+        raise ClaimFixtureValidationError(
+            f"{label} acceptedClaimIndexes must be a list"
+        )
+    accepted_indexes = tuple(
+        _index(item, f"{label} acceptedClaimIndexes {index}")
+        for index, item in enumerate(accepted)
+    )
+    if accepted_indexes != tuple(sorted(set(accepted_indexes))):
+        raise ClaimFixtureValidationError(
+            f"{label} acceptedClaimIndexes must be sorted and unique"
+        )
+    if any(index >= claim_count for index in accepted_indexes):
+        raise ClaimFixtureValidationError(
+            f"{label} acceptedClaimIndexes references an unknown claim"
+        )
+
+    issues = raw["issues"]
+    if not isinstance(issues, list):
+        raise ClaimFixtureValidationError(f"{label} issues must be a list")
+    for index, item in enumerate(issues):
+        item_label = f"{label} issue {index}"
+        _exact_keys(item, _EXPECTED_ISSUE_KEYS, item_label)
+        _text(item["code"], f"{item_label} code")
+        if item["candidateIndex"] is not None:
+            _index(item["candidateIndex"], f"{item_label} candidateIndex")
+        evidence_indexes = item["evidenceIndexes"]
+        if not isinstance(evidence_indexes, list):
+            raise ClaimFixtureValidationError(
+                f"{item_label} evidenceIndexes must be a list"
+            )
+        normalized_evidence = tuple(
+            _index(value, f"{item_label} evidenceIndexes {evidence_index}")
+            for evidence_index, value in enumerate(evidence_indexes)
+        )
+        if normalized_evidence != tuple(sorted(set(normalized_evidence))):
+            raise ClaimFixtureValidationError(
+                f"{item_label} evidenceIndexes must be sorted and unique"
+            )
+        entities = item["entities"]
+        if not isinstance(entities, list):
+            raise ClaimFixtureValidationError(f"{item_label} entities must be a list")
+        for entity_index, entity in enumerate(entities):
+            _validate_subject(entity, f"{item_label} entity {entity_index}")
 
 
 def _freeze(value: object) -> object:
@@ -202,7 +236,7 @@ def load_claim_fixture_catalog(path: Path) -> ClaimFixtureCatalog:
             _validate_claim(claim, f"{label} claim {claim_index}")
         for review_index, review in enumerate(item["review"]):
             _validate_review(review, f"{label} review {review_index}")
-        _validate_expected(item["expected"], f"{label} expected")
+        _validate_expected(item["expected"], f"{label} expected", len(item["claims"]))
         cases.append(
             ClaimFixtureCase(
                 case_id=case_id,
