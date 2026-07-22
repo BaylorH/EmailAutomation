@@ -1046,6 +1046,23 @@ def _actual_claim_outcome(
     )
 
 
+def _provider_quality_claim_outcome(
+    items: tuple[dict[str, object], ...],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            _digest(
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"evidenceText", "confidence"}
+                }
+            )
+            for item in items
+        )
+    )
+
+
 def _provider_claim_mismatch_field_counts(
     expected_items: tuple[dict[str, object], ...],
     actual_items: tuple[dict[str, object], ...],
@@ -1548,14 +1565,22 @@ def run_claim_replay(
                 sorted(_digest(item) for item in actual_claim_items)
             )
             if identity.evaluation_profile == "provider_quality":
+                expected_claim_items = _provider_expected_claim_items(
+                    evaluation_case,
+                    claim_by_id,
+                )
                 actual_reviews, review_parse_mismatches = _provider_review_outcome(
                     response.model_output,
                     normalized.evidence,
                 )
                 quality_mismatch_codes = _provider_quality_mismatches(
-                    expected_claim_digests=evaluation_case.expected_claim_digests,
+                    expected_claim_digests=_provider_quality_claim_outcome(
+                        expected_claim_items
+                    ),
                     expected_reviews=evaluation_case.expected_reviews,
-                    actual_claim_digests=actual_claim_outcome,
+                    actual_claim_digests=_provider_quality_claim_outcome(
+                        actual_claim_items
+                    ),
                     expected_predicate_counts=_provider_expected_predicate_counts(
                         evaluation_case,
                         claim_by_id,
@@ -1567,10 +1592,7 @@ def run_claim_replay(
                 )
                 claim_mismatch_field_counts = (
                     _provider_claim_mismatch_field_counts(
-                        _provider_expected_claim_items(
-                            evaluation_case,
-                            claim_by_id,
-                        ),
+                        expected_claim_items,
                         actual_claim_items,
                     )
                     if "claim_detail_mismatch" in quality_mismatch_codes

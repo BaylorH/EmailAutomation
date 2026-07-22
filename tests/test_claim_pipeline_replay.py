@@ -332,6 +332,7 @@ class _ProviderQualityRecordedAdapter:
         wrong_review_evidence_case="",
         rejected_candidate_case="",
         detail_mismatch_case="",
+        nonsemantic_variation_case="",
     ):
         self._provider_cases = {
             case.case_id: case for case in provider_catalog.cases
@@ -344,6 +345,7 @@ class _ProviderQualityRecordedAdapter:
         self._wrong_review_evidence_case = wrong_review_evidence_case
         self._rejected_candidate_case = rejected_candidate_case
         self._detail_mismatch_case = detail_mismatch_case
+        self._nonsemantic_variation_case = nonsemantic_variation_case
         self.calls = 0
 
     def propose(self, *, case_id, request, evidence, entities):
@@ -400,11 +402,15 @@ class _ProviderQualityRecordedAdapter:
             model_claims.pop()
         if case_id == self._detail_mismatch_case and model_claims:
             target = model_claims[0]
+            target["effectiveAt"] = "2026-07-22"
+        if case_id == self._nonsemantic_variation_case and model_claims:
+            target = model_claims[0]
             target["evidenceText"] = next(
                 item.content
                 for item in evidence
                 if item.evidence_id == target["evidenceId"]
             )
+            target["confidence"] = 0.91
         if case_id == self._rejected_candidate_case:
             rejected = next(
                 source.claims[index]
@@ -843,15 +849,48 @@ class ReplayExecutionTests(unittest.TestCase):
                         if item.case_id == "complete-property-facts"
                     )
                     self.assertEqual(
-                        (("evidenceText", 1),),
+                        (("effectiveAt", 1),),
                         failed.claim_mismatch_field_counts,
                     )
                     self.assertEqual(
-                        {"evidenceText": 1},
+                        {"effectiveAt": 1},
                         failed.to_dict()["claimMismatchFieldCounts"],
                     )
                 serialized = json.dumps(report.to_dict(), sort_keys=True)
                 self.assertNotIn("private free-form reason", serialized)
+
+    def test_provider_quality_accepts_valid_quote_and_confidence_variants(self):
+        telemetry = _MutableTelemetry()
+        adapter = _ProviderQualityRecordedAdapter(
+            self.provider_quality_catalog,
+            self.claim_catalog,
+            telemetry,
+            nonsemantic_variation_case="complete-property-facts",
+        )
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=self.claim_catalog,
+            provider_quality_catalog=self.provider_quality_catalog,
+            adapter=adapter,
+            identity=self._identity(
+                adapter,
+                repeats=1,
+                evaluation_profile="provider_quality",
+                evaluation_fixture_hash=self.provider_quality_catalog.manifest_hash,
+                case_count=len(self.provider_quality_catalog.cases),
+            ),
+            telemetry=telemetry,
+        )
+
+        self.assertTrue(report.passed)
+        complete = next(
+            item
+            for item in report.results
+            if item.case_id == "complete-property-facts"
+        )
+        self.assertEqual((), complete.quality_mismatch_codes)
+        self.assertEqual((), complete.claim_mismatch_field_counts)
 
     def test_dirty_source_can_pass_evaluation_but_not_reproducible_gate(self):
         adapter = self._adapter()
