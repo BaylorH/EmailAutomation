@@ -744,10 +744,10 @@ def compare_legacy_case(
         if item.action_type is ActionType.OUTBOUND_DRAFT
     }
 
-    findings: dict[str, str] = {}
+    findings: set[tuple[str, str]] = set()
 
     def add(code: str, entity_key: str) -> None:
-        findings.setdefault(code, entity_key)
+        findings.add((code, entity_key))
 
     for entity_key, _field in sorted(legacy_facts - policy_facts):
         add("legacy_unplanned_fact_mutation", entity_key)
@@ -807,9 +807,9 @@ def compare_legacy_case(
             code=code,
             category=_DISCREPANCY_META[code][0],
             severity=_DISCREPANCY_META[code][1],
-            entity_key=findings[code],
+            entity_key=entity_key,
         )
-        for code in sorted(findings)
+        for code, entity_key in sorted(findings)
     )
     if discrepancies:
         disposition = max(
@@ -899,6 +899,8 @@ def run_legacy_shadow(
             or result.severity != expected.severity
             or tuple(item.code for item in result.discrepancies)
             != expected.discrepancy_codes
+            or tuple(item.entity_key for item in result.discrepancies)
+            != expected.discrepancy_entities
         ):
             mismatches.append(result.case_id)
 

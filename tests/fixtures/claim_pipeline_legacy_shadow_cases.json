@@ -13,7 +13,7 @@
         "responseDraft": true,
         "skipResponse": false
       },
-      "expected": {"disposition": "deferred_surface", "severity": "warning", "discrepancyCodes": ["outbound_surface_deferred"]}
+      "expected": {"disposition": "deferred_surface", "severity": "warning", "discrepancyCodes": ["outbound_surface_deferred"], "discrepancyEntities": ["target"]}
     },
     {
       "caseId": "aligned-explicit-unavailable",
@@ -26,12 +26,12 @@
         "responseDraft": true,
         "skipResponse": false
       },
-      "expected": {"disposition": "deferred_surface", "severity": "warning", "discrepancyCodes": ["outbound_surface_deferred", "row_move_surface_deferred"]}
+      "expected": {"disposition": "deferred_surface", "severity": "warning", "discrepancyCodes": ["outbound_surface_deferred", "row_move_surface_deferred"], "discrepancyEntities": ["target", "target"]}
     },
     {
       "caseId": "tour-only-terminalization-risk",
       "policyCaseId": "tour-only-unavailable-near-miss",
-      "provenance": {"kind": "historical_probe", "sourceRef": "tests/test_broker_language_broker_tour_unavailable.py"},
+      "provenance": {"kind": "legacy_test_contract", "sourceRef": "tests/test_broker_language_broker_tour_unavailable.py"},
       "bindings": {"currentEntity": "target", "eventEntities": ["target"], "recipientRelation": "absent"},
       "legacyProposal": {
         "updates": [],
@@ -39,7 +39,7 @@
         "responseDraft": false,
         "skipResponse": true
       },
-      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_terminalizes_nonterminal"]}
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_terminalizes_nonterminal"], "discrepancyEntities": ["target"]}
     },
     {
       "caseId": "fit-market-conflation-risk",
@@ -55,7 +55,7 @@
         "responseDraft": true,
         "skipResponse": false
       },
-      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_market_fit_conflation", "outbound_surface_deferred", "row_move_surface_deferred"]}
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_market_fit_conflation", "outbound_surface_deferred", "row_move_surface_deferred"], "discrepancyEntities": ["target", "target", "target"]}
     },
     {
       "caseId": "backup-offer-terminalization-risk",
@@ -68,7 +68,7 @@
         "responseDraft": false,
         "skipResponse": true
       },
-      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_bypasses_required_review", "legacy_missing_policy_fact", "legacy_terminalizes_nonterminal"]}
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_bypasses_required_review", "legacy_missing_policy_fact", "legacy_terminalizes_nonterminal"], "discrepancyEntities": ["target", "target", "target"]}
     },
     {
       "caseId": "split-suite-missing-sibling-update",
@@ -81,12 +81,12 @@
         "responseDraft": false,
         "skipResponse": true
       },
-      "expected": {"disposition": "new_policy_gap", "severity": "release_blocker", "discrepancyCodes": ["legacy_missing_policy_fact", "row_move_surface_deferred"]}
+      "expected": {"disposition": "new_policy_gap", "severity": "release_blocker", "discrepancyCodes": ["legacy_missing_policy_fact", "row_move_surface_deferred"], "discrepancyEntities": ["suite_b", "suite_a"]}
     },
     {
       "caseId": "alternate-property-wrong-row-risk",
       "policyCaseId": "alternate-property-isolation",
-      "provenance": {"kind": "historical_probe", "sourceRef": "tests/test_colleague_redirect_guard.py"},
+      "provenance": {"kind": "synthetic_boundary", "sourceRef": "synthetic/alternate-property-wrong-row"},
       "bindings": {"currentEntity": "target", "eventEntities": ["target", "alternate"], "recipientRelation": "same"},
       "legacyProposal": {
         "updates": [
@@ -100,7 +100,7 @@
         "responseDraft": true,
         "skipResponse": false
       },
-      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_unplanned_fact_mutation", "outbound_surface_deferred", "row_move_surface_deferred"]}
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_unplanned_fact_mutation", "outbound_surface_deferred", "row_move_surface_deferred"], "discrepancyEntities": ["target", "target", "target"]}
     },
     {
       "caseId": "complete-closeout-aligned",
@@ -117,7 +117,7 @@
         "responseDraft": true,
         "skipResponse": false
       },
-      "expected": {"disposition": "deferred_surface", "severity": "warning", "discrepancyCodes": ["outbound_surface_deferred"]}
+      "expected": {"disposition": "deferred_surface", "severity": "warning", "discrepancyCodes": ["outbound_surface_deferred"], "discrepancyEntities": ["target"]}
     },
     {
       "caseId": "out-of-office-policy-improvement",
@@ -125,7 +125,7 @@
       "provenance": {"kind": "historical_probe", "sourceRef": "tests/test_out_of_office_wrong_contact_guard.py"},
       "bindings": {"currentEntity": "contact", "eventEntities": [], "recipientRelation": "absent"},
       "legacyProposal": {"updates": [], "events": [], "responseDraft": false, "skipResponse": true},
-      "expected": {"disposition": "expected_improvement", "severity": "info", "discrepancyCodes": ["policy_adds_waiting_state"]}
+      "expected": {"disposition": "expected_improvement", "severity": "info", "discrepancyCodes": ["policy_adds_waiting_state"], "discrepancyEntities": ["contact"]}
     },
     {
       "caseId": "redirect-held-for-approval",
@@ -138,7 +138,7 @@
         "responseDraft": false,
         "skipResponse": true
       },
-      "expected": {"disposition": "equivalent", "severity": "none", "discrepancyCodes": []}
+      "expected": {"disposition": "equivalent", "severity": "none", "discrepancyCodes": [], "discrepancyEntities": []}
     },
     {
       "caseId": "forwarded-redirect-auto-draft-risk",
@@ -151,7 +151,7 @@
         "responseDraft": true,
         "skipResponse": false
       },
-      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_automatic_outbound_during_review"]}
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_automatic_outbound_during_review"], "discrepancyEntities": ["contact"]}
     },
     {
       "caseId": "opt-out-plus-call-held",
@@ -167,7 +167,7 @@
         "responseDraft": true,
         "skipResponse": true
       },
-      "expected": {"disposition": "deferred_surface", "severity": "warning", "discrepancyCodes": ["row_move_surface_deferred"]}
+      "expected": {"disposition": "deferred_surface", "severity": "warning", "discrepancyCodes": ["row_move_surface_deferred"], "discrepancyEntities": ["contact"]}
     },
     {
       "caseId": "conflicting-availability-auto-mutation-risk",
@@ -180,7 +180,7 @@
         "responseDraft": false,
         "skipResponse": true
       },
-      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_bypasses_required_review", "legacy_unplanned_fact_mutation"]}
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_bypasses_required_review", "legacy_unplanned_fact_mutation"], "discrepancyEntities": ["target", "target"]}
     },
     {
       "caseId": "unsupported-hard-requirement-review-bypass",
@@ -193,7 +193,7 @@
         "responseDraft": true,
         "skipResponse": false
       },
-      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_automatic_outbound_during_review", "legacy_bypasses_required_review"]}
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_automatic_outbound_during_review", "legacy_bypasses_required_review"], "discrepancyEntities": ["target", "target"]}
     },
     {
       "caseId": "unavailable-without-terminal-event",
@@ -206,7 +206,7 @@
         "responseDraft": false,
         "skipResponse": true
       },
-      "expected": {"disposition": "new_policy_gap", "severity": "release_blocker", "discrepancyCodes": ["legacy_missing_terminal_freeze", "legacy_missing_terminal_status"]}
+      "expected": {"disposition": "new_policy_gap", "severity": "release_blocker", "discrepancyCodes": ["legacy_missing_terminal_freeze", "legacy_missing_terminal_status"], "discrepancyEntities": ["target", "target"]}
     }
   ]
 }

@@ -142,6 +142,7 @@ class LegacyShadowReportTests(unittest.TestCase):
                 disposition="equivalent",
                 severity="none",
                 discrepancy_codes=(),
+                discrepancy_entities=(),
             ),
         )
         drifted_catalog = LegacyShadowFixtureCatalog(

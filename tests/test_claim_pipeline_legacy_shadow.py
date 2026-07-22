@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from email_automation.claim_pipeline.contracts import ActionType, ApprovalClass
@@ -7,6 +8,8 @@ from email_automation.claim_pipeline.legacy_shadow import (
     project_legacy_proposal,
 )
 from email_automation.claim_pipeline.legacy_shadow_fixtures import (
+    LegacyShadowBindings,
+    LegacyShadowProposal,
     load_legacy_shadow_fixture_catalog,
 )
 from email_automation.claim_pipeline.policy_fixtures import (
@@ -204,6 +207,10 @@ class LegacyComparisonTests(unittest.TestCase):
                     case.expected.discrepancy_codes,
                     tuple(item.code for item in result.discrepancies),
                 )
+                self.assertEqual(
+                    case.expected.discrepancy_entities,
+                    tuple(item.entity_key for item in result.discrepancies),
+                )
 
     def test_wrong_row_mutation_is_a_legacy_release_blocker(self):
         result = self._compare("alternate-property-wrong-row-risk")
@@ -279,6 +286,42 @@ class LegacyComparisonTests(unittest.TestCase):
 
         self.assertEqual(first.result_digest, second.result_digest)
         self.assertEqual(first.to_dict(), second.to_dict())
+
+    def test_same_discrepancy_code_is_preserved_for_each_entity(self):
+        original = next(
+            case
+            for case in self.shadow_catalog.cases
+            if case.case_id == "split-suite-missing-sibling-update"
+        )
+        no_legacy_actions = replace(
+            original,
+            bindings=LegacyShadowBindings(
+                current_entity="suite_a",
+                event_entities=(),
+                recipient_relation="absent",
+            ),
+            legacy_proposal=LegacyShadowProposal(
+                updates=(),
+                events=(),
+                response_draft=False,
+                skip_response=True,
+            ),
+        )
+
+        result = compare_legacy_case(
+            no_legacy_actions,
+            self.policy_cases[original.policy_case_id],
+        )
+        missing_facts = [
+            item
+            for item in result.discrepancies
+            if item.code == "legacy_missing_policy_fact"
+        ]
+
+        self.assertEqual(
+            ["suite_a", "suite_b"],
+            [item.entity_key for item in missing_facts],
+        )
 
 
 if __name__ == "__main__":

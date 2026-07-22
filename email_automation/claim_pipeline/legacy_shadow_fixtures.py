@@ -64,7 +64,9 @@ _PROPOSAL_KEYS = frozenset(
 )
 _UPDATE_KEYS = frozenset({"column", "valueKind"})
 _EVENT_KEYS = frozenset({"type", "reason"})
-_EXPECTED_KEYS = frozenset({"disposition", "severity", "discrepancyCodes"})
+_EXPECTED_KEYS = frozenset(
+    {"disposition", "severity", "discrepancyCodes", "discrepancyEntities"}
+)
 _VALUE_KINDS = frozenset({"text", "number", "boolean"})
 _RECIPIENT_RELATIONS = frozenset({"absent", "same", "different"})
 _EVENT_TYPES = frozenset(
@@ -189,6 +191,7 @@ class LegacyShadowExpectation:
     disposition: str
     severity: str
     discrepancy_codes: tuple[str, ...]
+    discrepancy_entities: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -332,9 +335,24 @@ def _validate_case(
         raise LegacyShadowFixtureValidationError(
             f"case {case_id} discrepancyCodes must be sorted"
         )
-    if len(discrepancy_codes) != len(set(discrepancy_codes)):
+    discrepancy_entities = _string_list(
+        expected_raw["discrepancyEntities"],
+        f"case {case_id} discrepancyEntities",
+    )
+    if len(discrepancy_entities) != len(discrepancy_codes):
         raise LegacyShadowFixtureValidationError(
-            f"case {case_id} discrepancyCodes contains duplicates"
+            f"case {case_id} discrepancyEntities must match discrepancyCodes length"
+        )
+    for entity in discrepancy_entities:
+        if entity not in entity_keys:
+            raise LegacyShadowFixtureValidationError(
+                f"case {case_id} discrepancyEntities references unknown policy entity"
+            )
+    if len(set(zip(discrepancy_codes, discrepancy_entities))) != len(
+        discrepancy_codes
+    ):
+        raise LegacyShadowFixtureValidationError(
+            f"case {case_id} expected discrepancy signatures contain duplicates"
         )
     unknown_codes = set(discrepancy_codes) - LEGACY_SHADOW_DISCREPANCY_CODES
     if unknown_codes:
@@ -361,6 +379,7 @@ def _validate_case(
             disposition=disposition,
             severity=severity,
             discrepancy_codes=discrepancy_codes,
+            discrepancy_entities=discrepancy_entities,
         ),
     )
 
