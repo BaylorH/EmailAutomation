@@ -893,6 +893,21 @@ class ReplayExecutionTests(unittest.TestCase):
                         {"effectiveAt": 1},
                         failed.to_dict()["claimMismatchFieldCounts"],
                     )
+                if expected_code == "provider_candidate_rejected":
+                    failed = next(
+                        item
+                        for item in report.results
+                        if item.case_id
+                        == "ordinary-prose-does-not-fabricate-entities"
+                    )
+                    self.assertEqual(
+                        (("predicate_evidence_mismatch:availability", 1),),
+                        failed.rejected_predicate_counts,
+                    )
+                    self.assertEqual(
+                        {"predicate_evidence_mismatch:availability": 1},
+                        failed.to_dict()["rejectedPredicateCounts"],
+                    )
                 serialized = json.dumps(report.to_dict(), sort_keys=True)
                 self.assertNotIn("private free-form reason", serialized)
 

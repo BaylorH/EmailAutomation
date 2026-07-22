@@ -539,6 +539,7 @@ class ReplayCaseResult:
     accepted_claim_count: int
     accepted_predicate_counts: tuple[tuple[str, int], ...]
     claim_mismatch_field_counts: tuple[tuple[str, int], ...]
+    rejected_predicate_counts: tuple[tuple[str, int], ...]
     issue_codes: tuple[str, ...]
     quality_mismatch_codes: tuple[str, ...]
     passed: bool
@@ -555,6 +556,7 @@ class ReplayCaseResult:
             "acceptedClaimCount": self.accepted_claim_count,
             "acceptedPredicateCounts": dict(self.accepted_predicate_counts),
             "claimMismatchFieldCounts": dict(self.claim_mismatch_field_counts),
+            "rejectedPredicateCounts": dict(self.rejected_predicate_counts),
             "issueCodes": list(self.issue_codes),
             "qualityMismatchCodes": list(self.quality_mismatch_codes),
             "passed": self.passed,
@@ -1197,6 +1199,44 @@ def _provider_review_outcome(
     return tuple(sorted(reviews)), tuple(sorted(mismatch_codes))
 
 
+def _rejected_predicate_counts(
+    model_output: object,
+    issues: tuple[object, ...],
+) -> tuple[tuple[str, int], ...]:
+    if isinstance(model_output, str):
+        try:
+            model_output = json.loads(model_output)
+        except json.JSONDecodeError:
+            return ()
+    if not isinstance(model_output, Mapping):
+        return ()
+    raw_claims = model_output.get("claims")
+    if not isinstance(raw_claims, list):
+        return ()
+    allowed_predicates = {item.value for item in ClaimPredicate}
+    counts = {}
+    for issue in issues:
+        index = issue.candidate_index
+        if (
+            issue.code == "model_requested_review"
+            or index is None
+            or index < 0
+            or index >= len(raw_claims)
+        ):
+            continue
+        raw = raw_claims[index]
+        if not isinstance(raw, Mapping):
+            continue
+        predicate = raw.get("predicate")
+        if predicate not in allowed_predicates:
+            continue
+        key = f"{issue.code}:{predicate}"
+        if not re.fullmatch(r"[a-z][a-z0-9_]*:[a-z][a-z0-9_]*", key):
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return tuple(sorted(counts.items()))
+
+
 def _provider_quality_mismatches(
     *,
     expected_claim_digests: tuple[str, ...],
@@ -1372,6 +1412,7 @@ def _adapter_failure_result(
         accepted_claim_count=0,
         accepted_predicate_counts=(),
         claim_mismatch_field_counts=(),
+        rejected_predicate_counts=(),
         issue_codes=(),
         quality_mismatch_codes=(),
         passed=False,
@@ -1564,6 +1605,10 @@ def run_claim_replay(
             proposal_digests[case_id].add(proposal_digest)
             outcome_digests[case_id].add(outcome_digest)
             issue_codes = tuple(sorted(item.code for item in extracted.issues))
+            rejected_predicate_counts = _rejected_predicate_counts(
+                response.model_output,
+                extracted.issues,
+            )
             actual_predicate_counts = _accepted_predicate_counts(extracted.claims)
             actual_claim_items = _actual_claim_items(
                 extracted.claims,
@@ -1631,6 +1676,7 @@ def run_claim_replay(
                     accepted_claim_count=len(extracted.claims),
                     accepted_predicate_counts=actual_predicate_counts,
                     claim_mismatch_field_counts=claim_mismatch_field_counts,
+                    rejected_predicate_counts=rejected_predicate_counts,
                     issue_codes=issue_codes,
                     quality_mismatch_codes=quality_mismatch_codes,
                     passed=passed,
