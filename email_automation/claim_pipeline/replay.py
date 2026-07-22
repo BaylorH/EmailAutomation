@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Protocol
 
 from .claim_fixtures import ClaimFixtureCatalog
+from .claim_validation import (
+    CandidateValidationError,
+    is_fit_only_availability_evidence,
+    validate_claim_semantics,
+    validate_claim_subject_binding,
+)
 from .contracts import (
     ActorRole,
     Claim,
@@ -37,6 +45,7 @@ RECORDED_PROMPT_ID = "recorded-claim-proposal-v1"
 RECORDED_PROMPT_HASH = hashlib.sha256(
     b"SiteSift recorded claim fixture materialization v1"
 ).hexdigest()
+_REPORT_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 
 
 def _canonical_json(value: object) -> str:
@@ -66,10 +75,26 @@ def _text(value: object, label: str) -> str:
     return value.strip()
 
 
+def _report_safe_id(value: object, label: str) -> str:
+    cleaned = _text(value, label)
+    if not _REPORT_SAFE_ID.fullmatch(cleaned):
+        raise ValueError(f"{label} must be a report-safe identifier")
+    return cleaned
+
+
 def _sha256(value: object, label: str) -> str:
     cleaned = _text(value, label).lower()
     if len(cleaned) != 64 or any(character not in "0123456789abcdef" for character in cleaned):
         raise ValueError(f"{label} must be a SHA-256 hexadecimal digest")
+    return cleaned
+
+
+def _git_revision(value: object) -> str:
+    cleaned = _text(value, "code_revision").lower()
+    if len(cleaned) != 40 or any(
+        character not in "0123456789abcdef" for character in cleaned
+    ):
+        raise ValueError("code_revision must be a 40-character hexadecimal revision")
     return cleaned
 
 
@@ -110,10 +135,10 @@ class ReplayIdentity:
         if not isinstance(self.source_tree_dirty, bool):
             raise ValueError("source_tree_dirty must be boolean")
         normalized = {
-            "code_revision": _text(self.code_revision, "code_revision"),
+            "code_revision": _git_revision(self.code_revision),
             "source_tree_hash": _sha256(self.source_tree_hash, "source_tree_hash"),
             "source_tree_dirty": self.source_tree_dirty,
-            "python_version": _text(self.python_version, "python_version"),
+            "python_version": _report_safe_id(self.python_version, "python_version"),
             "dependency_lock_hash": _sha256(
                 self.dependency_lock_hash, "dependency_lock_hash"
             ),
@@ -126,9 +151,9 @@ class ReplayIdentity:
             "extraction_schema_version": _positive_int(
                 self.extraction_schema_version, "extraction_schema_version"
             ),
-            "provider_id": _text(self.provider_id, "provider_id"),
-            "model_id": _text(self.model_id, "model_id"),
-            "prompt_id": _text(self.prompt_id, "prompt_id"),
+            "provider_id": _report_safe_id(self.provider_id, "provider_id"),
+            "model_id": _report_safe_id(self.model_id, "model_id"),
+            "prompt_id": _report_safe_id(self.prompt_id, "prompt_id"),
             "prompt_hash": _sha256(self.prompt_hash, "prompt_hash"),
             "repeats": _positive_int(self.repeats, "repeats"),
             "case_count": _positive_int(self.case_count, "case_count"),
@@ -185,10 +210,10 @@ class ReplayIdentity:
         if not isinstance(source_tree_dirty, bool):
             raise ValueError("source_tree_dirty must be boolean")
         normalized = {
-            "code_revision": _text(code_revision, "code_revision"),
+            "code_revision": _git_revision(code_revision),
             "source_tree_hash": _sha256(source_tree_hash, "source_tree_hash"),
             "source_tree_dirty": source_tree_dirty,
-            "python_version": _text(python_version, "python_version"),
+            "python_version": _report_safe_id(python_version, "python_version"),
             "dependency_lock_hash": _sha256(
                 dependency_lock_hash, "dependency_lock_hash"
             ),
@@ -199,9 +224,9 @@ class ReplayIdentity:
             "extraction_schema_version": _positive_int(
                 extraction_schema_version, "extraction_schema_version"
             ),
-            "provider_id": _text(provider_id, "provider_id"),
-            "model_id": _text(model_id, "model_id"),
-            "prompt_id": _text(prompt_id, "prompt_id"),
+            "provider_id": _report_safe_id(provider_id, "provider_id"),
+            "model_id": _report_safe_id(model_id, "model_id"),
+            "prompt_id": _report_safe_id(prompt_id, "prompt_id"),
             "prompt_hash": _sha256(prompt_hash, "prompt_hash"),
             "repeats": _positive_int(repeats, "repeats"),
             "case_count": _positive_int(case_count, "case_count"),
@@ -356,6 +381,15 @@ class RecordedProposalAdapter:
         if request.entities != tuple(sorted(entities, key=lambda item: item.entity_id)):
             raise ValueError("recorded proposal entities do not match the request")
 
+        fixture_prior_claims = tuple(
+            _prior_claim_from_fixture(raw, evidence, entities)
+            for raw in case.prior_claims
+        )
+        if tuple(sorted(item.claim_id for item in request.prior_claims)) != tuple(
+            sorted(item.claim_id for item in fixture_prior_claims)
+        ):
+            raise ValueError("recorded proposal prior claims do not match the request")
+
         entity_by_key = {
             (item.relationship, item.suite, item.canonical_address): item
             for item in entities
@@ -375,6 +409,11 @@ class RecordedProposalAdapter:
                 for key, value in raw.items()
                 if key not in {"evidenceIndex", "subject"}
             }
+            supersedes = claim["supersedesClaimId"]
+            if isinstance(supersedes, str) and supersedes.startswith("prior:"):
+                claim["supersedesClaimId"] = fixture_prior_claims[
+                    int(supersedes.removeprefix("prior:"))
+                ].claim_id
             claim.update(
                 {
                     "evidenceId": evidence[raw["evidenceIndex"]].evidence_id,
@@ -499,6 +538,13 @@ def _validate_replay_inputs(
     adapter: ProposalAdapter,
     identity: ReplayIdentity,
 ) -> dict[str, object]:
+    _report_safe_id(interpretation_catalog.catalog_id, "interpretation catalog_id")
+    _report_safe_id(claim_catalog.catalog_id, "claim catalog_id")
+    for case in interpretation_catalog.cases:
+        _report_safe_id(case.case_id, "interpretation case_id")
+    for case in claim_catalog.cases:
+        _report_safe_id(case.case_id, "claim case_id")
+        _report_safe_id(case.interpretation_case_id, "interpretation case_id")
     if identity.interpretation_fixture_hash != interpretation_catalog.manifest_hash:
         raise ValueError("replay identity interpretation fixture hash does not match")
     if identity.claim_fixture_hash != claim_catalog.manifest_hash:
@@ -535,10 +581,199 @@ def _validate_replay_inputs(
     )
     if missing:
         raise ValueError("claim fixtures reference unknown interpretation cases")
+    for case in claim_catalog.cases:
+        source = interpretation_by_id[case.interpretation_case_id]
+        evidence = normalize_message_evidence(source.message).evidence
+        resolved_entities = resolve_entities(
+            tenant_id=source.message.tenant_id,
+            campaign_id=source.campaign_id,
+            seeds=source.seeds,
+            evidence=evidence,
+        ).entities
+        evidence_sources = tuple(item.source_kind.value for item in evidence)
+        bound_evidence_indexes = {
+            item["evidenceIndex"]
+            for item in (*case.claims, *case.prior_claims, *case.review)
+        }
+        accepted = tuple(
+            case.claims[index]
+            for index in case.expected["acceptedClaimIndexes"]
+        )
+        accepted_predicates = {item["predicate"] for item in accepted}
+        dimensions = set(case.incident_dimensions)
+        try:
+            source_time = datetime.fromisoformat(
+                source.message.observed_at.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{case.case_id} current message chronology is invalid"
+            ) from exc
+        for prior_index, raw_prior in enumerate(case.prior_claims):
+            envelope = evidence[raw_prior["evidenceIndex"]]
+            if raw_prior["evidenceText"].casefold() not in envelope.content.casefold():
+                raise ValueError(
+                    f"{case.case_id} prior claim {prior_index} excerpt is absent from evidence"
+                )
+            if raw_prior["actorEmail"].casefold() != envelope.actor.email.casefold():
+                raise ValueError(
+                    f"{case.case_id} prior claim {prior_index} actor is not evidence-bound"
+                )
+            try:
+                prior_time = datetime.fromisoformat(
+                    raw_prior["observedAt"].replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"{case.case_id} prior claim {prior_index} chronology is invalid"
+                ) from exc
+            if prior_time.tzinfo is None:
+                raise ValueError(
+                    f"{case.case_id} prior claim {prior_index} chronology is invalid"
+                )
+            if source_time.tzinfo is None or prior_time >= source_time:
+                raise ValueError(
+                    f"{case.case_id} prior claim {prior_index} must precede the current message"
+                )
+            if raw_prior["observedAt"] not in envelope.content:
+                raise ValueError(
+                    f"{case.case_id} prior claim {prior_index} chronology is not evidence-bound"
+                )
+            prior_claim = _prior_claim_from_fixture(
+                raw_prior,
+                evidence,
+                resolved_entities,
+            )
+            try:
+                validate_claim_semantics(prior_claim)
+            except CandidateValidationError as exc:
+                raise ValueError(
+                    f"{case.case_id} prior claim {prior_index} predicate does not match its evidence"
+                ) from exc
+            prior_entity = next(
+                item
+                for item in resolved_entities
+                if item.entity_id == prior_claim.subject_entity_id
+            )
+            try:
+                validate_claim_subject_binding(
+                    prior_claim,
+                    prior_entity,
+                    resolved_entities,
+                )
+            except CandidateValidationError as exc:
+                raise ValueError(
+                    f"{case.case_id} prior claim {prior_index} subject is not evidence-bound"
+                ) from exc
+        for dimension in ("attachment", "link"):
+            if dimension in dimensions and dimension not in evidence_sources:
+                raise ValueError(
+                    f"{case.case_id} {dimension} coverage requires {dimension} evidence"
+                )
+            if dimension in dimensions and not any(
+                index < len(evidence_sources)
+                and evidence_sources[index] == dimension
+                for index in bound_evidence_indexes
+            ):
+                raise ValueError(
+                    f"{case.case_id} {dimension} coverage requires a claim or review "
+                    f"bound to {dimension} evidence"
+                )
+        if "repeated_question" in dimensions and not (
+            any(
+                item["predicate"] == ClaimPredicate.INFORMATION_REQUEST.value
+                for item in case.prior_claims
+            )
+            and ClaimPredicate.INFORMATION_REQUEST.value in accepted_predicates
+        ):
+            raise ValueError(
+                f"{case.case_id} repeated_question coverage requires prior and current requests"
+            )
+        if "requirements_mismatch" in dimensions and not any(
+            item["predicate"] == ClaimPredicate.AVAILABILITY.value
+            and item["value"] == "unavailable"
+            and is_fit_only_availability_evidence(item["evidenceText"])
+            and any(
+                issue["candidateIndex"] == index
+                and issue["code"] == "predicate_evidence_mismatch"
+                for issue in case.expected["issues"]
+            )
+            for index, item in enumerate(case.claims)
+        ):
+            raise ValueError(
+                f"{case.case_id} requirements_mismatch coverage requires "
+                "fit-only availability evidence"
+            )
+        if "terminal_closeout" in dimensions and not any(
+            item["predicate"] == ClaimPredicate.AVAILABILITY.value
+            and item["value"] == "unavailable"
+            and item["subject"]["relationship"] == "target"
+            for item in accepted
+        ):
+            raise ValueError(
+                f"{case.case_id} terminal_closeout coverage requires target unavailability"
+            )
+        if "continued_followup_hazard" in dimensions and not (
+            ClaimPredicate.OPT_OUT.value in accepted_predicates
+            or any(
+                item["predicate"] == ClaimPredicate.AVAILABILITY.value
+                and item["value"] == "unavailable"
+                and item["subject"]["relationship"] == "target"
+                for item in accepted
+            )
+        ):
+            raise ValueError(
+                f"{case.case_id} continued_followup_hazard coverage requires a stop signal"
+            )
     return interpretation_by_id
 
 
 def _claim_from_fixture(
+    raw: Mapping[str, object],
+    evidence: tuple[EvidenceEnvelope, ...],
+    entities: tuple[EntityRef, ...],
+    prior_claims: tuple[Claim, ...] = (),
+) -> Claim:
+    envelope = evidence[raw["evidenceIndex"]]
+    subject = raw["subject"]
+    entity = next(
+        item
+        for item in entities
+        if (
+            item.relationship,
+            item.suite,
+            item.canonical_address,
+        )
+        == (
+            subject["relationship"],
+            subject["suite"],
+            subject["canonicalAddress"],
+        )
+    )
+    supersedes = raw["supersedesClaimId"]
+    if isinstance(supersedes, str) and supersedes.startswith("prior:"):
+        supersedes = prior_claims[int(supersedes.removeprefix("prior:"))].claim_id
+    return Claim.create(
+        tenant_id=envelope.tenant_id,
+        campaign_id=envelope.campaign_id,
+        evidence_id=envelope.evidence_id,
+        subject_entity_id=entity.entity_id,
+        predicate=ClaimPredicate(raw["predicate"]),
+        value=raw["value"],
+        evidence_text=raw["evidenceText"],
+        actor_role=ActorRole(raw["actorRole"]),
+        polarity=ClaimPolarity(raw["polarity"]),
+        modality=ClaimModality(raw["modality"]),
+        confidence=raw["confidence"],
+        unit=raw["unit"],
+        effective_at=raw["effectiveAt"],
+        supersedes_claim_id=supersedes,
+        actor_email=envelope.actor.email,
+        observed_at=envelope.observed_at,
+    )
+
+
+def _prior_claim_from_fixture(
     raw: Mapping[str, object],
     evidence: tuple[EvidenceEnvelope, ...],
     entities: tuple[EntityRef, ...],
@@ -574,38 +809,56 @@ def _claim_from_fixture(
         unit=raw["unit"],
         effective_at=raw["effectiveAt"],
         supersedes_claim_id=raw["supersedesClaimId"],
-        actor_email=envelope.actor.email,
-        observed_at=envelope.observed_at,
+        actor_email=raw["actorEmail"],
+        observed_at=raw["observedAt"],
     )
 
 
-def _claim_oracle(
-    case,
+def _claim_oracle(case) -> tuple[str, ...]:
+    return tuple(case.expected["acceptedClaimDigests"])
+
+
+def _actual_claim_outcome(
+    claims: tuple[Claim, ...],
     evidence: tuple[EvidenceEnvelope, ...],
     entities: tuple[EntityRef, ...],
-) -> tuple[dict[str, object], ...]:
-    return tuple(
-        sorted(
-            (
-                _plain_json(
-                    _claim_from_fixture(
-                        case.claims[index], evidence, entities
-                    ).to_dict()
-                )
-                for index in case.expected["acceptedClaimIndexes"]
-            ),
-            key=lambda item: item["claim_id"],
+    prior_claims: tuple[Claim, ...],
+) -> tuple[str, ...]:
+    evidence_indexes = {item.evidence_id: index for index, item in enumerate(evidence)}
+    entities_by_id = {item.entity_id: item for item in entities}
+    prior_indexes = {
+        item.claim_id: f"prior:{index}" for index, item in enumerate(prior_claims)
+    }
+    digests = []
+    for claim in claims:
+        entity = entities_by_id[claim.subject_entity_id]
+        supersedes = prior_indexes.get(
+            claim.supersedes_claim_id,
+            claim.supersedes_claim_id,
         )
-    )
-
-
-def _actual_claim_outcome(claims: tuple[Claim, ...]) -> tuple[dict[str, object], ...]:
-    return tuple(
-        sorted(
-            (_plain_json(item.to_dict()) for item in claims),
-            key=lambda item: item["claim_id"],
+        digests.append(
+            _digest(
+                {
+                    "evidenceIndex": evidence_indexes[claim.evidence_id],
+                    "subject": {
+                        "relationship": entity.relationship,
+                        "suite": entity.suite,
+                        "canonicalAddress": entity.canonical_address,
+                    },
+                    "predicate": claim.predicate.value,
+                    "value": _plain_json(claim.value),
+                    "evidenceText": claim.evidence_text,
+                    "actorRole": claim.actor_role.value,
+                    "polarity": claim.polarity.value,
+                    "modality": claim.modality.value,
+                    "confidence": claim.confidence,
+                    "unit": claim.unit,
+                    "effectiveAt": claim.effective_at,
+                    "supersedesClaimId": supersedes,
+                }
+            )
         )
-    )
+    return tuple(sorted(digests))
 
 
 def _issue_outcome(
@@ -845,11 +1098,16 @@ def run_claim_replay(
                 seeds=source.seeds,
                 evidence=normalized.evidence,
             )
+            prior_claims = tuple(
+                _prior_claim_from_fixture(raw, normalized.evidence, resolved.entities)
+                for raw in case.prior_claims
+            )
             request = build_claim_extraction_request(
                 tenant_id=source.message.tenant_id,
                 campaign_id=source.campaign_id,
                 evidence=normalized.evidence,
                 entities=resolved.entities,
+                prior_claims=prior_claims,
                 resolution_issues=resolved.issues,
             )
             try:
@@ -887,6 +1145,7 @@ def run_claim_replay(
                 campaign_id=source.campaign_id,
                 evidence=normalized.evidence,
                 entities=resolved.entities,
+                prior_claims=request.prior_claims,
                 resolution_issues=resolved.issues,
                 model_output=response.model_output,
             )
@@ -896,8 +1155,13 @@ def run_claim_replay(
             outcome_digests[case.case_id].add(outcome_digest)
             issue_codes = tuple(sorted(item.code for item in extracted.issues))
             passed = (
-                _claim_oracle(case, normalized.evidence, resolved.entities)
-                == _actual_claim_outcome(extracted.claims)
+                _claim_oracle(case)
+                == _actual_claim_outcome(
+                    extracted.claims,
+                    normalized.evidence,
+                    resolved.entities,
+                    request.prior_claims,
+                )
                 and _expected_issue_outcome(case)
                 == _issue_outcome(
                     extracted.issues, normalized.evidence, resolved.entities

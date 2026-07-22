@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -22,6 +23,7 @@ from .evidence import ExternalEvidenceInput, RawMessageEvidence
 
 
 INTERPRETATION_FIXTURE_SCHEMA_VERSION = 3
+_REPORT_SAFE_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _ROOT_KEYS = frozenset({"schemaVersion", "catalogId", "cases"})
 _CASE_KEYS = frozenset({"caseId", "campaignId", "message", "seeds", "expected"})
 _MESSAGE_KEYS = frozenset(
@@ -97,6 +99,15 @@ def _text(value: Any, label: str, *, allow_empty: bool = False) -> str:
     if not allow_empty and not value.strip():
         raise InterpretationFixtureValidationError(f"{label} must be non-empty")
     return value
+
+
+def _report_safe_id(value: Any, label: str) -> str:
+    cleaned = _text(value, label)
+    if not _REPORT_SAFE_ID.fullmatch(cleaned):
+        raise InterpretationFixtureValidationError(
+            f"{label} must be a report-safe identifier"
+        )
+    return cleaned
 
 
 def _enum(value: Any, enum_type: type, label: str):
@@ -360,7 +371,7 @@ def load_interpretation_fixture_catalog(
         raise InterpretationFixtureValidationError(
             "unsupported interpretation fixture schemaVersion"
         )
-    catalog_id = _text(raw["catalogId"], "catalogId")
+    catalog_id = _report_safe_id(raw["catalogId"], "catalogId")
     if not isinstance(raw["cases"], list) or not raw["cases"]:
         raise InterpretationFixtureValidationError("cases must be a non-empty list")
 
@@ -369,7 +380,7 @@ def load_interpretation_fixture_catalog(
     for index, item in enumerate(raw["cases"]):
         label = f"case {index}"
         _exact_keys(item, _CASE_KEYS, label)
-        case_id = _text(item["caseId"], f"{label} caseId")
+        case_id = _report_safe_id(item["caseId"], f"{label} caseId")
         if case_id in case_ids:
             raise InterpretationFixtureValidationError(f"duplicate caseId {case_id!r}")
         case_ids.add(case_id)

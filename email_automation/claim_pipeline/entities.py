@@ -22,6 +22,14 @@ _ADDRESS_RE = re.compile(
     r"NE|NW|SE|SW|N|S|E|W))?\b",
     re.IGNORECASE,
 )
+_DRIVE_IN_ADDRESS_RE = re.compile(
+    r"\b\d{1,6}\s+"
+    r"(?:[A-Za-z0-9][A-Za-z0-9.'-]*\s+){0,6}"
+    r"Drive-In\s+"
+    r"(?:Street|Avenue|Boulevard|Parkway|Highway|Road|Drive|Lane|Court|Way|"
+    r"St|Ave|Blvd|Pkwy|Hwy|Rd|Dr|Ln|Ct)\b",
+    re.IGNORECASE,
+)
 _SUITE_RE = re.compile(
     r"\b(?:Suite|Ste|Unit|Space)\b\s*#?\s*([A-Za-z0-9][A-Za-z0-9-]*)\b",
     re.IGNORECASE,
@@ -145,13 +153,26 @@ def extract_addresses(value: str) -> tuple[str, ...]:
         raise TypeError("evidence content must be a string")
     seen: set[str] = set()
     addresses: list[str] = []
-    for match in _ADDRESS_RE.finditer(value):
+    matches = sorted(
+        (*_DRIVE_IN_ADDRESS_RE.finditer(value), *_ADDRESS_RE.finditer(value)),
+        key=lambda item: (item.start(), -(item.end() - item.start())),
+    )
+    accepted_spans: list[tuple[int, int]] = []
+    for match in matches:
+        if any(
+            start <= match.start() and match.end() <= end
+            for start, end in accepted_spans
+        ):
+            continue
+        if re.match(r"-ins?\b", value[match.end() :], re.IGNORECASE):
+            continue
         canonical = canonicalize_address(match.group(0))
         if _NON_ADDRESS_WORDS.intersection(canonical.split()[1:]):
             continue
         if canonical and canonical not in seen:
             seen.add(canonical)
             addresses.append(canonical)
+            accepted_spans.append((match.start(), match.end()))
     return tuple(addresses)
 
 

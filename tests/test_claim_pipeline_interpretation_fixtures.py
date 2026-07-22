@@ -34,6 +34,19 @@ class InterpretationFixtureTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             first.cases[0].expected["issueCodes"] = ()
 
+    def test_report_visible_fixture_identifiers_reject_private_text(self):
+        raw = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        raw["cases"][0]["caseId"] = "private-broker@example.com"
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private-identifier.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(
+                InterpretationFixtureValidationError,
+                "caseId must be a report-safe identifier",
+            ):
+                load_interpretation_fixture_catalog(path)
+
     def test_every_case_executes_through_real_normalization_and_resolution(self):
         catalog = load_interpretation_fixture_catalog(FIXTURE_PATH)
 

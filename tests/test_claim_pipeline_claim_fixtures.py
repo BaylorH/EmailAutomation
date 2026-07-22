@@ -8,6 +8,14 @@ from email_automation.claim_pipeline.claim_fixtures import (
     CLAIM_FIXTURE_SCHEMA_VERSION,
     ClaimFixtureValidationError,
     load_claim_fixture_catalog,
+    validate_claim_fixture_coverage,
+)
+from email_automation.claim_pipeline.contracts import (
+    ActorRole,
+    Claim,
+    ClaimModality,
+    ClaimPolarity,
+    ClaimPredicate,
 )
 from email_automation.claim_pipeline.entities import resolve_entities
 from email_automation.claim_pipeline.evidence import normalize_message_evidence
@@ -40,6 +48,143 @@ class ClaimFixtureTests(unittest.TestCase):
         self.assertEqual(first.manifest_hash, second.manifest_hash)
         self.assertIsInstance(first.cases[0].expected, MappingProxyType)
 
+    def test_catalog_mechanically_requires_every_predicate_and_incident_dimension(self):
+        catalog = load_claim_fixture_catalog(CLAIM_FIXTURE_PATH)
+
+        self.assertEqual(3, CLAIM_FIXTURE_SCHEMA_VERSION)
+        self.assertEqual(
+            {item.value for item in ClaimPredicate},
+            set(catalog.required_predicate_outcomes),
+        )
+        self.assertTrue(
+            all(
+                {"accepted", "rejected"}.issubset(outcomes)
+                for outcomes in catalog.required_predicate_outcomes.values()
+            )
+        )
+        self.assertEqual(
+            {
+                "alternate_property",
+                "attachment",
+                "call_request",
+                "continued_followup_hazard",
+                "correction",
+                "link",
+                "multi_turn",
+                "opt_out",
+                "redirect",
+                "repeated_question",
+                "requirements_mismatch",
+                "split_suite",
+                "terminal_closeout",
+                "tour_request",
+            },
+            set(catalog.required_incident_dimensions),
+        )
+        validate_claim_fixture_coverage(catalog)
+
+    def test_coverage_declarations_must_be_proven_by_case_outcomes(self):
+        raw = json.loads(CLAIM_FIXTURE_PATH.read_text(encoding="utf-8"))
+        raw["cases"][0]["coverage"]["predicateOutcomes"] = [
+            {"predicate": "rent", "outcome": "accepted"}
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dishonest-coverage.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ClaimFixtureValidationError,
+                "does not prove accepted rent",
+            ):
+                load_claim_fixture_catalog(path)
+
+    def test_report_visible_fixture_identifiers_reject_private_text(self):
+        raw = json.loads(CLAIM_FIXTURE_PATH.read_text(encoding="utf-8"))
+        raw["cases"][0]["caseId"] = "private-broker@example.com"
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private-identifier.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ClaimFixtureValidationError,
+                "caseId must be a report-safe identifier",
+            ):
+                load_claim_fixture_catalog(path)
+
+    def test_missing_required_coverage_fails_closed(self):
+        raw = json.loads(CLAIM_FIXTURE_PATH.read_text(encoding="utf-8"))
+        raw["cases"] = [
+            case
+            for case in raw["cases"]
+            if not any(
+                item == {"predicate": "power", "outcome": "accepted"}
+                for item in case["coverage"]["predicateOutcomes"]
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing-coverage.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ClaimFixtureValidationError,
+                "missing required predicate coverage:.*power:accepted",
+            ):
+                load_claim_fixture_catalog(path)
+
+    def test_coverage_contract_cannot_shrink_supported_predicates_or_incidents(self):
+        raw = json.loads(CLAIM_FIXTURE_PATH.read_text(encoding="utf-8"))
+        mutations = (
+            (
+                lambda value: value["coverageContract"][
+                    "requiredPredicateOutcomes"
+                ].pop("power"),
+                "must name every supported predicate",
+            ),
+            (
+                lambda value: value["coverageContract"][
+                    "requiredIncidentDimensions"
+                ].remove("attachment"),
+                "must name every required incident dimension",
+            ),
+        )
+
+        for mutate, message in mutations:
+            with self.subTest(message=message):
+                candidate = json.loads(json.dumps(raw))
+                mutate(candidate)
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "shrunk-coverage.json"
+                    path.write_text(json.dumps(candidate), encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        ClaimFixtureValidationError,
+                        message,
+                    ):
+                        load_claim_fixture_catalog(path)
+
+    def test_multi_turn_cases_require_prior_claims_and_symbolic_supersession(self):
+        catalog = load_claim_fixture_catalog(CLAIM_FIXTURE_PATH)
+        multi_turn = [
+            case
+            for case in catalog.cases
+            if "multi_turn" in case.incident_dimensions
+        ]
+
+        self.assertTrue(multi_turn)
+        self.assertTrue(all(case.prior_claims for case in multi_turn))
+        correction_cases = [
+            case
+            for case in multi_turn
+            if "correction" in case.incident_dimensions
+        ]
+        self.assertTrue(correction_cases)
+        self.assertTrue(
+            any(
+                claim["supersedesClaimId"] == "prior:0"
+                for case in correction_cases
+                for claim in case.claims
+            )
+        )
+
     def test_every_case_executes_normalization_resolution_and_claim_extraction(self):
         claim_catalog = load_claim_fixture_catalog(CLAIM_FIXTURE_PATH)
         interpretation_catalog = load_interpretation_fixture_catalog(
@@ -60,6 +205,36 @@ class ClaimFixtureTests(unittest.TestCase):
                     evidence=normalized.evidence,
                 )
                 entity_by_key = {_subject_key(item): item for item in resolved.entities}
+                prior_claims = []
+                for raw in case.prior_claims:
+                    envelope = normalized.evidence[raw["evidenceIndex"]]
+                    subject = entity_by_key[
+                        (
+                            raw["subject"]["relationship"],
+                            raw["subject"]["suite"],
+                            raw["subject"]["canonicalAddress"],
+                        )
+                    ]
+                    prior_claims.append(
+                        Claim.create(
+                            tenant_id=envelope.tenant_id,
+                            campaign_id=envelope.campaign_id,
+                            evidence_id=envelope.evidence_id,
+                            subject_entity_id=subject.entity_id,
+                            predicate=ClaimPredicate(raw["predicate"]),
+                            value=raw["value"],
+                            evidence_text=raw["evidenceText"],
+                            actor_role=ActorRole(raw["actorRole"]),
+                            polarity=ClaimPolarity(raw["polarity"]),
+                            modality=ClaimModality(raw["modality"]),
+                            confidence=raw["confidence"],
+                            unit=raw["unit"],
+                            effective_at=raw["effectiveAt"],
+                            supersedes_claim_id=raw["supersedesClaimId"],
+                            actor_email=raw["actorEmail"],
+                            observed_at=raw["observedAt"],
+                        )
+                    )
                 model_claims = []
                 for raw in case.claims:
                     subject = entity_by_key[
@@ -69,12 +244,18 @@ class ClaimFixtureTests(unittest.TestCase):
                             raw["subject"]["canonicalAddress"],
                         )
                     ]
-                    model_claims.append(
-                        {
+                    claim = {
                             key: value
                             for key, value in raw.items()
                             if key not in {"evidenceIndex", "subject"}
                         }
+                    supersedes = claim["supersedesClaimId"]
+                    if isinstance(supersedes, str) and supersedes.startswith("prior:"):
+                        claim["supersedesClaimId"] = prior_claims[
+                            int(supersedes.removeprefix("prior:"))
+                        ].claim_id
+                    model_claims.append(
+                        claim
                         | {
                             "evidenceId": normalized.evidence[
                                 raw["evidenceIndex"]
@@ -94,6 +275,7 @@ class ClaimFixtureTests(unittest.TestCase):
                     campaign_id=source.campaign_id,
                     evidence=normalized.evidence,
                     entities=resolved.entities,
+                    prior_claims=prior_claims,
                     resolution_issues=resolved.issues,
                     model_output={"claims": model_claims, "review": model_review},
                 )

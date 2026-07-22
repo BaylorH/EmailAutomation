@@ -273,6 +273,28 @@ class EntityResolutionTests(unittest.TestCase):
             {issue.code for issue in result.issues},
         )
 
+    def test_drive_in_count_does_not_fabricate_a_street_address(self):
+        result = resolved("123 Industrial Ave has 2 drive-ins and 4 docks.")
+
+        self.assertEqual(
+            [],
+            [item for item in result.entities if item.relationship == "alternate"],
+        )
+
+    def test_hyphenated_drive_in_street_name_remains_a_valid_address(self):
+        result = resolved(
+            "The alternate is 12 Drive-In Lane and it remains available."
+        )
+
+        self.assertEqual(
+            ["12 drive-in lane"],
+            [
+                item.canonical_address
+                for item in result.entities
+                if item.relationship == "alternate"
+            ],
+        )
+
     def test_non_property_target_seed_is_rejected(self):
         with self.assertRaises(ValueError):
             EntitySeed(

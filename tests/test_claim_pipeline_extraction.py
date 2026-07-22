@@ -422,6 +422,32 @@ class ClaimExtractionBoundaryTests(unittest.TestCase):
 
 
 class ClaimEvidenceAndSubjectTests(unittest.TestCase):
+    def test_property_fact_cannot_use_a_contact_as_its_subject(self):
+        evidence = _evidence("Alex Broker says the property is available.")
+        contact = _entity(
+            entity_type=EntityType.CONTACT,
+            label="Alex Broker",
+            relationship="contact",
+            canonical_address="alex@example.com",
+            evidence_ids=(evidence.evidence_id,),
+        )
+
+        result = _extract(
+            (evidence,),
+            (contact,),
+            _proposal(
+                evidence,
+                contact,
+                evidenceText="the property is available",
+            ),
+        )
+
+        self.assertEqual((), result.claims)
+        self.assertEqual(
+            ("subject_evidence_mismatch",),
+            tuple(issue.code for issue in result.issues),
+        )
+
     def test_exact_excerpt_actor_and_known_ids_are_required(self):
         evidence = _evidence()
         entity = _entity()
@@ -1228,6 +1254,100 @@ class PredicateValidationTests(unittest.TestCase):
 
 
 class CorrectionAndConflictTests(unittest.TestCase):
+    def test_prior_claims_are_ordered_by_chronology_then_identity(self):
+        evidence = _evidence(observed_at="2026-07-22T14:00:00Z")
+        entity = _entity()
+
+        def prior(message_id, observed_at, value):
+            source = _evidence(
+                f"The rent is ${value}/SF/yr.",
+                message_id=message_id,
+                observed_at=observed_at,
+            )
+            return Claim.create(
+                tenant_id=TENANT_ID,
+                campaign_id=CAMPAIGN_ID,
+                evidence_id=source.evidence_id,
+                subject_entity_id=entity.entity_id,
+                predicate=ClaimPredicate.RENT,
+                value=value,
+                evidence_text=f"The rent is ${value}/SF/yr",
+                actor_role=ActorRole.BROKER,
+                actor_email=source.actor.email,
+                observed_at=observed_at,
+                polarity=ClaimPolarity.POSITIVE,
+                modality=ClaimModality.ASSERTED,
+                confidence=0.99,
+                unit="usd_per_sf_year",
+            )
+
+        newer = prior("m13", "2026-07-22T13:00:00Z", 13)
+        older = prior("m11", "2026-07-22T11:00:00Z", 11)
+        self.assertEqual((newer.claim_id, older.claim_id), tuple(
+            item.claim_id for item in sorted((newer, older), key=lambda item: item.claim_id)
+        ))
+        request = build_claim_extraction_request(
+            tenant_id=TENANT_ID,
+            campaign_id=CAMPAIGN_ID,
+            evidence=(evidence,),
+            entities=(entity,),
+            prior_claims=(newer, older),
+        )
+
+        self.assertEqual((older.claim_id, newer.claim_id), tuple(
+            item.claim_id for item in request.prior_claims
+        ))
+
+    def test_numeric_correction_must_name_the_value_it_supersedes(self):
+        correction_evidence = _evidence(
+            "Correction for 123 Industrial Ave: rent is $15.50/SF/yr, "
+            "not $14.00/SF/yr.",
+            observed_at="2026-07-22T13:00:00Z",
+        )
+        entity = _entity()
+        for old_value in (13.0, 123.0):
+            with self.subTest(old_value=old_value):
+                old_evidence = _evidence(
+                    f"The rent is ${old_value:.2f}/SF/yr.",
+                    message_id=f"message-old-{old_value}",
+                    observed_at="2026-07-22T11:00:00Z",
+                )
+                prior = Claim.create(
+                    tenant_id=TENANT_ID,
+                    campaign_id=CAMPAIGN_ID,
+                    evidence_id=old_evidence.evidence_id,
+                    subject_entity_id=entity.entity_id,
+                    predicate=ClaimPredicate.RENT,
+                    value=old_value,
+                    evidence_text=f"The rent is ${old_value:.2f}/SF/yr",
+                    actor_role=ActorRole.BROKER,
+                    actor_email=old_evidence.actor.email,
+                    observed_at=old_evidence.observed_at,
+                    polarity=ClaimPolarity.POSITIVE,
+                    modality=ClaimModality.ASSERTED,
+                    confidence=0.99,
+                    unit="usd_per_sf_year",
+                )
+                result = _extract(
+                    (correction_evidence,),
+                    (entity,),
+                    _proposal(
+                        correction_evidence,
+                        entity,
+                        predicate="rent",
+                        value=15.5,
+                        evidenceText=correction_evidence.content,
+                        modality="corrected",
+                        unit="usd_per_sf_year",
+                        supersedesClaimId=prior.claim_id,
+                    ),
+                    prior_claims=(prior,),
+                )
+
+                self.assertEqual(("invalid_correction",), tuple(
+                    issue.code for issue in result.issues
+                ))
+
     def test_correction_history_is_campaign_actor_and_chronology_bound(self):
         old_evidence = _evidence(
             "It is unavailable.",

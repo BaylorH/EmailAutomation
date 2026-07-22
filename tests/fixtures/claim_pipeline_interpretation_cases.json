@@ -475,6 +475,163 @@
         ],
         "issues": []
       }
+    },
+    {
+      "caseId": "complete-property-facts",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-15",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T13:10:00Z",
+        "subject": "RE: 123 Industrial Ave",
+        "body": "123 Industrial Ave is available for lease and the asking status is negotiable. The asking rent is $15.00/SF/yr and operating expenses are $3.25/SF/yr. The available space totals 20,000 SF including 2,500 SF office. Power is 400 amps, clear height is 28 feet, with 2 drive-ins and 4 docks. Occupancy is 2026-09-01 with a 5 year term.",
+        "signature": "",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Ave", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "123 Industrial Ave is available for lease and the asking status is negotiable. The asking rent is $15.00/SF/yr and operating expenses are $3.25/SF/yr. The available space totals 20,000 SF including 2,500 SF office. Power is 400 amps, clear height is 28 feet, with 2 drive-ins and 4 docks. Occupancy is 2026-09-01 with a 5 year term.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0, 1]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "workflow-intents-and-referral",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-16",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T13:15:00Z",
+        "subject": "RE: 123 Industrial Ave",
+        "body": "For 123 Industrial Ave, please stop emailing me and contact Jordan Lee at jordan@example.com instead. Could we schedule a call and a tour? Please send the brochure. The roof leak will be repaired. I will respond on 2026-07-30.",
+        "signature": "",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Ave", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "For 123 Industrial Ave, please stop emailing me and contact Jordan Lee at jordan@example.com instead. Could we schedule a call and a tour? Please send the brochure. The roof leak will be repaired. I will respond on 2026-07-30.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0, 1]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "broker-corrects-prior-rent",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-17",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T13:20:00Z",
+        "subject": "RE: 123 Industrial Ave",
+        "body": "Correction for 123 Industrial Ave: the corrected asking rent is $15.50/SF/yr, not $14.00/SF/yr.\n\nOn 2026-07-21T09:30:00Z Alex Broker <alex@example.com> wrote:\n> The asking rent is $14.00/SF/yr.",
+        "signature": "",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1, "quoted_body": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Ave", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "Correction for 123 Industrial Ave: the corrected asking rent is $15.50/SF/yr, not $14.00/SF/yr.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "quoted_body", "freshness": "quoted", "location": "body:lines-3-4", "content": "On 2026-07-21T09:30:00Z Alex Broker <alex@example.com> wrote:\n> The asking rent is $14.00/SF/yr.", "parentIndex": 1, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0, 1]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1, 2]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "repeated-brochure-request",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-18",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T13:25:00Z",
+        "subject": "RE: 123 Industrial Ave",
+        "body": "Please send the brochure for 123 Industrial Ave.\n\nOn 2026-07-21T09:30:00Z Alex Broker <alex@example.com> wrote:\n> Please send the brochure for 123 Industrial Ave.",
+        "signature": "",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1, "quoted_body": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Ave", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "Please send the brochure for 123 Industrial Ave.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "quoted_body", "freshness": "quoted", "location": "body:lines-3-4", "content": "On 2026-07-21T09:30:00Z Alex Broker <alex@example.com> wrote:\n> Please send the brochure for 123 Industrial Ave.", "parentIndex": 1, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0, 1, 2]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1, 2]}
+        ],
+        "issues": []
+      }
+    },
+    {
+      "caseId": "target-unavailable-stop-followups",
+      "campaignId": "campaign-1",
+      "message": {
+        "tenantId": "uid-1",
+        "messageId": "message-19",
+        "direction": "inbound",
+        "actor": {"name": "Alex Broker", "email": "alex@example.com", "role": "broker"},
+        "observedAt": "2026-07-22T13:30:00Z",
+        "subject": "RE: 123 Industrial Ave",
+        "body": "123 Industrial Ave is no longer available. Please stop contacting me about it.",
+        "signature": "",
+        "external": []
+      },
+      "seeds": [
+        {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 Industrial Avenue", "suite": "", "relationship": "target", "aliases": ["123 Industrial Ave"]}
+      ],
+      "expected": {
+        "sourceCounts": {"subject": 1, "fresh_body": 1},
+        "evidenceSequence": [
+          {"sourceKind": "subject", "freshness": "fresh", "location": "subject", "content": "RE: 123 Industrial Ave", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"},
+          {"sourceKind": "fresh_body", "freshness": "fresh", "location": "body:lines-1-1", "content": "123 Industrial Ave is no longer available. Please stop contacting me about it.", "parentIndex": null, "actorEmail": "alex@example.com", "actorRole": "broker"}
+        ],
+        "failures": [],
+        "entities": [
+          {"entityType": "target_property", "label": "123 Industrial Ave", "canonicalAddress": "123 industrial avenue", "suite": "", "relationship": "target", "evidenceIndexes": [0, 1]},
+          {"entityType": "contact", "label": "alex@example.com", "canonicalAddress": "alex@example.com", "suite": "", "relationship": "contact", "evidenceIndexes": [0, 1]}
+        ],
+        "issues": []
+      }
     }
   ]
 }

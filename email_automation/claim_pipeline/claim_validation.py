@@ -243,6 +243,15 @@ def _validate_subject_binding(
     entity: EntityRef,
     entities: tuple[EntityRef, ...],
 ) -> None:
+    if claim.predicate in _FACT_PREDICATES and entity.entity_type not in {
+        EntityType.TARGET_PROPERTY,
+        EntityType.PROPERTY,
+        EntityType.SUITE,
+    }:
+        _fail(
+            "subject_evidence_mismatch",
+            "Property fact must be bound to a property or suite subject.",
+        )
     bound = tuple(
         item
         for item in entities
@@ -297,6 +306,7 @@ def _validate_subject_binding(
 def _validate_correction(
     claim: Claim,
     prior_claims: Mapping[str, Claim],
+    evidence_content: str,
 ) -> None:
     is_correction = (
         claim.modality is ClaimModality.CORRECTED
@@ -327,6 +337,33 @@ def _validate_correction(
         _fail("invalid_correction", "Correction does not follow the superseded claim.")
     if claim.predicate is not ClaimPredicate.CORRECTION and prior.predicate is not claim.predicate:
         _fail("invalid_correction", "Correction changes predicate identity.")
+    if _is_number(prior.value):
+        names_old_value = False
+        for match in _NUMBER.finditer(evidence_content):
+            value = float(match.group(0).replace(",", ""))
+            if not math.isclose(
+                float(prior.value), value, rel_tol=1e-9, abs_tol=1e-9
+            ):
+                continue
+            before = evidence_content[max(0, match.start() - 32) : match.start()]
+            after = evidence_content[match.end() : match.end() + 24]
+            if re.search(
+                r"(?:\bnot|\bfrom|\binstead\s+of|\brather\s+than|"
+                r"\bprevious(?:ly)?|\bwas)\s*[$:]?\s*$",
+                before,
+                re.IGNORECASE,
+            ) or re.search(
+                r"^\s*(?:was|is)?\s*(?:wrong|incorrect|outdated)\b",
+                after,
+                re.IGNORECASE,
+            ):
+                names_old_value = True
+                break
+        if not names_old_value:
+            _fail(
+                "invalid_correction",
+                "Numeric correction does not identify the value it supersedes.",
+            )
 
 
 def _validate_predicate(claim: Claim) -> None:
@@ -604,6 +641,37 @@ def _validate_predicate(claim: Claim) -> None:
     _fail("invalid_predicate_value", "Predicate has no deterministic validator.")
 
 
+def validate_claim_semantics(claim: Claim) -> None:
+    """Validate a claim's predicate/value/excerpt contract without message context."""
+
+    if not isinstance(claim, Claim):
+        raise TypeError("claim must be a Claim")
+    _validate_predicate(claim)
+
+
+def validate_claim_subject_binding(
+    claim: Claim,
+    entity: EntityRef,
+    entities: Iterable[EntityRef],
+) -> None:
+    """Validate only a claim's subject/evidence binding contract."""
+
+    if not isinstance(claim, Claim) or not isinstance(entity, EntityRef):
+        raise TypeError("claim and entity must use claim-pipeline contracts")
+    entity_tuple = tuple(entities)
+    if not all(isinstance(item, EntityRef) for item in entity_tuple):
+        raise TypeError("entities must contain EntityRef values")
+    _validate_subject_binding(claim, entity, entity_tuple)
+
+
+def is_fit_only_availability_evidence(value: str) -> bool:
+    """Return whether text describes fit requirements without unavailability."""
+
+    if not isinstance(value, str):
+        raise TypeError("value must be text")
+    return bool(_FIT_ONLY_WORDS.search(value) and not _UNAVAILABLE_WORDS.search(value))
+
+
 def validate_extracted_claim(
     claim: Claim,
     *,
@@ -652,10 +720,13 @@ def validate_extracted_claim(
         _fail("invalid_predicate_value", "Claim effective date is invalid.")
     _validate_subject_binding(claim, entity, entity_tuple)
     _validate_predicate(claim)
-    _validate_correction(claim, prior_claims)
+    _validate_correction(claim, prior_claims, evidence.content)
 
 
 __all__ = [
     "CandidateValidationError",
+    "is_fit_only_availability_evidence",
+    "validate_claim_semantics",
+    "validate_claim_subject_binding",
     "validate_extracted_claim",
 ]

@@ -86,7 +86,9 @@ class ReplayContractTests(unittest.TestCase):
 
     def test_identity_rejects_invalid_hashes_repeats_and_unbounded_calls(self):
         invalid_values = (
+            {"code_revision": "private-broker@example.com"},
             {"dependency_lock_hash": "not-a-hash"},
+            {"provider_id": "private-broker@example.com"},
             {"repeats": 0},
             {"repeats": 11},
             {"case_count": 0},
@@ -174,6 +176,8 @@ class _AdapterWrapper:
         self._confidence_case = confidence_case
         self._wrong_review_evidence_case = wrong_review_evidence_case
         self._case_calls = {}
+        self.requests_by_case = {}
+        self.responses_by_case = {}
         self.calls = 0
         self.provider_id = recorded.provider_id
         if provider_id:
@@ -185,6 +189,7 @@ class _AdapterWrapper:
     def propose(self, *, case_id, request, evidence, entities):
         self.calls += 1
         self._case_calls[case_id] = self._case_calls.get(case_id, 0) + 1
+        self.requests_by_case[case_id] = request
         if case_id == self._fail_case:
             raise RuntimeError("private-broker@example.com must not reach the report")
         if case_id == self._invalid_response_case:
@@ -214,10 +219,12 @@ class _AdapterWrapper:
                 item.evidence_id for item in evidence if item.evidence_id != current
             )
             output["review"][0]["evidenceId"] = replacement
-        return ProposalResponse(
+        result = ProposalResponse(
             model_output=output,
             usage=self._usage or response.usage,
         )
+        self.responses_by_case[case_id] = result
+        return result
 
 
 class ReplayExecutionTests(unittest.TestCase):
@@ -422,6 +429,42 @@ class ReplayExecutionTests(unittest.TestCase):
         failed = next(item for item in report.results if item.case_id == case_id)
         self.assertFalse(failed.passed)
 
+    def test_fixture_claim_mutation_cannot_change_independent_expected_oracle(self):
+        original = next(
+            case
+            for case in self.claim_catalog.cases
+            if case.case_id == "complete-property-facts-accepted"
+        )
+        asking_index = next(
+            index
+            for index, claim in enumerate(original.claims)
+            if claim["predicate"] == "asking_status"
+        )
+        claims = list(original.claims)
+        changed = dict(claims[asking_index])
+        changed["value"] = "asking"
+        claims[asking_index] = changed
+        dishonest = replace(original, claims=tuple(claims))
+        catalog = replace(
+            self.claim_catalog,
+            cases=tuple(
+                dishonest if case.case_id == original.case_id else case
+                for case in self.claim_catalog.cases
+            ),
+        )
+        adapter = _AdapterWrapper(RecordedProposalAdapter(catalog))
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=catalog,
+            adapter=adapter,
+            identity=self._identity(adapter, repeats=1),
+        )
+
+        failed = next(item for item in report.results if item.case_id == original.case_id)
+        self.assertFalse(failed.passed)
+        self.assertFalse(report.passed)
+
     def test_same_issue_code_on_wrong_evidence_fails_complete_issue_oracle(self):
         case_id = "explicit-model-review-output"
         adapter = self._adapter(wrong_review_evidence_case=case_id)
@@ -462,6 +505,284 @@ class ReplayExecutionTests(unittest.TestCase):
                 claim_catalog=self.claim_catalog,
                 adapter=adapter,
                 identity=identity,
+            )
+        self.assertEqual(0, adapter.calls)
+
+    def test_incident_dimension_labels_must_match_the_replayed_message_shape(self):
+        original = self.claim_catalog.cases[0]
+        dishonest = replace(
+            original,
+            incident_dimensions=tuple(
+                sorted(set(original.incident_dimensions) | {"attachment"})
+            ),
+        )
+        catalog = replace(
+            self.claim_catalog,
+            cases=(dishonest,) + self.claim_catalog.cases[1:],
+        )
+        adapter = _AdapterWrapper(RecordedProposalAdapter(catalog))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "attachment coverage requires attachment evidence",
+        ):
+            run_claim_replay(
+                interpretation_catalog=self.interpretation_catalog,
+                claim_catalog=catalog,
+                adapter=adapter,
+                identity=self._identity(adapter, repeats=1),
+            )
+        self.assertEqual(0, adapter.calls)
+
+    def test_external_incident_dimension_must_bind_to_replayed_evidence(self):
+        original = next(
+            case
+            for case in self.claim_catalog.cases
+            if case.case_id == "alternate-attachment-cannot-identify-target"
+        )
+        body_bound_claim = dict(original.claims[0])
+        body_bound_claim["evidenceIndex"] = 1
+        dishonest = replace(original, claims=(body_bound_claim,))
+        catalog = replace(
+            self.claim_catalog,
+            cases=tuple(
+                dishonest if case.case_id == original.case_id else case
+                for case in self.claim_catalog.cases
+            ),
+        )
+        adapter = _AdapterWrapper(RecordedProposalAdapter(catalog))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "attachment coverage requires a claim or review bound to attachment evidence",
+        ):
+            run_claim_replay(
+                interpretation_catalog=self.interpretation_catalog,
+                claim_catalog=catalog,
+                adapter=adapter,
+                identity=self._identity(adapter, repeats=1),
+            )
+        self.assertEqual(0, adapter.calls)
+
+    def test_terminal_closeout_dimension_requires_target_unavailability(self):
+        original = next(
+            case
+            for case in self.claim_catalog.cases
+            if case.case_id == "target-terminal-signals-accepted"
+        )
+        non_target_availability = dict(original.claims[0])
+        non_target_subject = dict(non_target_availability["subject"])
+        non_target_subject["relationship"] = "alternate"
+        non_target_availability["subject"] = non_target_subject
+        dishonest = replace(
+            original,
+            claims=(non_target_availability,) + original.claims[1:],
+        )
+        catalog = replace(
+            self.claim_catalog,
+            cases=tuple(
+                dishonest if case.case_id == original.case_id else case
+                for case in self.claim_catalog.cases
+            ),
+        )
+        adapter = _AdapterWrapper(RecordedProposalAdapter(catalog))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "terminal_closeout coverage requires target unavailability",
+        ):
+            run_claim_replay(
+                interpretation_catalog=self.interpretation_catalog,
+                claim_catalog=catalog,
+                adapter=adapter,
+                identity=self._identity(adapter, repeats=1),
+            )
+        self.assertEqual(0, adapter.calls)
+
+    def test_structured_prior_claim_values_replay_without_hashing_claim_objects(self):
+        original = next(
+            case
+            for case in self.claim_catalog.cases
+            if case.case_id == "repeated-information-request-accepted"
+        )
+        structured_prior = dict(original.prior_claims[0])
+        structured_prior.update(
+            {
+                "predicate": "identity",
+                "value": {"address": "123 Industrial Ave"},
+                "evidenceText": "123 Industrial Ave",
+            }
+        )
+        updated = replace(
+            original,
+            prior_claims=(original.prior_claims[0], structured_prior),
+        )
+        catalog = replace(
+            self.claim_catalog,
+            cases=tuple(
+                updated if case.case_id == original.case_id else case
+                for case in self.claim_catalog.cases
+            ),
+        )
+        adapter = _AdapterWrapper(RecordedProposalAdapter(catalog))
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=catalog,
+            adapter=adapter,
+            identity=self._identity(adapter, repeats=1),
+        )
+
+        self.assertTrue(report.passed)
+
+    def test_prior_history_must_be_evidence_bound_semantic_and_chronological(self):
+        original = next(
+            case
+            for case in self.claim_catalog.cases
+            if case.case_id == "broker-correction-accepted"
+        )
+        mutations = (
+            ({"evidenceText": "unrelated prior assertion"}, "excerpt is absent"),
+            ({"value": 13.0}, "predicate does not match its evidence"),
+            ({"observedAt": "tomorrow"}, "chronology is invalid"),
+            ({"observedAt": "2026-07-23T09:30:00Z"}, "must precede"),
+            (
+                {"observedAt": "2026-07-20T01:02:03Z"},
+                "chronology is not evidence-bound",
+            ),
+            (
+                {
+                    "subject": {
+                        "relationship": "contact",
+                        "suite": "",
+                        "canonicalAddress": "alex@example.com",
+                    }
+                },
+                "subject is not evidence-bound",
+            ),
+        )
+
+        for changes, message in mutations:
+            with self.subTest(changes=changes):
+                prior = dict(original.prior_claims[0])
+                prior.update(changes)
+                updated = replace(original, prior_claims=(prior,))
+                catalog = replace(
+                    self.claim_catalog,
+                    cases=tuple(
+                        updated if case.case_id == original.case_id else case
+                        for case in self.claim_catalog.cases
+                    ),
+                )
+                adapter = _AdapterWrapper(RecordedProposalAdapter(catalog))
+
+                with self.assertRaisesRegex(ValueError, message):
+                    run_claim_replay(
+                        interpretation_catalog=self.interpretation_catalog,
+                        claim_catalog=catalog,
+                        adapter=adapter,
+                        identity=self._identity(adapter, repeats=1),
+                    )
+                self.assertEqual(0, adapter.calls)
+
+    def test_symbolic_supersession_selects_exact_prior_after_request_ordering(self):
+        original = next(
+            case
+            for case in self.claim_catalog.cases
+            if case.case_id == "broker-correction-accepted"
+        )
+        alternate = dict(original.prior_claims[0])
+        alternate["evidenceText"] = "asking rent is $14.00/SF/yr"
+        claims = []
+        for raw in original.claims:
+            claim = dict(raw)
+            claim["supersedesClaimId"] = "prior:1"
+            claims.append(claim)
+        updated = replace(
+            original,
+            prior_claims=(alternate, original.prior_claims[0]),
+            claims=tuple(claims),
+        )
+        catalog = replace(
+            self.claim_catalog,
+            cases=tuple(
+                updated if case.case_id == original.case_id else case
+                for case in self.claim_catalog.cases
+            ),
+        )
+        adapter = _AdapterWrapper(RecordedProposalAdapter(catalog))
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=catalog,
+            adapter=adapter,
+            identity=self._identity(adapter, repeats=1),
+        )
+
+        request = adapter.requests_by_case[original.case_id]
+        selected_id = next(
+            item.claim_id
+            for item in request.prior_claims
+            if item.evidence_text == original.prior_claims[0]["evidenceText"]
+        )
+        self.assertTrue(
+            all(
+                claim["supersedesClaimId"] == selected_id
+                for claim in adapter.responses_by_case[original.case_id].model_output[
+                    "claims"
+                ]
+            )
+        )
+        self.assertTrue(report.passed)
+
+    def test_requirements_mismatch_dimension_requires_fit_only_evidence(self):
+        original = next(
+            case
+            for case in self.claim_catalog.cases
+            if case.case_id == "complete-property-facts-rejected-near-misses"
+        )
+        dishonest = replace(
+            original,
+            incident_dimensions=tuple(
+                sorted(set(original.incident_dimensions) | {"requirements_mismatch"})
+            ),
+        )
+        catalog = replace(
+            self.claim_catalog,
+            cases=tuple(
+                dishonest if case.case_id == original.case_id else case
+                for case in self.claim_catalog.cases
+            ),
+        )
+        adapter = _AdapterWrapper(RecordedProposalAdapter(catalog))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "requirements_mismatch coverage requires fit-only availability evidence",
+        ):
+            run_claim_replay(
+                interpretation_catalog=self.interpretation_catalog,
+                claim_catalog=catalog,
+                adapter=adapter,
+                identity=self._identity(adapter, repeats=1),
+            )
+        self.assertEqual(0, adapter.calls)
+
+    def test_in_memory_private_case_identifier_is_rejected_before_replay(self):
+        original = self.claim_catalog.cases[0]
+        private = replace(original, case_id="private-broker@example.com")
+        catalog = replace(
+            self.claim_catalog,
+            cases=(private,) + self.claim_catalog.cases[1:],
+        )
+        adapter = _AdapterWrapper(RecordedProposalAdapter(catalog))
+
+        with self.assertRaisesRegex(ValueError, "case_id must be a report-safe identifier"):
+            run_claim_replay(
+                interpretation_catalog=self.interpretation_catalog,
+                claim_catalog=catalog,
+                adapter=adapter,
+                identity=self._identity(adapter, repeats=1),
             )
         self.assertEqual(0, adapter.calls)
 
@@ -506,12 +827,12 @@ class ReplayCliTests(unittest.TestCase):
         self.assertEqual(current_sha, payload["identity"]["codeRevision"])
         self.assertRegex(payload["identity"]["sourceTreeHash"], r"^[0-9a-f]{64}$")
         self.assertIsInstance(payload["identity"]["sourceTreeDirty"], bool)
-        self.assertEqual(20, payload["identity"]["caseCount"])
-        self.assertEqual(14, payload["identity"]["interpretationCaseCount"])
-        self.assertEqual(60, payload["identity"]["plannedCalls"])
-        self.assertEqual(42, payload["identity"]["plannedInterpretations"])
-        self.assertEqual(60, payload["summary"]["resultCount"])
-        self.assertEqual(42, payload["summary"]["interpretationResultCount"])
+        self.assertEqual(28, payload["identity"]["caseCount"])
+        self.assertEqual(19, payload["identity"]["interpretationCaseCount"])
+        self.assertEqual(84, payload["identity"]["plannedCalls"])
+        self.assertEqual(57, payload["identity"]["plannedInterpretations"])
+        self.assertEqual(84, payload["summary"]["resultCount"])
+        self.assertEqual(57, payload["summary"]["interpretationResultCount"])
         self.assertEqual(0, payload["summary"]["providerBilledCalls"])
         self.assertEqual(0, payload["summary"]["totalTokens"])
         self.assertEqual(0, payload["summary"]["costMicrousd"])

@@ -7,6 +7,7 @@ import json
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
 from .claim_validation import CandidateValidationError, validate_extracted_claim
@@ -454,6 +455,23 @@ def _check_scope(
     return None
 
 
+def _prior_observed_at(claim: Claim) -> datetime | None:
+    try:
+        value = datetime.fromisoformat(claim.observed_at.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    if value.tzinfo is None:
+        return None
+    return value.astimezone(timezone.utc)
+
+
+def _prior_order_key(claim: object) -> tuple[datetime, str]:
+    if not isinstance(claim, Claim):
+        return datetime.max.replace(tzinfo=timezone.utc), ""
+    observed_at = _prior_observed_at(claim)
+    return observed_at or datetime.max.replace(tzinfo=timezone.utc), claim.claim_id
+
+
 def build_claim_extraction_request(
     *,
     tenant_id: str,
@@ -469,7 +487,7 @@ def build_claim_extraction_request(
     campaign = _text(campaign_id, "campaign_id")
     evidence_tuple = tuple(sorted(evidence, key=lambda item: item.evidence_id))
     entity_tuple = tuple(sorted(entities, key=lambda item: item.entity_id))
-    prior_tuple = tuple(sorted(prior_claims, key=lambda item: item.claim_id))
+    prior_tuple = tuple(sorted(prior_claims, key=_prior_order_key))
     resolution_tuple = tuple(
         sorted(resolution_issues, key=lambda item: item.issue_id)
     )
