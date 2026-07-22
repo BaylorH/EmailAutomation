@@ -109,7 +109,7 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
         self.assertNotIn("state a concise reason", PINNED_PROMPT)
 
     def test_prompt_defines_complete_source_and_workflow_claim_rules(self):
-        self.assertEqual("sitesift-claim-proposal-2026-07-22-v5", PINNED_PROMPT_ID)
+        self.assertEqual("sitesift-claim-proposal-2026-07-22-v6", PINNED_PROMPT_ID)
         required_rules = (
             "emit every distinct supported claim",
             "Do not emit any claim from quoted, forwarded, or historical evidence",
@@ -121,10 +121,13 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
             "do not emit a candidate; emit one insufficient_evidence review item",
             "opt_out, call_request, tour_request, and information_request use value true",
             "referral uses an object containing only explicit name, email, or phone values",
-            "remediation uses the exact supported remediation phrase",
             "return_date uses an ISO date and the same effectiveAt date",
             "emit each one as a separate claim",
             "correction claim carries the exact phrase that negates or replaces the old value",
+            "tour_request evidenceText must contain both the request cue and the tour term",
+            "remediation value and evidenceText use the same exact repair-action clause",
+            "supersedesClaimId must be the exact claimId from priorClaims",
+            "same subjectEntityId as that prior claim",
         )
         for rule in required_rules:
             with self.subTest(rule=rule):

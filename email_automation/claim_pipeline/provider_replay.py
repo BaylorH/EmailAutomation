@@ -15,7 +15,7 @@ from .replay import ProposalResponse, ProposalUsage
 
 PINNED_PROVIDER_ID = "openai"
 PINNED_MODEL_ID = "gpt-5.2-2025-12-11"
-PINNED_PROMPT_ID = "sitesift-claim-proposal-2026-07-22-v5"
+PINNED_PROMPT_ID = "sitesift-claim-proposal-2026-07-22-v6"
 PINNED_PROMPT = f"""You are the read-only claim proposal stage for a commercial real-estate broker conversation.
 
 Return one JSON object with exactly two arrays: claims and review. Follow outputSchema in the supplied request exactly. Use only supplied evidence, entities, prior claims, and resolution issues.
@@ -36,8 +36,8 @@ Rules:
 - When a supported numeric fact lacks a required unit, time basis, or semantic basis, do not emit a candidate; emit one insufficient_evidence review item for that evidence.
 - Follow predicateContracts exactly for value type, enumerated value, unit, polarity, modality, effectiveAt, and correction requirements.
 - For a direct explicit current broker statement use confidence 0.99. Lower confidence only when the evidence itself remains ambiguous; never manufacture precision.
-- A correction must cite the correcting excerpt and supersede the exact prior claim only when the speaker, property, predicate, old value, and chronology all match. Emit both claims: the corrected domain claim carries the new normalized value, and the correction claim carries the exact phrase that negates or replaces the old value. Both use corrected modality and the same supersedesClaimId.
-- Bind workflow claims to the property or suite they concern, not to a contact or action entity. opt_out, call_request, tour_request, and information_request use value true with requested modality. referral uses an object containing only explicit name, email, or phone values with asserted modality. remediation uses the exact supported remediation phrase with asserted modality. return_date uses an ISO date and the same effectiveAt date with asserted modality. If one excerpt expresses multiple intents, emit each one as a separate claim.
+- A correction must cite the correcting excerpt and supersede the exact prior claim only when the speaker, property, predicate, old value, and chronology all match. supersedesClaimId must be the exact claimId from priorClaims, and both new claims use the same subjectEntityId as that prior claim. Emit both claims: the corrected domain claim carries the new normalized value, and the correction claim carries the exact phrase that negates or replaces the old value. Both use corrected modality and the same supersedesClaimId.
+- Bind workflow claims to the property or suite they concern, not to a contact or action entity. opt_out, call_request, tour_request, and information_request use value true with requested modality. tour_request evidenceText must contain both the request cue and the tour term; when a clause requests a call and a tour, reuse the complete shared clause for both claims. referral uses an object containing only explicit name, email, or phone values with asserted modality. remediation value and evidenceText use the same exact repair-action clause, including the action such as repair, replace, or remediate, with asserted modality. return_date uses an ISO date and the same effectiveAt date with asserted modality. If one excerpt expresses multiple intents, emit each one as a separate claim.
 - Fresh evidence controls current claims. Do not create a review item merely because quoted, forwarded, or historical text differs from a fresh statement.
 - When evidence cannot support a safe claim, omit it. Add a review item only when current evidence itself requires human review and bind it to the relevant evidenceId.
 - review.reason must be exactly one of these category tokens: {", ".join(SUPPORTED_REVIEW_CATEGORIES)}.
