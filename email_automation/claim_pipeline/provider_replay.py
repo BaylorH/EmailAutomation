@@ -143,6 +143,59 @@ def _normalize_text_backed_values(
     return normalized
 
 
+def _normalize_correction_pair_modalities(
+    model_output: object,
+    request: ClaimExtractionRequest,
+) -> object:
+    if not isinstance(model_output, Mapping):
+        return model_output
+    claims = model_output.get("claims")
+    if not isinstance(claims, list):
+        return model_output
+    prior_by_id = {item.claim_id: item for item in request.prior_claims}
+    evidence_by_id = {item.evidence_id: item for item in request.evidence}
+    corrections = tuple(
+        item
+        for item in claims
+        if isinstance(item, Mapping)
+        and item.get("predicate") == "correction"
+        and item.get("modality") == "corrected"
+    )
+    normalized_claims = []
+    for item in claims:
+        if not isinstance(item, Mapping) or item.get("modality") != "asserted":
+            normalized_claims.append(item)
+            continue
+        supersedes = item.get("supersedesClaimId")
+        prior = prior_by_id.get(supersedes)
+        evidence = evidence_by_id.get(item.get("evidenceId"))
+        has_matching_pair = any(
+            correction.get("evidenceId") == item.get("evidenceId")
+            and correction.get("subjectEntityId") == item.get("subjectEntityId")
+            and correction.get("actorRole") == item.get("actorRole")
+            and correction.get("supersedesClaimId") == supersedes
+            for correction in corrections
+        )
+        if (
+            prior is None
+            or evidence is None
+            or evidence.freshness.value != "fresh"
+            or evidence.actor.email.casefold() != prior.actor_email.casefold()
+            or evidence.actor.role.value != item.get("actorRole")
+            or item.get("subjectEntityId") != prior.subject_entity_id
+            or item.get("predicate") != prior.predicate.value
+            or not has_matching_pair
+        ):
+            normalized_claims.append(item)
+            continue
+        normalized = dict(item)
+        normalized["modality"] = "corrected"
+        normalized_claims.append(normalized)
+    normalized = dict(model_output)
+    normalized["claims"] = normalized_claims
+    return normalized
+
+
 def _add_resolved_external_identities(
     model_output: object,
     evidence: tuple[EvidenceEnvelope, ...],
@@ -325,6 +378,7 @@ class PinnedProviderProposalAdapter:
         if not isinstance(result, ProviderTransportResult):
             raise TypeError("provider transport returned an invalid result")
         model_output = _normalize_text_backed_values(result.model_output, evidence)
+        model_output = _normalize_correction_pair_modalities(model_output, request)
         model_output = _add_resolved_external_identities(
             model_output,
             evidence,

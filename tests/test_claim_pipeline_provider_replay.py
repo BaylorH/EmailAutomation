@@ -17,7 +17,10 @@ from email_automation.claim_pipeline.provider_replay import (
     PinnedProviderProposalAdapter,
     ProviderTransportResult,
 )
-from email_automation.claim_pipeline.replay import ProposalUsage
+from email_automation.claim_pipeline.replay import (
+    ProposalUsage,
+    _prior_claim_from_fixture,
+)
 
 
 FIXTURE_ROOT = __import__("pathlib").Path(__file__).parent / "fixtures"
@@ -82,6 +85,34 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
             campaign_id=source.campaign_id,
             evidence=normalized.evidence,
             entities=resolved.entities,
+            resolution_issues=resolved.issues,
+        )
+        return request, normalized.evidence, resolved.entities
+
+    def _request_for_claim_case(self, case_id):
+        case = next(item for item in self.claims.cases if item.case_id == case_id)
+        source = next(
+            item
+            for item in self.interpretation.cases
+            if item.case_id == case.interpretation_case_id
+        )
+        normalized = normalize_message_evidence(source.message)
+        resolved = resolve_entities(
+            tenant_id=source.message.tenant_id,
+            campaign_id=source.campaign_id,
+            seeds=source.seeds,
+            evidence=normalized.evidence,
+        )
+        prior_claims = tuple(
+            _prior_claim_from_fixture(raw, normalized.evidence, resolved.entities)
+            for raw in case.prior_claims
+        )
+        request = build_claim_extraction_request(
+            tenant_id=source.message.tenant_id,
+            campaign_id=source.campaign_id,
+            evidence=normalized.evidence,
+            entities=resolved.entities,
+            prior_claims=prior_claims,
             resolution_issues=resolved.issues,
         )
         return request, normalized.evidence, resolved.entities
@@ -319,6 +350,76 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
         correction = correction_response.model_output["claims"][0]
         self.assertEqual("not $14.00/SF/yr", correction["value"])
         self.assertEqual("positive", correction["polarity"])
+
+    def test_adapter_normalizes_only_proven_correction_pair_modality(self):
+        request, evidence, entities = self._request_for_claim_case(
+            "broker-correction-accepted"
+        )
+        fresh = next(item for item in evidence if "corrected asking rent" in item.content)
+        target = next(item for item in entities if item.relationship == "target")
+        prior = request.prior_claims[0]
+        rent = {
+            "evidenceId": fresh.evidence_id,
+            "subjectEntityId": target.entity_id,
+            "predicate": "rent",
+            "value": 15.5,
+            "evidenceText": "the corrected asking rent is $15.50/SF/yr",
+            "actorRole": "broker",
+            "polarity": "positive",
+            "modality": "asserted",
+            "confidence": 0.99,
+            "unit": "usd_per_sf_year",
+            "effectiveAt": None,
+            "supersedesClaimId": prior.claim_id,
+        }
+        correction = {
+            "evidenceId": fresh.evidence_id,
+            "subjectEntityId": target.entity_id,
+            "predicate": "correction",
+            "value": "not $14.00/SF/yr",
+            "evidenceText": "not $14.00/SF/yr",
+            "actorRole": "broker",
+            "polarity": "negative",
+            "modality": "corrected",
+            "confidence": 0.99,
+            "unit": None,
+            "effectiveAt": None,
+            "supersedesClaimId": prior.claim_id,
+        }
+
+        adapter = PinnedProviderProposalAdapter(
+            _FakeTransport(json.dumps({"claims": [rent, correction], "review": []}))
+        )
+        response = adapter.propose(
+            case_id="broker-corrects-prior-rent",
+            request=request,
+            evidence=evidence,
+            entities=entities,
+        )
+
+        normalized_rent = next(
+            item for item in response.model_output["claims"] if item["predicate"] == "rent"
+        )
+        self.assertEqual("corrected", normalized_rent["modality"])
+
+        unbound_rent = dict(rent, supersedesClaimId="claim_unknown")
+        unbound_adapter = PinnedProviderProposalAdapter(
+            _FakeTransport(
+                json.dumps({"claims": [unbound_rent, correction], "review": []})
+            )
+        )
+        unbound_response = unbound_adapter.propose(
+            case_id="broker-corrects-prior-rent",
+            request=request,
+            evidence=evidence,
+            entities=entities,
+        )
+        unbound = next(
+            item
+            for item in unbound_response.model_output["claims"]
+            if item["predicate"] == "rent"
+        )
+        self.assertEqual("asserted", unbound["modality"])
 
     def test_adapter_rejects_context_that_does_not_match_request(self):
         transport = _FakeTransport('{"claims":[],"review":[]}')
