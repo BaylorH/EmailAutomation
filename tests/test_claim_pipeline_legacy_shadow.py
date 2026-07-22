@@ -3,6 +3,7 @@ from pathlib import Path
 
 from email_automation.claim_pipeline.contracts import ActionType, ApprovalClass
 from email_automation.claim_pipeline.legacy_shadow import (
+    compare_legacy_case,
     project_legacy_proposal,
 )
 from email_automation.claim_pipeline.legacy_shadow_fixtures import (
@@ -170,6 +171,114 @@ class LegacyProjectionTests(unittest.TestCase):
             sorted(attempt.attempt_id for attempt in first.attempts),
             [attempt.attempt_id for attempt in first.attempts],
         )
+
+
+class LegacyComparisonTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.policy_catalog = load_policy_fixture_catalog(POLICY_FIXTURE_PATH)
+        cls.policy_cases = {
+            case.case_id: case for case in cls.policy_catalog.cases
+        }
+        cls.shadow_catalog = load_legacy_shadow_fixture_catalog(
+            SHADOW_FIXTURE_PATH,
+            policy_catalog=cls.policy_catalog,
+        )
+
+    def _compare(self, case_id):
+        case = next(
+            case for case in self.shadow_catalog.cases if case.case_id == case_id
+        )
+        return compare_legacy_case(case, self.policy_cases[case.policy_case_id])
+
+    def test_every_fixture_matches_its_exact_expected_classification(self):
+        for case in self.shadow_catalog.cases:
+            with self.subTest(case_id=case.case_id):
+                result = compare_legacy_case(
+                    case,
+                    self.policy_cases[case.policy_case_id],
+                )
+                self.assertEqual(case.expected.disposition, result.disposition)
+                self.assertEqual(case.expected.severity, result.severity)
+                self.assertEqual(
+                    case.expected.discrepancy_codes,
+                    tuple(item.code for item in result.discrepancies),
+                )
+
+    def test_wrong_row_mutation_is_a_legacy_release_blocker(self):
+        result = self._compare("alternate-property-wrong-row-risk")
+
+        self.assertEqual("legacy_safety_risk", result.disposition)
+        self.assertEqual("release_blocker", result.severity)
+        self.assertIn(
+            "legacy_unplanned_fact_mutation",
+            {item.code for item in result.discrepancies},
+        )
+
+    def test_tour_only_terminalization_is_not_downgraded_to_row_move_deferral(self):
+        result = self._compare("tour-only-terminalization-risk")
+
+        self.assertEqual(
+            ("legacy_terminalizes_nonterminal",),
+            tuple(item.code for item in result.discrepancies),
+        )
+        self.assertEqual("release_blocker", result.severity)
+
+    def test_fit_failure_cannot_be_reported_as_market_unavailability(self):
+        result = self._compare("fit-market-conflation-risk")
+
+        conflation = next(
+            item
+            for item in result.discrepancies
+            if item.code == "legacy_market_fit_conflation"
+        )
+        self.assertEqual("legacy_safety_risk", conflation.category)
+        self.assertEqual("release_blocker", conflation.severity)
+
+    def test_missing_terminal_freeze_and_status_are_policy_gaps(self):
+        result = self._compare("unavailable-without-terminal-event")
+
+        self.assertEqual("new_policy_gap", result.disposition)
+        self.assertEqual(
+            ("legacy_missing_terminal_freeze", "legacy_missing_terminal_status"),
+            tuple(item.code for item in result.discrepancies),
+        )
+
+    def test_out_of_office_state_is_visible_as_expected_improvement(self):
+        result = self._compare("out-of-office-policy-improvement")
+
+        self.assertEqual("expected_improvement", result.disposition)
+        self.assertEqual("info", result.severity)
+        self.assertEqual(
+            ("policy_adds_waiting_state",),
+            tuple(item.code for item in result.discrepancies),
+        )
+
+    def test_aligned_redirect_has_no_hidden_difference(self):
+        result = self._compare("redirect-held-for-approval")
+
+        self.assertEqual("equivalent", result.disposition)
+        self.assertEqual("none", result.severity)
+        self.assertEqual((), result.discrepancies)
+
+    def test_all_discrepancies_are_classified(self):
+        for case in self.shadow_catalog.cases:
+            result = compare_legacy_case(
+                case,
+                self.policy_cases[case.policy_case_id],
+            )
+            self.assertNotIn(
+                "unclassified_difference",
+                {item.code for item in result.discrepancies},
+                case.case_id,
+            )
+
+    def test_case_result_is_byte_stable(self):
+        first = self._compare("conflicting-availability-auto-mutation-risk")
+        second = self._compare("conflicting-availability-auto-mutation-risk")
+
+        self.assertEqual(first.result_digest, second.result_digest)
+        self.assertEqual(first.to_dict(), second.to_dict())
 
 
 if __name__ == "__main__":

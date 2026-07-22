@@ -68,7 +68,7 @@
         "responseDraft": false,
         "skipResponse": true
       },
-      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_bypasses_required_review", "legacy_terminalizes_nonterminal"]}
+      "expected": {"disposition": "legacy_safety_risk", "severity": "release_blocker", "discrepancyCodes": ["legacy_bypasses_required_review", "legacy_missing_policy_fact", "legacy_terminalizes_nonterminal"]}
     },
     {
       "caseId": "split-suite-missing-sibling-update",
