@@ -72,7 +72,7 @@ Commit: `git commit -m "Add executable policy safety lattice"`
 - Create: `email_automation/claim_pipeline/policy.py`
 - Create: `tests/test_claim_pipeline_policy.py`
 
-- [ ] **Step 1: Write failing scope and reduction tests**
+- [x] **Step 1: Write failing scope and reduction tests**
 
 Use this public shape:
 
@@ -92,17 +92,17 @@ request = PolicyEvaluationRequest.create(
 
 Prove mismatched tenant/campaign scope, duplicate IDs, and bad cross-entity correction links fail. Prove exact correction supersession, agreeing claims, conflict preservation, and reversed input order are deterministic.
 
-- [ ] **Step 2: Run tests and observe import failure**
+- [x] **Step 2: Run tests and observe import failure**
 
 Run: `.venv/bin/python -m unittest tests.test_claim_pipeline_policy.PolicyReductionTests`
 
 Expected: FAIL because the API is absent.
 
-- [ ] **Step 3: Implement immutable support**
+- [x] **Step 3: Implement immutable support**
 
 Add frozen `PolicyEvaluationRequest`, `ClaimConflict`, `EntityPolicyResult`, and `PolicyEvaluationResult`. Validate the claim bundle and all scope. Reduce corrections append-only, group active claims by entity/predicate, and preserve disagreements as conflicts rather than choosing a winner.
 
-- [ ] **Step 4: Run green and commit**
+- [x] **Step 4: Run green and commit**
 
 Run: `.venv/bin/python -m unittest tests.test_claim_pipeline_policy.PolicyReductionTests`
 
@@ -114,21 +114,21 @@ Commit: `git commit -m "Reduce policy claims deterministically"`
 - Modify: `email_automation/claim_pipeline/policy.py`
 - Modify: `tests/test_claim_pipeline_policy.py`
 
-- [ ] **Step 1: Write failing fixture-driven decision tests**
+- [x] **Step 1: Write failing fixture-driven decision tests**
 
 Build requests from every fixture and compare exact market, fit, completeness, conversation, approval class, reason codes, and missing fields. Add opposed checks proving tour-only wording cannot imply unavailable, soft preferences cannot create hard non-fit, one unavailable suite cannot terminalize its sibling, alternates cannot affect the target, and conflicts/unknown hard requirements create review.
 
-- [ ] **Step 2: Observe semantic failures**
+- [x] **Step 2: Observe semantic failures**
 
 Run: `.venv/bin/python -m unittest tests.test_claim_pipeline_policy.PolicyDecisionTests`
 
 Expected: FAIL because evaluation is absent.
 
-- [ ] **Step 3: Implement named pure evaluators**
+- [x] **Step 3: Implement named pure evaluators**
 
 Implement `_market_decision`, `_fit_decision`, `_completeness_decision`, `_conversation_decision`, and `_decision_approval_class` using the design precedence. Support hard `occupancy_by`, `minimum_term_months`, required fields, and named Base V1 policies. Unknown hard requirements must review, never allow. Create and validate one `DecisionSnapshot` per entity with sorted reason/evidence/missing-field tuples.
 
-- [ ] **Step 4: Run green and commit**
+- [x] **Step 4: Run green and commit**
 
 Run: `.venv/bin/python -m unittest tests.test_claim_pipeline_policy.PolicyDecisionTests`
 
@@ -142,27 +142,27 @@ Commit: `git commit -m "Evaluate campaign policy from accepted claims"`
 - Modify: `tests/test_claim_pipeline_policy.py`
 - Modify: `tests/test_claim_pipeline_validation.py`
 
-- [ ] **Step 1: Write failing planner and validator tests**
+- [x] **Step 1: Write failing planner and validator tests**
 
 For each fixture compare required and forbidden `(action_type, target, approval_class)` signatures. Prove every terminal-intent plan freezes follow-ups, no active/review plan auto-terminalizes, alternate facts cannot update the target row, recipients/calls remain human-required, every review has structured details, sequences/dependencies are valid, and all generated plans pass `validate_action_plan`.
 
 Add opposed validator tests: an automatic redirect still fails; a freeze without a terminal/opt-out decision still fails.
 
-- [ ] **Step 2: Observe failures**
+- [x] **Step 2: Observe failures**
 
 Run: `.venv/bin/python -m unittest tests.test_claim_pipeline_policy.PolicyActionTests tests.test_claim_pipeline_validation`
 
 Expected: FAIL because plans are absent and validation lacks decision-supported freeze semantics.
 
-- [ ] **Step 3: Implement deterministic planning**
+- [x] **Step 3: Implement deterministic planning**
 
 Generate supported fact updates with exact current values as expected prior state; freeze every terminal-intent decision; transition changed conversation states; keep alternates, recipients, tours, and calls human-owned; and create one structured review item for every review decision. Use fixed action ordering and earlier-only dependencies. Generate no outbound drafts.
 
-- [ ] **Step 4: Narrowly widen freeze validation**
+- [x] **Step 4: Narrowly widen freeze validation**
 
 Allow `FOLLOWUP_FREEZE` for opt-out or a bound `TERMINAL_INTENT` decision supported by same-entity availability, occupancy, term, or complete required-fact claims. Require the payload reason to match a terminal decision reason. Preserve all existing tenant, campaign, row, prior-state, target, and approval checks.
 
-- [ ] **Step 5: Run green and commit**
+- [x] **Step 5: Run green and commit**
 
 Run: `.venv/bin/python -m unittest tests.test_claim_pipeline_policy tests.test_claim_pipeline_validation`
 

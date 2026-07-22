@@ -16,8 +16,8 @@
       ],
       "contract": {
         "requiredFields": [
-          "total_sf",
-          "rent"
+            "rent",
+            "total_sf"
         ]
       },
       "entities": [
@@ -59,10 +59,10 @@
               "broker_confirmed_available",
               "required_facts_missing"
             ],
-            "missingFields": [
-              "total_sf",
-              "rent"
-            ],
+        "missingFields": [
+          "rent",
+          "total_sf"
+        ],
             "requiredActions": [
               "fact_update:automatic"
             ],
@@ -1285,4 +1285,3 @@
     }
   ]
 }
-

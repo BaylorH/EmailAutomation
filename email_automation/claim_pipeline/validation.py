@@ -11,6 +11,7 @@ from .contracts import (
     CampaignContract,
     Claim,
     ClaimPredicate,
+    ConversationState,
     DecisionSnapshot,
     EntityRef,
     EvidenceEnvelope,
@@ -82,7 +83,6 @@ FACT_FIELD_PREDICATES = {
 ACTION_SUPPORT_PREDICATES = {
     ActionType.RECIPIENT_CHANGE: frozenset({ClaimPredicate.REFERRAL}),
     ActionType.ALTERNATE_PROPERTY_PROPOSAL: frozenset({ClaimPredicate.IDENTITY}),
-    ActionType.FOLLOWUP_FREEZE: frozenset({ClaimPredicate.OPT_OUT}),
     ActionType.TOUR_REQUEST: frozenset({ClaimPredicate.TOUR_REQUEST}),
     ActionType.CALL_REQUEST: frozenset({ClaimPredicate.CALL_REQUEST}),
 }
@@ -110,6 +110,7 @@ def _require_tenant(expected: str, actual: str, label: str) -> None:
 def _validate_action_payload(
     action: PlannedAction,
     source_claims: tuple[Claim, ...],
+    decision: DecisionSnapshot,
 ) -> None:
     allowed_keys = ACTION_PAYLOAD_KEYS[action.action_type]
     unknown_keys = set(action.payload) - allowed_keys
@@ -137,6 +138,30 @@ def _validate_action_payload(
         raise ContractViolation(
             f"{action.action_type.value} source claims do not support the action"
         )
+
+    if action.action_type is ActionType.FOLLOWUP_FREEZE:
+        reason = str(action.payload.get("reason", "") or "").strip()
+        terminal_support = frozenset(
+            {
+                ClaimPredicate.AVAILABILITY,
+                ClaimPredicate.OCCUPANCY_DATE,
+                ClaimPredicate.TERM,
+                ClaimPredicate.OPT_OUT,
+                ClaimPredicate.TOTAL_SF,
+                ClaimPredicate.RENT,
+                ClaimPredicate.OPERATING_EXPENSES,
+            }
+        )
+        if decision.conversation_state is not ConversationState.TERMINAL_INTENT:
+            raise ContractViolation("followup freeze requires terminal intent")
+        if source_predicates.isdisjoint(terminal_support):
+            raise ContractViolation(
+                "followup freeze source claims do not support terminal intent"
+            )
+        if reason not in decision.reason_codes:
+            raise ContractViolation(
+                "followup freeze reason does not match the terminal decision"
+            )
 
 
 def validate_claim_bundle(
@@ -368,7 +393,7 @@ def validate_action_plan(
                     "planned action source claim does not support its target entity"
                 )
             source_claims.append(claim)
-        _validate_action_payload(action, tuple(source_claims))
+        _validate_action_payload(action, tuple(source_claims), decision)
         if (
             action.action_type in STATE_MUTATING_ACTION_TYPES
             and not action.expected_prior_state

@@ -210,6 +210,63 @@ def _scope(decision):
 
 
 class ClaimPipelineValidationTests(unittest.TestCase):
+    def test_terminal_decision_allows_supported_followup_freeze(self):
+        entity = _entity()
+        contract = _contract()
+        decision = DecisionSnapshot.create(
+            tenant_id=entity.tenant_id,
+            client_id=contract.client_id,
+            campaign_id=contract.campaign_id,
+            contract_id=contract.contract_id,
+            entity_id=entity.entity_id,
+            contract_version=contract.version,
+            snapshot_hash="snapshot-1",
+            market_state=MarketState.UNAVAILABLE,
+            fit_state=FitState.NONVIABLE,
+            completeness_state=CompletenessState.NOT_APPLICABLE,
+            conversation_state=ConversationState.TERMINAL_INTENT,
+            reason_codes=("broker_confirmed_unavailable",),
+        )
+        source = _source_claim(entity)
+        action = _action(
+            decision,
+            ActionType.FOLLOWUP_FREEZE,
+            ApprovalClass.AUTOMATIC,
+            source_claim_ids=(source.claim_id,),
+            payload={"reason": "broker_confirmed_unavailable"},
+        )
+
+        validate_action_plan(
+            _plan(decision, (action,)),
+            decision,
+            scope=_scope(decision),
+            entities=(entity,),
+            claims=(source,),
+            authorized_recipients=(),
+        )
+
+    def test_nonterminal_decision_rejects_followup_freeze(self):
+        entity = _entity()
+        decision = _decision(entity, _contract())
+        source = _source_claim(entity)
+        action = _action(
+            decision,
+            ActionType.FOLLOWUP_FREEZE,
+            ApprovalClass.AUTOMATIC,
+            source_claim_ids=(source.claim_id,),
+            payload={"reason": "broker_confirmed_unavailable"},
+        )
+
+        with self.assertRaisesRegex(ContractViolation, "terminal intent"):
+            validate_action_plan(
+                _plan(decision, (action,)),
+                decision,
+                scope=_scope(decision),
+                entities=(entity,),
+                claims=(source,),
+                authorized_recipients=(),
+            )
+
     def test_claim_bundle_rejects_unknown_evidence(self):
         evidence = _evidence()
         entity = _entity()
