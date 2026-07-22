@@ -192,6 +192,8 @@ Candidate rejection is isolated to the narrowest safe scope. When the candidate 
 
 For text-backed `remediation` and `correction` claims, the pinned provider adapter derives the proposed value from the exact evidence span before the unchanged shared extractor validates it, instead of trusting a second model-authored paraphrase. Predicate validation then proves the span's repair action or correction linkage. Recorded fixtures retain their authoritative values and digests. This removes a duplicate free-text degree of freedom without weakening evidence provenance.
 
+External property identity is deterministic once entity resolution has selected one fresh attachment or link subject. The provider adapter replaces model-authored identity for that resolved alternate property or suite with a canonical evidence-bound identity claim. Review proposals are also evidence-gated before extraction: entity ambiguity requires a matching resolution issue, and insufficient-evidence review requires a supported deterministic missing-basis pattern. Malformed review output remains visible and fail-closed.
+
 ## Stage 5: Effective Campaign Contract
 
 Each campaign has a versioned contract compiled from:

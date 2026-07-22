@@ -64,6 +64,12 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
             for item in self.interpretation.cases
             if item.case_id == case.interpretation_case_id
         )
+        return (case, *self._request_for_interpretation(source.case_id))
+
+    def _request_for_interpretation(self, case_id):
+        source = next(
+            item for item in self.interpretation.cases if item.case_id == case_id
+        )
         normalized = normalize_message_evidence(source.message)
         resolved = resolve_entities(
             tenant_id=source.message.tenant_id,
@@ -78,7 +84,7 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
             entities=resolved.entities,
             resolution_issues=resolved.issues,
         )
-        return case, request, normalized.evidence, resolved.entities
+        return request, normalized.evidence, resolved.entities
 
     def test_adapter_pins_identity_and_serializes_only_the_request(self):
         transport = _FakeTransport('{"claims":[],"review":[]}')
@@ -100,7 +106,7 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
         _, instructions, payload = transport.calls[0]
         self.assertNotIn("expected", instructions.casefold())
         self.assertEqual(request.to_dict(), json.loads(payload))
-        self.assertEqual('{"claims":[],"review":[]}', response.model_output)
+        self.assertEqual({"claims": [], "review": []}, response.model_output)
 
     def test_prompt_constrains_review_reasons_to_safe_category_tokens(self):
         self.assertIn("entity_ambiguity", PINNED_PROMPT)
@@ -155,7 +161,7 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
             ],
             "review": [],
         }
-        transport = _FakeTransport(output)
+        transport = _FakeTransport(json.dumps(output))
         adapter = PinnedProviderProposalAdapter(transport)
         case, request, evidence, entities = self._request()
 
@@ -174,6 +180,85 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
             ],
             [item["value"] for item in response.model_output["claims"]],
         )
+
+    def test_adapter_replaces_external_identity_with_resolved_claim(self):
+        scenarios = (
+            ("wrong-property-attachment", "alternate", "999 Other Road"),
+            ("attachment-only-reply", "suite_of_target", "Suite C"),
+        )
+        for case_id, relationship, expected_value in scenarios:
+            with self.subTest(case_id=case_id):
+                request, evidence, entities = self._request_for_interpretation(case_id)
+                entity = next(item for item in entities if item.relationship == relationship)
+                output = {
+                    "claims": [
+                        {
+                            "predicate": "identity",
+                            "subjectEntityId": entity.entity_id,
+                            "value": "model-selected identity",
+                        }
+                    ],
+                    "review": [],
+                }
+                adapter = PinnedProviderProposalAdapter(_FakeTransport(json.dumps(output)))
+
+                response = adapter.propose(
+                    case_id=case_id,
+                    request=request,
+                    evidence=evidence,
+                    entities=entities,
+                )
+
+                identities = [
+                    item
+                    for item in response.model_output["claims"]
+                    if item["predicate"] == "identity"
+                    and item["subjectEntityId"] == entity.entity_id
+                ]
+                self.assertEqual(1, len(identities))
+                self.assertEqual(expected_value, identities[0]["value"])
+                self.assertEqual(expected_value, identities[0]["evidenceText"])
+
+    def test_adapter_keeps_only_deterministically_supported_reviews(self):
+        scenarios = (
+            ("attachment-extraction-failure-visible", "insufficient_evidence", False),
+            ("ordinary-prose-does-not-fabricate-entities", "insufficient_evidence", True),
+            ("ambiguous-other-building", "entity_ambiguity", True),
+        )
+        for case_id, reason, expected_kept in scenarios:
+            with self.subTest(case_id=case_id):
+                request, evidence, entities = self._request_for_interpretation(case_id)
+                target_evidence = (
+                    next(
+                        item
+                        for item in evidence
+                        if any(
+                            item.evidence_id in issue.evidence_ids
+                            for issue in request.resolution_issues
+                        )
+                    )
+                    if reason == "entity_ambiguity"
+                    else evidence[-1]
+                )
+                output = {
+                    "claims": [],
+                    "review": [
+                        {
+                            "evidenceId": target_evidence.evidence_id,
+                            "reason": reason,
+                        }
+                    ],
+                }
+                adapter = PinnedProviderProposalAdapter(_FakeTransport(json.dumps(output)))
+
+                response = adapter.propose(
+                    case_id=case_id,
+                    request=request,
+                    evidence=evidence,
+                    entities=entities,
+                )
+
+                self.assertEqual(expected_kept, bool(response.model_output["review"]))
 
     def test_adapter_rejects_context_that_does_not_match_request(self):
         transport = _FakeTransport('{"claims":[],"review":[]}')

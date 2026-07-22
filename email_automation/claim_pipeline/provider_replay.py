@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
@@ -64,6 +65,11 @@ def _canonical_json(value: object) -> str:
 
 
 def _normalize_text_backed_values(model_output: object) -> object:
+    if isinstance(model_output, str):
+        try:
+            model_output = json.loads(model_output)
+        except json.JSONDecodeError:
+            return model_output
     if not isinstance(model_output, Mapping):
         return model_output
     claims = model_output.get("claims")
@@ -82,6 +88,132 @@ def _normalize_text_backed_values(model_output: object) -> object:
         normalized_claims.append(claim)
     normalized = dict(model_output)
     normalized["claims"] = normalized_claims
+    return normalized
+
+
+def _add_resolved_external_identities(
+    model_output: object,
+    evidence: tuple[EvidenceEnvelope, ...],
+    entities: tuple[EntityRef, ...],
+) -> object:
+    if not isinstance(model_output, Mapping):
+        return model_output
+    claims = model_output.get("claims")
+    if not isinstance(claims, list):
+        return model_output
+    evidence_by_id = {item.evidence_id: item for item in evidence}
+    identities = {}
+    for entity in entities:
+        if entity.relationship not in {
+            "alternate",
+            "suite_of_target",
+            "suite_of_alternate",
+        }:
+            continue
+        for evidence_id in entity.evidence_ids:
+            envelope = evidence_by_id.get(evidence_id)
+            if (
+                envelope is None
+                or envelope.freshness.value != "fresh"
+                or envelope.source_kind.value not in {"attachment", "link"}
+            ):
+                continue
+            if entity.suite:
+                match = re.search(
+                    rf"\b(?:suite|ste|unit)\s*[-#:]?\s*{re.escape(entity.suite)}\b",
+                    envelope.content,
+                    re.IGNORECASE,
+                )
+                if match is None:
+                    continue
+                evidence_text = match.group(0)
+                value = f"Suite {entity.suite}"
+            else:
+                start = envelope.content.casefold().find(entity.label.casefold())
+                if start < 0:
+                    continue
+                evidence_text = envelope.content[start : start + len(entity.label)]
+                value = evidence_text
+            identities[entity.entity_id] = {
+                "evidenceId": envelope.evidence_id,
+                "subjectEntityId": entity.entity_id,
+                "predicate": "identity",
+                "value": value,
+                "evidenceText": evidence_text,
+                "actorRole": envelope.actor.role.value,
+                "polarity": "positive",
+                "modality": "asserted",
+                "confidence": 0.99,
+                "unit": None,
+                "effectiveAt": None,
+                "supersedesClaimId": None,
+            }
+            break
+    if not identities:
+        return model_output
+    normalized = dict(model_output)
+    normalized["claims"] = [
+        item
+        for item in claims
+        if not (
+            isinstance(item, Mapping)
+            and item.get("predicate") == "identity"
+            and item.get("subjectEntityId") in identities
+        )
+    ] + list(identities.values())
+    return normalized
+
+
+def _supports_insufficient_evidence_review(content: str) -> bool:
+    has_currency_per_area = re.search(
+        r"(?:\$|\bUSD\b)\s*\d+(?:\.\d+)?\s*/\s*(?:SF\b|sq\.?\s*ft\b)",
+        content,
+        re.IGNORECASE,
+    )
+    has_time_basis = re.search(
+        r"/\s*(?:yr|year|mo|month)\b|\b(?:annual|annually|yearly|monthly)\b",
+        content,
+        re.IGNORECASE,
+    )
+    return bool(has_currency_per_area and not has_time_basis)
+
+
+def _filter_unsupported_reviews(
+    model_output: object,
+    request: ClaimExtractionRequest,
+) -> object:
+    if not isinstance(model_output, Mapping):
+        return model_output
+    reviews = model_output.get("review")
+    if not isinstance(reviews, list):
+        return model_output
+    evidence_by_id = {item.evidence_id: item for item in request.evidence}
+    ambiguous_evidence_ids = {
+        evidence_id
+        for issue in request.resolution_issues
+        for evidence_id in issue.evidence_ids
+    }
+    filtered = []
+    for item in reviews:
+        if not isinstance(item, Mapping) or set(item) != {"evidenceId", "reason"}:
+            filtered.append(item)
+            continue
+        evidence_id = item.get("evidenceId")
+        reason = item.get("reason")
+        envelope = evidence_by_id.get(evidence_id)
+        if reason == "entity_ambiguity":
+            if evidence_id in ambiguous_evidence_ids:
+                filtered.append(dict(item))
+            continue
+        if reason == "insufficient_evidence":
+            if envelope is not None and _supports_insufficient_evidence_review(
+                envelope.content
+            ):
+                filtered.append(dict(item))
+            continue
+        filtered.append(item)
+    normalized = dict(model_output)
+    normalized["review"] = filtered
     return normalized
 
 
@@ -140,10 +272,14 @@ class PinnedProviderProposalAdapter:
         )
         if not isinstance(result, ProviderTransportResult):
             raise TypeError("provider transport returned an invalid result")
-        return ProposalResponse(
-            model_output=_normalize_text_backed_values(result.model_output),
-            usage=result.usage,
+        model_output = _normalize_text_backed_values(result.model_output)
+        model_output = _add_resolved_external_identities(
+            model_output,
+            evidence,
+            entities,
         )
+        model_output = _filter_unsupported_reviews(model_output, request)
+        return ProposalResponse(model_output=model_output, usage=result.usage)
 
 
 __all__ = [
