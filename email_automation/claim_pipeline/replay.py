@@ -46,6 +46,7 @@ RECORDED_PROMPT_HASH = hashlib.sha256(
     b"SiteSift recorded claim fixture materialization v1"
 ).hexdigest()
 _REPORT_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+_EVALUATION_PROFILES = frozenset({"candidate_validation", "provider_quality"})
 
 
 def _canonical_json(value: object) -> str:
@@ -125,6 +126,7 @@ class ReplayIdentity:
     model_id: str
     prompt_id: str
     prompt_hash: str
+    evaluation_profile: str
     repeats: int
     case_count: int
     interpretation_case_count: int
@@ -155,6 +157,9 @@ class ReplayIdentity:
             "model_id": _report_safe_id(self.model_id, "model_id"),
             "prompt_id": _report_safe_id(self.prompt_id, "prompt_id"),
             "prompt_hash": _sha256(self.prompt_hash, "prompt_hash"),
+            "evaluation_profile": _report_safe_id(
+                self.evaluation_profile, "evaluation_profile"
+            ),
             "repeats": _positive_int(self.repeats, "repeats"),
             "case_count": _positive_int(self.case_count, "case_count"),
             "interpretation_case_count": _positive_int(
@@ -163,6 +168,8 @@ class ReplayIdentity:
         }
         if normalized["repeats"] > MAX_REPLAY_REPEATS:
             raise ValueError(f"repeats cannot exceed {MAX_REPLAY_REPEATS}")
+        if normalized["evaluation_profile"] not in _EVALUATION_PROFILES:
+            raise ValueError("evaluation_profile is unsupported")
         planned_calls = normalized["repeats"] * normalized["case_count"]
         planned_interpretations = (
             normalized["repeats"] * normalized["interpretation_case_count"]
@@ -206,6 +213,7 @@ class ReplayIdentity:
         repeats: int,
         case_count: int,
         interpretation_case_count: int,
+        evaluation_profile: str = "candidate_validation",
     ) -> "ReplayIdentity":
         if not isinstance(source_tree_dirty, bool):
             raise ValueError("source_tree_dirty must be boolean")
@@ -228,6 +236,9 @@ class ReplayIdentity:
             "model_id": _report_safe_id(model_id, "model_id"),
             "prompt_id": _report_safe_id(prompt_id, "prompt_id"),
             "prompt_hash": _sha256(prompt_hash, "prompt_hash"),
+            "evaluation_profile": _report_safe_id(
+                evaluation_profile, "evaluation_profile"
+            ),
             "repeats": _positive_int(repeats, "repeats"),
             "case_count": _positive_int(case_count, "case_count"),
             "interpretation_case_count": _positive_int(
@@ -236,6 +247,8 @@ class ReplayIdentity:
         }
         if normalized["repeats"] > MAX_REPLAY_REPEATS:
             raise ValueError(f"repeats cannot exceed {MAX_REPLAY_REPEATS}")
+        if normalized["evaluation_profile"] not in _EVALUATION_PROFILES:
+            raise ValueError("evaluation_profile is unsupported")
         planned_calls = normalized["repeats"] * normalized["case_count"]
         if planned_calls > MAX_REPLAY_CALLS:
             raise ValueError(f"planned calls cannot exceed {MAX_REPLAY_CALLS}")
@@ -273,6 +286,7 @@ class ReplayIdentity:
             "modelId": self.model_id,
             "promptId": self.prompt_id,
             "promptHash": self.prompt_hash,
+            "evaluationProfile": self.evaluation_profile,
             "repeats": self.repeats,
             "caseCount": self.case_count,
             "interpretationCaseCount": self.interpretation_case_count,
@@ -324,6 +338,73 @@ class ProposalUsage:
             "providerBilled": self.provider_billed,
             "usageComplete": self.usage_complete,
         }
+
+
+@dataclass(frozen=True)
+class ProviderTelemetrySnapshot:
+    """Aggregate transport observations, independent of proposal semantics."""
+
+    attempts: int = 0
+    billed_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_ms: int = 0
+    cost_microusd: int = 0
+    incomplete_attempts: int = 0
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "attempts",
+            "billed_calls",
+            "input_tokens",
+            "output_tokens",
+            "latency_ms",
+            "cost_microusd",
+            "incomplete_attempts",
+        ):
+            _nonnegative_int(getattr(self, field_name), field_name)
+        if self.billed_calls > self.attempts:
+            raise ValueError("billed_calls cannot exceed attempts")
+        if self.incomplete_attempts > self.attempts:
+            raise ValueError("incomplete_attempts cannot exceed attempts")
+
+    def delta_usage(self, earlier: "ProviderTelemetrySnapshot") -> ProposalUsage:
+        if not isinstance(earlier, ProviderTelemetrySnapshot):
+            raise TypeError("earlier telemetry must be a ProviderTelemetrySnapshot")
+        fields = (
+            "attempts",
+            "billed_calls",
+            "input_tokens",
+            "output_tokens",
+            "latency_ms",
+            "cost_microusd",
+            "incomplete_attempts",
+        )
+        delta = {
+            field_name: getattr(self, field_name) - getattr(earlier, field_name)
+            for field_name in fields
+        }
+        if any(value < 0 for value in delta.values()):
+            raise ValueError("provider telemetry cannot move backwards")
+        return ProposalUsage(
+            input_tokens=delta["input_tokens"],
+            output_tokens=delta["output_tokens"],
+            latency_ms=delta["latency_ms"],
+            cost_microusd=delta["cost_microusd"],
+            provider_calls=delta["attempts"],
+            provider_billed=(
+                delta["attempts"] > 0
+                and delta["billed_calls"] == delta["attempts"]
+            ),
+            usage_complete=(
+                delta["incomplete_attempts"] == 0
+                and delta["billed_calls"] in {0, delta["attempts"]}
+            ),
+        )
+
+
+class ProviderTelemetry(Protocol):
+    def snapshot(self) -> ProviderTelemetrySnapshot: ...
 
 
 @dataclass(frozen=True)
@@ -907,6 +988,23 @@ def _expected_issue_outcome(case) -> tuple[dict[str, object], ...]:
     )
 
 
+def _provider_expected_issue_outcome(case) -> tuple[dict[str, object], ...]:
+    expected = []
+    for item in case.expected["issues"]:
+        if item["code"] == "model_requested_review":
+            expected.append(_plain_json(item))
+        elif item["code"] == "unresolved_entity_context":
+            expected.append(
+                {
+                    "code": "model_requested_review",
+                    "candidateIndex": item["candidateIndex"],
+                    "evidenceIndexes": _plain_json(item["evidenceIndexes"]),
+                    "entities": [],
+                }
+            )
+    return tuple(sorted(expected, key=_canonical_json))
+
+
 def _proposal_digest(model_output: object) -> str:
     try:
         return _digest(_plain_json(model_output))
@@ -1049,12 +1147,42 @@ def _adapter_failure_result(
     )
 
 
+def _reconciled_case_usage(
+    *,
+    provider_id: str,
+    telemetry: ProviderTelemetry | None,
+    telemetry_before: ProviderTelemetrySnapshot | None,
+    declared: ProposalUsage | None,
+) -> tuple[ProposalUsage, str]:
+    if provider_id == RECORDED_PROVIDER_ID:
+        return declared or ProposalUsage(
+            provider_billed=False,
+            usage_complete=False,
+        ), ""
+    if telemetry is None or telemetry_before is None:
+        return ProposalUsage(provider_billed=False, usage_complete=False), (
+            "transport_telemetry_missing"
+        )
+    try:
+        observed = telemetry.snapshot().delta_usage(telemetry_before)
+    except (TypeError, ValueError):
+        return ProposalUsage(provider_billed=False, usage_complete=False), (
+            "transport_telemetry_invalid"
+        )
+    if observed.provider_calls != 1:
+        return observed, "transport_attempt_count_mismatch"
+    if declared is not None and declared != observed:
+        return observed, "transport_usage_mismatch"
+    return observed, ""
+
+
 def run_claim_replay(
     *,
     interpretation_catalog: InterpretationFixtureCatalog,
     claim_catalog: ClaimFixtureCatalog,
     adapter: ProposalAdapter,
     identity: ReplayIdentity,
+    telemetry: ProviderTelemetry | None = None,
 ) -> ReplayReport:
     """Run the current saved boundary catalogs without persistence or effects."""
 
@@ -1110,6 +1238,7 @@ def run_claim_replay(
                 prior_claims=prior_claims,
                 resolution_issues=resolved.issues,
             )
+            telemetry_before = telemetry.snapshot() if telemetry is not None else None
             try:
                 response = adapter.propose(
                     case_id=case.case_id,
@@ -1119,22 +1248,54 @@ def run_claim_replay(
                 )
             except Exception as exc:
                 safe_error = f"adapter_{type(exc).__name__}"
+                observed_usage, telemetry_error = _reconciled_case_usage(
+                    provider_id=identity.provider_id,
+                    telemetry=telemetry,
+                    telemetry_before=telemetry_before,
+                    declared=None,
+                )
                 failed = _adapter_failure_result(
                     case_id=case.case_id,
                     repeat_index=repeat_index,
                     request_id=request.request_id,
-                    error_code=safe_error,
+                    error_code=telemetry_error or safe_error,
+                    usage=observed_usage,
                 )
                 proposal_digests[case.case_id].add(failed.proposal_digest)
                 outcome_digests[case.case_id].add(failed.outcome_digest)
                 results.append(failed)
                 continue
             if not isinstance(response, ProposalResponse):
+                observed_usage, telemetry_error = _reconciled_case_usage(
+                    provider_id=identity.provider_id,
+                    telemetry=telemetry,
+                    telemetry_before=telemetry_before,
+                    declared=None,
+                )
                 failed = _adapter_failure_result(
                     case_id=case.case_id,
                     repeat_index=repeat_index,
                     request_id=request.request_id,
-                    error_code="adapter_invalid_response",
+                    error_code=telemetry_error or "adapter_invalid_response",
+                    usage=observed_usage,
+                )
+                proposal_digests[case.case_id].add(failed.proposal_digest)
+                outcome_digests[case.case_id].add(failed.outcome_digest)
+                results.append(failed)
+                continue
+            observed_usage, telemetry_error = _reconciled_case_usage(
+                provider_id=identity.provider_id,
+                telemetry=telemetry,
+                telemetry_before=telemetry_before,
+                declared=response.usage,
+            )
+            if telemetry_error:
+                failed = _adapter_failure_result(
+                    case_id=case.case_id,
+                    repeat_index=repeat_index,
+                    request_id=request.request_id,
+                    error_code=telemetry_error,
+                    usage=observed_usage,
                 )
                 proposal_digests[case.case_id].add(failed.proposal_digest)
                 outcome_digests[case.case_id].add(failed.outcome_digest)
@@ -1162,7 +1323,11 @@ def run_claim_replay(
                     resolved.entities,
                     request.prior_claims,
                 )
-                and _expected_issue_outcome(case)
+                and (
+                    _provider_expected_issue_outcome(case)
+                    if identity.evaluation_profile == "provider_quality"
+                    else _expected_issue_outcome(case)
+                )
                 == _issue_outcome(
                     extracted.issues, normalized.evidence, resolved.entities
                 )
@@ -1178,7 +1343,7 @@ def run_claim_replay(
                     issue_codes=issue_codes,
                     passed=passed,
                     error_code="",
-                    usage=response.usage,
+                    usage=observed_usage,
                 )
             )
 
@@ -1254,6 +1419,8 @@ __all__ = [
     "ProposalAdapter",
     "ProposalResponse",
     "ProposalUsage",
+    "ProviderTelemetry",
+    "ProviderTelemetrySnapshot",
     "RECORDED_MODEL_ID",
     "RECORDED_PROMPT_HASH",
     "RECORDED_PROMPT_ID",

@@ -24,7 +24,110 @@ from .entities import ResolutionIssue
 from .validation import ContractViolation, validate_claim_bundle
 
 
-CLAIM_EXTRACTION_SCHEMA_VERSION = 1
+CLAIM_EXTRACTION_SCHEMA_VERSION = 2
+PREDICATE_OUTPUT_CONTRACTS = {
+    "identity": {
+        "valueTypes": ["string", "object"],
+        "objectKeys": ["name", "email", "phone", "address"],
+        "units": [None],
+    },
+    "availability": {
+        "values": ["available", "unavailable", "conditional"],
+        "units": [None],
+        "polarityByValue": {
+            "available": "positive",
+            "unavailable": "negative",
+            "conditional": "positive",
+        },
+    },
+    "asking_status": {
+        "values": ["asking", "negotiable", "not_asking"],
+        "units": [None],
+        "polarityByValue": {
+            "asking": "positive",
+            "negotiable": "positive",
+            "not_asking": "negative",
+        },
+    },
+    "transaction_type": {
+        "values": ["lease", "sublease", "sale"],
+        "units": [None],
+    },
+    "total_sf": {"valueType": "positive_number", "units": ["sf"]},
+    "office_sf": {"valueType": "positive_number", "units": ["sf"]},
+    "rent": {
+        "valueType": "positive_number",
+        "units": [
+            "usd_per_sf_year",
+            "usd_per_sf_month",
+            "usd_month",
+            "usd_year",
+        ],
+    },
+    "operating_expenses": {
+        "valueType": "positive_number",
+        "units": [
+            "usd_per_sf_year",
+            "usd_per_sf_month",
+            "usd_month",
+            "usd_year",
+        ],
+    },
+    "power": {
+        "valueType": "positive_number",
+        "units": ["amps", "volts", "kva"],
+    },
+    "clear_height": {"valueType": "positive_number", "units": ["ft"]},
+    "drive_ins": {
+        "valueType": "nonnegative_integer",
+        "units": ["count"],
+    },
+    "docks": {"valueType": "nonnegative_integer", "units": ["count"]},
+    "occupancy_date": {
+        "valueType": "iso_date_yyyy_mm_dd",
+        "units": [None],
+        "effectiveAt": "same_date",
+    },
+    "term": {
+        "valueType": "positive_number",
+        "units": ["months", "years"],
+    },
+    "remediation": {
+        "valueType": "nonempty_exact_evidence_text",
+        "units": [None],
+    },
+    "referral": {
+        "valueType": "object",
+        "objectKeys": ["name", "email", "phone"],
+        "units": [None],
+    },
+    "correction": {
+        "valueType": "nonempty_exact_evidence_text",
+        "units": [None],
+        "correctedModalityRequiresSupersedesClaimId": True,
+    },
+    "opt_out": {"values": [True], "units": [None], "modality": "requested"},
+    "call_request": {
+        "values": [True],
+        "units": [None],
+        "modality": "requested",
+    },
+    "tour_request": {
+        "values": [True],
+        "units": [None],
+        "modality": "requested",
+    },
+    "information_request": {
+        "values": [True],
+        "units": [None],
+        "modality": "requested",
+    },
+    "return_date": {
+        "valueType": "iso_date_yyyy_mm_dd",
+        "units": [None],
+        "effectiveAt": "same_date",
+    },
+}
 MAX_CLAIM_CANDIDATES = 64
 MAX_REVIEW_ITEMS = 64
 MAX_MODEL_OUTPUT_CHARS = 1_000_000
@@ -286,6 +389,7 @@ class ClaimExtractionRequest:
                 for item in self.resolution_issues
             ],
             "supportedPredicates": [item.value for item in ClaimPredicate],
+            "predicateContracts": _json_ready(PREDICATE_OUTPUT_CONTRACTS),
             "outputSchema": _output_schema(),
         }
 
@@ -597,6 +701,18 @@ def _parse_candidate(raw: object) -> Claim:
         ) from exc
 
 
+def _canonical_evidence_text(value: str, evidence_content: str) -> str:
+    cleaned = value.strip()
+    without_sentence_punctuation = cleaned.rstrip(".!?").rstrip()
+    if (
+        without_sentence_punctuation
+        and without_sentence_punctuation != cleaned
+        and without_sentence_punctuation in evidence_content
+    ):
+        return without_sentence_punctuation
+    return cleaned
+
+
 def _with_evidence_context(claim: Claim, envelope: EvidenceEnvelope) -> Claim:
     return Claim.create(
         tenant_id=envelope.tenant_id,
@@ -605,7 +721,10 @@ def _with_evidence_context(claim: Claim, envelope: EvidenceEnvelope) -> Claim:
         subject_entity_id=claim.subject_entity_id,
         predicate=claim.predicate,
         value=claim.value,
-        evidence_text=claim.evidence_text,
+        evidence_text=_canonical_evidence_text(
+            claim.evidence_text,
+            envelope.content,
+        ),
         actor_role=claim.actor_role,
         polarity=claim.polarity,
         modality=claim.modality,
@@ -905,6 +1024,7 @@ def extract_claims(
 
 __all__ = [
     "CLAIM_EXTRACTION_SCHEMA_VERSION",
+    "PREDICATE_OUTPUT_CONTRACTS",
     "MAX_CLAIM_CANDIDATES",
     "MAX_ENTITY_ITEMS",
     "MAX_EVIDENCE_CONTENT_CHARS",

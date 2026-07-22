@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -11,8 +12,10 @@ from email_automation.claim_pipeline.claim_fixtures import load_claim_fixture_ca
 from email_automation.claim_pipeline.interpretation_fixtures import (
     load_interpretation_fixture_catalog,
 )
+from email_automation.claim_pipeline.extraction import CLAIM_EXTRACTION_SCHEMA_VERSION
 from email_automation.claim_pipeline.replay import (
     MAX_REPLAY_CALLS,
+    ProviderTelemetrySnapshot,
     ProposalResponse,
     ProposalUsage,
     RecordedProposalAdapter,
@@ -45,6 +48,7 @@ class ReplayContractTests(unittest.TestCase):
             "model_id": "fixture-output-v1",
             "prompt_id": "recorded-claim-proposal-v1",
             "prompt_hash": "e" * 64,
+            "evaluation_profile": "candidate_validation",
             "repeats": 3,
             "case_count": 20,
             "interpretation_case_count": 14,
@@ -75,6 +79,7 @@ class ReplayContractTests(unittest.TestCase):
                 "modelId",
                 "promptId",
                 "promptHash",
+                "evaluationProfile",
                 "repeats",
                 "caseCount",
                 "interpretationCaseCount",
@@ -152,6 +157,55 @@ class ReplayContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ProposalUsage(provider_calls=0, provider_billed=True)
 
+    def test_provider_telemetry_delta_is_exact_and_rejects_regression(self):
+        before = ProviderTelemetrySnapshot()
+        after = ProviderTelemetrySnapshot(
+            attempts=1,
+            billed_calls=1,
+            input_tokens=11,
+            output_tokens=7,
+            latency_ms=25,
+            cost_microusd=19,
+            incomplete_attempts=0,
+        )
+
+        self.assertEqual(
+            ProposalUsage(
+                input_tokens=11,
+                output_tokens=7,
+                latency_ms=25,
+                cost_microusd=19,
+                provider_calls=1,
+                provider_billed=True,
+                usage_complete=True,
+            ),
+            after.delta_usage(before),
+        )
+        with self.assertRaises(ValueError):
+            before.delta_usage(after)
+
+
+class _MutableTelemetry:
+    def __init__(self):
+        self._snapshot = ProviderTelemetrySnapshot()
+
+    def snapshot(self):
+        return self._snapshot
+
+    def record(self, usage, *, attempts=None):
+        observed_attempts = usage.provider_calls if attempts is None else attempts
+        self._snapshot = ProviderTelemetrySnapshot(
+            attempts=self._snapshot.attempts + observed_attempts,
+            billed_calls=self._snapshot.billed_calls
+            + (observed_attempts if usage.provider_billed else 0),
+            input_tokens=self._snapshot.input_tokens + usage.input_tokens,
+            output_tokens=self._snapshot.output_tokens + usage.output_tokens,
+            latency_ms=self._snapshot.latency_ms + usage.latency_ms,
+            cost_microusd=self._snapshot.cost_microusd + usage.cost_microusd,
+            incomplete_attempts=self._snapshot.incomplete_attempts
+            + (0 if usage.usage_complete else observed_attempts),
+        )
+
 
 class _AdapterWrapper:
     def __init__(
@@ -165,7 +219,11 @@ class _AdapterWrapper:
         wrong_case="",
         confidence_case="",
         wrong_review_evidence_case="",
+        empty_case="",
         provider_id="",
+        telemetry=None,
+        observed_usage=None,
+        observed_attempts=None,
     ):
         self._recorded = recorded
         self._usage = usage
@@ -175,6 +233,10 @@ class _AdapterWrapper:
         self._wrong_case = wrong_case
         self._confidence_case = confidence_case
         self._wrong_review_evidence_case = wrong_review_evidence_case
+        self._empty_case = empty_case
+        self._telemetry = telemetry
+        self._observed_usage = observed_usage
+        self._observed_attempts = observed_attempts
         self._case_calls = {}
         self.requests_by_case = {}
         self.responses_by_case = {}
@@ -191,6 +253,16 @@ class _AdapterWrapper:
         self._case_calls[case_id] = self._case_calls.get(case_id, 0) + 1
         self.requests_by_case[case_id] = request
         if case_id == self._fail_case:
+            if self._telemetry is not None:
+                self._telemetry.record(
+                    self._observed_usage
+                    or ProposalUsage(
+                        provider_calls=1,
+                        provider_billed=False,
+                        usage_complete=False,
+                    ),
+                    attempts=self._observed_attempts,
+                )
             raise RuntimeError("private-broker@example.com must not reach the report")
         if case_id == self._invalid_response_case:
             return {"private": "broker@example.com"}
@@ -201,6 +273,8 @@ class _AdapterWrapper:
             entities=entities,
         )
         output = json.loads(json.dumps(response.model_output))
+        if case_id == self._empty_case:
+            output = {"claims": [], "review": []}
         if (
             case_id == self._vary_case
             and self._case_calls[case_id] == 2
@@ -223,6 +297,11 @@ class _AdapterWrapper:
             model_output=output,
             usage=self._usage or response.usage,
         )
+        if self._telemetry is not None:
+            self._telemetry.record(
+                self._observed_usage or result.usage,
+                attempts=self._observed_attempts,
+            )
         self.responses_by_case[case_id] = result
         return result
 
@@ -241,7 +320,14 @@ class ReplayExecutionTests(unittest.TestCase):
             **kwargs,
         )
 
-    def _identity(self, adapter, *, repeats=3, source_tree_dirty=False):
+    def _identity(
+        self,
+        adapter,
+        *,
+        repeats=3,
+        source_tree_dirty=False,
+        evaluation_profile="candidate_validation",
+    ):
         return ReplayIdentity.create(
             code_revision="a" * 40,
             source_tree_hash="f" * 64,
@@ -250,11 +336,12 @@ class ReplayExecutionTests(unittest.TestCase):
             dependency_lock_hash="b" * 64,
             interpretation_fixture_hash=self.interpretation_catalog.manifest_hash,
             claim_fixture_hash=self.claim_catalog.manifest_hash,
-            extraction_schema_version=1,
+            extraction_schema_version=CLAIM_EXTRACTION_SCHEMA_VERSION,
             provider_id=adapter.provider_id,
             model_id=adapter.model_id,
             prompt_id=adapter.prompt_id,
             prompt_hash=adapter.prompt_hash,
+            evaluation_profile=evaluation_profile,
             repeats=repeats,
             case_count=len(self.claim_catalog.cases),
             interpretation_case_count=len(self.interpretation_catalog.cases),
@@ -371,13 +458,19 @@ class ReplayExecutionTests(unittest.TestCase):
             provider_billed=True,
             usage_complete=True,
         )
-        adapter = self._adapter(usage=usage, provider_id="test-provider")
+        telemetry = _MutableTelemetry()
+        adapter = self._adapter(
+            usage=usage,
+            provider_id="test-provider",
+            telemetry=telemetry,
+        )
         identity = self._identity(adapter, repeats=1)
         report = run_claim_replay(
             interpretation_catalog=self.interpretation_catalog,
             claim_catalog=self.claim_catalog,
             adapter=adapter,
             identity=identity,
+            telemetry=telemetry,
         )
 
         self.assertTrue(report.passed)
@@ -400,6 +493,121 @@ class ReplayExecutionTests(unittest.TestCase):
 
         self.assertFalse(report.passed)
         self.assertEqual(0, report.provider_calls)
+
+    def test_nonrecorded_adapter_requires_independent_telemetry(self):
+        usage = ProposalUsage(
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+            cost_microusd=1,
+            provider_calls=1,
+            provider_billed=True,
+            usage_complete=True,
+        )
+        adapter = self._adapter(usage=usage, provider_id="test-provider")
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=self.claim_catalog,
+            adapter=adapter,
+            identity=self._identity(adapter, repeats=1),
+        )
+
+        self.assertFalse(report.passed)
+        self.assertEqual(0, report.provider_calls)
+
+    def test_telemetry_undercount_and_usage_mismatch_fail_closed(self):
+        declared = ProposalUsage(
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=7,
+            cost_microusd=3,
+            provider_calls=1,
+            provider_billed=True,
+            usage_complete=True,
+        )
+        observed = ProposalUsage(
+            provider_calls=1,
+            provider_billed=False,
+            usage_complete=True,
+        )
+        telemetry = _MutableTelemetry()
+        adapter = self._adapter(
+            usage=declared,
+            provider_id="test-provider",
+            telemetry=telemetry,
+            observed_usage=observed,
+            observed_attempts=0,
+        )
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=self.claim_catalog,
+            adapter=adapter,
+            identity=self._identity(adapter, repeats=1),
+            telemetry=telemetry,
+        )
+
+        self.assertFalse(report.passed)
+        self.assertTrue(
+            any(item.error_code == "transport_attempt_count_mismatch" for item in report.results)
+        )
+
+    def test_provider_exception_retains_observed_incomplete_attempt(self):
+        case_id = self.claim_catalog.cases[0].case_id
+        telemetry = _MutableTelemetry()
+        adapter = self._adapter(
+            provider_id="test-provider",
+            fail_case=case_id,
+            telemetry=telemetry,
+        )
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=self.claim_catalog,
+            adapter=adapter,
+            identity=self._identity(adapter, repeats=1),
+            telemetry=telemetry,
+        )
+
+        failed = next(item for item in report.results if item.case_id == case_id)
+        self.assertEqual(1, failed.usage.provider_calls)
+        self.assertFalse(failed.usage.usage_complete)
+        self.assertFalse(report.passed)
+
+    def test_provider_quality_does_not_require_model_to_emit_attack_candidates(self):
+        case_id = "unit-price-without-time-basis-is-not-rent"
+        usage = ProposalUsage(
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+            cost_microusd=1,
+            provider_calls=1,
+            provider_billed=True,
+            usage_complete=True,
+        )
+        telemetry = _MutableTelemetry()
+        adapter = self._adapter(
+            provider_id="test-provider",
+            usage=usage,
+            telemetry=telemetry,
+            empty_case=case_id,
+        )
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=self.claim_catalog,
+            adapter=adapter,
+            identity=self._identity(
+                adapter,
+                repeats=1,
+                evaluation_profile="provider_quality",
+            ),
+            telemetry=telemetry,
+        )
+
+        target = next(item for item in report.results if item.case_id == case_id)
+        self.assertTrue(target.passed)
 
     def test_dirty_source_can_pass_evaluation_but_not_reproducible_gate(self):
         adapter = self._adapter()
@@ -489,7 +697,7 @@ class ReplayExecutionTests(unittest.TestCase):
             dependency_lock_hash="b" * 64,
             interpretation_fixture_hash=self.interpretation_catalog.manifest_hash,
             claim_fixture_hash="f" * 64,
-            extraction_schema_version=1,
+            extraction_schema_version=CLAIM_EXTRACTION_SCHEMA_VERSION,
             provider_id=adapter.provider_id,
             model_id=adapter.model_id,
             prompt_id=adapter.prompt_id,
@@ -807,6 +1015,16 @@ class ReplayCliTests(unittest.TestCase):
             check=False,
         )
 
+    def _run_with_env(self, *arguments, env):
+        return subprocess.run(
+            [sys.executable, str(REPLAY_SCRIPT), *arguments],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
     def test_cli_stamps_identity_and_runs_three_repeat_corpus_without_pii(self):
         completed = self._run("--repeats", "3")
 
@@ -862,12 +1080,52 @@ class ReplayCliTests(unittest.TestCase):
         self.assertEqual(2, completed.returncode)
         self.assertEqual("", completed.stdout)
 
+    def test_provider_mode_requires_explicit_call_permission(self):
+        completed = self._run("--provider", "openai")
+
+        self.assertEqual(2, completed.returncode)
+        self.assertEqual("", completed.stdout)
+        self.assertIn("--allow-provider-calls", completed.stderr)
+
+    def test_provider_mode_requires_key_before_transport_construction(self):
+        environment = dict(os.environ)
+        environment.pop("OPENAI_API_KEY", None)
+        completed = self._run_with_env(
+            "--provider",
+            "openai",
+            "--allow-provider-calls",
+            "--repeats",
+            "1",
+            env=environment,
+        )
+
+        self.assertEqual(2, completed.returncode)
+        self.assertEqual("", completed.stdout)
+        self.assertIn("OPENAI_API_KEY", completed.stderr)
+
+    def test_provider_mode_caps_total_calls_at_eighty_four(self):
+        environment = dict(os.environ)
+        environment["OPENAI_API_KEY"] = "test-key"
+        completed = self._run_with_env(
+            "--provider",
+            "openai",
+            "--allow-provider-calls",
+            "--repeats",
+            "4",
+            env=environment,
+        )
+
+        self.assertEqual(2, completed.returncode)
+        self.assertEqual("", completed.stdout)
+        self.assertIn("84", completed.stderr)
+
     def test_source_hash_reads_only_the_bounded_replay_surface(self):
         paths = self.cli_module._replay_surface_paths()
         relative = {path.relative_to(REPO_ROOT).as_posix() for path in paths}
 
         self.assertIn("email_automation/claim_pipeline/replay.py", relative)
         self.assertIn("scripts/run_claim_pipeline_replay.py", relative)
+        self.assertIn("scripts/claim_pipeline_openai_transport.py", relative)
         self.assertIn("requirements.lock", relative)
         self.assertIn(
             "tests/fixtures/claim_pipeline_interpretation_cases.json", relative
@@ -879,6 +1137,7 @@ class ReplayCliTests(unittest.TestCase):
                 value.startswith("email_automation/claim_pipeline/")
                 or value
                 in {
+                    "scripts/claim_pipeline_openai_transport.py",
                     "scripts/run_claim_pipeline_replay.py",
                     "requirements.lock",
                     "tests/fixtures/claim_pipeline_interpretation_cases.json",

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 from pathlib import Path
 import subprocess
@@ -28,6 +29,9 @@ from email_automation.claim_pipeline.replay import (
     ReplayIdentity,
     run_claim_replay,
 )
+from email_automation.claim_pipeline.provider_replay import (
+    PinnedProviderProposalAdapter,
+)
 
 
 INTERPRETATION_FIXTURE_PATH = (
@@ -37,6 +41,8 @@ CLAIM_FIXTURE_PATH = (
     REPO_ROOT / "tests" / "fixtures" / "claim_pipeline_claim_cases.json"
 )
 DEPENDENCY_LOCK_PATH = REPO_ROOT / "requirements.lock"
+OPENAI_TRANSPORT_PATH = REPO_ROOT / "scripts" / "claim_pipeline_openai_transport.py"
+MAX_PROVIDER_REPLAY_CALLS = 84
 
 
 def _git(*arguments: str) -> bytes:
@@ -56,6 +62,7 @@ def _replay_surface_paths() -> tuple[Path, ...]:
     paths = {
         *REPO_ROOT.joinpath("email_automation", "claim_pipeline").glob("*.py"),
         Path(__file__).resolve(),
+        OPENAI_TRANSPORT_PATH,
         INTERPRETATION_FIXTURE_PATH,
         CLAIM_FIXTURE_PATH,
         DEPENDENCY_LOCK_PATH,
@@ -83,8 +90,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Replay the current sanitized SiteSift boundary fixtures with no "
-            "provider calls or effects."
+            "effects. Recorded mode makes no provider calls."
         )
+    )
+    parser.add_argument(
+        "--provider",
+        choices=("recorded", "openai"),
+        default="recorded",
+    )
+    parser.add_argument(
+        "--allow-provider-calls",
+        action="store_true",
+        help="Required explicit opt-in for the bounded OpenAI replay.",
     )
     parser.add_argument(
         "--repeats",
@@ -101,12 +118,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     interpretation_catalog = load_interpretation_fixture_catalog(
         INTERPRETATION_FIXTURE_PATH
     )
     claim_catalog = load_claim_fixture_catalog(CLAIM_FIXTURE_PATH)
-    adapter = RecordedProposalAdapter(claim_catalog)
+    telemetry = None
+    if args.provider == "recorded":
+        adapter = RecordedProposalAdapter(claim_catalog)
+    else:
+        if not args.allow_provider_calls:
+            parser.error("OpenAI replay requires --allow-provider-calls")
+        planned_calls = args.repeats * len(claim_catalog.cases)
+        if planned_calls > MAX_PROVIDER_REPLAY_CALLS:
+            parser.error(
+                f"OpenAI replay is capped at {MAX_PROVIDER_REPLAY_CALLS} calls"
+            )
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            parser.error("OPENAI_API_KEY is required for OpenAI replay")
+        from claim_pipeline_openai_transport import OpenAIClaimReplayTransport
+
+        try:
+            telemetry = OpenAIClaimReplayTransport(api_key=api_key)
+        except (TypeError, ValueError) as exc:
+            parser.error(str(exc))
+        adapter = PinnedProviderProposalAdapter(telemetry)
     identity = ReplayIdentity.create(
         code_revision=_git("rev-parse", "HEAD").decode("ascii").strip(),
         source_tree_hash=_source_tree_hash(),
@@ -120,6 +158,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         model_id=adapter.model_id,
         prompt_id=adapter.prompt_id,
         prompt_hash=adapter.prompt_hash,
+        evaluation_profile=(
+            "provider_quality" if args.provider == "openai" else "candidate_validation"
+        ),
         repeats=args.repeats,
         case_count=len(claim_catalog.cases),
         interpretation_case_count=len(interpretation_catalog.cases),
@@ -129,6 +170,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         claim_catalog=claim_catalog,
         adapter=adapter,
         identity=identity,
+        telemetry=telemetry,
     )
     serialized = json.dumps(
         report.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True

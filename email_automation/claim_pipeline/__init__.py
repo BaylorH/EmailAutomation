@@ -105,6 +105,14 @@ from .replay import (
     ReplayReport,
     run_claim_replay,
 )
+from .provider_replay import (
+    PINNED_MODEL_ID,
+    PINNED_PROMPT_HASH,
+    PINNED_PROMPT_ID,
+    PINNED_PROVIDER_ID,
+    PinnedProviderProposalAdapter,
+    ProviderTransportResult,
+)
 
 __all__ = [
     "ActionPlan",
@@ -161,11 +169,17 @@ __all__ = [
     "MAX_REPLAY_CALLS",
     "MAX_REPLAY_REPEATS",
     "PlannedAction",
+    "PINNED_MODEL_ID",
+    "PINNED_PROMPT_HASH",
+    "PINNED_PROMPT_ID",
+    "PINNED_PROVIDER_ID",
     "PipelineGate",
     "PipelineScope",
     "ProposalAdapter",
     "ProposalResponse",
     "ProposalUsage",
+    "PinnedProviderProposalAdapter",
+    "ProviderTransportResult",
     "RECORDED_MODEL_ID",
     "RECORDED_PROMPT_HASH",
     "RECORDED_PROMPT_ID",

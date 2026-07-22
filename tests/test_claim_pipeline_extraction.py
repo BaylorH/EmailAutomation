@@ -18,6 +18,7 @@ from email_automation.claim_pipeline.contracts import (
 )
 from email_automation.claim_pipeline.extraction import (
     CLAIM_EXTRACTION_SCHEMA_VERSION,
+    PREDICATE_OUTPUT_CONTRACTS,
     MAX_CLAIM_CANDIDATES,
     MAX_EVIDENCE_CONTENT_CHARS,
     MAX_EVIDENCE_ITEMS,
@@ -156,6 +157,7 @@ class ClaimExtractionBoundaryTests(unittest.TestCase):
                 "resolutionIssues",
                 "supportedPredicates",
                 "outputSchema",
+                "predicateContracts",
             },
             set(payload),
         )
@@ -186,6 +188,24 @@ class ClaimExtractionBoundaryTests(unittest.TestCase):
                 }
             ),
             sorted(schema["properties"]["claims"]["items"]["required"]),
+        )
+        self.assertEqual(2, CLAIM_EXTRACTION_SCHEMA_VERSION)
+        self.assertEqual(
+            {item.value for item in ClaimPredicate},
+            set(payload["predicateContracts"]),
+        )
+        self.assertEqual(PREDICATE_OUTPUT_CONTRACTS, payload["predicateContracts"])
+        self.assertEqual(
+            ["available", "unavailable", "conditional"],
+            payload["predicateContracts"]["availability"]["values"],
+        )
+        self.assertEqual(
+            ["usd_per_sf_year", "usd_per_sf_month", "usd_month", "usd_year"],
+            payload["predicateContracts"]["rent"]["units"],
+        )
+        self.assertEqual(
+            [True],
+            payload["predicateContracts"]["opt_out"]["values"],
         )
 
     def test_request_rejects_oversized_evidence_before_model_inference(self):
@@ -277,6 +297,19 @@ class ClaimExtractionBoundaryTests(unittest.TestCase):
 
         self.assertEqual(accepted_a.claims[0].claim_id, accepted_b.claims[0].claim_id)
         self.assertEqual(rejected_a.issues[0].issue_id, rejected_b.issues[0].issue_id)
+
+    def test_terminal_sentence_punctuation_is_canonicalized_from_exact_excerpt(self):
+        evidence = _evidence("The property is available.")
+        entity = _entity()
+
+        result = _extract(
+            (evidence,),
+            (entity,),
+            _proposal(evidence, entity, evidenceText="The property is available."),
+        )
+
+        self.assertEqual(1, len(result.claims))
+        self.assertEqual("The property is available", result.claims[0].evidence_text)
 
     def test_request_result_and_issue_sequences_are_immutable_and_self_verifying(self):
         evidence = _evidence()
