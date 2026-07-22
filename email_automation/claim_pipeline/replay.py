@@ -536,6 +536,7 @@ class ReplayCaseResult:
     request_id: str
     proposal_digest: str
     outcome_digest: str
+    quality_outcome_digest: str
     accepted_claim_count: int
     accepted_predicate_counts: tuple[tuple[str, int], ...]
     claim_mismatch_field_counts: tuple[tuple[str, int], ...]
@@ -553,6 +554,7 @@ class ReplayCaseResult:
             "requestId": self.request_id,
             "proposalDigest": self.proposal_digest,
             "outcomeDigest": self.outcome_digest,
+            "qualityOutcomeDigest": self.quality_outcome_digest,
             "acceptedClaimCount": self.accepted_claim_count,
             "acceptedPredicateCounts": dict(self.accepted_predicate_counts),
             "claimMismatchFieldCounts": dict(self.claim_mismatch_field_counts),
@@ -591,6 +593,7 @@ class ReplayReport:
     interpretation_variance_case_ids: tuple[str, ...]
     proposal_variance_case_ids: tuple[str, ...]
     outcome_variance_case_ids: tuple[str, ...]
+    quality_outcome_variance_case_ids: tuple[str, ...]
     input_tokens: int
     output_tokens: int
     latency_ms: int
@@ -618,6 +621,9 @@ class ReplayReport:
                 ),
                 "proposalVarianceCaseIds": list(self.proposal_variance_case_ids),
                 "outcomeVarianceCaseIds": list(self.outcome_variance_case_ids),
+                "qualityOutcomeVarianceCaseIds": list(
+                    self.quality_outcome_variance_case_ids
+                ),
                 "inputTokens": self.input_tokens,
                 "outputTokens": self.output_tokens,
                 "totalTokens": self.input_tokens + self.output_tokens,
@@ -1078,6 +1084,24 @@ def _provider_quality_claim_outcome(
     )
 
 
+def _provider_quality_outcome_digest(
+    items: tuple[dict[str, object], ...],
+    reviews: tuple[ProviderReviewExpectation, ...],
+) -> str:
+    return _digest(
+        {
+            "claims": list(_provider_quality_claim_outcome(items)),
+            "reviews": [
+                {
+                    "category": item.category,
+                    "evidenceIndex": item.evidence_index,
+                }
+                for item in reviews
+            ],
+        }
+    )
+
+
 def _provider_claim_mismatch_field_counts(
     expected_items: tuple[dict[str, object], ...],
     actual_items: tuple[dict[str, object], ...],
@@ -1408,6 +1432,7 @@ def _adapter_failure_result(
         request_id=request_id,
         proposal_digest=digest,
         outcome_digest=digest,
+        quality_outcome_digest=digest,
         accepted_claim_count=0,
         accepted_predicate_counts=(),
         claim_mismatch_field_counts=(),
@@ -1491,6 +1516,9 @@ def run_claim_replay(
     outcome_digests: dict[str, set[str]] = {
         case.case_id: set() for case, _ in replay_cases
     }
+    quality_outcome_digests: dict[str, set[str]] = {
+        case.case_id: set() for case, _ in replay_cases
+    }
 
     for repeat_index in range(identity.repeats):
         for case in interpretation_catalog.cases:
@@ -1552,6 +1580,7 @@ def run_claim_replay(
                 )
                 proposal_digests[case_id].add(failed.proposal_digest)
                 outcome_digests[case_id].add(failed.outcome_digest)
+                quality_outcome_digests[case_id].add(failed.quality_outcome_digest)
                 results.append(failed)
                 continue
             if not isinstance(response, ProposalResponse):
@@ -1570,6 +1599,7 @@ def run_claim_replay(
                 )
                 proposal_digests[case_id].add(failed.proposal_digest)
                 outcome_digests[case_id].add(failed.outcome_digest)
+                quality_outcome_digests[case_id].add(failed.quality_outcome_digest)
                 results.append(failed)
                 continue
             observed_usage, telemetry_error = _reconciled_case_usage(
@@ -1588,6 +1618,7 @@ def run_claim_replay(
                 )
                 proposal_digests[case_id].add(failed.proposal_digest)
                 outcome_digests[case_id].add(failed.outcome_digest)
+                quality_outcome_digests[case_id].add(failed.quality_outcome_digest)
                 results.append(failed)
                 continue
             extracted = extract_claims(
@@ -1651,10 +1682,15 @@ def run_claim_replay(
                     if "claim_detail_mismatch" in quality_mismatch_codes
                     else ()
                 )
+                quality_outcome_digest = _provider_quality_outcome_digest(
+                    actual_claim_items,
+                    actual_reviews,
+                )
                 passed = not quality_mismatch_codes
             else:
                 quality_mismatch_codes = ()
                 claim_mismatch_field_counts = ()
+                quality_outcome_digest = outcome_digest
                 passed = (
                     _claim_oracle(source_case) == actual_claim_outcome
                     and _expected_issue_outcome(source_case)
@@ -1671,6 +1707,7 @@ def run_claim_replay(
                     request_id=request.request_id,
                     proposal_digest=proposal_digest,
                     outcome_digest=outcome_digest,
+                    quality_outcome_digest=quality_outcome_digest,
                     accepted_claim_count=len(extracted.claims),
                     accepted_predicate_counts=actual_predicate_counts,
                     claim_mismatch_field_counts=claim_mismatch_field_counts,
@@ -1682,6 +1719,7 @@ def run_claim_replay(
                     usage=observed_usage,
                 )
             )
+            quality_outcome_digests[case_id].add(quality_outcome_digest)
 
     interpretation_variance = tuple(
         sorted(
@@ -1695,6 +1733,13 @@ def run_claim_replay(
     )
     outcome_variance = tuple(
         sorted(case_id for case_id, values in outcome_digests.items() if len(values) > 1)
+    )
+    quality_outcome_variance = tuple(
+        sorted(
+            case_id
+            for case_id, values in quality_outcome_digests.items()
+            if len(values) > 1
+        )
     )
     error_count = sum(bool(item.error_code) for item in results)
     provider_calls = sum(item.usage.provider_calls for item in results)
@@ -1716,14 +1761,17 @@ def run_claim_replay(
             provider_calls == identity.planned_calls
             and provider_billed_calls == identity.planned_calls
         )
+    if identity.evaluation_profile == "provider_quality":
+        repeatability_passed = not quality_outcome_variance
+    else:
+        repeatability_passed = not proposal_variance and not outcome_variance
     evaluation_passed = (
         len(interpretation_results) == identity.planned_interpretations
         and all(item.passed for item in interpretation_results)
         and len(results) == identity.planned_calls
         and all(item.passed for item in results)
         and not interpretation_variance
-        and not proposal_variance
-        and not outcome_variance
+        and repeatability_passed
         and error_count == 0
         and usage_complete
         and provider_usage_matches_identity
@@ -1738,6 +1786,7 @@ def run_claim_replay(
         interpretation_variance_case_ids=interpretation_variance,
         proposal_variance_case_ids=proposal_variance,
         outcome_variance_case_ids=outcome_variance,
+        quality_outcome_variance_case_ids=quality_outcome_variance,
         input_tokens=sum(item.usage.input_tokens for item in results),
         output_tokens=sum(item.usage.output_tokens for item in results),
         latency_ms=sum(item.usage.latency_ms for item in results),

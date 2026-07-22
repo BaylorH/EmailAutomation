@@ -335,6 +335,8 @@ class _ProviderQualityRecordedAdapter:
         nonsemantic_variation_case="",
         additional_accepted_claim_case="",
         text_value_span_variation_case="",
+        nonsemantic_repeat_variation_case="",
+        semantic_repeat_variation_case="",
     ):
         self._provider_cases = {
             case.case_id: case for case in provider_catalog.cases
@@ -350,6 +352,9 @@ class _ProviderQualityRecordedAdapter:
         self._nonsemantic_variation_case = nonsemantic_variation_case
         self._additional_accepted_claim_case = additional_accepted_claim_case
         self._text_value_span_variation_case = text_value_span_variation_case
+        self._nonsemantic_repeat_variation_case = nonsemantic_repeat_variation_case
+        self._semantic_repeat_variation_case = semantic_repeat_variation_case
+        self._case_calls = {}
         self.calls = 0
 
     def propose(self, *, case_id, request, evidence, entities):
@@ -361,6 +366,7 @@ class _ProviderQualityRecordedAdapter:
             return value
 
         self.calls += 1
+        self._case_calls[case_id] = self._case_calls.get(case_id, 0) + 1
         case = self._provider_cases[case_id]
         entity_by_key = {
             (item.relationship, item.suite, item.canonical_address): item
@@ -430,6 +436,18 @@ class _ProviderQualityRecordedAdapter:
             for claim in model_claims:
                 if claim["predicate"] in {"remediation", "correction"}:
                     claim["value"] = claim["evidenceText"]
+        if (
+            case_id == self._nonsemantic_repeat_variation_case
+            and self._case_calls[case_id] == 2
+            and model_claims
+        ):
+            model_claims[0]["confidence"] = 0.91
+        if (
+            case_id == self._semantic_repeat_variation_case
+            and self._case_calls[case_id] == 2
+            and model_claims
+        ):
+            model_claims[0]["effectiveAt"] = "2026-07-22"
         if case_id == self._rejected_candidate_case:
             rejected = next(
                 source.claims[index]
@@ -1026,6 +1044,75 @@ class ReplayExecutionTests(unittest.TestCase):
                 self.assertTrue(report.passed)
                 result = next(item for item in report.results if item.case_id == case_id)
                 self.assertEqual((), result.quality_mismatch_codes)
+
+    def test_provider_quality_repeat_gate_ignores_only_nonsemantic_variance(self):
+        case_id = "complete-property-facts"
+        telemetry = _MutableTelemetry()
+        adapter = _ProviderQualityRecordedAdapter(
+            self.provider_quality_catalog,
+            self.claim_catalog,
+            telemetry,
+            nonsemantic_repeat_variation_case=case_id,
+        )
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=self.claim_catalog,
+            provider_quality_catalog=self.provider_quality_catalog,
+            adapter=adapter,
+            identity=self._identity(
+                adapter,
+                repeats=2,
+                evaluation_profile="provider_quality",
+                evaluation_fixture_hash=self.provider_quality_catalog.manifest_hash,
+                case_count=len(self.provider_quality_catalog.cases),
+            ),
+            telemetry=telemetry,
+        )
+
+        self.assertTrue(report.passed)
+        self.assertIn(case_id, report.proposal_variance_case_ids)
+        self.assertIn(case_id, report.outcome_variance_case_ids)
+        self.assertEqual((), report.quality_outcome_variance_case_ids)
+        self.assertIn(
+            "qualityOutcomeDigest",
+            next(
+                item
+                for item in report.to_dict()["results"]
+                if item["caseId"] == case_id
+            ),
+        )
+        self.assertEqual(
+            [], report.to_dict()["summary"]["qualityOutcomeVarianceCaseIds"]
+        )
+
+    def test_provider_quality_repeat_gate_blocks_semantic_outcome_variance(self):
+        case_id = "complete-property-facts"
+        telemetry = _MutableTelemetry()
+        adapter = _ProviderQualityRecordedAdapter(
+            self.provider_quality_catalog,
+            self.claim_catalog,
+            telemetry,
+            semantic_repeat_variation_case=case_id,
+        )
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=self.claim_catalog,
+            provider_quality_catalog=self.provider_quality_catalog,
+            adapter=adapter,
+            identity=self._identity(
+                adapter,
+                repeats=2,
+                evaluation_profile="provider_quality",
+                evaluation_fixture_hash=self.provider_quality_catalog.manifest_hash,
+                case_count=len(self.provider_quality_catalog.cases),
+            ),
+            telemetry=telemetry,
+        )
+
+        self.assertFalse(report.passed)
+        self.assertEqual((case_id,), report.quality_outcome_variance_case_ids)
 
     def test_dirty_source_can_pass_evaluation_but_not_reproducible_gate(self):
         adapter = self._adapter()
