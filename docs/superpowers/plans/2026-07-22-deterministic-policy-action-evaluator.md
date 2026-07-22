@@ -28,7 +28,7 @@
 - Create: `tests/fixtures/claim_pipeline_policy_cases.json`
 - Create: `tests/test_claim_pipeline_policy_fixtures.py`
 
-- [ ] **Step 1: Write failing loader tests**
+- [x] **Step 1: Write failing loader tests**
 
 Require at least 19 cases, every governing dimension, a reproducible manifest hash, exact keys, known enums/reason codes, valid entity and claim references, required and forbidden action signatures, and `effectPolicy=no_side_effect`.
 
@@ -44,23 +44,23 @@ self.assertEqual(
 
 Mutation tests must reject duplicate case IDs, unknown keys, missing dimensions, unknown reason codes, malformed current state, and any side-effect policy.
 
-- [ ] **Step 2: Run tests and observe import failure**
+- [x] **Step 2: Run tests and observe import failure**
 
 Run: `.venv/bin/python -m unittest tests.test_claim_pipeline_policy_fixtures`
 
 Expected: FAIL because `policy_fixtures` does not exist.
 
-- [ ] **Step 3: Implement the strict loader**
+- [x] **Step 3: Implement the strict loader**
 
 Define schema version 1, required dimensions, frozen `PolicyFixtureCase` and `PolicyFixtureCatalog`, exact-key validation, cross-reference validation, enum validation, and a canonical SHA-256 manifest.
 
-- [ ] **Step 4: Add the broad lattice**
+- [x] **Step 4: Add the broad lattice**
 
 Cover available/missing facts, explicit unavailable, tour-only unavailable near miss, hard versus soft occupancy, hard term versus absent minimum, definite versus tentative remediation, accepting backups, split suites, alternate-property isolation, correction supersession, complete facts, OOO return, redirect approval, opt-out plus call, conflicting claims, unknown hard requirements, and order permutations.
 
 Every expected entity result declares exact four-axis states, approval class, sorted reasons, missing fields, required actions, and forbidden actions.
 
-- [ ] **Step 5: Run green and commit**
+- [x] **Step 5: Run green and commit**
 
 Run: `.venv/bin/python -m unittest tests.test_claim_pipeline_policy_fixtures`
 
@@ -215,4 +215,3 @@ Commit: `git commit -m "Prove deterministic campaign policy planning"`
 ## Completion Gate
 
 This phase is complete only when the lattice is strict and broad, every decision dimension is independent, terminal intent always freezes follow-ups, alternate entities cannot mutate the target row, sensitive actions stay human-owned, ambiguity creates actionable reasons, repeated evaluation is stable, package isolation remains intact, and the full suite passes. It does not authorize persistence, shadow integration, drafting, sending, Sheet writes, deployment, or production use.
-

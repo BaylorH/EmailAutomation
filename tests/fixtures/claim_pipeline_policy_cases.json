@@ -1,0 +1,1288 @@
+{
+  "schemaVersion": 1,
+  "catalogId": "sitesift-policy-lattice-v1",
+  "cases": [
+    {
+      "caseId": "available-missing-facts",
+      "dimensions": [
+        "market_state",
+        "fit_state",
+        "completeness",
+        "conversation_state",
+        "entity_isolation",
+        "approval_boundary",
+        "claim_conflict",
+        "order_independence"
+      ],
+      "contract": {
+        "requiredFields": [
+          "total_sf",
+          "rent"
+        ]
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "availability",
+          "value": "available",
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "available",
+            "fitState": "viable",
+            "completenessState": "incomplete",
+            "conversationState": "active",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "broker_confirmed_available",
+              "required_facts_missing"
+            ],
+            "missingFields": [
+              "total_sf",
+              "rent"
+            ],
+            "requiredActions": [
+              "fact_update:automatic"
+            ],
+            "forbiddenActions": [
+              "followup_freeze:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "explicit-unavailable",
+      "dimensions": [
+        "market_state",
+        "conversation_state"
+      ],
+      "contract": {},
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "availability",
+          "value": "unavailable",
+          "polarity": "negative",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "unavailable",
+            "fitState": "nonviable",
+            "completenessState": "not_applicable",
+            "conversationState": "terminal_intent",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "broker_confirmed_unavailable"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic",
+              "followup_freeze:automatic",
+              "status_transition:automatic"
+            ],
+            "forbiddenActions": [
+              "outbound_draft:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "tour-only-unavailable-near-miss",
+      "dimensions": [
+        "market_state"
+      ],
+      "contract": {
+        "requiredFields": [
+          "rent"
+        ]
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "incomplete",
+            "conversationState": "active",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "market_state_unknown",
+              "required_facts_missing"
+            ],
+            "missingFields": [
+              "rent"
+            ],
+            "requiredActions": [],
+            "forbiddenActions": [
+              "followup_freeze:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "hard-occupancy-miss",
+      "dimensions": [
+        "fit_state",
+        "conversation_state"
+      ],
+      "contract": {
+        "hardRequirements": {
+          "occupancy_by": "2026-09-01"
+        }
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "availability",
+          "value": "available",
+          "polarity": "positive",
+          "modality": "asserted"
+        },
+        {
+          "key": "c2",
+          "subject": "target",
+          "predicate": "occupancy_date",
+          "value": "2027-01-01",
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "available",
+            "fitState": "nonviable",
+            "completenessState": "not_applicable",
+            "conversationState": "terminal_intent",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "broker_confirmed_available",
+              "hard_occupancy_after_deadline"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic",
+              "followup_freeze:automatic",
+              "status_transition:automatic"
+            ],
+            "forbiddenActions": []
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "soft-occupancy-preference",
+      "dimensions": [
+        "fit_state"
+      ],
+      "contract": {
+        "softPreferences": {
+          "occupancy_by": "2026-09-01"
+        }
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "availability",
+          "value": "available",
+          "polarity": "positive",
+          "modality": "asserted"
+        },
+        {
+          "key": "c2",
+          "subject": "target",
+          "predicate": "occupancy_date",
+          "value": "2027-01-01",
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "available",
+            "fitState": "viable",
+            "completenessState": "incomplete",
+            "conversationState": "active",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "broker_confirmed_available"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic"
+            ],
+            "forbiddenActions": [
+              "followup_freeze:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "hard-term-miss",
+      "dimensions": [
+        "fit_state"
+      ],
+      "contract": {
+        "hardRequirements": {
+          "minimum_term_months": 60
+        }
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "term",
+          "value": 24,
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "unknown",
+            "fitState": "nonviable",
+            "completenessState": "not_applicable",
+            "conversationState": "terminal_intent",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "hard_term_below_minimum",
+              "market_state_unknown"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic",
+              "followup_freeze:automatic",
+              "status_transition:automatic"
+            ],
+            "forbiddenActions": []
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "term-without-minimum",
+      "dimensions": [
+        "fit_state"
+      ],
+      "contract": {},
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "term",
+          "value": 24,
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "incomplete",
+            "conversationState": "active",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "market_state_unknown"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic"
+            ],
+            "forbiddenActions": [
+              "followup_freeze:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "definite-funded-remediation",
+      "dimensions": [
+        "fit_state"
+      ],
+      "contract": {
+        "hardRequirements": {
+          "drive_ins": 1,
+          "occupancy_by": "2026-10-01"
+        }
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "remediation",
+          "value": {
+            "drive_ins": 1,
+            "funded": true,
+            "by": "2026-09-01"
+          },
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "available",
+            "fitState": "conditional",
+            "completenessState": "incomplete",
+            "conversationState": "active",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "definite_remediation_before_deadline"
+            ],
+            "missingFields": [],
+            "requiredActions": [],
+            "forbiddenActions": [
+              "followup_freeze:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "tentative-remediation",
+      "dimensions": [
+        "approval_boundary"
+      ],
+      "contract": {
+        "hardRequirements": {
+          "drive_ins": 1
+        }
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "remediation",
+          "value": {
+            "drive_ins": 1
+          },
+          "polarity": "positive",
+          "modality": "possible"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "blocked",
+            "conversationState": "review",
+            "approvalClass": "human_required",
+            "reasonCodes": [
+              "market_state_unknown",
+              "tentative_remediation_requires_review"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "review_item:human_required"
+            ],
+            "forbiddenActions": [
+              "followup_freeze:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "accepting-backups",
+      "dimensions": [
+        "market_state",
+        "approval_boundary"
+      ],
+      "contract": {},
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "asking_status",
+          "value": "accepting_backups",
+          "polarity": "positive",
+          "modality": "conditional"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "conditional",
+            "fitState": "review",
+            "completenessState": "blocked",
+            "conversationState": "review",
+            "approvalClass": "human_required",
+            "reasonCodes": [
+              "accepting_backup_offers"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "review_item:human_required"
+            ],
+            "forbiddenActions": [
+              "followup_freeze:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "split-suite-mixed",
+      "dimensions": [
+        "entity_isolation"
+      ],
+      "contract": {},
+      "entities": [
+        {
+          "key": "suite_a",
+          "type": "suite",
+          "relationship": "target_component"
+        },
+        {
+          "key": "suite_b",
+          "type": "suite",
+          "relationship": "target_component"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "suite_a",
+          "predicate": "availability",
+          "value": "unavailable",
+          "polarity": "negative",
+          "modality": "asserted"
+        },
+        {
+          "key": "c2",
+          "subject": "suite_b",
+          "predicate": "availability",
+          "value": "available",
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "suite_a": "active",
+          "suite_b": "active"
+        },
+        "followupStates": {
+          "suite_a": "waiting",
+          "suite_b": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "suite_a",
+            "marketState": "unavailable",
+            "fitState": "nonviable",
+            "completenessState": "not_applicable",
+            "conversationState": "terminal_intent",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "broker_confirmed_unavailable"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic",
+              "followup_freeze:automatic",
+              "status_transition:automatic"
+            ],
+            "forbiddenActions": []
+          },
+          {
+            "subject": "suite_b",
+            "marketState": "available",
+            "fitState": "viable",
+            "completenessState": "incomplete",
+            "conversationState": "active",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "broker_confirmed_available"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic"
+            ],
+            "forbiddenActions": [
+              "followup_freeze:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "alternate-property-isolation",
+      "dimensions": [
+        "entity_isolation",
+        "approval_boundary"
+      ],
+      "contract": {
+        "alternatePolicy": "review"
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        },
+        {
+          "key": "alternate",
+          "type": "property",
+          "relationship": "alternate"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "availability",
+          "value": "unavailable",
+          "polarity": "negative",
+          "modality": "asserted"
+        },
+        {
+          "key": "c2",
+          "subject": "alternate",
+          "predicate": "identity",
+          "value": "900 Replacement Rd",
+          "polarity": "positive",
+          "modality": "asserted"
+        },
+        {
+          "key": "c3",
+          "subject": "alternate",
+          "predicate": "rent",
+          "value": 14,
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active",
+          "alternate": "active"
+        },
+        "followupStates": {
+          "target": "waiting",
+          "alternate": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "unavailable",
+            "fitState": "nonviable",
+            "completenessState": "not_applicable",
+            "conversationState": "terminal_intent",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "broker_confirmed_unavailable"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic",
+              "followup_freeze:automatic",
+              "status_transition:automatic"
+            ],
+            "forbiddenActions": []
+          },
+          {
+            "subject": "alternate",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "blocked",
+            "conversationState": "review",
+            "approvalClass": "human_required",
+            "reasonCodes": [
+              "alternate_property_requires_approval",
+              "market_state_unknown"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "alternate_property_proposal:human_required",
+              "review_item:human_required"
+            ],
+            "forbiddenActions": [
+              "fact_update:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "correction-supersedes-rent",
+      "dimensions": [
+        "order_independence"
+      ],
+      "contract": {
+        "requiredFields": [
+          "rent"
+        ]
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "old",
+          "subject": "target",
+          "predicate": "rent",
+          "value": 12,
+          "polarity": "positive",
+          "modality": "asserted"
+        },
+        {
+          "key": "new",
+          "subject": "target",
+          "predicate": "rent",
+          "value": 13.5,
+          "polarity": "positive",
+          "modality": "corrected",
+          "supersedes": "old"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "complete",
+            "conversationState": "terminal_intent",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "market_state_unknown",
+              "required_facts_complete"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic",
+              "followup_freeze:automatic",
+              "status_transition:automatic"
+            ],
+            "forbiddenActions": []
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "complete-required-facts",
+      "dimensions": [
+        "completeness",
+        "conversation_state"
+      ],
+      "contract": {
+        "requiredFields": [
+          "total_sf",
+          "rent",
+          "operating_expenses"
+        ]
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "total_sf",
+          "value": 10000,
+          "polarity": "positive",
+          "modality": "asserted"
+        },
+        {
+          "key": "c2",
+          "subject": "target",
+          "predicate": "rent",
+          "value": 15,
+          "polarity": "positive",
+          "modality": "asserted"
+        },
+        {
+          "key": "c3",
+          "subject": "target",
+          "predicate": "operating_expenses",
+          "value": 3.25,
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "complete",
+            "conversationState": "terminal_intent",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "market_state_unknown",
+              "required_facts_complete"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic",
+              "followup_freeze:automatic",
+              "status_transition:automatic"
+            ],
+            "forbiddenActions": []
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "out-of-office-return",
+      "dimensions": [
+        "conversation_state"
+      ],
+      "contract": {
+        "outOfOfficePolicy": "wait_for_return"
+      },
+      "entities": [
+        {
+          "key": "contact",
+          "type": "contact",
+          "relationship": "broker_contact"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "contact",
+          "predicate": "return_date",
+          "value": "2026-07-29",
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "contact": "active"
+        },
+        "followupStates": {
+          "contact": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "contact",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "blocked",
+            "conversationState": "waiting_broker",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "broker_return_date",
+              "market_state_unknown"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "status_transition:automatic"
+            ],
+            "forbiddenActions": [
+              "followup_freeze:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "redirect-requires-approval",
+      "dimensions": [
+        "approval_boundary"
+      ],
+      "contract": {
+        "redirectPolicy": "approval_required"
+      },
+      "entities": [
+        {
+          "key": "contact",
+          "type": "contact",
+          "relationship": "broker_contact"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "contact",
+          "predicate": "referral",
+          "value": "pat@example.test",
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "contact": "active"
+        },
+        "followupStates": {
+          "contact": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "contact",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "blocked",
+            "conversationState": "review",
+            "approvalClass": "human_required",
+            "reasonCodes": [
+              "market_state_unknown",
+              "redirect_requires_approval"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "recipient_change:human_required",
+              "review_item:human_required"
+            ],
+            "forbiddenActions": [
+              "recipient_change:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "opt-out-plus-call",
+      "dimensions": [
+        "approval_boundary",
+        "conversation_state"
+      ],
+      "contract": {
+        "callPolicy": "approval_required"
+      },
+      "entities": [
+        {
+          "key": "contact",
+          "type": "contact",
+          "relationship": "broker_contact"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "contact",
+          "predicate": "opt_out",
+          "value": true,
+          "polarity": "positive",
+          "modality": "asserted"
+        },
+        {
+          "key": "c2",
+          "subject": "contact",
+          "predicate": "call_request",
+          "value": true,
+          "polarity": "positive",
+          "modality": "requested"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "contact": "active"
+        },
+        "followupStates": {
+          "contact": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "contact",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "not_applicable",
+            "conversationState": "terminal_intent",
+            "approvalClass": "human_required",
+            "reasonCodes": [
+              "call_requires_approval",
+              "contact_opted_out",
+              "market_state_unknown"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "followup_freeze:automatic",
+              "status_transition:automatic",
+              "call_request:human_required"
+            ],
+            "forbiddenActions": [
+              "outbound_draft:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "conflicting-availability",
+      "dimensions": [
+        "claim_conflict"
+      ],
+      "contract": {},
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "availability",
+          "value": "available",
+          "polarity": "positive",
+          "modality": "asserted"
+        },
+        {
+          "key": "c2",
+          "subject": "target",
+          "predicate": "availability",
+          "value": "unavailable",
+          "polarity": "negative",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "blocked",
+            "conversationState": "review",
+            "approvalClass": "human_required",
+            "reasonCodes": [
+              "conflicting_active_claims",
+              "market_state_unknown"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "review_item:human_required"
+            ],
+            "forbiddenActions": [
+              "fact_update:automatic",
+              "followup_freeze:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "unsupported-hard-requirement",
+      "dimensions": [
+        "claim_conflict",
+        "approval_boundary"
+      ],
+      "contract": {
+        "hardRequirements": {
+          "rail_spur": true
+        }
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "availability",
+          "value": "available",
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "available",
+            "fitState": "review",
+            "completenessState": "blocked",
+            "conversationState": "review",
+            "approvalClass": "human_required",
+            "reasonCodes": [
+              "broker_confirmed_available",
+              "unsupported_hard_requirement"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic",
+              "review_item:human_required"
+            ],
+            "forbiddenActions": [
+              "followup_freeze:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    }
+  ]
+}
+
