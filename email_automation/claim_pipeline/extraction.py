@@ -920,10 +920,7 @@ def extract_claims(
             accepted.append(claim)
         except CandidateValidationError as exc:
             raw_evidence_id = raw.get("evidenceId") if isinstance(raw, Mapping) else None
-            if isinstance(raw_evidence_id, str) and raw_evidence_id in evidence_by_id:
-                blocked_claim_evidence_ids.add(raw_evidence_id)
-            else:
-                block_all_claims = True
+            blocked_known_key = False
             if isinstance(raw, Mapping):
                 raw_entity_id = raw.get("subjectEntityId")
                 raw_predicate = raw.get("predicate")
@@ -941,6 +938,12 @@ def extract_claims(
                     blocked_claim_keys.add(
                         (normalized_entity_id, normalized_predicate)
                     )
+                    blocked_known_key = True
+            if not blocked_known_key:
+                if isinstance(raw_evidence_id, str) and raw_evidence_id in evidence_by_id:
+                    blocked_claim_evidence_ids.add(raw_evidence_id)
+                else:
+                    block_all_claims = True
             issues.append(
                 _issue_for_candidate(
                     code=exc.code,

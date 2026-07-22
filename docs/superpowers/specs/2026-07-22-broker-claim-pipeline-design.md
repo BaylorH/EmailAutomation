@@ -187,6 +187,8 @@ Deterministic validators reject or downgrade claims when:
 
 Corrections remain append-only. The new claim supersedes an earlier claim; history is not erased.
 
+Candidate rejection is isolated to the narrowest safe scope. When the candidate names a known entity and supported predicate, rejection blocks that entity/predicate pair while other independently valid claims from the same evidence remain eligible. Review items still block their whole evidence item, and malformed candidates with no trustworthy entity/predicate identity still block the evidence or bundle. One bad interpretation cannot erase unrelated facts or intents from a compound broker reply.
+
 ## Stage 5: Effective Campaign Contract
 
 Each campaign has a versioned contract compiled from:

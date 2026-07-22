@@ -1246,7 +1246,6 @@ def _provider_quality_mismatches(
     actual_predicate_counts: tuple[tuple[str, int], ...],
     actual_reviews: tuple[ProviderReviewExpectation, ...],
     review_parse_mismatches: tuple[str, ...],
-    issue_codes: tuple[str, ...],
 ) -> tuple[str, ...]:
     mismatches = set(review_parse_mismatches)
     expected_claims = set(expected_claim_digests)
@@ -1271,8 +1270,6 @@ def _provider_quality_mismatches(
             mismatches.add("missing_expected_reviews")
         if actual_review_set - expected_review_set:
             mismatches.add("unexpected_reviews")
-    if any(code != "model_requested_review" for code in issue_codes):
-        mismatches.add("provider_candidate_rejected")
     return tuple(sorted(mismatches))
 
 
@@ -1643,7 +1640,6 @@ def run_claim_replay(
                     actual_predicate_counts=actual_predicate_counts,
                     actual_reviews=actual_reviews,
                     review_parse_mismatches=review_parse_mismatches,
-                    issue_codes=issue_codes,
                 )
                 claim_mismatch_field_counts = (
                     _provider_claim_mismatch_field_counts(

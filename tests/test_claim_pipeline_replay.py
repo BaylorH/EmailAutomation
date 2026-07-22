@@ -830,14 +830,6 @@ class ReplayExecutionTests(unittest.TestCase):
                 "review_binding_mismatch",
             ),
             (
-                {
-                    "rejected_candidate_case": (
-                        "ordinary-prose-does-not-fabricate-entities"
-                    )
-                },
-                "provider_candidate_rejected",
-            ),
-            (
                 {"detail_mismatch_case": "complete-property-facts"},
                 "claim_detail_mismatch",
             ),
@@ -893,23 +885,44 @@ class ReplayExecutionTests(unittest.TestCase):
                         {"effectiveAt": 1},
                         failed.to_dict()["claimMismatchFieldCounts"],
                     )
-                if expected_code == "provider_candidate_rejected":
-                    failed = next(
-                        item
-                        for item in report.results
-                        if item.case_id
-                        == "ordinary-prose-does-not-fabricate-entities"
-                    )
-                    self.assertEqual(
-                        (("predicate_evidence_mismatch:availability", 1),),
-                        failed.rejected_predicate_counts,
-                    )
-                    self.assertEqual(
-                        {"predicate_evidence_mismatch:availability": 1},
-                        failed.to_dict()["rejectedPredicateCounts"],
-                    )
                 serialized = json.dumps(report.to_dict(), sort_keys=True)
                 self.assertNotIn("private free-form reason", serialized)
+
+    def test_provider_quality_retains_safe_rejection_diagnostics_without_failing(self):
+        telemetry = _MutableTelemetry()
+        adapter = _ProviderQualityRecordedAdapter(
+            self.provider_quality_catalog,
+            self.claim_catalog,
+            telemetry,
+            rejected_candidate_case="ordinary-prose-does-not-fabricate-entities",
+        )
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=self.claim_catalog,
+            provider_quality_catalog=self.provider_quality_catalog,
+            adapter=adapter,
+            identity=self._identity(
+                adapter,
+                repeats=1,
+                evaluation_profile="provider_quality",
+                evaluation_fixture_hash=self.provider_quality_catalog.manifest_hash,
+                case_count=len(self.provider_quality_catalog.cases),
+            ),
+            telemetry=telemetry,
+        )
+
+        self.assertTrue(report.passed)
+        result = next(
+            item
+            for item in report.results
+            if item.case_id == "ordinary-prose-does-not-fabricate-entities"
+        )
+        self.assertEqual(
+            (("predicate_evidence_mismatch:availability", 1),),
+            result.rejected_predicate_counts,
+        )
+        self.assertEqual((), result.quality_mismatch_codes)
 
     def test_provider_quality_accepts_valid_quote_and_confidence_variants(self):
         telemetry = _MutableTelemetry()

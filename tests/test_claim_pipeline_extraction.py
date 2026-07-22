@@ -438,6 +438,42 @@ class ClaimExtractionBoundaryTests(unittest.TestCase):
 
         self.assertEqual((), result.claims)
 
+    def test_invalid_known_candidate_does_not_erase_other_predicates_from_evidence(self):
+        evidence = _evidence("Could we schedule a call and a tour?")
+        entity = _entity(evidence_ids=(evidence.evidence_id,))
+        call = _proposal(
+            evidence,
+            entity,
+            predicate="call_request",
+            value=True,
+            evidenceText="Could we schedule a call",
+            modality="requested",
+        )
+        invalid_tour = _proposal(
+            evidence,
+            entity,
+            predicate="tour_request",
+            value=True,
+            evidenceText="a tour",
+            modality="requested",
+        )
+
+        result = _extract(
+            (evidence,),
+            (entity,),
+            call,
+            invalid_tour,
+        )
+
+        self.assertEqual(
+            (ClaimPredicate.CALL_REQUEST,),
+            tuple(item.predicate for item in result.claims),
+        )
+        self.assertEqual(
+            ("predicate_evidence_mismatch",),
+            tuple(item.code for item in result.issues),
+        )
+
     def test_schema_valid_object_value_becomes_review_instead_of_crashing(self):
         evidence = _evidence()
         entity = _entity()

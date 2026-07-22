@@ -41,15 +41,17 @@ Provider pass criteria are:
 
 - inclusion of every required semantic claim from the provider case after every proposed claim passes the unchanged deterministic validator;
 - exact review category and evidence-index equality;
-- no malformed or validator-rejected provider candidate;
+- no malformed provider response, missing required claim, accepted unsafe claim, or wrong review outcome;
 - complete independent transport accounting;
 - no proposal or outcome variance across repeats.
 
 Required semantic matching preserves evidence index, subject, predicate, value, actor role, polarity, modality, unit, effective date, and correction linkage, while treating numerically equal integer/float representations as equivalent. It intentionally ignores only the exact contiguous `evidenceText` span and the precise accepted confidence number: multiple validator-approved excerpts can support the same fact, and the prompt's `0.99` instruction conflicts with older accepted fixture confidence values between `0.95` and `0.98`. The fixture's full accepted digests remain unchanged and continue to govern deterministic candidate validation.
 
-Additional claims are permitted only after they pass the same deterministic evidence, entity, freshness, actor, predicate, and conflict validators. The source candidate catalog proves required behavior, but it does not prove that every other validator-approved claim is wrong; treating its union as an exhaustive output list would repeat the candidate-oracle mistake. Redundant valid claims remain visible for the later deterministic policy layer to turn into no-ops. Missing required claims, rejected candidates, wrong reviews, or semantic replacements still fail.
+Additional claims are permitted only after they pass the same deterministic evidence, entity, freshness, actor, predicate, and conflict validators. The source candidate catalog proves required behavior, but it does not prove that every other validator-approved claim is wrong; treating its union as an exhaustive output list would repeat the candidate-oracle mistake. Redundant valid claims remain visible for the later deterministic policy layer to turn into no-ops. Missing required claims, wrong reviews, or semantic replacements still fail.
 
-The report adds only sorted safe mismatch codes and the provider-quality fixture hash. Allowed mismatch codes distinguish missing required claims, missing/unexpected reviews, review-binding errors, invalid review categories, rejected provider candidates, and fixed-field semantic differences. Raw evidence, addresses, emails, model prose, claim values, and review prose remain absent.
+Validator-rejected proposals remain visible through fixed validator-code/predicate counts but do not fail provider quality by themselves. They are untrusted intermediate proposals, not accepted system state. A rejection still causes failure indirectly whenever it removes a required claim or changes the required review outcome. This measures whether the composed model-plus-validator boundary is safe and complete while preserving evidence about model behavior for later cost and prompt work.
+
+The report adds only sorted safe mismatch codes, fixed rejected-predicate counts, and the provider-quality fixture hash. Allowed mismatch codes distinguish missing required claims, missing/unexpected reviews, review-binding errors, invalid review categories, and fixed-field semantic differences. Raw evidence, addresses, emails, model prose, claim values, and review prose remain absent.
 
 ## Failure And Cost Policy
 
