@@ -176,19 +176,19 @@ Commit: `git commit -m "Plan validated no-effect campaign actions"`
 - Modify: `tests/test_claim_pipeline_policy.py`
 - Modify: this plan
 
-- [ ] **Step 1: Write failing repeatability and import tests**
+- [x] **Step 1: Write failing repeatability and import tests**
 
 Evaluate the catalog three times with normal and reversed entity/claim order. Require identical decision dictionaries, plans, action IDs, idempotency keys, and result digests. Importing policy modules must not load Firebase, Firestore, OpenAI, requests, processing, messaging, Sheets, follow-up, email, or notifications.
 
-- [ ] **Step 2: Observe export/isolation failures**
+- [x] **Step 2: Observe export/isolation failures**
 
 Run: `.venv/bin/python -m unittest tests.test_claim_pipeline_policy tests.test_claim_pipeline_isolation`
 
-- [ ] **Step 3: Export the API and finalize the digest**
+- [x] **Step 3: Export the API and finalize the digest**
 
 Export policy request/result/fixture types and `evaluate_policy`. Hash canonical ordered decision and plan dictionaries only; exclude timing and diagnostics.
 
-- [ ] **Step 4: Run the focused suite**
+- [x] **Step 4: Run the focused suite**
 
 ```bash
 .venv/bin/python -m unittest   tests.test_claim_pipeline_policy_fixtures   tests.test_claim_pipeline_policy   tests.test_claim_pipeline_contracts   tests.test_claim_pipeline_validation   tests.test_claim_pipeline_claim_fixtures   tests.test_claim_pipeline_replay   tests.test_claim_pipeline_isolation
@@ -196,7 +196,7 @@ Export policy request/result/fixture types and `evaluate_policy`. Hash canonical
 
 Expected: all focused tests pass.
 
-- [ ] **Step 5: Run compilation, integrity, and full suite**
+- [x] **Step 5: Run compilation, integrity, and full suite**
 
 ```bash
 .venv/bin/python -m compileall -q email_automation/claim_pipeline
@@ -206,11 +206,21 @@ git diff --check
 
 Expected: exit 0 and the full backend suite passes.
 
-- [ ] **Step 6: Record exact evidence and commit**
+- [x] **Step 6: Record exact evidence and commit**
 
 Update this plan with exact counts and any justified oracle correction. Do not weaken expectations to fit implementation.
 
 Commit: `git commit -m "Prove deterministic campaign policy planning"`
+
+### Verification Evidence
+
+- The strict catalog contains 22 executable policy cases spanning all eight required dimensions.
+- The initial evaluator run exposed and then closed unproven hard-requirement and direct drive-in mismatch gaps; the expected policy was not weakened.
+- Every catalog case passes three-repeat and reversed entity/claim order digest checks.
+- Focused policy, contract, validator, claim-fixture, replay, and isolation verification passed 118 tests in 2.257 seconds.
+- Claim-package compilation and `git diff --check` exited zero.
+- The full backend suite passed 2,076 tests in 43.404 seconds. Its missing Firebase/Azure credential warning is expected in the isolated test environment; scheduler functionality stayed disabled.
+- No provider, Graph, Firebase, Sheets, mailbox, queue, notification, drafting, sending, deployment, or live customer surface was connected.
 
 ## Completion Gate
 
