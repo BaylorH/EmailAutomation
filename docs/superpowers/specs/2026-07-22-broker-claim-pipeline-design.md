@@ -190,6 +190,8 @@ Corrections remain append-only. The new claim supersedes an earlier claim; histo
 
 Candidate rejection is isolated to the narrowest safe scope. When the candidate names a known entity and supported predicate, rejection blocks that entity/predicate pair while other independently valid claims from the same evidence remain eligible. Review items still block their whole evidence item, and malformed candidates with no trustworthy entity/predicate identity still block the evidence or bundle. One bad interpretation cannot erase unrelated facts or intents from a compound broker reply.
 
+For text-backed `remediation` and `correction` claims, the pinned provider adapter derives the proposed value from the exact evidence span before the unchanged shared extractor validates it, instead of trusting a second model-authored paraphrase. Predicate validation then proves the span's repair action or correction linkage. Recorded fixtures retain their authoritative values and digests. This removes a duplicate free-text degree of freedom without weakening evidence provenance.
+
 ## Stage 5: Effective Campaign Contract
 
 Each campaign has a versioned contract compiled from:

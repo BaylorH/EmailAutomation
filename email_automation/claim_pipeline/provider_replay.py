@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -62,6 +63,28 @@ def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+def _normalize_text_backed_values(model_output: object) -> object:
+    if not isinstance(model_output, Mapping):
+        return model_output
+    claims = model_output.get("claims")
+    if not isinstance(claims, list):
+        return model_output
+    normalized_claims = []
+    for item in claims:
+        if not isinstance(item, Mapping):
+            normalized_claims.append(item)
+            continue
+        claim = dict(item)
+        if claim.get("predicate") in {"remediation", "correction"} and isinstance(
+            claim.get("evidenceText"), str
+        ):
+            claim["value"] = claim["evidenceText"]
+        normalized_claims.append(claim)
+    normalized = dict(model_output)
+    normalized["claims"] = normalized_claims
+    return normalized
+
+
 @dataclass(frozen=True)
 class ProviderTransportResult:
     model_output: object
@@ -117,7 +140,10 @@ class PinnedProviderProposalAdapter:
         )
         if not isinstance(result, ProviderTransportResult):
             raise TypeError("provider transport returned an invalid result")
-        return ProposalResponse(model_output=result.model_output, usage=result.usage)
+        return ProposalResponse(
+            model_output=_normalize_text_backed_values(result.model_output),
+            usage=result.usage,
+        )
 
 
 __all__ = [

@@ -134,6 +134,47 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
             with self.subTest(rule=rule):
                 self.assertIn(rule, PINNED_PROMPT)
 
+    def test_adapter_derives_text_backed_values_from_exact_evidence_spans(self):
+        output = {
+            "claims": [
+                {
+                    "predicate": "remediation",
+                    "value": "model paraphrase",
+                    "evidenceText": "The roof leak will be repaired",
+                },
+                {
+                    "predicate": "correction",
+                    "value": "different model wording",
+                    "evidenceText": "not the earlier asking rent",
+                },
+                {
+                    "predicate": "availability",
+                    "value": "available",
+                    "evidenceText": "is available",
+                },
+            ],
+            "review": [],
+        }
+        transport = _FakeTransport(output)
+        adapter = PinnedProviderProposalAdapter(transport)
+        case, request, evidence, entities = self._request()
+
+        response = adapter.propose(
+            case_id=case.case_id,
+            request=request,
+            evidence=evidence,
+            entities=entities,
+        )
+
+        self.assertEqual(
+            [
+                "The roof leak will be repaired",
+                "not the earlier asking rent",
+                "available",
+            ],
+            [item["value"] for item in response.model_output["claims"]],
+        )
+
     def test_adapter_rejects_context_that_does_not_match_request(self):
         transport = _FakeTransport('{"claims":[],"review":[]}')
         adapter = PinnedProviderProposalAdapter(transport)
