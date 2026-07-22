@@ -65,6 +65,18 @@ def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+def _canonical_provider_evidence_text(value: str, content: str) -> str:
+    cleaned = value.strip()
+    without_sentence_punctuation = cleaned.rstrip(".!?").rstrip()
+    if (
+        without_sentence_punctuation
+        and without_sentence_punctuation != cleaned
+        and without_sentence_punctuation in content
+    ):
+        return without_sentence_punctuation
+    return cleaned
+
+
 def _normalize_text_backed_values(
     model_output: object,
     evidence: tuple[EvidenceEnvelope, ...] = (),
@@ -108,10 +120,22 @@ def _normalize_text_backed_values(
                     evidence_text = containing[0]
                 elif len(candidates) == 1:
                     evidence_text = candidates[0]
-                claim["evidenceText"] = evidence_text
-            claim["value"] = claim.get("evidenceText")
+            if envelope is not None:
+                evidence_text = _canonical_provider_evidence_text(
+                    evidence_text,
+                    envelope.content,
+                )
+            claim["evidenceText"] = evidence_text
+            claim["value"] = evidence_text
         elif predicate == "correction" and isinstance(evidence_text, str):
-            claim["value"] = claim["evidenceText"]
+            envelope = evidence_by_id.get(claim.get("evidenceId"))
+            if envelope is not None:
+                evidence_text = _canonical_provider_evidence_text(
+                    evidence_text,
+                    envelope.content,
+                )
+            claim["evidenceText"] = evidence_text
+            claim["value"] = evidence_text
             claim["polarity"] = "positive"
         normalized_claims.append(claim)
     normalized = dict(model_output)

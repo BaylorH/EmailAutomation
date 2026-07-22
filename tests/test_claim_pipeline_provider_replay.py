@@ -271,7 +271,7 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
                     "evidenceId": workflow_body.evidence_id,
                     "predicate": "remediation",
                     "value": "model paraphrase",
-                    "evidenceText": "roof leak",
+                    "evidenceText": "The roof leak will be repaired.",
                     "polarity": "positive",
                 }
             ],
