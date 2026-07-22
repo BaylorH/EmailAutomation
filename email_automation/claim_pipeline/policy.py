@@ -62,6 +62,7 @@ _TERMINAL_REASONS = (
     "broker_confirmed_unavailable",
     "hard_occupancy_after_deadline",
     "hard_term_below_minimum",
+    "hard_drive_ins_below_minimum",
     "required_facts_complete",
 )
 
@@ -337,8 +338,39 @@ def _fit_state(
         return FitState.REVIEW, reasons + ["unsupported_hard_requirement"]
 
     occupancy_by = request.contract.hard_requirements.get("occupancy_by")
+    remediation = _first_claim(claims, ClaimPredicate.REMEDIATION)
+    if remediation:
+        if remediation.modality.value != "asserted":
+            return FitState.REVIEW, reasons + ["tentative_remediation_requires_review"]
+        value = remediation.value
+        by_value = value.get("by") if isinstance(value, Mapping) else None
+        funded = value.get("funded") if isinstance(value, Mapping) else None
+        remediated_drive_ins = (
+            value.get("drive_ins") if isinstance(value, Mapping) else None
+        )
+        required_drive_ins = request.contract.hard_requirements.get("drive_ins")
+        try:
+            drive_ins_satisfied = required_drive_ins is None or (
+                remediated_drive_ins is not None
+                and float(remediated_drive_ins) >= float(required_drive_ins)
+            )
+        except (TypeError, ValueError):
+            drive_ins_satisfied = False
+        deadline = _as_date(occupancy_by) if occupancy_by else None
+        remediation_date = _as_date(by_value) if by_value else None
+        if funded is True and remediation_date and drive_ins_satisfied and (
+            deadline is None or remediation_date <= deadline
+        ):
+            cleaned = [item for item in reasons if item != "market_state_unknown"]
+            if "definite_remediation_before_deadline" not in cleaned:
+                cleaned.append("definite_remediation_before_deadline")
+            return FitState.CONDITIONAL, cleaned
+        return FitState.REVIEW, reasons + ["tentative_remediation_requires_review"]
+
     occupancy = _claim_value(claims, ClaimPredicate.OCCUPANCY_DATE)
-    if occupancy_by and occupancy:
+    if occupancy_by:
+        if occupancy is None:
+            return FitState.REVIEW, reasons + ["hard_requirement_unproven"]
         deadline = _as_date(occupancy_by)
         available_on = _as_date(occupancy)
         if deadline is None or available_on is None:
@@ -348,30 +380,25 @@ def _fit_state(
 
     minimum_term = request.contract.hard_requirements.get("minimum_term_months")
     term = _claim_value(claims, ClaimPredicate.TERM)
-    if minimum_term is not None and term is not None:
+    if minimum_term is not None:
+        if term is None:
+            return FitState.REVIEW, reasons + ["hard_requirement_unproven"]
         try:
             if float(term) < float(minimum_term):
                 return FitState.NONVIABLE, reasons + ["hard_term_below_minimum"]
         except (TypeError, ValueError):
             return FitState.REVIEW, reasons + ["unsupported_hard_requirement"]
 
-    remediation = _first_claim(claims, ClaimPredicate.REMEDIATION)
-    if remediation:
-        if remediation.modality.value != "asserted":
-            return FitState.REVIEW, reasons + ["tentative_remediation_requires_review"]
-        value = remediation.value
-        by_value = value.get("by") if isinstance(value, Mapping) else None
-        funded = value.get("funded") if isinstance(value, Mapping) else None
-        deadline = _as_date(occupancy_by) if occupancy_by else None
-        remediation_date = _as_date(by_value) if by_value else None
-        if funded is True and remediation_date and (
-            deadline is None or remediation_date <= deadline
-        ):
-            cleaned = [item for item in reasons if item != "market_state_unknown"]
-            if "definite_remediation_before_deadline" not in cleaned:
-                cleaned.append("definite_remediation_before_deadline")
-            return FitState.CONDITIONAL, cleaned
-        return FitState.REVIEW, reasons + ["tentative_remediation_requires_review"]
+    required_drive_ins = request.contract.hard_requirements.get("drive_ins")
+    if required_drive_ins is not None:
+        drive_ins = _claim_value(claims, ClaimPredicate.DRIVE_INS)
+        if drive_ins is None:
+            return FitState.REVIEW, reasons + ["hard_requirement_unproven"]
+        try:
+            if float(drive_ins) < float(required_drive_ins):
+                return FitState.NONVIABLE, reasons + ["hard_drive_ins_below_minimum"]
+        except (TypeError, ValueError):
+            return FitState.REVIEW, reasons + ["hard_requirement_unproven"]
 
     if market is MarketState.CONDITIONAL:
         return FitState.REVIEW, reasons
@@ -399,6 +426,7 @@ def _approval_class(
         or {
             "conflicting_active_claims",
             "unsupported_hard_requirement",
+            "hard_requirement_unproven",
             "tentative_remediation_requires_review",
             "accepting_backup_offers",
         }
@@ -706,6 +734,7 @@ def evaluate_policy(request: PolicyEvaluationRequest) -> PolicyEvaluationResult:
 
     for entity in request.entities:
         entity_claims = effective.get(entity.entity_id, {})
+        entity_sources = active_source_claims[entity.entity_id]
         market, reasons = _market_state(
             entity_claims,
             has_conflict=entity.entity_id in conflict_entities,
@@ -739,8 +768,7 @@ def evaluate_policy(request: PolicyEvaluationRequest) -> PolicyEvaluationResult:
             sorted(
                 {
                     claim.evidence_id
-                    for predicate_claims in entity_claims.values()
-                    for claim in predicate_claims
+                    for claim in entity_sources
                 }
             )
         )
@@ -761,7 +789,6 @@ def evaluate_policy(request: PolicyEvaluationRequest) -> PolicyEvaluationResult:
             missing_fields=tuple(sorted(missing)),
         )
         validate_decision(decision, entities=request.entities, contract=request.contract)
-        entity_sources = active_source_claims[entity.entity_id]
         plan = _plan_actions(
             request,
             entity,

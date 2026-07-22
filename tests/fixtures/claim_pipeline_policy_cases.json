@@ -1282,6 +1282,211 @@
         ],
         "effectPolicy": "no_side_effect"
       }
+    },
+    {
+      "caseId": "hard-occupancy-unproven",
+      "dimensions": [
+        "fit_state",
+        "approval_boundary"
+      ],
+      "contract": {
+        "hardRequirements": {
+          "occupancy_by": "2026-09-01"
+        }
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "availability",
+          "value": "available",
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "available",
+            "fitState": "review",
+            "completenessState": "blocked",
+            "conversationState": "review",
+            "approvalClass": "human_required",
+            "reasonCodes": [
+              "broker_confirmed_available",
+              "hard_requirement_unproven"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic",
+              "review_item:human_required"
+            ],
+            "forbiddenActions": [
+              "followup_freeze:automatic"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "hard-occupancy-satisfied",
+      "dimensions": [
+        "fit_state",
+        "order_independence"
+      ],
+      "contract": {
+        "hardRequirements": {
+          "occupancy_by": "2026-09-01"
+        }
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "availability",
+          "value": "available",
+          "polarity": "positive",
+          "modality": "asserted"
+        },
+        {
+          "key": "c2",
+          "subject": "target",
+          "predicate": "occupancy_date",
+          "value": "2026-08-01",
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "available",
+            "fitState": "viable",
+            "completenessState": "incomplete",
+            "conversationState": "active",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "broker_confirmed_available"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic"
+            ],
+            "forbiddenActions": [
+              "followup_freeze:automatic",
+              "review_item:human_required"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "hard-drive-in-mismatch",
+      "dimensions": [
+        "fit_state",
+        "conversation_state"
+      ],
+      "contract": {
+        "hardRequirements": {
+          "drive_ins": 2
+        }
+      },
+      "entities": [
+        {
+          "key": "target",
+          "type": "target_property",
+          "relationship": "target"
+        }
+      ],
+      "claims": [
+        {
+          "key": "c1",
+          "subject": "target",
+          "predicate": "availability",
+          "value": "available",
+          "polarity": "positive",
+          "modality": "asserted"
+        },
+        {
+          "key": "c2",
+          "subject": "target",
+          "predicate": "drive_ins",
+          "value": 1,
+          "polarity": "positive",
+          "modality": "asserted"
+        }
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {
+          "target": "active"
+        },
+        "followupStates": {
+          "target": "waiting"
+        }
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "available",
+            "fitState": "nonviable",
+            "completenessState": "not_applicable",
+            "conversationState": "terminal_intent",
+            "approvalClass": "automatic",
+            "reasonCodes": [
+              "broker_confirmed_available",
+              "hard_drive_ins_below_minimum"
+            ],
+            "missingFields": [],
+            "requiredActions": [
+              "fact_update:automatic",
+              "followup_freeze:automatic",
+              "status_transition:automatic"
+            ],
+            "forbiddenActions": [
+              "review_item:human_required"
+            ]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
     }
   ]
 }

@@ -43,6 +43,8 @@ POLICY_REASON_CODES = frozenset(
         "accepting_backup_offers",
         "hard_occupancy_after_deadline",
         "hard_term_below_minimum",
+        "hard_drive_ins_below_minimum",
+        "hard_requirement_unproven",
         "definite_remediation_before_deadline",
         "tentative_remediation_requires_review",
         "required_facts_complete",
@@ -300,4 +302,3 @@ def load_policy_fixture_catalog(path: Path | str) -> PolicyFixtureCatalog:
         covered_dimensions=covered,
         manifest_hash=manifest_hash,
     )
-

@@ -228,6 +228,7 @@ class PolicyDecisionTests(unittest.TestCase):
         self.assertEqual("unknown", item.decision.market_state.value)
         self.assertEqual(ConversationState.REVIEW, item.decision.conversation_state)
         self.assertIn("conflicting_active_claims", item.decision.reason_codes)
+        self.assertEqual(2, len(item.decision.evidence_ids))
 
 
 class PolicyActionTests(unittest.TestCase):
@@ -283,10 +284,23 @@ class PolicyActionTests(unittest.TestCase):
         catalog = load_policy_fixture_catalog(FIXTURE_PATH)
         for case in catalog.cases:
             request, _, _ = _build_case(case)
-            digests = {evaluate_policy(request).result_digest for _ in range(3)}
+            reversed_request = PolicyEvaluationRequest.create(
+                contract=request.contract,
+                scope=request.scope,
+                entities=tuple(reversed(request.entities)),
+                claims=tuple(reversed(request.claims)),
+                snapshot_hash=request.snapshot_hash,
+                current_facts=request.current_facts,
+                current_conversation_states=request.current_conversation_states,
+                current_followup_states=request.current_followup_states,
+                authorized_recipients=request.authorized_recipients,
+            )
+            digests = {
+                evaluate_policy(candidate).result_digest
+                for candidate in (request, request, reversed_request)
+            }
             self.assertEqual(1, len(digests), case.case_id)
 
 
 if __name__ == "__main__":
     unittest.main()
-

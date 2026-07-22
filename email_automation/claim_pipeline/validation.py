@@ -146,6 +146,7 @@ def _validate_action_payload(
                 ClaimPredicate.AVAILABILITY,
                 ClaimPredicate.OCCUPANCY_DATE,
                 ClaimPredicate.TERM,
+                ClaimPredicate.DRIVE_INS,
                 ClaimPredicate.OPT_OUT,
                 ClaimPredicate.TOTAL_SF,
                 ClaimPredicate.RENT,
