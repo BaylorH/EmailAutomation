@@ -53,6 +53,10 @@ _REMEDIATION_WORDS = re.compile(
     r"replace(?:d|ment|s|ing)?|correct(?:ed|ing|s)?|resolve(?:d|s|ing)?)\b",
     re.IGNORECASE,
 )
+
+
+def is_remediation_evidence_text(value: str) -> bool:
+    return isinstance(value, str) and bool(_REMEDIATION_WORDS.search(value))
 _NUMBER = re.compile(r"(?<![A-Za-z0-9])(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)")
 _SF_WORDS = re.compile(r"(?:\bSF\b|sq\.?\s*ft|square\s+feet|square\s+foot)", re.IGNORECASE)
 _YEAR_WORDS = re.compile(r"(?:/\s*yr\b|per\s+year|annual(?:ly)?|\byearly\b)", re.IGNORECASE)
@@ -643,7 +647,7 @@ def _validate_predicate(claim: Claim) -> None:
             _fail("predicate_evidence_mismatch", "Claim value is absent from evidence.")
         if (
             predicate is ClaimPredicate.REMEDIATION
-            and not _REMEDIATION_WORDS.search(claim.evidence_text)
+            and not is_remediation_evidence_text(claim.evidence_text)
         ):
             _fail(
                 "predicate_evidence_mismatch",

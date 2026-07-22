@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
+from .claim_validation import is_remediation_evidence_text
 from .contracts import EntityRef, EvidenceEnvelope
 from .extraction import ClaimExtractionRequest, PREDICATE_OUTPUT_CONTRACTS
 from .provider_quality_fixtures import SUPPORTED_REVIEW_CATEGORIES
@@ -64,7 +65,10 @@ def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
-def _normalize_text_backed_values(model_output: object) -> object:
+def _normalize_text_backed_values(
+    model_output: object,
+    evidence: tuple[EvidenceEnvelope, ...] = (),
+) -> object:
     if isinstance(model_output, str):
         try:
             model_output = json.loads(model_output)
@@ -75,16 +79,40 @@ def _normalize_text_backed_values(model_output: object) -> object:
     claims = model_output.get("claims")
     if not isinstance(claims, list):
         return model_output
+    evidence_by_id = {item.evidence_id: item for item in evidence}
     normalized_claims = []
     for item in claims:
         if not isinstance(item, Mapping):
             normalized_claims.append(item)
             continue
         claim = dict(item)
-        if claim.get("predicate") in {"remediation", "correction"} and isinstance(
-            claim.get("evidenceText"), str
-        ):
+        predicate = claim.get("predicate")
+        evidence_text = claim.get("evidenceText")
+        if predicate == "remediation" and isinstance(evidence_text, str):
+            envelope = evidence_by_id.get(claim.get("evidenceId"))
+            if envelope is not None and not is_remediation_evidence_text(evidence_text):
+                candidates = tuple(
+                    segment.strip().rstrip(".!?").rstrip()
+                    for segment in re.findall(
+                        r"[^.!?\n]+(?:[.!?]+|$)",
+                        envelope.content,
+                    )
+                    if is_remediation_evidence_text(segment)
+                )
+                containing = tuple(
+                    segment
+                    for segment in candidates
+                    if evidence_text.casefold() in segment.casefold()
+                )
+                if len(containing) == 1:
+                    evidence_text = containing[0]
+                elif len(candidates) == 1:
+                    evidence_text = candidates[0]
+                claim["evidenceText"] = evidence_text
+            claim["value"] = claim.get("evidenceText")
+        elif predicate == "correction" and isinstance(evidence_text, str):
             claim["value"] = claim["evidenceText"]
+            claim["polarity"] = "positive"
         normalized_claims.append(claim)
     normalized = dict(model_output)
     normalized["claims"] = normalized_claims
@@ -272,7 +300,7 @@ class PinnedProviderProposalAdapter:
         )
         if not isinstance(result, ProviderTransportResult):
             raise TypeError("provider transport returned an invalid result")
-        model_output = _normalize_text_backed_values(result.model_output)
+        model_output = _normalize_text_backed_values(result.model_output, evidence)
         model_output = _add_resolved_external_identities(
             model_output,
             evidence,

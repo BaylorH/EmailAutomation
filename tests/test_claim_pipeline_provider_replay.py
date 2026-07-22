@@ -260,6 +260,66 @@ class PinnedProviderProposalAdapterTests(unittest.TestCase):
 
                 self.assertEqual(expected_kept, bool(response.model_output["review"]))
 
+    def test_adapter_expands_remediation_span_and_normalizes_correction_polarity(self):
+        workflow_request, workflow_evidence, workflow_entities = (
+            self._request_for_interpretation("workflow-intents-and-referral")
+        )
+        workflow_body = workflow_evidence[-1]
+        remediation_output = {
+            "claims": [
+                {
+                    "evidenceId": workflow_body.evidence_id,
+                    "predicate": "remediation",
+                    "value": "model paraphrase",
+                    "evidenceText": "roof leak",
+                    "polarity": "positive",
+                }
+            ],
+            "review": [],
+        }
+        remediation_adapter = PinnedProviderProposalAdapter(
+            _FakeTransport(json.dumps(remediation_output))
+        )
+
+        remediation_response = remediation_adapter.propose(
+            case_id="workflow-intents-and-referral",
+            request=workflow_request,
+            evidence=workflow_evidence,
+            entities=workflow_entities,
+        )
+        remediation = remediation_response.model_output["claims"][0]
+        self.assertEqual("The roof leak will be repaired", remediation["evidenceText"])
+        self.assertEqual(remediation["evidenceText"], remediation["value"])
+
+        correction_request, correction_evidence, correction_entities = (
+            self._request_for_interpretation("broker-corrects-prior-rent")
+        )
+        correction_output = {
+            "claims": [
+                {
+                    "evidenceId": correction_evidence[-1].evidence_id,
+                    "predicate": "correction",
+                    "value": "model paraphrase",
+                    "evidenceText": "not $14.00/SF/yr",
+                    "polarity": "negative",
+                }
+            ],
+            "review": [],
+        }
+        correction_adapter = PinnedProviderProposalAdapter(
+            _FakeTransport(json.dumps(correction_output))
+        )
+
+        correction_response = correction_adapter.propose(
+            case_id="broker-corrects-prior-rent",
+            request=correction_request,
+            evidence=correction_evidence,
+            entities=correction_entities,
+        )
+        correction = correction_response.model_output["claims"][0]
+        self.assertEqual("not $14.00/SF/yr", correction["value"])
+        self.assertEqual("positive", correction["polarity"])
+
     def test_adapter_rejects_context_that_does_not_match_request(self):
         transport = _FakeTransport('{"claims":[],"review":[]}')
         adapter = PinnedProviderProposalAdapter(transport)
