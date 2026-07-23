@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from email_automation.claim_pipeline.effect_adapter_fixtures import (
+    EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION,
     EffectAdapterFixtureValidationError,
     load_effect_adapter_fixture_catalog,
     run_effect_adapter_fixture_case,
@@ -29,6 +30,41 @@ from email_automation.claim_pipeline.effect_adapter_fixtures import (
 
 PROFILE = "disabled-effect-adapter-dry-run-v1"
 REQUIRED_RUNS = 3
+CANONICAL_FIXTURE_PATH = (
+    REPO_ROOT
+    / "tests"
+    / "fixtures"
+    / "claim_pipeline_effect_adapter_cases.json"
+).resolve()
+CANONICAL_FIXTURE_SHA256 = (
+    "c654da2a9a2fadee2f8cce761e17dd78d21168cfcb6b6e9fd06aeddff69ea229"
+)
+CANONICAL_FIXTURE_SCHEMA_VERSION = (
+    "claim-pipeline-effect-adapter-fixtures-v1"
+)
+# Report-visible fixture labels are closed here so arbitrary names cannot escape.
+CANONICAL_CASE_IDS = (
+    "automatic-fact-matching",
+    "automatic-fact-stale-prior",
+    "whole-plan-stale-snapshot",
+    "whole-plan-stale-contract",
+    "already-committed-effect",
+    "human-action-no-approval",
+    "human-action-exact-approval",
+    "approval-for-other-action",
+    "approval-wrong-plan",
+    "forbidden-plan",
+    "unsupported-actions",
+    "terminal-outbound-draft",
+    "terminal-followup-freeze",
+    "dependency-chain-eligible",
+    "dependency-chain-blocked",
+    "dependency-construction-rejected",
+    "scope-and-provenance-rejected",
+    "input-order-byte-stable",
+)
+CANONICAL_CASE_COUNT = 18
+CANONICAL_RESULT_COUNT = 54
 _SOURCE_PATHS = (
     "email_automation/claim_pipeline",
     "scripts/run_claim_pipeline_effect_adapter_dry_run.py",
@@ -44,6 +80,69 @@ _FORBIDDEN_REPORT_TOKENS = (
     "evidencetext",
     "row-fixture",
 )
+_IDENTITY_KEYS = frozenset(
+    {
+        "profile",
+        "codeRevision",
+        "sourceTreeDirty",
+        "sourceTreeHash",
+        "fixtureHash",
+        "caseCount",
+        "runs",
+    }
+)
+_SUMMARY_KEYS = frozenset(
+    {
+        "resultCount",
+        "passedResultCount",
+        "varianceCaseIds",
+        "statusCounts",
+        "reasonCounts",
+    }
+)
+_RESULT_KEYS = frozenset(
+    {
+        "caseId",
+        "passed",
+        "statusReasonSignatures",
+        "receiptDigest",
+    }
+)
+_STATUS_KEYS = frozenset({"blocked", "skipped", "would_apply"})
+_REASON_KEYS = frozenset(
+    {
+        "approval_required",
+        "approval_scope_mismatch",
+        "dependency_blocked",
+        "eligible_automatic_action",
+        "eligible_human_approved_action",
+        "idempotency_key_already_committed",
+        "plan_contract_violation",
+        "prior_state_mismatch",
+        "stale_contract",
+        "stale_snapshot",
+        "terminal_outbound_suppressed",
+        "unsupported_action_type",
+    }
+)
+_STATUS_REASON_SIGNATURES = frozenset(
+    {
+        "blocked:approval_scope_mismatch",
+        "blocked:dependency_blocked",
+        "blocked:plan_contract_violation",
+        "blocked:prior_state_mismatch",
+        "blocked:stale_contract",
+        "blocked:stale_snapshot",
+        "blocked:terminal_outbound_suppressed",
+        "blocked:unsupported_action_type",
+        "skipped:approval_required",
+        "skipped:idempotency_key_already_committed",
+        "would_apply:eligible_automatic_action",
+        "would_apply:eligible_human_approved_action",
+    }
+)
+_HEX_40 = re.compile(r"[0-9a-f]{40}\Z")
+_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class DryRunReportError(RuntimeError):
@@ -79,7 +178,7 @@ def _code_revision() -> str:
         revision = _git("rev-parse", "HEAD").decode("ascii").strip()
     except UnicodeDecodeError as exc:
         raise DryRunReportError("repository revision is invalid") from exc
-    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+    if not _HEX_40.fullmatch(revision):
         raise DryRunReportError("repository revision is invalid")
     return revision
 
@@ -139,6 +238,44 @@ def _safe_output_path(output_path: Path) -> Path:
     return path
 
 
+def _canonical_fixture_path(fixture_path: Path) -> Path:
+    path = Path(fixture_path).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    try:
+        path = path.resolve(strict=True)
+    except OSError as exc:
+        raise DryRunReportError(
+            "effect-adapter dry run requires the canonical fixture path"
+        ) from exc
+    if path != CANONICAL_FIXTURE_PATH:
+        raise DryRunReportError(
+            "effect-adapter dry run requires the canonical fixture path"
+        )
+    return path
+
+
+def _validated_runs(value: object) -> int:
+    if type(value) is int:
+        runs = value
+    elif isinstance(value, str):
+        try:
+            runs = int(value, 10)
+        except ValueError as exc:
+            raise DryRunReportError(
+                "effect-adapter dry run requires exactly 3 runs"
+            ) from exc
+    else:
+        raise DryRunReportError(
+            "effect-adapter dry run requires exactly 3 runs"
+        )
+    if runs != REQUIRED_RUNS:
+        raise DryRunReportError(
+            "effect-adapter dry run requires exactly 3 runs"
+        )
+    return runs
+
+
 def _remove_output(output_path: Path) -> None:
     try:
         output_path.unlink(missing_ok=True)
@@ -173,6 +310,117 @@ def _assert_private_report(report: Mapping[str, Any]) -> None:
         token in lowered for token in _FORBIDDEN_REPORT_TOKENS
     ):
         raise DryRunReportError("report privacy validation failed")
+    _assert_report_allowlist(report)
+
+
+def _exact_keys(
+    value: object,
+    expected: frozenset[str],
+) -> bool:
+    return isinstance(value, Mapping) and set(value) == expected
+
+
+def _count_map_is_allowed(
+    value: object,
+    allowed_keys: frozenset[str],
+) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == allowed_keys
+        and all(type(count) is int and count >= 0 for count in value.values())
+    )
+
+
+def _assert_report_allowlist(report: Mapping[str, Any]) -> None:
+    unsigned_keys = frozenset({"identity", "summary", "results", "passed"})
+    signed_keys = unsigned_keys | {"resultDigest"}
+    if set(report) not in (unsigned_keys, signed_keys):
+        raise DryRunReportError("report field allowlist validation failed")
+
+    identity = report.get("identity")
+    summary = report.get("summary")
+    results = report.get("results")
+    if not _exact_keys(identity, _IDENTITY_KEYS) or not _exact_keys(
+        summary,
+        _SUMMARY_KEYS,
+    ):
+        raise DryRunReportError("report field allowlist validation failed")
+    assert isinstance(identity, Mapping)
+    assert isinstance(summary, Mapping)
+
+    identity_allowed = (
+        identity["profile"] == PROFILE
+        and isinstance(identity["codeRevision"], str)
+        and _HEX_40.fullmatch(identity["codeRevision"]) is not None
+        and identity["sourceTreeDirty"] is False
+        and isinstance(identity["sourceTreeHash"], str)
+        and _HEX_64.fullmatch(identity["sourceTreeHash"]) is not None
+        and identity["fixtureHash"] == CANONICAL_FIXTURE_SHA256
+        and identity["caseCount"] == CANONICAL_CASE_COUNT
+        and identity["runs"] == REQUIRED_RUNS
+    )
+    summary_allowed = (
+        summary["resultCount"] == CANONICAL_RESULT_COUNT
+        and summary["passedResultCount"] == CANONICAL_RESULT_COUNT
+        and summary["varianceCaseIds"] == []
+        and _count_map_is_allowed(summary["statusCounts"], _STATUS_KEYS)
+        and _count_map_is_allowed(summary["reasonCounts"], _REASON_KEYS)
+    )
+    if not identity_allowed or not summary_allowed or report.get("passed") is not True:
+        raise DryRunReportError("report value allowlist validation failed")
+
+    if not isinstance(results, list) or len(results) != CANONICAL_RESULT_COUNT:
+        raise DryRunReportError("report value allowlist validation failed")
+    expected_case_ids = CANONICAL_CASE_IDS * REQUIRED_RUNS
+    actual_case_ids = []
+    for item in results:
+        if not _exact_keys(item, _RESULT_KEYS):
+            raise DryRunReportError("report field allowlist validation failed")
+        assert isinstance(item, Mapping)
+        signatures = item["statusReasonSignatures"]
+        if (
+            item["caseId"] not in CANONICAL_CASE_IDS
+            or item["passed"] is not True
+            or not isinstance(signatures, list)
+            or not signatures
+            or not all(
+                isinstance(signature, str)
+                and signature in _STATUS_REASON_SIGNATURES
+                for signature in signatures
+            )
+            or not isinstance(item["receiptDigest"], str)
+            or _HEX_64.fullmatch(item["receiptDigest"]) is None
+        ):
+            raise DryRunReportError("report value allowlist validation failed")
+        actual_case_ids.append(item["caseId"])
+    if tuple(actual_case_ids) != expected_case_ids:
+        raise DryRunReportError("report value allowlist validation failed")
+
+    if "resultDigest" in report and (
+        not isinstance(report["resultDigest"], str)
+        or _HEX_64.fullmatch(report["resultDigest"]) is None
+    ):
+        raise DryRunReportError("report value allowlist validation failed")
+
+
+def _validate_canonical_catalog(catalog) -> None:
+    if (
+        EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION
+        != CANONICAL_FIXTURE_SCHEMA_VERSION
+        or catalog.schema_version != CANONICAL_FIXTURE_SCHEMA_VERSION
+    ):
+        raise DryRunReportError(
+            "effect-adapter fixture schema version is not canonical"
+        )
+    if len(catalog.cases) != CANONICAL_CASE_COUNT:
+        raise DryRunReportError(
+            "effect-adapter fixture must contain exactly 18 cases"
+        )
+    case_ids = tuple(case.case_id for case in catalog.cases)
+    if case_ids != CANONICAL_CASE_IDS:
+        raise DryRunReportError(
+            "effect-adapter fixture must use the canonical case IDs"
+        )
 
 
 def _build_results(catalog, runs: int):
@@ -215,14 +463,18 @@ def _build_results(catalog, runs: int):
 def run_dry_run(
     *,
     fixture_path: Path,
-    runs: int,
+    runs: object,
     output_path: Path,
 ) -> dict[str, Any]:
-    if type(runs) is not int or runs != REQUIRED_RUNS:
-        raise DryRunReportError("effect-adapter dry run requires exactly 3 runs")
-
     output_path = _safe_output_path(Path(output_path))
     _remove_output(output_path)
+    runs = _validated_runs(runs)
+    fixture_path = _canonical_fixture_path(fixture_path)
+    fixture_hash = _file_hash(fixture_path)
+    if fixture_hash != CANONICAL_FIXTURE_SHA256:
+        raise DryRunReportError(
+            "effect-adapter canonical fixture hash mismatch"
+        )
     if _source_tree_dirty():
         raise DryRunReportError(
             "effect-adapter dry run requires a clean committed source tree"
@@ -230,19 +482,17 @@ def run_dry_run(
 
     revision = _code_revision()
     source_tree_hash = _source_tree_hash(revision)
-    fixture_path = Path(fixture_path).expanduser().resolve(strict=False)
-    fixture_hash = _file_hash(fixture_path)
     try:
         catalog = load_effect_adapter_fixture_catalog(fixture_path)
     except EffectAdapterFixtureValidationError as exc:
         raise DryRunReportError("effect-adapter fixture catalog rejected") from exc
+    _validate_canonical_catalog(catalog)
 
     results, receipt_digests, status_counts, reason_counts = _build_results(
         catalog,
         runs,
     )
-    expected_result_count = len(catalog.cases) * runs
-    if len(results) != expected_result_count:
+    if len(results) != CANONICAL_RESULT_COUNT:
         raise DryRunReportError("effect-adapter dry run is incomplete")
     if not all(item["passed"] for item in results):
         raise DryRunReportError("effect-adapter fixture expectation mismatch")
@@ -262,7 +512,7 @@ def run_dry_run(
             "sourceTreeDirty": False,
             "sourceTreeHash": source_tree_hash,
             "fixtureHash": fixture_hash,
-            "caseCount": len(catalog.cases),
+            "caseCount": CANONICAL_CASE_COUNT,
             "runs": runs,
         },
         "summary": {
@@ -275,8 +525,8 @@ def run_dry_run(
         "results": results,
     }
     report["passed"] = (
-        report["summary"]["resultCount"] == expected_result_count
-        and report["summary"]["passedResultCount"] == len(results)
+        report["summary"]["resultCount"] == CANONICAL_RESULT_COUNT
+        and report["summary"]["passedResultCount"] == CANONICAL_RESULT_COUNT
         and not variance_case_ids
     )
     if not report["passed"]:
@@ -289,7 +539,7 @@ def run_dry_run(
         _source_tree_dirty()
         or _code_revision() != revision
         or _source_tree_hash(revision) != source_tree_hash
-        or _file_hash(fixture_path) != fixture_hash
+        or _file_hash(fixture_path) != CANONICAL_FIXTURE_SHA256
     ):
         raise DryRunReportError("source identity changed during dry run")
 
@@ -306,7 +556,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--fixture", type=Path, required=True)
-    parser.add_argument("--runs", type=int, choices=(REQUIRED_RUNS,), required=True)
+    parser.add_argument("--runs", required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
