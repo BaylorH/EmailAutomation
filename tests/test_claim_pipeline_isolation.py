@@ -462,6 +462,14 @@ def _resolved_symbol(node, bindings):
         if owner is not None:
             return f"{owner}.{node.attr}"
     if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+        and _resolved_symbol(node.value, bindings)
+        in {"__builtins__", "builtins"}
+    ):
+        return f"builtins.{node.slice.value}"
+    if (
         isinstance(node, ast.Call)
         and _resolved_symbol(node.func, bindings) in {"getattr", "builtins.getattr"}
         and len(node.args) >= 2
@@ -500,6 +508,71 @@ def _imported_bindings(node):
                 bindings[alias.asname or alias.name] = resolved
                 imported_symbols.add(resolved)
     return bindings, imported_symbols
+
+
+def _bind_symbol_target(target, value, bindings):
+    if isinstance(target, ast.Starred):
+        _bind_symbol_target(target.value, value, bindings)
+        return
+    if isinstance(target, ast.Name):
+        resolved = _resolved_symbol(value, bindings)
+        if resolved is None:
+            bindings.pop(target.id, None)
+        else:
+            bindings[target.id] = resolved
+        return
+    if isinstance(target, (ast.List, ast.Tuple)) and isinstance(
+        value, (ast.List, ast.Tuple)
+    ):
+        for target_item, value_item in zip(
+            target.elts, value.elts, strict=False
+        ):
+            _bind_symbol_target(target_item, value_item, bindings)
+
+
+def _apply_named_expression_bindings(node, bindings):
+    if isinstance(
+        node,
+        (
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.ClassDef,
+            ast.Lambda,
+        ),
+    ):
+        return
+    for child in ast.iter_child_nodes(node):
+        _apply_named_expression_bindings(child, bindings)
+    if isinstance(node, ast.NamedExpr):
+        _bind_symbol_target(node.target, node.value, bindings)
+
+
+def _match_pattern_bindings(pattern, subject, bindings):
+    if isinstance(pattern, ast.MatchAs):
+        if pattern.pattern is not None:
+            _match_pattern_bindings(pattern.pattern, subject, bindings)
+        if pattern.name is not None:
+            _bind_symbol_target(
+                ast.Name(id=pattern.name, ctx=ast.Store()),
+                subject,
+                bindings,
+            )
+    elif isinstance(pattern, ast.MatchStar) and pattern.name is not None:
+        _bind_symbol_target(
+            ast.Name(id=pattern.name, ctx=ast.Store()),
+            subject,
+            bindings,
+        )
+    elif isinstance(pattern, ast.MatchSequence) and isinstance(
+        subject, (ast.List, ast.Tuple)
+    ):
+        for item_pattern, item_value in zip(
+            pattern.patterns, subject.elts, strict=False
+        ):
+            _match_pattern_bindings(item_pattern, item_value, bindings)
+    elif isinstance(pattern, ast.MatchOr):
+        for alternative in pattern.patterns:
+            _match_pattern_bindings(alternative, subject, bindings)
 
 
 def _binding_environments(tree):
@@ -571,15 +644,19 @@ def _binding_environments(tree):
                     callable_symbols,
                 )
             elif isinstance(statement, ast.If):
+                condition_bindings = dict(bindings)
+                _apply_named_expression_bindings(
+                    statement.test, condition_bindings
+                )
                 body_state = walk_scope(
                     statement.body,
-                    bindings,
+                    condition_bindings,
                     imported_symbols,
                     callable_symbols,
                 )
                 else_state = walk_scope(
                     statement.orelse,
-                    bindings,
+                    condition_bindings,
                     imported_symbols,
                     callable_symbols,
                 )
@@ -590,7 +667,7 @@ def _binding_environments(tree):
                 ) = merge_states(
                     [
                         (
-                            dict(bindings),
+                            condition_bindings,
                             set(imported_symbols),
                             set(callable_symbols),
                         ),
@@ -603,20 +680,61 @@ def _binding_environments(tree):
                 statement,
                 (ast.For, ast.AsyncFor, ast.While),
             ):
-                body_state = walk_scope(
-                    statement.body,
-                    bindings,
-                    imported_symbols,
-                    callable_symbols,
-                )
+                initial_bindings = dict(bindings)
+                if isinstance(statement, (ast.For, ast.AsyncFor)):
+                    iteration_values = (
+                        statement.iter.elts
+                        if isinstance(
+                            statement.iter,
+                            (ast.List, ast.Set, ast.Tuple),
+                        )
+                        else ()
+                    )
+                    body_states = []
+                    for iteration_value in iteration_values:
+                        iteration_bindings = dict(bindings)
+                        _bind_symbol_target(
+                            statement.target,
+                            iteration_value,
+                            iteration_bindings,
+                        )
+                        body_states.append(
+                            walk_scope(
+                                statement.body,
+                                iteration_bindings,
+                                imported_symbols,
+                                callable_symbols,
+                            )
+                        )
+                    if not body_states:
+                        body_states.append(
+                            walk_scope(
+                                statement.body,
+                                bindings,
+                                imported_symbols,
+                                callable_symbols,
+                            )
+                        )
+                else:
+                    _apply_named_expression_bindings(
+                        statement.test, initial_bindings
+                    )
+                    body_states = [
+                        walk_scope(
+                            statement.body,
+                            initial_bindings,
+                            imported_symbols,
+                            callable_symbols,
+                        )
+                    ]
                 loop_state = merge_states(
                     [
                         (
-                            dict(bindings),
+                            initial_bindings,
                             set(imported_symbols),
                             set(callable_symbols),
                         ),
-                        body_state,
+                        *body_states,
                     ]
                 )
                 else_state = walk_scope(
@@ -674,15 +792,35 @@ def _binding_environments(tree):
                 ) = merge_states([merged, final_state])
                 continue
             elif isinstance(statement, ast.Match):
+                subject_bindings = dict(bindings)
+                _apply_named_expression_bindings(
+                    statement.subject, subject_bindings
+                )
                 initial_state = (
-                    dict(bindings),
+                    subject_bindings,
                     set(imported_symbols),
                     set(callable_symbols),
                 )
-                case_states = [
-                    walk_scope(case.body, *initial_state)
-                    for case in statement.cases
-                ]
+                case_states = []
+                for case in statement.cases:
+                    case_bindings = dict(subject_bindings)
+                    _match_pattern_bindings(
+                        case.pattern,
+                        statement.subject,
+                        case_bindings,
+                    )
+                    if case.guard is not None:
+                        _apply_named_expression_bindings(
+                            case.guard, case_bindings
+                        )
+                    case_states.append(
+                        walk_scope(
+                            case.body,
+                            case_bindings,
+                            imported_symbols,
+                            callable_symbols,
+                        )
+                    )
                 (
                     bindings,
                     imported_symbols,
@@ -690,6 +828,7 @@ def _binding_environments(tree):
                 ) = merge_states([initial_state, *case_states])
                 continue
 
+            _apply_named_expression_bindings(statement, bindings)
             new_bindings, new_imports = _imported_bindings(statement)
             bindings.update(new_bindings)
             imported_symbols.update(new_imports)
@@ -704,22 +843,14 @@ def _binding_environments(tree):
                     f"<class>:{statement.lineno}:{statement.name}"
                 )
             elif isinstance(statement, ast.Assign):
-                resolved = _resolved_symbol(statement.value, bindings)
                 for target in statement.targets:
-                    if not isinstance(target, ast.Name):
-                        continue
-                    if resolved is None:
-                        bindings.pop(target.id, None)
-                    else:
-                        bindings[target.id] = resolved
-            elif isinstance(statement, ast.AnnAssign) and isinstance(
-                statement.target, ast.Name
-            ):
-                resolved = _resolved_symbol(statement.value, bindings)
-                if resolved is None:
-                    bindings.pop(statement.target.id, None)
-                else:
-                    bindings[statement.target.id] = resolved
+                    _bind_symbol_target(
+                        target, statement.value, bindings
+                    )
+            elif isinstance(statement, ast.AnnAssign):
+                _bind_symbol_target(
+                    statement.target, statement.value, bindings
+                )
 
         return bindings, imported_symbols, callable_symbols
 
@@ -894,12 +1025,132 @@ def _parameter_call_origins(node, safe_names, bindings_by_node):
         parameter_names.add(node.args.kwarg.arg)
     found = set()
 
+    def storage_key(value):
+        if isinstance(value, ast.Name):
+            return ("name", value.id)
+        if isinstance(value, ast.Attribute):
+            owner = storage_key(value.value)
+            if owner is not None:
+                return ("attribute", owner, value.attr)
+        if isinstance(value, ast.Subscript) and isinstance(
+            value.slice, ast.Constant
+        ):
+            owner = storage_key(value.value)
+            if owner is not None:
+                return ("item", owner, value.slice.value)
+        return None
+
     def origins(value, aliases):
         if isinstance(value, ast.Name):
             return aliases.get(value.id, frozenset())
-        if isinstance(value, ast.Attribute) and value.attr == "__call__":
+        if isinstance(value, ast.Attribute):
+            if value.attr == "__call__":
+                return origins(value.value, aliases)
+            return aliases.get(storage_key(value), frozenset())
+        if isinstance(value, ast.Subscript) and isinstance(
+            value.slice, ast.Constant
+        ):
+            if isinstance(value.value, (ast.List, ast.Tuple)):
+                index = value.slice.value
+                if isinstance(index, int) and -len(value.value.elts) <= index < len(
+                    value.value.elts
+                ):
+                    return origins(value.value.elts[index], aliases)
+            return aliases.get(storage_key(value), frozenset())
+        if isinstance(value, ast.NamedExpr):
             return origins(value.value, aliases)
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "getattr"
+            and len(value.args) >= 2
+            and isinstance(value.args[1], ast.Constant)
+            and value.args[1].value == "__call__"
+        ):
+            return origins(value.args[0], aliases)
         return frozenset()
+
+    def rebased_storage_key(key, source, target):
+        if key == source:
+            return target
+        if (
+            isinstance(key, tuple)
+            and len(key) == 3
+            and key[0] in {"attribute", "item"}
+        ):
+            owner = rebased_storage_key(key[1], source, target)
+            if owner is not None:
+                return (key[0], owner, key[2])
+        return None
+
+    def store(target, value, aliases):
+        if isinstance(target, ast.Starred):
+            store(target.value, value, aliases)
+            return
+        if isinstance(target, ast.Name):
+            target_key = ("name", target.id)
+            for key in list(aliases):
+                if isinstance(key, tuple) and rebased_storage_key(
+                    key, target_key, target_key
+                ) is not None:
+                    aliases.pop(key, None)
+            assigned = origins(value, aliases)
+            if assigned:
+                aliases[target.id] = assigned
+            else:
+                aliases.pop(target.id, None)
+            if isinstance(value, (ast.List, ast.Tuple)):
+                for index, item in enumerate(value.elts):
+                    item_origins = origins(item, aliases)
+                    if item_origins:
+                        aliases[("item", target_key, index)] = item_origins
+            source_key = storage_key(value)
+            if source_key is not None:
+                for key, item_origins in list(aliases.items()):
+                    if not isinstance(key, tuple):
+                        continue
+                    rebased = rebased_storage_key(
+                        key, source_key, target_key
+                    )
+                    if rebased is not None and rebased != target_key:
+                        aliases[rebased] = item_origins
+            return
+        if isinstance(target, (ast.Attribute, ast.Subscript)):
+            key = storage_key(target)
+            assigned = origins(value, aliases)
+            if key is not None and assigned:
+                aliases[key] = assigned
+            elif key is not None:
+                aliases.pop(key, None)
+            return
+        if isinstance(target, (ast.List, ast.Tuple)) and isinstance(
+            value, (ast.List, ast.Tuple)
+        ):
+            for target_item, value_item in zip(
+                target.elts, value.elts, strict=False
+            ):
+                store(target_item, value_item, aliases)
+
+    def bind_pattern(pattern, subject, aliases):
+        if isinstance(pattern, ast.MatchAs):
+            if pattern.pattern is not None:
+                bind_pattern(pattern.pattern, subject, aliases)
+            if pattern.name is not None:
+                store(
+                    ast.Name(id=pattern.name, ctx=ast.Store()),
+                    subject,
+                    aliases,
+                )
+        elif isinstance(pattern, ast.MatchSequence) and isinstance(
+            subject, (ast.List, ast.Tuple)
+        ):
+            for item_pattern, item_value in zip(
+                pattern.patterns, subject.elts, strict=False
+            ):
+                bind_pattern(item_pattern, item_value, aliases)
+        elif isinstance(pattern, ast.MatchOr):
+            for alternative in pattern.patterns:
+                bind_pattern(alternative, subject, aliases)
 
     def scan_expression(value, aliases):
         if isinstance(
@@ -911,6 +1162,10 @@ def _parameter_call_origins(node, safe_names, bindings_by_node):
                 ast.Lambda,
             ),
         ):
+            return
+        if isinstance(value, ast.NamedExpr):
+            scan_expression(value.value, aliases)
+            store(value.target, value.value, aliases)
             return
         if isinstance(value, ast.Call):
             found.update(origins(value.func, aliases))
@@ -948,6 +1203,18 @@ def _parameter_call_origins(node, safe_names, bindings_by_node):
             if isinstance(
                 statement, (ast.FunctionDef, ast.AsyncFunctionDef)
             ):
+                for decorator in statement.decorator_list:
+                    scan_expression(decorator, aliases)
+                    found.update(origins(decorator, aliases))
+                for default in (
+                    *statement.args.defaults,
+                    *(
+                        default
+                        for default in statement.args.kw_defaults
+                        if default is not None
+                    ),
+                ):
+                    scan_expression(default, aliases)
                 local_names = {
                     argument.arg
                     for argument in (
@@ -964,7 +1231,9 @@ def _parameter_call_origins(node, safe_names, bindings_by_node):
                 captured = {
                     name: origin
                     for name, origin in aliases.items()
-                    if name not in local_names
+                    if not (
+                        isinstance(name, str) and name in local_names
+                    )
                 }
                 walk(statement.body, captured)
                 aliases.pop(statement.name, None)
@@ -987,10 +1256,34 @@ def _parameter_call_origins(node, safe_names, bindings_by_node):
             ):
                 if isinstance(statement, (ast.For, ast.AsyncFor)):
                     scan_expression(statement.iter, aliases)
+                    iteration_values = (
+                        statement.iter.elts
+                        if isinstance(
+                            statement.iter,
+                            (ast.List, ast.Set, ast.Tuple),
+                        )
+                        else ()
+                    )
+                    body_states = []
+                    for iteration_value in iteration_values:
+                        iteration_aliases = dict(aliases)
+                        store(
+                            statement.target,
+                            iteration_value,
+                            iteration_aliases,
+                        )
+                        body_states.append(
+                            walk(statement.body, iteration_aliases)
+                        )
+                    if not body_states:
+                        body_states.append(
+                            walk(statement.body, aliases)
+                        )
                 else:
                     scan_expression(statement.test, aliases)
+                    body_states = [walk(statement.body, aliases)]
                 loop_aliases = merge_aliases(
-                    [aliases, walk(statement.body, aliases)]
+                    [aliases, *body_states]
                 )
                 aliases = merge_aliases(
                     [loop_aliases, walk(statement.orelse, loop_aliases)]
@@ -1023,28 +1316,24 @@ def _parameter_call_origins(node, safe_names, bindings_by_node):
                 scan_expression(statement.subject, aliases)
                 states = [aliases]
                 for case in statement.cases:
+                    case_aliases = dict(aliases)
+                    bind_pattern(
+                        case.pattern,
+                        statement.subject,
+                        case_aliases,
+                    )
                     if case.guard is not None:
-                        scan_expression(case.guard, aliases)
-                    states.append(walk(case.body, aliases))
+                        scan_expression(case.guard, case_aliases)
+                    states.append(walk(case.body, case_aliases))
                 aliases = merge_aliases(states)
                 continue
 
             scan_expression(statement, aliases)
             if isinstance(statement, ast.Assign):
-                assigned_origins = origins(statement.value, aliases)
                 for target in statement.targets:
-                    for name in _assigned_names(target):
-                        if assigned_origins:
-                            aliases[name] = assigned_origins
-                        else:
-                            aliases.pop(name, None)
+                    store(target, statement.value, aliases)
             elif isinstance(statement, ast.AnnAssign):
-                assigned_origins = origins(statement.value, aliases)
-                for name in _assigned_names(statement.target):
-                    if assigned_origins:
-                        aliases[name] = assigned_origins
-                    else:
-                        aliases.pop(name, None)
+                store(statement.target, statement.value, aliases)
         return aliases
 
     walk(
@@ -1080,18 +1369,27 @@ def _is_dataclass(class_node, bindings):
     )
 
 
-def _schema_literal_keys(value):
+def _schema_literal_keys(value, context="schema"):
     if isinstance(value, ast.Dict):
         keys = set()
         for key, item in zip(value.keys, value.values, strict=True):
             if isinstance(key, ast.Constant) and isinstance(key.value, str):
                 keys.add(key.value)
-                if (
-                    _identifier_tokens(key.value)
-                    & NON_STRUCTURAL_SCHEMA_KEYS
+                tokens = _identifier_tokens(key.value)
+                if context == "schema" and (
+                    tokens & NON_STRUCTURAL_SCHEMA_KEYS
                 ):
                     continue
-            keys.update(_schema_literal_keys(item))
+                child_context = (
+                    "fields"
+                    if tokens & {"field", "fields", "properties"}
+                    else "schema"
+                )
+                keys.update(
+                    _schema_literal_keys(item, child_context)
+                )
+                continue
+            keys.update(_schema_literal_keys(item, context))
         return keys
     if isinstance(value, (ast.List, ast.Set, ast.Tuple)):
         keys = set()
@@ -1099,21 +1397,32 @@ def _schema_literal_keys(value):
             if isinstance(item, ast.Constant) and isinstance(item.value, str):
                 keys.add(item.value)
             else:
-                keys.update(_schema_literal_keys(item))
+                keys.update(_schema_literal_keys(item, context))
         return keys
     if isinstance(value, ast.Call):
         keys = set()
         for argument in value.args:
-            keys.update(_schema_literal_keys(argument))
+            keys.update(_schema_literal_keys(argument, context))
         for keyword in value.keywords:
             if keyword.arg is not None:
                 keys.add(keyword.arg)
-                if (
-                    _identifier_tokens(keyword.arg)
-                    & NON_STRUCTURAL_SCHEMA_KEYS
+                tokens = _identifier_tokens(keyword.arg)
+                if context == "schema" and (
+                    tokens & NON_STRUCTURAL_SCHEMA_KEYS
                 ):
                     continue
-            keys.update(_schema_literal_keys(keyword.value))
+                child_context = (
+                    "fields"
+                    if tokens & {"field", "fields", "properties"}
+                    else "schema"
+                )
+                keys.update(
+                    _schema_literal_keys(
+                        keyword.value, child_context
+                    )
+                )
+                continue
+            keys.update(_schema_literal_keys(keyword.value, context))
         return keys
     return set()
 
@@ -1589,6 +1898,43 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             _effect_boundary_violations(tree),
         )
 
+    def test_effect_adapter_boundary_scanner_resolves_unpacking_and_walrus_aliases(
+        self,
+    ):
+        cases = {
+            "tuple-unpacked dataclass": (
+                "from dataclasses import dataclass\n"
+                "record, = (dataclass,)\n"
+                "@record\n"
+                "class Request:\n"
+                "    graph: object\n",
+                "dataclass-field:graph",
+            ),
+            "walrus dataclass": (
+                "from dataclasses import dataclass\n"
+                "if (record := dataclass):\n"
+                "    @record\n"
+                "    class Request:\n"
+                "        graph: object\n",
+                "dataclass-field:graph",
+            ),
+            "walrus callable": (
+                "def helper():\n"
+                "    pass\n"
+                "if (callback := helper):\n"
+                "    def run(fn=callback):\n"
+                "        pass\n",
+                "function-valued-default:fn",
+            ),
+        }
+
+        for label, (source, expected) in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(
+                    expected,
+                    _effect_boundary_violations(ast.parse(source)),
+                )
+
     def test_effect_adapter_boundary_scanner_retains_dangerous_alias_history(
         self,
     ):
@@ -1719,6 +2065,33 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 "    worker: object = make_field(default=helper)\n",
                 "function-valued-field:worker",
             ),
+            "loop target callable": (
+                "def helper():\n"
+                "    pass\n"
+                "for callback in (helper,):\n"
+                "    def run(fn=callback):\n"
+                "        pass\n",
+                "function-valued-default:fn",
+            ),
+            "loop target field": (
+                "from dataclasses import dataclass, field\n"
+                "def helper():\n"
+                "    pass\n"
+                "for make_field in (field,):\n"
+                "    @dataclass\n"
+                "    class Request:\n"
+                "        worker: object = make_field(default=helper)\n",
+                "function-valued-field:worker",
+            ),
+            "match capture callable": (
+                "def helper():\n"
+                "    pass\n"
+                "match helper:\n"
+                "    case callback:\n"
+                "        def run(fn=callback):\n"
+                "            pass\n",
+                "function-valued-default:fn",
+            ),
         }
 
         for label, (source, expected) in cases.items():
@@ -1771,6 +2144,38 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
         metadata_violations = _effect_boundary_violations(metadata_schema)
         self.assertNotIn("schema-key:graph", metadata_violations)
         self.assertNotIn("schema-key:service", metadata_violations)
+        nested_metadata_schema = ast.parse(
+            "SCHEMA = {\n"
+            "    'properties': {\n"
+            "        'item': {\n"
+            "            'metadata': {'graph': 'documentation label'},\n"
+            "            'default': {'callback': 'example default'},\n"
+            "            'examples': [{'service': 'example value'}],\n"
+            "        },\n"
+            "    },\n"
+            "}\n"
+        )
+        nested_metadata_violations = _effect_boundary_violations(
+            nested_metadata_schema
+        )
+        self.assertNotIn("schema-key:graph", nested_metadata_violations)
+        self.assertNotIn("schema-key:callback", nested_metadata_violations)
+        self.assertNotIn("schema-key:service", nested_metadata_violations)
+        named_metadata_fields = ast.parse(
+            "SCHEMA = {\n"
+            "    'properties': {\n"
+            "        'metadata': {'properties': {'graph': {}}},\n"
+            "        'default': {'properties': {'service': {}}},\n"
+            "        'examples': {'properties': {'callback': {}}},\n"
+            "    },\n"
+            "}\n"
+        )
+        named_field_violations = _effect_boundary_violations(
+            named_metadata_fields
+        )
+        self.assertIn("schema-key:graph", named_field_violations)
+        self.assertIn("schema-key:service", named_field_violations)
+        self.assertIn("schema-key:callback", named_field_violations)
         self.assertIn(
             "schema-key:callback",
             _effect_boundary_violations(
@@ -1965,6 +2370,39 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 "        return fn()\n"
                 "    return invoke()\n"
             ),
+            "nested decorator": (
+                "def run(fn):\n"
+                "    @fn\n"
+                "    def wrapped():\n"
+                "        pass\n"
+                "    return wrapped\n"
+            ),
+            "literal tuple subscript": (
+                "def run(fn):\n"
+                "    return (fn,)[0]()\n"
+            ),
+            "literal list subscript": (
+                "def run(fn):\n"
+                "    return [fn][0]()\n"
+            ),
+            "aliased container subscript": (
+                "def run(fn):\n"
+                "    runners = (fn,)\n"
+                "    return runners[0]()\n"
+            ),
+            "attribute storage": (
+                "def run(fn, holder):\n"
+                "    holder.runner = fn\n"
+                "    return holder.runner()\n"
+            ),
+            "reflective dunder call": (
+                "def run(fn):\n"
+                "    return getattr(fn, '__call__')()\n"
+            ),
+            "walrus call alias": (
+                "def run(fn):\n"
+                "    return (runner := fn)()\n"
+            ),
         }
 
         for label, source in cases.items():
@@ -1982,6 +2420,16 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
         self.assertNotIn(
             "callable-parameter:value",
             _effect_boundary_violations(ordinary_alias),
+        )
+        stored_only = ast.parse(
+            "def run(value, holder):\n"
+            "    values = (value,)\n"
+            "    holder.item = value\n"
+            "    return values, holder\n"
+        )
+        self.assertNotIn(
+            "callable-parameter:value",
+            _effect_boundary_violations(stored_only),
         )
 
     def test_effect_adapter_boundary_scanner_retains_callable_alias_history(
@@ -2117,6 +2565,11 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             "stored builtin tuple": (
                 "loads = (__import__,)\n"
                 "loaded = loads[0]('email_automation.messaging')\n",
+                "dynamic-import:__import__",
+            ),
+            "builtins mapping lookup": (
+                "load = __builtins__['__import__']\n"
+                "loaded = load('email_automation.messaging')\n",
                 "dynamic-import:__import__",
             ),
         }
