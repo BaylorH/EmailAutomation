@@ -370,6 +370,34 @@ BUILTIN_CALLABLE_NAMES = frozenset(
     for name in dir(builtins)
     if callable(getattr(builtins, name))
 )
+CALLABLE_ARGUMENT_POSITIONS = {
+    "filter": frozenset({0}),
+    "functools.reduce": frozenset({0}),
+    "map": frozenset({0}),
+}
+CALLABLE_KEYWORD_ARGUMENTS = {
+    "max": frozenset({"key"}),
+    "min": frozenset({"key"}),
+    "sorted": frozenset({"key"}),
+}
+NON_STRUCTURAL_SCHEMA_KEYS = frozenset(
+    {
+        "const",
+        "default",
+        "deprecated",
+        "description",
+        "enum",
+        "example",
+        "examples",
+        "metadata",
+        "read_only",
+        "readonly",
+        "title",
+        "write_only",
+        "writeonly",
+    }
+)
+_MISSING_SYMBOL = object()
 
 
 def _resolved_import_names(node):
@@ -485,6 +513,42 @@ def _binding_environments(tree):
             imported_by_node[child] = frozenset(imported_symbols)
             callables_by_node[child] = frozenset(callable_symbols)
 
+    def merge_states(states):
+        imported_symbols = set().union(
+            *(state[1] for state in states)
+        )
+        callable_symbols = set().union(
+            *(state[2] for state in states)
+        )
+        bindings = {}
+        names = set().union(*(state[0] for state in states))
+        relevant_symbols = {
+            *callable_symbols,
+            *DYNAMIC_IMPORT_SYMBOLS,
+            *FORBIDDEN_FUNCTION_SYMBOLS,
+            "dataclasses.dataclass",
+            "dataclasses.field",
+        }
+        for name in names:
+            values = {
+                state_bindings[name]
+                for state_bindings, _, _ in states
+                if name in state_bindings
+            }
+            risky = sorted(
+                value
+                for value in values
+                if value in relevant_symbols
+                or _imported_symbol_is_callable(
+                    value, imported_symbols
+                )
+            )
+            if risky:
+                bindings[name] = risky[0]
+            elif len(values) == 1:
+                bindings[name] = values.pop()
+        return bindings, imported_symbols, callable_symbols
+
     def walk_scope(statements, inherited, imported, callables):
         bindings = dict(inherited)
         imported_symbols = set(imported)
@@ -506,6 +570,125 @@ def _binding_environments(tree):
                     imported_symbols,
                     callable_symbols,
                 )
+            elif isinstance(statement, ast.If):
+                body_state = walk_scope(
+                    statement.body,
+                    bindings,
+                    imported_symbols,
+                    callable_symbols,
+                )
+                else_state = walk_scope(
+                    statement.orelse,
+                    bindings,
+                    imported_symbols,
+                    callable_symbols,
+                )
+                (
+                    bindings,
+                    imported_symbols,
+                    callable_symbols,
+                ) = merge_states(
+                    [
+                        (
+                            dict(bindings),
+                            set(imported_symbols),
+                            set(callable_symbols),
+                        ),
+                        body_state,
+                        else_state,
+                    ]
+                )
+                continue
+            elif isinstance(
+                statement,
+                (ast.For, ast.AsyncFor, ast.While),
+            ):
+                body_state = walk_scope(
+                    statement.body,
+                    bindings,
+                    imported_symbols,
+                    callable_symbols,
+                )
+                loop_state = merge_states(
+                    [
+                        (
+                            dict(bindings),
+                            set(imported_symbols),
+                            set(callable_symbols),
+                        ),
+                        body_state,
+                    ]
+                )
+                else_state = walk_scope(
+                    statement.orelse,
+                    *loop_state,
+                )
+                (
+                    bindings,
+                    imported_symbols,
+                    callable_symbols,
+                ) = merge_states([loop_state, else_state])
+                continue
+            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                body_state = walk_scope(
+                    statement.body,
+                    bindings,
+                    imported_symbols,
+                    callable_symbols,
+                )
+                (
+                    bindings,
+                    imported_symbols,
+                    callable_symbols,
+                ) = merge_states(
+                    [
+                        (
+                            dict(bindings),
+                            set(imported_symbols),
+                            set(callable_symbols),
+                        ),
+                        body_state,
+                    ]
+                )
+                continue
+            elif isinstance(statement, (ast.Try, ast.TryStar)):
+                initial_state = (
+                    dict(bindings),
+                    set(imported_symbols),
+                    set(callable_symbols),
+                )
+                body_state = walk_scope(statement.body, *initial_state)
+                else_state = walk_scope(statement.orelse, *body_state)
+                handler_states = [
+                    walk_scope(handler.body, *initial_state)
+                    for handler in statement.handlers
+                ]
+                merged = merge_states(
+                    [initial_state, body_state, else_state, *handler_states]
+                )
+                final_state = walk_scope(statement.finalbody, *merged)
+                (
+                    bindings,
+                    imported_symbols,
+                    callable_symbols,
+                ) = merge_states([merged, final_state])
+                continue
+            elif isinstance(statement, ast.Match):
+                initial_state = (
+                    dict(bindings),
+                    set(imported_symbols),
+                    set(callable_symbols),
+                )
+                case_states = [
+                    walk_scope(case.body, *initial_state)
+                    for case in statement.cases
+                ]
+                (
+                    bindings,
+                    imported_symbols,
+                    callable_symbols,
+                ) = merge_states([initial_state, *case_states])
+                continue
 
             new_bindings, new_imports = _imported_bindings(statement)
             bindings.update(new_bindings)
@@ -538,6 +721,8 @@ def _binding_environments(tree):
                 else:
                     bindings[statement.target.id] = resolved
 
+        return bindings, imported_symbols, callable_symbols
+
     record(tree, {}, set(), set())
     walk_scope(tree.body, {}, set(), set())
     return bindings_by_node, imported_by_node, callables_by_node
@@ -567,6 +752,36 @@ def _contains_function_surface(node, bindings):
     )
 
 
+def _loaded_symbol_value(symbol):
+    parts = symbol.split(".")
+    for index in range(len(parts), 0, -1):
+        module = sys.modules.get(".".join(parts[:index]))
+        if module is None:
+            continue
+        value = module
+        for attribute in parts[index:]:
+            namespace = getattr(value, "__dict__", {})
+            if attribute not in namespace:
+                return _MISSING_SYMBOL
+            value = namespace[attribute]
+        return value
+    return _MISSING_SYMBOL
+
+
+def _is_imported_reference(symbol, imported_symbols):
+    return symbol is not None and any(
+        symbol == imported or symbol.startswith(f"{imported}.")
+        for imported in imported_symbols
+    )
+
+
+def _imported_symbol_is_callable(symbol, imported_symbols):
+    if not _is_imported_reference(symbol, imported_symbols):
+        return False
+    value = _loaded_symbol_value(symbol)
+    return value is _MISSING_SYMBOL or callable(value)
+
+
 def _is_callable_reference(
     node,
     bindings,
@@ -576,11 +791,10 @@ def _is_callable_reference(
     resolved = _resolved_symbol(node, bindings)
     if resolved in callable_symbols or resolved in BUILTIN_CALLABLE_NAMES:
         return True
-    if resolved is not None and any(
-        resolved == imported or resolved.startswith(f"{imported}.")
-        for imported in imported_symbols
-    ):
-        return True
+    if _is_imported_reference(resolved, imported_symbols):
+        return _imported_symbol_is_callable(
+            resolved, imported_symbols
+        )
     return (
         resolved is not None
         and resolved.startswith("builtins.")
@@ -606,13 +820,90 @@ def _function_defaults(node):
             yield argument, default
 
 
-def _function_body_nodes(node):
-    pending = list(reversed(node.body))
-    while pending:
-        child = pending.pop()
-        yield child
+def _assigned_names(target):
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.List, ast.Tuple)):
+        names = set()
+        for item in target.elts:
+            names.update(_assigned_names(item))
+        return names
+    return set()
+
+
+def _scope_bound_names(statements):
+    names = set()
+    for statement in statements:
         if isinstance(
-            child,
+            statement,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        ):
+            names.add(statement.name)
+            continue
+        if isinstance(statement, ast.Import):
+            names.update(
+                alias.asname or alias.name.split(".", 1)[0]
+                for alias in statement.names
+            )
+        elif isinstance(statement, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in statement.names)
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                names.update(_assigned_names(target))
+        elif isinstance(statement, ast.AnnAssign):
+            names.update(_assigned_names(statement.target))
+        elif isinstance(statement, (ast.For, ast.AsyncFor)):
+            names.update(_assigned_names(statement.target))
+
+        child_lists = []
+        if isinstance(statement, ast.If):
+            child_lists = [statement.body, statement.orelse]
+        elif isinstance(
+            statement, (ast.For, ast.AsyncFor, ast.While)
+        ):
+            child_lists = [statement.body, statement.orelse]
+        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+            child_lists = [statement.body]
+        elif isinstance(statement, (ast.Try, ast.TryStar)):
+            child_lists = [
+                statement.body,
+                statement.orelse,
+                statement.finalbody,
+                *(handler.body for handler in statement.handlers),
+            ]
+        elif isinstance(statement, ast.Match):
+            child_lists = [case.body for case in statement.cases]
+        for child_list in child_lists:
+            names.update(_scope_bound_names(child_list))
+    return names
+
+
+def _parameter_call_origins(node, safe_names, bindings_by_node):
+    parameter_names = {
+        argument.arg
+        for argument in (
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        )
+        if argument.arg not in safe_names
+    }
+    if node.args.vararg is not None:
+        parameter_names.add(node.args.vararg.arg)
+    if node.args.kwarg is not None:
+        parameter_names.add(node.args.kwarg.arg)
+    found = set()
+
+    def origins(value, aliases):
+        if isinstance(value, ast.Name):
+            return aliases.get(value.id, frozenset())
+        if isinstance(value, ast.Attribute) and value.attr == "__call__":
+            return origins(value.value, aliases)
+        return frozenset()
+
+    def scan_expression(value, aliases):
+        if isinstance(
+            value,
             (
                 ast.FunctionDef,
                 ast.AsyncFunctionDef,
@@ -620,8 +911,147 @@ def _function_body_nodes(node):
                 ast.Lambda,
             ),
         ):
-            continue
-        pending.extend(reversed(list(ast.iter_child_nodes(child))))
+            return
+        if isinstance(value, ast.Call):
+            found.update(origins(value.func, aliases))
+            bindings = bindings_by_node.get(value, {})
+            callee = _resolved_symbol(value.func, bindings)
+            if callee is not None and callee.startswith("builtins."):
+                callee = callee.removeprefix("builtins.")
+            for position in CALLABLE_ARGUMENT_POSITIONS.get(
+                callee, frozenset()
+            ):
+                if position < len(value.args):
+                    found.update(origins(value.args[position], aliases))
+            callable_keywords = CALLABLE_KEYWORD_ARGUMENTS.get(
+                callee, frozenset()
+            )
+            for keyword in value.keywords:
+                if keyword.arg in callable_keywords:
+                    found.update(origins(keyword.value, aliases))
+        for child in ast.iter_child_nodes(value):
+            scan_expression(child, aliases)
+
+    def merge_aliases(states):
+        merged = {}
+        for name in set().union(*states):
+            combined = frozenset().union(
+                *(state.get(name, frozenset()) for state in states)
+            )
+            if combined:
+                merged[name] = combined
+        return merged
+
+    def walk(statements, inherited):
+        aliases = dict(inherited)
+        for statement in statements:
+            if isinstance(
+                statement, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                local_names = {
+                    argument.arg
+                    for argument in (
+                        *statement.args.posonlyargs,
+                        *statement.args.args,
+                        *statement.args.kwonlyargs,
+                    )
+                }
+                if statement.args.vararg is not None:
+                    local_names.add(statement.args.vararg.arg)
+                if statement.args.kwarg is not None:
+                    local_names.add(statement.args.kwarg.arg)
+                local_names.update(_scope_bound_names(statement.body))
+                captured = {
+                    name: origin
+                    for name, origin in aliases.items()
+                    if name not in local_names
+                }
+                walk(statement.body, captured)
+                aliases.pop(statement.name, None)
+                continue
+            if isinstance(statement, ast.ClassDef):
+                aliases.pop(statement.name, None)
+                continue
+            if isinstance(statement, ast.If):
+                scan_expression(statement.test, aliases)
+                aliases = merge_aliases(
+                    [
+                        aliases,
+                        walk(statement.body, aliases),
+                        walk(statement.orelse, aliases),
+                    ]
+                )
+                continue
+            if isinstance(
+                statement, (ast.For, ast.AsyncFor, ast.While)
+            ):
+                if isinstance(statement, (ast.For, ast.AsyncFor)):
+                    scan_expression(statement.iter, aliases)
+                else:
+                    scan_expression(statement.test, aliases)
+                loop_aliases = merge_aliases(
+                    [aliases, walk(statement.body, aliases)]
+                )
+                aliases = merge_aliases(
+                    [loop_aliases, walk(statement.orelse, loop_aliases)]
+                )
+                continue
+            if isinstance(statement, (ast.With, ast.AsyncWith)):
+                for item in statement.items:
+                    scan_expression(item.context_expr, aliases)
+                aliases = merge_aliases(
+                    [aliases, walk(statement.body, aliases)]
+                )
+                continue
+            if isinstance(statement, (ast.Try, ast.TryStar)):
+                body_aliases = walk(statement.body, aliases)
+                states = [
+                    aliases,
+                    body_aliases,
+                    walk(statement.orelse, body_aliases),
+                    *(
+                        walk(handler.body, aliases)
+                        for handler in statement.handlers
+                    ),
+                ]
+                merged = merge_aliases(states)
+                aliases = merge_aliases(
+                    [merged, walk(statement.finalbody, merged)]
+                )
+                continue
+            if isinstance(statement, ast.Match):
+                scan_expression(statement.subject, aliases)
+                states = [aliases]
+                for case in statement.cases:
+                    if case.guard is not None:
+                        scan_expression(case.guard, aliases)
+                    states.append(walk(case.body, aliases))
+                aliases = merge_aliases(states)
+                continue
+
+            scan_expression(statement, aliases)
+            if isinstance(statement, ast.Assign):
+                assigned_origins = origins(statement.value, aliases)
+                for target in statement.targets:
+                    for name in _assigned_names(target):
+                        if assigned_origins:
+                            aliases[name] = assigned_origins
+                        else:
+                            aliases.pop(name, None)
+            elif isinstance(statement, ast.AnnAssign):
+                assigned_origins = origins(statement.value, aliases)
+                for name in _assigned_names(statement.target):
+                    if assigned_origins:
+                        aliases[name] = assigned_origins
+                    else:
+                        aliases.pop(name, None)
+        return aliases
+
+    walk(
+        node.body,
+        {name: frozenset({name}) for name in parameter_names},
+    )
+    return found
 
 
 def _dataclass_default_expressions(value, bindings):
@@ -656,6 +1086,11 @@ def _schema_literal_keys(value):
         for key, item in zip(value.keys, value.values, strict=True):
             if isinstance(key, ast.Constant) and isinstance(key.value, str):
                 keys.add(key.value)
+                if (
+                    _identifier_tokens(key.value)
+                    & NON_STRUCTURAL_SCHEMA_KEYS
+                ):
+                    continue
             keys.update(_schema_literal_keys(item))
         return keys
     if isinstance(value, (ast.List, ast.Set, ast.Tuple)):
@@ -673,6 +1108,11 @@ def _schema_literal_keys(value):
         for keyword in value.keywords:
             if keyword.arg is not None:
                 keys.add(keyword.arg)
+                if (
+                    _identifier_tokens(keyword.arg)
+                    & NON_STRUCTURAL_SCHEMA_KEYS
+                ):
+                    continue
             keys.update(_schema_literal_keys(keyword.value))
         return keys
     return set()
@@ -680,7 +1120,7 @@ def _schema_literal_keys(value):
 
 def _schema_key_strings(tree):
     keys = set()
-    for node in tree.body:
+    for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             targets = {
                 target.id
@@ -762,7 +1202,6 @@ def _effect_boundary_violations(tree):
                     violations.add(
                         f"function-valued-default:{argument.arg}"
                     )
-            parameter_names = {argument.arg for argument in arguments}
             class_method = any(
                 _resolved_symbol(
                     decorator.func
@@ -780,16 +1219,14 @@ def _effect_boundary_violations(tree):
                 or _resolved_symbol(argument.annotation, bindings)
                 in {"builtins.type", "type"}
             }
-            for child in _function_body_nodes(node):
-                if (
-                    isinstance(child, ast.Call)
-                    and isinstance(child.func, ast.Name)
-                    and child.func.id in parameter_names
-                    and child.func.id not in safe_invoked_parameters
-                ):
-                    violations.add(
-                        f"callable-parameter:{child.func.id}"
-                    )
+            violations.update(
+                f"callable-parameter:{name}"
+                for name in _parameter_call_origins(
+                    node,
+                    safe_invoked_parameters,
+                    bindings_by_node,
+                )
+            )
         elif isinstance(node, ast.ClassDef):
             forbidden = _boundary_surface_tokens(node.name)
             violations.update(f"class:{token}" for token in forbidden)
@@ -1198,6 +1635,99 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             _effect_boundary_violations(nested_alias),
         )
 
+    def test_effect_adapter_boundary_scanner_tracks_control_flow_bindings(
+        self,
+    ):
+        cases = {
+            "if callable default": (
+                "if enabled:\n"
+                "    from .validation import validate_action_plan\n"
+                "    helper = validate_action_plan\n"
+                "    def run(fn=helper):\n"
+                "        pass\n",
+                "function-valued-default:fn",
+            ),
+            "try field alias": (
+                "from dataclasses import dataclass\n"
+                "try:\n"
+                "    from dataclasses import field\n"
+                "    def helper():\n"
+                "        pass\n"
+                "    @dataclass\n"
+                "    class Request:\n"
+                "        worker: object = field(default=helper)\n"
+                "except Exception:\n"
+                "    pass\n",
+                "function-valued-field:worker",
+            ),
+            "loop declaration": (
+                "for item in values:\n"
+                "    def helper():\n"
+                "        pass\n"
+                "    def run(fn=helper):\n"
+                "        pass\n",
+                "function-valued-default:fn",
+            ),
+            "with declaration": (
+                "with manager:\n"
+                "    def helper():\n"
+                "        pass\n"
+                "    def run(fn=helper):\n"
+                "        pass\n",
+                "function-valued-default:fn",
+            ),
+            "match declaration": (
+                "match value:\n"
+                "    case _:\n"
+                "        def helper():\n"
+                "            pass\n"
+                "        def run(fn=helper):\n"
+                "            pass\n",
+                "function-valued-default:fn",
+            ),
+            "post-if callable alias": (
+                "from .validation import validate_action_plan\n"
+                "helper = None\n"
+                "if enabled:\n"
+                "    helper = validate_action_plan\n"
+                "def run(fn=helper):\n"
+                "    pass\n",
+                "function-valued-default:fn",
+            ),
+            "post-if callable wins over constant": (
+                "from .effect_adapter_fixtures import "
+                "EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION\n"
+                "from .validation import validate_action_plan\n"
+                "helper = EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION\n"
+                "if enabled:\n"
+                "    helper = validate_action_plan\n"
+                "def run(fn=helper):\n"
+                "    pass\n",
+                "function-valued-default:fn",
+            ),
+            "post-try field alias": (
+                "from dataclasses import dataclass, field\n"
+                "def helper():\n"
+                "    pass\n"
+                "make_field = object\n"
+                "try:\n"
+                "    make_field = field\n"
+                "except Exception:\n"
+                "    pass\n"
+                "@dataclass\n"
+                "class Request:\n"
+                "    worker: object = make_field(default=helper)\n",
+                "function-valued-field:worker",
+            ),
+        }
+
+        for label, (source, expected) in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(
+                    expected,
+                    _effect_boundary_violations(ast.parse(source)),
+                )
+
     def test_effect_adapter_boundary_scanner_rejects_schema_declaration_bypasses(
         self,
     ):
@@ -1232,6 +1762,15 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
         mapping_violations = _effect_boundary_violations(mapping_schema)
         self.assertNotIn("schema-key:graph", mapping_violations)
         self.assertNotIn("schema-key:service", mapping_violations)
+        metadata_schema = ast.parse(
+            "SCHEMA = {\n"
+            "    'metadata': {'graph': 'documentation label'},\n"
+            "    'examples': [{'service': 'example value'}],\n"
+            "}\n"
+        )
+        metadata_violations = _effect_boundary_violations(metadata_schema)
+        self.assertNotIn("schema-key:graph", metadata_violations)
+        self.assertNotIn("schema-key:service", metadata_violations)
         self.assertIn(
             "schema-key:callback",
             _effect_boundary_violations(
@@ -1249,6 +1788,29 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             ),
         }
         for label, (source, expected) in nested_schema_cases.items():
+            with self.subTest(label=label):
+                self.assertIn(
+                    expected,
+                    _effect_boundary_violations(ast.parse(source)),
+                )
+
+    def test_effect_adapter_boundary_scanner_checks_nested_schema_declarations(
+        self,
+    ):
+        cases = {
+            "function schema": (
+                "def build():\n"
+                "    schema = {'properties': {'callback': {}}}\n",
+                "schema-key:callback",
+            ),
+            "class fields": (
+                "class Definition:\n"
+                "    SCHEMA_FIELDS = {'request': {'graph'}}\n",
+                "schema-key:graph",
+            ),
+        }
+
+        for label, (source, expected) in cases.items():
             with self.subTest(label=label):
                 self.assertIn(
                     expected,
@@ -1323,6 +1885,30 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                     _effect_boundary_violations(ast.parse(source)),
                 )
 
+        ordinary_imported_defaults = {
+            "enum member": (
+                "from .effect_adapter import DryRunStatus\n"
+                "def run(status=DryRunStatus.BLOCKED):\n"
+                "    pass\n"
+            ),
+            "schema version": (
+                "from .effect_adapter_fixtures import "
+                "EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION\n"
+                "def run(version=EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION):\n"
+                "    pass\n"
+            ),
+        }
+        for label, source in ordinary_imported_defaults.items():
+            with self.subTest(label=label):
+                self.assertFalse(
+                    any(
+                        item.startswith("function-valued-default:")
+                        for item in _effect_boundary_violations(
+                            ast.parse(source)
+                        )
+                    )
+                )
+
     def test_effect_adapter_boundary_scanner_rejects_invoked_parameters(self):
         invoked_parameter = ast.parse(
             "def run(fn):\n"
@@ -1356,6 +1942,46 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
         self.assertNotIn(
             "callable-parameter:enum_type",
             _effect_boundary_violations(declared_type),
+        )
+
+    def test_effect_adapter_boundary_scanner_tracks_parameter_indirection(self):
+        cases = {
+            "assigned alias": (
+                "def run(fn):\n"
+                "    runner = fn\n"
+                "    return runner()\n"
+            ),
+            "dunder call": (
+                "def run(fn):\n"
+                "    return fn.__call__()\n"
+            ),
+            "higher-order call": (
+                "def run(fn, values):\n"
+                "    return map(fn, values)\n"
+            ),
+            "nested capture": (
+                "def run(fn):\n"
+                "    def invoke():\n"
+                "        return fn()\n"
+                "    return invoke()\n"
+            ),
+        }
+
+        for label, source in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(
+                    "callable-parameter:fn",
+                    _effect_boundary_violations(ast.parse(source)),
+                )
+
+        ordinary_alias = ast.parse(
+            "def run(value):\n"
+            "    item = value\n"
+            "    return (item,)\n"
+        )
+        self.assertNotIn(
+            "callable-parameter:value",
+            _effect_boundary_violations(ordinary_alias),
         )
 
     def test_effect_adapter_boundary_scanner_retains_callable_alias_history(
