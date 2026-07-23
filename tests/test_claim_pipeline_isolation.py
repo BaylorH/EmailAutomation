@@ -33,17 +33,6 @@ EFFECT_ADAPTER_PATHS = (
     PACKAGE_ROOT / "effect_adapter.py",
     PACKAGE_ROOT / "effect_adapter_fixtures.py",
 )
-PRODUCTION_MODULE_PREFIXES = (
-    "email_automation.ai_processing",
-    "email_automation.email",
-    "email_automation.followup",
-    "email_automation.notifications",
-    "email_automation.pending_responses",
-    "email_automation.processing",
-    "email_automation.service_providers",
-    "email_automation.sheet_operations",
-    "email_automation.sheets",
-)
 FORBIDDEN_EFFECT_BOUNDARY_TOKENS = frozenset(
     {
         "callable",
@@ -86,6 +75,23 @@ EXPECTED_EFFECT_ADAPTER_API = {
     "evaluate_effect_plan",
     "load_effect_adapter_fixture_catalog",
     "run_effect_adapter_fixture_case",
+}
+EFFECT_ADAPTER_MODULES = frozenset(
+    {
+        "email_automation.claim_pipeline.effect_adapter",
+        "email_automation.claim_pipeline.effect_adapter_fixtures",
+    }
+)
+FORBIDDEN_FUNCTION_SYMBOLS = {
+    "collections.abc.Callable": "callable",
+    "types.FunctionType": "functiontype",
+    "typing.Callable": "callable",
+    "typing.Protocol": "protocol",
+}
+DYNAMIC_IMPORT_SYMBOLS = {
+    "__import__": "__import__",
+    "builtins.__import__": "__import__",
+    "importlib.import_module": "importlib.import_module",
 }
 
 
@@ -143,30 +149,71 @@ def _boundary_surface_tokens(name):
     return _identifier_tokens(name) & FORBIDDEN_EFFECT_BOUNDARY_TOKENS
 
 
-def _is_dataclass(class_node):
-    return any(
-        (
-            isinstance(decorator, ast.Name)
-            and decorator.id == "dataclass"
-        )
-        or (
-            isinstance(decorator, ast.Call)
-            and isinstance(decorator.func, ast.Name)
-            and decorator.func.id == "dataclass"
-        )
-        for decorator in class_node.decorator_list
+def _import_bindings(tree):
+    bindings = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound_name = alias.asname or alias.name.split(".", 1)[0]
+                bindings[bound_name] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                if node.level:
+                    module = _resolved_import_names(node)[0]
+                else:
+                    module = node.module
+                for alias in node.names:
+                    bindings[alias.asname or alias.name] = f"{module}.{alias.name}"
+            else:
+                for alias, resolved in zip(
+                    node.names, _resolved_import_names(node), strict=True
+                ):
+                    bindings[alias.asname or alias.name] = resolved
+    return bindings
+
+
+def _resolved_symbol(node, bindings):
+    if isinstance(node, ast.Name):
+        return bindings.get(node.id, node.id)
+    if isinstance(node, ast.Attribute):
+        owner = _resolved_symbol(node.value, bindings)
+        if owner is not None:
+            return f"{owner}.{node.attr}"
+    return None
+
+
+def _function_surface_token(node, bindings):
+    resolved = _resolved_symbol(node, bindings)
+    if resolved in FORBIDDEN_FUNCTION_SYMBOLS:
+        return FORBIDDEN_FUNCTION_SYMBOLS[resolved]
+    if isinstance(node, ast.Name):
+        raw_name = node.id.casefold()
+    elif isinstance(node, ast.Attribute):
+        raw_name = node.attr.casefold()
+    else:
+        return None
+    return {
+        "callable": "callable",
+        "functiontype": "functiontype",
+        "protocol": "protocol",
+    }.get(raw_name)
+
+
+def _contains_function_surface(node, bindings):
+    return node is not None and any(
+        _function_surface_token(child, bindings) is not None
+        for child in ast.walk(node)
     )
 
 
-def _is_sorted_key_lambda(node, parents):
-    keyword = parents.get(node)
-    call = parents.get(keyword)
-    return (
-        isinstance(keyword, ast.keyword)
-        and keyword.arg == "key"
-        and isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Name)
-        and call.func.id == "sorted"
+def _is_dataclass(class_node, bindings):
+    return any(
+        _resolved_symbol(
+            decorator.func if isinstance(decorator, ast.Call) else decorator,
+            bindings,
+        )
+        in {"dataclass", "dataclasses.dataclass"}
+        for decorator in class_node.decorator_list
     )
 
 
@@ -192,40 +239,44 @@ def _schema_key_strings(tree):
 
 
 def _effect_boundary_violations(tree):
-    parents = {
-        child: parent
-        for parent in ast.walk(tree)
-        for child in ast.iter_child_nodes(parent)
-    }
+    bindings = _import_bindings(tree)
     violations = set()
 
     for imported in _import_violations(tree):
         violations.add(f"import:{imported}")
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.Lambda) and not _is_sorted_key_lambda(node, parents):
+        if isinstance(node, ast.Lambda):
             violations.add(f"lambda:{node.lineno}")
-        if isinstance(node, ast.Name):
-            forbidden = {node.id.casefold()} & {"callable", "protocol"}
-            violations.update(f"identifier:{token}" for token in forbidden)
-        elif isinstance(node, ast.Attribute):
-            forbidden = {node.attr.casefold()} & {"callable", "protocol"}
-            violations.update(f"identifier:{token}" for token in forbidden)
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            function_token = _function_surface_token(node, bindings)
+            if function_token is not None:
+                violations.add(f"identifier:{function_token}")
+        if isinstance(node, ast.Call):
+            dynamic_import = DYNAMIC_IMPORT_SYMBOLS.get(
+                _resolved_symbol(node.func, bindings)
+            )
+            if dynamic_import is not None:
+                violations.add(f"dynamic-import:{dynamic_import}")
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             forbidden = _boundary_surface_tokens(node.name)
             violations.update(f"function:{token}" for token in forbidden)
-            arguments = (
+            arguments = [
                 *node.args.posonlyargs,
                 *node.args.args,
                 *node.args.kwonlyargs,
-            )
+            ]
+            if node.args.vararg is not None:
+                arguments.append(node.args.vararg)
+            if node.args.kwarg is not None:
+                arguments.append(node.args.kwarg)
             for argument in arguments:
                 forbidden = _boundary_surface_tokens(argument.arg)
                 violations.update(f"argument:{token}" for token in forbidden)
         elif isinstance(node, ast.ClassDef):
             forbidden = _boundary_surface_tokens(node.name)
             violations.update(f"class:{token}" for token in forbidden)
-            if not _is_dataclass(node):
+            if not _is_dataclass(node, bindings):
                 continue
             for field in node.body:
                 if not isinstance(field, ast.AnnAssign) or not isinstance(
@@ -234,14 +285,9 @@ def _effect_boundary_violations(tree):
                     continue
                 forbidden = _boundary_surface_tokens(field.target.id)
                 violations.update(f"dataclass-field:{token}" for token in forbidden)
-                annotation_names = {
-                    child.id.casefold()
-                    for child in ast.walk(field.annotation)
-                    if isinstance(child, ast.Name)
-                }
-                if annotation_names & {"callable", "protocol"}:
-                    violations.add(f"function-valued-field:{field.target.id}")
-                if isinstance(field.value, ast.Lambda):
+                if _contains_function_surface(
+                    field.annotation, bindings
+                ) or _contains_function_surface(field.value, bindings):
                     violations.add(f"function-valued-field:{field.target.id}")
 
     for key in _schema_key_strings(tree):
@@ -251,20 +297,100 @@ def _effect_boundary_violations(tree):
     return violations
 
 
-def _private_adapter_declarations():
-    names = set()
-    for path in EFFECT_ADAPTER_PATHS:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        names.update(
-            node.name
-            for node in tree.body
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name.startswith("_")
+def _literal_all_names(tree):
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "__all__"
+            for target in node.targets
+        ):
+            continue
+        if not isinstance(node.value, (ast.List, ast.Set, ast.Tuple)):
+            return set()
+        return {
+            item.value
+            for item in node.value.elts
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+    return set()
+
+
+def _effect_adapter_package_imports(tree):
+    imports = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        resolved_modules = _resolved_import_names(node)
+        if len(resolved_modules) != 1 or resolved_modules[0] not in EFFECT_ADAPTER_MODULES:
+            continue
+        imports.update(
+            (alias.name, alias.asname or alias.name)
+            for alias in node.names
         )
-    return names
+    return imports
+
+
+def _effect_adapter_api_violations(tree):
+    imports = _effect_adapter_package_imports(tree)
+    bound_public_names = {
+        bound_name
+        for source_name, bound_name in imports
+        if not bound_name.startswith("_")
+    }
+    exported_names = _literal_all_names(tree)
+    violations = {
+        f"private-source:{source_name}->{bound_name}"
+        for source_name, bound_name in imports
+        if source_name.startswith("_")
+    }
+    violations.update(
+        f"missing-bound:{name}"
+        for name in EXPECTED_EFFECT_ADAPTER_API - bound_public_names
+    )
+    violations.update(
+        f"unexpected-bound:{name}"
+        for name in bound_public_names - EXPECTED_EFFECT_ADAPTER_API
+    )
+    violations.update(
+        f"missing-export:{name}"
+        for name in EXPECTED_EFFECT_ADAPTER_API - exported_names
+    )
+    return violations
 
 
 class ClaimPipelineIsolationTests(unittest.TestCase):
+    def test_forbidden_effect_boundary_tokens_are_closed(self):
+        self.assertEqual(
+            frozenset(
+                {
+                    "callable",
+                    "callback",
+                    "client",
+                    "driver",
+                    "executor",
+                    "firebase",
+                    "firestore",
+                    "followup",
+                    "google",
+                    "graph",
+                    "hook",
+                    "msal",
+                    "notifications",
+                    "outbox",
+                    "pending_responses",
+                    "processing",
+                    "protocol",
+                    "repository",
+                    "requests",
+                    "service",
+                    "sheets",
+                    "transport",
+                }
+            ),
+            FORBIDDEN_EFFECT_BOUNDARY_TOKENS,
+        )
+
     def test_relative_imports_are_resolved_against_claim_pipeline_package(self):
         tree = ast.parse(
             "from ..processing import process_message\n"
@@ -328,14 +454,103 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
         self.assertIn("schema-key:callback", violations)
         self.assertTrue(any(item.startswith("lambda:") for item in violations))
 
-    def test_package_import_does_not_load_production_service_modules(self):
+    def test_effect_adapter_boundary_scanner_rejects_type_aliases(self):
+        tree = ast.parse(
+            "from typing import Callable as Fn, Protocol as P\n"
+            "from types import FunctionType as FT\n"
+            "import typing as type_defs\n"
+            "import types as runtime_types\n"
+            "from dataclasses import dataclass as record\n"
+            "import dataclasses as records\n"
+            "class Boundary(P):\n"
+            "    pass\n"
+            "@record(frozen=True)\n"
+            "class FirstRequest:\n"
+            "    worker: Fn\n"
+            "    runner: FT = FT\n"
+            "@records.dataclass\n"
+            "class SecondRequest:\n"
+            "    sender: type_defs.Callable = runtime_types.FunctionType\n"
+        )
+
+        violations = _effect_boundary_violations(tree)
+
+        self.assertIn("identifier:callable", violations)
+        self.assertIn("identifier:protocol", violations)
+        self.assertIn("identifier:functiontype", violations)
+        self.assertIn("function-valued-field:worker", violations)
+        self.assertIn("function-valued-field:runner", violations)
+        self.assertIn("function-valued-field:sender", violations)
+
+    def test_effect_adapter_boundary_scanner_checks_every_parameter_kind(self):
+        tree = ast.parse(
+            "def configure(service, /, client, *graph, transport, **repository):\n"
+            "    pass\n"
+        )
+
+        violations = _effect_boundary_violations(tree)
+
+        self.assertIn("argument:service", violations)
+        self.assertIn("argument:client", violations)
+        self.assertIn("argument:graph", violations)
+        self.assertIn("argument:transport", violations)
+        self.assertIn("argument:repository", violations)
+
+    def test_effect_adapter_boundary_scanner_rejects_dynamic_imports(self):
+        cases = {
+            "direct builtin": (
+                "direct = __import__('email_automation.processing')\n",
+                "dynamic-import:__import__",
+            ),
+            "aliased builtin": (
+                "from builtins import __import__ as load_builtin\n"
+                "loaded = load_builtin('email_automation.processing')\n",
+                "dynamic-import:__import__",
+            ),
+            "module attribute": (
+                "import importlib\n"
+                "loaded = importlib.import_module('email_automation.processing')\n",
+                "dynamic-import:importlib.import_module",
+            ),
+            "aliased module attribute": (
+                "import importlib as loader\n"
+                "loaded = loader.import_module('email_automation.processing')\n",
+                "dynamic-import:importlib.import_module",
+            ),
+            "aliased imported function": (
+                "from importlib import import_module as load\n"
+                "loaded = load('email_automation.processing')\n",
+                "dynamic-import:importlib.import_module",
+            ),
+        }
+
+        for label, (source, expected) in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(
+                    expected,
+                    _effect_boundary_violations(ast.parse(source)),
+                )
+
+    def test_effect_adapter_files_reject_every_lambda(self):
+        lambdas = set()
+        for path in EFFECT_ADAPTER_PATHS:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            lambdas.update(
+                f"{path.name}:{node.lineno}"
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Lambda)
+            )
+
+        self.assertEqual(set(), lambdas)
+
+    def test_package_import_loads_only_claim_pipeline_modules(self):
         script = (
             "import json, sys\n"
             "from email_automation import claim_pipeline\n"
-            f"prefixes = {PRODUCTION_MODULE_PREFIXES!r}\n"
             "loaded = sorted(name for name in sys.modules "
-            "if any(name == prefix or name.startswith(prefix + '.') "
-            "for prefix in prefixes))\n"
+            "if name.startswith('email_automation.') "
+            "and name != 'email_automation.claim_pipeline' "
+            "and not name.startswith('email_automation.claim_pipeline.'))\n"
             "print(json.dumps(loaded))\n"
         )
         completed = subprocess.run(
@@ -348,8 +563,13 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
         self.assertEqual([], json.loads(completed.stdout))
 
     def test_effect_adapter_api_is_exposed_at_package_boundary(self):
-        exported_names = set(claim_pipeline.__all__)
+        initializer_path = PACKAGE_ROOT / "__init__.py"
+        initializer_tree = ast.parse(
+            initializer_path.read_text(encoding="utf-8"),
+            filename=str(initializer_path),
+        )
 
+        self.assertEqual(set(), _effect_adapter_api_violations(initializer_tree))
         self.assertEqual(
             set(),
             {
@@ -358,15 +578,46 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 if not hasattr(claim_pipeline, name)
             },
         )
-        self.assertLessEqual(EXPECTED_EFFECT_ADAPTER_API, exported_names)
+
+    def test_effect_adapter_api_lock_rejects_extra_and_private_aliases(self):
+        baseline_import = (
+            "from .effect_adapter import ("
+            + ", ".join(sorted(EXPECTED_EFFECT_ADAPTER_API))
+            + ")\n"
+        )
+        baseline_all = f"__all__ = {sorted(EXPECTED_EFFECT_ADAPTER_API)!r}\n"
+        baseline = baseline_import + baseline_all
         self.assertEqual(
             set(),
-            {
-                name
-                for name in _private_adapter_declarations()
-                if name in exported_names or hasattr(claim_pipeline, name)
-            },
+            _effect_adapter_api_violations(ast.parse(baseline)),
         )
+        extra_report_exports = sorted(
+            EXPECTED_EFFECT_ADAPTER_API | {"EffectAdapterReport"}
+        )
+        private_alias_exports = sorted(
+            EXPECTED_EFFECT_ADAPTER_API | {"publish_report"}
+        )
+        cases = {
+            "extra report": (
+                baseline_import
+                + "from .effect_adapter import EffectAdapterReport\n"
+                + f"__all__ = {extra_report_exports!r}\n",
+                "unexpected-bound:EffectAdapterReport",
+            ),
+            "private helper alias": (
+                baseline_import
+                + "from .effect_adapter import _commit as publish_report\n"
+                + f"__all__ = {private_alias_exports!r}\n",
+                "private-source:_commit->publish_report",
+            ),
+        }
+
+        for label, (source, expected) in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(
+                    expected,
+                    _effect_adapter_api_violations(ast.parse(source)),
+                )
 
     def test_interpretation_api_is_exposed_at_package_boundary(self):
         expected_names = {
