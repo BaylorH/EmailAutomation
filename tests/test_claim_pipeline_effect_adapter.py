@@ -31,6 +31,10 @@ from email_automation.claim_pipeline.effect_adapter import (
     DryRunReason,
     DryRunStatus,
     EffectAdapterRequest,
+    OUTBOUND_ACTION_TYPES,
+    SUPPORTED_ACTION_TYPES,
+    TERMINAL_STATES,
+    evaluate_effect_plan,
 )
 
 
@@ -162,6 +166,384 @@ def _commit_receipt(*, effects=(), **overrides):
     }
     values.update(overrides)
     return DryRunCommitReceipt.create(**values)
+
+
+_ACTION_FIXTURES = {
+    ActionType.FACT_UPDATE: (
+        ClaimPredicate.AVAILABILITY,
+        {"field": "availability", "value": "available", "confidence": 0.99},
+        {"availability": "unknown"},
+        "",
+    ),
+    ActionType.FOLLOWUP_FREEZE: (
+        ClaimPredicate.OPT_OUT,
+        {"reason": "contact_opt_out"},
+        {"followUpStatus": "waiting"},
+        "",
+    ),
+    ActionType.STATUS_TRANSITION: (
+        ClaimPredicate.AVAILABILITY,
+        {"status": "waiting_user"},
+        {"conversationState": "active"},
+        "",
+    ),
+    ActionType.ALTERNATE_PROPERTY_PROPOSAL: (
+        ClaimPredicate.IDENTITY,
+        {"summary": "alternate-fixture"},
+        {},
+        "",
+    ),
+    ActionType.RECIPIENT_CHANGE: (
+        ClaimPredicate.REFERRAL,
+        {"reason": "redirect_requires_approval"},
+        {"recipient": ""},
+        "recipient-fixture",
+    ),
+    ActionType.CALL_REQUEST: (
+        ClaimPredicate.CALL_REQUEST,
+        {"notes": "call-fixture", "phone": ""},
+        {},
+        "",
+    ),
+    ActionType.TOUR_REQUEST: (
+        ClaimPredicate.TOUR_REQUEST,
+        {"notes": "tour-fixture"},
+        {},
+        "",
+    ),
+    ActionType.INFORMATION_REQUEST: (
+        ClaimPredicate.INFORMATION_REQUEST,
+        {"notes": "information-fixture"},
+        {},
+        "",
+    ),
+    ActionType.REVIEW_ITEM: (
+        ClaimPredicate.AVAILABILITY,
+        {
+            "summary": "review-fixture",
+            "details": {"reasonCodes": ["fixture-review"]},
+        },
+        {},
+        "",
+    ),
+    ActionType.NOTE_APPEND: (
+        ClaimPredicate.AVAILABILITY,
+        {"text": "note-fixture"},
+        {"note": ""},
+        "",
+    ),
+    ActionType.ROW_MOVE: (
+        ClaimPredicate.AVAILABILITY,
+        {"destination": "nonviable-fixture"},
+        {"rowState": "active"},
+        "",
+    ),
+    ActionType.NOTIFICATION: (
+        ClaimPredicate.AVAILABILITY,
+        {"message": "notification-fixture"},
+        {},
+        "",
+    ),
+    ActionType.LOI_REQUEST: (
+        ClaimPredicate.AVAILABILITY,
+        {"notes": "loi-fixture", "terms": {}},
+        {},
+        "",
+    ),
+    ActionType.OUTBOUND_DRAFT: (
+        ClaimPredicate.AVAILABILITY,
+        {"subject": "subject-fixture", "body": "body-fixture"},
+        {},
+        "recipient-fixture",
+    ),
+}
+
+
+def _request_fixture(
+    *,
+    action_type: ActionType = ActionType.FACT_UPDATE,
+    approval_class: ApprovalClass = ApprovalClass.AUTOMATIC,
+    conversation_state: ConversationState = ConversationState.ACTIVE,
+    current_snapshot_hash: str | None = None,
+    current_contract_id: str | None = None,
+    current_contract_version: int | None = None,
+    current_values: dict | None = None,
+    committed_idempotency_keys: tuple[str, ...] = (),
+    approval_grants: tuple[ApprovalGrant, ...] = (),
+    dependencies: tuple[str, ...] = (),
+) -> EffectAdapterRequest:
+    tenant_id = "tenant-fixture"
+    client_id = "client-fixture"
+    campaign_id = "campaign-fixture"
+    snapshot_hash = "snapshot-fixture"
+    contract = CampaignContract.create(
+        tenant_id=tenant_id,
+        client_id=client_id,
+        campaign_id=campaign_id,
+        version=1,
+        transaction_types=("transaction-fixture",),
+        required_fields=("availability",),
+        source_authority=ContractAuthority.SETUP,
+    )
+    scope = ExecutionScope(
+        tenant_id=tenant_id,
+        client_id=client_id,
+        campaign_id=campaign_id,
+        thread_id="thread-fixture",
+        sheet_id="sheet-fixture",
+        row_anchor="row-fixture",
+    )
+    target = EntityRef.create(
+        tenant_id=tenant_id,
+        campaign_id=campaign_id,
+        entity_type=EntityType.PROPERTY,
+        label="target-fixture",
+    )
+    action_target = target
+    entities = [target]
+    if action_type is ActionType.ALTERNATE_PROPERTY_PROPOSAL:
+        action_target = EntityRef.create(
+            tenant_id=tenant_id,
+            campaign_id=campaign_id,
+            entity_type=EntityType.PROPERTY,
+            label="alternate-fixture",
+            relationship="alternate",
+        )
+        entities.append(action_target)
+
+    predicate, payload, expected_prior_state, recipient = _ACTION_FIXTURES[action_type]
+    claim_value = "available"
+    if predicate is ClaimPredicate.REFERRAL:
+        claim_value = {
+            "name": "recipient-fixture",
+            "email": "recipient-fixture",
+        }
+    elif predicate is ClaimPredicate.IDENTITY:
+        claim_value = "alternate-fixture"
+    elif predicate is ClaimPredicate.OPT_OUT:
+        claim_value = True
+    elif predicate in {
+        ClaimPredicate.CALL_REQUEST,
+        ClaimPredicate.TOUR_REQUEST,
+        ClaimPredicate.INFORMATION_REQUEST,
+    }:
+        claim_value = f"{predicate.value}-fixture"
+
+    claim = Claim.create(
+        tenant_id=tenant_id,
+        campaign_id=campaign_id,
+        evidence_id=f"evidence-{action_type.value}-fixture",
+        subject_entity_id=action_target.entity_id,
+        predicate=predicate,
+        value=claim_value,
+        evidence_text=f"evidence-{action_type.value}-fixture",
+        actor_role=ActorRole.BROKER,
+        polarity=ClaimPolarity.POSITIVE,
+        modality=ClaimModality.ASSERTED,
+        confidence=0.99,
+    )
+
+    effective_conversation_state = conversation_state
+    reason_codes = ()
+    if action_type is ActionType.FOLLOWUP_FREEZE:
+        effective_conversation_state = ConversationState.TERMINAL_INTENT
+        reason_codes = ("contact_opt_out",)
+    elif action_type is ActionType.REVIEW_ITEM:
+        effective_conversation_state = ConversationState.REVIEW
+        reason_codes = ("fixture-review",)
+
+    decision = DecisionSnapshot.create(
+        tenant_id=tenant_id,
+        client_id=client_id,
+        campaign_id=campaign_id,
+        contract_id=contract.contract_id,
+        entity_id=target.entity_id,
+        contract_version=contract.version,
+        snapshot_hash=snapshot_hash,
+        market_state=MarketState.AVAILABLE,
+        fit_state=FitState.VIABLE,
+        completeness_state=CompletenessState.INCOMPLETE,
+        conversation_state=effective_conversation_state,
+        reason_codes=reason_codes,
+        evidence_ids=(claim.evidence_id,),
+    )
+    action = PlannedAction.create(
+        tenant_id=tenant_id,
+        client_id=client_id,
+        campaign_id=campaign_id,
+        thread_id=scope.thread_id,
+        sheet_id=scope.sheet_id,
+        row_anchor=scope.row_anchor,
+        decision_id=decision.decision_id,
+        contract_id=contract.contract_id,
+        action_type=action_type,
+        approval_class=approval_class,
+        target_entity_id=action_target.entity_id,
+        contract_version=contract.version,
+        snapshot_hash=snapshot_hash,
+        source_claim_ids=(claim.claim_id,),
+        operation_key=f"operation-{action_type.value}-fixture",
+        expected_prior_state=expected_prior_state,
+        dependencies=dependencies,
+        sequence=1,
+        recipient=recipient,
+        payload=payload,
+        reason=(
+            "contact_opt_out"
+            if action_type is ActionType.FOLLOWUP_FREEZE
+            else "reason-fixture"
+        ),
+    )
+    plan = ActionPlan.create(
+        tenant_id=tenant_id,
+        client_id=client_id,
+        campaign_id=campaign_id,
+        decision_id=decision.decision_id,
+        contract_id=contract.contract_id,
+        contract_version=contract.version,
+        snapshot_hash=snapshot_hash,
+        actions=(action,),
+    )
+    return EffectAdapterRequest.create(
+        plan=plan,
+        decision=decision,
+        scope=scope,
+        entities=tuple(entities),
+        claims=(claim,),
+        authorized_recipients=((recipient,) if recipient else ()),
+        current_snapshot_hash=(
+            snapshot_hash
+            if current_snapshot_hash is None
+            else current_snapshot_hash
+        ),
+        current_contract_id=(
+            contract.contract_id
+            if current_contract_id is None
+            else current_contract_id
+        ),
+        current_contract_version=(
+            contract.version
+            if current_contract_version is None
+            else current_contract_version
+        ),
+        current_states=(
+            ActionStateSnapshot.create(
+                action_id=action.action_id,
+                values=(
+                    expected_prior_state
+                    if current_values is None
+                    else current_values
+                ),
+            ),
+        ),
+        approval_grants=approval_grants,
+        committed_idempotency_keys=committed_idempotency_keys,
+    )
+
+
+def _with_exact_approval(request: EffectAdapterRequest) -> EffectAdapterRequest:
+    action = request.plan.actions[0]
+    grant = ApprovalGrant.create(
+        tenant_id=request.plan.tenant_id,
+        plan_id=request.plan.plan_id,
+        action_id=action.action_id,
+        snapshot_hash=request.current_snapshot_hash,
+        approved_by="operator-fixture",
+    )
+    return replace(request, approval_grants=(grant,))
+
+
+def _two_action_dependency_request(
+    first_state_matches: bool,
+) -> EffectAdapterRequest:
+    base = _request_fixture()
+    first = base.plan.actions[0]
+    second_claim = Claim.create(
+        tenant_id=base.plan.tenant_id,
+        campaign_id=base.plan.campaign_id,
+        evidence_id="evidence-dependency-second-fixture",
+        subject_entity_id=base.decision.entity_id,
+        predicate=ClaimPredicate.AVAILABILITY,
+        value="waiting_user",
+        evidence_text="evidence-dependency-second-fixture",
+        actor_role=ActorRole.BROKER,
+        polarity=ClaimPolarity.POSITIVE,
+        modality=ClaimModality.ASSERTED,
+        confidence=0.99,
+    )
+    second = PlannedAction.create(
+        tenant_id=first.tenant_id,
+        client_id=first.client_id,
+        campaign_id=first.campaign_id,
+        thread_id=first.thread_id,
+        sheet_id=first.sheet_id,
+        row_anchor=first.row_anchor,
+        decision_id=first.decision_id,
+        contract_id=first.contract_id,
+        action_type=ActionType.STATUS_TRANSITION,
+        approval_class=ApprovalClass.AUTOMATIC,
+        target_entity_id=first.target_entity_id,
+        contract_version=first.contract_version,
+        snapshot_hash=first.snapshot_hash,
+        source_claim_ids=(second_claim.claim_id,),
+        operation_key="operation-dependency-second-fixture",
+        expected_prior_state={"conversationState": "active"},
+        dependencies=(first.action_id,),
+        sequence=2,
+        recipient="",
+        payload={"status": "waiting_user"},
+        reason="reason-dependency-second-fixture",
+    )
+    plan = ActionPlan.create(
+        tenant_id=base.plan.tenant_id,
+        client_id=base.plan.client_id,
+        campaign_id=base.plan.campaign_id,
+        decision_id=base.plan.decision_id,
+        contract_id=base.plan.contract_id,
+        contract_version=base.plan.contract_version,
+        snapshot_hash=base.plan.snapshot_hash,
+        actions=(first, second),
+    )
+    grants = tuple(
+        ApprovalGrant.create(
+            tenant_id=plan.tenant_id,
+            plan_id=plan.plan_id,
+            action_id=action.action_id,
+            snapshot_hash=plan.snapshot_hash,
+            approved_by=f"operator-{index}-fixture",
+        )
+        for index, action in enumerate(plan.actions, start=1)
+    )
+    return EffectAdapterRequest.create(
+        plan=plan,
+        decision=base.decision,
+        scope=base.scope,
+        entities=base.entities,
+        claims=(*base.claims, second_claim),
+        authorized_recipients=base.authorized_recipients,
+        current_snapshot_hash=base.current_snapshot_hash,
+        current_contract_id=base.current_contract_id,
+        current_contract_version=base.current_contract_version,
+        current_states=(
+            ActionStateSnapshot.create(
+                action_id=first.action_id,
+                values=(
+                    first.expected_prior_state
+                    if first_state_matches
+                    else {"availability": "different"}
+                ),
+            ),
+            ActionStateSnapshot.create(
+                action_id=second.action_id,
+                values=second.expected_prior_state,
+            ),
+        ),
+        approval_grants=grants,
+        committed_idempotency_keys=(
+            "committed-first-fixture",
+            "committed-second-fixture",
+        ),
+    )
 
 
 class EffectAdapterContractTests(unittest.TestCase):
@@ -479,6 +861,232 @@ class EffectAdapterContractTests(unittest.TestCase):
             "completed_at",
         ):
             self.assertNotIn(sensitive_field, encoded)
+
+
+class EffectAdapterEvaluationTests(unittest.TestCase):
+    def assert_disposition(self, expected, request):
+        receipt = evaluate_effect_plan(request).effects[0]
+        self.assertEqual(expected, (receipt.status, receipt.reason))
+
+    def test_public_action_sets_are_closed(self):
+        self.assertEqual(
+            {
+                ActionType.FACT_UPDATE,
+                ActionType.FOLLOWUP_FREEZE,
+                ActionType.STATUS_TRANSITION,
+                ActionType.ALTERNATE_PROPERTY_PROPOSAL,
+                ActionType.RECIPIENT_CHANGE,
+                ActionType.CALL_REQUEST,
+                ActionType.TOUR_REQUEST,
+                ActionType.INFORMATION_REQUEST,
+                ActionType.REVIEW_ITEM,
+            },
+            SUPPORTED_ACTION_TYPES,
+        )
+        self.assertEqual({ActionType.OUTBOUND_DRAFT}, OUTBOUND_ACTION_TYPES)
+        self.assertEqual(
+            {
+                ConversationState.TERMINAL_INTENT,
+                ConversationState.TERMINAL_PENDING_ACK,
+                ConversationState.TERMINAL,
+            },
+            TERMINAL_STATES,
+        )
+
+    def test_matching_automatic_action_would_apply(self):
+        self.assert_disposition(
+            (
+                DryRunStatus.WOULD_APPLY,
+                DryRunReason.ELIGIBLE_AUTOMATIC_ACTION,
+            ),
+            _request_fixture(),
+        )
+
+    def test_stale_snapshot_blocks_every_action(self):
+        self.assert_disposition(
+            (DryRunStatus.BLOCKED, DryRunReason.STALE_SNAPSHOT),
+            _request_fixture(current_snapshot_hash="stale-snapshot"),
+        )
+
+    def test_stale_contract_blocks_every_action(self):
+        self.assert_disposition(
+            (DryRunStatus.BLOCKED, DryRunReason.STALE_CONTRACT),
+            _request_fixture(current_contract_version=2),
+        )
+
+    def test_prior_state_mismatch_blocks_action(self):
+        self.assert_disposition(
+            (DryRunStatus.BLOCKED, DryRunReason.PRIOR_STATE_MISMATCH),
+            _request_fixture(current_values={"availability": "different"}),
+        )
+
+    def test_committed_idempotency_key_skips_action(self):
+        request = _request_fixture()
+        request = replace(
+            request,
+            committed_idempotency_keys=(
+                request.plan.actions[0].idempotency_key,
+            ),
+        )
+        self.assert_disposition(
+            (
+                DryRunStatus.SKIPPED,
+                DryRunReason.IDEMPOTENCY_KEY_ALREADY_COMMITTED,
+            ),
+            request,
+        )
+
+    def test_human_action_without_approval_is_skipped(self):
+        self.assert_disposition(
+            (DryRunStatus.SKIPPED, DryRunReason.APPROVAL_REQUIRED),
+            _request_fixture(
+                action_type=ActionType.INFORMATION_REQUEST,
+                approval_class=ApprovalClass.HUMAN_REQUIRED,
+            ),
+        )
+
+    def test_exact_human_approval_would_apply(self):
+        request = _request_fixture(
+            action_type=ActionType.INFORMATION_REQUEST,
+            approval_class=ApprovalClass.HUMAN_REQUIRED,
+        )
+        self.assert_disposition(
+            (
+                DryRunStatus.WOULD_APPLY,
+                DryRunReason.ELIGIBLE_HUMAN_APPROVED_ACTION,
+            ),
+            _with_exact_approval(request),
+        )
+
+    def test_every_supported_human_action_requires_then_accepts_exact_approval(self):
+        human_types = (
+            ActionType.ALTERNATE_PROPERTY_PROPOSAL,
+            ActionType.RECIPIENT_CHANGE,
+            ActionType.CALL_REQUEST,
+            ActionType.TOUR_REQUEST,
+            ActionType.INFORMATION_REQUEST,
+            ActionType.REVIEW_ITEM,
+        )
+        for action_type in human_types:
+            with self.subTest(action_type=action_type.value):
+                request = _request_fixture(
+                    action_type=action_type,
+                    approval_class=ApprovalClass.HUMAN_REQUIRED,
+                )
+                self.assert_disposition(
+                    (DryRunStatus.SKIPPED, DryRunReason.APPROVAL_REQUIRED),
+                    request,
+                )
+                self.assert_disposition(
+                    (
+                        DryRunStatus.WOULD_APPLY,
+                        DryRunReason.ELIGIBLE_HUMAN_APPROVED_ACTION,
+                    ),
+                    _with_exact_approval(request),
+                )
+
+    def test_wrong_scope_approval_blocks_action(self):
+        request = _with_exact_approval(
+            _request_fixture(
+                action_type=ActionType.INFORMATION_REQUEST,
+                approval_class=ApprovalClass.HUMAN_REQUIRED,
+            )
+        )
+        wrong = ApprovalGrant.create(
+            tenant_id=request.plan.tenant_id,
+            plan_id="wrong-plan",
+            action_id=request.plan.actions[0].action_id,
+            snapshot_hash=request.current_snapshot_hash,
+            approved_by="operator-fixture",
+        )
+        request = replace(request, approval_grants=(wrong,))
+        self.assert_disposition(
+            (DryRunStatus.BLOCKED, DryRunReason.APPROVAL_SCOPE_MISMATCH),
+            request,
+        )
+
+    def test_terminal_outbound_draft_is_suppressed(self):
+        self.assert_disposition(
+            (
+                DryRunStatus.BLOCKED,
+                DryRunReason.TERMINAL_OUTBOUND_SUPPRESSED,
+            ),
+            _request_fixture(
+                action_type=ActionType.OUTBOUND_DRAFT,
+                approval_class=ApprovalClass.HUMAN_REQUIRED,
+                conversation_state=ConversationState.TERMINAL_INTENT,
+            ),
+        )
+
+    def test_unsupported_action_is_blocked(self):
+        self.assert_disposition(
+            (DryRunStatus.BLOCKED, DryRunReason.UNSUPPORTED_ACTION_TYPE),
+            _request_fixture(action_type=ActionType.NOTIFICATION),
+        )
+
+    def test_blocked_dependency_blocks_dependent_action(self):
+        commit = evaluate_effect_plan(
+            _two_action_dependency_request(first_state_matches=False)
+        )
+        self.assertEqual(
+            (
+                DryRunStatus.BLOCKED,
+                DryRunReason.PRIOR_STATE_MISMATCH,
+            ),
+            (commit.effects[0].status, commit.effects[0].reason),
+        )
+        self.assertEqual(
+            (
+                DryRunStatus.BLOCKED,
+                DryRunReason.DEPENDENCY_BLOCKED,
+            ),
+            (commit.effects[1].status, commit.effects[1].reason),
+        )
+        self.assertEqual(
+            (commit.effects[0].receipt_id,),
+            commit.effects[1].dependency_receipt_ids,
+        )
+        self.assertNotEqual(
+            (commit.effects[0].action_id,),
+            commit.effects[1].dependency_receipt_ids,
+        )
+
+    def test_forbidden_action_blocks_the_whole_plan_as_contract_violation(self):
+        commit = evaluate_effect_plan(
+            _request_fixture(approval_class=ApprovalClass.FORBIDDEN)
+        )
+        self.assertTrue(commit.effects)
+        self.assertTrue(
+            all(
+                (effect.status, effect.reason)
+                == (
+                    DryRunStatus.BLOCKED,
+                    DryRunReason.PLAN_CONTRACT_VIOLATION,
+                )
+                for effect in commit.effects
+            )
+        )
+
+    def test_repeated_and_reversed_inputs_are_byte_stable(self):
+        request = _two_action_dependency_request(first_state_matches=True)
+        forward = evaluate_effect_plan(request)
+        repeated = evaluate_effect_plan(request)
+        reversed_request = replace(
+            request,
+            current_states=tuple(reversed(request.current_states)),
+            approval_grants=tuple(reversed(request.approval_grants)),
+            committed_idempotency_keys=tuple(
+                reversed(request.committed_idempotency_keys)
+            ),
+        )
+        reversed_result = evaluate_effect_plan(reversed_request)
+
+        self.assertEqual(forward.receipt_id, repeated.receipt_id)
+        self.assertEqual(forward.receipt_id, reversed_result.receipt_id)
+        self.assertEqual(
+            json.dumps(forward.to_dict(), sort_keys=True),
+            json.dumps(reversed_result.to_dict(), sort_keys=True),
+        )
 
 
 if __name__ == "__main__":

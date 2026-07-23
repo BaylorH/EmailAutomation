@@ -12,11 +12,16 @@ from typing import Any, Mapping
 
 from .contracts import (
     ActionPlan,
+    ActionType,
+    ApprovalClass,
     Claim,
+    ConversationState,
     DecisionSnapshot,
     EntityRef,
     ExecutionScope,
+    PlannedAction,
 )
+from .validation import ContractViolation, validate_action_plan
 
 
 class DryRunStatus(str, Enum):
@@ -38,6 +43,29 @@ class DryRunReason(str, Enum):
     DEPENDENCY_BLOCKED = "dependency_blocked"
     TERMINAL_OUTBOUND_SUPPRESSED = "terminal_outbound_suppressed"
     PLAN_CONTRACT_VIOLATION = "plan_contract_violation"
+
+
+SUPPORTED_ACTION_TYPES = frozenset(
+    {
+        ActionType.FACT_UPDATE,
+        ActionType.FOLLOWUP_FREEZE,
+        ActionType.STATUS_TRANSITION,
+        ActionType.ALTERNATE_PROPERTY_PROPOSAL,
+        ActionType.RECIPIENT_CHANGE,
+        ActionType.CALL_REQUEST,
+        ActionType.TOUR_REQUEST,
+        ActionType.INFORMATION_REQUEST,
+        ActionType.REVIEW_ITEM,
+    }
+)
+OUTBOUND_ACTION_TYPES = frozenset({ActionType.OUTBOUND_DRAFT})
+TERMINAL_STATES = frozenset(
+    {
+        ConversationState.TERMINAL_INTENT,
+        ConversationState.TERMINAL_PENDING_ACK,
+        ConversationState.TERMINAL,
+    }
+)
 
 
 _VALID_REASONS_BY_STATUS = MappingProxyType({
@@ -509,3 +537,217 @@ class DryRunCommitReceipt(_JsonContract):
             snapshot_hash=snapshot_hash,
             effects=frozen_effects,
         )
+
+
+def _receipt(
+    plan_id: str,
+    action: PlannedAction,
+    status: DryRunStatus,
+    reason: DryRunReason,
+    dependency_receipt_ids: tuple[str, ...],
+) -> DryRunEffectReceipt:
+    return DryRunEffectReceipt.create(
+        plan_id=plan_id,
+        action_id=action.action_id,
+        idempotency_key=action.idempotency_key,
+        action_type=action.action_type.value,
+        sequence=action.sequence,
+        status=status,
+        reason=reason,
+        dependency_receipt_ids=dependency_receipt_ids,
+    )
+
+
+def _commit(
+    request: EffectAdapterRequest,
+    effects: tuple[DryRunEffectReceipt, ...],
+) -> DryRunCommitReceipt:
+    return DryRunCommitReceipt.create(
+        tenant_id=request.plan.tenant_id,
+        plan_id=request.plan.plan_id,
+        decision_id=request.decision.decision_id,
+        contract_id=request.plan.contract_id,
+        contract_version=request.plan.contract_version,
+        snapshot_hash=request.plan.snapshot_hash,
+        effects=effects,
+    )
+
+
+def _request_identity_failure(
+    request: EffectAdapterRequest,
+) -> DryRunReason | None:
+    if (
+        request.current_snapshot_hash != request.plan.snapshot_hash
+        or request.current_snapshot_hash != request.decision.snapshot_hash
+    ):
+        return DryRunReason.STALE_SNAPSHOT
+    if (
+        request.current_contract_id != request.plan.contract_id
+        or request.current_contract_id != request.decision.contract_id
+        or request.current_contract_version != request.plan.contract_version
+        or request.current_contract_version != request.decision.contract_version
+    ):
+        return DryRunReason.STALE_CONTRACT
+    return None
+
+
+def _grants_by_action(
+    grants: tuple[ApprovalGrant, ...],
+) -> Mapping[str, tuple[ApprovalGrant, ...]]:
+    grouped: dict[str, list[ApprovalGrant]] = {}
+    for grant in sorted(grants, key=lambda item: item.grant_id):
+        grouped.setdefault(grant.action_id, []).append(grant)
+    return {
+        action_id: tuple(action_grants)
+        for action_id, action_grants in grouped.items()
+    }
+
+
+def _human_approval_disposition(
+    request: EffectAdapterRequest,
+    action: PlannedAction,
+    grants: Mapping[str, tuple[ApprovalGrant, ...]],
+) -> tuple[DryRunStatus, DryRunReason]:
+    action_grants = grants.get(action.action_id, ())
+    if not action_grants:
+        return DryRunStatus.SKIPPED, DryRunReason.APPROVAL_REQUIRED
+
+    ownership = (
+        request.plan.tenant_id,
+        request.plan.plan_id,
+        action.action_id,
+        request.current_snapshot_hash,
+    )
+    matching = tuple(
+        grant
+        for grant in action_grants
+        if (
+            grant.tenant_id,
+            grant.plan_id,
+            grant.action_id,
+            grant.snapshot_hash,
+        )
+        == ownership
+    )
+    if len(action_grants) != 1 or len(matching) != 1:
+        return DryRunStatus.BLOCKED, DryRunReason.APPROVAL_SCOPE_MISMATCH
+    return (
+        DryRunStatus.WOULD_APPLY,
+        DryRunReason.ELIGIBLE_HUMAN_APPROVED_ACTION,
+    )
+
+
+def evaluate_effect_plan(request: EffectAdapterRequest) -> DryRunCommitReceipt:
+    """Classify a validated plan without executing or persisting any effect."""
+    ordered = tuple(
+        sorted(
+            request.plan.actions,
+            key=lambda item: (item.sequence, item.action_id),
+        )
+    )
+    try:
+        validate_action_plan(
+            request.plan,
+            request.decision,
+            scope=request.scope,
+            entities=request.entities,
+            claims=request.claims,
+            authorized_recipients=request.authorized_recipients,
+        )
+    except ContractViolation:
+        return _commit(
+            request,
+            tuple(
+                _receipt(
+                    request.plan.plan_id,
+                    action,
+                    DryRunStatus.BLOCKED,
+                    DryRunReason.PLAN_CONTRACT_VIOLATION,
+                    (),
+                )
+                for action in ordered
+            ),
+        )
+
+    global_reason = _request_identity_failure(request)
+    if global_reason is not None:
+        return _commit(
+            request,
+            tuple(
+                _receipt(
+                    request.plan.plan_id,
+                    action,
+                    DryRunStatus.BLOCKED,
+                    global_reason,
+                    (),
+                )
+                for action in ordered
+            ),
+        )
+
+    states = {item.action_id: item for item in request.current_states}
+    grants = _grants_by_action(request.approval_grants)
+    committed = frozenset(request.committed_idempotency_keys)
+    receipts_by_action: dict[str, DryRunEffectReceipt] = {}
+    receipts = []
+
+    for action in ordered:
+        dependency_receipts = tuple(
+            receipts_by_action[dependency_id]
+            for dependency_id in action.dependencies
+        )
+        if any(
+            item.status is not DryRunStatus.WOULD_APPLY
+            for item in dependency_receipts
+        ):
+            status, reason = (
+                DryRunStatus.BLOCKED,
+                DryRunReason.DEPENDENCY_BLOCKED,
+            )
+        elif action.action_type not in SUPPORTED_ACTION_TYPES:
+            if (
+                action.action_type in OUTBOUND_ACTION_TYPES
+                and request.decision.conversation_state in TERMINAL_STATES
+            ):
+                status, reason = (
+                    DryRunStatus.BLOCKED,
+                    DryRunReason.TERMINAL_OUTBOUND_SUPPRESSED,
+                )
+            else:
+                status, reason = (
+                    DryRunStatus.BLOCKED,
+                    DryRunReason.UNSUPPORTED_ACTION_TYPE,
+                )
+        elif action.idempotency_key in committed:
+            status, reason = (
+                DryRunStatus.SKIPPED,
+                DryRunReason.IDEMPOTENCY_KEY_ALREADY_COMMITTED,
+            )
+        elif states[action.action_id].values != action.expected_prior_state:
+            status, reason = (
+                DryRunStatus.BLOCKED,
+                DryRunReason.PRIOR_STATE_MISMATCH,
+            )
+        elif action.approval_class is ApprovalClass.HUMAN_REQUIRED:
+            status, reason = _human_approval_disposition(
+                request,
+                action,
+                grants,
+            )
+        else:
+            status, reason = (
+                DryRunStatus.WOULD_APPLY,
+                DryRunReason.ELIGIBLE_AUTOMATIC_ACTION,
+            )
+
+        receipt = _receipt(
+            request.plan.plan_id,
+            action,
+            status,
+            reason,
+            tuple(item.receipt_id for item in dependency_receipts),
+        )
+        receipts.append(receipt)
+        receipts_by_action[action.action_id] = receipt
+
+    return _commit(request, tuple(receipts))
