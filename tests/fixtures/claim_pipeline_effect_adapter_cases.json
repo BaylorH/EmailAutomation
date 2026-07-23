@@ -1,0 +1,201 @@
+{
+  "schemaVersion": "claim-pipeline-effect-adapter-fixtures-v1",
+  "cases": [
+    {
+      "caseId": "automatic-fact-matching",
+      "actions": [
+        {"type": "fact_update", "approval": "automatic"}
+      ],
+      "mutations": [],
+      "expectedReceipts": [
+        {"action": "fact_update:1", "status": "would_apply", "reason": "eligible_automatic_action"}
+      ]
+    },
+    {
+      "caseId": "automatic-fact-stale-prior",
+      "actions": [
+        {"type": "fact_update", "approval": "automatic"}
+      ],
+      "mutations": ["stale_prior_state:1"],
+      "expectedReceipts": [
+        {"action": "fact_update:1", "status": "blocked", "reason": "prior_state_mismatch"}
+      ]
+    },
+    {
+      "caseId": "whole-plan-stale-snapshot",
+      "actions": [
+        {"type": "fact_update", "approval": "automatic"}
+      ],
+      "mutations": ["stale_snapshot"],
+      "expectedReceipts": [
+        {"action": "fact_update:1", "status": "blocked", "reason": "stale_snapshot"}
+      ]
+    },
+    {
+      "caseId": "whole-plan-stale-contract",
+      "actions": [
+        {"type": "fact_update", "approval": "automatic"}
+      ],
+      "mutations": ["stale_contract"],
+      "expectedReceipts": [
+        {"action": "fact_update:1", "status": "blocked", "reason": "stale_contract"}
+      ]
+    },
+    {
+      "caseId": "already-committed-effect",
+      "actions": [
+        {"type": "fact_update", "approval": "automatic"}
+      ],
+      "mutations": ["committed:1"],
+      "expectedReceipts": [
+        {"action": "fact_update:1", "status": "skipped", "reason": "idempotency_key_already_committed"}
+      ]
+    },
+    {
+      "caseId": "human-action-no-approval",
+      "actions": [
+        {"type": "information_request", "approval": "human_required"}
+      ],
+      "mutations": [],
+      "expectedReceipts": [
+        {"action": "information_request:1", "status": "skipped", "reason": "approval_required"}
+      ]
+    },
+    {
+      "caseId": "human-action-exact-approval",
+      "actions": [
+        {"type": "information_request", "approval": "human_required"}
+      ],
+      "mutations": ["approve:1"],
+      "expectedReceipts": [
+        {"action": "information_request:1", "status": "would_apply", "reason": "eligible_human_approved_action"}
+      ]
+    },
+    {
+      "caseId": "approval-for-other-action",
+      "actions": [
+        {"type": "information_request", "approval": "human_required"}
+      ],
+      "mutations": ["approval_other_action:1"],
+      "expectedReceipts": [
+        {"action": "information_request:1", "status": "skipped", "reason": "approval_required"}
+      ]
+    },
+    {
+      "caseId": "approval-wrong-plan",
+      "actions": [
+        {"type": "information_request", "approval": "human_required"}
+      ],
+      "mutations": ["approval_wrong_plan:1"],
+      "expectedReceipts": [
+        {"action": "information_request:1", "status": "blocked", "reason": "approval_scope_mismatch"}
+      ]
+    },
+    {
+      "caseId": "forbidden-plan",
+      "actions": [
+        {"type": "fact_update", "approval": "forbidden"}
+      ],
+      "mutations": [],
+      "expectedReceipts": [
+        {"action": "fact_update:1", "status": "blocked", "reason": "plan_contract_violation"}
+      ]
+    },
+    {
+      "caseId": "unsupported-actions",
+      "actions": [
+        {"type": "note_append", "approval": "automatic"},
+        {"type": "row_move", "approval": "automatic"},
+        {"type": "notification", "approval": "automatic"},
+        {"type": "loi_request", "approval": "human_required"},
+        {"type": "outbound_draft", "approval": "human_required"}
+      ],
+      "mutations": [],
+      "expectedReceipts": [
+        {"action": "note_append:1", "status": "blocked", "reason": "unsupported_action_type"},
+        {"action": "row_move:2", "status": "blocked", "reason": "unsupported_action_type"},
+        {"action": "notification:3", "status": "blocked", "reason": "unsupported_action_type"},
+        {"action": "loi_request:4", "status": "blocked", "reason": "unsupported_action_type"},
+        {"action": "outbound_draft:5", "status": "blocked", "reason": "unsupported_action_type"}
+      ]
+    },
+    {
+      "caseId": "terminal-outbound-draft",
+      "actions": [
+        {"type": "outbound_draft", "approval": "human_required"}
+      ],
+      "mutations": ["terminal_decision"],
+      "expectedReceipts": [
+        {"action": "outbound_draft:1", "status": "blocked", "reason": "terminal_outbound_suppressed"}
+      ]
+    },
+    {
+      "caseId": "terminal-followup-freeze",
+      "actions": [
+        {"type": "followup_freeze", "approval": "automatic"}
+      ],
+      "mutations": ["terminal_decision"],
+      "expectedReceipts": [
+        {"action": "followup_freeze:1", "status": "would_apply", "reason": "eligible_automatic_action"}
+      ]
+    },
+    {
+      "caseId": "dependency-chain-eligible",
+      "actions": [
+        {"type": "fact_update", "approval": "automatic"},
+        {"type": "status_transition", "approval": "automatic", "dependsOn": [1]}
+      ],
+      "mutations": [],
+      "expectedReceipts": [
+        {"action": "fact_update:1", "status": "would_apply", "reason": "eligible_automatic_action"},
+        {"action": "status_transition:2", "status": "would_apply", "reason": "eligible_automatic_action"}
+      ]
+    },
+    {
+      "caseId": "dependency-chain-blocked",
+      "actions": [
+        {"type": "fact_update", "approval": "automatic"},
+        {"type": "status_transition", "approval": "automatic", "dependsOn": [1]}
+      ],
+      "mutations": ["stale_prior_state:1"],
+      "expectedReceipts": [
+        {"action": "fact_update:1", "status": "blocked", "reason": "prior_state_mismatch"},
+        {"action": "status_transition:2", "status": "blocked", "reason": "dependency_blocked"}
+      ]
+    },
+    {
+      "caseId": "dependency-construction-rejected",
+      "actions": [
+        {"type": "fact_update", "approval": "automatic", "dependsOn": [2]},
+        {"type": "status_transition", "approval": "automatic"}
+      ],
+      "mutations": [],
+      "expectedReceipts": [
+        {"action": "fact_update:1", "status": "blocked", "reason": "plan_contract_violation"},
+        {"action": "status_transition:2", "status": "blocked", "reason": "plan_contract_violation"}
+      ]
+    },
+    {
+      "caseId": "scope-and-provenance-rejected",
+      "actions": [
+        {"type": "fact_update", "approval": "automatic"}
+      ],
+      "mutations": ["scope_row_mismatch"],
+      "expectedReceipts": [
+        {"action": "fact_update:1", "status": "blocked", "reason": "plan_contract_violation"}
+      ]
+    },
+    {
+      "caseId": "input-order-byte-stable",
+      "actions": [
+        {"type": "fact_update", "approval": "automatic"},
+        {"type": "status_transition", "approval": "automatic", "dependsOn": [1]}
+      ],
+      "mutations": ["reverse_request_collections"],
+      "expectedReceipts": [
+        {"action": "fact_update:1", "status": "would_apply", "reason": "eligible_automatic_action"},
+        {"action": "status_transition:2", "status": "would_apply", "reason": "eligible_automatic_action"}
+      ]
+    }
+  ]
+}
