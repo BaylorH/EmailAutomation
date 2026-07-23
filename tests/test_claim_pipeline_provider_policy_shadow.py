@@ -165,12 +165,17 @@ class ProviderPolicyShadowTests(unittest.TestCase):
             if item.case_id == "unavailable-optout-suppression"
         )
         self.assertIn("provider_quality_failed", failed.mismatch_codes)
+        self.assertIn(
+            "missing_expected_claims",
+            failed.provider_quality_mismatch_codes,
+        )
         stopped = next(
             item
             for item in report.results
             if item.case_id == "workflow-intents-visible"
         )
         self.assertEqual(("not_run_after_failure",), stopped.mismatch_codes)
+        self.assertEqual((), report.policy_outcome_variance_case_ids)
 
     def test_fixture_order_does_not_change_semantic_result_digest(self):
         baseline = self._run()

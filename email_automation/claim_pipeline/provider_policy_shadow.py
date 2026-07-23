@@ -493,6 +493,7 @@ class ProviderPolicyShadowCaseResult:
     disposition: str
     gap_codes: tuple[str, ...]
     mismatch_codes: tuple[str, ...]
+    provider_quality_mismatch_codes: tuple[str, ...]
     policy_outcome_digest: str
     passed: bool
 
@@ -504,6 +505,9 @@ class ProviderPolicyShadowCaseResult:
             "disposition": self.disposition,
             "gapCodes": list(self.gap_codes),
             "mismatchCodes": list(self.mismatch_codes),
+            "providerQualityMismatchCodes": list(
+                self.provider_quality_mismatch_codes
+            ),
             "policyOutcomeDigest": self.policy_outcome_digest,
             "passed": self.passed,
         }
@@ -905,16 +909,28 @@ def run_provider_policy_shadow(
                         disposition="blocker",
                         gap_codes=(),
                         mismatch_codes=mismatch_codes,
+                        provider_quality_mismatch_codes=(),
                         policy_outcome_digest=outcome_digest,
                         passed=False,
                     )
                 )
-                outcome_digests[case.case_id].add(outcome_digest)
                 continue
             if not quality.passed:
                 mismatch_codes = ("provider_quality_failed",)
+                provider_quality_mismatch_codes = tuple(
+                    sorted(
+                        {
+                            *quality.quality_mismatch_codes,
+                            *([quality.error_code] if quality.error_code else []),
+                        }
+                    )
+                )
                 outcome_digest = _digest(
-                    {"caseId": case.case_id, "mismatchCodes": mismatch_codes}
+                    {
+                        "caseId": case.case_id,
+                        "mismatchCodes": mismatch_codes,
+                        "providerQualityMismatchCodes": provider_quality_mismatch_codes,
+                    }
                 )
                 result = ProviderPolicyShadowCaseResult(
                     case_id=case.case_id,
@@ -923,11 +939,13 @@ def run_provider_policy_shadow(
                     disposition="blocker",
                     gap_codes=(),
                     mismatch_codes=mismatch_codes,
+                    provider_quality_mismatch_codes=(
+                        provider_quality_mismatch_codes
+                    ),
                     policy_outcome_digest=outcome_digest,
                     passed=False,
                 )
                 results.append(result)
-                outcome_digests[case.case_id].add(outcome_digest)
                 continue
 
             source, evidence, entities, prior_claims, request = _source_context(
@@ -998,6 +1016,7 @@ def run_provider_policy_shadow(
                 disposition=disposition,
                 gap_codes=gap_codes,
                 mismatch_codes=mismatch_codes,
+                provider_quality_mismatch_codes=(),
                 policy_outcome_digest=outcome_digest,
                 passed=not mismatch_codes,
             )
