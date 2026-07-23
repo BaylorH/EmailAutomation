@@ -380,6 +380,17 @@ CALLABLE_KEYWORD_ARGUMENTS = {
     "min": frozenset({"key"}),
     "sorted": frozenset({"key"}),
 }
+PURE_PARAMETER_METHOD_NAMES = frozenset(
+    {
+        "_identity",
+        "get",
+        "items",
+        "read_text",
+        "startswith",
+        "strip",
+        "to_dict",
+    }
+)
 NON_STRUCTURAL_SCHEMA_KEYS = frozenset(
     {
         "const",
@@ -398,6 +409,7 @@ NON_STRUCTURAL_SCHEMA_KEYS = frozenset(
     }
 )
 MAX_STRUCTURE_DEPTH = 32
+UNKNOWN_DANGEROUS_ORIGIN = "<unknown-dangerous-origin>"
 _MISSING_SYMBOL = object()
 
 
@@ -531,7 +543,7 @@ def _structured_item(value, key, depth=0):
 
 def _structured_leaves(value, depth=0):
     if depth >= MAX_STRUCTURE_DEPTH:
-        return set()
+        return {UNKNOWN_DANGEROUS_ORIGIN}
     if isinstance(value, str):
         return {value}
     if isinstance(value, frozenset):
@@ -551,8 +563,10 @@ def _structured_leaves(value, depth=0):
 
 
 def _symbol_structure(node, bindings, structures, depth=0):
-    if node is None or depth >= MAX_STRUCTURE_DEPTH:
+    if node is None:
         return None
+    if depth >= MAX_STRUCTURE_DEPTH:
+        return UNKNOWN_DANGEROUS_ORIGIN
     if isinstance(node, ast.NamedExpr):
         return _symbol_structure(
             node.value, bindings, structures, depth + 1
@@ -560,48 +574,77 @@ def _symbol_structure(node, bindings, structures, depth=0):
     if isinstance(node, ast.Name) and node.id in structures:
         return structures[node.id]
     if isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+        items = []
+        for item in node.elts:
+            value = _symbol_structure(
+                item.value if isinstance(item, ast.Starred) else item,
+                bindings,
+                structures,
+                depth + 1,
+            )
+            if (
+                isinstance(item, ast.Starred)
+                and isinstance(value, tuple)
+                and len(value) == 2
+                and value[0] == "sequence"
+            ):
+                items.extend(value[1])
+            else:
+                items.append(value)
         return (
             "sequence",
-            tuple(
-                _symbol_structure(
-                    item.value if isinstance(item, ast.Starred) else item,
-                    bindings,
-                    structures,
-                    depth + 1,
-                )
-                for item in node.elts
-            ),
+            tuple(items),
         )
     if isinstance(node, ast.Dict):
+        entries = []
+        for key, item in zip(node.keys, node.values, strict=True):
+            if key is None:
+                unpacked = _symbol_structure(
+                    item, bindings, structures, depth + 1
+                )
+                if unpacked in {"__builtins__", "builtins"}:
+                    entries.append(
+                        ("__import__", "builtins.__import__")
+                    )
+                elif (
+                    isinstance(unpacked, tuple)
+                    and len(unpacked) == 2
+                    and unpacked[0] == "mapping"
+                ):
+                    entries.extend(unpacked[1])
+                elif unpacked == UNKNOWN_DANGEROUS_ORIGIN:
+                    entries.append((None, unpacked))
+                continue
+            if isinstance(key, ast.Constant):
+                entries.append(
+                    (
+                        key.value,
+                        _symbol_structure(
+                            item,
+                            bindings,
+                            structures,
+                            depth + 1,
+                        ),
+                    )
+                )
         return (
             "mapping",
-            tuple(
-                (
-                    key.value,
-                    _symbol_structure(
-                        item,
-                        bindings,
-                        structures,
-                        depth + 1,
-                    ),
-                )
-                for key, item in zip(
-                    node.keys, node.values, strict=True
-                )
-                if isinstance(key, ast.Constant)
-            ),
+            tuple(entries),
         )
-    if isinstance(node, ast.Subscript) and isinstance(
-        node.slice, ast.Constant
-    ):
+    if isinstance(node, ast.Subscript):
         owner = _symbol_structure(
             node.value, bindings, structures, depth + 1
         )
-        selected = _structured_item(
-            owner, node.slice.value, depth + 1
-        )
-        if selected is not None:
-            return selected
+        if isinstance(node.slice, ast.Constant):
+            selected = _structured_item(
+                owner, node.slice.value, depth + 1
+            )
+            if selected is not None:
+                return selected
+            resolved = _resolved_symbol(node, bindings)
+            if resolved is not None:
+                return resolved
+        return frozenset(_structured_leaves(owner, depth + 1))
     if isinstance(node, ast.Call):
         callee = _resolved_symbol(node.func, bindings)
         if callee in {"iter", "list", "set", "tuple"} and node.args:
@@ -613,6 +656,23 @@ def _symbol_structure(node, bindings, structures, depth=0):
             and node.args
             and _resolved_symbol(node.args[0], bindings)
             in {"__builtins__", "builtins"}
+        ) or callee in {
+            "__builtins__.copy",
+            "builtins.__dict__.copy",
+        } or (
+            callee == "dict"
+            and node.args
+            and bool(
+                _structured_leaves(
+                    _symbol_structure(
+                        node.args[0],
+                        bindings,
+                        structures,
+                        depth + 1,
+                    )
+                )
+                & DYNAMIC_IMPORT_SYMBOLS.keys()
+            )
         ) or (
             isinstance(node.func, ast.Attribute)
             and node.func.attr == "copy"
@@ -1225,6 +1285,8 @@ def _is_callable_reference(
 ):
     value = _symbol_structure(node, bindings, structures)
     for resolved in _structured_leaves(value):
+        if resolved == UNKNOWN_DANGEROUS_ORIGIN:
+            return True
         if resolved in callable_symbols or resolved in BUILTIN_CALLABLE_NAMES:
             return True
         if (
@@ -1321,7 +1383,6 @@ def _scope_bound_names(statements):
 def _parameter_call_origins(
     node,
     safe_names,
-    safe_method_names,
     bindings_by_node,
 ):
     parameter_names = {
@@ -1338,6 +1399,12 @@ def _parameter_call_origins(
     if node.args.kwarg is not None:
         parameter_names.add(node.args.kwarg.arg)
     found = set()
+
+    def origin_sequence(values):
+        return ("origin-sequence", tuple(values))
+
+    def stored_origin(key, value):
+        return ("stored-origin", key, value)
 
     def storage_key(value):
         if isinstance(value, ast.Name):
@@ -1356,12 +1423,23 @@ def _parameter_call_origins(
 
     def literal_item(value, key, depth=0):
         if depth >= MAX_STRUCTURE_DEPTH:
+            return UNKNOWN_DANGEROUS_ORIGIN
+        if value == UNKNOWN_DANGEROUS_ORIGIN:
+            return value
+        if (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and value[0] == "origin-sequence"
+        ):
+            if isinstance(key, int) and -len(value[1]) <= key < len(
+                value[1]
+            ):
+                return value[1][key]
             return None
         if isinstance(value, (ast.List, ast.Tuple)):
-            if isinstance(key, int) and -len(value.elts) <= key < len(
-                value.elts
-            ):
-                return value.elts[key]
+            entries = container_entries(value, {})
+            if isinstance(key, int) and -len(entries) <= key < len(entries):
+                return entries[key][1]
             return None
         if isinstance(value, ast.Dict):
             for item_key, item_value in zip(
@@ -1385,9 +1463,36 @@ def _parameter_call_origins(
 
     def container_entries(value, aliases, depth=0):
         if depth >= MAX_STRUCTURE_DEPTH:
-            return ()
+            return ((None, UNKNOWN_DANGEROUS_ORIGIN),)
+        if (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and value[0] == "origin-sequence"
+        ):
+            return tuple(enumerate(value[1]))
+        if (
+            isinstance(value, tuple)
+            and len(value) == 3
+            and value[0] == "stored-origin"
+        ):
+            owner = value[1]
+        else:
+            owner = None
         if isinstance(value, (ast.List, ast.Set, ast.Tuple)):
-            return tuple(enumerate(value.elts))
+            values = []
+            for item in value.elts:
+                if isinstance(item, ast.Starred):
+                    expanded = container_entries(
+                        item.value, aliases, depth + 1
+                    )
+                    if expanded:
+                        values.extend(
+                            expanded_item
+                            for _, expanded_item in expanded
+                        )
+                        continue
+                values.append(item)
+            return tuple(enumerate(values))
         if isinstance(value, ast.Dict):
             return tuple(
                 (key.value, item)
@@ -1398,15 +1503,25 @@ def _parameter_call_origins(
             )
         if isinstance(value, ast.Call):
             bindings = bindings_by_node.get(value, {})
-            if (
-                _resolved_symbol(value.func, bindings)
-                in {"iter", "list", "set", "tuple"}
-                and value.args
-            ):
+            callee = _resolved_symbol(value.func, bindings)
+            if callee in {"iter", "list", "set", "tuple"} and value.args:
                 return container_entries(
                     value.args[0], aliases, depth + 1
                 )
-        owner = storage_key(value)
+            if callee in {"enumerate", "builtins.enumerate"} and value.args:
+                return tuple(
+                    (
+                        index,
+                        origin_sequence((ast.Constant(index), item)),
+                    )
+                    for index, (_, item) in enumerate(
+                        container_entries(
+                            value.args[0], aliases, depth + 1
+                        )
+                    )
+                )
+        if owner is None:
+            owner = storage_key(value)
         if owner is None:
             return ()
         entries = []
@@ -1417,29 +1532,62 @@ def _parameter_call_origins(
                 and key[0] == "item"
                 and key[1] == owner
             ):
-                entries.append((key[2], item_origins))
+                entries.append(
+                    (key[2], stored_origin(key, item_origins))
+                )
         return tuple(sorted(entries, key=lambda item: repr(item[0])))
 
-    def origins(value, aliases):
+    def origins(value, aliases, depth=0):
+        if depth >= MAX_STRUCTURE_DEPTH:
+            return frozenset(parameter_names)
+        if value == UNKNOWN_DANGEROUS_ORIGIN:
+            return frozenset(parameter_names)
         if isinstance(value, frozenset):
             return value
+        if (
+            isinstance(value, tuple)
+            and len(value) == 3
+            and value[0] == "stored-origin"
+        ):
+            return value[2]
+        if (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and value[0] == "origin-sequence"
+        ):
+            return frozenset().union(
+                *(
+                    origins(item, aliases, depth + 1)
+                    for item in value[1]
+                )
+            )
         if isinstance(value, ast.Name):
             return aliases.get(value.id, frozenset())
         if isinstance(value, ast.Attribute):
             if value.attr == "__call__":
-                return origins(value.value, aliases)
-            return aliases.get(storage_key(value), frozenset())
-        if isinstance(value, ast.Subscript) and isinstance(
-            value.slice, ast.Constant
-        ):
-            selected = literal_item(
-                value.value, value.slice.value
+                return origins(value.value, aliases, depth + 1)
+            stored = aliases.get(storage_key(value), frozenset())
+            return stored or origins(value.value, aliases, depth + 1)
+        if isinstance(value, ast.Subscript):
+            if isinstance(value.slice, ast.Constant):
+                selected = literal_item(
+                    value.value, value.slice.value
+                )
+                if selected is not None:
+                    return origins(selected, aliases, depth + 1)
+                stored = aliases.get(storage_key(value), frozenset())
+                if stored:
+                    return stored
+            return frozenset().union(
+                *(
+                    origins(item, aliases, depth + 1)
+                    for _, item in container_entries(
+                        value.value, aliases, depth + 1
+                    )
+                )
             )
-            if selected is not None:
-                return origins(selected, aliases)
-            return aliases.get(storage_key(value), frozenset())
         if isinstance(value, ast.NamedExpr):
-            return origins(value.value, aliases)
+            return origins(value.value, aliases, depth + 1)
         if (
             isinstance(value, ast.Call)
             and _resolved_symbol(
@@ -1448,9 +1596,9 @@ def _parameter_call_origins(
             in {"getattr", "builtins.getattr"}
             and len(value.args) >= 2
             and isinstance(value.args[1], ast.Constant)
-            and value.args[1].value == "__call__"
+            and isinstance(value.args[1].value, str)
         ):
-            return origins(value.args[0], aliases)
+            return origins(value.args[0], aliases, depth + 1)
         return frozenset()
 
     def rebased_storage_key(key, source, target):
@@ -1482,28 +1630,10 @@ def _parameter_call_origins(
                 aliases[target.id] = assigned
             else:
                 aliases.pop(target.id, None)
-            if isinstance(value, (ast.List, ast.Tuple)):
-                for index, item in container_entries(value, aliases):
-                    item_origins = origins(item, aliases)
-                    if item_origins:
-                        aliases[("item", target_key, index)] = item_origins
-                    store_nested(
-                        ("item", target_key, index),
-                        item,
-                        aliases,
-                    )
-            elif isinstance(value, ast.Dict):
-                for item_key, item in container_entries(value, aliases):
-                    item_origins = origins(item, aliases)
-                    if item_origins:
-                        aliases[
-                            ("item", target_key, item_key)
-                        ] = item_origins
-                    store_nested(
-                        ("item", target_key, item_key),
-                        item,
-                        aliases,
-                    )
+            for item_key, item in container_entries(value, aliases):
+                key = ("item", target_key, item_key)
+                aliases[key] = origins(item, aliases)
+                store_nested(key, item, aliases)
             source_key = storage_key(value)
             if source_key is not None:
                 for key, item_origins in list(aliases.items()):
@@ -1523,22 +1653,45 @@ def _parameter_call_origins(
             elif key is not None:
                 aliases.pop(key, None)
             return
-        if isinstance(target, (ast.List, ast.Tuple)) and isinstance(
-            value, (ast.List, ast.Tuple)
-        ):
-            for target_item, value_item in zip(
-                target.elts, value.elts, strict=False
-            ):
-                store(target_item, value_item, aliases)
+        if isinstance(target, (ast.List, ast.Tuple)):
+            values = tuple(
+                item for _, item in container_entries(value, aliases)
+            )
+            starred = next(
+                (
+                    index
+                    for index, item in enumerate(target.elts)
+                    if isinstance(item, ast.Starred)
+                ),
+                None,
+            )
+            if starred is None:
+                for target_item, value_item in zip(
+                    target.elts, values, strict=False
+                ):
+                    store(target_item, value_item, aliases)
+                return
+            trailing = len(target.elts) - starred - 1
+            for index in range(starred):
+                if index < len(values):
+                    store(target.elts[index], values[index], aliases)
+            stop = len(values) - trailing
+            store(
+                target.elts[starred],
+                origin_sequence(values[starred:stop]),
+                aliases,
+            )
+            for offset in range(1, trailing + 1):
+                if offset <= len(values):
+                    store(target.elts[-offset], values[-offset], aliases)
 
     def store_nested(owner, value, aliases, depth=0):
         if depth >= MAX_STRUCTURE_DEPTH:
+            aliases[owner] = frozenset(parameter_names)
             return
         for item_key, item in container_entries(value, aliases, depth):
             key = ("item", owner, item_key)
-            item_origins = origins(item, aliases)
-            if item_origins:
-                aliases[key] = item_origins
+            aliases[key] = origins(item, aliases)
             store_nested(key, item, aliases, depth + 1)
 
     def bind_pattern(pattern, subject, aliases):
@@ -1593,23 +1746,18 @@ def _parameter_call_origins(
             store(value.target, value.value, aliases)
             return
         if isinstance(value, ast.Call):
-            executable_origins = origins(value.func, aliases)
-            found.update(executable_origins)
-            if (
-                isinstance(value.func, ast.Attribute)
-                and not executable_origins
-            ):
-                method_origins = (
-                    origins(value.func.value, aliases)
-                    - safe_method_names
+            if isinstance(value.func, ast.Attribute):
+                stored_method = aliases.get(
+                    storage_key(value.func), frozenset()
                 )
-                found.update(
-                    name
-                    for name in method_origins
-                    if value.func.attr == "execute"
-                    or name == "adapter"
-                    or _boundary_surface_tokens(name)
-                )
+                found.update(stored_method)
+                if (
+                    value.func.attr
+                    not in PURE_PARAMETER_METHOD_NAMES
+                ):
+                    found.update(origins(value.func.value, aliases))
+            else:
+                found.update(origins(value.func, aliases))
             bindings = bindings_by_node.get(value, {})
             callee = _resolved_symbol(value.func, bindings)
             if callee is not None and callee.startswith("builtins."):
@@ -1634,7 +1782,7 @@ def _parameter_call_origins(
             combined = frozenset().union(
                 *(state.get(name, frozenset()) for state in states)
             )
-            if combined:
+            if combined or isinstance(name, tuple):
                 merged[name] = combined
         return merged
 
@@ -1683,6 +1831,18 @@ def _parameter_call_origins(
                 for decorator in statement.decorator_list:
                     scan_expression(decorator, aliases)
                     found.update(origins(decorator, aliases))
+                local_names = {
+                    statement.name,
+                    *_scope_bound_names(statement.body),
+                }
+                captured = {
+                    name: origin
+                    for name, origin in aliases.items()
+                    if not (
+                        isinstance(name, str) and name in local_names
+                    )
+                }
+                walk(statement.body, captured)
                 aliases.pop(statement.name, None)
                 continue
             if isinstance(statement, ast.If):
@@ -1910,6 +2070,47 @@ def _schema_key_strings(tree):
     return keys
 
 
+def _is_allowed_sorted_key_lambda(node, parents, bindings):
+    arguments = node.args
+    if (
+        len(arguments.posonlyargs) + len(arguments.args) != 1
+        or arguments.vararg is not None
+        or arguments.kwarg is not None
+        or arguments.kwonlyargs
+        or arguments.defaults
+        or arguments.kw_defaults
+    ):
+        return False
+    argument = (arguments.posonlyargs + arguments.args)[0].arg
+    keyword = parents.get(node)
+    call = parents.get(keyword)
+    if (
+        not isinstance(keyword, ast.keyword)
+        or keyword.arg != "key"
+        or not isinstance(call, ast.Call)
+        or _resolved_symbol(call.func, bindings)
+        not in {"builtins.sorted", "sorted"}
+    ):
+        return False
+
+    def attribute_name(value):
+        if (
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id == argument
+        ):
+            return value.attr
+        return None
+
+    if attribute_name(node.body) == "grant_id":
+        return True
+    return (
+        isinstance(node.body, ast.Tuple)
+        and tuple(attribute_name(item) for item in node.body.elts)
+        == ("sequence", "action_id")
+    )
+
+
 def _effect_boundary_violations(tree):
     (
         bindings_by_node,
@@ -1918,6 +2119,11 @@ def _effect_boundary_violations(tree):
         structures_by_node,
     ) = _binding_environments(tree)
     violations = set()
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
 
     for imported in _import_violations(tree):
         violations.add(f"import:{imported}")
@@ -1927,7 +2133,11 @@ def _effect_boundary_violations(tree):
         imported_symbols = imported_by_node.get(node, frozenset())
         callable_symbols = callables_by_node.get(node, frozenset())
         structures = structures_by_node.get(node, {})
-        if isinstance(node, ast.Lambda):
+        if isinstance(node, ast.Lambda) and not _is_allowed_sorted_key_lambda(
+            node,
+            parents,
+            bindings,
+        ):
             violations.add(f"lambda:{node.lineno}")
         if isinstance(node, (ast.Name, ast.Attribute)):
             function_token = _function_surface_token(node, bindings)
@@ -1995,18 +2205,11 @@ def _effect_boundary_violations(tree):
                 or _resolved_symbol(argument.annotation, bindings)
                 in {"builtins.type", "type"}
             }
-            safe_method_parameters = {
-                argument.arg
-                for argument in arguments
-                if argument.arg == "self"
-                or argument.annotation is not None
-            }
             violations.update(
                 f"callable-parameter:{name}"
                 for name in _parameter_call_origins(
                     node,
                     safe_invoked_parameters,
-                    safe_method_parameters,
                     bindings_by_node,
                 )
             )
@@ -2107,9 +2310,35 @@ def _target_names(target):
     return set()
 
 
+def _module_control_flow_bodies(node):
+    if isinstance(node, ast.If):
+        return (node.body, node.orelse)
+    if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+        return (node.body, node.orelse)
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        return (node.body,)
+    if isinstance(node, (ast.Try, ast.TryStar)):
+        return (
+            node.body,
+            node.orelse,
+            node.finalbody,
+            *(handler.body for handler in node.handlers),
+        )
+    if isinstance(node, ast.Match):
+        return tuple(case.body for case in node.cases)
+    return ()
+
+
+def _module_scope_nodes(statements):
+    for node in statements:
+        yield node
+        for body in _module_control_flow_bodies(node):
+            yield from _module_scope_nodes(body)
+
+
 def _package_public_bindings(tree):
     bindings = set()
-    for node in tree.body:
+    for node in _module_scope_nodes(tree.body):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             bindings.add(node.name)
         elif isinstance(node, ast.Import):
@@ -2136,25 +2365,97 @@ def _package_public_bindings(tree):
 
 
 def _package_binding_provenance(tree):
-    bindings = {}
-    for node in tree.body:
-        imported, _ = _imported_bindings(node)
-        bindings.update(imported)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            bindings[node.name] = f"<local-function>.{node.name}"
-        elif isinstance(node, ast.ClassDef):
-            bindings[node.name] = f"<local-class>.{node.name}"
-        elif isinstance(node, ast.Assign):
-            resolved = _resolved_symbol(node.value, bindings)
-            provenance = resolved or f"<{type(node.value).__name__}>"
-            for target in node.targets:
-                for name in _target_names(target):
+    def merge(states):
+        merged = {}
+        for name in set().union(*(state.keys() for state in states)):
+            merged[name] = frozenset().union(
+                *(state.get(name, frozenset()) for state in states)
+            )
+        return merged
+
+    def resolved(node, bindings):
+        if isinstance(node, ast.Name):
+            return bindings.get(node.id, frozenset({node.id}))
+        if isinstance(node, ast.Attribute):
+            owners = resolved(node.value, bindings)
+            return frozenset(f"{owner}.{node.attr}" for owner in owners)
+        return frozenset({f"<{type(node).__name__}>"})
+
+    def walk(statements, inherited):
+        bindings = dict(inherited)
+        for node in statements:
+            if isinstance(node, ast.If):
+                bindings = merge(
+                    [
+                        walk(node.body, bindings),
+                        walk(node.orelse, bindings),
+                    ]
+                )
+                continue
+            if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                loop_state = merge(
+                    [bindings, walk(node.body, bindings)]
+                )
+                bindings = merge(
+                    [loop_state, walk(node.orelse, loop_state)]
+                )
+                continue
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                bindings = merge(
+                    [bindings, walk(node.body, bindings)]
+                )
+                continue
+            if isinstance(node, (ast.Try, ast.TryStar)):
+                body_state = walk(node.body, bindings)
+                states = [
+                    bindings,
+                    walk(node.orelse, body_state),
+                    *(
+                        walk(handler.body, bindings)
+                        for handler in node.handlers
+                    ),
+                ]
+                bindings = walk(node.finalbody, merge(states))
+                continue
+            if isinstance(node, ast.Match):
+                bindings = merge(
+                    [
+                        bindings,
+                        *(
+                            walk(case.body, bindings)
+                            for case in node.cases
+                        ),
+                    ]
+                )
+                continue
+
+            imported, _ = _imported_bindings(node)
+            bindings.update(
+                {
+                    name: frozenset({provenance})
+                    for name, provenance in imported.items()
+                }
+            )
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                bindings[node.name] = frozenset(
+                    {f"<local-function>.{node.name}"}
+                )
+            elif isinstance(node, ast.ClassDef):
+                bindings[node.name] = frozenset(
+                    {f"<local-class>.{node.name}"}
+                )
+            elif isinstance(node, ast.Assign):
+                provenance = resolved(node.value, bindings)
+                for target in node.targets:
+                    for name in _target_names(target):
+                        bindings[name] = provenance
+            elif isinstance(node, ast.AnnAssign):
+                provenance = resolved(node.value, bindings)
+                for name in _target_names(node.target):
                     bindings[name] = provenance
-        elif isinstance(node, ast.AnnAssign):
-            resolved = _resolved_symbol(node.value, bindings)
-            provenance = resolved or f"<{type(node.value).__name__}>"
-            for name in _target_names(node.target):
-                bindings[name] = provenance
+        return bindings
+
+    bindings = walk(tree.body, {})
     return {
         name: provenance
         for name, provenance in bindings.items()
@@ -2231,7 +2532,7 @@ def _effect_adapter_api_violations(tree):
         f"rebound-package-api:{name}"
         for name, expected in EXPECTED_PACKAGE_BINDING_PROVENANCE.items()
         if name in package_provenance
-        and package_provenance[name] != expected
+        and package_provenance[name] != frozenset({expected})
     )
     return violations
 
@@ -2809,6 +3110,20 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                     _effect_boundary_violations(ast.parse(source)),
                 )
 
+        depth_limited_default = "helper"
+        for _ in range(MAX_STRUCTURE_DEPTH + 1):
+            depth_limited_default = f"[{depth_limited_default}]"
+        depth_limited_tree = ast.parse(
+            "def helper():\n"
+            "    pass\n"
+            f"def run(fn={depth_limited_default}):\n"
+            "    pass\n"
+        )
+        self.assertIn(
+            "function-valued-default:fn",
+            _effect_boundary_violations(depth_limited_tree),
+        )
+
     def test_effect_adapter_boundary_scanner_rejects_imported_callable_injection(
         self,
     ):
@@ -2991,16 +3306,112 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 "        case {'main': callback}:\n"
                 "            return callback()\n"
             ),
+            "flattened starred container": (
+                "def run(fn):\n"
+                "    source = (fn,)\n"
+                "    callbacks = (*source,)\n"
+                "    return callbacks[0]()\n"
+            ),
+            "starred assignment target": (
+                "def run(fn):\n"
+                "    first, *runners = (object, fn)\n"
+                "    return runners[0]()\n"
+            ),
+            "computed container subscript": (
+                "def run(fn, key):\n"
+                "    callbacks = (fn,)\n"
+                "    return callbacks[key]()\n"
+            ),
+            "enumerated loop callback": (
+                "def run(fn):\n"
+                "    callbacks = (fn,)\n"
+                "    for _, callback in enumerate(callbacks):\n"
+                "        return callback()\n"
+            ),
+            "saved iterator loop source": (
+                "def run(fn):\n"
+                "    callbacks = (fn,)\n"
+                "    source = iter(callbacks)\n"
+                "    for callback in source:\n"
+                "        return callback()\n"
+            ),
+            "nested sequence capture": (
+                "def run(fn):\n"
+                "    callbacks = ((fn,),)\n"
+                "    match callbacks:\n"
+                "        case ((callback,),):\n"
+                "            return callback()\n"
+            ),
+            "nested mapping capture": (
+                "def run(fn):\n"
+                "    callbacks = {'outer': {'inner': fn}}\n"
+                "    match callbacks:\n"
+                "        case {'outer': {'inner': callback}}:\n"
+                "            return callback()\n"
+            ),
+            "generic injected service method": (
+                "def run(worker):\n"
+                "    return worker.run()\n"
+            ),
+            "annotated injected service method": (
+                "def run(adapter: object):\n"
+                "    return adapter.execute()\n"
+            ),
+            "attribute decorator owner": (
+                "def run(adapter):\n"
+                "    @adapter.decorate\n"
+                "    def wrapped():\n"
+                "        pass\n"
+                "    return wrapped\n"
+            ),
+            "extracted attribute method": (
+                "def run(adapter):\n"
+                "    action = adapter.execute\n"
+                "    return action()\n"
+            ),
+            "extracted getattr method": (
+                "def run(adapter):\n"
+                "    action = getattr(adapter, 'execute')\n"
+                "    return action()\n"
+            ),
+            "nested class body method": (
+                "def run(adapter):\n"
+                "    class Wrapped:\n"
+                "        action = adapter.execute\n"
+                "        @adapter.decorate\n"
+                "        def invoke(self):\n"
+                "            pass\n"
+                "    return Wrapped\n"
+            ),
+            "nested class captured invocation": (
+                "def run(adapter):\n"
+                "    class Wrapped:\n"
+                "        def invoke(self):\n"
+                "            return adapter.execute()\n"
+                "    return Wrapped\n"
+            ),
         }
 
         for label, source in cases.items():
             with self.subTest(label=label):
+                parameter = (
+                    "adapter"
+                    if label
+                    in {
+                        "injected service method",
+                        "annotated injected service method",
+                        "attribute decorator owner",
+                        "extracted attribute method",
+                        "extracted getattr method",
+                        "nested class body method",
+                        "nested class captured invocation",
+                    }
+                    else "worker"
+                    if label == "generic injected service method"
+                    else "fn"
+                )
                 self.assertIn(
-                    (
-                        "callable-parameter:adapter"
-                        if label == "injected service method"
-                        else "callable-parameter:fn"
-                    ),
+                    f"callable-parameter:{parameter}",
                     _effect_boundary_violations(ast.parse(source)),
                 )
 
@@ -3032,6 +3443,24 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             "callable-parameter:value",
             _effect_boundary_violations(nested_storage_only),
         )
+        expanded_storage_only = ast.parse(
+            "def run(value, key):\n"
+            "    source = (value,)\n"
+            "    values = (*source,)\n"
+            "    return values[key]\n"
+        )
+        self.assertNotIn(
+            "callable-parameter:value",
+            _effect_boundary_violations(expanded_storage_only),
+        )
+        proven_pure_method = ast.parse(
+            "def normalize(value):\n"
+            "    return value.strip()\n"
+        )
+        self.assertNotIn(
+            "callable-parameter:value",
+            _effect_boundary_violations(proven_pure_method),
+        )
         nested_value = "fn"
         for _ in range(12):
             nested_value = f"[{nested_value}]"
@@ -3042,6 +3471,18 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
         self.assertIn(
             "callable-parameter:fn",
             _effect_boundary_violations(deep_call),
+        )
+        depth_limited_value = "fn"
+        for _ in range(MAX_STRUCTURE_DEPTH + 1):
+            depth_limited_value = f"[{depth_limited_value}]"
+        depth_limited_call = ast.parse(
+            "def run(fn):\n"
+            f"    return {depth_limited_value}"
+            f"{'[0]' * (MAX_STRUCTURE_DEPTH + 1)}()\n"
+        )
+        self.assertIn(
+            "callable-parameter:fn",
+            _effect_boundary_violations(depth_limited_call),
         )
         cyclic_aliases = ast.parse(
             "def run(value):\n"
@@ -3189,6 +3630,18 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 "loaded = loads[0]('email_automation.messaging')\n",
                 "dynamic-import:__import__",
             ),
+            "flattened stored builtin tuple": (
+                "source = (__import__,)\n"
+                "loads = (*source,)\n"
+                "loaded = loads[0]('email_automation.messaging')\n",
+                "dynamic-import:__import__",
+            ),
+            "computed stored builtin subscript": (
+                "loads = (__import__,)\n"
+                "index = 0\n"
+                "loaded = loads[index]('email_automation.messaging')\n",
+                "dynamic-import:__import__",
+            ),
             "builtins mapping lookup": (
                 "load = __builtins__['__import__']\n"
                 "loaded = load('email_automation.messaging')\n",
@@ -3202,6 +3655,19 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             ),
             "method copied builtins": (
                 "namespace = __builtins__.copy()\n"
+                "loaded = namespace['__import__']"
+                "('email_automation.messaging')\n",
+                "dynamic-import:__import__",
+            ),
+            "unpacked builtins mapping": (
+                "namespace = {**__builtins__}\n"
+                "loaded = namespace['__import__']"
+                "('email_automation.messaging')\n",
+                "dynamic-import:__import__",
+            ),
+            "saved builtins copy method": (
+                "copy_namespace = __builtins__.copy\n"
+                "namespace = copy_namespace()\n"
                 "loaded = namespace['__import__']"
                 "('email_automation.messaging')\n",
                 "dynamic-import:__import__",
@@ -3226,17 +3692,71 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             )
         )
 
-    def test_effect_adapter_files_reject_every_lambda(self):
-        lambdas = set()
-        for path in EFFECT_ADAPTER_PATHS:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-            lambdas.update(
-                f"{path.name}:{node.lineno}"
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Lambda)
-            )
+    def test_effect_adapter_files_allow_only_pure_sorted_key_lambdas(self):
+        adapter_path = PACKAGE_ROOT / "effect_adapter.py"
+        adapter_tree = ast.parse(
+            adapter_path.read_text(encoding="utf-8"),
+            filename=str(adapter_path),
+        )
+        adapter_lambdas = [
+            node for node in ast.walk(adapter_tree) if isinstance(node, ast.Lambda)
+        ]
 
-        self.assertEqual(set(), lambdas)
+        self.assertEqual(2, len(adapter_lambdas))
+        self.assertEqual(set(), _effect_boundary_violations(adapter_tree))
+        fixture_tree = ast.parse(
+            (PACKAGE_ROOT / "effect_adapter_fixtures.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(
+            any(isinstance(node, ast.Lambda) for node in ast.walk(fixture_tree))
+        )
+
+        allowed = {
+            "single attribute": (
+                "items = sorted(values, key=lambda item: item.grant_id)\n"
+            ),
+            "attribute tuple": (
+                "items = sorted(\n"
+                "    values,\n"
+                "    key=lambda item: (item.sequence, item.action_id),\n"
+                ")\n"
+            ),
+        }
+        for label, source in allowed.items():
+            with self.subTest(label=label):
+                self.assertFalse(
+                    any(
+                        item.startswith("lambda:")
+                        for item in _effect_boundary_violations(
+                            ast.parse(source)
+                        )
+                    )
+                )
+
+        rejected = {
+            "arbitrary lambda": "callback = lambda value: value\n",
+            "call in sorted key": (
+                "items = sorted(values, key=lambda item: helper(item))\n"
+            ),
+            "allowed shape outside sorted": (
+                "callback = lambda item: item.grant_id\n"
+            ),
+            "unrelated sorted attribute": (
+                "items = sorted(values, key=lambda item: item.callback)\n"
+            ),
+        }
+        for label, source in rejected.items():
+            with self.subTest(label=label):
+                self.assertTrue(
+                    any(
+                        item.startswith("lambda:")
+                        for item in _effect_boundary_violations(
+                            ast.parse(source)
+                        )
+                    )
+                )
 
     def test_package_import_loads_only_claim_pipeline_modules(self):
         script = (
@@ -3322,6 +3842,21 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 "evaluate_effect_plan = _private_helper\n"
             ),
             "none assignment": "evaluate_effect_plan = None\n",
+            "if rebinding": (
+                "if enabled:\n"
+                "    evaluate_effect_plan = None\n"
+            ),
+            "try rebinding": (
+                "try:\n"
+                "    evaluate_effect_plan = None\n"
+                "except Exception:\n"
+                "    pass\n"
+            ),
+            "match rebinding": (
+                "match mode:\n"
+                "    case _:\n"
+                "        evaluate_effect_plan = None\n"
+            ),
         }
 
         for label, appended_source in cases.items():

@@ -613,15 +613,11 @@ def _request_identity_failure(
     return None
 
 
-def _approval_grant_sort_key(item: ApprovalGrant) -> str:
-    return item.grant_id
-
-
 def _grants_by_action(
     grants: tuple[ApprovalGrant, ...],
 ) -> Mapping[str, tuple[ApprovalGrant, ...]]:
     grouped: dict[str, list[ApprovalGrant]] = {}
-    for grant in sorted(grants, key=_approval_grant_sort_key):
+    for grant in sorted(grants, key=lambda item: item.grant_id):
         grouped.setdefault(grant.action_id, []).append(grant)
     return {
         action_id: tuple(action_grants)
@@ -663,16 +659,12 @@ def _human_approval_disposition(
     )
 
 
-def _planned_action_sort_key(item: PlannedAction) -> tuple[int, str]:
-    return item.sequence, item.action_id
-
-
 def evaluate_effect_plan(request: EffectAdapterRequest) -> DryRunCommitReceipt:
     """Classify a validated plan without executing or persisting any effect."""
     ordered = tuple(
         sorted(
             request.plan.actions,
-            key=_planned_action_sort_key,
+            key=lambda item: (item.sequence, item.action_id),
         )
     )
     try:
