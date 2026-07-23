@@ -4,6 +4,8 @@ import importlib.util
 import io
 import json
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -113,6 +115,21 @@ class EffectAdapterReportTests(unittest.TestCase):
 
     def _seed_passed_report(self, path):
         path.write_text('{"passed":true}\n', encoding="utf-8")
+
+    def _seed_atomic_temporary(self, output_path, suffix="stale"):
+        path = output_path.parent / f".{output_path.name}.{suffix}"
+        path.write_text('{"passed":true}\n', encoding="utf-8")
+        return path
+
+    def _run_cli_subprocess(self, *arguments):
+        return subprocess.run(
+            (sys.executable, str(SCRIPT_PATH), *map(str, arguments)),
+            cwd=REPO_ROOT,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
     def _fixture_payload(self):
         return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -704,6 +721,124 @@ class EffectAdapterReportTests(unittest.TestCase):
                 )
 
             self.assertFalse(output_path.exists())
+
+    def test_subprocess_unknown_option_clears_stale_output_before_argparse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "report.json"
+            temporary_path = self._seed_atomic_temporary(output_path)
+            self._seed_passed_report(output_path)
+
+            completed = self._run_cli_subprocess(
+                "--fixture",
+                FIXTURE_PATH,
+                "--runs",
+                "3",
+                "--output",
+                output_path,
+                "--unexpected-option",
+            )
+
+            self.assertEqual(2, completed.returncode)
+            self.assertIn("unrecognized arguments", completed.stderr)
+            self.assertFalse(output_path.exists())
+            self.assertFalse(temporary_path.exists())
+
+    def test_subprocess_missing_required_arg_clears_supplied_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "report.json"
+            self._seed_passed_report(output_path)
+
+            completed = self._run_cli_subprocess(
+                "--runs",
+                "3",
+                "--output",
+                output_path,
+            )
+
+            self.assertEqual(2, completed.returncode)
+            self.assertIn("required", completed.stderr)
+            self.assertFalse(output_path.exists())
+
+    def test_subprocess_output_equals_variant_clears_before_parser_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "report.json"
+            temporary_path = self._seed_atomic_temporary(output_path)
+            self._seed_passed_report(output_path)
+
+            completed = self._run_cli_subprocess(
+                "--fixture",
+                FIXTURE_PATH,
+                "--runs",
+                "3",
+                f"--output={output_path}",
+                "--unexpected-option",
+            )
+
+            self.assertEqual(2, completed.returncode)
+            self.assertFalse(output_path.exists())
+            self.assertFalse(temporary_path.exists())
+
+    def test_subprocess_repeated_and_malformed_outputs_clear_every_candidate(self):
+        cases = (
+            ("repeated", lambda first, _second: ("--output", first, "--output", first)),
+            (
+                "conflicting",
+                lambda first, second: (
+                    "--output",
+                    first,
+                    f"--output={second}",
+                ),
+            ),
+            (
+                "malformed",
+                lambda first, _second: (
+                    "--output",
+                    first,
+                    "--output=",
+                ),
+            ),
+        )
+        for label, output_arguments in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                first_path = Path(directory) / "first.json"
+                second_path = Path(directory) / "second.json"
+                paths = (first_path,) if label != "conflicting" else (
+                    first_path,
+                    second_path,
+                )
+                temporary_paths = tuple(
+                    self._seed_atomic_temporary(path) for path in paths
+                )
+                for path in paths:
+                    self._seed_passed_report(path)
+
+                completed = self._run_cli_subprocess(
+                    "--fixture",
+                    FIXTURE_PATH,
+                    "--runs",
+                    "3",
+                    *output_arguments(first_path, second_path),
+                )
+
+                self.assertEqual(2, completed.returncode)
+                self.assertIn("--output", completed.stderr)
+                self.assertTrue(all(not path.exists() for path in paths))
+                self.assertTrue(
+                    all(not path.exists() for path in temporary_paths)
+                )
+
+    def test_subprocess_does_not_treat_unrelated_values_as_output_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            unrelated_path = Path(directory) / "unrelated.json"
+            self._seed_passed_report(unrelated_path)
+
+            completed = self._run_cli_subprocess(
+                "--unexpected-option",
+                unrelated_path,
+            )
+
+            self.assertEqual(2, completed.returncode)
+            self.assertTrue(unrelated_path.exists())
 
 
 if __name__ == "__main__":

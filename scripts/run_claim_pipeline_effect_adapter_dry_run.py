@@ -283,6 +283,60 @@ def _remove_output(output_path: Path) -> None:
         raise DryRunReportError("stale report output cannot be removed") from exc
 
 
+def _remove_stale_output_artifacts(output_path: Path) -> Path:
+    output_path = _safe_output_path(output_path)
+    _remove_output(output_path)
+    temporary_prefix = f".{output_path.name}."
+    try:
+        siblings = tuple(output_path.parent.iterdir())
+        for sibling in siblings:
+            if sibling.name.startswith(temporary_prefix):
+                sibling.unlink(missing_ok=True)
+    except OSError as exc:
+        raise DryRunReportError(
+            "stale report temporary output cannot be removed"
+        ) from exc
+    return output_path
+
+
+def _preparse_output_paths(
+    argv: Sequence[str],
+) -> tuple[tuple[Path, ...], Optional[str]]:
+    candidates = []
+    output_occurrences = 0
+    malformed = False
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            break
+        if token == "--output":
+            output_occurrences += 1
+            if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+                malformed = True
+                index += 1
+                continue
+            candidates.append(Path(argv[index + 1]))
+            index += 2
+            continue
+        if token.startswith("--output="):
+            output_occurrences += 1
+            value = token.partition("=")[2]
+            if value:
+                candidates.append(Path(value))
+            else:
+                malformed = True
+        index += 1
+
+    if output_occurrences > 1:
+        issue = "--output must be supplied exactly once"
+    elif malformed:
+        issue = "--output requires one unambiguous path"
+    else:
+        issue = None
+    return tuple(candidates), issue
+
+
 def _atomic_write(output_path: Path, content: bytes) -> None:
     temporary_path = None
     try:
@@ -466,8 +520,7 @@ def run_dry_run(
     runs: object,
     output_path: Path,
 ) -> dict[str, Any]:
-    output_path = _safe_output_path(Path(output_path))
-    _remove_output(output_path)
+    output_path = _remove_stale_output_artifacts(Path(output_path))
     runs = _validated_runs(runs)
     fixture_path = _canonical_fixture_path(fixture_path)
     fixture_hash = _file_hash(fixture_path)
@@ -563,7 +616,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = tuple(
+        sys.argv[1:] if argv is None else (str(item) for item in argv)
+    )
+    output_paths, output_issue = _preparse_output_paths(raw_argv)
+    cleanup_error = None
+    for output_path in output_paths:
+        try:
+            _remove_stale_output_artifacts(output_path)
+        except DryRunReportError as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+    if cleanup_error is not None:
+        parser.error(str(cleanup_error))
+    if output_issue is not None:
+        parser.error(output_issue)
+
+    args = parser.parse_args(raw_argv)
     try:
         report = run_dry_run(
             fixture_path=args.fixture,
