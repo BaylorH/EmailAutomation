@@ -1,0 +1,152 @@
+{
+  "schemaVersion": 1,
+  "catalogId": "provider-policy-shadow-v1",
+  "providerQualityFixtureHash": "9b4f9f70461eb2d7f5d8582b36a7f5ec0d20b20c89a1e23f92fd6d2fbb8b8190",
+  "cases": [
+    {
+      "caseId": "fresh-suite-closeout",
+      "providerCaseId": "fresh-reply-over-quoted-stale-history",
+      "dimensions": ["freshness"],
+      "contract": {"requiredFields": ["availability"], "hardRequirements": {}, "softPreferences": {}},
+      "subjects": [{"key": "suite-b", "entityType": "suite", "relationship": "suite_of_target", "suite": "B"}],
+      "currentState": {"facts": {"suite-b": {}}, "conversationStates": {"suite-b": "active"}, "followupStates": {"suite-b": "scheduled"}},
+      "expected": {
+        "disposition": "pass",
+        "gapCodes": [],
+        "results": [{
+          "subject": "suite-b", "marketState": "available", "fitState": "viable", "completenessState": "complete", "conversationState": "terminal_intent", "approvalClass": "automatic",
+          "reasonCodes": ["broker_confirmed_available", "required_facts_complete"], "missingFields": [], "actionCount": 3,
+          "requiredActions": ["fact_update:automatic", "followup_freeze:automatic", "status_transition:automatic"],
+          "forbiddenActions": ["outbound_draft:automatic", "review_item:human_required"]
+        }]
+      }
+    },
+    {
+      "caseId": "split-suite-isolation",
+      "providerCaseId": "split-suite-statuses",
+      "dimensions": ["split_suite"],
+      "contract": {"requiredFields": [], "hardRequirements": {}, "softPreferences": {}},
+      "subjects": [
+        {"key": "suite-a", "entityType": "suite", "relationship": "suite_of_target", "suite": "A"},
+        {"key": "suite-b", "entityType": "suite", "relationship": "suite_of_target", "suite": "B"}
+      ],
+      "currentState": {"facts": {"suite-a": {}, "suite-b": {}}, "conversationStates": {"suite-a": "active", "suite-b": "active"}, "followupStates": {"suite-a": "scheduled", "suite-b": "scheduled"}},
+      "expected": {
+        "disposition": "pass",
+        "gapCodes": [],
+        "results": [
+          {"subject": "suite-a", "marketState": "unavailable", "fitState": "nonviable", "completenessState": "not_applicable", "conversationState": "terminal_intent", "approvalClass": "automatic", "reasonCodes": ["broker_confirmed_unavailable"], "missingFields": [], "actionCount": 3, "requiredActions": ["fact_update:automatic", "followup_freeze:automatic", "status_transition:automatic"], "forbiddenActions": ["outbound_draft:automatic", "review_item:human_required"]},
+          {"subject": "suite-b", "marketState": "available", "fitState": "viable", "completenessState": "incomplete", "conversationState": "active", "approvalClass": "automatic", "reasonCodes": ["broker_confirmed_available"], "missingFields": [], "actionCount": 1, "requiredActions": ["fact_update:automatic"], "forbiddenActions": ["followup_freeze:automatic", "review_item:human_required"]}
+        ]
+      }
+    },
+    {
+      "caseId": "attachment-alternate-isolation",
+      "providerCaseId": "wrong-property-attachment",
+      "dimensions": ["attachment_isolation"],
+      "contract": {"requiredFields": [], "hardRequirements": {}, "softPreferences": {}},
+      "subjects": [{"key": "alternate", "entityType": "property", "relationship": "alternate", "suite": ""}],
+      "currentState": {"facts": {"alternate": {}}, "conversationStates": {"alternate": "active"}, "followupStates": {"alternate": "scheduled"}},
+      "expected": {
+        "disposition": "pass",
+        "gapCodes": [],
+        "results": [{
+          "subject": "alternate", "marketState": "unknown", "fitState": "review", "completenessState": "blocked", "conversationState": "review", "approvalClass": "human_required",
+          "reasonCodes": ["alternate_property_requires_approval", "market_state_unknown"], "missingFields": [], "actionCount": 3,
+          "requiredActions": ["alternate_property_proposal:human_required", "review_item:human_required", "status_transition:automatic"],
+          "forbiddenActions": ["fact_update:automatic", "outbound_draft:automatic", "recipient_change:automatic"]
+        }]
+      }
+    },
+    {
+      "caseId": "complete-facts-closeout",
+      "providerCaseId": "complete-property-facts",
+      "dimensions": ["complete_facts", "terminal_suppression"],
+      "contract": {"requiredFields": ["asking_status", "availability", "clear_height", "docks", "drive_ins", "occupancy_date", "office_sf", "operating_expenses", "power", "rent", "term", "total_sf", "transaction_type"], "hardRequirements": {}, "softPreferences": {}},
+      "subjects": [{"key": "target", "entityType": "target_property", "relationship": "target", "suite": ""}],
+      "currentState": {"facts": {"target": {}}, "conversationStates": {"target": "active"}, "followupStates": {"target": "scheduled"}},
+      "expected": {
+        "disposition": "pass",
+        "gapCodes": [],
+        "results": [{
+          "subject": "target", "marketState": "available", "fitState": "viable", "completenessState": "complete", "conversationState": "terminal_intent", "approvalClass": "automatic",
+          "reasonCodes": ["broker_confirmed_available", "required_facts_complete"], "missingFields": [], "actionCount": 15,
+          "requiredActions": ["fact_update:automatic", "followup_freeze:automatic", "status_transition:automatic"],
+          "forbiddenActions": ["outbound_draft:automatic", "review_item:human_required"]
+        }]
+      }
+    },
+    {
+      "caseId": "workflow-intents-visible",
+      "providerCaseId": "workflow-intents-and-referral",
+      "dimensions": ["workflow_intents"],
+      "contract": {"requiredFields": [], "hardRequirements": {}, "softPreferences": {}},
+      "subjects": [{"key": "target", "entityType": "target_property", "relationship": "target", "suite": ""}],
+      "currentState": {"facts": {"target": {}}, "conversationStates": {"target": "active"}, "followupStates": {"target": "scheduled"}},
+      "expected": {
+        "disposition": "expected_gap",
+        "gapCodes": ["information_request_action_missing", "tour_request_action_missing"],
+        "results": [{
+          "subject": "target", "marketState": "unknown", "fitState": "review", "completenessState": "blocked", "conversationState": "terminal_intent", "approvalClass": "human_required",
+          "reasonCodes": ["broker_return_date", "call_requires_approval", "contact_opted_out", "market_state_unknown", "tentative_remediation_requires_review"], "missingFields": [], "actionCount": 4,
+          "requiredActions": ["call_request:human_required", "followup_freeze:automatic", "recipient_change:human_required", "status_transition:automatic"],
+          "forbiddenActions": ["outbound_draft:automatic", "recipient_change:automatic", "tour_request:automatic"]
+        }]
+      }
+    },
+    {
+      "caseId": "rent-correction-closeout",
+      "providerCaseId": "broker-corrects-prior-rent",
+      "dimensions": ["correction"],
+      "contract": {"requiredFields": ["rent"], "hardRequirements": {}, "softPreferences": {}},
+      "subjects": [{"key": "target", "entityType": "target_property", "relationship": "target", "suite": ""}],
+      "currentState": {"facts": {"target": {"rent": 14}}, "conversationStates": {"target": "active"}, "followupStates": {"target": "scheduled"}},
+      "expected": {
+        "disposition": "pass",
+        "gapCodes": [],
+        "results": [{
+          "subject": "target", "marketState": "unknown", "fitState": "review", "completenessState": "complete", "conversationState": "terminal_intent", "approvalClass": "automatic",
+          "reasonCodes": ["market_state_unknown", "required_facts_complete"], "missingFields": [], "actionCount": 3,
+          "requiredActions": ["fact_update:automatic", "followup_freeze:automatic", "status_transition:automatic"],
+          "forbiddenActions": ["outbound_draft:automatic", "review_item:human_required"]
+        }]
+      }
+    },
+    {
+      "caseId": "repeated-information-request",
+      "providerCaseId": "repeated-brochure-request",
+      "dimensions": ["repeated_request"],
+      "contract": {"requiredFields": [], "hardRequirements": {}, "softPreferences": {}},
+      "subjects": [{"key": "target", "entityType": "target_property", "relationship": "target", "suite": ""}],
+      "currentState": {"facts": {"target": {}}, "conversationStates": {"target": "active"}, "followupStates": {"target": "scheduled"}},
+      "expected": {
+        "disposition": "expected_gap",
+        "gapCodes": ["information_request_action_missing"],
+        "results": [{
+          "subject": "target", "marketState": "unknown", "fitState": "review", "completenessState": "incomplete", "conversationState": "active", "approvalClass": "automatic",
+          "reasonCodes": ["market_state_unknown"], "missingFields": [], "actionCount": 0,
+          "requiredActions": [],
+          "forbiddenActions": ["outbound_draft:automatic", "review_item:human_required"]
+        }]
+      }
+    },
+    {
+      "caseId": "unavailable-optout-suppression",
+      "providerCaseId": "target-unavailable-stop-followups",
+      "dimensions": ["terminal_suppression"],
+      "contract": {"requiredFields": [], "hardRequirements": {}, "softPreferences": {}},
+      "subjects": [{"key": "target", "entityType": "target_property", "relationship": "target", "suite": ""}],
+      "currentState": {"facts": {"target": {}}, "conversationStates": {"target": "active"}, "followupStates": {"target": "scheduled"}},
+      "expected": {
+        "disposition": "pass",
+        "gapCodes": [],
+        "results": [{
+          "subject": "target", "marketState": "unavailable", "fitState": "nonviable", "completenessState": "not_applicable", "conversationState": "terminal_intent", "approvalClass": "automatic",
+          "reasonCodes": ["broker_confirmed_unavailable", "contact_opted_out"], "missingFields": [], "actionCount": 3,
+          "requiredActions": ["fact_update:automatic", "followup_freeze:automatic", "status_transition:automatic"],
+          "forbiddenActions": ["outbound_draft:automatic", "review_item:human_required"]
+        }]
+      }
+    }
+  ]
+}
