@@ -1,7 +1,7 @@
 # Disabled Effect Adapter Design
 
 **Date:** 2026-07-22
-**Status:** Proposed for review
+**Status:** Approved by Baylor on 2026-07-22
 **Deliverable:** Finding
 **Project:** SiteSiftAI / MOHR Email Automation
 
@@ -162,7 +162,6 @@ Use a closed reason vocabulary:
 - `eligible_human_approved_action`
 - `approval_required`
 - `approval_scope_mismatch`
-- `forbidden_action`
 - `unsupported_action_type`
 - `stale_snapshot`
 - `stale_contract`
@@ -209,6 +208,10 @@ eligibility to only the currently planned policy actions:
 | `review_item` | Human-required; skipped without exact approval, otherwise `would_apply` |
 | All other action types | `blocked` with `unsupported_action_type` |
 
+An action carrying `ApprovalClass.FORBIDDEN` is not a valid plan. The existing
+`validate_action_plan` boundary rejects it before action-level evaluation, so
+every action in that plan receives `blocked:plan_contract_violation`.
+
 `outbound_draft` is always blocked in this phase. If the decision or current
 conversation is terminal, it receives the more specific
 `terminal_outbound_suppressed` reason. This design does not draft or send an
@@ -226,7 +229,7 @@ The evaluator is deterministic and fail closed in this order:
    Any mismatch blocks every action as stale.
 3. Process actions by `(sequence, action_id)` and require every dependency to
    refer to a preceding `would_apply` receipt.
-4. Reject `forbidden` and unsupported action types.
+4. Reject unsupported action types.
 5. Suppress outbound actions under terminal state before checking approval.
 6. Skip any idempotency key already present in committed history.
 7. Compare the exact supplied current state with `expected_prior_state`.
@@ -253,7 +256,7 @@ examples tied to Jill or Baylor:
 7. Human action with exact approval.
 8. Approval for the wrong action.
 9. Approval for the wrong plan or snapshot.
-10. Forbidden action.
+10. Forbidden action rejected as a whole-plan contract violation.
 11. Unsupported notification, row-move, note, LOI, and outbound-draft actions.
 12. Terminal decision with outbound draft.
 13. Follow-up freeze with terminal evidence and matching state.
