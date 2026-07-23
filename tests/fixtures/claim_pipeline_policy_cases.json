@@ -1487,6 +1487,108 @@
         ],
         "effectPolicy": "no_side_effect"
       }
+    },
+    {
+      "caseId": "pure-tour-request",
+      "dimensions": ["conversation_state", "approval_boundary"],
+      "contract": {},
+      "entities": [
+        {"key": "target", "type": "target_property", "relationship": "target"}
+      ],
+      "claims": [
+        {"key": "tour", "subject": "target", "predicate": "tour_request", "value": true, "polarity": "positive", "modality": "requested"}
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {"target": "active"},
+        "followupStates": {"target": "scheduled"}
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "blocked",
+            "conversationState": "review",
+            "approvalClass": "human_required",
+            "reasonCodes": ["market_state_unknown", "tour_requires_approval"],
+            "missingFields": [],
+            "requiredActions": ["review_item:human_required", "status_transition:automatic", "tour_request:human_required"],
+            "forbiddenActions": ["outbound_draft:automatic", "tour_request:automatic"]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "repeated-information-request",
+      "dimensions": ["conversation_state", "approval_boundary", "order_independence"],
+      "contract": {},
+      "entities": [
+        {"key": "target", "type": "target_property", "relationship": "target"}
+      ],
+      "claims": [
+        {"key": "info-1", "subject": "target", "predicate": "information_request", "value": true, "polarity": "positive", "modality": "requested"},
+        {"key": "info-2", "subject": "target", "predicate": "information_request", "value": true, "polarity": "positive", "modality": "requested"}
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {"target": "active"},
+        "followupStates": {"target": "scheduled"}
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "blocked",
+            "conversationState": "review",
+            "approvalClass": "human_required",
+            "reasonCodes": ["information_request_requires_approval", "market_state_unknown"],
+            "missingFields": [],
+            "requiredActions": ["information_request:human_required", "review_item:human_required", "status_transition:automatic"],
+            "forbiddenActions": ["information_request:automatic", "outbound_draft:automatic"]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
+    },
+    {
+      "caseId": "terminal-workflow-requests",
+      "dimensions": ["conversation_state", "approval_boundary"],
+      "contract": {},
+      "entities": [
+        {"key": "target", "type": "target_property", "relationship": "target"}
+      ],
+      "claims": [
+        {"key": "optout", "subject": "target", "predicate": "opt_out", "value": true, "polarity": "positive", "modality": "asserted"},
+        {"key": "tour", "subject": "target", "predicate": "tour_request", "value": true, "polarity": "positive", "modality": "requested"},
+        {"key": "info", "subject": "target", "predicate": "information_request", "value": true, "polarity": "positive", "modality": "requested"}
+      ],
+      "currentState": {
+        "facts": {},
+        "conversationStates": {"target": "active"},
+        "followupStates": {"target": "scheduled"}
+      },
+      "expected": {
+        "results": [
+          {
+            "subject": "target",
+            "marketState": "unknown",
+            "fitState": "review",
+            "completenessState": "not_applicable",
+            "conversationState": "terminal_intent",
+            "approvalClass": "human_required",
+            "reasonCodes": ["contact_opted_out", "information_request_requires_approval", "market_state_unknown", "tour_requires_approval"],
+            "missingFields": [],
+            "requiredActions": ["followup_freeze:automatic", "information_request:human_required", "status_transition:automatic", "tour_request:human_required"],
+            "forbiddenActions": ["outbound_draft:automatic", "review_item:human_required"]
+          }
+        ],
+        "effectPolicy": "no_side_effect"
+      }
     }
   ]
 }

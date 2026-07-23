@@ -434,6 +434,8 @@ def _approval_class(
         entity.relationship == "alternate"
         or _first_claim(claims, ClaimPredicate.REFERRAL)
         or _first_claim(claims, ClaimPredicate.CALL_REQUEST)
+        or _first_claim(claims, ClaimPredicate.TOUR_REQUEST)
+        or _first_claim(claims, ClaimPredicate.INFORMATION_REQUEST)
         or conversation is ConversationState.REVIEW
         or {
             "conflicting_active_claims",
@@ -682,6 +684,42 @@ def _plan_actions(
         )
         sequence += 1
 
+    tour_requests = claims.get(ClaimPredicate.TOUR_REQUEST, ())
+    if tour_requests:
+        actions.append(
+            _make_action(
+                request,
+                decision,
+                action_type=ActionType.TOUR_REQUEST,
+                approval_class=ApprovalClass.HUMAN_REQUIRED,
+                entity=entity,
+                source_claims=tour_requests,
+                sequence=sequence,
+                payload={"notes": "Broker requested a tour."},
+                expected_prior_state={},
+                reason="tour_requires_approval",
+            )
+        )
+        sequence += 1
+
+    information_requests = claims.get(ClaimPredicate.INFORMATION_REQUEST, ())
+    if information_requests:
+        actions.append(
+            _make_action(
+                request,
+                decision,
+                action_type=ActionType.INFORMATION_REQUEST,
+                approval_class=ApprovalClass.HUMAN_REQUIRED,
+                entity=entity,
+                source_claims=information_requests,
+                sequence=sequence,
+                payload={"notes": "Broker requested property information."},
+                expected_prior_state={},
+                reason="information_request_requires_approval",
+            )
+        )
+        sequence += 1
+
     if decision.conversation_state is ConversationState.REVIEW and all_claims:
         actions.append(
             _make_action(
@@ -771,6 +809,10 @@ def evaluate_policy(request: PolicyEvaluationRequest) -> PolicyEvaluationResult:
         approval = _approval_class(entity, entity_claims, reasons, conversation)
         if _first_claim(entity_claims, ClaimPredicate.CALL_REQUEST):
             reasons.append("call_requires_approval")
+        if _first_claim(entity_claims, ClaimPredicate.TOUR_REQUEST):
+            reasons.append("tour_requires_approval")
+        if _first_claim(entity_claims, ClaimPredicate.INFORMATION_REQUEST):
+            reasons.append("information_request_requires_approval")
         if _first_claim(entity_claims, ClaimPredicate.OPT_OUT):
             reasons.append("contact_opted_out")
         if _first_claim(entity_claims, ClaimPredicate.RETURN_DATE):

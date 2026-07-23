@@ -314,6 +314,24 @@ class PolicyDecisionTests(unittest.TestCase):
 
 
 class PolicyActionTests(unittest.TestCase):
+    def test_repeated_information_requests_plan_one_typed_action(self):
+        case = next(
+            item
+            for item in load_policy_fixture_catalog(FIXTURE_PATH).cases
+            if item.case_id == "repeated-information-request"
+        )
+        request, _, _ = _build_case(case)
+
+        actions = evaluate_policy(request).results[0].action_plan.actions
+
+        self.assertEqual(
+            1,
+            sum(
+                action.action_type is ActionType.INFORMATION_REQUEST
+                for action in actions
+            ),
+        )
+
     def test_fixture_action_requirements_and_prohibitions(self):
         catalog = load_policy_fixture_catalog(FIXTURE_PATH)
         for case in catalog.cases:

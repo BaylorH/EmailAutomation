@@ -54,6 +54,8 @@ POLICY_REASON_CODES = frozenset(
         "redirect_requires_approval",
         "alternate_property_requires_approval",
         "call_requires_approval",
+        "tour_requires_approval",
+        "information_request_requires_approval",
         "conflicting_active_claims",
         "unsupported_hard_requirement",
         "market_state_unknown",
