@@ -575,6 +575,26 @@ class EffectAdapterFixtureTests(unittest.TestCase):
                 )
                 self._assert_raw_rejected(raw, "nonstandard JSON constant")
 
+    def test_fixture_indexes_reject_non_ascii_and_oversized_decimal_strings(self):
+        invalid_indexes = (
+            ("non-ascii", "\N{SUPERSCRIPT TWO}"),
+            ("oversized", "1" * 5000),
+        )
+        for label, index in invalid_indexes:
+            with self.subTest(surface="mutation", index=label):
+                payload = self._payload()
+                payload["cases"][0]["mutations"] = [
+                    f"stale_prior_state:{index}"
+                ]
+                self._assert_rejected(payload, "mutation index")
+
+            with self.subTest(surface="receipt", index=label):
+                payload = self._payload()
+                payload["cases"][0]["expectedReceipts"][0][
+                    "action"
+                ] = f"fact_update:{index}"
+                self._assert_rejected(payload, "action sequence")
+
     def test_unknown_action_approval_and_mutation_tokens_are_rejected(self):
         mutations = (
             ("actions", "type", "send_message", "action type"),

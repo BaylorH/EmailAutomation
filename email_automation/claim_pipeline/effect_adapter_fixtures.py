@@ -51,6 +51,7 @@ _ACTION_KEYS = frozenset({"type", "approval", "dependsOn"})
 _ACTION_REQUIRED_KEYS = frozenset({"type", "approval"})
 _RECEIPT_KEYS = frozenset({"action", "status", "reason"})
 _CASE_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+_MAX_FIXTURE_INDEX_DIGITS = 10
 _FIXTURE_ACTION_TYPES = frozenset(
     {
         ActionType.FACT_UPDATE,
@@ -198,6 +199,31 @@ def _enum_token(value: Any, enum_type: type, label: str):
         ) from exc
 
 
+def _parse_fixture_index(
+    value: Any,
+    *,
+    action_count: int,
+    label: str,
+) -> int:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_FIXTURE_INDEX_DIGITS
+        or any(character not in "0123456789" for character in value)
+        or value.startswith("0")
+    ):
+        _fail(f"{label} must be a canonical bounded ASCII decimal")
+    try:
+        index = int(value)
+    except ValueError as exc:
+        raise EffectAdapterFixtureValidationError(
+            f"{label} must be a canonical bounded ASCII decimal"
+        ) from exc
+    if not 1 <= index <= action_count:
+        _fail(f"{label} must reference a planned action")
+    return index
+
+
 def _validate_dependencies(
     value: Any,
     *,
@@ -252,14 +278,13 @@ def _validate_mutation(
     if token in _SIMPLE_MUTATIONS:
         return token
     prefix, separator, raw_index = token.partition(":")
-    if (
-        not separator
-        or prefix not in _INDEXED_MUTATIONS
-        or not raw_index.isdigit()
-        or str(int(raw_index)) != raw_index
-        or not 1 <= int(raw_index) <= action_count
-    ):
+    if not separator or prefix not in _INDEXED_MUTATIONS:
         _fail(f"{label} has invalid mutation token {token!r}")
+    _parse_fixture_index(
+        raw_index,
+        action_count=action_count,
+        label=f"{label} mutation index",
+    )
     return token
 
 
@@ -272,16 +297,14 @@ def _validate_expected_receipt(
     _exact_keys(raw, _RECEIPT_KEYS, label)
     action_signature = _required_text(raw["action"], f"{label} action")
     action_token, separator, sequence_token = action_signature.rpartition(":")
-    if (
-        not separator
-        or not sequence_token.isdigit()
-        or str(int(sequence_token)) != sequence_token
-    ):
+    if not separator:
         _fail(f"{label} action is malformed")
     action_type = _enum_token(action_token, ActionType, f"{label} action type")
-    sequence = int(sequence_token)
-    if not 1 <= sequence <= len(action_types):
-        _fail(f"{label} action sequence is invalid")
+    sequence = _parse_fixture_index(
+        sequence_token,
+        action_count=len(action_types),
+        label=f"{label} action sequence",
+    )
     if action_types[sequence - 1] is not action_type:
         _fail(f"{label} action does not match the planned action")
 
@@ -382,9 +405,15 @@ def _validate_case(raw: Any, index: int) -> EffectAdapterFixtureCase:
     signatures = tuple(receipt["action"] for receipt in expected_receipts)
     if len(signatures) != len(set(signatures)):
         _fail(f"case {case_id} expectedReceipts contains duplicate actions")
-    if tuple(int(signature.rpartition(":")[2]) for signature in signatures) != tuple(
-        range(1, action_count + 1)
-    ):
+    receipt_sequences = tuple(
+        _parse_fixture_index(
+            signature.rpartition(":")[2],
+            action_count=action_count,
+            label=f"case {case_id} expected receipt action sequence",
+        )
+        for signature in signatures
+    )
+    if receipt_sequences != tuple(range(1, action_count + 1)):
         _fail(f"case {case_id} expectedReceipts must be in action sequence order")
 
     return EffectAdapterFixtureCase(
@@ -784,7 +813,16 @@ def _build_effect_adapter_request(
 
     for mutation in case.mutations:
         prefix, _, raw_index = mutation.partition(":")
-        index = int(raw_index) - 1 if raw_index else None
+        index = (
+            _parse_fixture_index(
+                raw_index,
+                action_count=len(request.plan.actions),
+                label=f"case {case.case_id} mutation index",
+            )
+            - 1
+            if raw_index
+            else None
+        )
         if prefix == "stale_prior_state":
             states = list(request.current_states)
             states[index] = ActionStateSnapshot.create(
