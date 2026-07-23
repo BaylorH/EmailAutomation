@@ -51,6 +51,19 @@ _ACTION_KEYS = frozenset({"type", "approval", "dependsOn"})
 _ACTION_REQUIRED_KEYS = frozenset({"type", "approval"})
 _RECEIPT_KEYS = frozenset({"action", "status", "reason"})
 _CASE_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+_FIXTURE_ACTION_TYPES = frozenset(
+    {
+        ActionType.FACT_UPDATE,
+        ActionType.STATUS_TRANSITION,
+        ActionType.FOLLOWUP_FREEZE,
+        ActionType.INFORMATION_REQUEST,
+        ActionType.NOTE_APPEND,
+        ActionType.ROW_MOVE,
+        ActionType.NOTIFICATION,
+        ActionType.LOI_REQUEST,
+        ActionType.OUTBOUND_DRAFT,
+    }
+)
 _SIMPLE_MUTATIONS = frozenset(
     {
         "stale_snapshot",
@@ -294,6 +307,11 @@ def _validate_case(raw: Any, index: int) -> EffectAdapterFixtureCase:
             ActionType,
             f"{action_label} action type",
         )
+        if action_type not in _FIXTURE_ACTION_TYPES:
+            _fail(
+                f"{action_label} fixture action type {action_type.value!r} "
+                "is not supported"
+            )
         approval = _enum_token(
             raw_action["approval"],
             ApprovalClass,

@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError, is_dataclass
 from pathlib import Path
 from unittest.mock import patch
 
+from email_automation.claim_pipeline.contracts import ActionType
 from email_automation.claim_pipeline.effect_adapter import (
     DryRunReason,
     DryRunStatus,
@@ -430,6 +431,37 @@ class EffectAdapterFixtureTests(unittest.TestCase):
         payload = self._payload()
         payload["cases"][0]["mutations"] = ["connect_service"]
         self._assert_rejected(payload, "mutation")
+
+    def test_valid_production_actions_outside_fixture_vocabulary_are_rejected(self):
+        fixture_action_types = {
+            action[0]
+            for _, actions, _, _ in REQUIRED_CASE_DEFINITIONS
+            for action in actions
+        }
+        excluded = tuple(
+            action_type
+            for action_type in ActionType
+            if action_type.value not in fixture_action_types
+        )
+        self.assertEqual(
+            {
+                ActionType.ALTERNATE_PROPERTY_PROPOSAL,
+                ActionType.CALL_REQUEST,
+                ActionType.RECIPIENT_CHANGE,
+                ActionType.REVIEW_ITEM,
+                ActionType.TOUR_REQUEST,
+            },
+            set(excluded),
+        )
+
+        for action_type in excluded:
+            with self.subTest(action_type=action_type.value):
+                payload = self._payload()
+                payload["cases"][0]["actions"][0]["type"] = action_type.value
+                payload["cases"][0]["expectedReceipts"][0][
+                    "action"
+                ] = f"{action_type.value}:1"
+                self._assert_rejected(payload, "fixture action type")
 
     def test_invalid_dependencies_are_rejected(self):
         invalid_values = ([0], [2], [3], ["1"], [1, 1])
