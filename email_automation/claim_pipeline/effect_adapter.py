@@ -40,6 +40,34 @@ class DryRunReason(str, Enum):
     PLAN_CONTRACT_VIOLATION = "plan_contract_violation"
 
 
+_VALID_REASONS_BY_STATUS = MappingProxyType({
+    DryRunStatus.WOULD_APPLY: frozenset(
+        {
+            DryRunReason.ELIGIBLE_AUTOMATIC_ACTION,
+            DryRunReason.ELIGIBLE_HUMAN_APPROVED_ACTION,
+        }
+    ),
+    DryRunStatus.SKIPPED: frozenset(
+        {
+            DryRunReason.APPROVAL_REQUIRED,
+            DryRunReason.IDEMPOTENCY_KEY_ALREADY_COMMITTED,
+        }
+    ),
+    DryRunStatus.BLOCKED: frozenset(
+        {
+            DryRunReason.APPROVAL_SCOPE_MISMATCH,
+            DryRunReason.UNSUPPORTED_ACTION_TYPE,
+            DryRunReason.STALE_SNAPSHOT,
+            DryRunReason.STALE_CONTRACT,
+            DryRunReason.PRIOR_STATE_MISMATCH,
+            DryRunReason.DEPENDENCY_BLOCKED,
+            DryRunReason.TERMINAL_OUTBOUND_SUPPRESSED,
+            DryRunReason.PLAN_CONTRACT_VIOLATION,
+        }
+    ),
+})
+
+
 def _freeze_json(value: Any) -> Any:
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
@@ -83,6 +111,12 @@ def _stable_id(prefix: str, payload: Mapping[str, Any]) -> str:
 def _require_text(label: str, value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be non-empty text")
+    return value
+
+
+def _require_positive_int(label: str, value: Any) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
     return value
 
 
@@ -215,8 +249,10 @@ class EffectAdapterRequest(_JsonContract):
             raise TypeError("effect adapter scope must be an ExecutionScope")
         _require_text("current_snapshot_hash", self.current_snapshot_hash)
         _require_text("current_contract_id", self.current_contract_id)
-        if self.current_contract_version < 1:
-            raise ValueError("current_contract_version must be at least 1")
+        _require_positive_int(
+            "current_contract_version",
+            self.current_contract_version,
+        )
 
         object.__setattr__(self, "entities", tuple(self.entities))
         object.__setattr__(self, "claims", tuple(self.claims))
@@ -321,12 +357,13 @@ class DryRunEffectReceipt(_JsonContract):
             "action_type",
         ):
             _require_text(f"dry-run effect {label}", getattr(self, label))
-        if self.sequence < 1:
-            raise ValueError("dry-run effect sequence must be at least 1")
+        _require_positive_int("dry-run effect sequence", self.sequence)
         if not isinstance(self.status, DryRunStatus):
             raise TypeError("dry-run effect status must be a DryRunStatus")
         if not isinstance(self.reason, DryRunReason):
             raise TypeError("dry-run effect reason must be a DryRunReason")
+        if self.reason not in _VALID_REASONS_BY_STATUS[self.status]:
+            raise ValueError("dry-run effect status/reason combination is invalid")
         object.__setattr__(
             self,
             "dependency_receipt_ids",
@@ -398,11 +435,19 @@ class DryRunCommitReceipt(_JsonContract):
             "snapshot_hash",
         ):
             _require_text(f"dry-run commit {label}", getattr(self, label))
-        if self.contract_version < 1:
-            raise ValueError("dry-run commit contract_version must be at least 1")
+        _require_positive_int(
+            "dry-run commit contract_version",
+            self.contract_version,
+        )
         object.__setattr__(self, "effects", tuple(self.effects))
         if not all(isinstance(effect, DryRunEffectReceipt) for effect in self.effects):
             raise TypeError("dry-run commit effects must be DryRunEffectReceipt values")
+        if any(effect.plan_id != self.plan_id for effect in self.effects):
+            raise ValueError("effect plan_id must match commit plan_id")
+        for field_name in ("receipt_id", "action_id", "idempotency_key", "sequence"):
+            values = tuple(getattr(effect, field_name) for effect in self.effects)
+            if len(set(values)) != len(values):
+                raise ValueError(f"duplicate effect {field_name}")
         expected_receipt_id = _stable_id("dry_commit", self._identity())
         if self.receipt_id != expected_receipt_id:
             raise ValueError("commit receipt identity does not match its fields")
