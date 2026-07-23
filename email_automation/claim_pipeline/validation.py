@@ -29,6 +29,7 @@ APPROVAL_GATED_ACTION_TYPES = frozenset(
         ActionType.RECIPIENT_CHANGE,
         ActionType.ALTERNATE_PROPERTY_PROPOSAL,
         ActionType.TOUR_REQUEST,
+        ActionType.INFORMATION_REQUEST,
         ActionType.CALL_REQUEST,
         ActionType.LOI_REQUEST,
     }
@@ -56,6 +57,7 @@ ACTION_PAYLOAD_KEYS = {
     ActionType.REVIEW_ITEM: frozenset({"summary", "details"}),
     ActionType.RECIPIENT_CHANGE: frozenset({"reason"}),
     ActionType.TOUR_REQUEST: frozenset({"notes", "requested_times"}),
+    ActionType.INFORMATION_REQUEST: frozenset({"notes"}),
     ActionType.CALL_REQUEST: frozenset({"notes", "phone"}),
     ActionType.LOI_REQUEST: frozenset({"notes", "terms"}),
     ActionType.OUTBOUND_DRAFT: frozenset({"subject", "body", "html"}),
@@ -84,6 +86,9 @@ ACTION_SUPPORT_PREDICATES = {
     ActionType.RECIPIENT_CHANGE: frozenset({ClaimPredicate.REFERRAL}),
     ActionType.ALTERNATE_PROPERTY_PROPOSAL: frozenset({ClaimPredicate.IDENTITY}),
     ActionType.TOUR_REQUEST: frozenset({ClaimPredicate.TOUR_REQUEST}),
+    ActionType.INFORMATION_REQUEST: frozenset(
+        {ClaimPredicate.INFORMATION_REQUEST}
+    ),
     ActionType.CALL_REQUEST: frozenset({ClaimPredicate.CALL_REQUEST}),
 }
 

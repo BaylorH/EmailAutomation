@@ -138,6 +138,7 @@ class ActionType(str, Enum):
     REVIEW_ITEM = "review_item"
     RECIPIENT_CHANGE = "recipient_change"
     TOUR_REQUEST = "tour_request"
+    INFORMATION_REQUEST = "information_request"
     CALL_REQUEST = "call_request"
     LOI_REQUEST = "loi_request"
     OUTBOUND_DRAFT = "outbound_draft"

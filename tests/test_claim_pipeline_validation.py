@@ -140,6 +140,7 @@ def _action(
         ActionType.ALTERNATE_PROPERTY_PROPOSAL: ClaimPredicate.IDENTITY,
         ActionType.FOLLOWUP_FREEZE: ClaimPredicate.OPT_OUT,
         ActionType.TOUR_REQUEST: ClaimPredicate.TOUR_REQUEST,
+        ActionType.INFORMATION_REQUEST: ClaimPredicate.INFORMATION_REQUEST,
         ActionType.CALL_REQUEST: ClaimPredicate.CALL_REQUEST,
     }.get(action_type, ClaimPredicate.AVAILABILITY)
     source_claim_ids = source_claim_ids or (
@@ -156,6 +157,7 @@ def _action(
         ActionType.REVIEW_ITEM: {"summary": "review needed"},
         ActionType.RECIPIENT_CHANGE: {"reason": "broker referral"},
         ActionType.TOUR_REQUEST: {"notes": "tour requested"},
+        ActionType.INFORMATION_REQUEST: {"notes": "information requested"},
         ActionType.CALL_REQUEST: {"notes": "call requested"},
         ActionType.LOI_REQUEST: {"notes": "LOI requested"},
         ActionType.OUTBOUND_DRAFT: {"subject": "Re: property", "body": "Thanks"},
@@ -210,6 +212,70 @@ def _scope(decision):
 
 
 class ClaimPipelineValidationTests(unittest.TestCase):
+    def test_action_contract_includes_information_request(self):
+        self.assertIn(
+            "information_request",
+            {action_type.value for action_type in ActionType},
+        )
+
+    def test_workflow_request_actions_require_human_approval(self):
+        entity = _entity()
+        decision = _decision(entity, _contract())
+        for action_type, predicate in (
+            (ActionType.TOUR_REQUEST, ClaimPredicate.TOUR_REQUEST),
+            (ActionType.INFORMATION_REQUEST, ClaimPredicate.INFORMATION_REQUEST),
+        ):
+            with self.subTest(action_type=action_type.value):
+                source = _source_claim(entity, predicate)
+                action = _action(
+                    decision,
+                    action_type,
+                    ApprovalClass.AUTOMATIC,
+                    source_claim_ids=(source.claim_id,),
+                )
+
+                with self.assertRaisesRegex(
+                    ContractViolation,
+                    "requires human approval",
+                ):
+                    validate_action_plan(
+                        _plan(decision, (action,)),
+                        decision,
+                        scope=_scope(decision),
+                        entities=(entity,),
+                        claims=(source,),
+                        authorized_recipients=(),
+                    )
+
+    def test_workflow_request_actions_require_matching_claim_support(self):
+        entity = _entity()
+        decision = _decision(entity, _contract())
+        unrelated = _source_claim(entity, ClaimPredicate.AVAILABILITY)
+        for action_type in (
+            ActionType.TOUR_REQUEST,
+            ActionType.INFORMATION_REQUEST,
+        ):
+            with self.subTest(action_type=action_type.value):
+                action = _action(
+                    decision,
+                    action_type,
+                    ApprovalClass.HUMAN_REQUIRED,
+                    source_claim_ids=(unrelated.claim_id,),
+                )
+
+                with self.assertRaisesRegex(
+                    ContractViolation,
+                    "do not support the action",
+                ):
+                    validate_action_plan(
+                        _plan(decision, (action,)),
+                        decision,
+                        scope=_scope(decision),
+                        entities=(entity,),
+                        claims=(unrelated,),
+                        authorized_recipients=(),
+                    )
+
     def test_terminal_decision_allows_supported_followup_freeze(self):
         entity = _entity()
         contract = _contract()
