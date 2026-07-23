@@ -1,4 +1,5 @@
 import ast
+import builtins
 import json
 import re
 import subprocess
@@ -93,6 +94,21 @@ DYNAMIC_IMPORT_SYMBOLS = {
     "builtins.__import__": "__import__",
     "importlib.import_module": "importlib.import_module",
 }
+SCHEMA_DECLARATION_TOKENS = frozenset(
+    {"field", "fields", "key", "keys", "schema"}
+)
+BUILTIN_CALLABLE_NAMES = frozenset(
+    name
+    for name in dir(builtins)
+    if callable(getattr(builtins, name))
+)
+ALLOWED_EFFECT_PACKAGE_EXPORTS = EXPECTED_EFFECT_ADAPTER_API | {
+    "EffectReceipt",
+    "EffectStatus",
+    "LegacyShadowReport",
+    "ProviderPolicyShadowReport",
+    "ReplayReport",
+}
 
 
 def _resolved_import_names(node):
@@ -151,6 +167,7 @@ def _boundary_surface_tokens(name):
 
 def _import_bindings(tree):
     bindings = {}
+    simple_assignments = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -169,6 +186,27 @@ def _import_bindings(tree):
                     node.names, _resolved_import_names(node), strict=True
                 ):
                     bindings[alias.asname or alias.name] = resolved
+        elif isinstance(node, ast.Assign):
+            simple_assignments.extend(
+                (target.id, node.value)
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign) and isinstance(
+            node.target, ast.Name
+        ):
+            simple_assignments.append((node.target.id, node.value))
+
+    for _ in range(len(simple_assignments)):
+        changed = False
+        for bound_name, value in simple_assignments:
+            resolved = _resolved_symbol(value, bindings)
+            if resolved is None or bindings.get(bound_name) == resolved:
+                continue
+            bindings[bound_name] = resolved
+            changed = True
+        if not changed:
+            break
     return bindings
 
 
@@ -179,6 +217,16 @@ def _resolved_symbol(node, bindings):
         owner = _resolved_symbol(node.value, bindings)
         if owner is not None:
             return f"{owner}.{node.attr}"
+    if (
+        isinstance(node, ast.Call)
+        and _resolved_symbol(node.func, bindings) in {"getattr", "builtins.getattr"}
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+        and isinstance(node.args[1].value, str)
+    ):
+        owner = _resolved_symbol(node.args[0], bindings)
+        if owner in {"__builtins__", "builtins"}:
+            return f"builtins.{node.args[1].value}"
     return None
 
 
@@ -206,6 +254,50 @@ def _contains_function_surface(node, bindings):
     )
 
 
+def _is_callable_reference(node, bindings, declared_callables):
+    resolved = _resolved_symbol(node, bindings)
+    if resolved in declared_callables or resolved in BUILTIN_CALLABLE_NAMES:
+        return True
+    return (
+        resolved is not None
+        and resolved.startswith("builtins.")
+        and resolved.rsplit(".", 1)[-1] in BUILTIN_CALLABLE_NAMES
+    )
+
+
+def _function_defaults(node):
+    positional = [*node.args.posonlyargs, *node.args.args]
+    if node.args.defaults:
+        for argument, default in zip(
+            positional[-len(node.args.defaults):],
+            node.args.defaults,
+            strict=True,
+        ):
+            yield argument, default
+    for argument, default in zip(
+        node.args.kwonlyargs,
+        node.args.kw_defaults,
+        strict=True,
+    ):
+        if default is not None:
+            yield argument, default
+
+
+def _dataclass_default_expressions(value, bindings):
+    if value is None:
+        return ()
+    if (
+        isinstance(value, ast.Call)
+        and _resolved_symbol(value.func, bindings) == "dataclasses.field"
+    ):
+        return tuple(
+            keyword.value
+            for keyword in value.keywords
+            if keyword.arg in {"default", "default_factory"}
+        )
+    return (value,)
+
+
 def _is_dataclass(class_node, bindings):
     return any(
         _resolved_symbol(
@@ -220,18 +312,28 @@ def _is_dataclass(class_node, bindings):
 def _schema_key_strings(tree):
     keys = set()
     for node in tree.body:
-        if not isinstance(node, ast.Assign):
+        if isinstance(node, ast.Assign):
+            targets = {
+                target.id
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            }
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(
+            node.target, ast.Name
+        ):
+            targets = {node.target.id}
+            value = node.value
+        else:
             continue
-        targets = {
-            target.id
-            for target in node.targets
-            if isinstance(target, ast.Name)
-        }
-        if not any(target.endswith("_KEYS") for target in targets):
+        if value is None or not any(
+            _identifier_tokens(target) & SCHEMA_DECLARATION_TOKENS
+            for target in targets
+        ):
             continue
         keys.update(
             child.value
-            for child in ast.walk(node.value)
+            for child in ast.walk(value)
             if isinstance(child, ast.Constant)
             and isinstance(child.value, str)
         )
@@ -240,6 +342,11 @@ def _schema_key_strings(tree):
 
 def _effect_boundary_violations(tree):
     bindings = _import_bindings(tree)
+    declared_callables = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
     violations = set()
 
     for imported in _import_violations(tree):
@@ -253,11 +360,12 @@ def _effect_boundary_violations(tree):
             if function_token is not None:
                 violations.add(f"identifier:{function_token}")
         if isinstance(node, ast.Call):
-            dynamic_import = DYNAMIC_IMPORT_SYMBOLS.get(
-                _resolved_symbol(node.func, bindings)
-            )
-            if dynamic_import is not None:
-                violations.add(f"dynamic-import:{dynamic_import}")
+            for candidate in (node.func, node):
+                dynamic_import = DYNAMIC_IMPORT_SYMBOLS.get(
+                    _resolved_symbol(candidate, bindings)
+                )
+                if dynamic_import is not None:
+                    violations.add(f"dynamic-import:{dynamic_import}")
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             forbidden = _boundary_surface_tokens(node.name)
             violations.update(f"function:{token}" for token in forbidden)
@@ -273,6 +381,13 @@ def _effect_boundary_violations(tree):
             for argument in arguments:
                 forbidden = _boundary_surface_tokens(argument.arg)
                 violations.update(f"argument:{token}" for token in forbidden)
+            for argument, default in _function_defaults(node):
+                if _is_callable_reference(
+                    default, bindings, declared_callables
+                ):
+                    violations.add(
+                        f"function-valued-default:{argument.arg}"
+                    )
         elif isinstance(node, ast.ClassDef):
             forbidden = _boundary_surface_tokens(node.name)
             violations.update(f"class:{token}" for token in forbidden)
@@ -289,6 +404,15 @@ def _effect_boundary_violations(tree):
                     field.annotation, bindings
                 ) or _contains_function_surface(field.value, bindings):
                     violations.add(f"function-valued-field:{field.target.id}")
+                if any(
+                    _is_callable_reference(
+                        default, bindings, declared_callables
+                    )
+                    for default in _dataclass_default_expressions(
+                        field.value, bindings
+                    )
+                ):
+                    violations.add(f"function-valued-field:{field.target.id}")
 
     for key in _schema_key_strings(tree):
         forbidden = _identifier_tokens(key) & FORBIDDEN_EFFECT_BOUNDARY_TOKENS
@@ -297,23 +421,87 @@ def _effect_boundary_violations(tree):
     return violations
 
 
+def _assigns_all(node):
+    return isinstance(node, ast.Assign) and any(
+        isinstance(target, ast.Name) and target.id == "__all__"
+        for target in node.targets
+    )
+
+
 def _literal_all_names(tree):
+    assignments = [
+        node
+        for node in tree.body
+        if _assigns_all(node)
+    ]
+    if len(assignments) != 1:
+        return set(), False
+    assignment = assignments[0]
+    if not isinstance(assignment.value, (ast.List, ast.Tuple)):
+        return set(), False
+    if not all(
+        isinstance(item, ast.Constant) and isinstance(item.value, str)
+        for item in assignment.value.elts
+    ):
+        return set(), False
+    values = tuple(item.value for item in assignment.value.elts)
+    if len(values) != len(set(values)):
+        return set(values), False
     for node in tree.body:
-        if not isinstance(node, ast.Assign):
+        if node is assignment:
             continue
-        if not any(
-            isinstance(target, ast.Name) and target.id == "__all__"
-            for target in node.targets
+        if any(
+            isinstance(child, ast.Name) and child.id == "__all__"
+            for child in ast.walk(node)
         ):
-            continue
-        if not isinstance(node.value, (ast.List, ast.Set, ast.Tuple)):
-            return set()
-        return {
-            item.value
-            for item in node.value.elts
-            if isinstance(item, ast.Constant) and isinstance(item.value, str)
-        }
+            return set(values), False
+    return set(values), True
+
+
+def _target_names(target):
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.List, ast.Tuple)):
+        names = set()
+        for item in target.elts:
+            names.update(_target_names(item))
+        return names
     return set()
+
+
+def _package_public_bindings(tree):
+    bindings = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bindings.add(node.name)
+        elif isinstance(node, ast.Import):
+            bindings.update(
+                alias.asname or alias.name.split(".", 1)[0]
+                for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom):
+            bindings.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name != "*"
+            )
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                bindings.update(_target_names(target))
+        elif isinstance(node, ast.AnnAssign):
+            bindings.update(_target_names(node.target))
+    return {
+        name
+        for name in bindings
+        if name != "__all__" and not name.startswith("_")
+    }
+
+
+def _is_unexpected_effect_export(name):
+    if name in ALLOWED_EFFECT_PACKAGE_EXPORTS:
+        return False
+    tokens = _identifier_tokens(name)
+    return bool(tokens & {"effect", "helper", "report"})
 
 
 def _effect_adapter_package_imports(tree):
@@ -338,7 +526,8 @@ def _effect_adapter_api_violations(tree):
         for source_name, bound_name in imports
         if not bound_name.startswith("_")
     }
-    exported_names = _literal_all_names(tree)
+    exported_names, literal_exports = _literal_all_names(tree)
+    package_bindings = _package_public_bindings(tree)
     violations = {
         f"private-source:{source_name}->{bound_name}"
         for source_name, bound_name in imports
@@ -352,9 +541,25 @@ def _effect_adapter_api_violations(tree):
         f"unexpected-bound:{name}"
         for name in bound_public_names - EXPECTED_EFFECT_ADAPTER_API
     )
+    if not literal_exports:
+        violations.add("dynamic-package-exports")
+        return violations
     violations.update(
         f"missing-export:{name}"
         for name in EXPECTED_EFFECT_ADAPTER_API - exported_names
+    )
+    violations.update(
+        f"package-export-without-binding:{name}"
+        for name in exported_names - package_bindings
+    )
+    violations.update(
+        f"package-binding-without-export:{name}"
+        for name in package_bindings - exported_names
+    )
+    violations.update(
+        f"unexpected-effect-export:{name}"
+        for name in exported_names
+        if _is_unexpected_effect_export(name)
     )
     return violations
 
@@ -482,6 +687,93 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
         self.assertIn("function-valued-field:runner", violations)
         self.assertIn("function-valued-field:sender", violations)
 
+    def test_effect_adapter_boundary_scanner_resolves_chained_dataclass_aliases(
+        self,
+    ):
+        tree = ast.parse(
+            "from dataclasses import dataclass\n"
+            "from typing import Callable as Fn\n"
+            "record = dataclass\n"
+            "@record\n"
+            "class Request:\n"
+            "    worker: Fn\n"
+        )
+
+        self.assertIn(
+            "function-valued-field:worker",
+            _effect_boundary_violations(tree),
+        )
+
+    def test_effect_adapter_boundary_scanner_rejects_schema_declaration_bypasses(
+        self,
+    ):
+        cases = {
+            "annotated keys": (
+                "_ROOT_KEYS: frozenset[str] = frozenset({'callback'})\n"
+            ),
+            "schema declaration": "SCHEMA = frozenset({'callback'})\n",
+            "field declaration": (
+                "MESSAGE_FIELDS = frozenset({'callback'})\n"
+            ),
+        }
+
+        for label, source in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(
+                    "schema-key:callback",
+                    _effect_boundary_violations(ast.parse(source)),
+                )
+
+        ordinary_constants = ast.parse(
+            "DESCRIPTION = 'callback service prose'\n"
+            "STATUS_VALUES = frozenset({'callback'})\n"
+        )
+        self.assertNotIn(
+            "schema-key:callback",
+            _effect_boundary_violations(ordinary_constants),
+        )
+
+    def test_effect_adapter_boundary_scanner_rejects_named_callable_defaults(
+        self,
+    ):
+        cases = {
+            "local function default": (
+                "def helper():\n"
+                "    pass\n"
+                "def execute(value=helper):\n"
+                "    pass\n",
+                "function-valued-default:value",
+            ),
+            "builtin function default": (
+                "def execute(ordering=sorted):\n"
+                "    pass\n",
+                "function-valued-default:ordering",
+            ),
+            "dataclass local default": (
+                "from dataclasses import dataclass, field\n"
+                "def helper():\n"
+                "    pass\n"
+                "@dataclass\n"
+                "class Request:\n"
+                "    worker: object = field(default=helper)\n",
+                "function-valued-field:worker",
+            ),
+            "dataclass builtin default factory": (
+                "from dataclasses import dataclass, field\n"
+                "@dataclass\n"
+                "class Request:\n"
+                "    ordering: object = field(default_factory=sorted)\n",
+                "function-valued-field:ordering",
+            ),
+        }
+
+        for label, (source, expected) in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(
+                    expected,
+                    _effect_boundary_violations(ast.parse(source)),
+                )
+
     def test_effect_adapter_boundary_scanner_checks_every_parameter_kind(self):
         tree = ast.parse(
             "def configure(service, /, client, *graph, transport, **repository):\n"
@@ -522,6 +814,22 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 "loaded = load('email_automation.processing')\n",
                 "dynamic-import:importlib.import_module",
             ),
+            "rebound builtin": (
+                "load = __import__\n"
+                "loaded = load('email_automation.messaging')\n",
+                "dynamic-import:__import__",
+            ),
+            "rebound imported function": (
+                "from importlib import import_module\n"
+                "load = import_module\n"
+                "loaded = load('email_automation.messaging')\n",
+                "dynamic-import:importlib.import_module",
+            ),
+            "getattr builtin": (
+                "load = getattr(__builtins__, '__import__')\n"
+                "loaded = load('email_automation.messaging')\n",
+                "dynamic-import:__import__",
+            ),
         }
 
         for label, (source, expected) in cases.items():
@@ -546,12 +854,30 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
     def test_package_import_loads_only_claim_pipeline_modules(self):
         script = (
             "import json, sys\n"
+            "attempts = []\n"
+            "class ImportAttemptSentinel:\n"
+            "    def find_spec(self, fullname, path=None, target=None):\n"
+            "        if (fullname.startswith('email_automation.') "
+            "and fullname != 'email_automation.claim_pipeline' "
+            "and not fullname.startswith('email_automation.claim_pipeline.')):\n"
+            "            attempts.append(fullname)\n"
+            "        return None\n"
+            "sentinel = ImportAttemptSentinel()\n"
+            "sys.meta_path.insert(0, sentinel)\n"
             "from email_automation import claim_pipeline\n"
+            "package_attempts = list(attempts)\n"
+            "probe = 'email_automation._claim_pipeline_isolation_probe'\n"
+            "try:\n"
+            "    __import__(probe)\n"
+            "except ImportError:\n"
+            "    pass\n"
+            "sys.modules.pop(probe, None)\n"
             "loaded = sorted(name for name in sys.modules "
             "if name.startswith('email_automation.') "
             "and name != 'email_automation.claim_pipeline' "
             "and not name.startswith('email_automation.claim_pipeline.'))\n"
-            "print(json.dumps(loaded))\n"
+            "print(json.dumps({'attempts': package_attempts, "
+            "'loaded': loaded, 'probeSeen': probe in attempts}))\n"
         )
         completed = subprocess.run(
             [sys.executable, "-c", script],
@@ -560,7 +886,10 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             text=True,
         )
 
-        self.assertEqual([], json.loads(completed.stdout))
+        result = json.loads(completed.stdout)
+        self.assertEqual([], result["attempts"])
+        self.assertEqual([], result["loaded"])
+        self.assertTrue(result["probeSeen"])
 
     def test_effect_adapter_api_is_exposed_at_package_boundary(self):
         initializer_path = PACKAGE_ROOT / "__init__.py"
@@ -617,6 +946,170 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 self.assertIn(
                     expected,
                     _effect_adapter_api_violations(ast.parse(source)),
+                )
+
+    def test_effect_adapter_api_lock_rejects_invented_and_dynamic_exports(self):
+        initializer_path = PACKAGE_ROOT / "__init__.py"
+        initializer_source = initializer_path.read_text(encoding="utf-8")
+
+        unbound_export_tree = ast.parse(initializer_source)
+        unbound_all = next(
+            node
+            for node in unbound_export_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets
+            )
+        )
+        unbound_all.value.elts.append(ast.Constant("build_effect_report"))
+
+        bound_export_tree = ast.parse(initializer_source)
+        bound_all = next(
+            node
+            for node in bound_export_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets
+            )
+        )
+        bound_all.value.elts.append(ast.Constant("build_effect_report"))
+        bound_export_tree.body.append(
+            ast.Assign(
+                targets=[ast.Name(id="build_effect_report", ctx=ast.Store())],
+                value=ast.Constant(None),
+            )
+        )
+
+        orphan_binding_tree = ast.parse(initializer_source)
+        orphan_binding_tree.body.append(
+            ast.Assign(
+                targets=[ast.Name(id="build_report", ctx=ast.Store())],
+                value=ast.Constant(None),
+            )
+        )
+
+        foreign_report_tree = ast.parse(initializer_source)
+        foreign_report_all = next(
+            node
+            for node in foreign_report_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets
+            )
+        )
+        foreign_report_all.value.elts.append(
+            ast.Constant("UnexpectedReport")
+        )
+        foreign_report_tree.body.extend(
+            ast.parse(
+                "from .contracts import UnexpectedReport\n"
+            ).body
+        )
+
+        local_helper_tree = ast.parse(initializer_source)
+        local_helper_all = next(
+            node
+            for node in local_helper_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets
+            )
+        )
+        local_helper_all.value.elts.append(
+            ast.Constant("build_helper")
+        )
+        local_helper_tree.body.extend(
+            ast.parse(
+                "def build_helper():\n"
+                "    pass\n"
+            ).body
+        )
+
+        starred_tree = ast.parse(initializer_source)
+        starred_all = next(
+            node
+            for node in starred_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets
+            )
+        )
+        starred_all.value = ast.List(
+            elts=[
+                ast.Starred(
+                    value=ast.Name(id="__all__", ctx=ast.Load()),
+                    ctx=ast.Load(),
+                ),
+                ast.Constant("build_effect_report"),
+            ],
+            ctx=ast.Load(),
+        )
+
+        append_tree = ast.parse(initializer_source)
+        append_tree.body.append(
+            ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id="__all__", ctx=ast.Load()),
+                        attr="append",
+                        ctx=ast.Load(),
+                    ),
+                    args=[ast.Constant("build_effect_report")],
+                    keywords=[],
+                )
+            )
+        )
+
+        nonliteral_tree = ast.parse(initializer_source)
+        nonliteral_all = next(
+            node
+            for node in nonliteral_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets
+            )
+        )
+        nonliteral_all.value = ast.Name(id="exports", ctx=ast.Load())
+
+        cases = {
+            "unbound export": (
+                unbound_export_tree,
+                "package-export-without-binding:build_effect_report",
+            ),
+            "bound invented export": (
+                bound_export_tree,
+                "unexpected-effect-export:build_effect_report",
+            ),
+            "binding without export": (
+                orphan_binding_tree,
+                "package-binding-without-export:build_report",
+            ),
+            "foreign report export": (
+                foreign_report_tree,
+                "unexpected-effect-export:UnexpectedReport",
+            ),
+            "local helper export": (
+                local_helper_tree,
+                "unexpected-effect-export:build_helper",
+            ),
+            "starred reassignment": (starred_tree, "dynamic-package-exports"),
+            "append mutation": (append_tree, "dynamic-package-exports"),
+            "nonliteral assignment": (
+                nonliteral_tree,
+                "dynamic-package-exports",
+            ),
+        }
+        for label, (tree, expected) in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(
+                    expected,
+                    _effect_adapter_api_violations(tree),
                 )
 
     def test_interpretation_api_is_exposed_at_package_boundary(self):
