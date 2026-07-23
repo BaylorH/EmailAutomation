@@ -87,7 +87,7 @@
         "disposition": "expected_gap",
         "gapCodes": ["information_request_action_missing", "tour_request_action_missing"],
         "results": [{
-          "subject": "target", "marketState": "unknown", "fitState": "review", "completenessState": "blocked", "conversationState": "terminal_intent", "approvalClass": "human_required",
+          "subject": "target", "marketState": "unknown", "fitState": "review", "completenessState": "not_applicable", "conversationState": "terminal_intent", "approvalClass": "human_required",
           "reasonCodes": ["broker_return_date", "call_requires_approval", "contact_opted_out", "market_state_unknown", "tentative_remediation_requires_review"], "missingFields": [], "actionCount": 4,
           "requiredActions": ["call_request:human_required", "followup_freeze:automatic", "recipient_change:human_required", "status_transition:automatic"],
           "forbiddenActions": ["outbound_draft:automatic", "recipient_change:automatic", "tour_request:automatic"]
