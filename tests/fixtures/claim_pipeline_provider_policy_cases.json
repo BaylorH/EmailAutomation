@@ -84,12 +84,12 @@
       "subjects": [{"key": "target", "entityType": "target_property", "relationship": "target", "suite": ""}],
       "currentState": {"facts": {"target": {}}, "conversationStates": {"target": "active"}, "followupStates": {"target": "scheduled"}},
       "expected": {
-        "disposition": "expected_gap",
-        "gapCodes": ["information_request_action_missing", "tour_request_action_missing"],
+        "disposition": "pass",
+        "gapCodes": [],
         "results": [{
           "subject": "target", "marketState": "unknown", "fitState": "review", "completenessState": "not_applicable", "conversationState": "terminal_intent", "approvalClass": "human_required",
-          "reasonCodes": ["broker_return_date", "call_requires_approval", "contact_opted_out", "market_state_unknown", "tentative_remediation_requires_review"], "missingFields": [], "actionCount": 4,
-          "requiredActions": ["call_request:human_required", "followup_freeze:automatic", "recipient_change:human_required", "status_transition:automatic"],
+          "reasonCodes": ["broker_return_date", "call_requires_approval", "contact_opted_out", "information_request_requires_approval", "market_state_unknown", "tentative_remediation_requires_review", "tour_requires_approval"], "missingFields": [], "actionCount": 6,
+          "requiredActions": ["call_request:human_required", "followup_freeze:automatic", "information_request:human_required", "recipient_change:human_required", "status_transition:automatic", "tour_request:human_required"],
           "forbiddenActions": ["outbound_draft:automatic", "recipient_change:automatic", "tour_request:automatic"]
         }]
       }
@@ -120,13 +120,13 @@
       "subjects": [{"key": "target", "entityType": "target_property", "relationship": "target", "suite": ""}],
       "currentState": {"facts": {"target": {}}, "conversationStates": {"target": "active"}, "followupStates": {"target": "scheduled"}},
       "expected": {
-        "disposition": "expected_gap",
-        "gapCodes": ["information_request_action_missing"],
+        "disposition": "pass",
+        "gapCodes": [],
         "results": [{
-          "subject": "target", "marketState": "unknown", "fitState": "review", "completenessState": "incomplete", "conversationState": "active", "approvalClass": "automatic",
-          "reasonCodes": ["market_state_unknown"], "missingFields": [], "actionCount": 0,
-          "requiredActions": [],
-          "forbiddenActions": ["outbound_draft:automatic", "review_item:human_required"]
+          "subject": "target", "marketState": "unknown", "fitState": "review", "completenessState": "blocked", "conversationState": "review", "approvalClass": "human_required",
+          "reasonCodes": ["information_request_requires_approval", "market_state_unknown"], "missingFields": [], "actionCount": 3,
+          "requiredActions": ["information_request:human_required", "review_item:human_required", "status_transition:automatic"],
+          "forbiddenActions": ["information_request:automatic", "outbound_draft:automatic"]
         }]
       }
     },

@@ -111,21 +111,13 @@ class ProviderPolicyShadowTests(unittest.TestCase):
         self.assertEqual(0, report.total_tokens)
         self.assertEqual(0, report.cost_microusd)
         self.assertEqual((), report.policy_outcome_variance_case_ids)
-        self.assertEqual(
-            {
-                "repeated-information-request": (
-                    "information_request_action_missing",
-                ),
-                "workflow-intents-visible": (
-                    "information_request_action_missing",
-                    "tour_request_action_missing",
-                ),
-            },
-            {
-                item.case_id: item.gap_codes
+        self.assertFalse(
+            any(item.gap_codes for item in report.results),
+            [
+                (item.case_id, item.gap_codes)
                 for item in report.results
-                if item.repeat_index == 0 and item.gap_codes
-            },
+                if item.gap_codes
+            ],
         )
 
     def test_policy_results_preserve_entity_and_terminal_boundaries(self):

@@ -762,7 +762,11 @@ def _gap_codes(
             and ActionType.TOUR_REQUEST not in actions
         ):
             gaps.add("tour_request_action_missing")
-        if claim.predicate is ClaimPredicate.INFORMATION_REQUEST and claim.value is True:
+        if (
+            claim.predicate is ClaimPredicate.INFORMATION_REQUEST
+            and claim.value is True
+            and ActionType.INFORMATION_REQUEST not in actions
+        ):
             gaps.add("information_request_action_missing")
     return tuple(sorted(gaps))
 
