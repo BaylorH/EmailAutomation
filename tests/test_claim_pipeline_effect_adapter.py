@@ -455,6 +455,8 @@ def _with_exact_approval(request: EffectAdapterRequest) -> EffectAdapterRequest:
 
 def _two_action_dependency_request(
     first_state_matches: bool,
+    *,
+    duplicate_dependencies: bool = False,
 ) -> EffectAdapterRequest:
     base = _request_fixture()
     first = base.plan.actions[0]
@@ -488,7 +490,11 @@ def _two_action_dependency_request(
         source_claim_ids=(second_claim.claim_id,),
         operation_key="operation-dependency-second-fixture",
         expected_prior_state={"conversationState": "active"},
-        dependencies=(first.action_id,),
+        dependencies=(
+            (first.action_id, first.action_id)
+            if duplicate_dependencies
+            else (first.action_id,)
+        ),
         sequence=2,
         recipient="",
         payload={"status": "waiting_user"},
@@ -985,6 +991,35 @@ class EffectAdapterEvaluationTests(unittest.TestCase):
                     _with_exact_approval(request),
                 )
 
+    def test_every_human_only_action_rejects_non_human_approval_class(self):
+        human_types = (
+            ActionType.ALTERNATE_PROPERTY_PROPOSAL,
+            ActionType.RECIPIENT_CHANGE,
+            ActionType.CALL_REQUEST,
+            ActionType.TOUR_REQUEST,
+            ActionType.INFORMATION_REQUEST,
+            ActionType.REVIEW_ITEM,
+        )
+        for action_type in human_types:
+            with self.subTest(action_type=action_type.value):
+                commit = evaluate_effect_plan(
+                    _request_fixture(
+                        action_type=action_type,
+                        approval_class=ApprovalClass.AUTOMATIC,
+                    )
+                )
+                self.assertTrue(commit.effects)
+                self.assertTrue(
+                    all(
+                        (effect.status, effect.reason)
+                        == (
+                            DryRunStatus.BLOCKED,
+                            DryRunReason.PLAN_CONTRACT_VIOLATION,
+                        )
+                        for effect in commit.effects
+                    )
+                )
+
     def test_wrong_scope_approval_blocks_action(self):
         request = _with_exact_approval(
             _request_fixture(
@@ -1003,6 +1038,52 @@ class EffectAdapterEvaluationTests(unittest.TestCase):
         self.assert_disposition(
             (DryRunStatus.BLOCKED, DryRunReason.APPROVAL_SCOPE_MISMATCH),
             request,
+        )
+
+    def test_reversed_wrong_scope_grants_are_byte_stable_and_blocked(self):
+        request = _request_fixture(
+            action_type=ActionType.INFORMATION_REQUEST,
+            approval_class=ApprovalClass.HUMAN_REQUIRED,
+        )
+        action = request.plan.actions[0]
+        wrong_plan = ApprovalGrant.create(
+            tenant_id=request.plan.tenant_id,
+            plan_id="wrong-plan",
+            action_id=action.action_id,
+            snapshot_hash=request.current_snapshot_hash,
+            approved_by="operator-plan-fixture",
+        )
+        wrong_snapshot = ApprovalGrant.create(
+            tenant_id=request.plan.tenant_id,
+            plan_id=request.plan.plan_id,
+            action_id=action.action_id,
+            snapshot_hash="wrong-snapshot",
+            approved_by="operator-snapshot-fixture",
+        )
+        forward = evaluate_effect_plan(
+            replace(
+                request,
+                approval_grants=(wrong_plan, wrong_snapshot),
+            )
+        )
+        reversed_result = evaluate_effect_plan(
+            replace(
+                request,
+                approval_grants=(wrong_snapshot, wrong_plan),
+            )
+        )
+
+        self.assertEqual(
+            (
+                DryRunStatus.BLOCKED,
+                DryRunReason.APPROVAL_SCOPE_MISMATCH,
+            ),
+            (forward.effects[0].status, forward.effects[0].reason),
+        )
+        self.assertEqual(forward.receipt_id, reversed_result.receipt_id)
+        self.assertEqual(
+            json.dumps(forward.to_dict(), sort_keys=True),
+            json.dumps(reversed_result.to_dict(), sort_keys=True),
         )
 
     def test_terminal_outbound_draft_is_suppressed(self):
@@ -1051,6 +1132,26 @@ class EffectAdapterEvaluationTests(unittest.TestCase):
             commit.effects[1].dependency_receipt_ids,
         )
 
+    def test_duplicate_dependency_ids_block_the_whole_plan(self):
+        commit = evaluate_effect_plan(
+            _two_action_dependency_request(
+                first_state_matches=True,
+                duplicate_dependencies=True,
+            )
+        )
+
+        self.assertEqual(2, len(commit.effects))
+        self.assertTrue(
+            all(
+                (effect.status, effect.reason)
+                == (
+                    DryRunStatus.BLOCKED,
+                    DryRunReason.PLAN_CONTRACT_VIOLATION,
+                )
+                for effect in commit.effects
+            )
+        )
+
     def test_forbidden_action_blocks_the_whole_plan_as_contract_violation(self):
         commit = evaluate_effect_plan(
             _request_fixture(approval_class=ApprovalClass.FORBIDDEN)
@@ -1086,6 +1187,50 @@ class EffectAdapterEvaluationTests(unittest.TestCase):
         self.assertEqual(
             json.dumps(forward.to_dict(), sort_keys=True),
             json.dumps(reversed_result.to_dict(), sort_keys=True),
+        )
+
+    def test_distinct_stale_snapshots_have_distinct_commit_identities(self):
+        first = evaluate_effect_plan(
+            _request_fixture(current_snapshot_hash="stale-snapshot-first")
+        )
+        second = evaluate_effect_plan(
+            _request_fixture(current_snapshot_hash="stale-snapshot-second")
+        )
+
+        self.assertNotEqual(first.receipt_id, second.receipt_id)
+        self.assertEqual("stale-snapshot-first", first.snapshot_hash)
+        self.assertEqual("stale-snapshot-second", second.snapshot_hash)
+        self.assertEqual(
+            "stale-snapshot-first",
+            first.to_dict()["snapshot_hash"],
+        )
+        self.assertEqual(
+            "stale-snapshot-second",
+            second.to_dict()["snapshot_hash"],
+        )
+
+    def test_stale_contract_commit_represents_current_contract_identity(self):
+        request = _request_fixture(
+            current_contract_id="stale-contract-fixture",
+            current_contract_version=2,
+        )
+        commit = evaluate_effect_plan(request)
+
+        self.assertEqual(DryRunReason.STALE_CONTRACT, commit.effects[0].reason)
+        self.assertEqual(request.current_contract_id, commit.contract_id)
+        self.assertEqual(
+            request.current_contract_version,
+            commit.contract_version,
+        )
+        self.assertEqual(
+            {
+                "contract_id": "stale-contract-fixture",
+                "contract_version": 2,
+            },
+            {
+                "contract_id": commit.to_dict()["contract_id"],
+                "contract_version": commit.to_dict()["contract_version"],
+            },
         )
 
 

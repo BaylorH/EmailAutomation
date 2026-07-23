@@ -66,6 +66,16 @@ TERMINAL_STATES = frozenset(
         ConversationState.TERMINAL,
     }
 )
+_HUMAN_REQUIRED_ACTION_TYPES = frozenset(
+    {
+        ActionType.ALTERNATE_PROPERTY_PROPOSAL,
+        ActionType.RECIPIENT_CHANGE,
+        ActionType.CALL_REQUEST,
+        ActionType.TOUR_REQUEST,
+        ActionType.INFORMATION_REQUEST,
+        ActionType.REVIEW_ITEM,
+    }
+)
 
 
 _VALID_REASONS_BY_STATUS = MappingProxyType({
@@ -566,11 +576,23 @@ def _commit(
         tenant_id=request.plan.tenant_id,
         plan_id=request.plan.plan_id,
         decision_id=request.decision.decision_id,
-        contract_id=request.plan.contract_id,
-        contract_version=request.plan.contract_version,
-        snapshot_hash=request.plan.snapshot_hash,
+        contract_id=request.current_contract_id,
+        contract_version=request.current_contract_version,
+        snapshot_hash=request.current_snapshot_hash,
         effects=effects,
     )
+
+
+def _adapter_contract_is_valid(plan: ActionPlan) -> bool:
+    for action in plan.actions:
+        if (
+            action.action_type in _HUMAN_REQUIRED_ACTION_TYPES
+            and action.approval_class is not ApprovalClass.HUMAN_REQUIRED
+        ):
+            return False
+        if len(action.dependencies) != len(set(action.dependencies)):
+            return False
+    return True
 
 
 def _request_identity_failure(
@@ -655,6 +677,20 @@ def evaluate_effect_plan(request: EffectAdapterRequest) -> DryRunCommitReceipt:
             authorized_recipients=request.authorized_recipients,
         )
     except ContractViolation:
+        return _commit(
+            request,
+            tuple(
+                _receipt(
+                    request.plan.plan_id,
+                    action,
+                    DryRunStatus.BLOCKED,
+                    DryRunReason.PLAN_CONTRACT_VIOLATION,
+                    (),
+                )
+                for action in ordered
+            ),
+        )
+    if not _adapter_contract_is_valid(request.plan):
         return _commit(
             request,
             tuple(
