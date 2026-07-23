@@ -77,6 +77,166 @@ EXPECTED_EFFECT_ADAPTER_API = {
     "load_effect_adapter_fixture_catalog",
     "run_effect_adapter_fixture_case",
 }
+EXPECTED_PACKAGE_API = frozenset(
+    """
+ActionPlan
+ActionStateSnapshot
+ActionType
+Actor
+ActorRole
+ApprovalGrant
+ApprovalClass
+CampaignContract
+Claim
+CLAIM_EXTRACTION_SCHEMA_VERSION
+CLAIM_FIXTURE_SCHEMA_VERSION
+ClaimExtractionIssue
+ClaimExtractionRequest
+ClaimExtractionResult
+ClaimFixtureCase
+ClaimFixtureCatalog
+ClaimFixtureValidationError
+ClaimConflict
+ClaimModality
+ClaimPolarity
+ClaimPredicate
+ClaimPipelineMode
+CommitReceipt
+CompletenessState
+ConversationState
+ContractAuthority
+ContractViolation
+DecisionSnapshot
+Direction
+DryRunCommitReceipt
+DryRunEffectReceipt
+DryRunReason
+DryRunStatus
+EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION
+EffectReceipt
+EffectStatus
+EffectAdapterFixtureCase
+EffectAdapterFixtureCatalog
+EffectAdapterFixtureResult
+EffectAdapterFixtureValidationError
+EffectAdapterRequest
+EntityRef
+EntityPolicyResult
+EntityMatch
+EntityResolutionResult
+EntitySeed
+EntityType
+EvidenceEnvelope
+EvidenceFailure
+EvidenceFreshness
+EvidenceNormalizationResult
+EvidenceSource
+ExternalEvidenceInput
+ExecutionScope
+FIXTURE_SCHEMA_VERSION
+FitState
+FixtureCase
+FixtureCatalog
+FixtureValidationError
+INTERPRETATION_FIXTURE_SCHEMA_VERSION
+LEGACY_SHADOW_FIXTURE_SCHEMA_VERSION
+LegacyActionAttempt
+LegacyProjection
+LegacyShadowCaseResult
+LegacyShadowDiscrepancy
+LegacyShadowFixtureCase
+LegacyShadowFixtureCatalog
+LegacyShadowFixtureValidationError
+LegacyShadowIdentity
+LegacyShadowReport
+InterpretationFixtureCase
+InterpretationFixtureCatalog
+InterpretationFixtureValidationError
+InterpretationReplayResult
+MarketState
+MAX_REPLAY_CALLS
+MAX_REPLAY_REPEATS
+PlannedAction
+PINNED_MODEL_ID
+PINNED_PROMPT_HASH
+PINNED_PROMPT_ID
+PINNED_PROVIDER_ID
+POLICY_FIXTURE_SCHEMA_VERSION
+POLICY_REASON_CODES
+PolicyEvaluationRequest
+PolicyEvaluationResult
+PolicyFixtureCase
+PolicyFixtureCatalog
+PolicyFixtureValidationError
+PipelineGate
+PipelineScope
+ProposalAdapter
+ProposalResponse
+ProposalUsage
+PROVIDER_QUALITY_FIXTURE_SCHEMA_VERSION
+PROVIDER_POLICY_FIXTURE_SCHEMA_VERSION
+PROVIDER_POLICY_SHADOW_PROFILE
+BudgetedProviderTransport
+ProviderBudgetExceeded
+ProviderBudgetLimits
+ProviderPolicyFixtureCase
+ProviderPolicyFixtureCatalog
+ProviderPolicyFixtureValidationError
+ProviderPolicyShadowCaseResult
+ProviderPolicyShadowIdentity
+ProviderPolicyShadowReport
+ProviderReservationSnapshot
+PinnedProviderProposalAdapter
+ProviderTransportResult
+ProviderQualityFixtureCase
+ProviderQualityFixtureCatalog
+ProviderQualityFixtureValidationError
+ProviderReviewExpectation
+RECORDED_MODEL_ID
+RECORDED_PROMPT_HASH
+RECORDED_PROMPT_ID
+RECORDED_PROVIDER_ID
+REQUIRED_DIMENSIONS
+REQUIRED_POLICY_DIMENSIONS
+SUPPORTED_REVIEW_CATEGORIES
+SUPPORTED_PROVIDER_POLICY_GAPS
+RawMessageEvidence
+RecordedProposalAdapter
+RecordedProviderQualityProposalAdapter
+ReplayCaseResult
+ReplayIdentity
+ReplayReport
+ResolutionIssue
+canonicalize_address
+compare_legacy_case
+build_claim_extraction_request
+extract_claims
+extract_addresses
+extract_suites
+evaluate_effect_plan
+evaluate_policy
+load_effect_adapter_fixture_catalog
+load_fixture_catalog
+load_interpretation_fixture_catalog
+load_legacy_shadow_fixture_catalog
+load_claim_fixture_catalog
+load_provider_quality_fixture_catalog
+load_provider_policy_fixture_catalog
+load_policy_fixture_catalog
+normalize_message_evidence
+parse_pipeline_mode
+project_legacy_proposal
+resolve_entities
+run_claim_replay
+run_effect_adapter_fixture_case
+run_provider_policy_shadow
+run_legacy_shadow
+validate_action_plan
+validate_claim_bundle
+validate_decision
+select_provider_policy_cases
+""".split()
+)
 EFFECT_ADAPTER_MODULES = frozenset(
     {
         "email_automation.claim_pipeline.effect_adapter",
@@ -102,13 +262,6 @@ BUILTIN_CALLABLE_NAMES = frozenset(
     for name in dir(builtins)
     if callable(getattr(builtins, name))
 )
-ALLOWED_EFFECT_PACKAGE_EXPORTS = EXPECTED_EFFECT_ADAPTER_API | {
-    "EffectReceipt",
-    "EffectStatus",
-    "LegacyShadowReport",
-    "ProviderPolicyShadowReport",
-    "ReplayReport",
-}
 
 
 def _resolved_import_names(node):
@@ -165,6 +318,14 @@ def _boundary_surface_tokens(name):
     return _identifier_tokens(name) & FORBIDDEN_EFFECT_BOUNDARY_TOKENS
 
 
+def _is_dangerous_symbol(symbol):
+    return symbol in {
+        *DYNAMIC_IMPORT_SYMBOLS,
+        *FORBIDDEN_FUNCTION_SYMBOLS,
+        "dataclasses.dataclass",
+    }
+
+
 def _import_bindings(tree):
     bindings = {}
     simple_assignments = []
@@ -202,6 +363,9 @@ def _import_bindings(tree):
         for bound_name, value in simple_assignments:
             resolved = _resolved_symbol(value, bindings)
             if resolved is None or bindings.get(bound_name) == resolved:
+                continue
+            current = bindings.get(bound_name)
+            if _is_dangerous_symbol(current):
                 continue
             bindings[bound_name] = resolved
             changed = True
@@ -309,6 +473,32 @@ def _is_dataclass(class_node, bindings):
     )
 
 
+def _schema_literal_keys(value):
+    if isinstance(value, ast.Dict):
+        return {
+            key.value
+            for key in value.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+    if isinstance(value, (ast.List, ast.Set, ast.Tuple)):
+        return {
+            item.value
+            for item in value.elts
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+    if isinstance(value, ast.Call):
+        keys = set()
+        for argument in value.args:
+            keys.update(_schema_literal_keys(argument))
+        keys.update(
+            keyword.arg
+            for keyword in value.keywords
+            if keyword.arg is not None
+        )
+        return keys
+    return set()
+
+
 def _schema_key_strings(tree):
     keys = set()
     for node in tree.body:
@@ -331,12 +521,7 @@ def _schema_key_strings(tree):
             for target in targets
         ):
             continue
-        keys.update(
-            child.value
-            for child in ast.walk(value)
-            if isinstance(child, ast.Constant)
-            and isinstance(child.value, str)
-        )
+        keys.update(_schema_literal_keys(value))
     return keys
 
 
@@ -359,6 +544,11 @@ def _effect_boundary_violations(tree):
             function_token = _function_surface_token(node, bindings)
             if function_token is not None:
                 violations.add(f"identifier:{function_token}")
+            dynamic_import = DYNAMIC_IMPORT_SYMBOLS.get(
+                _resolved_symbol(node, bindings)
+            )
+            if dynamic_import is not None:
+                violations.add(f"dynamic-import:{dynamic_import}")
         if isinstance(node, ast.Call):
             for candidate in (node.func, node):
                 dynamic_import = DYNAMIC_IMPORT_SYMBOLS.get(
@@ -497,13 +687,6 @@ def _package_public_bindings(tree):
     }
 
 
-def _is_unexpected_effect_export(name):
-    if name in ALLOWED_EFFECT_PACKAGE_EXPORTS:
-        return False
-    tokens = _identifier_tokens(name)
-    return bool(tokens & {"effect", "helper", "report"})
-
-
 def _effect_adapter_package_imports(tree):
     imports = set()
     for node in tree.body:
@@ -557,9 +740,16 @@ def _effect_adapter_api_violations(tree):
         for name in package_bindings - exported_names
     )
     violations.update(
-        f"unexpected-effect-export:{name}"
-        for name in exported_names
-        if _is_unexpected_effect_export(name)
+        f"unexpected-package-api:{name}"
+        for name in (exported_names | package_bindings) - EXPECTED_PACKAGE_API
+    )
+    violations.update(
+        f"missing-package-export:{name}"
+        for name in EXPECTED_PACKAGE_API - exported_names
+    )
+    violations.update(
+        f"missing-package-binding:{name}"
+        for name in EXPECTED_PACKAGE_API - package_bindings
     )
     return violations
 
@@ -704,6 +894,23 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             _effect_boundary_violations(tree),
         )
 
+    def test_effect_adapter_boundary_scanner_retains_dangerous_alias_history(
+        self,
+    ):
+        tree = ast.parse(
+            "from dataclasses import dataclass\n"
+            "record = dataclass\n"
+            "@record\n"
+            "class Request:\n"
+            "    graph: object\n"
+            "record = object\n"
+        )
+
+        self.assertIn(
+            "dataclass-field:graph",
+            _effect_boundary_violations(tree),
+        )
+
     def test_effect_adapter_boundary_scanner_rejects_schema_declaration_bypasses(
         self,
     ):
@@ -731,6 +938,18 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
         self.assertNotIn(
             "schema-key:callback",
             _effect_boundary_violations(ordinary_constants),
+        )
+        mapping_schema = ast.parse(
+            "SCHEMA = {'description': 'graph service prose'}\n"
+        )
+        mapping_violations = _effect_boundary_violations(mapping_schema)
+        self.assertNotIn("schema-key:graph", mapping_violations)
+        self.assertNotIn("schema-key:service", mapping_violations)
+        self.assertIn(
+            "schema-key:callback",
+            _effect_boundary_violations(
+                ast.parse("SCHEMA = {'callback': 'ordinary prose'}\n")
+            ),
         )
 
     def test_effect_adapter_boundary_scanner_rejects_named_callable_defaults(
@@ -830,6 +1049,11 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 "loaded = load('email_automation.messaging')\n",
                 "dynamic-import:__import__",
             ),
+            "stored builtin tuple": (
+                "loads = (__import__,)\n"
+                "loaded = loads[0]('email_automation.messaging')\n",
+                "dynamic-import:__import__",
+            ),
         }
 
         for label, (source, expected) in cases.items():
@@ -909,43 +1133,54 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
         )
 
     def test_effect_adapter_api_lock_rejects_extra_and_private_aliases(self):
-        baseline_import = (
-            "from .effect_adapter import ("
-            + ", ".join(sorted(EXPECTED_EFFECT_ADAPTER_API))
-            + ")\n"
+        initializer_source = (
+            (PACKAGE_ROOT / "__init__.py").read_text(encoding="utf-8")
         )
-        baseline_all = f"__all__ = {sorted(EXPECTED_EFFECT_ADAPTER_API)!r}\n"
-        baseline = baseline_import + baseline_all
-        self.assertEqual(
-            set(),
-            _effect_adapter_api_violations(ast.parse(baseline)),
+        extra_report_tree = ast.parse(initializer_source)
+        extra_report_all = next(
+            node
+            for node in extra_report_tree.body
+            if _assigns_all(node)
         )
-        extra_report_exports = sorted(
-            EXPECTED_EFFECT_ADAPTER_API | {"EffectAdapterReport"}
+        extra_report_all.value.elts.append(
+            ast.Constant("EffectAdapterReport")
         )
-        private_alias_exports = sorted(
-            EXPECTED_EFFECT_ADAPTER_API | {"publish_report"}
+        extra_report_tree.body.extend(
+            ast.parse(
+                "from .effect_adapter import EffectAdapterReport\n"
+            ).body
+        )
+
+        private_alias_tree = ast.parse(initializer_source)
+        private_alias_all = next(
+            node
+            for node in private_alias_tree.body
+            if _assigns_all(node)
+        )
+        private_alias_all.value.elts.append(
+            ast.Constant("publish_report")
+        )
+        private_alias_tree.body.extend(
+            ast.parse(
+                "from .effect_adapter import _commit as publish_report\n"
+            ).body
         )
         cases = {
             "extra report": (
-                baseline_import
-                + "from .effect_adapter import EffectAdapterReport\n"
-                + f"__all__ = {extra_report_exports!r}\n",
+                extra_report_tree,
                 "unexpected-bound:EffectAdapterReport",
             ),
             "private helper alias": (
-                baseline_import
-                + "from .effect_adapter import _commit as publish_report\n"
-                + f"__all__ = {private_alias_exports!r}\n",
+                private_alias_tree,
                 "private-source:_commit->publish_report",
             ),
         }
 
-        for label, (source, expected) in cases.items():
+        for label, (tree, expected) in cases.items():
             with self.subTest(label=label):
                 self.assertIn(
                     expected,
-                    _effect_adapter_api_violations(ast.parse(source)),
+                    _effect_adapter_api_violations(tree),
                 )
 
     def test_effect_adapter_api_lock_rejects_invented_and_dynamic_exports(self):
@@ -1029,6 +1264,43 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             ).body
         )
 
+        neutral_foreign_tree = ast.parse(initializer_source)
+        neutral_foreign_all = next(
+            node
+            for node in neutral_foreign_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets
+            )
+        )
+        neutral_foreign_all.value.elts.append(
+            ast.Constant("NeutralUtility")
+        )
+        neutral_foreign_tree.body.extend(
+            ast.parse(
+                "from .contracts import NeutralUtility\n"
+            ).body
+        )
+
+        neutral_local_tree = ast.parse(initializer_source)
+        neutral_local_all = next(
+            node
+            for node in neutral_local_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets
+            )
+        )
+        neutral_local_all.value.elts.append(ast.Constant("compose"))
+        neutral_local_tree.body.extend(
+            ast.parse(
+                "def compose():\n"
+                "    pass\n"
+            ).body
+        )
+
         starred_tree = ast.parse(initializer_source)
         starred_all = next(
             node
@@ -1077,6 +1349,34 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
         )
         nonliteral_all.value = ast.Name(id="exports", ctx=ast.Load())
 
+        invented_export_trees = {}
+        for invented_name in (
+            "DryRunBuilder",
+            "AdapterBuilder",
+            "NeutralPublicUtility",
+            "Surprise",
+        ):
+            tree = ast.parse(initializer_source)
+            all_assignment = next(
+                node
+                for node in tree.body
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "__all__"
+                    for target in node.targets
+                )
+            )
+            all_assignment.value.elts.append(ast.Constant(invented_name))
+            tree.body.append(
+                ast.Assign(
+                    targets=[
+                        ast.Name(id=invented_name, ctx=ast.Store())
+                    ],
+                    value=ast.Constant(None),
+                )
+            )
+            invented_export_trees[invented_name] = tree
+
         cases = {
             "unbound export": (
                 unbound_export_tree,
@@ -1084,7 +1384,7 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             ),
             "bound invented export": (
                 bound_export_tree,
-                "unexpected-effect-export:build_effect_report",
+                "unexpected-package-api:build_effect_report",
             ),
             "binding without export": (
                 orphan_binding_tree,
@@ -1092,11 +1392,19 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             ),
             "foreign report export": (
                 foreign_report_tree,
-                "unexpected-effect-export:UnexpectedReport",
+                "unexpected-package-api:UnexpectedReport",
             ),
             "local helper export": (
                 local_helper_tree,
-                "unexpected-effect-export:build_helper",
+                "unexpected-package-api:build_helper",
+            ),
+            "neutral foreign export": (
+                neutral_foreign_tree,
+                "unexpected-package-api:NeutralUtility",
+            ),
+            "neutral local export": (
+                neutral_local_tree,
+                "unexpected-package-api:compose",
             ),
             "starred reassignment": (starred_tree, "dynamic-package-exports"),
             "append mutation": (append_tree, "dynamic-package-exports"),
@@ -1105,6 +1413,15 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 "dynamic-package-exports",
             ),
         }
+        cases.update(
+            {
+                f"invented {name}": (
+                    tree,
+                    f"unexpected-package-api:{name}",
+                )
+                for name, tree in invented_export_trees.items()
+            }
+        )
         for label, (tree, expected) in cases.items():
             with self.subTest(label=label):
                 self.assertIn(
