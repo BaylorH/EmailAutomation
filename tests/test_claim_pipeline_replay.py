@@ -1253,6 +1253,37 @@ class ReplayExecutionTests(unittest.TestCase):
         self.assertEqual(1, report.provider_calls)
         self.assertEqual(1, len(report.results))
 
+    def test_provider_quality_fail_fast_stops_on_second_repeat_semantic_variance(self):
+        telemetry = _MutableTelemetry()
+        first_case = self.provider_quality_catalog.cases[0].case_id
+        adapter = _ProviderQualityRecordedAdapter(
+            self.provider_quality_catalog,
+            self.claim_catalog,
+            telemetry,
+            semantic_repeat_variation_case=first_case,
+        )
+
+        report = run_claim_replay(
+            interpretation_catalog=self.interpretation_catalog,
+            claim_catalog=self.claim_catalog,
+            provider_quality_catalog=self.provider_quality_catalog,
+            adapter=adapter,
+            identity=self._identity(
+                adapter,
+                repeats=3,
+                evaluation_profile="provider_quality",
+                evaluation_fixture_hash=self.provider_quality_catalog.manifest_hash,
+                case_count=len(self.provider_quality_catalog.cases),
+            ),
+            telemetry=telemetry,
+            fail_fast=True,
+        )
+
+        self.assertFalse(report.evaluation_passed)
+        self.assertEqual(20, adapter.calls)
+        self.assertEqual(20, report.provider_calls)
+        self.assertEqual((first_case,), report.quality_outcome_variance_case_ids)
+
     def test_evaluation_fixture_hash_mismatch_is_rejected_before_adapter_call(self):
         adapter = self._adapter()
 

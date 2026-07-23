@@ -1733,7 +1733,13 @@ def run_claim_replay(
                 )
             )
             quality_outcome_digests[case_id].add(quality_outcome_digest)
-            if fail_fast and not passed:
+            semantic_variance = (
+                len(quality_outcome_digests[case_id]) > 1
+                if identity.evaluation_profile == "provider_quality"
+                else len(proposal_digests[case_id]) > 1
+                or len(outcome_digests[case_id]) > 1
+            )
+            if fail_fast and (not passed or semantic_variance):
                 stop_requested = True
                 break
         if stop_requested:
