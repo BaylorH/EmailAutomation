@@ -2,11 +2,13 @@ import json
 import re
 import tempfile
 import unittest
-from dataclasses import FrozenInstanceError, is_dataclass
+from collections.abc import Mapping
+from dataclasses import FrozenInstanceError, is_dataclass, replace
 from pathlib import Path
 from unittest.mock import patch
 
-from email_automation.claim_pipeline.contracts import ActionType
+from email_automation.claim_pipeline import effect_adapter_fixtures as fixture_module
+from email_automation.claim_pipeline.contracts import ActionType, Claim
 from email_automation.claim_pipeline.effect_adapter import (
     DryRunReason,
     DryRunStatus,
@@ -232,14 +234,38 @@ class EffectAdapterFixtureTests(unittest.TestCase):
         return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
     def _assert_rejected(self, payload, pattern=None):
+        self._assert_raw_rejected(json.dumps(payload), pattern)
+
+    def _assert_raw_rejected(self, raw, pattern=None):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "invalid.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
+            if isinstance(raw, bytes):
+                path.write_bytes(raw)
+            else:
+                path.write_text(raw, encoding="utf-8")
             context = self.assertRaises(EffectAdapterFixtureValidationError)
             with context:
                 load_effect_adapter_fixture_catalog(path)
             if pattern is not None:
                 self.assertRegex(str(context.exception), pattern)
+
+    def _email_like_strings(self, value):
+        if isinstance(value, str):
+            return (value,) if EMAIL_LIKE.search(value) else ()
+        if isinstance(value, Mapping):
+            return tuple(
+                match
+                for key, item in value.items()
+                for nested in (key, item)
+                for match in self._email_like_strings(nested)
+            )
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return tuple(
+                match
+                for item in value
+                for match in self._email_like_strings(item)
+            )
+        return ()
 
     def test_catalog_has_exact_schema_and_case_lattice(self):
         catalog = load_effect_adapter_fixture_catalog(FIXTURE_PATH)
@@ -296,11 +322,16 @@ class EffectAdapterFixtureTests(unittest.TestCase):
         self.assertEqual({status.value for status in DryRunStatus}, statuses)
         self.assertEqual({reason.value for reason in DryRunReason}, reasons)
 
-    def test_fixture_and_results_contain_no_email_like_strings(self):
+    def test_fixture_requests_and_results_contain_no_email_like_strings(self):
         raw = FIXTURE_PATH.read_text(encoding="utf-8")
         self.assertIsNone(EMAIL_LIKE.search(raw))
 
         catalog = load_effect_adapter_fixture_catalog(FIXTURE_PATH)
+        for case in catalog.cases:
+            with self.subTest(case=case.case_id):
+                request = fixture_module._build_effect_adapter_request(case)
+                self.assertEqual((), self._email_like_strings(request.to_dict()))
+
         results = tuple(run_effect_adapter_fixture_case(case) for case in catalog.cases)
         serialized = json.dumps(
             [
@@ -315,6 +346,47 @@ class EffectAdapterFixtureTests(unittest.TestCase):
             sort_keys=True,
         )
         self.assertIsNone(EMAIL_LIKE.search(serialized))
+
+    def test_recursive_privacy_scan_detects_nested_request_claim_value(self):
+        catalog = load_effect_adapter_fixture_catalog(FIXTURE_PATH)
+        case = catalog.cases[0]
+        request = fixture_module._build_effect_adapter_request(case)
+        source = request.claims[0]
+        privacy_probe = "privacy-probe@" + "example.invalid"
+        tainted_claim = Claim.create(
+            tenant_id=source.tenant_id,
+            evidence_id=source.evidence_id,
+            subject_entity_id=source.subject_entity_id,
+            predicate=source.predicate,
+            value={"nested": {"contact": privacy_probe}},
+            evidence_text=source.evidence_text,
+            actor_role=source.actor_role,
+            polarity=source.polarity,
+            modality=source.modality,
+            confidence=source.confidence,
+            unit=source.unit,
+            effective_at=source.effective_at,
+            supersedes_claim_id=source.supersedes_claim_id,
+            campaign_id=source.campaign_id,
+            actor_email=source.actor_email,
+            observed_at=source.observed_at,
+        )
+        tainted_request = replace(
+            request,
+            claims=(tainted_claim, *request.claims[1:]),
+        )
+
+        with patch.object(
+            fixture_module,
+            "_build_effect_adapter_request",
+            return_value=tainted_request,
+        ):
+            built = fixture_module._build_effect_adapter_request(case)
+
+        self.assertEqual(
+            (privacy_probe,),
+            self._email_like_strings(built.to_dict()),
+        )
 
     def test_every_case_matches_the_complete_ordered_receipt_oracle(self):
         catalog = load_effect_adapter_fixture_catalog(FIXTURE_PATH)
@@ -366,6 +438,7 @@ class EffectAdapterFixtureTests(unittest.TestCase):
             "current_states",
             "approval_grants",
             "committed_idempotency_keys",
+            "authorized_recipients",
         ):
             original = getattr(first, attribute)
             reversed_value = getattr(reversed_request, attribute)
@@ -416,6 +489,91 @@ class EffectAdapterFixtureTests(unittest.TestCase):
         duplicate = self._payload()
         duplicate["cases"].append(dict(duplicate["cases"][0]))
         self._assert_rejected(duplicate, "duplicate caseId")
+
+    def test_duplicate_json_object_keys_are_rejected_at_every_depth(self):
+        raw_catalog = FIXTURE_PATH.read_text(encoding="utf-8")
+        schema_entry = (
+            f'"schemaVersion": "{EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION}"'
+        )
+        duplicate_root = raw_catalog.replace(
+            schema_entry,
+            f"{schema_entry},\n  {schema_entry}",
+            1,
+        )
+        duplicate_action = (
+            '{"schemaVersion":"'
+            + EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION
+            + '","cases":[{"caseId":"duplicate-action-key",'
+            '"actions":[{"type":"fact_update","type":"fact_update",'
+            '"approval":"automatic"}],"mutations":[],"expectedReceipts":'
+            '[{"action":"fact_update:1","status":"would_apply",'
+            '"reason":"eligible_automatic_action"}]}]}'
+        )
+
+        for label, raw in (
+            ("root", duplicate_root),
+            ("action", duplicate_action),
+        ):
+            with self.subTest(level=label):
+                self._assert_raw_rejected(raw, "duplicate JSON object key")
+
+    def test_whitespace_padded_tokens_are_rejected(self):
+        mutations = (
+            (
+                "action",
+                lambda payload: payload["cases"][0]["actions"][0].__setitem__(
+                    "type", " fact_update"
+                ),
+            ),
+            (
+                "mutation",
+                lambda payload: payload["cases"][0].__setitem__(
+                    "mutations", ["stale_snapshot "]
+                ),
+            ),
+            (
+                "status",
+                lambda payload: payload["cases"][0]["expectedReceipts"][
+                    0
+                ].__setitem__("status", " would_apply"),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(token=label):
+                payload = self._payload()
+                mutate(payload)
+                self._assert_rejected(payload, "surrounding whitespace")
+
+    def test_file_decode_and_json_parse_failures_are_normalized(self):
+        oversized_integer = "1" * 10000
+        malformed_inputs = (
+            ("invalid-utf8", b'{"schemaVersion":"\xff"}', "cannot be read"),
+            ("malformed-json", '{"schemaVersion":', "cannot be read"),
+            (
+                "oversized-integer",
+                '{"schemaVersion":"'
+                + EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION
+                + '","cases":'
+                + oversized_integer
+                + "}",
+                "cannot be read",
+            ),
+        )
+        for label, raw, pattern in malformed_inputs:
+            with self.subTest(input=label):
+                self._assert_raw_rejected(raw, pattern)
+
+    def test_nonstandard_json_constants_are_rejected_during_parsing(self):
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(constant=constant):
+                raw = (
+                    '{"schemaVersion":"'
+                    + EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION
+                    + '","cases":'
+                    + constant
+                    + "}"
+                )
+                self._assert_raw_rejected(raw, "nonstandard JSON constant")
 
     def test_unknown_action_approval_and_mutation_tokens_are_rejected(self):
         mutations = (

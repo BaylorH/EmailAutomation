@@ -146,6 +146,21 @@ def _fail(message: str) -> None:
     raise EffectAdapterFixtureValidationError(message)
 
 
+def _json_object_without_duplicates(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            _fail(f"duplicate JSON object key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    _fail(f"nonstandard JSON constant {value!r}")
+
+
 def _exact_keys(
     value: Any,
     expected: frozenset[str],
@@ -166,9 +181,11 @@ def _exact_keys(
 
 
 def _required_text(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value:
         _fail(f"{label} must be non-empty text")
-    return value.strip()
+    if value != value.strip():
+        _fail(f"{label} must not contain surrounding whitespace")
+    return value
 
 
 def _enum_token(value: Any, enum_type: type, label: str):
@@ -382,8 +399,15 @@ def load_effect_adapter_fixture_catalog(
     path: Path,
 ) -> EffectAdapterFixtureCatalog:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = path.read_text(encoding="utf-8")
+        payload = json.loads(
+            raw,
+            object_pairs_hook=_json_object_without_duplicates,
+            parse_constant=_reject_json_constant,
+        )
+    except EffectAdapterFixtureValidationError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise EffectAdapterFixtureValidationError(
             f"effect-adapter fixture catalog cannot be read: {exc}"
         ) from exc
@@ -682,6 +706,12 @@ def _build_effect_adapter_request(
     authorized_recipients = tuple(
         action.recipient for action in actions if action.recipient
     )
+    if "reverse_request_collections" in case.mutations:
+        authorized_recipients = (
+            *authorized_recipients,
+            "recipient-order-1-opaque",
+            "recipient-order-2-opaque",
+        )
     validate_action_plan(
         plan,
         decision,
@@ -822,6 +852,9 @@ def _build_effect_adapter_request(
                 request,
                 entities=tuple(reversed(request.entities)),
                 claims=tuple(reversed(request.claims)),
+                authorized_recipients=tuple(
+                    reversed(request.authorized_recipients)
+                ),
                 current_states=tuple(reversed(request.current_states)),
                 approval_grants=tuple(reversed(request.approval_grants)),
                 committed_idempotency_keys=tuple(
@@ -863,6 +896,9 @@ def run_effect_adapter_fixture_case(
             request,
             entities=tuple(reversed(request.entities)),
             claims=tuple(reversed(request.claims)),
+            authorized_recipients=tuple(
+                reversed(request.authorized_recipients)
+            ),
             current_states=tuple(reversed(request.current_states)),
             approval_grants=tuple(reversed(request.approval_grants)),
             committed_idempotency_keys=tuple(
