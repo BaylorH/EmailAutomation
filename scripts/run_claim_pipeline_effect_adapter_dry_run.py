@@ -12,7 +12,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 from typing import Any, Mapping, Optional, Sequence
 
 
@@ -30,6 +29,13 @@ from email_automation.claim_pipeline.effect_adapter_fixtures import (
 
 PROFILE = "disabled-effect-adapter-dry-run-v1"
 REQUIRED_RUNS = 3
+CANONICAL_OUTPUT_PATH = Path(
+    "/tmp/sitesift-disabled-effect-adapter-report.json"
+)
+OWNED_TEMP_PATH = Path(
+    "/tmp/.sitesift-disabled-effect-adapter-report.json.tmp"
+)
+_UNLINK_ATTEMPTS = 3
 CANONICAL_FIXTURE_PATH = (
     REPO_ROOT
     / "tests"
@@ -183,22 +189,19 @@ def _code_revision() -> str:
     return revision
 
 
-def _source_tree_hash(revision: str) -> str:
+def _source_tree_hash() -> str:
     tree = _git(
         "ls-tree",
         "-r",
         "-z",
         "--full-tree",
-        revision,
+        "HEAD",
         "--",
         *_SOURCE_PATHS,
     )
     if not tree:
         raise DryRunReportError("committed source surface is empty")
     digest = hashlib.sha256()
-    revision_bytes = revision.encode("ascii")
-    digest.update(len(revision_bytes).to_bytes(8, "big"))
-    digest.update(revision_bytes)
     digest.update(len(tree).to_bytes(8, "big"))
     digest.update(tree)
     return digest.hexdigest()
@@ -230,11 +233,17 @@ def _receipt_digest(receipt_id: str) -> str:
 
 
 def _safe_output_path(output_path: Path) -> Path:
-    path = output_path.expanduser().resolve(strict=False)
-    if path.is_relative_to(REPO_ROOT):
-        raise DryRunReportError("report output must be outside the repository")
-    if not path.parent.is_dir():
-        raise DryRunReportError("report output directory does not exist")
+    try:
+        expanded = os.path.expanduser(os.fspath(output_path))
+        path = Path(os.path.abspath(expanded))
+    except (TypeError, ValueError, OSError) as exc:
+        raise DryRunReportError(
+            "effect-adapter dry run requires the canonical report output path"
+        ) from exc
+    if path != CANONICAL_OUTPUT_PATH:
+        raise DryRunReportError(
+            "effect-adapter dry run requires the canonical report output path"
+        )
     return path
 
 
@@ -276,26 +285,83 @@ def _validated_runs(value: object) -> int:
     return runs
 
 
-def _remove_output(output_path: Path) -> None:
+def _unlink_exact_with_retry(path: Path) -> bool:
+    last_error = None
+    for _ in range(_UNLINK_ATTEMPTS):
+        try:
+            os.unlink(path)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            last_error = exc
+    raise DryRunReportError(f"cleanup failed for {path}") from last_error
+
+
+def _lstat_exists(path: Path) -> bool:
     try:
-        output_path.unlink(missing_ok=True)
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
     except OSError as exc:
-        raise DryRunReportError("stale report output cannot be removed") from exc
+        raise DryRunReportError(
+            f"cleanup inspection failed for {path}"
+        ) from exc
+    return True
+
+
+def _cleanup_errors(paths: Sequence[Path]) -> tuple[str, ...]:
+    errors = []
+    for path in paths:
+        try:
+            _unlink_exact_with_retry(path)
+        except DryRunReportError as exc:
+            errors.append(str(exc))
+    return tuple(errors)
+
+
+def _raise_controlled_failure(
+    primary: str,
+    *,
+    cause: BaseException,
+    cleanup_paths: Sequence[Path],
+    extra_context: Sequence[str] = (),
+) -> None:
+    contexts = list(extra_context)
+    contexts.extend(_cleanup_errors(cleanup_paths))
+    message = primary
+    if contexts:
+        message = f"{message}; cleanup context: {'; '.join(contexts)}"
+    raise DryRunReportError(message) from cause
 
 
 def _remove_stale_output_artifacts(output_path: Path) -> Path:
     output_path = _safe_output_path(output_path)
-    _remove_output(output_path)
-    temporary_prefix = f".{output_path.name}."
+    errors = []
     try:
-        siblings = tuple(output_path.parent.iterdir())
-        for sibling in siblings:
-            if sibling.name.startswith(temporary_prefix):
-                sibling.unlink(missing_ok=True)
-    except OSError as exc:
+        _unlink_exact_with_retry(output_path)
+    except DryRunReportError as exc:
+        errors.append(str(exc))
+
+    temporary_collision = False
+    try:
+        temporary_collision = _lstat_exists(OWNED_TEMP_PATH)
+    except DryRunReportError as exc:
+        errors.append(str(exc))
+    if temporary_collision:
+        try:
+            _unlink_exact_with_retry(OWNED_TEMP_PATH)
+        except DryRunReportError as exc:
+            errors.append(str(exc))
+
+    if errors:
         raise DryRunReportError(
-            "stale report temporary output cannot be removed"
-        ) from exc
+            f"stale report cleanup failed; {'; '.join(errors)}"
+        )
+    if temporary_collision:
+        raise DryRunReportError(
+            f"temporary output collision cleared at {OWNED_TEMP_PATH}"
+        )
     return output_path
 
 
@@ -337,24 +403,84 @@ def _preparse_output_paths(
     return tuple(candidates), issue
 
 
-def _atomic_write(output_path: Path, content: bytes) -> None:
-    temporary_path = None
+def _fsync_parent_directory(directory: Path) -> None:
+    flags = os.O_RDONLY
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if directory_flag is None:
+        raise OSError("directory synchronization is unavailable")
+    descriptor = os.open(directory, flags | directory_flag)
+    fsync_error = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=output_path.parent,
-            prefix=f".{output_path.name}.",
-            delete=False,
-        ) as stream:
-            temporary_path = Path(stream.name)
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, output_path)
+        os.fsync(descriptor)
     except OSError as exc:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-        raise DryRunReportError("report output could not be written") from exc
+        fsync_error = exc
+    try:
+        os.close(descriptor)
+    except OSError as close_error:
+        if fsync_error is not None:
+            raise DryRunReportError(
+                "parent directory fsync failed; directory close failed"
+            ) from fsync_error
+        raise close_error
+    if fsync_error is not None:
+        raise fsync_error
+
+
+def _atomic_write(output_path: Path, content: bytes) -> None:
+    output_path = _safe_output_path(output_path)
+    no_follow_flag = getattr(os, "O_NOFOLLOW", None)
+    if no_follow_flag is None:
+        raise DryRunReportError(
+            "exclusive no-follow temporary output is unavailable"
+        )
+
+    descriptor = None
+    phase = "temporary output creation"
+    try:
+        descriptor = os.open(
+            OWNED_TEMP_PATH,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | no_follow_flag,
+            0o600,
+        )
+        phase = "temporary output write"
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("temporary output write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+
+        phase = "report output write during replace"
+        os.replace(OWNED_TEMP_PATH, output_path)
+        phase = "parent directory fsync"
+        _fsync_parent_directory(output_path.parent)
+    except (OSError, DryRunReportError) as exc:
+        close_context = []
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                close_context.append(
+                    "temporary output descriptor close failed"
+                )
+        if isinstance(exc, FileExistsError):
+            primary = "report temporary output collision"
+        elif phase == "parent directory fsync":
+            primary = "report parent directory fsync failed"
+        else:
+            primary = f"report output write failed during {phase}"
+        _raise_controlled_failure(
+            primary,
+            cause=exc,
+            cleanup_paths=(output_path, OWNED_TEMP_PATH),
+            extra_context=close_context,
+        )
 
 
 def _assert_private_report(report: Mapping[str, Any]) -> None:
@@ -534,7 +660,7 @@ def run_dry_run(
         )
 
     revision = _code_revision()
-    source_tree_hash = _source_tree_hash(revision)
+    source_tree_hash = _source_tree_hash()
     try:
         catalog = load_effect_adapter_fixture_catalog(fixture_path)
     except EffectAdapterFixtureValidationError as exc:
@@ -591,7 +717,7 @@ def run_dry_run(
     if (
         _source_tree_dirty()
         or _code_revision() != revision
-        or _source_tree_hash(revision) != source_tree_hash
+        or _source_tree_hash() != source_tree_hash
         or _file_hash(fixture_path) != CANONICAL_FIXTURE_SHA256
     ):
         raise DryRunReportError("source identity changed during dry run")
@@ -603,6 +729,7 @@ def run_dry_run(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description=(
             "Run the fixed sanitized disabled effect-adapter proof. "
             "No service or production effect is available."

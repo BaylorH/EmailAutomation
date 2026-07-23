@@ -1,9 +1,12 @@
 import contextlib
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +28,12 @@ EXPECTED_CASES = 18
 EXPECTED_RESULTS = 54
 EXPECTED_FIXTURE_HASH = (
     "c654da2a9a2fadee2f8cce761e17dd78d21168cfcb6b6e9fd06aeddff69ea229"
+)
+CANONICAL_OUTPUT_PATH = Path(
+    "/tmp/sitesift-disabled-effect-adapter-report.json"
+)
+OWNED_TEMP_PATH = Path(
+    "/tmp/.sitesift-disabled-effect-adapter-report.json.tmp"
 )
 EXPECTED_SCHEMA_VERSION = "claim-pipeline-effect-adapter-fixtures-v1"
 EXPECTED_CASE_IDS = (
@@ -95,6 +104,21 @@ class EffectAdapterReportTests(unittest.TestCase):
     def setUpClass(cls):
         cls.script = _load_script()
 
+    def setUp(self):
+        self._unlink_test_artifact(CANONICAL_OUTPUT_PATH)
+        self._unlink_test_artifact(OWNED_TEMP_PATH)
+
+    def tearDown(self):
+        self._unlink_test_artifact(CANONICAL_OUTPUT_PATH)
+        self._unlink_test_artifact(OWNED_TEMP_PATH)
+
+    def _unlink_test_artifact(self, path):
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return
+        os.unlink(path)
+
     def _run(
         self,
         output_path,
@@ -116,10 +140,9 @@ class EffectAdapterReportTests(unittest.TestCase):
     def _seed_passed_report(self, path):
         path.write_text('{"passed":true}\n', encoding="utf-8")
 
-    def _seed_atomic_temporary(self, output_path, suffix="stale"):
-        path = output_path.parent / f".{output_path.name}.{suffix}"
-        path.write_text('{"passed":true}\n', encoding="utf-8")
-        return path
+    def _seed_atomic_temporary(self):
+        OWNED_TEMP_PATH.write_text('{"passed":true}\n', encoding="utf-8")
+        return OWNED_TEMP_PATH
 
     def _run_cli_subprocess(self, *arguments):
         return subprocess.run(
@@ -160,11 +183,309 @@ class EffectAdapterReportTests(unittest.TestCase):
             EXPECTED_RESULTS,
             getattr(self.script, "CANONICAL_RESULT_COUNT", None),
         )
+        self.assertEqual(
+            CANONICAL_OUTPUT_PATH,
+            getattr(self.script, "CANONICAL_OUTPUT_PATH", None),
+        )
+        self.assertEqual(
+            OWNED_TEMP_PATH,
+            getattr(self.script, "OWNED_TEMP_PATH", None),
+        )
+
+    def test_parser_rejects_output_abbreviation_and_cleans_explicit_output(self):
+        self._seed_passed_report(CANONICAL_OUTPUT_PATH)
+
+        completed = self._run_cli_subprocess(
+            "--fixture",
+            FIXTURE_PATH,
+            "--runs",
+            "3",
+            "--out",
+            "ignored-output-value",
+            "--output",
+            CANONICAL_OUTPUT_PATH,
+            "--unexpected-option",
+        )
+
+        self.assertEqual(2, completed.returncode)
+        self.assertRegex(
+            completed.stderr,
+            r"unrecognized arguments:.*--out",
+        )
+        self.assertFalse(CANONICAL_OUTPUT_PATH.exists())
+
+    def test_arbitrary_output_path_is_rejected_without_deleting_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            arbitrary_path = Path(directory) / "passed-report.json"
+            seeded = b'{"passed":true,"owner":"external"}\n'
+            arbitrary_path.write_bytes(seeded)
+
+            completed = self._run_cli_subprocess(
+                "--fixture",
+                FIXTURE_PATH,
+                "--runs",
+                "3",
+                "--output",
+                arbitrary_path,
+            )
+
+            self.assertEqual(2, completed.returncode)
+            self.assertIn("canonical report output path", completed.stderr)
+            self.assertEqual(seeded, arbitrary_path.read_bytes())
+
+    def test_canonical_target_symlink_is_unlinked_without_following_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            symlink_target = Path(directory) / "external-proof.json"
+            seeded = b'{"passed":true,"owner":"external"}\n'
+            symlink_target.write_bytes(seeded)
+            CANONICAL_OUTPUT_PATH.symlink_to(symlink_target)
+
+            cleaned_path = self.script._remove_stale_output_artifacts(
+                CANONICAL_OUTPUT_PATH
+            )
+
+            self.assertEqual(CANONICAL_OUTPUT_PATH, cleaned_path)
+            self.assertFalse(CANONICAL_OUTPUT_PATH.exists())
+            self.assertEqual(seeded, symlink_target.read_bytes())
+
+    def test_unrelated_similarly_prefixed_sibling_is_never_removed(self):
+        unrelated_path = Path(
+            f"{OWNED_TEMP_PATH}.unrelated-{os.getpid()}"
+        )
+        self.addCleanup(self._unlink_test_artifact, unrelated_path)
+        unrelated_path.write_bytes(b"not-owned\n")
+        self._seed_passed_report(CANONICAL_OUTPUT_PATH)
+
+        self.script._remove_stale_output_artifacts(CANONICAL_OUTPUT_PATH)
+
+        self.assertFalse(CANONICAL_OUTPUT_PATH.exists())
+        self.assertEqual(b"not-owned\n", unrelated_path.read_bytes())
+
+    def test_owned_temp_symlink_collision_is_unlinked_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            symlink_target = Path(directory) / "external-temp-target"
+            seeded = b"external-temp-content\n"
+            symlink_target.write_bytes(seeded)
+            self._seed_passed_report(CANONICAL_OUTPUT_PATH)
+            OWNED_TEMP_PATH.symlink_to(symlink_target)
+
+            with self.assertRaisesRegex(
+                self.script.DryRunReportError,
+                "temporary output collision",
+            ):
+                self.script._remove_stale_output_artifacts(
+                    CANONICAL_OUTPUT_PATH
+                )
+
+            self.assertFalse(CANONICAL_OUTPUT_PATH.exists())
+            self.assertFalse(OWNED_TEMP_PATH.exists())
+            self.assertEqual(seeded, symlink_target.read_bytes())
+
+    def test_atomic_write_orders_file_and_parent_directory_fsync(self):
+        self.assertTrue(
+            hasattr(self.script, "_fsync_parent_directory"),
+            "runner must expose the parent-directory durability step",
+        )
+        events = []
+        original_open = self.script.os.open
+        original_fsync = self.script.os.fsync
+        original_replace = self.script.os.replace
+        original_close = self.script.os.close
+
+        def open_spy(path, flags, mode=0o777):
+            descriptor = original_open(path, flags, mode)
+            kind = (
+                "directory"
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                else "file"
+            )
+            events.append(f"{kind}-open")
+            return descriptor
+
+        def fsync_spy(descriptor):
+            kind = (
+                "directory"
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                else "file"
+            )
+            events.append(f"{kind}-fsync")
+            return original_fsync(descriptor)
+
+        def replace_spy(source, target):
+            events.append("replace")
+            return original_replace(source, target)
+
+        def close_spy(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                events.append("directory-close")
+            return original_close(descriptor)
+
+        with mock.patch.object(
+            self.script.os,
+            "open",
+            side_effect=open_spy,
+        ), mock.patch.object(
+            self.script.os,
+            "fsync",
+            side_effect=fsync_spy,
+        ), mock.patch.object(
+            self.script.os,
+            "replace",
+            side_effect=replace_spy,
+        ), mock.patch.object(
+            self.script.os,
+            "close",
+            side_effect=close_spy,
+        ):
+            self.script._atomic_write(CANONICAL_OUTPUT_PATH, b"proof\n")
+
+        self.assertEqual(b"proof\n", CANONICAL_OUTPUT_PATH.read_bytes())
+        self.assertLess(events.index("file-fsync"), events.index("replace"))
+        self.assertLess(events.index("replace"), events.index("directory-open"))
+        self.assertLess(
+            events.index("directory-open"),
+            events.index("directory-fsync"),
+        )
+        self.assertLess(
+            events.index("directory-fsync"),
+            events.index("directory-close"),
+        )
+
+    def test_parent_directory_fsync_failure_removes_passing_target(self):
+        self.assertTrue(
+            hasattr(self.script, "_fsync_parent_directory"),
+            "runner must expose the parent-directory durability step",
+        )
+
+        with mock.patch.object(
+            self.script,
+            "_fsync_parent_directory",
+            side_effect=OSError("injected directory fsync failure"),
+        ), self.assertRaisesRegex(
+            self.script.DryRunReportError,
+            "parent directory fsync",
+        ):
+            self.script._atomic_write(CANONICAL_OUTPUT_PATH, b"proof\n")
+
+        self.assertFalse(CANONICAL_OUTPUT_PATH.exists())
+        self.assertFalse(OWNED_TEMP_PATH.exists())
+
+    def test_transient_unlink_failure_is_retried_and_artifact_removed(self):
+        self._seed_passed_report(CANONICAL_OUTPUT_PATH)
+        original_unlink = self.script.os.unlink
+        attempts = 0
+
+        def transient_unlink(path):
+            nonlocal attempts
+            if Path(path) == CANONICAL_OUTPUT_PATH:
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("injected transient unlink failure")
+            return original_unlink(path)
+
+        with mock.patch.object(
+            self.script.os,
+            "unlink",
+            side_effect=transient_unlink,
+        ):
+            self.script._remove_stale_output_artifacts(
+                CANONICAL_OUTPUT_PATH
+            )
+
+        self.assertEqual(2, attempts)
+        self.assertFalse(CANONICAL_OUTPUT_PATH.exists())
+
+    def test_persistent_unlink_failure_is_controlled_and_names_artifact(self):
+        self._seed_passed_report(CANONICAL_OUTPUT_PATH)
+
+        with mock.patch.object(
+            self.script.os,
+            "unlink",
+            side_effect=OSError("injected persistent unlink failure"),
+        ), self.assertRaisesRegex(
+            self.script.DryRunReportError,
+            rf"cleanup.*{re.escape(str(CANONICAL_OUTPUT_PATH))}",
+        ):
+            self.script._remove_stale_output_artifacts(
+                CANONICAL_OUTPUT_PATH
+            )
+
+        self.assertTrue(CANONICAL_OUTPUT_PATH.exists())
+
+    def test_primary_write_and_cleanup_failures_share_one_controlled_error(self):
+        with mock.patch.object(
+            self.script.os,
+            "replace",
+            side_effect=OSError("injected replace failure"),
+        ), mock.patch.object(
+            self.script.os,
+            "unlink",
+            side_effect=OSError("injected cleanup failure"),
+        ), self.assertRaisesRegex(
+            self.script.DryRunReportError,
+            rf"write.*cleanup.*{re.escape(str(OWNED_TEMP_PATH))}",
+        ):
+            self.script._atomic_write(CANONICAL_OUTPUT_PATH, b"proof\n")
+
+        self.assertFalse(CANONICAL_OUTPUT_PATH.exists())
+        self.assertTrue(OWNED_TEMP_PATH.exists())
+
+    def test_cli_cleanup_failure_is_controlled_without_traceback(self):
+        self._seed_passed_report(CANONICAL_OUTPUT_PATH)
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            self.script.os,
+            "unlink",
+            side_effect=OSError("injected persistent unlink failure"),
+        ), contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            self.script.main(
+                (
+                    "--fixture",
+                    str(FIXTURE_PATH),
+                    "--runs",
+                    "3",
+                    "--output",
+                    str(CANONICAL_OUTPUT_PATH),
+                    "--unexpected-option",
+                )
+            )
+
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn(str(CANONICAL_OUTPUT_PATH), stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_source_tree_hash_depends_only_on_committed_tree_listing(self):
+        parameters = tuple(
+            inspect.signature(self.script._source_tree_hash).parameters
+        )
+        self.assertEqual((), parameters)
+        tree_listing = (
+            b"100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            b"\tscripts/example.py\0"
+        )
+        expected = hashlib.sha256(
+            len(tree_listing).to_bytes(8, "big") + tree_listing
+        ).hexdigest()
+
+        with mock.patch.object(
+            self.script,
+            "_git",
+            return_value=tree_listing,
+        ) as git:
+            first = self.script._source_tree_hash()
+            second = self.script._source_tree_hash()
+
+        self.assertEqual(expected, first)
+        self.assertEqual(first, second)
+        self.assertEqual(2, git.call_count)
+        for call in git.call_args_list:
+            self.assertEqual("ls-tree", call.args[0])
+            self.assertNotIn("revision-a", call.args)
+            self.assertNotIn("revision-b", call.args)
 
     def test_report_has_exact_identity_counts_results_and_digest(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "report.json"
-            report = self._run(output_path)
+        report = self._run(CANONICAL_OUTPUT_PATH)
 
         self.assertTrue(report["passed"])
         self.assertEqual(
@@ -225,8 +546,7 @@ class EffectAdapterReportTests(unittest.TestCase):
         self.assertEqual(_canonical_digest(unsigned), result_digest)
 
     def test_report_can_only_emit_canonical_case_ids_and_approved_fields(self):
-        with tempfile.TemporaryDirectory() as directory:
-            report = self._run(Path(directory) / "report.json")
+        report = self._run(CANONICAL_OUTPUT_PATH)
 
         self.assertEqual(
             EXPECTED_CASE_IDS * EXPECTED_RUNS,
@@ -257,8 +577,7 @@ class EffectAdapterReportTests(unittest.TestCase):
             self.script._assert_private_report(tainted)
 
     def test_encoded_report_is_private_and_contains_no_timestamps(self):
-        with tempfile.TemporaryDirectory() as directory:
-            report = self._run(Path(directory) / "report.json")
+        report = self._run(CANONICAL_OUTPUT_PATH)
 
         encoded = json.dumps(report, sort_keys=True)
         self.assertNotRegex(encoded, EMAIL_LIKE)
@@ -274,22 +593,19 @@ class EffectAdapterReportTests(unittest.TestCase):
             self.assertNotIn(forbidden, encoded)
 
     def test_repeated_clean_executions_are_byte_identical(self):
-        with tempfile.TemporaryDirectory() as directory:
-            first_path = Path(directory) / "first.json"
-            second_path = Path(directory) / "second.json"
+        first_report = self._run(CANONICAL_OUTPUT_PATH)
+        first_bytes = CANONICAL_OUTPUT_PATH.read_bytes()
+        second_report = self._run(CANONICAL_OUTPUT_PATH)
 
-            first_report = self._run(first_path)
-            second_report = self._run(second_path)
-
-            self.assertEqual(first_report, second_report)
-            self.assertEqual(first_path.read_bytes(), second_path.read_bytes())
+        self.assertEqual(first_report, second_report)
+        self.assertEqual(first_bytes, CANONICAL_OUTPUT_PATH.read_bytes())
 
     def test_external_one_case_fixture_is_rejected_and_stale_output_removed(self):
         payload = self._fixture_payload()
         payload["cases"] = payload["cases"][:1]
         with tempfile.TemporaryDirectory() as directory:
             fixture_path = self._write_fixture(directory, payload)
-            output_path = Path(directory) / "report.json"
+            output_path = CANONICAL_OUTPUT_PATH
             self._seed_passed_report(output_path)
 
             with self.assertRaisesRegex(
@@ -304,7 +620,7 @@ class EffectAdapterReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture_path = Path(directory) / "copy.json"
             fixture_path.write_bytes(FIXTURE_PATH.read_bytes())
-            output_path = Path(directory) / "report.json"
+            output_path = CANONICAL_OUTPUT_PATH
 
             with self.assertRaisesRegex(
                 self.script.DryRunReportError,
@@ -325,7 +641,7 @@ class EffectAdapterReportTests(unittest.TestCase):
         payload["cases"][0]["caseId"] = "john-smith-123-main-street"
         with tempfile.TemporaryDirectory() as directory:
             fixture_path = self._write_fixture(directory, payload)
-            output_path = Path(directory) / "report.json"
+            output_path = CANONICAL_OUTPUT_PATH
 
             with mock.patch.object(
                 self.script,
@@ -369,7 +685,7 @@ class EffectAdapterReportTests(unittest.TestCase):
             with self.subTest(
                 pattern=pattern
             ), tempfile.TemporaryDirectory() as directory:
-                output_path = Path(directory) / "report.json"
+                output_path = CANONICAL_OUTPUT_PATH
                 with mock.patch.object(
                     self.script,
                     "_source_tree_dirty",
@@ -389,8 +705,8 @@ class EffectAdapterReportTests(unittest.TestCase):
                     )
 
     def test_dirty_tree_removes_stale_passed_output_and_stops(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "report.json"
+        with tempfile.TemporaryDirectory():
+            output_path = CANONICAL_OUTPUT_PATH
             self._seed_passed_report(output_path)
 
             with mock.patch.object(
@@ -419,8 +735,8 @@ class EffectAdapterReportTests(unittest.TestCase):
                 return replace(result, passed=False)
             return result
 
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "report.json"
+        with tempfile.TemporaryDirectory():
+            output_path = CANONICAL_OUTPUT_PATH
             self._seed_passed_report(output_path)
             with mock.patch.object(
                 self.script,
@@ -454,8 +770,8 @@ class EffectAdapterReportTests(unittest.TestCase):
                 return replace(result, receipt_id=f"receipt-variant-{invocation}")
             return result
 
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "report.json"
+        with tempfile.TemporaryDirectory():
+            output_path = CANONICAL_OUTPUT_PATH
             self._seed_passed_report(output_path)
             with mock.patch.object(
                 self.script,
@@ -478,8 +794,8 @@ class EffectAdapterReportTests(unittest.TestCase):
             self.assertFalse(output_path.exists())
 
     def test_incomplete_run_stops_before_passed_report(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "report.json"
+        with tempfile.TemporaryDirectory():
+            output_path = CANONICAL_OUTPUT_PATH
             self._seed_passed_report(output_path)
             with mock.patch.object(
                 self.script,
@@ -505,7 +821,7 @@ class EffectAdapterReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture_path = Path(directory) / "invalid.json"
             fixture_path.write_text("{", encoding="utf-8")
-            output_path = Path(directory) / "report.json"
+            output_path = CANONICAL_OUTPUT_PATH
             self._seed_passed_report(output_path)
             with mock.patch.object(
                 self.script,
@@ -543,8 +859,8 @@ class EffectAdapterReportTests(unittest.TestCase):
             receipt["reason"] = "privacy-probe@" + "example.invalid"
             return replace(result, receipts=(receipt,))
 
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "report.json"
+        with tempfile.TemporaryDirectory():
+            output_path = CANONICAL_OUTPUT_PATH
             self._seed_passed_report(output_path)
             with mock.patch.object(
                 self.script,
@@ -567,8 +883,8 @@ class EffectAdapterReportTests(unittest.TestCase):
             self.assertFalse(output_path.exists())
 
     def test_runs_other_than_three_are_rejected_before_fixture_execution(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "report.json"
+        with tempfile.TemporaryDirectory():
+            output_path = CANONICAL_OUTPUT_PATH
             self._seed_passed_report(output_path)
             with mock.patch.object(
                 self.script,
@@ -587,32 +903,11 @@ class EffectAdapterReportTests(unittest.TestCase):
             self.assertFalse(output_path.exists())
 
     def test_atomic_write_failures_leave_no_target_or_temporary_artifact(self):
-        original_named_temporary_file = tempfile.NamedTemporaryFile
-
-        class WriteFailingTemporaryFile:
-            def __init__(self, *args, **kwargs):
-                self._context = original_named_temporary_file(*args, **kwargs)
-                self._stream = None
-
-            def __enter__(self):
-                self._stream = self._context.__enter__()
-                return self
-
-            def __exit__(self, *args):
-                return self._context.__exit__(*args)
-
-            @property
-            def name(self):
-                return self._stream.name
-
-            def write(self, _content):
-                raise OSError("injected temporary write failure")
-
         fault_patches = (
             mock.patch.object(
-                self.script.tempfile,
-                "NamedTemporaryFile",
-                WriteFailingTemporaryFile,
+                self.script.os,
+                "write",
+                side_effect=OSError("injected temporary write failure"),
             ),
             mock.patch.object(
                 self.script.os,
@@ -621,22 +916,17 @@ class EffectAdapterReportTests(unittest.TestCase):
             ),
         )
         for fault_patch in fault_patches:
-            with self.subTest(
-                fault=fault_patch
-            ), tempfile.TemporaryDirectory() as directory:
-                output_path = Path(directory) / "report.json"
+            with self.subTest(fault=fault_patch):
+                output_path = CANONICAL_OUTPUT_PATH
                 self._seed_passed_report(output_path)
                 with fault_patch, self.assertRaisesRegex(
                     self.script.DryRunReportError,
-                    "could not be written",
+                    "write",
                 ):
                     self._run(output_path)
 
                 self.assertFalse(output_path.exists())
-                self.assertEqual(
-                    [],
-                    list(Path(directory).glob(f".{output_path.name}.*")),
-                )
+                self.assertFalse(OWNED_TEMP_PATH.exists())
 
     def test_clean_tree_check_includes_untracked_files(self):
         with mock.patch.object(
@@ -653,8 +943,8 @@ class EffectAdapterReportTests(unittest.TestCase):
         )
 
     def test_cli_writes_exact_report_and_rejects_other_run_counts(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "report.json"
+        with tempfile.TemporaryDirectory():
+            output_path = CANONICAL_OUTPUT_PATH
             stdout = io.StringIO()
             with mock.patch.object(
                 self.script,
@@ -699,7 +989,7 @@ class EffectAdapterReportTests(unittest.TestCase):
         payload["cases"] = payload["cases"][:1]
         with tempfile.TemporaryDirectory() as directory:
             fixture_path = self._write_fixture(directory, payload)
-            output_path = Path(directory) / "report.json"
+            output_path = CANONICAL_OUTPUT_PATH
             self._seed_passed_report(output_path)
 
             with mock.patch.object(
@@ -723,9 +1013,9 @@ class EffectAdapterReportTests(unittest.TestCase):
             self.assertFalse(output_path.exists())
 
     def test_subprocess_unknown_option_clears_stale_output_before_argparse(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "report.json"
-            temporary_path = self._seed_atomic_temporary(output_path)
+        with tempfile.TemporaryDirectory():
+            output_path = CANONICAL_OUTPUT_PATH
+            self._seed_atomic_temporary()
             self._seed_passed_report(output_path)
 
             completed = self._run_cli_subprocess(
@@ -739,13 +1029,13 @@ class EffectAdapterReportTests(unittest.TestCase):
             )
 
             self.assertEqual(2, completed.returncode)
-            self.assertIn("unrecognized arguments", completed.stderr)
+            self.assertIn("temporary output collision", completed.stderr)
             self.assertFalse(output_path.exists())
-            self.assertFalse(temporary_path.exists())
+            self.assertFalse(OWNED_TEMP_PATH.exists())
 
     def test_subprocess_missing_required_arg_clears_supplied_output(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "report.json"
+        with tempfile.TemporaryDirectory():
+            output_path = CANONICAL_OUTPUT_PATH
             self._seed_passed_report(output_path)
 
             completed = self._run_cli_subprocess(
@@ -760,9 +1050,9 @@ class EffectAdapterReportTests(unittest.TestCase):
             self.assertFalse(output_path.exists())
 
     def test_subprocess_output_equals_variant_clears_before_parser_error(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "report.json"
-            temporary_path = self._seed_atomic_temporary(output_path)
+        with tempfile.TemporaryDirectory():
+            output_path = CANONICAL_OUTPUT_PATH
+            self._seed_atomic_temporary()
             self._seed_passed_report(output_path)
 
             completed = self._run_cli_subprocess(
@@ -775,8 +1065,9 @@ class EffectAdapterReportTests(unittest.TestCase):
             )
 
             self.assertEqual(2, completed.returncode)
-            self.assertFalse(output_path.exists())
-            self.assertFalse(temporary_path.exists())
+            self.assertIn("temporary output collision", completed.stderr)
+            self.assertFalse(CANONICAL_OUTPUT_PATH.exists())
+            self.assertFalse(OWNED_TEMP_PATH.exists())
 
     def test_subprocess_repeated_and_malformed_outputs_clear_every_candidate(self):
         cases = (
@@ -800,17 +1091,12 @@ class EffectAdapterReportTests(unittest.TestCase):
         )
         for label, output_arguments in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
-                first_path = Path(directory) / "first.json"
-                second_path = Path(directory) / "second.json"
-                paths = (first_path,) if label != "conflicting" else (
-                    first_path,
-                    second_path,
-                )
-                temporary_paths = tuple(
-                    self._seed_atomic_temporary(path) for path in paths
-                )
-                for path in paths:
-                    self._seed_passed_report(path)
+                first_path = CANONICAL_OUTPUT_PATH
+                second_path = Path(directory) / "external.json"
+                self._seed_passed_report(first_path)
+                external_seed = b'{"passed":true,"owner":"external"}\n'
+                if label == "conflicting":
+                    second_path.write_bytes(external_seed)
 
                 completed = self._run_cli_subprocess(
                     "--fixture",
@@ -822,10 +1108,9 @@ class EffectAdapterReportTests(unittest.TestCase):
 
                 self.assertEqual(2, completed.returncode)
                 self.assertIn("--output", completed.stderr)
-                self.assertTrue(all(not path.exists() for path in paths))
-                self.assertTrue(
-                    all(not path.exists() for path in temporary_paths)
-                )
+                self.assertFalse(first_path.exists())
+                if label == "conflicting":
+                    self.assertEqual(external_seed, second_path.read_bytes())
 
     def test_subprocess_does_not_treat_unrelated_values_as_output_paths(self):
         with tempfile.TemporaryDirectory() as directory:
