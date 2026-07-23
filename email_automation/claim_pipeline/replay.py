@@ -1483,6 +1483,7 @@ def run_claim_replay(
     adapter: ProposalAdapter,
     identity: ReplayIdentity,
     telemetry: ProviderTelemetry | None = None,
+    fail_fast: bool = False,
 ) -> ReplayReport:
     """Run the current saved boundary catalogs without persistence or effects."""
 
@@ -1520,6 +1521,9 @@ def run_claim_replay(
         case.case_id: set() for case, _ in replay_cases
     }
 
+    if not isinstance(fail_fast, bool):
+        raise TypeError("fail_fast must be boolean")
+    stop_requested = False
     for repeat_index in range(identity.repeats):
         for case in interpretation_catalog.cases:
             actual = _interpretation_outcome(case)
@@ -1582,6 +1586,9 @@ def run_claim_replay(
                 outcome_digests[case_id].add(failed.outcome_digest)
                 quality_outcome_digests[case_id].add(failed.quality_outcome_digest)
                 results.append(failed)
+                if fail_fast:
+                    stop_requested = True
+                    break
                 continue
             if not isinstance(response, ProposalResponse):
                 observed_usage, telemetry_error = _reconciled_case_usage(
@@ -1601,6 +1608,9 @@ def run_claim_replay(
                 outcome_digests[case_id].add(failed.outcome_digest)
                 quality_outcome_digests[case_id].add(failed.quality_outcome_digest)
                 results.append(failed)
+                if fail_fast:
+                    stop_requested = True
+                    break
                 continue
             observed_usage, telemetry_error = _reconciled_case_usage(
                 provider_id=identity.provider_id,
@@ -1620,6 +1630,9 @@ def run_claim_replay(
                 outcome_digests[case_id].add(failed.outcome_digest)
                 quality_outcome_digests[case_id].add(failed.quality_outcome_digest)
                 results.append(failed)
+                if fail_fast:
+                    stop_requested = True
+                    break
                 continue
             extracted = extract_claims(
                 tenant_id=source.message.tenant_id,
@@ -1720,6 +1733,11 @@ def run_claim_replay(
                 )
             )
             quality_outcome_digests[case_id].add(quality_outcome_digest)
+            if fail_fast and not passed:
+                stop_requested = True
+                break
+        if stop_requested:
+            break
 
     interpretation_variance = tuple(
         sorted(

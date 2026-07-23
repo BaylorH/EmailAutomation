@@ -104,8 +104,9 @@ oracle that simply ignores those predicates.
 - Retry count: zero at both SDK and harness layers.
 - Model, SDK, prompt, schema, timeout, and maximum output tokens remain pinned.
 - Before each invocation, reserve a conservative upper bound using UTF-8 input
-  bytes as the maximum input-token count plus the transport's pinned maximum
-  output tokens and pinned list prices.
+  bytes as the maximum text-token count, a fixed 4,096-token allowance for
+  request framing and tokenizer overhead, the transport's pinned maximum output
+  tokens, and pinned list prices.
 - Refuse the call if the next reservation would exceed 1,500,000 tokens or
   5,000,000 micro-USD. Report both conservative reservations and observed
   provider usage.

@@ -171,6 +171,32 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             {name for name in expected_names if not hasattr(claim_pipeline, name)},
         )
 
+    def test_provider_policy_shadow_api_is_exposed_at_package_boundary(self):
+        expected_names = {
+            "PROVIDER_POLICY_FIXTURE_SCHEMA_VERSION",
+            "PROVIDER_POLICY_SHADOW_PROFILE",
+            "SUPPORTED_PROVIDER_POLICY_GAPS",
+            "BudgetedProviderTransport",
+            "ProviderBudgetExceeded",
+            "ProviderBudgetLimits",
+            "ProviderPolicyFixtureCase",
+            "ProviderPolicyFixtureCatalog",
+            "ProviderPolicyFixtureValidationError",
+            "ProviderPolicyShadowCaseResult",
+            "ProviderPolicyShadowIdentity",
+            "ProviderPolicyShadowReport",
+            "ProviderReservationSnapshot",
+            "RecordedProviderQualityProposalAdapter",
+            "load_provider_policy_fixture_catalog",
+            "run_provider_policy_shadow",
+            "select_provider_policy_cases",
+        }
+
+        self.assertEqual(
+            set(),
+            {name for name in expected_names if not hasattr(claim_pipeline, name)},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

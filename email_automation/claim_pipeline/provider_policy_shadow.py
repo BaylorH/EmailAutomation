@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -99,6 +100,158 @@ def _selected_provider_quality_catalog(
         manifest_hash=selection_hash,
         cases=tuple(provider_by_id[case_id] for case_id in selected_ids),
     )
+
+
+def select_provider_policy_cases(
+    catalog: ProviderPolicyFixtureCatalog,
+    *,
+    case_ids: tuple[str, ...],
+) -> ProviderPolicyFixtureCatalog:
+    """Select a strict case subset and bind the selection into a fresh hash."""
+
+    if not case_ids or len(case_ids) != len(set(case_ids)):
+        raise ValueError("provider-policy case selection must be non-empty and unique")
+    by_id = {case.case_id: case for case in catalog.cases}
+    unknown = set(case_ids) - set(by_id)
+    if unknown:
+        raise ValueError("provider-policy case selection contains an unknown case")
+    ordered_ids = tuple(sorted(case_ids))
+    manifest_hash = _digest(
+        {
+            "profile": PROVIDER_POLICY_SHADOW_PROFILE,
+            "sourceFixtureHash": catalog.manifest_hash,
+            "caseIds": ordered_ids,
+        }
+    )
+    selected = tuple(by_id[case_id] for case_id in ordered_ids)
+    return ProviderPolicyFixtureCatalog(
+        schema_version=catalog.schema_version,
+        catalog_id="provider-policy-selection-v1",
+        provider_quality_fixture_hash=catalog.provider_quality_fixture_hash,
+        cases=selected,
+        covered_dimensions=frozenset(
+            dimension for case in selected for dimension in case.dimensions
+        ),
+        manifest_hash=manifest_hash,
+    )
+
+
+class ProviderBudgetExceeded(ValueError):
+    """Raised before a provider call that would exceed a hard reservation cap."""
+
+
+@dataclass(frozen=True)
+class ProviderBudgetLimits:
+    max_calls: int
+    max_reserved_tokens: int
+    max_reserved_cost_microusd: int
+
+    def __post_init__(self) -> None:
+        for field in (
+            "max_calls",
+            "max_reserved_tokens",
+            "max_reserved_cost_microusd",
+        ):
+            value = getattr(self, field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{field} must be a nonnegative integer")
+
+
+@dataclass(frozen=True)
+class ProviderReservationSnapshot:
+    reserved_calls: int = 0
+    reserved_tokens: int = 0
+    reserved_cost_microusd: int = 0
+
+
+class BudgetedProviderTransport:
+    """Reserve conservative maximum provider exposure before each invocation."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        limits: ProviderBudgetLimits,
+        max_output_tokens: int,
+        input_token_overhead: int,
+        input_cost_microusd_per_million: int,
+        output_cost_microusd_per_million: int,
+    ):
+        self.provider_id = getattr(delegate, "provider_id", "")
+        self.model_id = getattr(delegate, "model_id", "")
+        if not self.provider_id or not self.model_id:
+            raise ValueError("budgeted provider transport identity is incomplete")
+        for label, value in (
+            ("max_output_tokens", max_output_tokens),
+            ("input_cost_microusd_per_million", input_cost_microusd_per_million),
+            ("output_cost_microusd_per_million", output_cost_microusd_per_million),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{label} must be positive")
+        if (
+            not isinstance(input_token_overhead, int)
+            or isinstance(input_token_overhead, bool)
+            or input_token_overhead < 0
+        ):
+            raise ValueError("input_token_overhead must be nonnegative")
+        if not callable(getattr(delegate, "invoke", None)) or not callable(
+            getattr(delegate, "snapshot", None)
+        ):
+            raise ValueError("budgeted provider transport is incomplete")
+        self._delegate = delegate
+        self.limits = limits
+        self._max_output_tokens = max_output_tokens
+        self._input_token_overhead = input_token_overhead
+        self._input_rate = input_cost_microusd_per_million
+        self._output_rate = output_cost_microusd_per_million
+        self._reserved_calls = 0
+        self._reserved_tokens = 0
+        self._reserved_cost_microusd = 0
+
+    def snapshot(self) -> Any:
+        return self._delegate.snapshot()
+
+    def reservation_snapshot(self) -> ProviderReservationSnapshot:
+        return ProviderReservationSnapshot(
+            reserved_calls=self._reserved_calls,
+            reserved_tokens=self._reserved_tokens,
+            reserved_cost_microusd=self._reserved_cost_microusd,
+        )
+
+    def invoke(
+        self,
+        *,
+        case_id: str,
+        instructions: str,
+        payload: str,
+    ) -> Any:
+        max_input_tokens = (
+            len(f"{instructions}{payload}".encode("utf-8"))
+            + self._input_token_overhead
+        )
+        reserved_tokens = max_input_tokens + self._max_output_tokens
+        reserved_cost = math.ceil(
+            max_input_tokens * self._input_rate / 1_000_000
+        ) + math.ceil(
+            self._max_output_tokens * self._output_rate / 1_000_000
+        )
+        next_calls = self._reserved_calls + 1
+        next_tokens = self._reserved_tokens + reserved_tokens
+        next_cost = self._reserved_cost_microusd + reserved_cost
+        if next_calls > self.limits.max_calls:
+            raise ProviderBudgetExceeded("provider call cap would be exceeded")
+        if next_tokens > self.limits.max_reserved_tokens:
+            raise ProviderBudgetExceeded("provider token reservation cap would be exceeded")
+        if next_cost > self.limits.max_reserved_cost_microusd:
+            raise ProviderBudgetExceeded("provider cost reservation cap would be exceeded")
+        self._reserved_calls = next_calls
+        self._reserved_tokens = next_tokens
+        self._reserved_cost_microusd = next_cost
+        return self._delegate.invoke(
+            case_id=case_id,
+            instructions=instructions,
+            payload=payload,
+        )
 
 
 class RecordedProviderQualityProposalAdapter:
@@ -210,6 +363,10 @@ class ProviderPolicyShadowIdentity:
     model_id: str
     prompt_id: str
     prompt_hash: str
+    call_mode: str
+    max_provider_calls: int
+    max_reserved_tokens: int
+    max_reserved_cost_microusd: int
     repeats: int
     case_count: int
     planned_calls: int
@@ -235,7 +392,13 @@ class ProviderPolicyShadowIdentity:
             "repeats",
             "case_count",
         }
-        if set(values) != required:
+        optional = {
+            "call_mode",
+            "max_provider_calls",
+            "max_reserved_tokens",
+            "max_reserved_cost_microusd",
+        }
+        if set(values) - (required | optional) or required - set(values):
             raise ValueError("provider-policy identity fields are incomplete")
         for field in (
             "source_tree_hash",
@@ -272,6 +435,22 @@ class ProviderPolicyShadowIdentity:
             raise ValueError("case_count must be positive")
         planned_calls = repeats * case_count
         normalized = dict(values)
+        normalized.setdefault("call_mode", "recorded")
+        normalized.setdefault("max_provider_calls", planned_calls)
+        normalized.setdefault("max_reserved_tokens", 0)
+        normalized.setdefault("max_reserved_cost_microusd", 0)
+        if normalized["call_mode"] not in {"recorded", "smoke", "final"}:
+            raise ValueError("call_mode is unsupported")
+        for field in (
+            "max_provider_calls",
+            "max_reserved_tokens",
+            "max_reserved_cost_microusd",
+        ):
+            value = normalized[field]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{field} must be nonnegative")
+        if normalized["max_provider_calls"] < planned_calls:
+            raise ValueError("provider call cap is below the planned call count")
         normalized["planned_calls"] = planned_calls
         normalized["identity_id"] = _digest(
             {"profile": PROVIDER_POLICY_SHADOW_PROFILE, **normalized}
@@ -296,6 +475,10 @@ class ProviderPolicyShadowIdentity:
             "modelId": self.model_id,
             "promptId": self.prompt_id,
             "promptHash": self.prompt_hash,
+            "callMode": self.call_mode,
+            "maxProviderCalls": self.max_provider_calls,
+            "maxReservedTokens": self.max_reserved_tokens,
+            "maxReservedCostMicrousd": self.max_reserved_cost_microusd,
             "repeats": self.repeats,
             "caseCount": self.case_count,
             "plannedCalls": self.planned_calls,
@@ -340,6 +523,9 @@ class ProviderPolicyShadowReport:
     latency_ms: int
     cost_microusd: int
     usage_complete: bool
+    reserved_calls: int
+    reserved_tokens: int
+    reserved_cost_microusd: int
     result_digest: str
 
     @property
@@ -365,6 +551,9 @@ class ProviderPolicyShadowReport:
                 "latencyMs": self.latency_ms,
                 "costMicrousd": self.cost_microusd,
                 "usageComplete": self.usage_complete,
+                "reservedCalls": self.reserved_calls,
+                "reservedTokens": self.reserved_tokens,
+                "reservedCostMicrousd": self.reserved_cost_microusd,
             },
             "resultDigest": self.result_digest,
             "results": [item.to_dict() for item in self.results],
@@ -623,6 +812,7 @@ def run_provider_policy_shadow(
     adapter: ProposalAdapter,
     identity: ProviderPolicyShadowIdentity,
     telemetry: ProviderTelemetry | None = None,
+    budget: BudgetedProviderTransport | None = None,
 ) -> ProviderPolicyShadowReport:
     """Run the bounded provider-policy corpus without persistence or effects."""
 
@@ -634,6 +824,18 @@ def run_provider_policy_shadow(
         provider_policy_catalog=provider_policy_catalog,
         adapter=adapter,
     )
+    if identity.provider_id != RECORDED_PROVIDER_ID:
+        if budget is None or telemetry is not budget:
+            raise ValueError(
+                "provider-policy calls require one budgeted telemetry transport"
+            )
+        expected_limits = ProviderBudgetLimits(
+            max_calls=identity.max_provider_calls,
+            max_reserved_tokens=identity.max_reserved_tokens,
+            max_reserved_cost_microusd=identity.max_reserved_cost_microusd,
+        )
+        if budget.limits != expected_limits:
+            raise ValueError("provider-policy identity budget does not match transport")
     selected_provider_catalog = _selected_provider_quality_catalog(
         provider_quality_catalog,
         provider_policy_catalog,
@@ -665,6 +867,7 @@ def run_provider_policy_shadow(
         adapter=capturing,
         identity=replay_identity,
         telemetry=telemetry,
+        fail_fast=True,
     )
 
     interpretation_by_id = {
@@ -687,8 +890,27 @@ def run_provider_policy_shadow(
     for repeat_index in range(identity.repeats):
         for case in ordered_cases:
             provider_case = provider_by_id[case.provider_case_id]
-            quality = quality_by_key[(case.provider_case_id, repeat_index)]
+            quality = quality_by_key.get((case.provider_case_id, repeat_index))
             subject_keys = tuple(sorted(str(item["key"]) for item in case.subjects))
+            if quality is None:
+                mismatch_codes = ("not_run_after_failure",)
+                outcome_digest = _digest(
+                    {"caseId": case.case_id, "mismatchCodes": mismatch_codes}
+                )
+                results.append(
+                    ProviderPolicyShadowCaseResult(
+                        case_id=case.case_id,
+                        repeat_index=repeat_index,
+                        subject_keys=subject_keys,
+                        disposition="blocker",
+                        gap_codes=(),
+                        mismatch_codes=mismatch_codes,
+                        policy_outcome_digest=outcome_digest,
+                        passed=False,
+                    )
+                )
+                outcome_digests[case.case_id].add(outcome_digest)
+                continue
             if not quality.passed:
                 mismatch_codes = ("provider_quality_failed",)
                 outcome_digest = _digest(
@@ -795,6 +1017,11 @@ def run_provider_policy_shadow(
         and not variance
     )
     result_digest = _digest([item.to_dict() for item in ordered_results])
+    reservations = (
+        budget.reservation_snapshot()
+        if budget is not None
+        else ProviderReservationSnapshot()
+    )
     return ProviderPolicyShadowReport(
         identity=identity,
         evaluation_passed=evaluation_passed,
@@ -808,15 +1035,23 @@ def run_provider_policy_shadow(
         latency_ms=provider_report.latency_ms,
         cost_microusd=provider_report.cost_microusd,
         usage_complete=provider_report.usage_complete,
+        reserved_calls=reservations.reserved_calls,
+        reserved_tokens=reservations.reserved_tokens,
+        reserved_cost_microusd=reservations.reserved_cost_microusd,
         result_digest=result_digest,
     )
 
 
 __all__ = [
     "PROVIDER_POLICY_SHADOW_PROFILE",
+    "BudgetedProviderTransport",
+    "ProviderBudgetExceeded",
+    "ProviderBudgetLimits",
+    "ProviderReservationSnapshot",
     "ProviderPolicyShadowCaseResult",
     "ProviderPolicyShadowIdentity",
     "ProviderPolicyShadowReport",
     "RecordedProviderQualityProposalAdapter",
     "run_provider_policy_shadow",
+    "select_provider_policy_cases",
 ]

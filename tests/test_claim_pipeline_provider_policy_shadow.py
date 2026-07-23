@@ -35,8 +35,10 @@ class _TamperedAdapter:
         self.prompt_hash = delegate.prompt_hash
         self._delegate = delegate
         self._case_id = case_id
+        self.calls = 0
 
     def propose(self, **kwargs):
+        self.calls += 1
         response = self._delegate.propose(**kwargs)
         if kwargs["case_id"] != self._case_id:
             return response
@@ -156,12 +158,19 @@ class ProviderPolicyShadowTests(unittest.TestCase):
 
         self.assertFalse(report.evaluation_passed)
         self.assertFalse(report.passed)
+        self.assertEqual(6, adapter.calls)
         failed = next(
             item
             for item in report.results
             if item.case_id == "unavailable-optout-suppression"
         )
         self.assertIn("provider_quality_failed", failed.mismatch_codes)
+        stopped = next(
+            item
+            for item in report.results
+            if item.case_id == "workflow-intents-visible"
+        )
+        self.assertEqual(("not_run_after_failure",), stopped.mismatch_codes)
 
     def test_fixture_order_does_not_change_semantic_result_digest(self):
         baseline = self._run()
