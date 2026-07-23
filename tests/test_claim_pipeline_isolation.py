@@ -1,4 +1,5 @@
 import ast
+import copy
 import hashlib
 import json
 import re
@@ -8,11 +9,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from email_automation import claim_pipeline
-from email_automation.claim_pipeline import effect_adapter
-from email_automation.claim_pipeline import effect_adapter_fixtures
 
-
+_TRUSTED_SHA256 = hashlib.sha256
+_TRUSTED_READ_BYTES = Path.read_bytes
 PACKAGE_ROOT = (
     Path(__file__).resolve().parents[1]
     / "email_automation"
@@ -27,6 +26,7 @@ EFFECT_ADAPTER_PATHS = (
     EFFECT_ADAPTER_PATH,
     EFFECT_ADAPTER_FIXTURES_PATH,
 )
+# Reviewed source locks are byte-exact and LF-canonical.
 REVIEWED_SOURCE_DIGESTS = {
     INITIALIZER_PATH: (
         "6aa6e12ca1ff46265e8ea7233e5d647a491970770246bd98d62ca0e2307a6577"
@@ -38,6 +38,40 @@ REVIEWED_SOURCE_DIGESTS = {
         "c2c38d1f943eaa0be279ec047fb45bffe4a87a5441f7a9e1234b4260b647fba1"
     ),
 }
+
+
+def _sha256_file(path):
+    return _TRUSTED_SHA256(_TRUSTED_READ_BYTES(path)).hexdigest()
+
+
+def _assert_reviewed_digest(path, expected):
+    source = _TRUSTED_READ_BYTES(path)
+    if b"\r" in source:
+        raise AssertionError(
+            f"reviewed source must be LF-canonical: {path.name}"
+        )
+    actual = _TRUSTED_SHA256(source).hexdigest()
+    if actual != expected:
+        raise AssertionError(
+            "reviewed source digest mismatch for "
+            f"{path.name}: expected {expected}, got {actual}"
+        )
+
+
+def _preflight_reviewed_sources(
+    reviewed_sources=REVIEWED_SOURCE_DIGESTS,
+):
+    for path, expected in reviewed_sources.items():
+        _assert_reviewed_digest(path, expected)
+
+
+_preflight_reviewed_sources()
+
+from email_automation import claim_pipeline
+from email_automation.claim_pipeline import effect_adapter
+from email_automation.claim_pipeline import effect_adapter_fixtures
+
+
 ALLOWED_IMPORT_PREFIXES = (
     "__future__",
     "collections.abc",
@@ -126,23 +160,61 @@ EXPECTED_EFFECT_ADAPTER_IMPORTS = {
         }
     ),
 }
+EXPECTED_EFFECT_ADAPTER_BINDINGS = frozenset(
+    {
+        ("effect_adapter", "ActionStateSnapshot", "ActionStateSnapshot"),
+        ("effect_adapter", "ApprovalGrant", "ApprovalGrant"),
+        ("effect_adapter", "DryRunCommitReceipt", "DryRunCommitReceipt"),
+        ("effect_adapter", "DryRunEffectReceipt", "DryRunEffectReceipt"),
+        ("effect_adapter", "DryRunReason", "DryRunReason"),
+        ("effect_adapter", "DryRunStatus", "DryRunStatus"),
+        ("effect_adapter", "EffectAdapterRequest", "EffectAdapterRequest"),
+        (
+            "effect_adapter",
+            "evaluate_effect_plan",
+            "evaluate_effect_plan",
+        ),
+        (
+            "effect_adapter_fixtures",
+            "EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION",
+            "EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION",
+        ),
+        (
+            "effect_adapter_fixtures",
+            "EffectAdapterFixtureCatalog",
+            "EffectAdapterFixtureCatalog",
+        ),
+        (
+            "effect_adapter_fixtures",
+            "EffectAdapterFixtureCase",
+            "EffectAdapterFixtureCase",
+        ),
+        (
+            "effect_adapter_fixtures",
+            "EffectAdapterFixtureResult",
+            "EffectAdapterFixtureResult",
+        ),
+        (
+            "effect_adapter_fixtures",
+            "EffectAdapterFixtureValidationError",
+            "EffectAdapterFixtureValidationError",
+        ),
+        (
+            "effect_adapter_fixtures",
+            "load_effect_adapter_fixture_catalog",
+            "load_effect_adapter_fixture_catalog",
+        ),
+        (
+            "effect_adapter_fixtures",
+            "run_effect_adapter_fixture_case",
+            "run_effect_adapter_fixture_case",
+        ),
+    }
+)
 EFFECT_ADAPTER_MODULES = {
     "effect_adapter": effect_adapter,
     "effect_adapter_fixtures": effect_adapter_fixtures,
 }
-
-
-def _sha256_file(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _assert_reviewed_digest(path, expected):
-    actual = _sha256_file(path)
-    if actual != expected:
-        raise AssertionError(
-            "reviewed source digest mismatch for "
-            f"{path.name}: expected {expected}, got {actual}"
-        )
 
 
 def _resolved_import_names(node):
@@ -444,10 +516,72 @@ def _effect_adapter_import_bindings(tree):
     return tuple(bindings)
 
 
+def _effect_adapter_api_violations(tree):
+    bindings = frozenset(_effect_adapter_import_bindings(tree))
+    return {
+        f"missing effect adapter binding:{binding!r}"
+        for binding in EXPECTED_EFFECT_ADAPTER_BINDINGS - bindings
+    } | {
+        f"unexpected effect adapter binding:{binding!r}"
+        for binding in bindings - EXPECTED_EFFECT_ADAPTER_BINDINGS
+    }
+
+
 class ClaimPipelineIsolationTests(unittest.TestCase):
+    def test_reviewed_preflight_precedes_protected_imports(self):
+        tree = ast.parse(
+            Path(__file__).read_text(encoding="utf-8"),
+            filename=__file__,
+        )
+        preflight_indexes = [
+            index
+            for index, node in enumerate(tree.body)
+            if (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id
+                == "_preflight_reviewed_sources"
+            )
+        ]
+        protected_import_indexes = [
+            index
+            for index, node in enumerate(tree.body)
+            if (
+                isinstance(node, ast.ImportFrom)
+                and (
+                    node.module == "email_automation"
+                    or (
+                        node.module is not None
+                        and node.module.startswith(
+                            "email_automation.claim_pipeline"
+                        )
+                    )
+                )
+            )
+        ]
+
+        self.assertEqual(1, len(preflight_indexes))
+        self.assertTrue(protected_import_indexes)
+        self.assertLess(
+            preflight_indexes[0],
+            min(protected_import_indexes),
+        )
+
     def test_reviewed_effect_sources_are_byte_pinned(self):
         for path, expected in REVIEWED_SOURCE_DIGESTS.items():
             with self.subTest(path=path.name):
+                _assert_reviewed_digest(path, expected)
+
+    def test_reviewed_digest_rejects_crlf_before_hash_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reviewed.py"
+            path.write_bytes(b"reviewed source\r\n")
+            expected = _sha256_file(path)
+
+            with self.assertRaisesRegex(
+                AssertionError, "LF-canonical"
+            ):
                 _assert_reviewed_digest(path, expected)
 
     def test_reviewed_digest_rejects_one_byte_change(self):
@@ -461,6 +595,27 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 AssertionError, "reviewed source digest mismatch"
             ):
                 _assert_reviewed_digest(path, expected)
+
+    def test_reviewed_preflight_rejects_before_source_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "reviewed.py"
+            marker = root / "executed"
+            source = (
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('executed')\n"
+            ).encode("utf-8")
+            path.write_bytes(source)
+            expected = _sha256_file(path)
+            path.write_bytes(source + b"# changed\n")
+
+            with self.assertRaisesRegex(
+                AssertionError, "reviewed source digest mismatch"
+            ):
+                _preflight_reviewed_sources({path: expected})
+                exec(compile(path.read_bytes(), str(path), "exec"))
+
+            self.assertFalse(marker.exists())
 
     def test_relative_imports_are_resolved_against_claim_pipeline_package(
         self,
@@ -637,18 +792,23 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             filename=str(INITIALIZER_PATH),
         )
         bindings = _effect_adapter_import_bindings(initializer_tree)
-        bound_names = {
-            bound_name for _, _, bound_name in bindings
-        }
 
         self.assertEqual(
-            EXPECTED_EFFECT_ADAPTER_API, bound_names
+            set(), _effect_adapter_api_violations(initializer_tree)
         )
         self.assertLessEqual(
             EXPECTED_EFFECT_ADAPTER_API,
             set(claim_pipeline.__all__),
         )
-        for module_name, source_name, bound_name in bindings:
+        self.assertEqual(
+            EXPECTED_EFFECT_ADAPTER_BINDINGS,
+            frozenset(bindings),
+        )
+        for (
+            module_name,
+            source_name,
+            bound_name,
+        ) in EXPECTED_EFFECT_ADAPTER_BINDINGS:
             with self.subTest(name=bound_name):
                 self.assertFalse(source_name.startswith("_"))
                 self.assertIs(
@@ -658,6 +818,58 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                         source_name,
                     ),
                 )
+
+    def test_effect_adapter_api_rejects_swapped_public_aliases(self):
+        initializer_tree = ast.parse(
+            INITIALIZER_PATH.read_text(encoding="utf-8"),
+            filename=str(INITIALIZER_PATH),
+        )
+        mutated_tree = copy.deepcopy(initializer_tree)
+        adapter_import = next(
+            node
+            for node in mutated_tree.body
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.level == 1
+                and node.module == "effect_adapter"
+            )
+        )
+        aliases = {
+            alias.name: alias for alias in adapter_import.names
+        }
+        aliases["ActionStateSnapshot"].asname = "ApprovalGrant"
+        aliases["ApprovalGrant"].asname = "ActionStateSnapshot"
+
+        self.assertTrue(
+            _effect_adapter_api_violations(mutated_tree)
+        )
+
+    def test_effect_adapter_api_rejects_private_source_alias(self):
+        initializer_tree = ast.parse(
+            INITIALIZER_PATH.read_text(encoding="utf-8"),
+            filename=str(INITIALIZER_PATH),
+        )
+        mutated_tree = copy.deepcopy(initializer_tree)
+        adapter_import = next(
+            node
+            for node in mutated_tree.body
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.level == 1
+                and node.module == "effect_adapter"
+            )
+        )
+        evaluate_alias = next(
+            alias
+            for alias in adapter_import.names
+            if alias.name == "evaluate_effect_plan"
+        )
+        evaluate_alias.name = "_stable_id"
+        evaluate_alias.asname = "evaluate_effect_plan"
+
+        self.assertTrue(
+            _effect_adapter_api_violations(mutated_tree)
+        )
 
     def test_private_adapter_declarations_are_not_exported(self):
         exported_names = set(claim_pipeline.__all__)
