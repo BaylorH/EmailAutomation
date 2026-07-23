@@ -237,6 +237,114 @@ validate_decision
 select_provider_policy_cases
 """.split()
 )
+EXPECTED_PACKAGE_IMPORTS = {
+    "claim_fixtures": """
+        CLAIM_FIXTURE_SCHEMA_VERSION ClaimFixtureCase ClaimFixtureCatalog
+        ClaimFixtureValidationError load_claim_fixture_catalog
+    """.split(),
+    "contracts": """
+        ActionPlan ActionType Actor ActorRole ApprovalClass CampaignContract
+        Claim ClaimModality ClaimPolarity ClaimPredicate CommitReceipt
+        CompletenessState ConversationState ContractAuthority DecisionSnapshot
+        Direction EffectReceipt EffectStatus EntityRef EntityType
+        EvidenceEnvelope EvidenceFreshness EvidenceSource ExecutionScope
+        FitState MarketState PlannedAction
+    """.split(),
+    "effect_adapter": """
+        ActionStateSnapshot ApprovalGrant DryRunCommitReceipt
+        DryRunEffectReceipt DryRunReason DryRunStatus EffectAdapterRequest
+        evaluate_effect_plan
+    """.split(),
+    "effect_adapter_fixtures": """
+        EFFECT_ADAPTER_FIXTURE_SCHEMA_VERSION EffectAdapterFixtureCase
+        EffectAdapterFixtureCatalog EffectAdapterFixtureResult
+        EffectAdapterFixtureValidationError load_effect_adapter_fixture_catalog
+        run_effect_adapter_fixture_case
+    """.split(),
+    "entities": """
+        EntityMatch EntityResolutionResult EntitySeed ResolutionIssue
+        canonicalize_address extract_addresses extract_suites resolve_entities
+    """.split(),
+    "evidence": """
+        EvidenceFailure EvidenceNormalizationResult ExternalEvidenceInput
+        RawMessageEvidence normalize_message_evidence
+    """.split(),
+    "extraction": """
+        CLAIM_EXTRACTION_SCHEMA_VERSION ClaimExtractionIssue
+        ClaimExtractionRequest ClaimExtractionResult
+        build_claim_extraction_request extract_claims
+    """.split(),
+    "fixtures": """
+        FIXTURE_SCHEMA_VERSION REQUIRED_DIMENSIONS FixtureCase FixtureCatalog
+        FixtureValidationError load_fixture_catalog
+    """.split(),
+    "interpretation_fixtures": """
+        INTERPRETATION_FIXTURE_SCHEMA_VERSION InterpretationFixtureCase
+        InterpretationFixtureCatalog InterpretationFixtureValidationError
+        load_interpretation_fixture_catalog
+    """.split(),
+    "legacy_shadow": """
+        LegacyActionAttempt LegacyProjection LegacyShadowCaseResult
+        LegacyShadowDiscrepancy LegacyShadowIdentity LegacyShadowReport
+        compare_legacy_case project_legacy_proposal run_legacy_shadow
+    """.split(),
+    "legacy_shadow_fixtures": """
+        LEGACY_SHADOW_FIXTURE_SCHEMA_VERSION LegacyShadowFixtureCase
+        LegacyShadowFixtureCatalog LegacyShadowFixtureValidationError
+        load_legacy_shadow_fixture_catalog
+    """.split(),
+    "mode": """
+        ClaimPipelineMode PipelineGate PipelineScope parse_pipeline_mode
+    """.split(),
+    "policy": """
+        ClaimConflict EntityPolicyResult PolicyEvaluationRequest
+        PolicyEvaluationResult evaluate_policy
+    """.split(),
+    "policy_fixtures": """
+        POLICY_FIXTURE_SCHEMA_VERSION POLICY_REASON_CODES
+        REQUIRED_POLICY_DIMENSIONS PolicyFixtureCase PolicyFixtureCatalog
+        PolicyFixtureValidationError load_policy_fixture_catalog
+    """.split(),
+    "provider_policy_fixtures": """
+        PROVIDER_POLICY_FIXTURE_SCHEMA_VERSION SUPPORTED_PROVIDER_POLICY_GAPS
+        ProviderPolicyFixtureCase ProviderPolicyFixtureCatalog
+        ProviderPolicyFixtureValidationError load_provider_policy_fixture_catalog
+    """.split(),
+    "provider_policy_shadow": """
+        PROVIDER_POLICY_SHADOW_PROFILE BudgetedProviderTransport
+        ProviderBudgetExceeded ProviderBudgetLimits
+        ProviderPolicyShadowCaseResult ProviderPolicyShadowIdentity
+        ProviderPolicyShadowReport ProviderReservationSnapshot
+        RecordedProviderQualityProposalAdapter run_provider_policy_shadow
+        select_provider_policy_cases
+    """.split(),
+    "provider_quality_fixtures": """
+        PROVIDER_QUALITY_FIXTURE_SCHEMA_VERSION SUPPORTED_REVIEW_CATEGORIES
+        ProviderQualityFixtureCase ProviderQualityFixtureCatalog
+        ProviderQualityFixtureValidationError ProviderReviewExpectation
+        load_provider_quality_fixture_catalog
+    """.split(),
+    "provider_replay": """
+        PINNED_MODEL_ID PINNED_PROMPT_HASH PINNED_PROMPT_ID PINNED_PROVIDER_ID
+        PinnedProviderProposalAdapter ProviderTransportResult
+    """.split(),
+    "replay": """
+        InterpretationReplayResult MAX_REPLAY_CALLS MAX_REPLAY_REPEATS
+        ProposalAdapter ProposalResponse ProposalUsage RECORDED_MODEL_ID
+        RECORDED_PROMPT_HASH RECORDED_PROMPT_ID RECORDED_PROVIDER_ID
+        RecordedProposalAdapter ReplayCaseResult ReplayIdentity ReplayReport
+        run_claim_replay
+    """.split(),
+    "validation": """
+        ContractViolation validate_action_plan validate_claim_bundle
+        validate_decision
+    """.split(),
+}
+EXPECTED_PACKAGE_BINDING_PROVENANCE = {
+    name: f"email_automation.claim_pipeline.{module}.{name}"
+    for module, names in EXPECTED_PACKAGE_IMPORTS.items()
+    for name in names
+}
 EFFECT_ADAPTER_MODULES = frozenset(
     {
         "email_automation.claim_pipeline.effect_adapter",
@@ -318,62 +426,6 @@ def _boundary_surface_tokens(name):
     return _identifier_tokens(name) & FORBIDDEN_EFFECT_BOUNDARY_TOKENS
 
 
-def _is_dangerous_symbol(symbol):
-    return symbol in {
-        *DYNAMIC_IMPORT_SYMBOLS,
-        *FORBIDDEN_FUNCTION_SYMBOLS,
-        "dataclasses.dataclass",
-    }
-
-
-def _import_bindings(tree):
-    bindings = {}
-    simple_assignments = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                bound_name = alias.asname or alias.name.split(".", 1)[0]
-                bindings[bound_name] = alias.name
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                if node.level:
-                    module = _resolved_import_names(node)[0]
-                else:
-                    module = node.module
-                for alias in node.names:
-                    bindings[alias.asname or alias.name] = f"{module}.{alias.name}"
-            else:
-                for alias, resolved in zip(
-                    node.names, _resolved_import_names(node), strict=True
-                ):
-                    bindings[alias.asname or alias.name] = resolved
-        elif isinstance(node, ast.Assign):
-            simple_assignments.extend(
-                (target.id, node.value)
-                for target in node.targets
-                if isinstance(target, ast.Name)
-            )
-        elif isinstance(node, ast.AnnAssign) and isinstance(
-            node.target, ast.Name
-        ):
-            simple_assignments.append((node.target.id, node.value))
-
-    for _ in range(len(simple_assignments)):
-        changed = False
-        for bound_name, value in simple_assignments:
-            resolved = _resolved_symbol(value, bindings)
-            if resolved is None or bindings.get(bound_name) == resolved:
-                continue
-            current = bindings.get(bound_name)
-            if _is_dangerous_symbol(current):
-                continue
-            bindings[bound_name] = resolved
-            changed = True
-        if not changed:
-            break
-    return bindings
-
-
 def _resolved_symbol(node, bindings):
     if isinstance(node, ast.Name):
         return bindings.get(node.id, node.id)
@@ -392,6 +444,103 @@ def _resolved_symbol(node, bindings):
         if owner in {"__builtins__", "builtins"}:
             return f"builtins.{node.args[1].value}"
     return None
+
+
+def _imported_bindings(node):
+    bindings = {}
+    imported_symbols = set()
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            bound_name = alias.asname or alias.name.split(".", 1)[0]
+            bindings[bound_name] = alias.name
+            imported_symbols.add(alias.name)
+    elif isinstance(node, ast.ImportFrom):
+        if node.module:
+            module = (
+                _resolved_import_names(node)[0]
+                if node.level
+                else node.module
+            )
+            for alias in node.names:
+                resolved = f"{module}.{alias.name}"
+                bindings[alias.asname or alias.name] = resolved
+                imported_symbols.add(resolved)
+        else:
+            for alias, resolved in zip(
+                node.names, _resolved_import_names(node), strict=True
+            ):
+                bindings[alias.asname or alias.name] = resolved
+                imported_symbols.add(resolved)
+    return bindings, imported_symbols
+
+
+def _binding_environments(tree):
+    bindings_by_node = {}
+    imported_by_node = {}
+    callables_by_node = {}
+
+    def record(node, bindings, imported_symbols, callable_symbols):
+        for child in ast.walk(node):
+            bindings_by_node[child] = dict(bindings)
+            imported_by_node[child] = frozenset(imported_symbols)
+            callables_by_node[child] = frozenset(callable_symbols)
+
+    def walk_scope(statements, inherited, imported, callables):
+        bindings = dict(inherited)
+        imported_symbols = set(imported)
+        callable_symbols = set(callables)
+        for statement in statements:
+            record(
+                statement,
+                bindings,
+                imported_symbols,
+                callable_symbols,
+            )
+            if isinstance(
+                statement,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            ):
+                walk_scope(
+                    statement.body,
+                    bindings,
+                    imported_symbols,
+                    callable_symbols,
+                )
+
+            new_bindings, new_imports = _imported_bindings(statement)
+            bindings.update(new_bindings)
+            imported_symbols.update(new_imports)
+            if isinstance(
+                statement, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                symbol = f"<callable>:{statement.lineno}:{statement.name}"
+                bindings[statement.name] = symbol
+                callable_symbols.add(symbol)
+            elif isinstance(statement, ast.ClassDef):
+                bindings[statement.name] = (
+                    f"<class>:{statement.lineno}:{statement.name}"
+                )
+            elif isinstance(statement, ast.Assign):
+                resolved = _resolved_symbol(statement.value, bindings)
+                for target in statement.targets:
+                    if not isinstance(target, ast.Name):
+                        continue
+                    if resolved is None:
+                        bindings.pop(target.id, None)
+                    else:
+                        bindings[target.id] = resolved
+            elif isinstance(statement, ast.AnnAssign) and isinstance(
+                statement.target, ast.Name
+            ):
+                resolved = _resolved_symbol(statement.value, bindings)
+                if resolved is None:
+                    bindings.pop(statement.target.id, None)
+                else:
+                    bindings[statement.target.id] = resolved
+
+    record(tree, {}, set(), set())
+    walk_scope(tree.body, {}, set(), set())
+    return bindings_by_node, imported_by_node, callables_by_node
 
 
 def _function_surface_token(node, bindings):
@@ -418,9 +567,19 @@ def _contains_function_surface(node, bindings):
     )
 
 
-def _is_callable_reference(node, bindings, declared_callables):
+def _is_callable_reference(
+    node,
+    bindings,
+    callable_symbols,
+    imported_symbols,
+):
     resolved = _resolved_symbol(node, bindings)
-    if resolved in declared_callables or resolved in BUILTIN_CALLABLE_NAMES:
+    if resolved in callable_symbols or resolved in BUILTIN_CALLABLE_NAMES:
+        return True
+    if resolved is not None and any(
+        resolved == imported or resolved.startswith(f"{imported}.")
+        for imported in imported_symbols
+    ):
         return True
     return (
         resolved is not None
@@ -445,6 +604,24 @@ def _function_defaults(node):
     ):
         if default is not None:
             yield argument, default
+
+
+def _function_body_nodes(node):
+    pending = list(reversed(node.body))
+    while pending:
+        child = pending.pop()
+        yield child
+        if isinstance(
+            child,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.Lambda,
+            ),
+        ):
+            continue
+        pending.extend(reversed(list(ast.iter_child_nodes(child))))
 
 
 def _dataclass_default_expressions(value, bindings):
@@ -475,26 +652,28 @@ def _is_dataclass(class_node, bindings):
 
 def _schema_literal_keys(value):
     if isinstance(value, ast.Dict):
-        return {
-            key.value
-            for key in value.keys
-            if isinstance(key, ast.Constant) and isinstance(key.value, str)
-        }
+        keys = set()
+        for key, item in zip(value.keys, value.values, strict=True):
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                keys.add(key.value)
+            keys.update(_schema_literal_keys(item))
+        return keys
     if isinstance(value, (ast.List, ast.Set, ast.Tuple)):
-        return {
-            item.value
-            for item in value.elts
-            if isinstance(item, ast.Constant) and isinstance(item.value, str)
-        }
+        keys = set()
+        for item in value.elts:
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                keys.add(item.value)
+            else:
+                keys.update(_schema_literal_keys(item))
+        return keys
     if isinstance(value, ast.Call):
         keys = set()
         for argument in value.args:
             keys.update(_schema_literal_keys(argument))
-        keys.update(
-            keyword.arg
-            for keyword in value.keywords
-            if keyword.arg is not None
-        )
+        for keyword in value.keywords:
+            if keyword.arg is not None:
+                keys.add(keyword.arg)
+            keys.update(_schema_literal_keys(keyword.value))
         return keys
     return set()
 
@@ -526,18 +705,20 @@ def _schema_key_strings(tree):
 
 
 def _effect_boundary_violations(tree):
-    bindings = _import_bindings(tree)
-    declared_callables = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    (
+        bindings_by_node,
+        imported_by_node,
+        callables_by_node,
+    ) = _binding_environments(tree)
     violations = set()
 
     for imported in _import_violations(tree):
         violations.add(f"import:{imported}")
 
     for node in ast.walk(tree):
+        bindings = bindings_by_node.get(node, {})
+        imported_symbols = imported_by_node.get(node, frozenset())
+        callable_symbols = callables_by_node.get(node, frozenset())
         if isinstance(node, ast.Lambda):
             violations.add(f"lambda:{node.lineno}")
         if isinstance(node, (ast.Name, ast.Attribute)):
@@ -573,10 +754,41 @@ def _effect_boundary_violations(tree):
                 violations.update(f"argument:{token}" for token in forbidden)
             for argument, default in _function_defaults(node):
                 if _is_callable_reference(
-                    default, bindings, declared_callables
+                    default,
+                    bindings,
+                    callable_symbols,
+                    imported_symbols,
                 ):
                     violations.add(
                         f"function-valued-default:{argument.arg}"
+                    )
+            parameter_names = {argument.arg for argument in arguments}
+            class_method = any(
+                _resolved_symbol(
+                    decorator.func
+                    if isinstance(decorator, ast.Call)
+                    else decorator,
+                    bindings,
+                )
+                in {"builtins.classmethod", "classmethod"}
+                for decorator in node.decorator_list
+            )
+            safe_invoked_parameters = {
+                argument.arg
+                for argument in arguments
+                if (argument.arg == "cls" and class_method)
+                or _resolved_symbol(argument.annotation, bindings)
+                in {"builtins.type", "type"}
+            }
+            for child in _function_body_nodes(node):
+                if (
+                    isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Name)
+                    and child.func.id in parameter_names
+                    and child.func.id not in safe_invoked_parameters
+                ):
+                    violations.add(
+                        f"callable-parameter:{child.func.id}"
                     )
         elif isinstance(node, ast.ClassDef):
             forbidden = _boundary_surface_tokens(node.name)
@@ -588,18 +800,30 @@ def _effect_boundary_violations(tree):
                     field.target, ast.Name
                 ):
                     continue
+                field_bindings = bindings_by_node.get(field, bindings)
+                field_imports = imported_by_node.get(
+                    field, imported_symbols
+                )
+                field_callables = callables_by_node.get(
+                    field, callable_symbols
+                )
                 forbidden = _boundary_surface_tokens(field.target.id)
                 violations.update(f"dataclass-field:{token}" for token in forbidden)
                 if _contains_function_surface(
-                    field.annotation, bindings
-                ) or _contains_function_surface(field.value, bindings):
+                    field.annotation, field_bindings
+                ) or _contains_function_surface(
+                    field.value, field_bindings
+                ):
                     violations.add(f"function-valued-field:{field.target.id}")
                 if any(
                     _is_callable_reference(
-                        default, bindings, declared_callables
+                        default,
+                        field_bindings,
+                        field_callables,
+                        field_imports,
                     )
                     for default in _dataclass_default_expressions(
-                        field.value, bindings
+                        field.value, field_bindings
                     )
                 ):
                     violations.add(f"function-valued-field:{field.target.id}")
@@ -687,6 +911,33 @@ def _package_public_bindings(tree):
     }
 
 
+def _package_binding_provenance(tree):
+    bindings = {}
+    for node in tree.body:
+        imported, _ = _imported_bindings(node)
+        bindings.update(imported)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bindings[node.name] = f"<local-function>.{node.name}"
+        elif isinstance(node, ast.ClassDef):
+            bindings[node.name] = f"<local-class>.{node.name}"
+        elif isinstance(node, ast.Assign):
+            resolved = _resolved_symbol(node.value, bindings)
+            provenance = resolved or f"<{type(node.value).__name__}>"
+            for target in node.targets:
+                for name in _target_names(target):
+                    bindings[name] = provenance
+        elif isinstance(node, ast.AnnAssign):
+            resolved = _resolved_symbol(node.value, bindings)
+            provenance = resolved or f"<{type(node.value).__name__}>"
+            for name in _target_names(node.target):
+                bindings[name] = provenance
+    return {
+        name: provenance
+        for name, provenance in bindings.items()
+        if name != "__all__" and not name.startswith("_")
+    }
+
+
 def _effect_adapter_package_imports(tree):
     imports = set()
     for node in tree.body:
@@ -711,6 +962,7 @@ def _effect_adapter_api_violations(tree):
     }
     exported_names, literal_exports = _literal_all_names(tree)
     package_bindings = _package_public_bindings(tree)
+    package_provenance = _package_binding_provenance(tree)
     violations = {
         f"private-source:{source_name}->{bound_name}"
         for source_name, bound_name in imports
@@ -750,6 +1002,12 @@ def _effect_adapter_api_violations(tree):
     violations.update(
         f"missing-package-binding:{name}"
         for name in EXPECTED_PACKAGE_API - package_bindings
+    )
+    violations.update(
+        f"rebound-package-api:{name}"
+        for name, expected in EXPECTED_PACKAGE_BINDING_PROVENANCE.items()
+        if name in package_provenance
+        and package_provenance[name] != expected
     )
     return violations
 
@@ -911,6 +1169,35 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
             _effect_boundary_violations(tree),
         )
 
+    def test_effect_adapter_boundary_scanner_keeps_aliases_in_lexical_scope(
+        self,
+    ):
+        unrelated_local_alias = ast.parse(
+            "from dataclasses import dataclass\n"
+            "def unrelated():\n"
+            "    safe_decorator = dataclass\n"
+            "@safe_decorator\n"
+            "class Request:\n"
+            "    graph: object\n"
+        )
+        nested_alias = ast.parse(
+            "from dataclasses import dataclass\n"
+            "def build_request():\n"
+            "    record = dataclass\n"
+            "    @record\n"
+            "    class Request:\n"
+            "        graph: object\n"
+        )
+
+        self.assertNotIn(
+            "dataclass-field:graph",
+            _effect_boundary_violations(unrelated_local_alias),
+        )
+        self.assertIn(
+            "dataclass-field:graph",
+            _effect_boundary_violations(nested_alias),
+        )
+
     def test_effect_adapter_boundary_scanner_rejects_schema_declaration_bypasses(
         self,
     ):
@@ -951,6 +1238,22 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 ast.parse("SCHEMA = {'callback': 'ordinary prose'}\n")
             ),
         )
+        nested_schema_cases = {
+            "properties mapping": (
+                "SCHEMA = {'properties': {'callback': {}}}\n",
+                "schema-key:callback",
+            ),
+            "nested field collection": (
+                "SCHEMA_FIELDS = {'request': {'graph'}}\n",
+                "schema-key:graph",
+            ),
+        }
+        for label, (source, expected) in nested_schema_cases.items():
+            with self.subTest(label=label):
+                self.assertIn(
+                    expected,
+                    _effect_boundary_violations(ast.parse(source)),
+                )
 
     def test_effect_adapter_boundary_scanner_rejects_named_callable_defaults(
         self,
@@ -983,6 +1286,142 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 "class Request:\n"
                 "    ordering: object = field(default_factory=sorted)\n",
                 "function-valued-field:ordering",
+            ),
+        }
+
+        for label, (source, expected) in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(
+                    expected,
+                    _effect_boundary_violations(ast.parse(source)),
+                )
+
+    def test_effect_adapter_boundary_scanner_rejects_imported_callable_injection(
+        self,
+    ):
+        cases = {
+            "function default": (
+                "from .validation import validate_action_plan\n"
+                "def run(fn=validate_action_plan):\n"
+                "    pass\n",
+                "function-valued-default:fn",
+            ),
+            "dataclass default": (
+                "from dataclasses import dataclass, field\n"
+                "from .validation import validate_action_plan\n"
+                "@dataclass\n"
+                "class Request:\n"
+                "    worker: object = field(default=validate_action_plan)\n",
+                "function-valued-field:worker",
+            ),
+        }
+
+        for label, (source, expected) in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(
+                    expected,
+                    _effect_boundary_violations(ast.parse(source)),
+                )
+
+    def test_effect_adapter_boundary_scanner_rejects_invoked_parameters(self):
+        invoked_parameter = ast.parse(
+            "def run(fn):\n"
+            "    return fn()\n"
+        )
+        ordinary_pure_call = ast.parse(
+            "def run(values):\n"
+            "    return sorted(values)\n"
+        )
+        disguised_parameter = ast.parse(
+            "def run(cls):\n"
+            "    return cls()\n"
+        )
+        declared_type = ast.parse(
+            "def parse(enum_type: type):\n"
+            "    return enum_type('value')\n"
+        )
+
+        self.assertIn(
+            "callable-parameter:fn",
+            _effect_boundary_violations(invoked_parameter),
+        )
+        self.assertIn(
+            "callable-parameter:cls",
+            _effect_boundary_violations(disguised_parameter),
+        )
+        self.assertNotIn(
+            "callable-parameter:values",
+            _effect_boundary_violations(ordinary_pure_call),
+        )
+        self.assertNotIn(
+            "callable-parameter:enum_type",
+            _effect_boundary_violations(declared_type),
+        )
+
+    def test_effect_adapter_boundary_scanner_retains_callable_alias_history(
+        self,
+    ):
+        cases = {
+            "function default alias": (
+                "def helper():\n"
+                "    pass\n"
+                "callback = helper\n"
+                "def run(fn=callback):\n"
+                "    pass\n"
+                "callback = None\n",
+                "function-valued-default:fn",
+            ),
+            "field alias": (
+                "from dataclasses import dataclass, field\n"
+                "def helper():\n"
+                "    pass\n"
+                "make_field = field\n"
+                "@dataclass\n"
+                "class Request:\n"
+                "    worker: object = make_field(default=helper)\n"
+                "make_field = object\n",
+                "function-valued-field:worker",
+            ),
+            "field factory alias": (
+                "from dataclasses import dataclass, field\n"
+                "def helper():\n"
+                "    pass\n"
+                "make_field = field\n"
+                "@dataclass\n"
+                "class Request:\n"
+                "    worker: object = make_field(default_factory=helper)\n"
+                "make_field = object\n",
+                "function-valued-field:worker",
+            ),
+            "field default callable alias": (
+                "from dataclasses import dataclass, field\n"
+                "def helper():\n"
+                "    pass\n"
+                "callback = helper\n"
+                "@dataclass\n"
+                "class Request:\n"
+                "    worker: object = field(default=callback)\n"
+                "callback = None\n",
+                "function-valued-field:worker",
+            ),
+            "field factory callable alias": (
+                "from dataclasses import dataclass, field\n"
+                "def helper():\n"
+                "    pass\n"
+                "callback = helper\n"
+                "@dataclass\n"
+                "class Request:\n"
+                "    worker: object = field(default_factory=callback)\n"
+                "callback = None\n",
+                "function-valued-field:worker",
+            ),
+            "imported callable alias": (
+                "from .validation import validate_action_plan\n"
+                "callback = validate_action_plan\n"
+                "def run(fn=callback):\n"
+                "    pass\n"
+                "callback = None\n",
+                "function-valued-default:fn",
             ),
         }
 
@@ -1131,6 +1570,43 @@ class ClaimPipelineIsolationTests(unittest.TestCase):
                 if not hasattr(claim_pipeline, name)
             },
         )
+
+    def test_package_api_binding_provenance_and_runtime_identity_are_exact(self):
+        self.assertEqual(
+            EXPECTED_PACKAGE_API,
+            frozenset(EXPECTED_PACKAGE_BINDING_PROVENANCE),
+        )
+        for name, provenance in EXPECTED_PACKAGE_BINDING_PROVENANCE.items():
+            module_name, source_name = provenance.rsplit(".", 1)
+            with self.subTest(name=name):
+                self.assertIs(
+                    getattr(claim_pipeline, name),
+                    getattr(sys.modules[module_name], source_name),
+                )
+
+    def test_effect_adapter_api_lock_rejects_approved_name_rebinding(self):
+        initializer_source = (
+            PACKAGE_ROOT / "__init__.py"
+        ).read_text(encoding="utf-8")
+        cases = {
+            "foreign import alias": (
+                "from .contracts import Actor as evaluate_effect_plan\n"
+            ),
+            "private local helper": (
+                "def _private_helper():\n"
+                "    pass\n"
+                "evaluate_effect_plan = _private_helper\n"
+            ),
+            "none assignment": "evaluate_effect_plan = None\n",
+        }
+
+        for label, appended_source in cases.items():
+            with self.subTest(label=label):
+                tree = ast.parse(initializer_source + appended_source)
+                self.assertIn(
+                    "rebound-package-api:evaluate_effect_plan",
+                    _effect_adapter_api_violations(tree),
+                )
 
     def test_effect_adapter_api_lock_rejects_extra_and_private_aliases(self):
         initializer_source = (
