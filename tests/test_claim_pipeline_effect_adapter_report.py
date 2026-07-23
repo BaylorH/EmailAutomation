@@ -214,6 +214,64 @@ class EffectAdapterReportTests(unittest.TestCase):
         )
         self.assertFalse(CANONICAL_OUTPUT_PATH.exists())
 
+    def test_typo_only_output_form_cannot_preserve_owned_report(self):
+        self._seed_passed_report(CANONICAL_OUTPUT_PATH)
+
+        completed = self._run_cli_subprocess(
+            "--fixture",
+            FIXTURE_PATH,
+            "--runs",
+            "3",
+            "--out",
+            CANONICAL_OUTPUT_PATH,
+        )
+
+        self.assertEqual(2, completed.returncode)
+        self.assertIn("--out", completed.stderr)
+        self.assertFalse(CANONICAL_OUTPUT_PATH.exists())
+
+    def test_all_parser_exit_paths_invalidate_owned_report_first(self):
+        cases = (
+            ("no-args", (), 2),
+            ("help", ("--help",), 0),
+            ("unknown-only", ("--unexpected-option",), 2),
+            (
+                "missing-required",
+                ("--runs", "3", "--output", CANONICAL_OUTPUT_PATH),
+                2,
+            ),
+        )
+        for label, arguments, expected_status in cases:
+            with self.subTest(label=label):
+                self._seed_passed_report(CANONICAL_OUTPUT_PATH)
+
+                completed = self._run_cli_subprocess(*arguments)
+
+                self.assertEqual(expected_status, completed.returncode)
+                self.assertFalse(CANONICAL_OUTPUT_PATH.exists())
+
+    def test_startup_cleanup_only_unlinks_owned_names_and_not_symlink_targets(self):
+        unrelated_path = Path(
+            f"{OWNED_TEMP_PATH}.startup-unrelated-{os.getpid()}"
+        )
+        self.addCleanup(self._unlink_test_artifact, unrelated_path)
+        unrelated_path.write_bytes(b"unrelated\n")
+        with tempfile.TemporaryDirectory() as directory:
+            symlink_target = Path(directory) / "external-report.json"
+            seeded = b'{"passed":true,"owner":"external"}\n'
+            symlink_target.write_bytes(seeded)
+            CANONICAL_OUTPUT_PATH.symlink_to(symlink_target)
+
+            completed = self._run_cli_subprocess("--help")
+
+            self.assertEqual(0, completed.returncode)
+            self.assertFalse(CANONICAL_OUTPUT_PATH.exists())
+            self.assertEqual(seeded, symlink_target.read_bytes())
+            self.assertEqual(b"unrelated\n", unrelated_path.read_bytes())
+
+    def test_output_candidate_preparse_is_removed(self):
+        self.assertFalse(hasattr(self.script, "_preparse_output_paths"))
+
     def test_arbitrary_output_path_is_rejected_without_deleting_it(self):
         with tempfile.TemporaryDirectory() as directory:
             arbitrary_path = Path(directory) / "passed-report.json"
@@ -438,7 +496,13 @@ class EffectAdapterReportTests(unittest.TestCase):
             self.script.os,
             "unlink",
             side_effect=OSError("injected persistent unlink failure"),
-        ), contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+        ), mock.patch.object(
+            self.script,
+            "build_parser",
+            wraps=self.script.build_parser,
+        ) as parser_builder, contextlib.redirect_stderr(
+            stderr
+        ), self.assertRaises(SystemExit) as raised:
             self.script.main(
                 (
                     "--fixture",
@@ -454,6 +518,7 @@ class EffectAdapterReportTests(unittest.TestCase):
         self.assertEqual(2, raised.exception.code)
         self.assertIn(str(CANONICAL_OUTPUT_PATH), stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
+        parser_builder.assert_not_called()
 
     def test_source_tree_hash_depends_only_on_committed_tree_listing(self):
         parameters = tuple(

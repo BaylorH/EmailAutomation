@@ -365,44 +365,6 @@ def _remove_stale_output_artifacts(output_path: Path) -> Path:
     return output_path
 
 
-def _preparse_output_paths(
-    argv: Sequence[str],
-) -> tuple[tuple[Path, ...], Optional[str]]:
-    candidates = []
-    output_occurrences = 0
-    malformed = False
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token == "--":
-            break
-        if token == "--output":
-            output_occurrences += 1
-            if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
-                malformed = True
-                index += 1
-                continue
-            candidates.append(Path(argv[index + 1]))
-            index += 2
-            continue
-        if token.startswith("--output="):
-            output_occurrences += 1
-            value = token.partition("=")[2]
-            if value:
-                candidates.append(Path(value))
-            else:
-                malformed = True
-        index += 1
-
-    if output_occurrences > 1:
-        issue = "--output must be supplied exactly once"
-    elif malformed:
-        issue = "--output requires one unambiguous path"
-    else:
-        issue = None
-    return tuple(candidates), issue
-
-
 def _fsync_parent_directory(directory: Path) -> None:
     flags = os.O_RDONLY
     directory_flag = getattr(os, "O_DIRECTORY", None)
@@ -737,34 +699,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--runs", required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        action="append",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_parser()
+    try:
+        _remove_stale_output_artifacts(CANONICAL_OUTPUT_PATH)
+    except DryRunReportError as exc:
+        print(f"{Path(__file__).name}: error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+
     raw_argv = tuple(
         sys.argv[1:] if argv is None else (str(item) for item in argv)
     )
-    output_paths, output_issue = _preparse_output_paths(raw_argv)
-    cleanup_error = None
-    for output_path in output_paths:
-        try:
-            _remove_stale_output_artifacts(output_path)
-        except DryRunReportError as exc:
-            if cleanup_error is None:
-                cleanup_error = exc
-    if cleanup_error is not None:
-        parser.error(str(cleanup_error))
-    if output_issue is not None:
-        parser.error(output_issue)
-
+    parser = build_parser()
     args = parser.parse_args(raw_argv)
+    if len(args.output) != 1:
+        parser.error("--output must be supplied exactly once")
     try:
+        output_path = _safe_output_path(args.output[0])
         report = run_dry_run(
             fixture_path=args.fixture,
             runs=args.runs,
-            output_path=args.output,
+            output_path=output_path,
         )
     except DryRunReportError as exc:
         parser.error(str(exc))
