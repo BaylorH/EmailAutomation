@@ -439,7 +439,12 @@ class ProviderPolicyShadowIdentity:
         normalized.setdefault("max_provider_calls", planned_calls)
         normalized.setdefault("max_reserved_tokens", 0)
         normalized.setdefault("max_reserved_cost_microusd", 0)
-        if normalized["call_mode"] not in {"recorded", "smoke", "final"}:
+        if normalized["call_mode"] not in {
+            "recorded",
+            "smoke",
+            "final",
+            "workflow-reliability",
+        }:
             raise ValueError("call_mode is unsupported")
         for field in (
             "max_provider_calls",

@@ -162,9 +162,80 @@ class ProviderPolicyShadowScriptTests(unittest.TestCase):
         self.assertEqual(24, report["summary"]["resultCount"])
         self.assertEqual(8, len({item["caseId"] for item in report["results"]}))
 
+    def test_recorded_workflow_reliability_is_fixed_at_four_by_three(self):
+        status, report = self._main_json(
+            "--provider",
+            "recorded",
+            "--mode",
+            "workflow-reliability",
+        )
+
+        self.assertEqual(0, status)
+        self.assertEqual(12, report["identity"]["plannedCalls"])
+        self.assertEqual(4, report["identity"]["repeats"])
+        self.assertEqual(12, report["summary"]["resultCount"])
+        self.assertEqual(
+            {
+                "repeated-information-request",
+                "unavailable-optout-suppression",
+                "workflow-intents-visible",
+            },
+            {item["caseId"] for item in report["results"]},
+        )
+        self.assertEqual(12, report["summary"]["passedResultCount"])
+        self.assertEqual([], report["summary"]["policyOutcomeVarianceCaseIds"])
+        self.assertFalse(any(item["gapCodes"] for item in report["results"]))
+        self.assertEqual(0, report["summary"]["providerCalls"])
+
+    def test_workflow_reliability_has_distinct_low_call_budget(self):
+        _, report = self._main_json(
+            "--provider",
+            "recorded",
+            "--mode",
+            "workflow-reliability",
+        )
+
+        self.assertEqual(12, report["identity"]["maxProviderCalls"])
+        self.assertEqual(400_000, report["identity"]["maxReservedTokens"])
+        self.assertEqual(
+            2_500_000,
+            report["identity"]["maxReservedCostMicrousd"],
+        )
+
     def test_openai_requires_explicit_opt_in_before_key_or_transport(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.script.main(("--provider", "openai", "--mode", "smoke"))
+
+    def test_unexpected_reliability_schedule_fails_before_transport(self):
+        invalid = self.script._ModeSpec(
+            case_ids=self.script.WORKFLOW_RELIABILITY_CASE_IDS,
+            repeats=4,
+            planned_calls=11,
+            max_reserved_tokens=400_000,
+            max_reserved_cost_microusd=2_500_000,
+        )
+        with mock.patch.dict(
+            self.script.MODE_SPECS,
+            {"workflow-reliability": invalid},
+        ), mock.patch.object(
+            self.script,
+            "OpenAIClaimReplayTransport",
+        ) as transport, contextlib.redirect_stderr(
+            io.StringIO()
+        ), self.assertRaises(
+            SystemExit
+        ):
+            self.script.main(
+                (
+                    "--provider",
+                    "openai",
+                    "--mode",
+                    "workflow-reliability",
+                    "--allow-provider-calls",
+                )
+            )
+
+        transport.assert_not_called()
 
     def test_report_contains_caps_and_no_fixture_values(self):
         _, report = self._main_json("--provider", "recorded", "--mode", "final")
@@ -183,6 +254,26 @@ class ProviderPolicyShadowScriptTests(unittest.TestCase):
             "jordan@example",
             "evidenceText",
             "rawOutput",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_workflow_reliability_report_is_value_free(self):
+        _, report = self._main_json(
+            "--provider",
+            "recorded",
+            "--mode",
+            "workflow-reliability",
+        )
+        serialized = json.dumps(report, sort_keys=True)
+
+        for forbidden in (
+            "123 Industrial",
+            "999 Other",
+            "alex@example",
+            "jordan@example",
+            "evidenceText",
+            "rawOutput",
+            "recipient",
         ):
             self.assertNotIn(forbidden, serialized)
 
