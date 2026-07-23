@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 
 from email_automation.claim_pipeline.contracts import (
+    ActionType,
     ActorRole,
     ApprovalClass,
     CampaignContract,
@@ -147,6 +148,87 @@ class PolicyReductionTests(unittest.TestCase):
         ]
 
         self.assertEqual([13.5], [action.payload["value"] for action in fact_updates])
+
+    def test_correction_audit_claim_may_reference_the_corrected_domain_claim(self):
+        case = next(
+            item
+            for item in load_policy_fixture_catalog(FIXTURE_PATH).cases
+            if item.case_id == "correction-supersedes-rent"
+        )
+        request, _, claims = _build_case(case)
+        old = claims["old"]
+        audit = Claim.create(
+            tenant_id=old.tenant_id,
+            campaign_id=old.campaign_id,
+            evidence_id="evidence-correction-audit",
+            subject_entity_id=old.subject_entity_id,
+            predicate=ClaimPredicate.CORRECTION,
+            value="fixture correction",
+            evidence_text="fixture correction",
+            actor_role=old.actor_role,
+            polarity=old.polarity,
+            modality=ClaimModality.CORRECTED,
+            confidence=0.99,
+            supersedes_claim_id=old.claim_id,
+            actor_email=old.actor_email,
+            observed_at="2026-07-22T12:59:00Z",
+        )
+
+        composed = PolicyEvaluationRequest.create(
+            contract=request.contract,
+            scope=request.scope,
+            entities=request.entities,
+            claims=(*request.claims, audit),
+            snapshot_hash=request.snapshot_hash,
+            current_facts=request.current_facts,
+            current_conversation_states=request.current_conversation_states,
+            current_followup_states=request.current_followup_states,
+            authorized_recipients=request.authorized_recipients,
+        )
+
+        self.assertEqual("complete", evaluate_policy(composed).results[0].decision.completeness_state.value)
+
+    def test_structured_referral_uses_explicit_email_for_recipient_change(self):
+        case = next(
+            item
+            for item in load_policy_fixture_catalog(FIXTURE_PATH).cases
+            if item.case_id == "redirect-requires-approval"
+        )
+        request, _, claims = _build_case(case)
+        original = claims["c1"]
+        structured = Claim.create(
+            tenant_id=original.tenant_id,
+            campaign_id=original.campaign_id,
+            evidence_id=original.evidence_id,
+            subject_entity_id=original.subject_entity_id,
+            predicate=original.predicate,
+            value={"name": "Fixture Contact", "email": "pat@example.test"},
+            evidence_text=original.evidence_text,
+            actor_role=original.actor_role,
+            polarity=original.polarity,
+            modality=original.modality,
+            confidence=original.confidence,
+            actor_email=original.actor_email,
+            observed_at=original.observed_at,
+        )
+        composed = PolicyEvaluationRequest.create(
+            contract=request.contract,
+            scope=request.scope,
+            entities=request.entities,
+            claims=(structured,),
+            snapshot_hash=request.snapshot_hash,
+            current_facts=request.current_facts,
+            current_conversation_states=request.current_conversation_states,
+            current_followup_states=request.current_followup_states,
+            authorized_recipients=("pat@example.test",),
+        )
+
+        action = next(
+            item
+            for item in evaluate_policy(composed).results[0].action_plan.actions
+            if item.action_type is ActionType.RECIPIENT_CHANGE
+        )
+        self.assertEqual("pat@example.test", action.recipient)
 
     def test_input_order_does_not_change_result(self):
         case = next(

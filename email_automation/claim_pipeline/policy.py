@@ -162,7 +162,10 @@ class PolicyEvaluationRequest:
                     raise ValueError("policy correction supersedes unknown claim")
                 if prior.subject_entity_id != claim.subject_entity_id:
                     raise ValueError("policy correction crosses entity scope")
-                if prior.predicate is not claim.predicate:
+                if (
+                    prior.predicate is not claim.predicate
+                    and claim.predicate is not ClaimPredicate.CORRECTION
+                ):
                     raise ValueError("policy correction crosses predicate scope")
 
         def scoped_mapping(values: Mapping[str, Any] | None, label: str) -> Mapping[str, Any]:
@@ -291,6 +294,15 @@ def _claim_value(
 ) -> Any:
     claim = _first_claim(claims, predicate)
     return claim.value if claim else None
+
+
+def _referral_recipient(claim: Claim | None) -> str:
+    if claim is None:
+        return ""
+    if isinstance(claim.value, Mapping):
+        email = claim.value.get("email")
+        return str(email).strip() if email else ""
+    return str(claim.value).strip()
 
 
 def _as_date(value: Any) -> date | None:
@@ -633,7 +645,8 @@ def _plan_actions(
         sequence += 1
 
     referral = _first_claim(claims, ClaimPredicate.REFERRAL)
-    if referral:
+    referral_recipient = _referral_recipient(referral)
+    if referral and referral_recipient:
         actions.append(
             _make_action(
                 request,
@@ -643,7 +656,7 @@ def _plan_actions(
                 entity=entity,
                 source_claims=(referral,),
                 sequence=sequence,
-                recipient=str(referral.value),
+                recipient=referral_recipient,
                 payload={"reason": "redirect_requires_approval"},
                 expected_prior_state={"recipient": ""},
                 reason="redirect_requires_approval",
