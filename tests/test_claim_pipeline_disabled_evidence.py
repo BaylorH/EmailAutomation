@@ -356,6 +356,36 @@ class DisabledEvidenceProjectorTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, serialized)
 
+    def test_projector_rejects_receipt_that_does_not_match_action_identity(self):
+        claim, plan, receipt = tainted_plan_and_receipt()
+        effect = receipt.effects[0]
+        mismatched_effect = DryRunEffectReceipt.create(
+            plan_id=effect.plan_id,
+            action_id=effect.action_id,
+            idempotency_key="effect_mismatched",
+            action_type=effect.action_type,
+            sequence=effect.sequence,
+            status=effect.status,
+            reason=effect.reason,
+            dependency_receipt_ids=effect.dependency_receipt_ids,
+        )
+        mismatched_receipt = DryRunCommitReceipt.create(
+            tenant_id=receipt.tenant_id,
+            plan_id=receipt.plan_id,
+            decision_id=receipt.decision_id,
+            contract_id=receipt.contract_id,
+            contract_version=receipt.contract_version,
+            snapshot_hash=receipt.snapshot_hash,
+            effects=(mismatched_effect,),
+        )
+
+        with self.assertRaises(ValueError):
+            project_disabled_evidence(
+                plan=plan,
+                claims=(claim,),
+                receipt=mismatched_receipt,
+            )
+
 
 class DisabledEvidenceSerializerTests(unittest.TestCase):
     def test_serializer_is_canonical_and_derives_run_id(self):
@@ -440,6 +470,7 @@ class DisabledEvidenceVerifierTests(unittest.TestCase):
 
         verified = verify_disabled_evidence_envelope(
             envelope,
+            receipt=receipt,
             trust_anchor=fixture_trust_anchor(),
         )
         self.assertTrue(verified.verified)
@@ -448,12 +479,14 @@ class DisabledEvidenceVerifierTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             verify_disabled_evidence_envelope(
                 receipt,
+                receipt=receipt,
                 trust_anchor=fixture_trust_anchor(),
             )
 
         missing = replace(envelope, zero_effect_attestation=None)
         missing_result = verify_disabled_evidence_envelope(
             missing,
+            receipt=receipt,
             trust_anchor=fixture_trust_anchor(),
         )
         self.assertFalse(missing_result.verified)
@@ -469,6 +502,7 @@ class DisabledEvidenceVerifierTests(unittest.TestCase):
         )
         forged_result = verify_disabled_evidence_envelope(
             forged,
+            receipt=receipt,
             trust_anchor=fixture_trust_anchor(),
         )
         self.assertFalse(forged_result.verified)
@@ -481,6 +515,7 @@ class DisabledEvidenceVerifierTests(unittest.TestCase):
         )
         taxonomy_result = verify_disabled_evidence_envelope(
             unsupported_taxonomy,
+            receipt=receipt,
             trust_anchor=fixture_trust_anchor(),
         )
         self.assertFalse(taxonomy_result.verified)
@@ -490,6 +525,64 @@ class DisabledEvidenceVerifierTests(unittest.TestCase):
             EvidenceDisposition.UNKNOWN_TAXONOMY,
             taxonomy_result.warning_disposition,
         )
+
+    def test_verifier_recomputes_canonical_integrity_before_accepting_envelope(self):
+        claim, plan, receipt = tainted_plan_and_receipt()
+        projection = project_disabled_evidence(
+            plan=plan,
+            claims=(claim,),
+            receipt=receipt,
+        )
+        envelope = serialize_disabled_evidence(
+            receipt=receipt,
+            projection=projection,
+            provenance=provenance(),
+            timestamps=timestamps(),
+            zero_effect_attestation=zero_effect_attestation(),
+            destination_attestation=destination_attestation(),
+        )
+
+        tampered_projection = replace(
+            envelope,
+            summary=EvidenceSummary(claim_count=0, action_count=0, warning_count=0),
+            rows=(),
+        )
+        tampered_run = replace(envelope, run_id="run_" + "0" * 64)
+        tampered_payload_hash = replace(
+            envelope,
+            content_hashes=replace(
+                envelope.content_hashes,
+                payload_sha256="0" * 64,
+            ),
+        )
+        tampered_time = replace(
+            envelope,
+            timestamps=replace(
+                envelope.timestamps,
+                captured_at="2026-07-24T12:00:03Z",
+            ),
+        )
+        tampered_provenance = replace(
+            envelope,
+            provenance=replace(envelope.provenance, result_digest="9" * 64),
+        )
+
+        for label, candidate in (
+            ("projection", tampered_projection),
+            ("run_id", tampered_run),
+            ("payload_hash", tampered_payload_hash),
+            ("timestamp", tampered_time),
+            ("provenance", tampered_provenance),
+        ):
+            with self.subTest(label=label):
+                result = verify_disabled_evidence_envelope(
+                    candidate,
+                    receipt=receipt,
+                    trust_anchor=fixture_trust_anchor(),
+                )
+                self.assertFalse(result.verified)
+                self.assertFalse(result.include_in_normal_reads)
+                self.assertEqual("hash_integrity_mismatch", result.failure_code)
 
 
 class DisabledEvidenceDuplicateTests(unittest.TestCase):
@@ -510,6 +603,16 @@ class DisabledEvidenceDuplicateTests(unittest.TestCase):
         )
         changed = replace(
             original,
+            summary=EvidenceSummary(claim_count=0, action_count=0, warning_count=0),
+            rows=(),
+        )
+        changed_same_stored_hash = replace(
+            original,
+            summary=EvidenceSummary(claim_count=0, action_count=0, warning_count=0),
+            rows=(),
+        )
+        changed_different_stored_hash = replace(
+            original,
             content_hashes=replace(
                 original.content_hashes,
                 envelope_sha256="0" * 64,
@@ -518,12 +621,24 @@ class DisabledEvidenceDuplicateTests(unittest.TestCase):
 
         same = classify_duplicate_envelope(original, original)
         conflict = classify_duplicate_envelope(original, changed)
+        conflict_same_stored_hash = classify_duplicate_envelope(
+            original,
+            changed_same_stored_hash,
+        )
+        conflict_different_stored_hash = classify_duplicate_envelope(
+            original,
+            changed_different_stored_hash,
+        )
 
         self.assertEqual("same_hash_duplicate", same.outcome)
         self.assertFalse(same.should_write)
         self.assertEqual("conflict", conflict.outcome)
         self.assertFalse(conflict.should_write)
         self.assertTrue(conflict.preserve_original)
+        self.assertEqual("conflict", conflict_same_stored_hash.outcome)
+        self.assertFalse(conflict_same_stored_hash.should_write)
+        self.assertEqual("conflict", conflict_different_stored_hash.outcome)
+        self.assertFalse(conflict_different_stored_hash.should_write)
 
 
 if __name__ == "__main__":

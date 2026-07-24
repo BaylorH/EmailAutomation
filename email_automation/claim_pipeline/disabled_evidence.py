@@ -384,6 +384,15 @@ def project_disabled_evidence(
     }
     if set(effects_by_action) != set(actions_by_id):
         raise ValueError("receipt effects must match plan actions exactly")
+    for action_id, action in actions_by_id.items():
+        effect = effects_by_action[action_id]
+        if (
+            effect.plan_id != plan.plan_id
+            or effect.idempotency_key != action.idempotency_key
+            or effect.action_type != action.action_type.value
+            or effect.sequence != action.sequence
+        ):
+            raise ValueError("receipt effect identity must match plan action")
 
     referenced_claim_ids = tuple(
         dict.fromkeys(
@@ -535,9 +544,114 @@ def serialize_disabled_evidence(
     )
 
 
+def _projection_sha256(summary: EvidenceSummary, rows: tuple[object, ...]) -> str:
+    projection = EvidenceProjection(summary=summary, rows=rows)
+    return hashlib.sha256(canonical_json(projection.to_dict())).hexdigest()
+
+
+def _receipt_payload_sha256(receipt: object) -> str:
+    if not hasattr(receipt, "to_dict") or not hasattr(receipt, "receipt_id"):
+        raise TypeError("verifier requires a dry-run receipt payload")
+    return hashlib.sha256(canonical_json(receipt.to_dict())).hexdigest()
+
+
+def _payload_basis(
+    envelope: DisabledEvidenceEnvelope,
+    *,
+    projection_sha256: str,
+    receipt_payload_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": envelope.run_id,
+        "taxonomy_version": TAXONOMY_VERSION,
+        "provenance": envelope.provenance,
+        "adapter_mode": "disabled",
+        "environment_marker": "local_fixture",
+        "timestamps": envelope.timestamps,
+        "content_hashes": {
+            "source_sha256": SOURCE_SHA256,
+            "fixture_sha256": FIXTURE_SHA256,
+            "projection_sha256": projection_sha256,
+            "receipt_payload_sha256": receipt_payload_sha256,
+        },
+        "zero_effect_attestation": envelope.zero_effect_attestation,
+        "summary": envelope.summary,
+        "rows": envelope.rows,
+    }
+
+
+def _computed_hashes_from_receipt_hash(
+    envelope: DisabledEvidenceEnvelope,
+    *,
+    receipt_payload_sha256: str,
+) -> EvidenceContentHashes:
+    projection_hash = _projection_sha256(envelope.summary, envelope.rows)
+    payload_basis = _payload_basis(
+        envelope,
+        projection_sha256=projection_hash,
+        receipt_payload_sha256=receipt_payload_sha256,
+    )
+    payload_sha256 = hashlib.sha256(canonical_json(payload_basis)).hexdigest()
+    envelope_basis = dict(payload_basis)
+    envelope_basis["destination_attestation"] = envelope.destination_attestation
+    envelope_basis["content_hashes"] = {
+        **payload_basis["content_hashes"],
+        "payload_sha256": payload_sha256,
+    }
+    envelope_sha256 = hashlib.sha256(canonical_json(envelope_basis)).hexdigest()
+    return EvidenceContentHashes(
+        source_sha256=SOURCE_SHA256,
+        fixture_sha256=FIXTURE_SHA256,
+        projection_sha256=projection_hash,
+        receipt_payload_sha256=receipt_payload_sha256,
+        payload_sha256=payload_sha256,
+        envelope_sha256=envelope_sha256,
+    )
+
+
+def _computed_hashes(
+    envelope: DisabledEvidenceEnvelope,
+    *,
+    receipt: object,
+) -> EvidenceContentHashes:
+    return _computed_hashes_from_receipt_hash(
+        envelope,
+        receipt_payload_sha256=_receipt_payload_sha256(receipt),
+    )
+
+
+def _envelope_integrity_matches(
+    envelope: DisabledEvidenceEnvelope,
+    *,
+    receipt: object,
+) -> bool:
+    if envelope.schema_version != SCHEMA_VERSION:
+        return False
+    if envelope.taxonomy_version != TAXONOMY_VERSION:
+        return False
+    if envelope.adapter_mode != "disabled":
+        return False
+    if envelope.environment_marker != "local_fixture":
+        return False
+    expected_hashes = _computed_hashes(envelope, receipt=receipt)
+    expected_run_id = derive_run_id(
+        receipt_id=receipt.receipt_id,
+        projection_sha256=expected_hashes.projection_sha256,
+        fixture_sha256=expected_hashes.fixture_sha256,
+        code_revision=envelope.provenance.code_revision,
+        result_digest=envelope.provenance.result_digest,
+    )
+    return (
+        envelope.run_id == expected_run_id
+        and envelope.content_hashes == expected_hashes
+    )
+
+
 def verify_disabled_evidence_envelope(
     envelope: object,
     *,
+    receipt: object,
     trust_anchor: FixtureTrustAnchor,
 ) -> EvidenceVerificationResult:
     if not isinstance(envelope, DisabledEvidenceEnvelope):
@@ -556,17 +670,30 @@ def verify_disabled_evidence_envelope(
             include_in_normal_reads=False,
             failure_code="missing_zero_effect_attestation",
         )
-    expected = (
+    trusted_attestation = (
         attestation.attestation_schema == ZERO_EFFECT_ATTESTATION_SCHEMA
-        and attestation.verified_source_sha256
-        == envelope.content_hashes.source_sha256
-        and attestation.verified_report_sha256 == envelope.provenance.report_sha256
-        and attestation.verified_result_digest == envelope.provenance.result_digest
         and attestation.verifier_id == trust_anchor.verifier_id
         and attestation.verifier_version == trust_anchor.verifier_version
         and attestation.signature == trust_anchor.signature
     )
-    if not expected:
+    if not trusted_attestation:
+        return EvidenceVerificationResult(
+            verified=False,
+            include_in_normal_reads=False,
+            failure_code="invalid_zero_effect_attestation",
+        )
+    if not _envelope_integrity_matches(envelope, receipt=receipt):
+        return EvidenceVerificationResult(
+            verified=False,
+            include_in_normal_reads=False,
+            failure_code="hash_integrity_mismatch",
+        )
+    attestation_matches_envelope = (
+        attestation.verified_source_sha256 == envelope.content_hashes.source_sha256
+        and attestation.verified_report_sha256 == envelope.provenance.report_sha256
+        and attestation.verified_result_digest == envelope.provenance.result_digest
+    )
+    if not attestation_matches_envelope:
         return EvidenceVerificationResult(
             verified=False,
             include_in_normal_reads=False,
@@ -586,9 +713,24 @@ def classify_duplicate_envelope(
         raise TypeError("duplicate classification requires evidence envelopes")
     if existing.run_id != candidate.run_id:
         return EvidenceDuplicateResult(outcome="new_run", should_write=True)
+    existing_hash = _computed_hashes_from_receipt_hash(
+        existing,
+        receipt_payload_sha256=existing.content_hashes.receipt_payload_sha256,
+    )
+    candidate_hash = _computed_hashes_from_receipt_hash(
+        candidate,
+        receipt_payload_sha256=candidate.content_hashes.receipt_payload_sha256,
+    )
+    existing_valid = (
+        existing_hash.envelope_sha256 == existing.content_hashes.envelope_sha256
+    )
+    candidate_valid = (
+        candidate_hash.envelope_sha256 == candidate.content_hashes.envelope_sha256
+    )
     if (
-        existing.content_hashes.envelope_sha256
-        == candidate.content_hashes.envelope_sha256
+        existing_valid
+        and candidate_valid
+        and existing_hash.envelope_sha256 == candidate_hash.envelope_sha256
     ):
         return EvidenceDuplicateResult(
             outcome="same_hash_duplicate",
