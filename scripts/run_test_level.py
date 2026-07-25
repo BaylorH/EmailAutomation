@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import Callable, Iterator, Mapping, TextIO
 from unittest.mock import MagicMock, patch
 
+if __package__:
+    from scripts.sec_l2_runner import SecL2Result, run_sec_l2
+else:
+    from sec_l2_runner import SecL2Result, run_sec_l2
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY_PATH = (
@@ -56,6 +61,7 @@ class LevelResult:
     failures: int = 0
     errors: int = 0
     skipped: int = 0
+    duration_ms: int = 0
     detail: str = ""
 
     @property
@@ -257,6 +263,55 @@ def _unavailable(
     return result
 
 
+def run_l2(
+    *,
+    admin_ui_root: Path,
+    output: TextIO | None = None,
+) -> LevelResult:
+    output = output or sys.stdout
+    sec_result: SecL2Result = run_sec_l2(admin_ui_root)
+    result = LevelResult(
+        level="L2",
+        status=sec_result.status,
+        tests_run=sec_result.tests_run,
+        failures=sec_result.failures,
+        errors=sec_result.errors,
+        skipped=sec_result.skipped,
+        duration_ms=sec_result.duration_ms,
+        detail=sec_result.detail,
+    )
+
+    if result.status == "passed":
+        print(
+            "L2 PASSED "
+            "family=SEC "
+            "scenario=SEC-01 "
+            f"tests={result.tests_run} "
+            f"failures={result.failures} "
+            f"errors={result.errors} "
+            f"skipped={result.skipped} "
+            f"duration_ms={result.duration_ms} "
+            f"admin_ui_commit={sec_result.admin_ui_commit}",
+            file=output,
+        )
+    elif result.status == "unavailable":
+        print(f"L2 UNAVAILABLE: {result.detail}", file=output)
+    else:
+        print(
+            "L2 FAILED "
+            "family=SEC "
+            "scenario=SEC-01 "
+            f"tests={result.tests_run} "
+            f"failures={result.failures} "
+            f"errors={result.errors} "
+            f"skipped={result.skipped} "
+            f"duration_ms={result.duration_ms} "
+            f"admin_ui_commit={sec_result.admin_ui_commit}",
+            file=output,
+        )
+    return result
+
+
 def run_level(
     level: str,
     *,
@@ -295,6 +350,15 @@ def run_level(
                 normalized_level,
                 "missing required environment: "
                 + ", ".join(missing_environment),
+                output=output,
+            )
+
+        if (
+            normalized_level == "L2"
+            and profile.get("availability") == "environment_required"
+        ):
+            return run_l2(
+                admin_ui_root=Path(os.environ["SITESIFT_ADMIN_UI_ROOT"]),
                 output=output,
             )
 
