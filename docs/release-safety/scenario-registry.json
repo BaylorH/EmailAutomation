@@ -7,14 +7,21 @@
   "sourceBaseline": "8e68e05c509dc27cb358cabcd293987a9f3d130b",
   "lastReconciled": "2026-07-24",
   "latestExecutionEvidence": {
-    "artifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md",
-    "sourceCommit": "c4fac5042d9c077754ab1321616ca6c490680763",
-    "command": "./scripts/run_test_level.sh --level L1",
+    "artifact": "docs/release-safety/sec-01-l2-emulator-evidence-2026-07-24.md",
+    "scenarioIds": [
+      "SEC-01"
+    ],
+    "sourceCommit": "b60c31f6b1ae59c6ef3ac6944ef9094a8c55e34a",
+    "dependencyCommits": {
+      "emailAdminUi": "d98740b9eab03bf0ef971b26349318d25e1956b5"
+    },
+    "command": "./scripts/run_test_level.sh --level L2",
     "status": "passed",
-    "testsRun": 2294,
+    "testsRun": 10,
     "failures": 0,
     "errors": 0,
-    "skipped": 0
+    "skipped": 0,
+    "durationMs": 14559
   },
   "levels": {
     "L1": {
@@ -696,11 +703,11 @@
       "requiredResult": "Firestore rules deny cross-user access and permit only the intended user or server writer.",
       "owner": "shared",
       "executionLevels": ["L2", "L4"],
-      "testPaths": ["tests/test_surface_c_conversation_sheet_authz.py"],
-      "explicitGap": "Known production rules include a permissive authenticated catch-all and no full emulator proof exists.",
+      "testPaths": ["tests/test_sec_l2_emulator_adapter.py", "email-admin-ui:tests/firestore-rules/firestore.rules.test.js"],
+      "explicitGap": "The complete Firestore emulator authorization matrix now passes at L2; production rules deployment and controlled L4 proof remain outside this result.",
       "dataClassification": ["synthetic_emulator", "controlled_test_accounts"],
-      "latestResult": {"status": "gap", "level": null, "date": "2026-07-24", "summary": "Supporting authorization tests do not prove the full Firestore rules boundary."},
-      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
+      "latestResult": {"status": "passed", "level": "L2", "date": "2026-07-24", "sourceCommit": "b60c31f6b1ae59c6ef3ac6944ef9094a8c55e34a", "dependencyCommits": {"emailAdminUi": "d98740b9eab03bf0ef971b26349318d25e1956b5"}, "summary": "The complete SEC-01 Firestore emulator matrix passed 10 tests with no failures, errors, or skips; SEC-02, SEC-03, deployment, and server-writer rule coverage remain outside this result."},
+      "evidenceArtifact": "docs/release-safety/sec-01-l2-emulator-evidence-2026-07-24.md"
     },
     {
       "id": "SEC-02",

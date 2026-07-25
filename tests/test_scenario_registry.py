@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -47,6 +48,16 @@ VALID_RESULT_STATUSES = {
 EVIDENCE_RELATIVE_PATH = (
     "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
 )
+SEC_01_EVIDENCE_RELATIVE_PATH = (
+    "docs/release-safety/sec-01-l2-emulator-evidence-2026-07-24.md"
+)
+SEC_01_ADAPTER_TEST_PATH = "tests/test_sec_l2_emulator_adapter.py"
+SEC_01_RULES_TEST_PATH = (
+    "email-admin-ui:tests/firestore-rules/firestore.rules.test.js"
+)
+RUNNABLE_SOURCE_COMMIT = "b60c31f6b1ae59c6ef3ac6944ef9094a8c55e34a"
+ADAPTER_IMPLEMENTATION_COMMIT = "7b2f6aa539c440ebcda25d24ebef20e4c7389d3b"
+EMAIL_ADMIN_UI_COMMIT = "d98740b9eab03bf0ef971b26349318d25e1956b5"
 
 
 class TestScenarioRegistry(unittest.TestCase):
@@ -87,6 +98,12 @@ class TestScenarioRegistry(unittest.TestCase):
             levels["L1"]["selection"],
             {"startDirectory": "tests", "pattern": "test*.py"},
         )
+        self.assertEqual(levels["L2"]["availability"], "environment_required")
+        self.assertEqual(
+            levels["L2"]["requiredEnvironment"],
+            ["SITESIFT_ADMIN_UI_ROOT"],
+        )
+        self.assertEqual(levels["L2"]["scenarioIds"], ["SEC-01"])
 
     def test_canonical_command_bootstraps_the_pinned_environment(self):
         wrapper = REPO_ROOT / "scripts" / "run_test_level.sh"
@@ -138,6 +155,10 @@ class TestScenarioRegistry(unittest.TestCase):
                     self.assertTrue(explicit_gap.strip())
 
                 for relative_path in test_paths:
+                    if relative_path.startswith("email-admin-ui:"):
+                        self.assertEqual(scenario["id"], "SEC-01")
+                        self.assertEqual(relative_path, SEC_01_RULES_TEST_PATH)
+                        continue
                     self.assertTrue(relative_path.startswith("tests/"))
                     self.assertTrue(
                         (REPO_ROOT / relative_path).is_file(),
@@ -165,30 +186,104 @@ class TestScenarioRegistry(unittest.TestCase):
                         f"{evidence_artifact}",
                     )
 
-    def test_every_latest_result_points_to_the_dated_execution_record(self):
+    def test_sec_01_records_cross_repository_tests_and_commit_metadata(self):
+        scenario = next(
+            item for item in self.registry["scenarios"] if item["id"] == "SEC-01"
+        )
+        evidence = self.registry["latestExecutionEvidence"]
+        latest = scenario["latestResult"]
+
+        self.assertEqual(
+            scenario["testPaths"],
+            [SEC_01_ADAPTER_TEST_PATH, SEC_01_RULES_TEST_PATH],
+        )
+        self.assertEqual(latest["status"], "passed")
+        self.assertEqual(latest["level"], "L2")
+        self.assertEqual(latest["sourceCommit"], RUNNABLE_SOURCE_COMMIT)
+        self.assertEqual(evidence["sourceCommit"], RUNNABLE_SOURCE_COMMIT)
+        self.assertEqual(
+            latest["dependencyCommits"],
+            {"emailAdminUi": EMAIL_ADMIN_UI_COMMIT},
+        )
+        self.assertLessEqual(len(latest["summary"]), 300)
+        for boundary in ("SEC-02", "SEC-03", "deployment", "server-writer"):
+            self.assertIn(boundary, latest["summary"])
+
+    def test_latest_execution_evidence_is_scenario_scoped_and_reproducible(self):
         evidence = self.registry["latestExecutionEvidence"]
 
-        self.assertEqual(evidence["artifact"], EVIDENCE_RELATIVE_PATH)
-        self.assertRegex(evidence["sourceCommit"], r"^[0-9a-f]{40}$")
-        self.assertEqual(evidence["command"], self.registry["levels"]["L1"]["command"])
+        self.assertEqual(evidence["artifact"], SEC_01_EVIDENCE_RELATIVE_PATH)
+        self.assertEqual(evidence["scenarioIds"], ["SEC-01"])
+        self.assertEqual(evidence["sourceCommit"], RUNNABLE_SOURCE_COMMIT)
+        self.assertEqual(
+            evidence["dependencyCommits"],
+            {"emailAdminUi": EMAIL_ADMIN_UI_COMMIT},
+        )
+        self.assertEqual(evidence["command"], self.registry["levels"]["L2"]["command"])
         self.assertEqual(evidence["status"], "passed")
         self.assertGreater(evidence["testsRun"], 0)
         self.assertEqual(evidence["failures"], 0)
         self.assertEqual(evidence["errors"], 0)
         self.assertEqual(evidence["skipped"], 0)
+        self.assertGreater(evidence["durationMs"], 0)
 
         evidence_text = (REPO_ROOT / evidence["artifact"]).read_text(encoding="utf-8")
         for expected_text in (
             evidence["sourceCommit"],
-            evidence["command"],
+            ADAPTER_IMPLEMENTATION_COMMIT,
+            EMAIL_ADMIN_UI_COMMIT,
+            f"{evidence['command']}",
             f"tests={evidence['testsRun']}",
+            f"duration_ms={evidence['durationMs']}",
+            "SEC-01",
             "Gate 2 remains unauthorized",
         ):
             self.assertIn(expected_text, evidence_text)
 
+    def test_latest_evidence_source_commit_contains_runnable_l2_profile(self):
+        evidence = self.registry["latestExecutionEvidence"]
+        source_commit = evidence["sourceCommit"]
+        completed = subprocess.run(
+            [
+                "git",
+                "show",
+                f"{source_commit}:docs/release-safety/scenario-registry.json",
+            ],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        source_registry = json.loads(completed.stdout)
+        source_l2 = source_registry["levels"]["L2"]
+        self.assertEqual(source_l2["availability"], "environment_required")
+        self.assertEqual(
+            source_l2["requiredEnvironment"],
+            ["SITESIFT_ADMIN_UI_ROOT"],
+        )
+        self.assertEqual(source_l2["scenarioIds"], ["SEC-01"])
+        self.assertEqual(
+            source_l2["command"],
+            "./scripts/run_test_level.sh --level L2",
+        )
+
+    def test_each_scenario_points_to_its_own_existing_evidence(self):
         for scenario in self.registry["scenarios"]:
             with self.subTest(scenario=scenario["id"]):
-                self.assertEqual(scenario["evidenceArtifact"], evidence["artifact"])
+                evidence_path = REPO_ROOT / scenario["evidenceArtifact"]
+                self.assertTrue(evidence_path.is_file())
+                if scenario["id"] == "SEC-01":
+                    self.assertEqual(
+                        scenario["evidenceArtifact"],
+                        SEC_01_EVIDENCE_RELATIVE_PATH,
+                    )
+                else:
+                    self.assertEqual(
+                        scenario["evidenceArtifact"],
+                        EVIDENCE_RELATIVE_PATH,
+                    )
 
 
 if __name__ == "__main__":
