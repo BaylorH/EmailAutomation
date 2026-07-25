@@ -6,6 +6,16 @@
   "authorizationBoundary": "Gate 2 persistence, APIs, UI, credentials, deploys, and live-service work are not authorized by this registry.",
   "sourceBaseline": "8e68e05c509dc27cb358cabcd293987a9f3d130b",
   "lastReconciled": "2026-07-24",
+  "latestExecutionEvidence": {
+    "artifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md",
+    "sourceCommit": "5ea134b30f43b223222812b40e39fcb0fdcb2a4b",
+    "command": "./scripts/run_test_level.sh --level L1",
+    "status": "passed",
+    "testsRun": 2293,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
   "levels": {
     "L1": {
       "name": "Pure local",
@@ -88,7 +98,7 @@
       "explicitGap": "A fresh dedicated-account campaign creation run is required.",
       "dataClassification": ["dedicated_sandbox", "controlled_test_accounts"],
       "latestResult": {"status": "unavailable", "level": null, "date": "2026-07-24", "summary": "No L3 or L4 campaign environment was authorized for this task."},
-      "evidenceArtifact": null
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "ACC-02",
@@ -100,7 +110,7 @@
       "explicitGap": "The full emulator authorization path and controlled browser bypass attempt have not been run.",
       "dataClassification": ["synthetic_emulator", "controlled_test_accounts"],
       "latestResult": {"status": "not_run", "level": null, "date": "2026-07-24", "summary": "Supporting authorization tests exist; the required L2 and L4 proofs were not run."},
-      "evidenceArtifact": "tests/test_surface_c_dashboard_auth.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "ACC-03",
@@ -112,7 +122,7 @@
       "explicitGap": "The server-side mailbox readiness model does not yet distinguish every required failure state.",
       "dataClassification": ["synthetic_emulator", "dedicated_sandbox"],
       "latestResult": {"status": "gap", "level": null, "date": "2026-07-24", "summary": "Local supporting tests exist, but the readiness-state contract remains incomplete."},
-      "evidenceArtifact": "tests/test_surface_c_device_flow.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "ACC-04",
@@ -124,7 +134,7 @@
       "explicitGap": "Cross-repository emulator and controlled browser proof remain outstanding.",
       "dataClassification": ["synthetic_local", "synthetic_emulator", "controlled_test_accounts"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free recipient and mapping contracts are current; L2 and L4 remain."},
-      "evidenceArtifact": "tests/test_column_mode_contract.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "ACC-05",
@@ -136,7 +146,7 @@
       "explicitGap": "The emulator-side stale-data bypass check remains outstanding.",
       "dataClassification": ["synthetic_local", "synthetic_emulator"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "The local static and request contracts pass; emulator enforcement remains."},
-      "evidenceArtifact": "tests/test_column_mode_contract.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "QUE-01",
@@ -148,7 +158,7 @@
       "explicitGap": "A Functions, queue, and worker sandbox proof is required.",
       "dataClassification": ["synthetic_emulator", "dedicated_sandbox"],
       "latestResult": {"status": "not_run", "level": null, "date": "2026-07-24", "summary": "Local service-contract coverage exists; the required integrated environments were not run."},
-      "evidenceArtifact": "tests/test_process_user_service.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "QUE-02",
@@ -160,7 +170,7 @@
       "explicitGap": "There is no universal content-keyed send lock or complete cross-delivery sandbox proof.",
       "dataClassification": ["synthetic_emulator", "dedicated_sandbox"],
       "latestResult": {"status": "gap", "level": null, "date": "2026-07-24", "summary": "Supporting dedupe tests exist, but the cross-delivery guarantee is incomplete."},
-      "evidenceArtifact": "tests/test_rubric_core_event_classifier_duplicate_retry.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "QUE-03",
@@ -172,7 +182,7 @@
       "explicitGap": "The emulator queue boundary and controlled campaign stop proof remain outstanding.",
       "dataClassification": ["synthetic_emulator", "controlled_test_accounts"],
       "latestResult": {"status": "not_run", "level": null, "date": "2026-07-24", "summary": "Supporting local controls pass inside L1 discovery; the required L2 and L4 levels were not run."},
-      "evidenceArtifact": "tests/test_campaign_automation_pause.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "QUE-04",
@@ -184,7 +194,7 @@
       "explicitGap": "A deployed single-runner identity proof remains outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Local scheduler scope and lease tests are current; deployed concurrency remains unproved."},
-      "evidenceArtifact": "tests/test_scheduler_scope.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "OUT-01",
@@ -196,7 +206,7 @@
       "explicitGap": "Real Graph and controlled campaign proof remain outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox", "controlled_test_accounts"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free outbox and indexing tests are current; L3 and L4 remain."},
-      "evidenceArtifact": "tests/test_outbox_safety.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "OUT-02",
@@ -208,7 +218,7 @@
       "explicitGap": "The emulator-side authorization and write-boundary proof remains outstanding.",
       "dataClassification": ["synthetic_local", "synthetic_emulator"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free recipient safety tests are current; L2 remains."},
-      "evidenceArtifact": "tests/test_outbox_safety.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "OUT-03",
@@ -220,7 +230,7 @@
       "explicitGap": "The operator-visible draft and launch-review proof remains outstanding.",
       "dataClassification": ["synthetic_local", "controlled_test_accounts"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free body-safety tests are current; L4 remains."},
-      "evidenceArtifact": "tests/test_outbound_body_safety.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "OUT-04",
@@ -232,7 +242,7 @@
       "explicitGap": "Real-service timing proof remains outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Local cancellation-race tests are current; L3 remains."},
-      "evidenceArtifact": "tests/test_combo_stop_cancel_during_claim.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "OUT-05",
@@ -244,7 +254,7 @@
       "explicitGap": "Real Outlook Sent Items behavior remains outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free sent-mail guards are current; L3 remains."},
-      "evidenceArtifact": "tests/test_sent_mail_guard_recipient_continuation.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "OUT-06",
@@ -256,7 +266,7 @@
       "explicitGap": "Real Graph throttling behavior remains outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free retry policy tests are current; L3 remains."},
-      "evidenceArtifact": "tests/test_graph_retry_policy.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "OUT-07",
@@ -268,7 +278,7 @@
       "explicitGap": "Emulator state and controlled operator-visible proof remain outstanding.",
       "dataClassification": ["synthetic_local", "synthetic_emulator", "controlled_test_accounts"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free cap and kill-switch tests are current; L2 and L4 remain."},
-      "evidenceArtifact": "tests/test_outbound_kill_switch.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "OUT-08",
@@ -280,7 +290,7 @@
       "explicitGap": "The send-surface inventory does not yet prove one shared enforced send boundary.",
       "dataClassification": ["synthetic_local", "synthetic_emulator"],
       "latestResult": {"status": "gap", "level": "L1", "date": "2026-07-24", "summary": "The local path inventory is current, but shared-boundary enforcement remains incomplete."},
-      "evidenceArtifact": "docs/release-safety/outbound-send-surface-inventory.json"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "IN-01",
@@ -292,7 +302,7 @@
       "explicitGap": "A real Outlook mailbox proof remains outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free matching tests are current; L3 remains."},
-      "evidenceArtifact": "tests/test_rubric_core_inbox_matching_happy_path.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "IN-02",
@@ -304,7 +314,7 @@
       "explicitGap": "The real-mailbox fallback matrix remains outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Local subject and envelope tests are current; L3 remains."},
-      "evidenceArtifact": "tests/test_source_message_envelope.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "IN-03",
@@ -316,7 +326,7 @@
       "explicitGap": "Complete cross-effect emulator and provider proof remains outstanding.",
       "dataClassification": ["synthetic_local", "synthetic_emulator", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Local dedupe tests are current; L2 and L3 remain."},
-      "evidenceArtifact": "tests/test_message_history_dedupe.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "IN-04",
@@ -328,7 +338,7 @@
       "explicitGap": "The live worker still uses the legacy path and needs L3 proof.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Strong local property guards are current; legacy-worker L3 proof remains."},
-      "evidenceArtifact": "tests/test_property_address_guard.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "IN-05",
@@ -340,7 +350,7 @@
       "explicitGap": "A real-mailbox quote-shape matrix remains outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free quote guards are current; L3 remains."},
-      "evidenceArtifact": "tests/test_quoted_tail_detection.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "IN-06",
@@ -352,7 +362,7 @@
       "explicitGap": "Emulator state and real-provider failure proof remain outstanding.",
       "dataClassification": ["synthetic_local", "synthetic_emulator", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free retry visibility is current; L2 and L3 remain."},
-      "evidenceArtifact": "tests/test_processing_retryability.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "IN-07",
@@ -364,7 +374,7 @@
       "explicitGap": "The isolated claim path is not production-wired and needs L3 legacy-path comparison.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "The local policy lattice is broad; production-path L3 proof remains."},
-      "evidenceArtifact": "tests/test_broker_language_broker_wrong_contact.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "IN-08",
@@ -376,7 +386,7 @@
       "explicitGap": "A fresh provider run is required after any prompt, model, or input change.",
       "dataClassification": ["dedicated_sandbox"],
       "latestResult": {"status": "not_run", "level": null, "date": "2026-07-24", "summary": "Historical repeated-run evidence exists; no fresh L3 provider call was authorized here."},
-      "evidenceArtifact": "docs/release-safety/workflow-provider-reliability-evidence-2026-07-22.md"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "CLM-01",
@@ -388,7 +398,7 @@
       "explicitGap": null,
       "dataClassification": ["synthetic_local"],
       "latestResult": {"status": "passed", "level": "L1", "date": "2026-07-24", "summary": "Credential-free claim identity contracts are current."},
-      "evidenceArtifact": "tests/test_claim_pipeline_claim_fixtures.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "CLM-02",
@@ -400,7 +410,7 @@
       "explicitGap": null,
       "dataClassification": ["synthetic_local"],
       "latestResult": {"status": "passed", "level": "L1", "date": "2026-07-24", "summary": "Credential-free correction and conflict policy tests are current."},
-      "evidenceArtifact": "tests/test_claim_pipeline_policy.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "CLM-03",
@@ -412,7 +422,7 @@
       "explicitGap": null,
       "dataClassification": ["synthetic_local"],
       "latestResult": {"status": "passed", "level": "L1", "date": "2026-07-24", "summary": "The exhaustive Gate 1 status and reason lattice is current."},
-      "evidenceArtifact": "tests/test_claim_pipeline_disabled_evidence.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "CLM-04",
@@ -424,7 +434,7 @@
       "explicitGap": null,
       "dataClassification": ["synthetic_local"],
       "latestResult": {"status": "passed", "level": "L1", "date": "2026-07-24", "summary": "Disabled-adapter execution status is current."},
-      "evidenceArtifact": "tests/test_claim_pipeline_disabled_evidence.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "CLM-05",
@@ -436,7 +446,7 @@
       "explicitGap": null,
       "dataClassification": ["synthetic_local"],
       "latestResult": {"status": "passed", "level": "L1", "date": "2026-07-24", "summary": "Tainted-input and direct-constructor sanitization tests are current."},
-      "evidenceArtifact": "tests/test_claim_pipeline_disabled_evidence.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "CLM-06",
@@ -448,7 +458,7 @@
       "explicitGap": null,
       "dataClassification": ["synthetic_local"],
       "latestResult": {"status": "passed", "level": "L1", "date": "2026-07-24", "summary": "Unknown schema and taxonomy verifier tests are current."},
-      "evidenceArtifact": "tests/test_claim_pipeline_disabled_evidence.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "CLM-07",
@@ -460,7 +470,7 @@
       "explicitGap": null,
       "dataClassification": ["synthetic_local"],
       "latestResult": {"status": "passed", "level": "L1", "date": "2026-07-24", "summary": "Adversarial attestation and revision-binding tests are current."},
-      "evidenceArtifact": "tests/test_claim_pipeline_disabled_evidence.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "CLM-08",
@@ -472,7 +482,7 @@
       "explicitGap": null,
       "dataClassification": ["synthetic_local"],
       "latestResult": {"status": "passed", "level": "L1", "date": "2026-07-24", "summary": "Exact row and byte boundary tests are current."},
-      "evidenceArtifact": "tests/test_claim_pipeline_disabled_evidence.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "CLM-09",
@@ -484,7 +494,7 @@
       "explicitGap": null,
       "dataClassification": ["synthetic_local"],
       "latestResult": {"status": "passed", "level": "L1", "date": "2026-07-24", "summary": "Duplicate, conflict, and tamper tests are current."},
-      "evidenceArtifact": "tests/test_claim_pipeline_disabled_evidence.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "CLM-10",
@@ -496,7 +506,7 @@
       "explicitGap": null,
       "dataClassification": ["synthetic_local"],
       "latestResult": {"status": "passed", "level": "L1", "date": "2026-07-24", "summary": "Isolation, scope, and legacy-operation tests are current."},
-      "evidenceArtifact": "tests/test_claim_pipeline_isolation.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "SHT-01",
@@ -508,7 +518,7 @@
       "explicitGap": "A real isolated Sheet write remains outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Local AI metadata and row-anchor tests are current; L3 remains."},
-      "evidenceArtifact": "tests/test_ai_meta_row_identity.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "SHT-02",
@@ -520,7 +530,7 @@
       "explicitGap": "A real Sheet row-movement proof remains outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Strong local row-anchor tests are current; L3 remains."},
-      "evidenceArtifact": "tests/test_sheet_row_anchor_safety.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "SHT-03",
@@ -532,7 +542,7 @@
       "explicitGap": "Real Google Sheets API semantics remain outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Local formula, numeric, and image contracts are current; L3 remains."},
-      "evidenceArtifact": "tests/test_sheet_operations_formula.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "SHT-04",
@@ -544,7 +554,7 @@
       "explicitGap": "API-level retry and ambiguous-write semantics remain outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free Sheet retry tests are current; L3 remains."},
-      "evidenceArtifact": "tests/test_sheets_retry.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "SHT-05",
@@ -556,7 +566,7 @@
       "explicitGap": "No isolated emulator or Sheet sandbox test currently proves unchanged data on credential failure.",
       "dataClassification": ["synthetic_emulator", "dedicated_sandbox"],
       "latestResult": {"status": "gap", "level": null, "date": "2026-07-24", "summary": "The clean L1 harness no longer requires credentials, but the L2 and L3 failure-state proof is missing."},
-      "evidenceArtifact": "tests/test_runtime_dependency_contract.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "RSP-01",
@@ -568,7 +578,7 @@
       "explicitGap": "Graph and dashboard end-to-end proof remain outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox", "controlled_test_accounts"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free reply identity and safety tests are current; L3 and L4 remain."},
-      "evidenceArtifact": "tests/test_processing_reply_identity.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "RSP-02",
@@ -580,7 +590,7 @@
       "explicitGap": "Some blocked replies can still retry into dead letters instead of immediate operator work.",
       "dataClassification": ["synthetic_local", "synthetic_emulator", "controlled_test_accounts"],
       "latestResult": {"status": "gap", "level": "L1", "date": "2026-07-24", "summary": "Local pending-response tests are current, but immediate operator visibility is incomplete."},
-      "evidenceArtifact": "tests/test_pending_responses.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "RSP-03",
@@ -592,7 +602,7 @@
       "explicitGap": "Real Graph reply-all behavior remains outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free routing and privacy tests are current; L3 remains."},
-      "evidenceArtifact": "tests/test_outbox_reply_recipient_routing.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "FUP-01",
@@ -604,7 +614,7 @@
       "explicitGap": "Real Graph and clock-window proof remains outstanding.",
       "dataClassification": ["synthetic_local", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Local due-follow-up tests are current; L3 remains."},
-      "evidenceArtifact": "tests/test_broker_language_followup_due.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "FUP-02",
@@ -616,7 +626,7 @@
       "explicitGap": "Integrated state and real-service proof remain outstanding.",
       "dataClassification": ["synthetic_local", "synthetic_emulator", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Strong local terminal-state tests are current; L2 and L3 remain."},
-      "evidenceArtifact": "tests/test_followup_terminal_state.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "FUP-03",
@@ -628,7 +638,7 @@
       "explicitGap": "Emulator transaction and real-latency proof remain outstanding.",
       "dataClassification": ["synthetic_local", "synthetic_emulator", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Local claim and lease tests are current; L2 and L3 remain."},
-      "evidenceArtifact": "tests/test_scheduler_lease.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "NOT-01",
@@ -640,7 +650,7 @@
       "explicitGap": "Actionable visibility for every policy-blocked item remains incomplete.",
       "dataClassification": ["synthetic_local", "synthetic_emulator", "controlled_test_accounts"],
       "latestResult": {"status": "gap", "level": "L1", "date": "2026-07-24", "summary": "Local notification tests are current, but complete actionable coverage is missing."},
-      "evidenceArtifact": "tests/test_notifications.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "NOT-02",
@@ -652,7 +662,7 @@
       "explicitGap": "Fresh emulator and browser proofs are required after affected UI or backend changes.",
       "dataClassification": ["synthetic_emulator", "controlled_test_accounts"],
       "latestResult": {"status": "not_run", "level": null, "date": "2026-07-24", "summary": "Supporting backend action tests exist; the required L2 and L4 proofs were not run."},
-      "evidenceArtifact": "tests/test_dashboard_escalation_actions.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "REC-01",
@@ -664,7 +674,7 @@
       "explicitGap": "Emulator state and operator-service proof remain outstanding.",
       "dataClassification": ["synthetic_local", "synthetic_emulator", "dedicated_sandbox"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free recovery tests are current; L2 and L3 remain."},
-      "evidenceArtifact": "tests/test_dead_letter_recovery.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "REC-02",
@@ -676,7 +686,7 @@
       "explicitGap": "Per-item Admin visibility and next-action coverage are not fully implemented.",
       "dataClassification": ["synthetic_local", "synthetic_emulator", "controlled_test_accounts"],
       "latestResult": {"status": "gap", "level": "L1", "date": "2026-07-24", "summary": "Local visibility tests are current, but the operator recovery surface remains incomplete."},
-      "evidenceArtifact": "tests/test_dead_letter_visibility.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "SEC-01",
@@ -688,7 +698,7 @@
       "explicitGap": "Known production rules include a permissive authenticated catch-all and no full emulator proof exists.",
       "dataClassification": ["synthetic_emulator", "controlled_test_accounts"],
       "latestResult": {"status": "gap", "level": null, "date": "2026-07-24", "summary": "Supporting authorization tests do not prove the full Firestore rules boundary."},
-      "evidenceArtifact": "tests/test_surface_c_conversation_sheet_authz.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "SEC-02",
@@ -700,7 +710,7 @@
       "explicitGap": "Full-file emulator rules and controlled cross-user proofs remain outstanding.",
       "dataClassification": ["synthetic_emulator", "controlled_test_accounts"],
       "latestResult": {"status": "not_run", "level": null, "date": "2026-07-24", "summary": "Supporting authorization tests exist; the required L2 and L4 environments were not run."},
-      "evidenceArtifact": "tests/test_surface_c_dashboard_auth.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "SEC-03",
@@ -712,7 +722,7 @@
       "explicitGap": "A centralized emulator-backed audit of every operational writer remains outstanding.",
       "dataClassification": ["synthetic_local", "synthetic_emulator"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Credential-free sanitization tests are current; centralized L2 audit remains."},
-      "evidenceArtifact": "tests/test_claim_pipeline_disabled_evidence.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "OBS-01",
@@ -724,7 +734,7 @@
       "explicitGap": "The Sentry silent-drop path and complete integrated health proof remain undeployed.",
       "dataClassification": ["synthetic_local", "synthetic_emulator", "dedicated_sandbox"],
       "latestResult": {"status": "gap", "level": "L1", "date": "2026-07-24", "summary": "Local health tests are current, but integrated failure visibility is incomplete."},
-      "evidenceArtifact": "tests/test_system_health.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "OBS-02",
@@ -736,7 +746,7 @@
       "explicitGap": "Emulator reconciliation and operator-facing all-in cost labeling remain outstanding.",
       "dataClassification": ["synthetic_local", "synthetic_emulator", "controlled_test_accounts"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Local usage math is current; L2 reconciliation and L4 labeling proof remain."},
-      "evidenceArtifact": "tests/test_openai_usage_tracking.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "DEP-01",
@@ -748,7 +758,7 @@
       "explicitGap": "The running worker has not been reproduced from one reviewed image and manifest.",
       "dataClassification": ["synthetic_emulator", "dedicated_sandbox"],
       "latestResult": {"status": "not_run", "level": null, "date": "2026-07-24", "summary": "Local deployment contracts exist; no L2 build or L3 deployment proof was run."},
-      "evidenceArtifact": "tests/test_ws_b_cloudrun_service_spec.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "DEP-02",
@@ -760,7 +770,7 @@
       "explicitGap": "A controlled rollback drill is required.",
       "dataClassification": ["dedicated_sandbox", "controlled_test_accounts"],
       "latestResult": {"status": "not_run", "level": null, "date": "2026-07-24", "summary": "The rollback contract is documented; no controlled drill was run."},
-      "evidenceArtifact": "tests/test_ws_b_cutover_rollback_doc.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "DEP-03",
@@ -772,7 +782,7 @@
       "explicitGap": "A controlled deployment smoke check remains required after pipeline changes.",
       "dataClassification": ["synthetic_local", "controlled_test_accounts"],
       "latestResult": {"status": "partial", "level": "L1", "date": "2026-07-24", "summary": "Local deployment-boundary contracts are current; L4 smoke proof remains."},
-      "evidenceArtifact": "tests/test_process_user_production_deploy_contract.py"
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
       "id": "DEP-04",
@@ -784,7 +794,7 @@
       "explicitGap": "This progressive campaign rule is a controlled process and has no automated proof.",
       "dataClassification": ["controlled_test_accounts"],
       "latestResult": {"status": "not_run", "level": null, "date": "2026-07-24", "summary": "No L4 campaign progression was authorized or run."},
-      "evidenceArtifact": null
+      "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     }
   ]
 }

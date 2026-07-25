@@ -44,6 +44,9 @@ VALID_RESULT_STATUSES = {
     "unavailable",
     "not_run",
 }
+EVIDENCE_RELATIVE_PATH = (
+    "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
+)
 
 
 class TestScenarioRegistry(unittest.TestCase):
@@ -161,6 +164,31 @@ class TestScenarioRegistry(unittest.TestCase):
                         f"{scenario['id']} references missing evidence "
                         f"{evidence_artifact}",
                     )
+
+    def test_every_latest_result_points_to_the_dated_execution_record(self):
+        evidence = self.registry["latestExecutionEvidence"]
+
+        self.assertEqual(evidence["artifact"], EVIDENCE_RELATIVE_PATH)
+        self.assertRegex(evidence["sourceCommit"], r"^[0-9a-f]{40}$")
+        self.assertEqual(evidence["command"], self.registry["levels"]["L1"]["command"])
+        self.assertEqual(evidence["status"], "passed")
+        self.assertGreater(evidence["testsRun"], 0)
+        self.assertEqual(evidence["failures"], 0)
+        self.assertEqual(evidence["errors"], 0)
+        self.assertEqual(evidence["skipped"], 0)
+
+        evidence_text = (REPO_ROOT / evidence["artifact"]).read_text(encoding="utf-8")
+        for expected_text in (
+            evidence["sourceCommit"],
+            evidence["command"],
+            f"tests={evidence['testsRun']}",
+            "Gate 2 remains unauthorized",
+        ):
+            self.assertIn(expected_text, evidence_text)
+
+        for scenario in self.registry["scenarios"]:
+            with self.subTest(scenario=scenario["id"]):
+                self.assertEqual(scenario["evidenceArtifact"], evidence["artifact"])
 
 
 if __name__ == "__main__":
