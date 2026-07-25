@@ -3,7 +3,7 @@
 Date: 2026-07-24
 
 Source commit tested:
-`5ea134b30f43b223222812b40e39fcb0fdcb2a4b`
+`c4fac5042d9c077754ab1321616ca6c490680763`
 
 Branch:
 `codex/sitesift-test-harness-registry-20260724`
@@ -35,14 +35,16 @@ absent during both unittest discovery and execution.
 - `E2E_TEST_MODE=true` is active only during discovery and execution.
 - Inherited environment names containing credentials, secrets, passwords,
   private keys, bearer values, API keys, or tokens are removed and restored.
+- Sensitive environment values created during a test are removed before the
+  caller's original environment is restored.
 - Known provider client-ID and emulator environment names are also removed.
 - Google Cloud and Firebase Admin Firestore client factories return an
   in-memory `MagicMock`.
 - Firebase Admin initialization returns an in-memory `MagicMock`.
 - MSAL public/confidential client factories and the OpenAI client factory
   return in-memory `MagicMock` instances.
-- Socket connection and DNS resolution calls raise
-  `L1NetworkAccessBlocked`.
+- TCP connection helpers, UDP/datagram send operations, and standard DNS
+  resolution functions raise `L1NetworkAccessBlocked`.
 - No `service-account.json` or root test token-cache file was present.
 
 The first network-blocked candidate run exposed an import-time MSAL tenant
@@ -53,10 +55,10 @@ green run.
 ## Recorded Result
 
 ```text
-L1 PASSED tests=2293 failures=0 errors=0 skipped=0
-real 51.47
-user 17.28
-sys 4.02
+L1 PASSED tests=2294 failures=0 errors=0 skipped=0
+real 52.06
+user 17.09
+sys 4.04
 ```
 
 The full discovery pattern was `tests/test*.py`. Application output was

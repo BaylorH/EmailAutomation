@@ -8,10 +8,10 @@
   "lastReconciled": "2026-07-24",
   "latestExecutionEvidence": {
     "artifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md",
-    "sourceCommit": "5ea134b30f43b223222812b40e39fcb0fdcb2a4b",
+    "sourceCommit": "c4fac5042d9c077754ab1321616ca6c490680763",
     "command": "./scripts/run_test_level.sh --level L1",
     "status": "passed",
-    "testsRun": 2293,
+    "testsRun": 2294,
     "failures": 0,
     "errors": 0,
     "skipped": 0
