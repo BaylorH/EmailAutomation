@@ -78,6 +78,12 @@ class _CredentialFreeSocket(socket.socket):
     def connect_ex(self, address: object) -> int:
         raise L1NetworkAccessBlocked(f"L1 network access blocked: {address!r}")
 
+    def sendmsg(self, *args: object, **kwargs: object) -> int:
+        raise L1NetworkAccessBlocked("L1 network access blocked")
+
+    def sendto(self, *args: object, **kwargs: object) -> int:
+        raise L1NetworkAccessBlocked("L1 network access blocked")
+
 
 def _block_l1_network(*args: object, **kwargs: object) -> None:
     raise L1NetworkAccessBlocked("L1 network access blocked")
@@ -112,6 +118,21 @@ def credential_free_l1_environment() -> Iterator[MagicMock]:
             "socket.getaddrinfo",
             side_effect=_block_l1_network,
         ), patch(
+            "socket.getfqdn",
+            side_effect=_block_l1_network,
+        ), patch(
+            "socket.gethostbyaddr",
+            side_effect=_block_l1_network,
+        ), patch(
+            "socket.gethostbyname",
+            side_effect=_block_l1_network,
+        ), patch(
+            "socket.gethostbyname_ex",
+            side_effect=_block_l1_network,
+        ), patch(
+            "socket.getnameinfo",
+            side_effect=_block_l1_network,
+        ), patch(
             "google.cloud.firestore.Client",
             return_value=fake_client,
         ), patch(
@@ -132,6 +153,9 @@ def credential_free_l1_environment() -> Iterator[MagicMock]:
         ):
             yield fake_client
     finally:
+        for name in list(os.environ):
+            if _is_sensitive_environment_name(name):
+                os.environ.pop(name, None)
         os.environ.update(removed_environment)
         if e2e_mode_was_set:
             os.environ[E2E_TEST_MODE_ENV] = previous_e2e_mode or ""

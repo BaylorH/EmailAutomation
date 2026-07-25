@@ -29,14 +29,42 @@ class TestCredentialFreeL1Runner(unittest.TestCase):
         }
 
         def observe_boundary(phase):
-            network_is_blocked = isinstance(socket.create_connection, Mock)
+            dns_functions = (
+                socket.getaddrinfo,
+                socket.getfqdn,
+                socket.gethostbyaddr,
+                socket.gethostbyname,
+                socket.gethostbyname_ex,
+                socket.getnameinfo,
+            )
+            required_socket_overrides = {
+                "connect",
+                "connect_ex",
+                "sendmsg",
+                "sendto",
+            }
+            network_is_blocked = (
+                isinstance(socket.create_connection, Mock)
+                and all(isinstance(function, Mock) for function in dns_functions)
+                and socket.socket is run_test_level._CredentialFreeSocket
+                and required_socket_overrides <= set(socket.socket.__dict__)
+            )
             if network_is_blocked:
-                try:
-                    socket.create_connection(("127.0.0.1", 1))
-                except run_test_level.L1NetworkAccessBlocked:
-                    pass
-                else:
+                guarded_calls = (
+                    lambda: socket.create_connection(("127.0.0.1", 1)),
+                    lambda: socket.gethostbyname("example.com"),
+                    lambda: socket.socket(
+                        socket.AF_INET,
+                        socket.SOCK_DGRAM,
+                    ).sendto(b"probe", ("127.0.0.1", 9)),
+                )
+                for guarded_call in guarded_calls:
+                    try:
+                        guarded_call()
+                    except run_test_level.L1NetworkAccessBlocked:
+                        continue
                     network_is_blocked = False
+                    break
 
             observations.append(
                 (
@@ -56,6 +84,7 @@ class TestCredentialFreeL1Runner(unittest.TestCase):
         class BootstrapCase(unittest.TestCase):
             def runTest(self):
                 observe_boundary("execution")
+                os.environ["CREATED_DURING_L1_TOKEN"] = "synthetic"
 
         def suite_factory():
             observe_boundary("discovery")
@@ -76,6 +105,7 @@ class TestCredentialFreeL1Runner(unittest.TestCase):
             for name, value in sensitive_environment.items():
                 self.assertEqual(os.environ[name], value)
             self.assertEqual(os.environ["E2E_TEST_MODE"], "previous-value")
+            self.assertNotIn("CREATED_DURING_L1_TOKEN", os.environ)
 
         self.assertEqual(
             observations,
