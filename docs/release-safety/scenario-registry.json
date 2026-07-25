@@ -53,14 +53,16 @@
     "L2": {
       "name": "Local integration",
       "command": "./scripts/run_test_level.sh --level L2",
-      "availability": "unconfigured",
+      "availability": "environment_required",
       "requiredEnvironment": [
-        "FIRESTORE_EMULATOR_HOST"
+        "SITESIFT_ADMIN_UI_ROOT"
+      ],
+      "scenarioIds": [
+        "SEC-01"
       ],
       "dataClassification": "synthetic_emulator",
-      "unavailableReason": "No canonical disposable emulator suite is registered yet.",
-      "proves": "Local transactions, rules, serialization boundaries, retries, and read/write ownership.",
-      "doesNotProve": "External provider behavior, deployed identity, or operator-visible end-to-end behavior."
+      "proves": "The complete Firestore rules file enforces owner access, protected-collection constraints, cross-user denial, and default-deny behavior in a disposable emulator.",
+      "doesNotProve": "Function identity, privacy of every operational writer, external provider behavior, deployed identity, production rules deployment, or Gate 2."
     },
     "L3": {
       "name": "Isolated service sandbox",
