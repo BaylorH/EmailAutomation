@@ -68,6 +68,16 @@ class FakeSheetsService:
 
 
 class AssetColumnRoutingTests(unittest.TestCase):
+    def test_brochure_label_wins_over_generic_building_abbreviation(self):
+        self.assertFalse(
+            sheets.is_floorplan_filename(
+                "105 W Dewey Ave, Bldg B, 9&10, Wharton_Brochure.pdf"
+            )
+        )
+        self.assertTrue(
+            sheets.is_floorplan_filename("2 Howard Pl, Floor Plans 6 8 17.pdf")
+        )
+
     def test_flyer_alias_and_floorplan_use_distinct_cells_with_stale_input_header(self):
         service = FakeSheetsService(["Property Address", "Flyer"])
         stale_header = list(service.headers)

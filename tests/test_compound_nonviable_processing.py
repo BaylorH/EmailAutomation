@@ -321,10 +321,10 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
             11,
             client_id="client-1",
-            reason="property_unavailable",
+            reason="requirements_mismatch",
         )
         self.assertIn(
-            {"status": processing.THREAD_STATUS["stopped"], "reason": "property_unavailable"},
+            {"status": processing.THREAD_STATUS["stopped"], "reason": "requirements_mismatch"},
             result["statusUpdates"],
         )
         self.assertTrue(
