@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import sys
+import threading
 import unittest
 from collections import defaultdict
 from dataclasses import replace
@@ -37,6 +40,7 @@ class InMemoryReceiptStore:
     """Transactional in-memory fake for the persistence boundary."""
 
     def __init__(self, events=None):
+        self._lock = threading.RLock()
         self.events = events if events is not None else []
         self.receipts = {}
         self.histories = defaultdict(list)
@@ -48,121 +52,128 @@ class InMemoryReceiptStore:
         self.fail_transition_once = set()
 
     def _save(self, receipt):
-        self.receipts[receipt.effect_id] = receipt
-        self.histories[receipt.effect_id].append(receipt)
-        return receipt
+        with self._lock:
+            self.receipts[receipt.effect_id] = receipt
+            self.histories[receipt.effect_id].append(receipt)
+            return receipt
 
     def load_receipt(self, request):
-        self.events.append(("receipt_read", request.effect_id))
-        return self.receipts.get(request.effect_id)
+        with self._lock:
+            self.events.append(("receipt_read", request.effect_id))
+            return self.receipts.get(request.effect_id)
 
     def record_blocked(self, request, reason):
-        current = self.receipts.get(request.effect_id)
-        return self._save(
-            EffectReceipt(
-                effect_id=request.effect_id,
-                content_idempotency_key=request.content_idempotency_key,
-                state=ReceiptState.BLOCKED,
-                attempts=current.attempts if current else 0,
-                reason=reason,
+        with self._lock:
+            current = self.receipts.get(request.effect_id)
+            return self._save(
+                EffectReceipt(
+                    effect_id=request.effect_id,
+                    content_idempotency_key=request.content_idempotency_key,
+                    state=ReceiptState.BLOCKED,
+                    attempts=current.attempts if current else 0,
+                    reason=reason,
+                )
             )
-        )
-
-    def prepare(self, request):
-        current = self.receipts.get(request.effect_id)
-        return self._save(
-            EffectReceipt(
-                effect_id=request.effect_id,
-                content_idempotency_key=request.content_idempotency_key,
-                state=ReceiptState.PREPARED,
-                attempts=current.attempts if current else 0,
-            )
-        )
 
     def reserve_attempt(self, request, limits):
         """Atomically enforces receipt state, identity, bounds, and counters."""
-        self.events.append(("reserve", request.effect_id))
-        current = self.receipts.get(request.effect_id)
-        if current:
-            if current.content_idempotency_key != request.content_idempotency_key:
-                return AttemptReservation(
-                    receipt=self._save(
-                        replace(
-                            current,
-                            state=ReceiptState.TERMINAL_FAILED,
-                            reason="content_identity_conflict",
-                        )
-                    ),
-                    acquired=False,
-                )
-            if current.state in {
-                ReceiptState.CLAIMED,
-                ReceiptState.PROVIDER_ACCEPTED,
-                ReceiptState.SUCCEEDED,
-                ReceiptState.CANCELLED,
-                ReceiptState.TERMINAL_FAILED,
-                ReceiptState.RECONCILIATION_REQUIRED,
-            }:
-                return AttemptReservation(receipt=current, acquired=False)
+        with self._lock:
+            self.events.append(("reserve", request.effect_id))
+            current = self.receipts.get(request.effect_id)
+            if current:
+                if (
+                    current.content_idempotency_key
+                    != request.content_idempotency_key
+                ):
+                    return AttemptReservation(
+                        receipt=self._save(
+                            replace(
+                                current,
+                                state=ReceiptState.TERMINAL_FAILED,
+                                reason="content_identity_conflict",
+                            )
+                        ),
+                        acquired=False,
+                    )
+                if current.state in {
+                    ReceiptState.CLAIMED,
+                    ReceiptState.PROVIDER_ACCEPTED,
+                    ReceiptState.SUCCEEDED,
+                    ReceiptState.CANCELLED,
+                    ReceiptState.TERMINAL_FAILED,
+                    ReceiptState.RECONCILIATION_REQUIRED,
+                }:
+                    return AttemptReservation(receipt=current, acquired=False)
 
-        attempts = current.attempts if current else 0
-        if attempts >= limits.max_attempts:
+            attempts = current.attempts if current else 0
+            if current is None or current.state == ReceiptState.BLOCKED:
+                current = self._save(
+                    EffectReceipt(
+                        effect_id=request.effect_id,
+                        content_idempotency_key=request.content_idempotency_key,
+                        state=ReceiptState.PREPARED,
+                        attempts=attempts,
+                    )
+                )
+
+            if attempts >= limits.max_attempts:
+                receipt = self._save(
+                    EffectReceipt(
+                        request.effect_id,
+                        request.content_idempotency_key,
+                        ReceiptState.TERMINAL_FAILED,
+                        attempts,
+                        "provider_attempts_exhausted",
+                    )
+                )
+                return AttemptReservation(receipt=receipt, acquired=False)
+
+            cap_checks = (
+                (
+                    self.run_attempts[request.run_id],
+                    limits.max_per_run,
+                    "run_cap_reached",
+                ),
+                (
+                    self.user_attempts[(request.run_id, request.user_id)],
+                    limits.max_per_user,
+                    "user_cap_reached",
+                ),
+                (
+                    self.provider_attempts[(request.run_id, request.provider)],
+                    limits.max_per_provider,
+                    "provider_cap_reached",
+                ),
+            )
+            for count, cap, reason in cap_checks:
+                if count >= cap:
+                    return AttemptReservation(
+                        receipt=self.record_blocked(request, reason),
+                        acquired=False,
+                    )
+
+            self.run_attempts[request.run_id] += 1
+            self.user_attempts[(request.run_id, request.user_id)] += 1
+            self.provider_attempts[(request.run_id, request.provider)] += 1
             receipt = self._save(
                 EffectReceipt(
                     request.effect_id,
                     request.content_idempotency_key,
-                    ReceiptState.TERMINAL_FAILED,
-                    attempts,
-                    "provider_attempts_exhausted",
+                    ReceiptState.CLAIMED,
+                    attempts + 1,
                 )
             )
-            return AttemptReservation(receipt=receipt, acquired=False)
-
-        cap_checks = (
-            (
-                self.run_attempts[request.run_id],
-                limits.max_per_run,
-                "run_cap_reached",
-            ),
-            (
-                self.user_attempts[(request.run_id, request.user_id)],
-                limits.max_per_user,
-                "user_cap_reached",
-            ),
-            (
-                self.provider_attempts[(request.run_id, request.provider)],
-                limits.max_per_provider,
-                "provider_cap_reached",
-            ),
-        )
-        for count, cap, reason in cap_checks:
-            if count >= cap:
-                return AttemptReservation(
-                    receipt=self.record_blocked(request, reason),
-                    acquired=False,
-                )
-
-        self.run_attempts[request.run_id] += 1
-        self.user_attempts[(request.run_id, request.user_id)] += 1
-        self.provider_attempts[(request.run_id, request.provider)] += 1
-        receipt = self._save(
-            EffectReceipt(
-                request.effect_id,
-                request.content_idempotency_key,
-                ReceiptState.CLAIMED,
-                attempts + 1,
-            )
-        )
-        return AttemptReservation(receipt=receipt, acquired=True)
+            return AttemptReservation(receipt=receipt, acquired=True)
 
     def read_authoritative_state(self, request):
-        self.events.append(("authoritative_read", request.effect_id))
-        if self.before_authoritative_read:
-            self.before_authoritative_read(request)
-        return self.authority.get(
-            request.effect_id,
-            AuthoritativeDecision(AuthorityState.ACTIVE),
-        )
+        with self._lock:
+            self.events.append(("authoritative_read", request.effect_id))
+            if self.before_authoritative_read:
+                self.before_authoritative_read(request)
+            return self.authority.get(
+                request.effect_id,
+                AuthoritativeDecision(AuthorityState.ACTIVE),
+            )
 
     def transition(
         self,
@@ -172,19 +183,22 @@ class InMemoryReceiptStore:
         reason="",
         provider_reference="",
     ):
-        current = self.receipts[request.effect_id]
-        self.events.append(("transition", state.value))
-        if state in self.fail_transition_once:
-            self.fail_transition_once.remove(state)
-            raise RuntimeError(f"simulated {state.value} persistence failure")
-        return self._save(
-            replace(
-                current,
-                state=state,
-                reason=reason,
-                provider_reference=provider_reference,
+        with self._lock:
+            current = self.receipts[request.effect_id]
+            self.events.append(("transition", state.value))
+            if state in self.fail_transition_once:
+                self.fail_transition_once.remove(state)
+                raise RuntimeError(
+                    f"simulated {state.value} persistence failure"
+                )
+            return self._save(
+                replace(
+                    current,
+                    state=state,
+                    reason=reason,
+                    provider_reference=provider_reference,
+                )
             )
-        )
 
 
 class InMemoryProvider:
@@ -200,6 +214,51 @@ class InMemoryProvider:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+class AdversarialInterleavingReceiptStore(InMemoryReceiptStore):
+    """Force both contenders to observe absence before the first claim."""
+
+    def __init__(self):
+        super().__init__()
+        self._first_loaded = threading.Event()
+        self._second_loaded = threading.Event()
+        self._first_claimed = threading.Event()
+
+    @staticmethod
+    def _wait(event):
+        if not event.wait(timeout=5):
+            raise RuntimeError("concurrency test interleaving timed out")
+
+    def load_receipt(self, request):
+        receipt = super().load_receipt(request)
+        if threading.current_thread().name == "contender-a":
+            self._first_loaded.set()
+            self._wait(self._second_loaded)
+        elif threading.current_thread().name == "contender-b":
+            self._second_loaded.set()
+            self._wait(self._first_loaded)
+            self._wait(self._first_claimed)
+        return receipt
+
+    def reserve_attempt(self, request, limits):
+        reservation = super().reserve_attempt(request, limits)
+        if (
+            threading.current_thread().name == "contender-a"
+            and reservation.acquired
+        ):
+            self._first_claimed.set()
+        return reservation
+
+
+class ThreadSafeProvider(InMemoryProvider):
+    def __init__(self, outcomes=None, events=None):
+        super().__init__(outcomes, events)
+        self._lock = threading.Lock()
+
+    def execute(self, request):
+        with self._lock:
+            return super().execute(request)
 
 
 def request(
@@ -237,6 +296,11 @@ def live_config(**overrides):
     }
     values.update(overrides)
     return EffectGatewayConfig(**values)
+
+
+def receipt_reference(raw_reference):
+    digest = hashlib.sha256(raw_reference.encode("utf-8")).hexdigest()
+    return f"provider_ref_{digest}"
 
 
 class EffectIdentityTests(unittest.TestCase):
@@ -381,6 +445,65 @@ class EffectGatewayGateTests(unittest.TestCase):
                 self.assertEqual(len(provider.calls), 1)
 
 
+class EffectGatewayConcurrencyTests(unittest.TestCase):
+    def test_two_contenders_share_one_atomic_lifecycle(self):
+        req = request()
+        store = AdversarialInterleavingReceiptStore()
+        provider = ThreadSafeProvider(
+            [
+                ProviderEffectResult("graph-message-1"),
+                ProviderEffectResult("graph-message-2"),
+            ]
+        )
+        gateway = EffectGateway(store, {"graph": provider}, live_config())
+        receipts = {}
+        failures = {}
+
+        def execute(name):
+            try:
+                receipts[name] = gateway.execute(req)
+            except Exception as error:  # pragma: no cover - failure diagnostics
+                failures[name] = error
+
+        contenders = [
+            threading.Thread(
+                target=execute,
+                args=("a",),
+                name="contender-a",
+            ),
+            threading.Thread(
+                target=execute,
+                args=("b",),
+                name="contender-b",
+            ),
+        ]
+        for contender in contenders:
+            contender.start()
+        for contender in contenders:
+            contender.join(timeout=5)
+
+        self.assertFalse(
+            any(contender.is_alive() for contender in contenders),
+            "concurrent gateway execution deadlocked",
+        )
+        self.assertEqual(failures, {})
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(
+            [receipt.state for receipt in store.histories[req.effect_id]],
+            [
+                ReceiptState.PREPARED,
+                ReceiptState.CLAIMED,
+                ReceiptState.PROVIDER_ACCEPTED,
+                ReceiptState.SUCCEEDED,
+            ],
+        )
+        self.assertEqual(
+            store.receipts[req.effect_id].state,
+            ReceiptState.SUCCEEDED,
+        )
+        self.assertEqual(set(receipts), {"a", "b"})
+
+
 class EffectGatewayAuthorityTests(unittest.TestCase):
     def test_authoritative_cancellation_landing_at_final_read_prevents_provider(self):
         events = []
@@ -457,7 +580,10 @@ class EffectGatewayReceiptTests(unittest.TestCase):
         retry = gateway.execute(req)
 
         self.assertEqual(first.state, ReceiptState.SUCCEEDED)
-        self.assertEqual(first.provider_reference, "graph-message-1")
+        self.assertEqual(
+            first.provider_reference,
+            receipt_reference("graph-message-1"),
+        )
         self.assertEqual(retry, first)
         self.assertEqual(len(provider.calls), 1)
 
@@ -571,7 +697,10 @@ class EffectGatewayReceiptTests(unittest.TestCase):
         ).execute(req)
 
         self.assertEqual(receipt.state, ReceiptState.RECONCILIATION_REQUIRED)
-        self.assertEqual(receipt.provider_reference, "graph-message-1")
+        self.assertEqual(
+            receipt.provider_reference,
+            receipt_reference("graph-message-1"),
+        )
         self.assertEqual(receipt.reason, "receipt_finalize_failed")
         self.assertEqual(len(provider.calls), 1)
 
@@ -651,6 +780,88 @@ class EffectGatewayReceiptTests(unittest.TestCase):
             self.assertNotIn(fragment, serialized)
 
 
+class ProviderReferenceSafetyTests(unittest.TestCase):
+    def test_graph_style_reference_is_deterministically_tokenized(self):
+        raw_reference = "AAMkAGI2AAABEgAQABCD_123+/=="
+        req = request()
+        store = InMemoryReceiptStore()
+        receipt = EffectGateway(
+            store,
+            {"graph": InMemoryProvider([ProviderEffectResult(raw_reference)])},
+            live_config(),
+        ).execute(req)
+        expected = receipt_reference(raw_reference)
+
+        self.assertEqual(receipt.state, ReceiptState.SUCCEEDED)
+        self.assertEqual(receipt.provider_reference, expected)
+        self.assertEqual(
+            receipt.to_dict()["providerReference"],
+            expected,
+        )
+        self.assertNotIn(raw_reference, repr(receipt))
+        self.assertNotIn(raw_reference, json.dumps(receipt.to_dict()))
+
+    def test_secret_bearing_provider_reference_serializes_only_a_hash(self):
+        raw_reference = (
+            "token=secret-token recipient=broker@example.test "
+            "body=private-message customer_id=client-123"
+        )
+
+        class SecretBearingReferenceProvider:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, current_request):
+                self.calls.append(current_request)
+                return ProviderEffectResult(raw_reference)
+
+        req = request()
+        store = InMemoryReceiptStore()
+        provider = SecretBearingReferenceProvider()
+        receipt = EffectGateway(
+            store,
+            {"graph": provider},
+            live_config(),
+        ).execute(req)
+        serialized = json.dumps(receipt.to_dict(), sort_keys=True)
+
+        self.assertEqual(receipt.state, ReceiptState.SUCCEEDED)
+        self.assertEqual(
+            receipt.provider_reference,
+            receipt_reference(raw_reference),
+        )
+        self.assertEqual(len(provider.calls), 1)
+        for fragment in (
+            "secret-token",
+            "broker@example.test",
+            "private-message",
+            "client-123",
+        ):
+            self.assertNotIn(fragment, repr(receipt))
+            self.assertNotIn(fragment, serialized)
+
+    def test_receipts_reject_every_raw_provider_reference(self):
+        req = request()
+        for raw_reference in (
+            "AAMkAGI2AAABEgAQABCD_123+/==",
+            "token=secret-token",
+            "recipient=broker@example.test",
+            "A" * 513,
+        ):
+            with self.subTest(reference=raw_reference[:24]):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "SHA-256 token",
+                ):
+                    EffectReceipt(
+                        effect_id=req.effect_id,
+                        content_idempotency_key=req.content_idempotency_key,
+                        state=ReceiptState.PROVIDER_ACCEPTED,
+                        attempts=1,
+                        provider_reference=raw_reference,
+                    )
+
+
 class EffectWorkerWiringTests(unittest.TestCase):
     def test_main_is_the_only_tracked_provider_effect_worker_entry(self):
         main_tree = ast.parse((REPO_ROOT / "main.py").read_text(encoding="utf-8"))
@@ -714,10 +925,7 @@ class LiveRunnerContainmentTests(unittest.TestCase):
         tests_path = str(path.parent)
         sys.path.insert(0, tests_path)
         try:
-            # The legacy module loaded dotenv at import time. Suppress local
-            # credential discovery while the RED test drives its retirement.
-            with mock.patch.object(Path, "exists", return_value=False):
-                spec.loader.exec_module(module)
+            spec.loader.exec_module(module)
         finally:
             sys.path.remove(tests_path)
         cls.live = module
@@ -726,72 +934,155 @@ class LiveRunnerContainmentTests(unittest.TestCase):
     def tearDownClass(cls):
         sys.modules.pop(cls.live.__name__, None)
 
-    def test_live_pipeline_fails_closed_before_starting_a_subprocess(self):
-        runner = self.live.MultiTurnTestRunner(wait_seconds=0)
-        authorization = {
-            "SITESIFT_LIVE_TEST_AUTHORIZATION":
-                "I_UNDERSTAND_LIVE_PROVIDER_EFFECTS"
-        }
-        with mock.patch.dict(os.environ, authorization, clear=True), mock.patch.object(
-            self.live.subprocess,
-            "run",
-        ) as run:
-            with self.assertRaises(self.live.LiveAuthorizationError):
-                runner._run_pipeline()
+    def test_legacy_live_authorized_constructor_parameter_is_rejected(self):
+        with self.assertRaises(TypeError):
+            self.live.MultiTurnTestRunner(
+                wait_seconds=0,
+                live_authorized=True,
+            )
 
-        run.assert_not_called()
+    def test_forged_attributes_and_environment_never_start_a_subprocess(self):
+        exact = "I_UNDERSTAND_LIVE_PROVIDER_EFFECTS"
+        for environment_value in (exact, f" {exact} "):
+            for forged_value in (True, object()):
+                with self.subTest(
+                    environment_value=environment_value,
+                    forged_type=type(forged_value).__name__,
+                ):
+                    runner = self.live.MultiTurnTestRunner(wait_seconds=0)
+                    runner.live_authorized = forged_value
+                    with mock.patch.dict(
+                        os.environ,
+                        {
+                            "SITESIFT_LIVE_TEST_AUTHORIZATION":
+                                environment_value
+                        },
+                        clear=True,
+                    ), mock.patch("subprocess.run") as run:
+                        with self.assertRaises(
+                            self.live.LiveAuthorizationError
+                        ):
+                            runner._run_pipeline()
 
-    def test_authorized_pipeline_invokes_only_the_tracked_python_module(self):
-        runner = self.live.MultiTurnTestRunner(
-            wait_seconds=0,
-            live_authorized=True,
-        )
-        completed = SimpleNamespace(
-            returncode=0,
-            stdout="pipeline complete",
-            stderr="",
-        )
-        authorization = {
-            "SITESIFT_LIVE_TEST_AUTHORIZATION":
-                "I_UNDERSTAND_LIVE_PROVIDER_EFFECTS"
-        }
-        with mock.patch.dict(os.environ, authorization, clear=True), mock.patch.object(
-            self.live.subprocess,
-            "run",
-            return_value=completed,
-        ) as run:
-            runner._run_pipeline()
+                    run.assert_not_called()
 
-        self.assertEqual(
-            run.call_args.args[0],
-            [sys.executable, "-m", "main"],
-        )
-        self.assertFalse(run.call_args.kwargs.get("shell", False))
-
-    def test_environment_only_cleanup_cannot_touch_data_clients(self):
-        authorization = {
-            "SITESIFT_LIVE_TEST_AUTHORIZATION":
-                "I_UNDERSTAND_LIVE_PROVIDER_EFFECTS"
-        }
+    def test_legacy_boolean_cleanup_authority_is_rejected_before_data_clients(self):
         fake_fs = mock.MagicMock()
         fake_clients = SimpleNamespace(_fs=fake_fs)
-
-        with mock.patch.dict(os.environ, authorization, clear=True), mock.patch.dict(
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SITESIFT_LIVE_TEST_AUTHORIZATION":
+                    "I_UNDERSTAND_LIVE_PROVIDER_EFFECTS"
+            },
+            clear=True,
+        ), mock.patch.dict(
             sys.modules,
             {"email_automation.clients": fake_clients},
-        ):
-            with self.assertRaises(self.live.LiveAuthorizationError):
-                self.live.cleanup_test_data()
+        ), mock.patch.object(self.live.RunState, "clear"):
+            with self.assertRaises(TypeError):
+                self.live.cleanup_test_data(live_authorized=True)
 
         fake_fs.collection.assert_not_called()
 
-    def test_live_runner_has_no_dependency_on_the_ignored_shell_launcher(self):
+    def test_cleanup_always_fails_closed_for_exact_and_padded_environment(self):
+        exact = "I_UNDERSTAND_LIVE_PROVIDER_EFFECTS"
+        for environment_value in (exact, f" {exact} "):
+            with self.subTest(environment_value=environment_value):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "SITESIFT_LIVE_TEST_AUTHORIZATION":
+                            environment_value
+                    },
+                    clear=True,
+                ):
+                    with self.assertRaises(
+                        self.live.LiveAuthorizationError
+                    ):
+                        self.live.cleanup_test_data()
+
+    def test_legacy_effect_execution_code_is_absent(self):
         source = (
             REPO_ROOT / "tests" / "multi_turn_live_test.py"
         ).read_text(encoding="utf-8")
 
         self.assertNotIn("run_production.sh", source)
         self.assertNotIn('["bash"', source)
+        self.assertNotIn("subprocess.run(", source)
+        self.assertNotIn('[sys.executable, "-m", "main"]', source)
+        self.assertNotIn("SITESIFT_LIVE_TEST_AUTHORIZATION", source)
+        self.assertNotIn("--authorize-live-effects", source)
+        self.assertNotIn("load_dotenv", source)
+
+    def test_list_remains_read_only_and_available(self):
+        stdout = io.StringIO()
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["multi_turn_live_test.py", "--list"],
+        ), mock.patch.object(sys, "stdout", stdout), mock.patch.object(
+            self.live,
+            "MultiTurnTestRunner",
+        ) as runner:
+            self.live.main()
+
+        runner.assert_not_called()
+        self.assertIn("Available scenarios:", stdout.getvalue())
+
+    def test_legacy_cli_authorization_flag_is_rejected_without_execution(self):
+        exact = "I_UNDERSTAND_LIVE_PROVIDER_EFFECTS"
+        for environment_value in (exact, f" {exact} "):
+            with self.subTest(environment_value=environment_value):
+                fake_runner = mock.MagicMock()
+                fake_runner.return_value.run.return_value = {
+                    "summary": {
+                        "scenarios_passed": 1,
+                        "scenarios_total": 1,
+                        "turns_passed": 1,
+                        "turns_total": 1,
+                        "total_duration_seconds": 0,
+                        "overall_pass": True,
+                    }
+                }
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "SITESIFT_LIVE_TEST_AUTHORIZATION":
+                            environment_value
+                    },
+                    clear=True,
+                ), mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "multi_turn_live_test.py",
+                        "--scenario",
+                        "gradual_info_gathering",
+                        "--authorize-live-effects",
+                    ],
+                ), mock.patch.object(
+                    self.live,
+                    "MultiTurnTestRunner",
+                    fake_runner,
+                ), mock.patch.object(
+                    self.live,
+                    "load_dotenv",
+                    create=True,
+                ), mock.patch.object(
+                    sys,
+                    "stdout",
+                    io.StringIO(),
+                ), mock.patch.object(
+                    sys,
+                    "stderr",
+                    io.StringIO(),
+                ):
+                    with self.assertRaises(SystemExit) as exit_context:
+                        self.live.main()
+
+                self.assertEqual(exit_context.exception.code, 2)
+                fake_runner.assert_not_called()
 
 
 if __name__ == "__main__":

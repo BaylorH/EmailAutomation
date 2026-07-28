@@ -27,6 +27,7 @@ MAX_ATTEMPTS_ENV = "SITESIFT_EFFECT_MAX_ATTEMPTS"
 MAX_PER_RUN_ENV = "SITESIFT_EFFECT_MAX_PER_RUN"
 MAX_PER_USER_ENV = "SITESIFT_EFFECT_MAX_PER_USER"
 MAX_PER_PROVIDER_ENV = "SITESIFT_EFFECT_MAX_PER_PROVIDER"
+_PROVIDER_REFERENCE_PREFIX = "provider_ref_"
 
 
 class ReceiptState(str, Enum):
@@ -64,6 +65,38 @@ def _require_text(label: str, value: Any) -> str:
     if not normalized:
         raise ValueError(f"{label} must be non-empty")
     return normalized
+
+
+def _require_raw_provider_reference(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("provider_reference must be a non-empty string")
+    return value
+
+
+def _receipt_provider_reference(raw_reference: str) -> str:
+    """Return a fixed-form token safe for durable receipts and logs."""
+
+    digest = hashlib.sha256(raw_reference.encode("utf-8")).hexdigest()
+    return f"{_PROVIDER_REFERENCE_PREFIX}{digest}"
+
+
+def _validate_receipt_provider_reference(value: Any) -> str:
+    if value == "":
+        return value
+    if not isinstance(value, str) or not value.startswith(
+        _PROVIDER_REFERENCE_PREFIX
+    ):
+        raise ValueError(
+            "provider_reference must be empty or a provider_ref SHA-256 token"
+        )
+    digest = value[len(_PROVIDER_REFERENCE_PREFIX) :]
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError(
+            "provider_reference must be empty or a provider_ref SHA-256 token"
+        )
+    return value
 
 
 def _json_ready(value: Any) -> Any:
@@ -240,6 +273,13 @@ class EffectReceipt:
     reason: str = ""
     provider_reference: str = ""
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "provider_reference",
+            _validate_receipt_provider_reference(self.provider_reference),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "effectId": self.effect_id,
@@ -271,7 +311,7 @@ class ProviderEffectResult:
         object.__setattr__(
             self,
             "provider_reference",
-            _require_text("provider_reference", self.provider_reference),
+            _require_raw_provider_reference(self.provider_reference),
         )
 
 
@@ -288,7 +328,7 @@ class UncertainProviderOutcomeError(RuntimeError):
 
 
 class EffectReceiptStore(Protocol):
-    """Persistence port; ``reserve_attempt`` must be one atomic operation."""
+    """Persistence port with one atomic prepare-and-claim operation."""
 
     def load_receipt(
         self,
@@ -299,11 +339,6 @@ class EffectReceiptStore(Protocol):
         self,
         request: ProviderEffectRequest,
         reason: str,
-    ) -> EffectReceipt: ...
-
-    def prepare(
-        self,
-        request: ProviderEffectRequest,
     ) -> EffectReceipt: ...
 
     def reserve_attempt(
@@ -384,9 +419,6 @@ class EffectGateway:
                 "invalid_or_missing_caps",
             )
 
-        if current is None or current.state == ReceiptState.BLOCKED:
-            self._store.prepare(request)
-
         reservation = self._store.reserve_attempt(
             request,
             self._config.limits,
@@ -432,6 +464,9 @@ class EffectGateway:
                     ReceiptState.RECONCILIATION_REQUIRED,
                     reason="provider_outcome_unknown",
                 )
+            provider_reference = _receipt_provider_reference(
+                result.provider_reference
+            )
         except TerminalProviderError:
             return self._store.transition(
                 request,
@@ -469,14 +504,14 @@ class EffectGateway:
             accepted = self._store.transition(
                 request,
                 ReceiptState.PROVIDER_ACCEPTED,
-                provider_reference=result.provider_reference,
+                provider_reference=provider_reference,
             )
         except Exception:
             return self._store.transition(
                 request,
                 ReceiptState.RECONCILIATION_REQUIRED,
                 reason="receipt_acceptance_failed",
-                provider_reference=result.provider_reference,
+                provider_reference=provider_reference,
             )
         return self._finalize_accepted(request, accepted)
 

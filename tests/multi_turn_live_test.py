@@ -1,24 +1,12 @@
 #!/usr/bin/env python3
 """
-Multi-Turn Live Email Integration Test
+Retired Multi-Turn Live Email Integration Test
 
-Sends real emails between baylor.freelance@outlook.com (Outlook/Graph API)
-and bp21harrison@gmail.com (Gmail/SMTP) over multiple turns, running through
-the actual production pipeline (main.py) each turn.
-
-Measures: thread matching, AI extraction accuracy, response quality, latency.
+The legacy effectful runner is permanently disabled. Its scenario catalog is
+kept for read-only inspection.
 
 Usage:
-    python tests/multi_turn_live_test.py                    # Run all 3 scenarios
-    python tests/multi_turn_live_test.py --scenario gradual_info_gathering
-    python tests/multi_turn_live_test.py --resume           # Resume interrupted run
-    python tests/multi_turn_live_test.py --wait 90          # Custom wait (seconds)
-    python tests/multi_turn_live_test.py --cleanup          # Remove test data
-    python tests/multi_turn_live_test.py --list             # List scenarios
-
-Live effects additionally require both:
-    SITESIFT_LIVE_TEST_AUTHORIZATION=I_UNDERSTAND_LIVE_PROVIDER_EFFECTS
-    --authorize-live-effects
+    python tests/multi_turn_live_test.py --list
 """
 
 import os
@@ -26,34 +14,11 @@ import sys
 import json
 import time
 import argparse
-import subprocess
 import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field, asdict
-
-# Load .env
-def load_dotenv():
-    env_paths = [
-        Path(__file__).parent.parent / ".env",
-        Path(__file__).parent / ".env",
-        Path.home() / ".emailautomation.env",
-    ]
-    for env_path in env_paths:
-        if env_path.exists():
-            print(f"Loading environment from: {env_path}")
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        key, value = line.split("=", 1)
-                        key = key.strip()
-                        value = value.strip().strip('"').strip("'")
-                        if key and value:
-                            os.environ[key] = value
-            return True
-    return False
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -82,8 +47,6 @@ OUTLOOK_USER_ID = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
 DEFAULT_WAIT_SECONDS = 75
 RESULTS_DIR = PROJECT_ROOT / "tests" / "results"
 STATE_FILE = PROJECT_ROOT / "tests" / ".multi_turn_state.json"
-LIVE_AUTHORIZATION_ENV = "SITESIFT_LIVE_TEST_AUTHORIZATION"
-LIVE_AUTHORIZATION_VALUE = "I_UNDERSTAND_LIVE_PROVIDER_EFFECTS"
 
 # Required fields for "complete" detection
 REQUIRED_FIELDS = ["Total SF", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]
@@ -101,16 +64,11 @@ class LiveAuthorizationError(RuntimeError):
     """Raised before credentials, clients, data, or providers can be touched."""
 
 
-def _require_live_authorization(*, cli_authorized=False):
-    environment_authorized = (
-        os.getenv(LIVE_AUTHORIZATION_ENV, "").strip()
-        == LIVE_AUTHORIZATION_VALUE
+def _require_live_authorization():
+    raise LiveAuthorizationError(
+        "Legacy live multi-turn effects are permanently retired; "
+        "--list is the only supported mode."
     )
-    if not environment_authorized or cli_authorized is not True:
-        raise LiveAuthorizationError(
-            "Live multi-turn effects are disabled. Set the exact live-test "
-            "authorization environment value and pass --authorize-live-effects."
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -197,14 +155,8 @@ class RunState:
 # Core orchestrator
 # ---------------------------------------------------------------------------
 class MultiTurnTestRunner:
-    def __init__(
-        self,
-        wait_seconds: int = DEFAULT_WAIT_SECONDS,
-        *,
-        live_authorized: bool = False,
-    ):
+    def __init__(self, wait_seconds: int = DEFAULT_WAIT_SECONDS):
         self.wait_seconds = wait_seconds
-        self.live_authorized = live_authorized is True
         self.graph_client: Optional[EmailTestClient] = None
         self.gmail_sender: Optional[GmailSender] = None
         self.sheets = None
@@ -212,9 +164,7 @@ class MultiTurnTestRunner:
         self._thread_client_ids: Dict[str, str] = {}  # thread_id -> actual clientId
 
     def _require_live(self):
-        _require_live_authorization(
-            cli_authorized=self.live_authorized,
-        )
+        _require_live_authorization()
 
     def _init_clients(self):
         """Initialize Graph API and Gmail clients (and do deferred imports)."""
@@ -307,41 +257,8 @@ class MultiTurnTestRunner:
     # Pipeline execution
     # ------------------------------------------------------------------
     def _run_pipeline(self) -> Tuple[float, str]:
-        """
-        Run the tracked main.py module without any ignored shell launcher.
-        Returns (duration_seconds, stdout_output).
-        """
+        """Retired effectful pipeline hook; always fail closed."""
         self._require_live()
-        print(f"\n>>> Running pipeline (main.py) ...")
-        start = time.time()
-
-        result = subprocess.run(
-            [sys.executable, "-m", "main"],
-            capture_output=True,
-            text=True,
-            cwd=str(PROJECT_ROOT),
-            timeout=300,
-        )
-        duration = time.time() - start
-
-        output = result.stdout + "\n" + result.stderr
-        if result.returncode != 0:
-            print(f"Pipeline exited with code {result.returncode}")
-            print(f"STDERR: {result.stderr[-500:]}" if result.stderr else "")
-        else:
-            print(f"Pipeline completed in {duration:.1f}s")
-
-        # Log key pipeline output lines for debugging
-        for line in output.split("\n"):
-            line_lower = line.strip().lower()
-            if any(kw in line_lower for kw in [
-                "applied", "skipped", "proposal", "sheet", "error",
-                "needs_user_input", "forward_to_user", "closing",
-                "missing_fields", "row_completed", "action_needed",
-            ]):
-                print(f"  [pipeline] {line.strip()[:120]}")
-
-        return duration, output
 
     # ------------------------------------------------------------------
     # Firestore queries
@@ -1547,58 +1464,9 @@ class MultiTurnTestRunner:
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
-def cleanup_test_data(*, live_authorized: bool = False):
-    """Remove test clients, threads, and notifications created by tests."""
-    _require_live_authorization(
-        cli_authorized=live_authorized is True,
-    )
-    from email_automation.clients import _fs
-
-    print("Cleaning up multi-turn test data...")
-
-    clients_ref = (
-        _fs.collection("users")
-        .document(OUTLOOK_USER_ID)
-        .collection("clients")
-    )
-
-    deleted_clients = 0
-    for doc in clients_ref.stream():
-        if doc.id.startswith("multi_turn_test_"):
-            data = doc.to_dict()
-            if data.get("isTestClient"):
-                # Delete notifications subcollection
-                notifs = doc.reference.collection("notifications")
-                for n in notifs.stream():
-                    n.reference.delete()
-                doc.reference.delete()
-                deleted_clients += 1
-                print(f"  Deleted client: {doc.id}")
-
-    # Delete test threads (by subject match)
-    threads_ref = (
-        _fs.collection("users")
-        .document(OUTLOOK_USER_ID)
-        .collection("threads")
-    )
-    deleted_threads = 0
-    test_addresses = [s.property_address.lower() for s in ALL_SCENARIOS.values()]
-    for doc in threads_ref.stream():
-        data = doc.to_dict()
-        subject = (data.get("subject") or "").lower()
-        if any(addr in subject for addr in test_addresses):
-            # Delete messages subcollection
-            msgs = doc.reference.collection("messages")
-            for m in msgs.stream():
-                m.reference.delete()
-            doc.reference.delete()
-            deleted_threads += 1
-            print(f"  Deleted thread: {doc.id}")
-
-    # Clean up state file
-    RunState.clear()
-
-    print(f"\nCleanup complete: {deleted_clients} clients, {deleted_threads} threads deleted")
+def cleanup_test_data():
+    """Retired effectful cleanup hook; always fail closed."""
+    _require_live_authorization()
 
 
 # ---------------------------------------------------------------------------
@@ -1634,12 +1502,6 @@ def main():
         action="store_true",
         help="List available scenarios",
     )
-    parser.add_argument(
-        "--authorize-live-effects",
-        action="store_true",
-        help="Required with the exact live-test authorization environment value",
-    )
-
     args = parser.parse_args()
 
     if args.list:
@@ -1653,43 +1515,10 @@ def main():
                 print(f"      Turn {i+1}: [{turn.action.value}] {turn.description}")
         return
 
-    try:
-        _require_live_authorization(
-            cli_authorized=args.authorize_live_effects,
-        )
-    except LiveAuthorizationError as error:
-        parser.error(str(error))
-
-    # Credentials are discovered only after the explicit, process-external
-    # authorization check has passed.
-    load_dotenv()
-
-    if args.cleanup:
-        cleanup_test_data(
-            live_authorized=args.authorize_live_effects,
-        )
-        return
-
-    runner = MultiTurnTestRunner(
-        wait_seconds=args.wait,
-        live_authorized=args.authorize_live_effects,
+    parser.error(
+        "Legacy live multi-turn effects are permanently retired; "
+        "--list is the only supported mode."
     )
-
-    scenario_names = [args.scenario] if args.scenario else None
-    report = runner.run(scenario_names=scenario_names, resume=args.resume)
-
-    # Print final summary
-    summary = report["summary"]
-    print("\n" + "=" * 80)
-    print("FINAL SUMMARY")
-    print("=" * 80)
-    print(f"  Scenarios: {summary['scenarios_passed']}/{summary['scenarios_total']} passed")
-    print(f"  Turns: {summary['turns_passed']}/{summary['turns_total']} passed")
-    print(f"  Duration: {summary['total_duration_seconds']}s")
-    print(f"  Result: {'PASS' if summary['overall_pass'] else 'FAIL'}")
-    print("=" * 80)
-
-    sys.exit(0 if summary["overall_pass"] else 1)
 
 
 if __name__ == "__main__":
