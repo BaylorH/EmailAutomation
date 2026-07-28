@@ -2,6 +2,7 @@ import io
 import json
 import os
 import socket
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,32 +18,127 @@ from scripts import run_test_level
 
 
 class TestCredentialFreeL1Runner(unittest.TestCase):
-    def test_l1_discovery_rejects_legacy_effectful_suffix_if_loader_returns_it(self):
-        class LegacyEffectfulCase(unittest.TestCase):
-            def runTest(self):
-                self.fail("legacy effectful test must never execute")
-
-        LegacyEffectfulCase.__module__ = "tests.e2e_test"
-        loader = Mock()
-        loader.discover.return_value = unittest.TestSuite(
-            [LegacyEffectfulCase()]
+    def test_existing_legacy_manual_surfaces_are_explicitly_inventoried(self):
+        test_root = run_test_level.REPO_ROOT / "tests"
+        legacy_surfaces = frozenset(
+            path.relative_to(test_root).as_posix()
+            for path in test_root.rglob("*_test.py")
+            if path.is_file() and not path.name.startswith("test")
         )
 
-        with patch.object(
-            run_test_level.unittest,
-            "TestLoader",
-            return_value=loader,
-        ):
+        self.assertEqual(
+            legacy_surfaces,
+            run_test_level.L1_EXCLUDED_MANUAL_SURFACES,
+        )
+
+    def test_unregistered_legacy_surface_fails_closed_before_import(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_root = Path(tmp_dir)
+            import_marker = test_root / "legacy-imported"
+            (test_root / "new_manual_test.py").write_text(
+                "from pathlib import Path\n"
+                f"Path({str(import_marker)!r}).write_text('imported')\n",
+                encoding="utf-8",
+            )
+
             with self.assertRaisesRegex(
                 RuntimeError,
-                "outside credential-free L1 selection",
+                "unregistered legacy manual test surface.*new_manual_test.py",
             ):
-                run_test_level._discover_l1_suite()
+                run_test_level._discover_l1_suite(
+                    test_root=test_root,
+                    excluded_manual_surfaces=frozenset(),
+                )
 
-        loader.discover.assert_called_once_with(
-            "tests",
-            pattern="test*.py",
-        )
+            self.assertFalse(import_marker.exists())
+
+    def test_allowlisted_legacy_surface_is_not_collected_by_real_discovery(self):
+        original_sys_path = sys.path.copy()
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                test_root = Path(tmp_dir)
+                import_marker = test_root / "legacy-imported"
+                (test_root / "manual_flow_test.py").write_text(
+                    "from pathlib import Path\n"
+                    f"Path({str(import_marker)!r}).write_text('imported')\n"
+                    "raise AssertionError('manual surface must not be imported')\n",
+                    encoding="utf-8",
+                )
+
+                suite = run_test_level._discover_l1_suite(
+                    test_root=test_root,
+                    excluded_manual_surfaces=frozenset({"manual_flow_test.py"}),
+                )
+
+                self.assertEqual(suite.countTestCases(), 0)
+                self.assertFalse(import_marker.exists())
+        finally:
+            sys.path[:] = original_sys_path
+
+    def test_canonical_rename_opts_manual_surface_into_l1_boundary(self):
+        original_sys_path = sys.path.copy()
+        module_name = "test_manual_boundary"
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                test_root = Path(tmp_dir)
+                manual_path = test_root / "manual_boundary_test.py"
+                canonical_path = test_root / f"{module_name}.py"
+                manual_path.write_text(
+                    "import os\n"
+                    "import socket\n"
+                    "import unittest\n"
+                    "from scripts import run_test_level\n"
+                    "\n"
+                    "DISCOVERY_WAS_CREDENTIAL_FREE = (\n"
+                    "    'OPENAI_API_KEY' not in os.environ\n"
+                    "    and os.environ.get('E2E_TEST_MODE') == 'true'\n"
+                    ")\n"
+                    "try:\n"
+                    "    socket.gethostbyname('example.invalid')\n"
+                    "except run_test_level.L1NetworkAccessBlocked:\n"
+                    "    DISCOVERY_NETWORK_WAS_BLOCKED = True\n"
+                    "else:\n"
+                    "    DISCOVERY_NETWORK_WAS_BLOCKED = False\n"
+                    "\n"
+                    "class CanonicalBoundaryCase(unittest.TestCase):\n"
+                    "    def test_discovery_and_execution_use_l1_boundary(self):\n"
+                    "        self.assertTrue(DISCOVERY_WAS_CREDENTIAL_FREE)\n"
+                    "        self.assertTrue(DISCOVERY_NETWORK_WAS_BLOCKED)\n"
+                    "        self.assertNotIn('OPENAI_API_KEY', os.environ)\n"
+                    "        with self.assertRaises(\n"
+                    "            run_test_level.L1NetworkAccessBlocked\n"
+                    "        ):\n"
+                    "            socket.gethostbyname('example.invalid')\n",
+                    encoding="utf-8",
+                )
+
+                excluded_suite = run_test_level._discover_l1_suite(
+                    test_root=test_root,
+                    excluded_manual_surfaces=frozenset(
+                        {"manual_boundary_test.py"}
+                    ),
+                )
+                self.assertEqual(excluded_suite.countTestCases(), 0)
+
+                manual_path.rename(canonical_path)
+                output = io.StringIO()
+                with patch.dict(
+                    os.environ,
+                    {"OPENAI_API_KEY": "live-key"},
+                ):
+                    result = run_test_level.run_l1(
+                        suite_factory=lambda: run_test_level._discover_l1_suite(
+                            test_root=test_root,
+                            excluded_manual_surfaces=frozenset(),
+                        ),
+                        output=output,
+                    )
+
+                self.assertEqual(result.status, "passed", result.detail)
+                self.assertEqual(result.tests_run, 1)
+        finally:
+            sys.modules.pop(module_name, None)
+            sys.path[:] = original_sys_path
 
     def test_l1_bootstrap_covers_discovery_and_execution(self):
         observations = []

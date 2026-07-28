@@ -25,6 +25,21 @@ else:
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+L1_TEST_ROOT = REPO_ROOT / "tests"
+L1_EXCLUDED_MANUAL_SURFACES = frozenset(
+    {
+        "campaign_lifecycle_test.py",
+        "e2e_test.py",
+        "email_integration_test.py",
+        "full_flow_test.py",
+        "full_pipeline_test.py",
+        "integration_test.py",
+        "multi_turn_live_test.py",
+        "production_test.py",
+        "run_full_test.py",
+        "standalone_test.py",
+    }
+)
 DEFAULT_REGISTRY_PATH = (
     REPO_ROOT / "docs" / "release-safety" / "scenario-registry.json"
 )
@@ -169,27 +184,38 @@ def credential_free_l1_environment() -> Iterator[MagicMock]:
             os.environ.pop(E2E_TEST_MODE_ENV, None)
 
 
-def _discover_l1_suite() -> unittest.TestSuite:
+def _discover_l1_suite(
+    *,
+    test_root: Path = L1_TEST_ROOT,
+    excluded_manual_surfaces: frozenset[
+        str
+    ] = L1_EXCLUDED_MANUAL_SURFACES,
+) -> unittest.TestSuite:
+    """Validate manual surfaces, then discover canonical tests.
+
+    Filenames declare the execution boundary; they do not infer whether code is
+    effectful. Registered noncanonical ``*_test.py`` files remain manual, while
+    renaming one to canonical ``test*.py`` opts it into credential-free L1.
+    """
+
+    legacy_surfaces = frozenset(
+        path.relative_to(test_root).as_posix()
+        for path in test_root.rglob("*_test.py")
+        if path.is_file() and not path.name.startswith("test")
+    )
+    unregistered_surfaces = sorted(
+        legacy_surfaces - excluded_manual_surfaces
+    )
+    if unregistered_surfaces:
+        raise RuntimeError(
+            "L1 found unregistered legacy manual test surface(s): "
+            + ", ".join(unregistered_surfaces)
+            + ". Register each as manual or rename it to canonical test*.py "
+            "to run inside the credential-free/network-blocked L1 boundary."
+        )
+
     loader = unittest.TestLoader()
-    suite = loader.discover("tests", pattern="test*.py")
-    for test in _iter_suite_tests(suite):
-        module_name = test.__class__.__module__.rsplit(".", 1)[-1]
-        if module_name.endswith("_test") and not module_name.startswith("test"):
-            raise RuntimeError(
-                "L1 discovery collected a legacy effectful test outside "
-                f"credential-free L1 selection: {module_name}.py"
-            )
-    return suite
-
-
-def _iter_suite_tests(
-    suite: unittest.TestSuite,
-) -> Iterator[unittest.TestCase]:
-    for test in suite:
-        if isinstance(test, unittest.TestSuite):
-            yield from _iter_suite_tests(test)
-        else:
-            yield test
+    return loader.discover(str(test_root), pattern="test*.py")
 
 
 def run_l1(
