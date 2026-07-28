@@ -290,6 +290,49 @@ oversights:
    out of *outbound campaign* mail during an incident means the kill switch or emptying
    their queue, not the auto-reply allowlist.
 
+## Credential-free worker source rollback
+
+Create the rollback material only from a clean reviewed commit:
+
+```bash
+PYTHON_BIN=/absolute/path/to/python \
+  bash scripts/release/build-worker.sh \
+  --output /absolute/path/to/new-worker-artifact
+```
+
+`build-worker.sh` uses `git archive`, so the source archive is deterministic
+for the commit. Its exact Git pathspecs exclude tracked `venv`/`.venv` trees,
+which are already outside the Docker context. The dynamic manifest binds those
+pathspecs, the full commit, archive SHA-256, Dockerfile SHA-256, requirements
+lock SHA-256, pinned base-image identity, Python/Git/tar versions, and the
+eventual Docker build arguments. It makes no provider, network, credential,
+queue, worker, campaign, send, or live-data call.
+
+Verify the local bytes offline:
+
+```bash
+PYTHON_BIN=/absolute/path/to/python \
+  bash scripts/release/verify-worker.sh \
+  --manifest /absolute/path/to/worker-artifact/worker-release-manifest.json
+```
+
+Restore defaults to dry-run and verifies first:
+
+```bash
+PYTHON_BIN=/absolute/path/to/python \
+  bash scripts/release/restore-worker.sh \
+  --manifest /absolute/path/to/worker-artifact/worker-release-manifest.json \
+  --target /absolute/path/to/empty-restore-directory
+```
+
+Use `--apply` only to reconstruct the verified source locally. The restore
+script refuses missing, mismatched, absolute, traversal, or unsafe tar
+artifacts and non-empty targets. Docker daemon capability is explicitly not
+assumed in the credential-free rehearsal: the manifest proves the source,
+Dockerfile, lock, base, and build-argument identity, while a later Docker build
+or deployment remains a separate approved operation. No provider image is
+required for rollback selection.
+
 ---
 
 *Generated verifying the `codex/safety-rails-observability-20260704` worktree — suite

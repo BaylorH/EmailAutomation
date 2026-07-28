@@ -212,6 +212,14 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(self._gcloud_calls(), [])
         self.assertEqual(self._git_calls(), self._git_preflight_calls())
 
+    def test_dry_run_reports_credential_free_source_rollback_build_without_running_it(self):
+        result = self._run("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("scripts/release/build-worker.sh", result.stdout)
+        self.assertIn("source rollback", result.stdout.lower())
+        self.assertIn("dry-run", result.stdout.lower())
+        self.assertEqual(self._gcloud_calls(), [])
+
     def test_missing_principal_stops_before_git_or_gcloud(self):
         result = self._run("--apply", account=None)
         self.assertNotEqual(result.returncode, 0)

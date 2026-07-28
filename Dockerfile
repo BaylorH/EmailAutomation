@@ -8,6 +8,11 @@
 # a manylinux wheel for 3.12, keeping the build wheel-only and layers minimal.
 FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 
+ARG SOURCE_COMMIT=unknown
+ARG SOURCE_BUILD_IDENTITY=unknown
+LABEL org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+    com.sitesift.source-build-identity="${SOURCE_BUILD_IDENTITY}"
+
 # - PYTHONUNBUFFERED: stream logs to Cloud Logging without buffering
 # - PYTHONDONTWRITEBYTECODE: no .pyc clutter in the image
 # - PIP_NO_CACHE_DIR: smaller image

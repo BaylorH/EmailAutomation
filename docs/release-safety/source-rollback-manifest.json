@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "artifactKind": "sitesift-worker-source-rollback",
+  "cleanSourceRequired": true,
+  "offlineVerificationRequired": true,
+  "defaultRestoreMode": "dry-run",
+  "providerImageRequired": false,
+  "sourceArchive": "worker-source.tar",
+  "dynamicManifest": "worker-release-manifest.json",
+  "identityInputs": [
+    "repository.commit",
+    "source.archiveSha256",
+    "source.gitPathspecs",
+    "build.dockerfileSha256",
+    "build.lockfileSha256",
+    "build.baseImage"
+  ],
+  "scripts": {
+    "build": "scripts/release/build-worker.sh",
+    "verify": "scripts/release/verify-worker.sh",
+    "restore": "scripts/release/restore-worker.sh"
+  }
+}

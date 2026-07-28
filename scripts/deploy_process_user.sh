@@ -62,6 +62,7 @@ print_command() {
 if [[ "$mode" == "dry-run" ]]; then
   printf 'dry-run: zero gcloud commands will execute\n'
   printf 'image tag: %s\n' "$image_tag"
+  printf 'source rollback artifact (separate, credential-free): bash scripts/release/build-worker.sh --output <new-artifact-directory>\n'
   print_command "${build_command[@]}"
   print_command "${digest_command[@]}"
   printf 'deploy image after digest resolution: %s@sha256:<64-hex-digest>\n' "$image_tag"

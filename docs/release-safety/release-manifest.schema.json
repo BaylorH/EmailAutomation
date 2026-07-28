@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sitesiftai.com/schemas/worker-release-manifest.schema.json",
+  "title": "SiteSift worker source rollback manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "artifactKind",
+    "repository",
+    "source",
+    "build",
+    "tools",
+    "restoreCommands"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "artifactKind": {
+      "const": "sitesift-worker-source-rollback"
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commit",
+        "clean"
+      ],
+      "properties": {
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "clean": {
+          "const": true
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "archive",
+        "archiveSha256",
+        "gitPathspecs"
+      ],
+      "properties": {
+        "archive": {
+          "const": "worker-source.tar"
+        },
+        "archiveSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "gitPathspecs": {
+          "const": [
+            ".",
+            ":(exclude,glob)**/venv/**",
+            ":(exclude,glob)**/.venv/**"
+          ]
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceBuildIdentity",
+        "dockerfileSha256",
+        "lockfileSha256",
+        "baseImage",
+        "command"
+      ],
+      "properties": {
+        "sourceBuildIdentity": {
+          "$ref": "#/$defs/sha256"
+        },
+        "dockerfileSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "lockfileSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "baseImage": {
+          "type": "string",
+          "pattern": "@sha256:[0-9a-f]{64}$"
+        },
+        "command": {
+          "type": "array",
+          "minItems": 7,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "python",
+        "git",
+        "tar"
+      ],
+      "properties": {
+        "python": {
+          "const": "Python 3.12.13"
+        },
+        "git": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tar": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "restoreCommands": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verify",
+        "dryRun",
+        "apply"
+      ],
+      "properties": {
+        "verify": {
+          "const": "bash scripts/release/verify-worker.sh --manifest worker-release-manifest.json"
+        },
+        "dryRun": {
+          "const": "bash scripts/release/restore-worker.sh --manifest worker-release-manifest.json --target <empty-dir>"
+        },
+        "apply": {
+          "const": "bash scripts/release/restore-worker.sh --apply --manifest worker-release-manifest.json --target <empty-dir>"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

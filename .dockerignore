@@ -52,6 +52,9 @@ ENV/
 .DS_Store
 *.log
 logs/
+release-artifacts/
+worker-release-manifest.json
+*.tar
 
 # --- Local data artifacts ---
 *.xlsx
