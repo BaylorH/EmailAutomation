@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 import os
 import re
@@ -11,6 +12,12 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INVENTORY_PATH = REPO_ROOT / "docs" / "release-safety" / "outbound-send-surface-inventory.json"
+SOURCE_BASELINE_PATH = (
+    REPO_ROOT
+    / "docs"
+    / "release-safety"
+    / "outbound-send-source-baseline.json"
+)
 
 GRAPH_SEND_PATTERN = re.compile(
     r"/me/(?:sendMail|messages/\{[^}]+\}/(?:reply|send|createReply|createReplyAll))"
@@ -55,6 +62,15 @@ def _workflow_files():
     )
 
 
+def _semantic_ast_sha256(source: str) -> str:
+    normalized = ast.dump(
+        ast.parse(source),
+        annotate_fields=True,
+        include_attributes=False,
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def _functions_with_legacy_final_send_literals(relative_path: str):
     tree = ast.parse(
         (REPO_ROOT / relative_path).read_text(encoding="utf-8")
@@ -95,6 +111,103 @@ def _first_executable_statement(function):
 
 
 class GraphSendInventoryTests(unittest.TestCase):
+    def test_outbound_source_review_baseline_covers_every_production_python_ast(self):
+        self.assertTrue(
+            SOURCE_BASELINE_PATH.exists(),
+            "A reviewed production-source baseline is required.",
+        )
+        baseline = json.loads(SOURCE_BASELINE_PATH.read_text())
+        self.assertEqual(baseline.get("schemaVersion"), 1)
+        self.assertEqual(
+            baseline.get("algorithm"),
+            "python-ast-dump-sha256-v1",
+        )
+        self.assertEqual(
+            baseline.get("pythonVersion"),
+            ".".join(str(part) for part in sys.version_info[:3]),
+        )
+        expected = baseline.get("files")
+        self.assertIsInstance(expected, dict)
+
+        production_files = {
+            str(relative_path): _semantic_ast_sha256(
+                (REPO_ROOT / relative_path).read_text(
+                    encoding="utf-8",
+                    errors="strict",
+                )
+            )
+            for relative_path in _repo_python_files()
+        }
+        self.assertEqual(
+            set(expected),
+            set(production_files),
+            "Production Python files changed; every addition/removal requires "
+            "an explicit outbound-source baseline review.",
+        )
+        self.assertEqual(
+            expected,
+            production_files,
+            "Production Python semantics changed; review outbound effects and "
+            "update the baseline deliberately.",
+        )
+
+    def test_source_review_baseline_catches_syntax_independent_bypass_shapes(self):
+        reviewed_source = "def reviewed():\n    return 'safe'\n"
+        reviewed_hash = _semantic_ast_sha256(reviewed_source)
+        bypasses = {
+            "split_endpoint": (
+                'post(base + "/me/messages/" + draft_id + "/" + "send")'
+            ),
+            "mapping_percent": (
+                'post("%(base)s/me/messages/%(id)s/%(op)s" % '
+                '{"base": base, "id": draft_id, "op": "send"})'
+            ),
+            "match_case": (
+                'match action:\n'
+                '    case "send":\n'
+                '        post(f"{base}/me/messages/{draft_id}/{action}")'
+            ),
+            "provider_alias": (
+                "raw = provider.send_draft\n"
+                'raw("draft-id")'
+            ),
+            "getattr_alias": (
+                'getattr(provider, "send_" + "draft")("draft-id")'
+            ),
+            "late_bound_closure": (
+                "def invoke():\n"
+                '    raw("draft-id")\n'
+                "raw = provider.send_draft"
+            ),
+        }
+
+        for name, bypass in bypasses.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(
+                    reviewed_hash,
+                    _semantic_ast_sha256(
+                        f"{reviewed_source}\n{bypass}\n"
+                    ),
+                )
+
+    def test_source_review_baseline_ignores_comments_and_formatting_only(self):
+        compact = "def reviewed(value):\n    return value + 1\n"
+        reformatted = (
+            "# explanatory comment\n\n"
+            "def reviewed(\n"
+            "    value,\n"
+            "):\n"
+            "    return (\n"
+            "        value\n"
+            "        + 1\n"
+            "    )\n"
+        )
+
+        self.assertEqual(
+            _semantic_ast_sha256(compact),
+            _semantic_ast_sha256(reformatted),
+        )
+
     def test_inventory_exists_and_covers_every_graph_send_surface(self):
         self.assertTrue(
             INVENTORY_PATH.exists(),
