@@ -81,6 +81,21 @@ class ObservabilityInitializationTests(unittest.TestCase):
         self.assertIn("init_sentry()", main_source)
         self.assertIn("init_sentry()", service_source)
 
+    def test_sentry_runtime_is_declared_and_hash_locked(self):
+        requirements = (
+            REPO_ROOT / "requirements.txt"
+        ).read_text(encoding="utf-8").splitlines()
+        lock = (
+            REPO_ROOT / "requirements.lock"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("sentry-sdk", requirements)
+        self.assertRegex(
+            lock,
+            r"(?m)^sentry-sdk==[0-9][^\s]* \\\n"
+            r"(?:    --hash=sha256:[0-9a-f]{64}(?: \\\n)?)+$",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
