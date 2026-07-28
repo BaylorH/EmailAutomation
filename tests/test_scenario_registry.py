@@ -21,7 +21,7 @@ FAMILY_COUNTS = {
     "FUP": 3,
     "NOT": 2,
     "REC": 2,
-    "SEC": 3,
+    "SEC": 4,
     "OBS": 2,
     "DEP": 4,
 }
@@ -44,6 +44,36 @@ VALID_RESULT_STATUSES = {
     "gap",
     "unavailable",
     "not_run",
+}
+TURN2_ACCEPTANCE_ROWS = {
+    "ACC-03",
+    "ACC-04",
+    "ACC-05",
+    "QUE-01",
+    "QUE-02",
+    "QUE-04",
+    "OUT-02",
+    "OUT-04",
+    "OUT-05",
+    "OUT-06",
+    "OUT-08",
+    "RSP-02",
+    "NOT-01",
+    "REC-01",
+    "REC-02",
+    "SEC-02",
+    "SEC-03",
+    "SEC-04",
+    "OBS-01",
+    "DEP-01",
+    "DEP-02",
+    "DEP-03",
+}
+TURN2_CONTRACT_IDS = {
+    "verified_firebase_authority",
+    "durable_provider_effect",
+    "drive_trash_reconciliation",
+    "reproducible_release_artifact",
 }
 EVIDENCE_RELATIVE_PATH = (
     "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
@@ -125,6 +155,128 @@ class TestScenarioRegistry(unittest.TestCase):
             {scenario["family"] for scenario in scenarios},
             set(FAMILY_COUNTS),
         )
+
+    def test_turn2_contract_freeze_is_machine_readable_and_complete(self):
+        freeze = self.registry["turn2ContractFreeze"]
+        scenario_ids = {scenario["id"] for scenario in self.registry["scenarios"]}
+
+        self.assertEqual(freeze["turn"], 2)
+        self.assertEqual(freeze["status"], "contract_frozen")
+        self.assertEqual(set(freeze["acceptanceRows"]), TURN2_ACCEPTANCE_ROWS)
+        self.assertLessEqual(TURN2_ACCEPTANCE_ROWS, scenario_ids)
+        self.assertEqual(set(freeze["contracts"]), TURN2_CONTRACT_IDS)
+
+        covered_rows = set()
+        for contract_id, contract in freeze["contracts"].items():
+            with self.subTest(contract=contract_id):
+                contract_rows = set(contract["acceptanceRows"])
+                self.assertTrue(contract_rows)
+                self.assertLessEqual(contract_rows, TURN2_ACCEPTANCE_ROWS)
+                covered_rows.update(contract_rows)
+        self.assertEqual(covered_rows, TURN2_ACCEPTANCE_ROWS)
+
+    def test_turn2_authority_contract_rejects_unverified_callers_before_effects(self):
+        contract = self.registry["turn2ContractFreeze"]["contracts"][
+            "verified_firebase_authority"
+        ]
+
+        self.assertEqual(contract["authoritySource"], "verified_firebase_auth")
+        self.assertFalse(contract["callerUidIsAuthority"])
+        self.assertFalse(contract["bodyUidIsAuthority"])
+        self.assertEqual(
+            set(contract["failClosedPrincipals"]),
+            {
+                "anonymous",
+                "missing_token",
+                "invalid_token",
+                "expired_token",
+                "revoked_token",
+                "principal_mismatch",
+            },
+        )
+        self.assertEqual(
+            set(contract["beforeEffects"]),
+            {
+                "firestore_admin",
+                "google_drive",
+                "google_sheets",
+                "microsoft_graph",
+                "cloud_tasks",
+                "openai",
+            },
+        )
+
+    def test_turn2_provider_effect_contract_is_durable_bounded_and_visible(self):
+        contract = self.registry["turn2ContractFreeze"]["contracts"][
+            "durable_provider_effect"
+        ]
+
+        self.assertEqual(
+            set(contract["requiredIdentities"]),
+            {"effectId", "contentIdempotencyKey"},
+        )
+        self.assertEqual(contract["receiptDurability"], "durable")
+        self.assertEqual(
+            set(contract["receiptStates"]),
+            {
+                "prepared",
+                "claimed",
+                "provider_accepted",
+                "succeeded",
+                "cancelled",
+                "terminal_failed",
+                "reconciliation_required",
+            },
+        )
+        self.assertEqual(
+            contract["cancellationCheck"],
+            "immediately_before_provider_effect",
+        )
+        self.assertTrue(contract["attemptPolicy"]["bounded"])
+        self.assertTrue(contract["attemptPolicy"]["explicitCapRequired"])
+        self.assertTrue(contract["terminalFailure"]["operatorVisible"])
+        self.assertEqual(
+            contract["terminalFailure"]["receiptState"],
+            "terminal_failed",
+        )
+
+    def test_turn2_drive_trash_partial_failure_is_safe_to_reconcile(self):
+        contract = self.registry["turn2ContractFreeze"]["contracts"][
+            "drive_trash_reconciliation"
+        ]
+
+        self.assertEqual(
+            set(contract["outcomes"]),
+            {
+                "drive_trash_failed",
+                "drive_trashed_firestore_marked",
+                "drive_trashed_firestore_mark_failed",
+            },
+        )
+        self.assertEqual(
+            contract["partialFailureOutcome"],
+            "drive_trashed_firestore_mark_failed",
+        )
+        self.assertTrue(contract["retry"]["readsDurableReceipt"])
+        self.assertTrue(contract["retry"]["reconcilesFirestoreMark"])
+        self.assertTrue(contract["retry"]["forbidsDuplicateDriveMutation"])
+
+    def test_turn2_release_contract_points_to_the_system_artifact_manifest(self):
+        contract = self.registry["turn2ContractFreeze"]["contracts"][
+            "reproducible_release_artifact"
+        ]
+
+        self.assertEqual(
+            contract["manifestSource"],
+            "docs/release-safety/system-audit-matrix.json"
+            "#releaseArtifactManifest",
+        )
+        self.assertEqual(contract["firebaseFunctionCount"], 29)
+        self.assertEqual(
+            contract["mailboxReadinessFunction"],
+            "getMailboxReadinessState",
+        )
+        self.assertTrue(contract["sourceBasedRestoreVerification"])
 
     def test_each_scenario_has_owner_levels_data_and_required_result(self):
         for scenario in self.registry["scenarios"]:

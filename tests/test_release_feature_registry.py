@@ -11,6 +11,75 @@ GRADEBOOK_PATH = REPO_ROOT / "docs" / "release-safety" / "feature-gradebook.json
 OUTBOUND_INVENTORY_PATH = (
     REPO_ROOT / "docs" / "release-safety" / "outbound-send-surface-inventory.json"
 )
+SYSTEM_AUDIT_MATRIX_PATH = (
+    REPO_ROOT / "docs" / "release-safety" / "system-audit-matrix.json"
+)
+
+TURN2_CONTRACT_IDS = {
+    "verified_firebase_authority",
+    "durable_provider_effect",
+    "drive_trash_reconciliation",
+    "reproducible_release_artifact",
+}
+
+TURN2_REQUIRED_FEATURE_ASSIGNMENTS = {
+    "verified_firebase_authority": {
+        "core.upload_mapping",
+        "core.manual_reply",
+        "core.health_recovery",
+        "infra.shared_entitlements",
+        "infra.firestore_lane_rules",
+    },
+    "durable_provider_effect": {
+        "core.outbox_send",
+        "core.manual_reply",
+        "core.inbox_auto_reply",
+        "core.followups",
+        "core.health_recovery",
+        "infra.cloud_tasks",
+    },
+    "drive_trash_reconciliation": {
+        "core.stop_cancel_dismiss",
+        "core.health_recovery",
+    },
+    "reproducible_release_artifact": {
+        "infra.cloud_scheduler",
+        "infra.cloud_tasks",
+        "infra.observability",
+    },
+}
+
+EXPECTED_FIREBASE_FUNCTIONS = {
+    "api",
+    "deleteSheet",
+    "generateAllScripts",
+    "generateSecondaryScript",
+    "regeneratePrimaryScript",
+    "generateInitialScript",
+    "chatWithPropertyContext",
+    "analyzeSheetColumns",
+    "getUserData",
+    "stopConversation",
+    "planTourRoute",
+    "getGraphHopperUsage",
+    "getAdminUsageReport",
+    "getAdminOperationsReport",
+    "getAdminCampaignConversations",
+    "getMailboxReadinessState",
+    "getCampaignAccessState",
+    "setCampaignAccessState",
+    "stopCampaign",
+    "geocodeCampaignProperties",
+    "persistCampaignPropertyCoordinates",
+    "acceptNewProperty",
+    "initiateMsalAuth",
+    "msalCallback",
+    "subscribeOnConnect",
+    "graphWebhook",
+    "processOutboxOnCreate",
+    "renewSubscriptions",
+    "reconcile",
+}
 
 REQUIRED_FEATURE_IDS = {
     "core.upload_mapping",
@@ -376,6 +445,74 @@ class ReleaseFeatureRegistryTests(unittest.TestCase):
 
         for feature_id in feature_ids:
             visit(feature_id)
+
+    def test_turn2_contract_assignments_reference_known_feature_ids(self):
+        registry = _read_json(REGISTRY_PATH)
+        feature_ids = {feature["id"] for feature in registry["features"]}
+        assignments = registry["turn2ContractAssignments"]
+
+        self.assertEqual(set(assignments), TURN2_CONTRACT_IDS)
+        for contract_id, required_features in TURN2_REQUIRED_FEATURE_ASSIGNMENTS.items():
+            with self.subTest(contract=contract_id):
+                assigned_features = assignments[contract_id]
+                self.assertEqual(len(assigned_features), len(set(assigned_features)))
+                self.assertLessEqual(set(assigned_features), feature_ids)
+                self.assertLessEqual(required_features, set(assigned_features))
+
+    def test_turn2_cross_repo_invariants_are_frozen_in_the_audit_matrix(self):
+        matrix = _read_json(SYSTEM_AUDIT_MATRIX_PATH)
+        invariants = {
+            invariant["id"]: invariant
+            for invariant in matrix["crossRepoInvariants"]
+        }
+
+        self.assertLessEqual(TURN2_CONTRACT_IDS, set(invariants))
+        for contract_id in TURN2_CONTRACT_IDS:
+            with self.subTest(contract=contract_id):
+                invariant = invariants[contract_id]
+                self.assertTrue(invariant["rule"])
+                self.assertTrue(invariant["packageAcceptance"])
+
+    def test_release_artifact_manifest_freezes_complete_reproducible_identity(self):
+        matrix = _read_json(SYSTEM_AUDIT_MATRIX_PATH)
+        manifest = matrix["releaseArtifactManifest"]
+
+        self.assertEqual(
+            manifest["source"]["requiredFields"],
+            ["sourceCommit", "sourceArchiveSha256", "sourceBuildIdentity"],
+        )
+        function_manifest = manifest["firebaseFunctions"]
+        self.assertEqual(function_manifest["expectedCount"], 29)
+        self.assertEqual(len(function_manifest["expectedNames"]), 29)
+        self.assertEqual(
+            set(function_manifest["expectedNames"]),
+            EXPECTED_FIREBASE_FUNCTIONS,
+        )
+        self.assertEqual(
+            function_manifest["mailboxReadinessFunction"],
+            "getMailboxReadinessState",
+        )
+        self.assertTrue(manifest["hosting"]["completeAssetHashesRequired"])
+        self.assertEqual(
+            manifest["hosting"]["assetHashFields"],
+            ["path", "sha256"],
+        )
+        self.assertEqual(
+            manifest["worker"]["requiredFields"],
+            ["sourceCommit", "sourceArchiveSha256", "sourceBuildIdentity"],
+        )
+        self.assertTrue(manifest["restoreVerification"]["sourceBased"])
+        self.assertEqual(
+            manifest["restoreVerification"]["requiredChecks"],
+            [
+                "source_commit_matches",
+                "source_archive_hash_matches",
+                "rebuild_identity_matches",
+                "function_manifest_matches",
+                "hosting_asset_hashes_match",
+                "worker_build_identity_matches",
+            ],
+        )
 
     def test_processing_send_surface_is_not_misclassified_as_read_only(self):
         registry = _read_json(REGISTRY_PATH)

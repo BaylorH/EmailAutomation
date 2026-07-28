@@ -17,6 +17,33 @@ from scripts import run_test_level
 
 
 class TestCredentialFreeL1Runner(unittest.TestCase):
+    def test_l1_discovery_rejects_legacy_effectful_suffix_if_loader_returns_it(self):
+        class LegacyEffectfulCase(unittest.TestCase):
+            def runTest(self):
+                self.fail("legacy effectful test must never execute")
+
+        LegacyEffectfulCase.__module__ = "tests.e2e_test"
+        loader = Mock()
+        loader.discover.return_value = unittest.TestSuite(
+            [LegacyEffectfulCase()]
+        )
+
+        with patch.object(
+            run_test_level.unittest,
+            "TestLoader",
+            return_value=loader,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "outside credential-free L1 selection",
+            ):
+                run_test_level._discover_l1_suite()
+
+        loader.discover.assert_called_once_with(
+            "tests",
+            pattern="test*.py",
+        )
+
     def test_l1_bootstrap_covers_discovery_and_execution(self):
         observations = []
         sensitive_environment = {

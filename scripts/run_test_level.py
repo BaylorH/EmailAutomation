@@ -171,7 +171,25 @@ def credential_free_l1_environment() -> Iterator[MagicMock]:
 
 def _discover_l1_suite() -> unittest.TestSuite:
     loader = unittest.TestLoader()
-    return loader.discover("tests", pattern="test*.py")
+    suite = loader.discover("tests", pattern="test*.py")
+    for test in _iter_suite_tests(suite):
+        module_name = test.__class__.__module__.rsplit(".", 1)[-1]
+        if module_name.endswith("_test") and not module_name.startswith("test"):
+            raise RuntimeError(
+                "L1 discovery collected a legacy effectful test outside "
+                f"credential-free L1 selection: {module_name}.py"
+            )
+    return suite
+
+
+def _iter_suite_tests(
+    suite: unittest.TestSuite,
+) -> Iterator[unittest.TestCase]:
+    for test in suite:
+        if isinstance(test, unittest.TestSuite):
+            yield from _iter_suite_tests(test)
+        else:
+            yield test
 
 
 def run_l1(

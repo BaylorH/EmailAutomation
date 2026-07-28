@@ -8,6 +8,37 @@
     "dev_tour": "Tour scheduling isolated from normal users until separately proven.",
     "later_firebase_native": "Infrastructure migration work after Production V1 is stable."
   },
+  "turn2ContractAssignments": {
+    "verified_firebase_authority": [
+      "core.upload_mapping",
+      "core.launch_draft",
+      "core.manual_reply",
+      "core.health_recovery",
+      "admin.usage_readonly",
+      "infra.shared_entitlements",
+      "infra.firestore_lane_rules"
+    ],
+    "durable_provider_effect": [
+      "core.outbox_send",
+      "core.manual_reply",
+      "core.inbox_auto_reply",
+      "core.followups",
+      "core.health_recovery",
+      "core.scheduler_scope",
+      "infra.cloud_scheduler",
+      "infra.cloud_tasks"
+    ],
+    "drive_trash_reconciliation": [
+      "core.stop_cancel_dismiss",
+      "core.health_recovery"
+    ],
+    "reproducible_release_artifact": [
+      "core.scheduler_scope",
+      "infra.cloud_scheduler",
+      "infra.cloud_tasks",
+      "infra.observability"
+    ]
+  },
   "features": [
     {
       "id": "core.upload_mapping",
