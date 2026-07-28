@@ -173,18 +173,17 @@ class EffectGatewayConfig:
     def from_env(cls) -> "EffectGatewayConfig":
         """Load fail-closed controls.
 
-        Both the gateway-specific opt-in and the existing global outbound
-        ``live`` mode are required. Every cap must also be explicitly positive.
-        Missing, malformed, zero, and negative values all disable effects.
+        Both the exact gateway-specific ``true`` value and the exact global
+        outbound ``live`` value are required without case or whitespace
+        normalization. Every cap must also be explicitly positive. Missing,
+        malformed, zero, and negative values all disable effects.
         """
 
         return cls(
-            enabled=os.getenv(PROVIDER_EFFECTS_ENABLED_ENV, "").strip().lower()
-            == "true",
-            global_effects_enabled=os.getenv(
-                GLOBAL_OUTBOUND_MODE_ENV, ""
-            ).strip().lower()
-            == "live",
+            enabled=os.getenv(PROVIDER_EFFECTS_ENABLED_ENV, "") == "true",
+            global_effects_enabled=(
+                os.getenv(GLOBAL_OUTBOUND_MODE_ENV, "") == "live"
+            ),
             limits=AttemptLimits(
                 max_attempts=_positive_env_int(MAX_ATTEMPTS_ENV),
                 max_per_run=_positive_env_int(MAX_PER_RUN_ENV),
@@ -335,11 +334,13 @@ class EffectReceiptStore(Protocol):
         request: ProviderEffectRequest,
     ) -> EffectReceipt | None: ...
 
-    def record_blocked(
+    def create_blocked_if_absent(
         self,
         request: ProviderEffectRequest,
         reason: str,
-    ) -> EffectReceipt: ...
+    ) -> EffectReceipt:
+        """Atomically create BLOCKED if absent, else return existing unchanged."""
+        ...
 
     def reserve_attempt(
         self,
@@ -410,11 +411,17 @@ class EffectGateway:
                 ).receipt
 
         if not self._config.enabled:
-            return self._store.record_blocked(request, "gateway_disabled")
+            return self._store.create_blocked_if_absent(
+                request,
+                "gateway_disabled",
+            )
         if not self._config.global_effects_enabled:
-            return self._store.record_blocked(request, "global_kill")
+            return self._store.create_blocked_if_absent(
+                request,
+                "global_kill",
+            )
         if not self._config.limits.valid:
-            return self._store.record_blocked(
+            return self._store.create_blocked_if_absent(
                 request,
                 "invalid_or_missing_caps",
             )

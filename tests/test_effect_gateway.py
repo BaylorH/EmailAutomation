@@ -62,15 +62,17 @@ class InMemoryReceiptStore:
             self.events.append(("receipt_read", request.effect_id))
             return self.receipts.get(request.effect_id)
 
-    def record_blocked(self, request, reason):
+    def create_blocked_if_absent(self, request, reason):
         with self._lock:
             current = self.receipts.get(request.effect_id)
+            if current is not None:
+                return current
             return self._save(
                 EffectReceipt(
                     effect_id=request.effect_id,
                     content_idempotency_key=request.content_idempotency_key,
                     state=ReceiptState.BLOCKED,
-                    attempts=current.attempts if current else 0,
+                    attempts=0,
                     reason=reason,
                 )
             )
@@ -148,7 +150,17 @@ class InMemoryReceiptStore:
             for count, cap, reason in cap_checks:
                 if count >= cap:
                     return AttemptReservation(
-                        receipt=self.record_blocked(request, reason),
+                        receipt=self._save(
+                            EffectReceipt(
+                                effect_id=request.effect_id,
+                                content_idempotency_key=(
+                                    request.content_idempotency_key
+                                ),
+                                state=ReceiptState.BLOCKED,
+                                attempts=attempts,
+                                reason=reason,
+                            )
+                        ),
                         acquired=False,
                     )
 
@@ -249,6 +261,25 @@ class AdversarialInterleavingReceiptStore(InMemoryReceiptStore):
         ):
             self._first_claimed.set()
         return reservation
+
+
+class DelayedBlockedSettlementReceiptStore(InMemoryReceiptStore):
+    """Pause a stale absent read until another worker finishes its lifecycle."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocked_load_observed = threading.Event()
+        self.release_blocked_settlement = threading.Event()
+
+    def load_receipt(self, request):
+        receipt = super().load_receipt(request)
+        if threading.current_thread().name == "delayed-blocked":
+            if receipt is not None:
+                raise RuntimeError("expected delayed worker to observe absence")
+            self.blocked_load_observed.set()
+            if not self.release_blocked_settlement.wait(timeout=5):
+                raise RuntimeError("blocked-settlement interleaving timed out")
+        return receipt
 
 
 class ThreadSafeProvider(InMemoryProvider):
@@ -360,6 +391,13 @@ class EffectIdentityTests(unittest.TestCase):
 
 
 class EffectGatewayGateTests(unittest.TestCase):
+    _CAP_ENVIRONMENT = {
+        "SITESIFT_EFFECT_MAX_ATTEMPTS": "3",
+        "SITESIFT_EFFECT_MAX_PER_RUN": "20",
+        "SITESIFT_EFFECT_MAX_PER_USER": "10",
+        "SITESIFT_EFFECT_MAX_PER_PROVIDER": "10",
+    }
+
     def test_no_environment_configuration_means_zero_provider_effects(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             config = EffectGatewayConfig.from_env()
@@ -374,6 +412,64 @@ class EffectGatewayGateTests(unittest.TestCase):
         self.assertEqual(receipt.reason, "gateway_disabled")
         self.assertEqual(provider.calls, [])
         self.assertIs(store.receipts[receipt.effect_id], receipt)
+
+    def test_environment_authorization_requires_exact_unmodified_bytes(self):
+        cases = (
+            ("TRUE", "live", "gateway_disabled"),
+            ("True", "live", "gateway_disabled"),
+            (" true", "live", "gateway_disabled"),
+            ("true ", "live", "gateway_disabled"),
+            ("true", "LIVE", "global_kill"),
+            ("true", "Live", "global_kill"),
+            ("true", " live", "global_kill"),
+            ("true", "live ", "global_kill"),
+        )
+        for enabled_value, global_value, expected_reason in cases:
+            with self.subTest(
+                enabled=enabled_value,
+                global_mode=global_value,
+            ):
+                environment = {
+                    **self._CAP_ENVIRONMENT,
+                    "SITESIFT_PROVIDER_EFFECTS_ENABLED": enabled_value,
+                    "SITESIFT_OUTBOUND_MODE": global_value,
+                }
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    config = EffectGatewayConfig.from_env()
+                store = InMemoryReceiptStore()
+                provider = InMemoryProvider()
+
+                receipt = EffectGateway(
+                    store,
+                    {"graph": provider},
+                    config,
+                ).execute(request())
+
+                self.assertEqual(receipt.state, ReceiptState.BLOCKED)
+                self.assertEqual(receipt.reason, expected_reason)
+                self.assertEqual(provider.calls, [])
+
+    def test_exact_environment_authorization_allows_one_effect(self):
+        environment = {
+            **self._CAP_ENVIRONMENT,
+            "SITESIFT_PROVIDER_EFFECTS_ENABLED": "true",
+            "SITESIFT_OUTBOUND_MODE": "live",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            config = EffectGatewayConfig.from_env()
+        store = InMemoryReceiptStore()
+        provider = InMemoryProvider()
+
+        receipt = EffectGateway(
+            store,
+            {"graph": provider},
+            config,
+        ).execute(request())
+
+        self.assertTrue(config.enabled)
+        self.assertTrue(config.global_effects_enabled)
+        self.assertEqual(receipt.state, ReceiptState.SUCCEEDED)
+        self.assertEqual(len(provider.calls), 1)
 
     def test_global_kill_blocks_an_explicitly_enabled_gateway(self):
         store = InMemoryReceiptStore()
@@ -403,6 +499,50 @@ class EffectGatewayGateTests(unittest.TestCase):
                 self.assertEqual(receipt.state, ReceiptState.BLOCKED)
                 self.assertEqual(receipt.reason, "invalid_or_missing_caps")
                 self.assertEqual(provider.calls, [])
+
+    def test_blocked_settlement_preserves_every_existing_durable_state(self):
+        req = request()
+        durable_states = (
+            ReceiptState.CLAIMED,
+            ReceiptState.PROVIDER_ACCEPTED,
+            ReceiptState.SUCCEEDED,
+            ReceiptState.CANCELLED,
+            ReceiptState.TERMINAL_FAILED,
+            ReceiptState.RECONCILIATION_REQUIRED,
+        )
+        for state in durable_states:
+            with self.subTest(state=state):
+                store = InMemoryReceiptStore()
+                existing = store._save(
+                    EffectReceipt(
+                        effect_id=req.effect_id,
+                        content_idempotency_key=req.content_idempotency_key,
+                        state=state,
+                        attempts=1,
+                        provider_reference=(
+                            receipt_reference("graph-message-1")
+                            if state
+                            in {
+                                ReceiptState.PROVIDER_ACCEPTED,
+                                ReceiptState.SUCCEEDED,
+                            }
+                            else ""
+                        ),
+                    )
+                )
+                history_before = tuple(store.histories[req.effect_id])
+
+                settled = store.create_blocked_if_absent(
+                    req,
+                    "gateway_disabled",
+                )
+
+                self.assertIs(settled, existing)
+                self.assertIs(store.receipts[req.effect_id], existing)
+                self.assertEqual(
+                    tuple(store.histories[req.effect_id]),
+                    history_before,
+                )
 
     def test_transactional_reservation_enforces_run_user_and_provider_caps(self):
         cases = (
@@ -502,6 +642,84 @@ class EffectGatewayConcurrencyTests(unittest.TestCase):
             ReceiptState.SUCCEEDED,
         )
         self.assertEqual(set(receipts), {"a", "b"})
+
+    def test_delayed_blocked_settlement_never_regresses_success(self):
+        blocked_configs = (
+            ("gateway_disabled", live_config(enabled=False)),
+            ("global_kill", live_config(global_effects_enabled=False)),
+            (
+                "invalid_or_missing_caps",
+                live_config(limits=AttemptLimits()),
+            ),
+        )
+        for expected_reason, blocked_config in blocked_configs:
+            with self.subTest(reason=expected_reason):
+                req = request()
+                store = DelayedBlockedSettlementReceiptStore()
+                provider = ThreadSafeProvider(
+                    [
+                        ProviderEffectResult("graph-message-1"),
+                        ProviderEffectResult("must-not-run"),
+                    ]
+                )
+                enabled_gateway = EffectGateway(
+                    store,
+                    {"graph": provider},
+                    live_config(),
+                )
+                blocked_gateway = EffectGateway(
+                    store,
+                    {"graph": provider},
+                    blocked_config,
+                )
+                delayed_result = {}
+                delayed_failure = {}
+
+                def execute_delayed_block():
+                    try:
+                        delayed_result["receipt"] = blocked_gateway.execute(req)
+                    except Exception as error:
+                        delayed_failure["error"] = error
+
+                delayed = threading.Thread(
+                    target=execute_delayed_block,
+                    name="delayed-blocked",
+                )
+                delayed.start()
+                self.assertTrue(
+                    store.blocked_load_observed.wait(timeout=5),
+                    "delayed worker did not observe receipt absence",
+                )
+
+                succeeded = enabled_gateway.execute(req)
+                store.release_blocked_settlement.set()
+                delayed.join(timeout=5)
+                retry = enabled_gateway.execute(req)
+
+                self.assertFalse(
+                    delayed.is_alive(),
+                    "delayed blocked settlement deadlocked",
+                )
+                self.assertEqual(delayed_failure, {})
+                self.assertEqual(
+                    delayed_result["receipt"],
+                    succeeded,
+                    expected_reason,
+                )
+                self.assertEqual(retry, succeeded)
+                self.assertEqual(len(provider.calls), 1)
+                self.assertEqual(
+                    [
+                        receipt.state
+                        for receipt in store.histories[req.effect_id]
+                    ],
+                    [
+                        ReceiptState.PREPARED,
+                        ReceiptState.CLAIMED,
+                        ReceiptState.PROVIDER_ACCEPTED,
+                        ReceiptState.SUCCEEDED,
+                    ],
+                )
 
 
 class EffectGatewayAuthorityTests(unittest.TestCase):
