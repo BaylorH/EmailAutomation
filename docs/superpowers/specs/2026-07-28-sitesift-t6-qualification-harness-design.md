@@ -1,7 +1,8 @@
 # SiteSift T6 Qualification Harness Design
 
 **Date:** 2026-07-28
-**Status:** Proposed for written review
+**Status:** Approved; planning audit found the frozen candidate must currently
+fail live admission
 **Deliverable:** Both — qualification-harness code and a verified qualification finding
 **Product candidate:** Frontend/Functions `b4636e8276db18cb633d8c9e27b5e05fa9dc21a9`; backend `f104b5f4cfc7574188e47efaadbf72df219e19a5`
 
@@ -18,9 +19,33 @@ strictly bounded, privacy-safe, and fail-closed. Building and testing the
 harness itself must have zero external effects.
 
 This work does not deploy, send mail, create a campaign, touch Jill or any
-customer, use live credentials, or claim that L3/L4 passed. A later,
-separately authorized T6b turn supplies test-owned infrastructure and
-credentials, approves each effectful stage, and records the actual result.
+customer, use live credentials, or claim that L3/L4 passed. After the planning
+audit's candidate refutation is repaired and a new candidate is frozen, a
+later, separately authorized T6b turn may supply test-owned infrastructure and
+credentials, approve each effectful stage, and record the actual result.
+
+## Planning-audit result
+
+The post-approval source audit established that the apparatus is buildable, but
+the named frozen candidate currently triggers the design's own refutation
+conditions:
+
+- the frozen OpenAI transport uses zero retries but exposes neither a durable
+  idempotency key nor a queryable provider receipt for an ambiguous response;
+- `refresh_and_process_user()` reaches direct OpenAI, Graph draft/attachment,
+  Drive create/permission, and Firebase Storage mutations outside the frozen
+  final-send gateway;
+- the current gateway cannot enforce or enumerate the exact approved
+  stage/recipient/effect plan by run; and
+- the worker returns no typed counters and has additional reversible surfaces
+  that would need exact snapshot/reconciliation coverage.
+
+Therefore T6a must build the generic offline controls, encode static seam
+checks, and produce a verified `REFUTED` finding for this candidate. It must not
+construct live clients or issue L3/L4 effects. The next product phase closes
+those seams and freezes a new candidate; only that new candidate may seek T6b
+authorization. This preserves all harness work and the earlier L1/L2 evidence
+as historical evidence without falsely carrying it onto changed source.
 
 ## Release State Preserved
 
@@ -89,9 +114,11 @@ Forbidden effects:
 
 ### T6b — controlled qualification
 
-T6b requires a new authorization that names the exact harness commit,
-candidate hashes, project, test identities, sender, recipient, test client,
-test thread namespace, stage, expiry, and effect caps.
+T6b is unavailable for the currently frozen candidate. After product effect
+closure and a new L1/L2-qualified candidate pass the static seam gate, T6b
+requires a new authorization that names the exact harness commit, candidate
+hashes, project, test identities, sender, recipient, test client, test thread
+namespace, stage, expiry, and effect caps.
 
 Authorization is one stage at a time. Approval of the 1-row stage does not
 authorize 3, 10, or 22 rows. The next stage requires a new approval bound to
@@ -197,8 +224,11 @@ access.
 
 The qualification parent never imports `email_automation` or root `main.py`
 from its own branch. Candidate behavior runs in a child process with the
-verified extraction as its working directory and only product dependencies plus
-the standard library on its import path.
+verified extraction as its only product import root and only product
+dependencies plus the standard library on its import path. Its working
+directory is a separate writable run directory because the frozen worker writes
+`msal_token_cache.bin` relative to CWD; the verified extraction remains
+read-only.
 
 The parent writes a canonical request to the child's standard input and reads
 the typed result envelope from a dedicated inherited result pipe so product log
@@ -206,8 +236,8 @@ output cannot be mistaken for protocol data. A minimal launcher, hashed as part
 of the harness identity, does only the following:
 
 - for L3, import the frozen candidate claim/proposal/provider APIs, construct
-  their existing pinned provider adapter, evaluate the supplied synthetic cases,
-  and return typed semantic results; or
+  their existing pinned provider adapter, evaluate exactly one admitted
+  case/repeat, and return one typed semantic result; or
 - for L4, load the frozen root `main.py` and call its existing
   `refresh_and_process_user(exact_test_uid)` once.
 
@@ -471,12 +501,14 @@ inference only; every product-persistence, Sheet, mailbox, and campaign adapter
 is a fail-on-call sentinel. The qualification control-plane ledger is the one
 allowed persistence surface.
 
-The run-level atomic ledger claim is created before the smoke call. Immediately
-before each admitted case/repeat call, the parent atomically reserves its unique
-provider idempotency key in that claimed ledger. A started reservation is never
-called again. Success records the provider request/usage digest; timeout,
-process interruption, or missing response leaves the reservation
-reconciliation-required.
+The run-level atomic ledger claim is created before the smoke call. For each
+admitted case/repeat, the parent atomically reserves its unique provider
+idempotency key and only then launches a fresh child that may make that one
+call. A started reservation is never called again. Success records the provider
+request/usage digest; timeout, process interruption, or missing response leaves
+the reservation reconciliation-required. Running the frozen multi-case replay
+loop inside one child is forbidden because it provides no parent-side pre-call
+reservation seam.
 
 L3 uses the same recovery capsule and `recover` command as L4. Recovery may
 query provider/usage metadata when supported and finalize the evidence, but it
@@ -753,26 +785,27 @@ T6a is complete only when:
 1. the harness exists only on the separate qualification branch;
 2. candidate binding proves the exact frozen product artifacts and extracted
    product imports;
-3. a seam audit proves every reachable candidate provider/mail effect uses the
-   frozen final gateway, and live credential capability is restricted to
-   test-owned infrastructure;
+3. the seam audit deterministically identifies the current candidate's complete
+   closed refutation set before credentials or client construction;
 4. committed synthetic 1/3/10/22 fixtures regenerate byte-identically and pass
    privacy scans;
 5. approval, predecessor, atomic-claim, stage, cap, no-retry, reconciliation,
    recovery, restoration, and evidence
    contracts are covered by failure-injection tests;
-6. read-capable live adapters are unreachable before local admission, and all
-   effect-capable methods are unreachable before complete admission;
-7. the recovery capsule is durable before an atomic run/namespace claim becomes
-   the first external write, and no started L3/L4 effect can replay;
+6. live adapters remain unimplemented/unreachable for this refuted candidate,
+   and admission tests prove no credential or client construction can occur;
+7. in-memory failure-injection tests prove the recovery capsule precedes an
+   atomic run/namespace claim and no started L3/L4 effect can replay;
 8. build/verify execution performs zero network, credential, provider,
    persistence, campaign, queue, scheduler, or mail activity;
 9. canonical L3/L4 entry points exist and fail closed when not separately
    authorized;
-10. the qualification-only branch cannot be packaged as the product worker;
+10. every supported product packaging/deployment entry point refuses the
+    qualification marker, and its Docker build context cannot produce a worker
+    image;
 11. the pinned Node/Python and full backend test suites remain green; and
 12. the verified branch commit and test evidence are recorded in Brain with a
-    T6b handoff that clearly states no live qualification has run yet.
+    product-effect-closure planning handoff that states live T6b is premature.
 
 ## Refutation Conditions
 
@@ -798,8 +831,9 @@ Stop and redesign rather than weakening the gate if:
 ## Milestone Meaning
 
 Passing T6a means “the controlled qualification apparatus is built and proved
-safe offline.” It does not mean the product is fully qualified or ready for
-Jill.
+safe offline.” For the currently named candidate, it also means the live gate
+has honestly refuted the candidate and identified the exact product seams that
+must close. It does not mean the product is fully qualified or ready for Jill.
 
 Passing the separately authorized T6b L3 and all four L4 stages means the exact
 candidate has completed the planned provider and full-worker qualification
