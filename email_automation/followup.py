@@ -45,6 +45,10 @@ from .campaign_safety import (
     stopped_followup_patch,
 )
 from .outbound_safety import validate_outbound_body
+from .graph_final_send import (
+    execute_graph_draft_final_send,
+    resolve_effect_run_id,
+)
 from .column_config import (
     get_column_config_error,
     response_requests_nonrequestable_fields,
@@ -1152,10 +1156,13 @@ def _send_followup_email(
                     print(f"      🛑 {failure_reason}")
                     return False
 
+        authority_client_id = (
+            (latest_thread_data or thread_data).get("clientId")
+            or thread_data.get("clientId")
+        )
         campaign_decision = get_client_automation_decision(
             user_id,
-            (latest_thread_data or thread_data).get("clientId")
-            or thread_data.get("clientId"),
+            authority_client_id,
         )
         if campaign_decision.denies_autonomous_work:
             _set_followup_campaign_suppression(campaign_decision)
@@ -1173,13 +1180,26 @@ def _send_followup_email(
             print(f"   🛑 {failure_reason}")
             return False
 
-        reply_resp = exponential_backoff_request(
-            lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-            max_retries=1,
-            operation="graph_send",
+        effect_outcome = execute_graph_draft_final_send(
+            user_id=user_id,
+            client_id=authority_client_id or "",
+            run_id=resolve_effect_run_id(),
+            effect_type="mail.followup",
+            effect_key=f"followup:{thread_id}:{followup_index}",
+            content={
+                "body": html_content,
+                "to": [recipient],
+                "cc": final_cc_recipients,
+                "subject": subject,
+                "followupIndex": followup_index,
+            },
+            draft_id=reply_draft_id,
+            headers=headers,
+            base_url=base,
+            http_post=requests.post,
         )
 
-        if reply_resp.status_code in [200, 201, 202]:
+        if effect_outcome.accepted:
             print(f"   Sent follow-up #{followup_index + 1} for thread {thread_id[:20]}...")
             _save_followup_message(
                 user_id, thread_id, recipient, subject,
@@ -1196,10 +1216,30 @@ def _send_followup_email(
 
             return True
         else:
-            print(f"   Failed to send follow-up: {reply_resp.status_code}")
-            _set_followup_send_outcome(
-                error=f"Follow-up Graph send returned HTTP {reply_resp.status_code}"
-            )
+            receipt = effect_outcome.receipt
+            if effect_outcome.already_applied:
+                failure_reason = (
+                    "A prior follow-up final send was already accepted; "
+                    "Sent Items reconciliation is required"
+                )
+            else:
+                failure_reason = (
+                    "Follow-up blocked by provider-effect gateway: "
+                    f"{receipt.state.value}/"
+                    f"{receipt.reason or 'unspecified'}"
+                )
+            print(f"   Failed to send follow-up: {failure_reason}")
+            if receipt.reason.startswith("authoritative_"):
+                latest_decision = get_client_automation_decision(
+                    user_id,
+                    authority_client_id,
+                )
+                if latest_decision.denies_autonomous_work:
+                    _set_followup_campaign_suppression(latest_decision)
+                else:
+                    _set_followup_send_outcome(error=failure_reason)
+            else:
+                _set_followup_send_outcome(error=failure_reason)
             return False
 
     except Exception as e:

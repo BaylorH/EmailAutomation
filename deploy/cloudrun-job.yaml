@@ -65,6 +65,20 @@ spec:
                   value: SCHEDULER_TARGET_USER_IDS_PLACEHOLDER
                 - name: SITESIFT_SCHEDULER_ALLOWED_USER_IDS
                   value: SCHEDULER_ALLOWED_USER_IDS_PLACEHOLDER
+                # --- Single final-send gateway. Exact values are deliberate:
+                #     missing, padded, or non-positive values fail closed. ---
+                - name: SITESIFT_PROVIDER_EFFECTS_ENABLED
+                  value: "true"
+                - name: SITESIFT_OUTBOUND_MODE
+                  value: "live"
+                - name: SITESIFT_EFFECT_MAX_ATTEMPTS
+                  value: "3"
+                - name: SITESIFT_EFFECT_MAX_PER_RUN
+                  value: "100"
+                - name: SITESIFT_EFFECT_MAX_PER_USER
+                  value: "50"
+                - name: SITESIFT_EFFECT_MAX_PER_PROVIDER
+                  value: "100"
                 # --- Non-secret Azure app id (used for the appid prefix check) ---
                 - name: AZURE_API_APP_ID
                   value: AZURE_API_APP_ID_PLACEHOLDER

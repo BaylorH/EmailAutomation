@@ -48,6 +48,7 @@ class AuthorityState(str, Enum):
 
     ACTIVE = "active"
     CANCELLED = "cancelled"
+    PAUSED = "paused"
     TERMINAL = "terminal"
 
 
@@ -65,6 +66,19 @@ def _require_text(label: str, value: Any) -> str:
     if not normalized:
         raise ValueError(f"{label} must be non-empty")
     return normalized
+
+
+def _require_exact_text(label: str, value: Any) -> str:
+    """Require an identity whose bytes are already canonical.
+
+    Authority identifiers are security boundaries.  Silently trimming or
+    coercing them could authorize a different Firestore path than the caller
+    actually supplied.
+    """
+
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{label} must be an exact non-empty string")
+    return value
 
 
 def _require_raw_provider_reference(value: Any) -> str:
@@ -199,6 +213,7 @@ class ProviderEffectRequest:
 
     run_id: str
     user_id: str
+    authority_client_id: str
     provider: str
     effect_type: str
     effect_key: str
@@ -212,6 +227,7 @@ class ProviderEffectRequest:
         *,
         run_id: str,
         user_id: str,
+        authority_client_id: str | None = None,
         provider: str,
         effect_type: str,
         effect_key: str,
@@ -219,7 +235,15 @@ class ProviderEffectRequest:
     ) -> "ProviderEffectRequest":
         normalized = {
             "run_id": _require_text("run_id", run_id),
-            "user_id": _require_text("user_id", user_id),
+            "user_id": _require_exact_text("user_id", user_id),
+            "authority_client_id": (
+                _require_exact_text(
+                    "authority_client_id",
+                    authority_client_id,
+                )
+                if authority_client_id is not None
+                else ""
+            ),
             "provider": _require_text("provider", provider).lower(),
             "effect_type": _require_text("effect_type", effect_type).lower(),
             "effect_key": _require_text("effect_key", effect_key),
@@ -231,6 +255,7 @@ class ProviderEffectRequest:
             "effect",
             {
                 "userId": normalized["user_id"],
+                "authorityClientId": normalized["authority_client_id"],
                 "provider": normalized["provider"],
                 "effectType": normalized["effect_type"],
                 "effectKey": normalized["effect_key"],
@@ -254,6 +279,7 @@ class ProviderEffectRequest:
         return {
             "runId": self.run_id,
             "userId": self.user_id,
+            "authorityClientId": self.authority_client_id,
             "provider": self.provider,
             "effectType": self.effect_type,
             "effectKey": self.effect_key,
@@ -271,6 +297,8 @@ class EffectReceipt:
     attempts: int
     reason: str = ""
     provider_reference: str = ""
+    claim_owner: str = ""
+    version: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -287,6 +315,7 @@ class EffectReceipt:
             "attempts": self.attempts,
             "reason": self.reason,
             "providerReference": self.provider_reference,
+            "version": self.version,
         }
 
 
@@ -294,6 +323,8 @@ class EffectReceipt:
 class AttemptReservation:
     receipt: EffectReceipt
     acquired: bool
+    owner_token: str = ""
+    version: int = 0
 
 
 @dataclass(frozen=True)
@@ -360,6 +391,8 @@ class EffectReceiptStore(Protocol):
         *,
         reason: str = "",
         provider_reference: str = "",
+        expected_owner: str = "",
+        expected_version: int = 0,
     ) -> EffectReceipt: ...
 
 
@@ -439,18 +472,32 @@ class EffectGateway:
                 request,
                 ReceiptState.CANCELLED,
                 reason="authoritative_cancelled",
+                expected_owner=reservation.owner_token,
+                expected_version=reservation.version,
             )
         if authoritative.state == AuthorityState.TERMINAL:
             return self._store.transition(
                 request,
                 ReceiptState.TERMINAL_FAILED,
                 reason="authoritative_terminal",
+                expected_owner=reservation.owner_token,
+                expected_version=reservation.version,
+            )
+        if authoritative.state == AuthorityState.PAUSED:
+            return self._store.transition(
+                request,
+                ReceiptState.PREPARED,
+                reason="authoritative_paused",
+                expected_owner=reservation.owner_token,
+                expected_version=reservation.version,
             )
         if authoritative.state != AuthorityState.ACTIVE:
             return self._store.transition(
                 request,
                 ReceiptState.TERMINAL_FAILED,
                 reason="invalid_authoritative_state",
+                expected_owner=reservation.owner_token,
+                expected_version=reservation.version,
             )
 
         adapter = self._providers.get(request.provider)
@@ -459,6 +506,8 @@ class EffectGateway:
                 request,
                 ReceiptState.TERMINAL_FAILED,
                 reason="provider_adapter_missing",
+                expected_owner=reservation.owner_token,
+                expected_version=reservation.version,
             )
 
         # Keep this call directly adjacent to the authoritative re-read above:
@@ -470,6 +519,8 @@ class EffectGateway:
                     request,
                     ReceiptState.RECONCILIATION_REQUIRED,
                     reason="provider_outcome_unknown",
+                    expected_owner=reservation.owner_token,
+                    expected_version=reservation.version,
                 )
             provider_reference = _receipt_provider_reference(
                 result.provider_reference
@@ -479,6 +530,8 @@ class EffectGateway:
                 request,
                 ReceiptState.TERMINAL_FAILED,
                 reason="provider_terminal",
+                expected_owner=reservation.owner_token,
+                expected_version=reservation.version,
             )
         except RetryableProviderError:
             if reservation.receipt.attempts >= self._config.limits.max_attempts:
@@ -491,12 +544,16 @@ class EffectGateway:
                 request,
                 state,
                 reason=reason,
+                expected_owner=reservation.owner_token,
+                expected_version=reservation.version,
             )
         except UncertainProviderOutcomeError:
             return self._store.transition(
                 request,
                 ReceiptState.RECONCILIATION_REQUIRED,
                 reason="provider_outcome_unknown",
+                expected_owner=reservation.owner_token,
+                expected_version=reservation.version,
             )
         except Exception:
             # Provider SDK exceptions are uncertain unless the adapter
@@ -505,6 +562,8 @@ class EffectGateway:
                 request,
                 ReceiptState.RECONCILIATION_REQUIRED,
                 reason="provider_outcome_unknown",
+                expected_owner=reservation.owner_token,
+                expected_version=reservation.version,
             )
 
         try:
@@ -512,6 +571,8 @@ class EffectGateway:
                 request,
                 ReceiptState.PROVIDER_ACCEPTED,
                 provider_reference=provider_reference,
+                expected_owner=reservation.owner_token,
+                expected_version=reservation.version,
             )
         except Exception:
             return self._store.transition(
@@ -519,6 +580,8 @@ class EffectGateway:
                 ReceiptState.RECONCILIATION_REQUIRED,
                 reason="receipt_acceptance_failed",
                 provider_reference=provider_reference,
+                expected_owner=reservation.owner_token,
+                expected_version=reservation.version,
             )
         return self._finalize_accepted(request, accepted)
 
@@ -534,6 +597,8 @@ class EffectGateway:
                 request,
                 ReceiptState.SUCCEEDED,
                 provider_reference=accepted.provider_reference,
+                expected_owner=accepted.claim_owner,
+                expected_version=accepted.version,
             )
         except Exception:
             return self._store.transition(
@@ -541,4 +606,6 @@ class EffectGateway:
                 ReceiptState.RECONCILIATION_REQUIRED,
                 reason="receipt_finalize_failed",
                 provider_reference=accepted.provider_reference,
+                expected_owner=accepted.claim_owner,
+                expected_version=accepted.version,
             )

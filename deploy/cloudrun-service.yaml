@@ -77,6 +77,20 @@ spec:
             # --- Non-secret Azure app id (used for the appid prefix check). ---
             - name: AZURE_API_APP_ID
               value: AZURE_API_APP_ID_PLACEHOLDER
+            # --- Single final-send gateway. The service recycles after each
+            #     request, so its process run id is request-scoped. ---
+            - name: SITESIFT_PROVIDER_EFFECTS_ENABLED
+              value: "true"
+            - name: SITESIFT_OUTBOUND_MODE
+              value: "live"
+            - name: SITESIFT_EFFECT_MAX_ATTEMPTS
+              value: "3"
+            - name: SITESIFT_EFFECT_MAX_PER_RUN
+              value: "100"
+            - name: SITESIFT_EFFECT_MAX_PER_USER
+              value: "50"
+            - name: SITESIFT_EFFECT_MAX_PER_PROVIDER
+              value: "100"
             # --- In-app shared-secret gate for POST /process-user. Referenced
             #     from Secret Manager. When unset the endpoint is open (rely on
             #     Cloud Run IAM only); set it before any public exposure. ---

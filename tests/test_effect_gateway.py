@@ -74,6 +74,7 @@ class InMemoryReceiptStore:
                     state=ReceiptState.BLOCKED,
                     attempts=0,
                     reason=reason,
+                    version=1,
                 )
             )
 
@@ -88,12 +89,15 @@ class InMemoryReceiptStore:
                     != request.content_idempotency_key
                 ):
                     return AttemptReservation(
-                        receipt=self._save(
-                            replace(
-                                current,
-                                state=ReceiptState.TERMINAL_FAILED,
-                                reason="content_identity_conflict",
-                            )
+                        receipt=EffectReceipt(
+                            effect_id=request.effect_id,
+                            content_idempotency_key=(
+                                request.content_idempotency_key
+                            ),
+                            state=ReceiptState.TERMINAL_FAILED,
+                            attempts=current.attempts,
+                            reason="content_identity_conflict",
+                            version=current.version,
                         ),
                         acquired=False,
                     )
@@ -115,6 +119,7 @@ class InMemoryReceiptStore:
                         content_idempotency_key=request.content_idempotency_key,
                         state=ReceiptState.PREPARED,
                         attempts=attempts,
+                        version=(current.version if current else 0) + 1,
                     )
                 )
 
@@ -126,6 +131,7 @@ class InMemoryReceiptStore:
                         ReceiptState.TERMINAL_FAILED,
                         attempts,
                         "provider_attempts_exhausted",
+                        version=current.version + 1,
                     )
                 )
                 return AttemptReservation(receipt=receipt, acquired=False)
@@ -159,6 +165,7 @@ class InMemoryReceiptStore:
                                 state=ReceiptState.BLOCKED,
                                 attempts=attempts,
                                 reason=reason,
+                                version=current.version + 1,
                             )
                         ),
                         acquired=False,
@@ -167,15 +174,23 @@ class InMemoryReceiptStore:
             self.run_attempts[request.run_id] += 1
             self.user_attempts[(request.run_id, request.user_id)] += 1
             self.provider_attempts[(request.run_id, request.provider)] += 1
+            owner_token = f"owner-{request.effect_id}-{attempts + 1}"
             receipt = self._save(
                 EffectReceipt(
                     request.effect_id,
                     request.content_idempotency_key,
                     ReceiptState.CLAIMED,
                     attempts + 1,
+                    claim_owner=owner_token,
+                    version=current.version + 1,
                 )
             )
-            return AttemptReservation(receipt=receipt, acquired=True)
+            return AttemptReservation(
+                receipt=receipt,
+                acquired=True,
+                owner_token=owner_token,
+                version=receipt.version,
+            )
 
     def read_authoritative_state(self, request):
         with self._lock:
@@ -194,9 +209,26 @@ class InMemoryReceiptStore:
         *,
         reason="",
         provider_reference="",
+        expected_owner="",
+        expected_version=0,
     ):
         with self._lock:
             current = self.receipts[request.effect_id]
+            if (
+                (expected_owner or expected_version)
+                and (
+                    current.claim_owner != expected_owner
+                    or current.version != expected_version
+                )
+            ):
+                return current
+            if current.state in {
+                ReceiptState.SUCCEEDED,
+                ReceiptState.CANCELLED,
+                ReceiptState.TERMINAL_FAILED,
+                ReceiptState.RECONCILIATION_REQUIRED,
+            }:
+                return current
             self.events.append(("transition", state.value))
             if state in self.fail_transition_once:
                 self.fail_transition_once.remove(state)
@@ -209,6 +241,7 @@ class InMemoryReceiptStore:
                     state=state,
                     reason=reason,
                     provider_reference=provider_reference,
+                    version=current.version + 1,
                 )
             )
 
@@ -297,12 +330,14 @@ def request(
     *,
     run_id="run-1",
     user_id="user-1",
+    client_id="client-1",
     provider="graph",
     content=None,
 ):
     return ProviderEffectRequest.create(
         run_id=run_id,
         user_id=user_id,
+        authority_client_id=client_id,
         provider=provider,
         effect_type="mail.reply",
         effect_key=effect_key,
@@ -388,6 +423,34 @@ class EffectIdentityTests(unittest.TestCase):
             first.to_dict()["contentIdempotencyKey"],
             first.content_idempotency_key,
         )
+
+    def test_authority_client_is_part_of_effect_and_content_identity(self):
+        first = request(client_id="client-a")
+        second = request(client_id="client-b")
+
+        self.assertNotEqual(first.effect_id, second.effect_id)
+        self.assertNotEqual(
+            first.content_idempotency_key,
+            second.content_idempotency_key,
+        )
+
+    def test_one_clients_success_receipt_cannot_satisfy_another_client(self):
+        first = request(client_id="client-a")
+        second = request(client_id="client-b")
+        store = InMemoryReceiptStore()
+        provider = InMemoryProvider([ProviderEffectResult("graph-message-1")])
+        gateway = EffectGateway(store, {"graph": provider}, live_config())
+
+        succeeded = gateway.execute(first)
+        store.authority[second.effect_id] = AuthoritativeDecision(
+            AuthorityState.CANCELLED,
+            "different_client_cancelled",
+        )
+        second_result = gateway.execute(second)
+
+        self.assertEqual(succeeded.state, ReceiptState.SUCCEEDED)
+        self.assertEqual(second_result.state, ReceiptState.CANCELLED)
+        self.assertEqual(len(provider.calls), 1)
 
 
 class EffectGatewayGateTests(unittest.TestCase):
@@ -721,6 +784,83 @@ class EffectGatewayConcurrencyTests(unittest.TestCase):
                     ],
                 )
 
+    def test_concurrent_finalizer_failure_cannot_regress_durable_success(self):
+        req = request()
+        provider_reference = receipt_reference("provider-accepted")
+
+        class ConcurrentFinalizerStore(InMemoryReceiptStore):
+            def __init__(self):
+                super().__init__()
+                self.receipts[req.effect_id] = EffectReceipt(
+                    effect_id=req.effect_id,
+                    content_idempotency_key=req.content_idempotency_key,
+                    state=ReceiptState.PROVIDER_ACCEPTED,
+                    attempts=1,
+                    provider_reference=provider_reference,
+                )
+                self.both_finalizing = threading.Barrier(2)
+                self.success_written = threading.Event()
+
+            def transition(
+                self,
+                request,
+                state,
+                *,
+                reason="",
+                provider_reference="",
+                expected_owner="",
+                expected_version=0,
+            ):
+                if state == ReceiptState.SUCCEEDED:
+                    self.both_finalizing.wait(timeout=5)
+                    if threading.current_thread().name == "late-failure":
+                        self.success_written.wait(timeout=5)
+                        raise RuntimeError("simulated stale finalizer failure")
+                    result = super().transition(
+                        request,
+                        state,
+                        reason=reason,
+                        provider_reference=provider_reference,
+                        expected_owner=expected_owner,
+                        expected_version=expected_version,
+                    )
+                    self.success_written.set()
+                    return result
+                return super().transition(
+                    request,
+                    state,
+                    reason=reason,
+                    provider_reference=provider_reference,
+                    expected_owner=expected_owner,
+                    expected_version=expected_version,
+                )
+
+        store = ConcurrentFinalizerStore()
+        gateway = EffectGateway(store, {}, EffectGatewayConfig())
+        results = []
+
+        def finalize():
+            results.append(gateway.execute(req))
+
+        contenders = [
+            threading.Thread(target=finalize, name="success"),
+            threading.Thread(target=finalize, name="late-failure"),
+        ]
+        for contender in contenders:
+            contender.start()
+        for contender in contenders:
+            contender.join(timeout=5)
+
+        self.assertFalse(any(contender.is_alive() for contender in contenders))
+        self.assertEqual(
+            store.receipts[req.effect_id].state,
+            ReceiptState.SUCCEEDED,
+        )
+        self.assertEqual(
+            {result.state for result in results},
+            {ReceiptState.SUCCEEDED},
+        )
+
 
 class EffectGatewayAuthorityTests(unittest.TestCase):
     def test_authoritative_cancellation_landing_at_final_read_prevents_provider(self):
@@ -878,6 +1018,10 @@ class EffectGatewayReceiptTests(unittest.TestCase):
 
         self.assertEqual(conflict.state, ReceiptState.TERMINAL_FAILED)
         self.assertEqual(conflict.reason, "content_identity_conflict")
+        self.assertEqual(
+            store.receipts[original.effect_id].state,
+            ReceiptState.SUCCEEDED,
+        )
         self.assertEqual(len(provider.calls), 1)
 
     def test_provider_acceptance_is_durable_before_success(self):

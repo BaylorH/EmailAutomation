@@ -52,6 +52,10 @@ from .campaign_safety import (
     get_client_automation_pause,
 )
 from .outbound_safety import validate_outbound_body
+from .graph_final_send import (
+    execute_graph_draft_final_send,
+    resolve_effect_run_id,
+)
 from .column_config import (
     get_column_config_error,
     response_requests_nonrequestable_fields,
@@ -550,6 +554,30 @@ def _campaign_suppression_result(decision) -> Dict[str, Any]:
         "campaignAutomationReason": decision.reason,
         "campaignAutomationTerminal": terminal,
     }
+
+
+def _provider_effect_failure_result(outcome) -> Dict[str, Any]:
+    """Translate a fail-closed gateway receipt into existing outbox semantics."""
+
+    receipt = outcome.receipt
+    result = {
+        "providerEffectState": receipt.state.value,
+        "providerEffectReason": receipt.reason,
+    }
+    if receipt.reason.startswith("authoritative_"):
+        result.update(
+            {
+                "campaignAutomationSuppressed": True,
+                "campaignAutomationState": receipt.state.value,
+                "campaignAutomationReason": receipt.reason,
+                "campaignAutomationTerminal": receipt.reason
+                in {
+                    "authoritative_cancelled",
+                    "authoritative_terminal",
+                },
+            }
+        )
+    return result
 
 
 def _handle_suppressed_outbox_send_result(
@@ -1736,7 +1764,8 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
                           signature_mode: str = None, user_email: str = None,
                           fallback_to_emails: Optional[List[str]] = None,
                           fallback_cc_emails: Optional[List[str]] = None,
-                          client_id: Optional[str] = None) -> dict:
+                          client_id: Optional[str] = None,
+                          effect_key: Optional[str] = None) -> dict:
     """
     Send an outbox item as a reply to an existing message in a thread.
 
@@ -1903,13 +1932,32 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
             }
 
         sent_after = datetime.now(timezone.utc) - timedelta(seconds=10)
-        resp = exponential_backoff_request(
-            lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-            max_retries=1,
-            operation="graph_send",
+        effect_outcome = execute_graph_draft_final_send(
+            user_id=user_id,
+            client_id=client_id or "",
+            run_id=resolve_effect_run_id(),
+            effect_type="mail.reply",
+            effect_key=(
+                effect_key
+                or f"outbox-reply:{thread_id}:{reply_to_msg_id}"
+            ),
+            content={
+                "body": html_body,
+                "to": [
+                    _recipient_address(recipient)
+                    for recipient in recipient_payload["toRecipients"]
+                    if _recipient_address(recipient)
+                ],
+                "cc": recipient_result.get("ccRecipients") or [],
+                "replyToMessageId": reply_to_msg_id,
+            },
+            draft_id=reply_draft_id,
+            headers=headers,
+            base_url=base,
+            http_post=requests.post,
         )
 
-        if resp and resp.status_code in [200, 202]:
+        if effect_outcome.accepted:
             print(f"   ✅ Sent reply-all draft to thread {thread_id}")
             identity = _find_recent_sent_reply_identity(
                 headers,
@@ -1931,9 +1979,23 @@ def _send_outbox_as_reply(user_id: str, headers: dict, body: str, reply_to_msg_i
                 **identity,
             }
 
-        error_msg = f"Send draft failed: {resp.status_code if resp else 'None'}"
+        receipt = effect_outcome.receipt
+        if effect_outcome.already_applied:
+            error_msg = (
+                "A prior final send was already accepted; Sent Items "
+                "reconciliation is required before indexing"
+            )
+        else:
+            error_msg = (
+                "Send draft blocked by provider-effect gateway: "
+                f"{receipt.state.value}/{receipt.reason or 'unspecified'}"
+            )
         print(f"   ❌ {error_msg}")
-        return {"sent": False, "error": error_msg}
+        return {
+            "sent": False,
+            "error": error_msg,
+            **_provider_effect_failure_result(effect_outcome),
+        }
 
     except Exception as e:
         error_msg = str(e)
@@ -2575,7 +2637,8 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                         subject_override: str = None, signature_mode: str = None, followup_config: Dict = None,
                         contact_name: str = None, user_email: str = None,
                         thread_context: Optional[Dict[str, Any]] = None,
-                        allow_scheduling_language: bool = False):
+                        allow_scheduling_language: bool = False,
+                        effect_key: Optional[str] = None):
     """
     Send email and immediately index it in Firestore for reply tracking.
 
@@ -2832,11 +2895,50 @@ def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, rec
                 print(f"🛑 {reason}")
                 return results
 
-            exponential_backoff_request(
-                lambda: requests.post(f"{base}/me/messages/{draft_id}/send", headers=headers, timeout=30),
-                max_retries=1,
-                operation="graph_send",
+            effect_outcome = execute_graph_draft_final_send(
+                user_id=user_id,
+                client_id=client_id_or_none or "",
+                run_id=resolve_effect_run_id(),
+                effect_type="mail.send",
+                effect_key=(
+                    f"{effect_key}:{addr.lower()}"
+                    if effect_key
+                    else (
+                        "semantic-send:"
+                        f"{client_id_or_none}:{row_number}:{addr.lower()}:"
+                        f"{subject_to_use}"
+                    )
+                ),
+                content={
+                    "body": content,
+                    "to": [addr],
+                    "subject": subject_to_use,
+                    "rowNumber": row_number,
+                },
+                draft_id=draft_id,
+                headers=headers,
+                base_url=base,
+                http_post=requests.post,
             )
+            if not effect_outcome.accepted:
+                receipt = effect_outcome.receipt
+                if effect_outcome.already_applied:
+                    results["errors"][addr] = (
+                        "A prior final send was already accepted; Sent Items "
+                        "reconciliation is required before indexing"
+                    )
+                else:
+                    results["errors"][addr] = (
+                        "Send blocked by provider-effect gateway: "
+                        f"{receipt.state.value}/"
+                        f"{receipt.reason or 'unspecified'}"
+                    )
+                results.update(
+                    _provider_effect_failure_result(effect_outcome)
+                )
+                if results.get("campaignAutomationSuppressed"):
+                    return results
+                continue
 
             # 4. Index in Firestore with retry logic
             # CRITICAL: Email is already sent at this point. We MUST index it successfully
@@ -3624,7 +3726,8 @@ def _send_multi_property_email(
                                        user_signature=user_signature, subject_override=subject_override,
                                        signature_mode=signature_mode, followup_config=followup_config,
                                        contact_name=contact_name, user_email=user_email,
-                                       allow_scheduling_language=_is_tour_invite_outbox(data))
+                                       allow_scheduling_language=_is_tour_invite_outbox(data),
+                                       effect_key=item["doc"].id)
             if _handle_suppressed_outbox_send_result(
                 user_id, item['doc'].reference, data, res
             ):
@@ -3880,6 +3983,9 @@ def _send_combined_property_email(
     clientId = primary["clientId"]
     primary_row = primary["rowNumber"]
     primary_doc_id = primary["item"]['doc'].id
+    combined_effect_key = "combined:" + ",".join(
+        sorted(c["item"]["doc"].id for c in claimed)
+    )
 
     def _fail_all(reason_prefix: str, error_msg: str):
         """Atomic failure: bump attempts / dead-letter EVERY claimed item together."""
@@ -4047,6 +4153,7 @@ def _send_combined_property_email(
             signature_mode=signature_mode, followup_config=followup_config,
             contact_name=contact_name, user_email=user_email,
             thread_context=thread_context,
+            effect_key=combined_effect_key,
         )
         if res.get("campaignAutomationSuppressed"):
             for c in claimed:
@@ -4347,6 +4454,7 @@ def _send_single_outbox_item(
                         fallback_to_emails=emails,
                         fallback_cc_emails=data.get("ccEmails") or data.get("ccRecipients") or [],
                         client_id=clientId,
+                        effect_key=d.id,
                     )
 
                     if _handle_suppressed_outbox_send_result(
@@ -4436,6 +4544,7 @@ def _send_single_outbox_item(
                         contact_name=contact_name, user_email=user_email,
                         thread_context=_thread_context_from_outbox(data),
                         allow_scheduling_language=_is_tour_invite_outbox(data),
+                        effect_key=d.id,
                     )
                     if _handle_suppressed_outbox_send_result(
                         user_id,
@@ -4557,7 +4666,8 @@ def _send_single_outbox_item(
                                            signature_mode=signature_mode, followup_config=followup_config,
                                            contact_name=recipient_contact_name, user_email=user_email,
                                            thread_context=_thread_context_from_outbox(data),
-                                           allow_scheduling_language=_is_tour_invite_outbox(data))
+                                           allow_scheduling_language=_is_tour_invite_outbox(data),
+                                           effect_key=d.id)
 
                 if _handle_suppressed_outbox_send_result(
                     user_id,

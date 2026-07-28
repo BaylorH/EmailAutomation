@@ -614,7 +614,10 @@ class _AutoReplyFakeFs:
         return True
 
     def to_dict(self):
-        return {"email": "operator@sitesift.com"}
+        return {
+            "email": "operator@sitesift.com",
+            "clientId": "client-active",
+        }
 
 
 class InboxAutoReplyWrongRecipientTests(unittest.TestCase):

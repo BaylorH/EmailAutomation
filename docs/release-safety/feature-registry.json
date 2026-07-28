@@ -153,7 +153,7 @@
       "releaseStatus": "prod_required",
       "normalUserAccess": true,
       "ownerModules": {
-        "backend": ["email_automation/effect_gateway.py", "email_automation/email.py", "email_automation/outbound_safety.py", "email_automation/service_providers.py", "email_automation/sent_mail_guard.py"],
+        "backend": ["email_automation/email.py", "email_automation/outbound_safety.py", "email_automation/service_providers.py", "email_automation/sent_mail_guard.py", "email_automation/effect_gateway.py", "email_automation/firestore_effect_store.py", "email_automation/graph_final_send.py"],
         "frontend": ["src/utils/actionAudit.js", "src/components/EmailSchedulerButton.jsx"],
         "functions": [],
         "firestoreRules": ["firestore.rules"]

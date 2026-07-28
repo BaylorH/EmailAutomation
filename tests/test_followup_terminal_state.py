@@ -665,6 +665,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
         thread_data = {
             "email": ["bp21harrison@gmail.com"],
             "contactName": "Riley Broker",
+            "clientId": "client-1",
         }
         post_urls = []
         patched_payloads = []

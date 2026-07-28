@@ -130,9 +130,24 @@ def credential_free_l1_environment() -> Iterator[MagicMock]:
     previous_e2e_mode = os.environ.get(E2E_TEST_MODE_ENV)
     os.environ[E2E_TEST_MODE_ENV] = "true"
     fake_client = MagicMock(name="credential_free_firestore_client")
+    from tests.test_effect_gateway import InMemoryReceiptStore
+
+    gateway_environment = {
+        "SITESIFT_PROVIDER_EFFECTS_ENABLED": "true",
+        "SITESIFT_OUTBOUND_MODE": "live",
+        "SITESIFT_EFFECT_MAX_ATTEMPTS": "3",
+        "SITESIFT_EFFECT_MAX_PER_RUN": "100000",
+        "SITESIFT_EFFECT_MAX_PER_USER": "100000",
+        "SITESIFT_EFFECT_MAX_PER_PROVIDER": "100000",
+        "SITESIFT_EFFECT_RUN_ID": "credential-free-l1",
+    }
 
     try:
-        with patch("socket.socket", _CredentialFreeSocket), patch(
+        with patch.dict(
+            os.environ,
+            gateway_environment,
+            clear=False,
+        ), patch("socket.socket", _CredentialFreeSocket), patch(
             "socket.create_connection",
             side_effect=_block_l1_network,
         ), patch(
@@ -171,6 +186,9 @@ def credential_free_l1_environment() -> Iterator[MagicMock]:
         ), patch(
             "openai.OpenAI",
             return_value=MagicMock(name="credential_free_openai_client"),
+        ), patch(
+            "email_automation.graph_final_send._default_receipt_store",
+            side_effect=InMemoryReceiptStore,
         ):
             yield fake_client
     finally:

@@ -3,6 +3,21 @@
   "purpose": "Machine-readable inventory of every Python file that can directly call Microsoft Graph send/reply endpoints. Update this file whenever a Graph send surface is added, removed, or moved.",
   "sendSurfaces": [
     {
+      "path": "email_automation/graph_final_send.py",
+      "lane": "single_final_send_gateway",
+      "policyStatus": "gateway",
+      "trigger": "Every active outbox, inbox auto-reply, pending-response retry, and follow-up lane delegates its irreversible draft send here.",
+      "risk": "Any bypass would evade durable idempotency receipts, atomic caps, exact campaign authority, and uncertain-outcome reconciliation.",
+      "currentControls": [
+        "one raw Graph final-send call with no opaque retry wrapper",
+        "transactional Firestore receipt reservation",
+        "owner/version compare-and-set transitions",
+        "immediate pre-send campaign authority read",
+        "redacted operator receipts"
+      ],
+      "nextGate": "Keep the final-send inventory test mandatory and reject any active final-send literal outside this adapter."
+    },
+    {
       "path": "email_automation/email.py",
       "lane": "core_outbox",
       "policyStatus": "guarded",
@@ -13,9 +28,10 @@
         "paused-client dead-letter guard",
         "Results/Tour outbox pause gate",
         "Sent Items retry reconciliation",
-        "actionAudit terminal states"
+        "actionAudit terminal states",
+        "single final-send gateway"
       ],
-      "nextGate": "Centralize these controls into a shared outbound policy object and require every other send surface to call it or document why it is legacy-disabled."
+      "nextGate": "Keep every final Graph send routed through email_automation/graph_final_send.py."
     },
     {
       "path": "email_automation/processing.py",
@@ -27,9 +43,10 @@
         "reply-all draft path",
         "tour action allowlist gate",
         "reply indexing tests",
-        "Graph retry tests"
+        "Graph retry tests",
+        "single final-send gateway"
       ],
-      "nextGate": "Route every processing reply through the same outbound policy used by outbox sends and keep tour interpretation separate from core event handling."
+      "nextGate": "Keep every processing and pending-response final send routed through email_automation/graph_final_send.py."
     },
     {
       "path": "email_automation/followup.py",
@@ -40,9 +57,10 @@
       "currentControls": [
         "terminal-state checks",
         "off-hours/weekend deferral",
-        "reply draft send path"
+        "reply draft send path",
+        "single final-send gateway"
       ],
-      "nextGate": "Add an explicit outbound policy call before Graph send and a fixture proving manual Sent Items continuation suppresses follow-up."
+      "nextGate": "Keep every follow-up final send routed through email_automation/graph_final_send.py."
     },
     {
       "path": "email_automation/email_operations.py",

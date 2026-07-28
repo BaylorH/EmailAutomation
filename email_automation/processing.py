@@ -50,6 +50,10 @@ from .tour_scheduling import (
     tour_date_from_thread_data,
 )
 from .outbound_safety import validate_outbound_body
+from .graph_final_send import (
+    execute_graph_draft_final_send,
+    resolve_effect_run_id,
+)
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
                    format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff,
@@ -3682,18 +3686,71 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
 
         reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
         _set_reply_send_outcome(send_attempt_at=reply_sent_after)
-        resp = exponential_backoff_request(
-            lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-            max_retries=1,
-            operation="graph_send",
+        effect_outcome = execute_graph_draft_final_send(
+            user_id=user_id,
+            client_id=client_id or "",
+            run_id=resolve_effect_run_id(),
+            effect_type="mail.reply",
+            effect_key=f"inbox-reply:{thread_id}:{current_msg_id}",
+            content={
+                "body": html_body,
+                "to": [
+                    (
+                        (recipient_item.get("emailAddress") or {}).get(
+                            "address"
+                        )
+                        or ""
+                    )
+                    for recipient_item in recipient_payload["toRecipients"]
+                ],
+                "cc": [
+                    (
+                        (recipient_item.get("emailAddress") or {}).get(
+                            "address"
+                        )
+                        or ""
+                    )
+                    for recipient_item in recipient_payload["ccRecipients"]
+                ],
+                "replyToMessageId": current_msg_id,
+            },
+            draft_id=reply_draft_id,
+            headers=headers,
+            base_url=base,
+            http_post=requests.post,
         )
-        reply_sent_successfully = resp and resp.status_code in [200, 202]
+        reply_sent_successfully = effect_outcome.accepted
         if reply_sent_successfully:
             print(f"   ✅ Sent reply via createReplyAll draft")
 
         if not reply_sent_successfully:
-            failure_reason = f"Reply-all draft send failed: {resp.status_code if resp else 'no response'}"
-            _set_reply_send_outcome(error=failure_reason, outcome="send_failed")
+            receipt = effect_outcome.receipt
+            if effect_outcome.already_applied:
+                return _mark_reply_sent_but_unindexed(
+                    "A prior final send was already accepted; Sent Items "
+                    "reconciliation is required before indexing"
+                )
+            failure_reason = (
+                "Reply-all draft blocked by provider-effect gateway: "
+                f"{receipt.state.value}/{receipt.reason or 'unspecified'}"
+            )
+            if receipt.reason.startswith("authoritative_"):
+                latest_decision = get_client_automation_decision(
+                    user_id,
+                    client_id,
+                )
+                if latest_decision.denies_autonomous_work:
+                    _set_reply_campaign_suppression(latest_decision)
+                else:
+                    _set_reply_send_outcome(
+                        error=failure_reason,
+                        outcome="send_failed",
+                    )
+            else:
+                _set_reply_send_outcome(
+                    error=failure_reason,
+                    outcome="send_failed",
+                )
             print(f"   ❌ {failure_reason}")
             return False
 

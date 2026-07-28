@@ -12,9 +12,11 @@ os.environ.setdefault(
 )
 
 from email_automation import email as email_module
+from email_automation import graph_final_send
 from email_automation import sent_mail_guard
 from email_automation import utils
 from email_automation.campaign_safety import CampaignAutomationDecision
+from tests.test_effect_gateway import InMemoryReceiptStore
 
 
 class FakeResponse:
@@ -103,6 +105,7 @@ class GraphRetryPolicyTests(unittest.TestCase):
                 "Hi Broker,\n\nThanks.",
                 "reply-message-1",
                 "thread-1",
+                client_id="client-1",
             )
 
         self.assertTrue(result["sent"])
@@ -110,8 +113,89 @@ class GraphRetryPolicyTests(unittest.TestCase):
             call for call in retry_calls
             if call.get("operation") == "graph_send"
         ]
-        self.assertTrue(send_calls)
-        self.assertEqual(send_calls[-1].get("max_retries"), 1)
+        self.assertEqual(
+            send_calls,
+            [],
+            "The final /send is owned by GraphFinalSendAdapter and must not "
+            "be hidden inside the generic retry helper",
+        )
+
+    def test_retry_after_success_neither_sends_nor_indexes_the_new_draft(self):
+        store = InMemoryReceiptStore()
+        created_drafts = []
+        final_send_urls = []
+
+        def fake_post(url, **_kwargs):
+            if url.endswith("/me/messages"):
+                draft_id = f"draft-{len(created_drafts) + 1}"
+                created_drafts.append(draft_id)
+                return FakeResponse(201, {"id": draft_id})
+            if url.endswith("/send"):
+                final_send_urls.append(url)
+                return FakeResponse(202)
+            return FakeResponse(500, text=f"Unexpected POST {url}")
+
+        def fake_get(url, **_kwargs):
+            draft_id = url.rsplit("/", 1)[-1]
+            return FakeResponse(
+                200,
+                {
+                    "internetMessageId": f"<{draft_id}@example.test>",
+                    "conversationId": f"conversation-{draft_id}",
+                    "subject": "Availability request",
+                },
+            )
+
+        gateway_environment = {
+            "SITESIFT_PROVIDER_EFFECTS_ENABLED": "true",
+            "SITESIFT_OUTBOUND_MODE": "live",
+            "SITESIFT_EFFECT_MAX_ATTEMPTS": "3",
+            "SITESIFT_EFFECT_MAX_PER_RUN": "10",
+            "SITESIFT_EFFECT_MAX_PER_USER": "10",
+            "SITESIFT_EFFECT_MAX_PER_PROVIDER": "10",
+            "SITESIFT_EFFECT_RUN_ID": "retry-after-success-test",
+        }
+        with patch.dict(os.environ, gateway_environment, clear=False), \
+             patch.object(email_module, "resolve_outbound_mode", return_value="live"), \
+             patch.object(email_module, "exponential_backoff_request", side_effect=lambda func, **_kwargs: func()), \
+             patch.object(email_module.requests, "post", side_effect=fake_post), \
+             patch.object(email_module.requests, "get", side_effect=fake_get), \
+             patch.object(email_module.time, "sleep", return_value=None), \
+             patch.object(email_module, "save_thread_root", return_value=True) as save_thread, \
+             patch.object(email_module, "save_message", return_value=True) as save_message, \
+             patch.object(email_module, "index_message_id", return_value=True) as index_message, \
+             patch.object(email_module, "lookup_thread_by_message_id", side_effect=lambda _uid, message_id: message_id.strip("<>")), \
+             patch.object(email_module, "index_conversation_id", return_value=True) as index_conversation, \
+             patch("email_automation.processing.is_contact_opted_out", return_value=None), \
+             patch.object(graph_final_send, "_default_receipt_store", return_value=store):
+            arguments = {
+                "user_id": "uid-1",
+                "headers": {"Authorization": "Bearer token"},
+                "script": "Hello, is this property available?",
+                "recipients": ["broker@example.com"],
+                "client_id_or_none": "client-1",
+                "row_number": 12,
+                "subject_override": "Availability request",
+                "effect_key": "outbox-doc-1",
+            }
+            first = email_module.send_and_index_email(**arguments)
+            second = email_module.send_and_index_email(**arguments)
+
+        self.assertEqual(first["sent"], ["broker@example.com"])
+        self.assertEqual(second["sent"], [])
+        self.assertIn("reconciliation is required", second["errors"]["broker@example.com"])
+        self.assertEqual(created_drafts, ["draft-1", "draft-2"])
+        self.assertEqual(
+            final_send_urls,
+            [
+                "https://graph.microsoft.com/v1.0/me/messages/"
+                "draft-1/send"
+            ],
+        )
+        save_thread.assert_called_once()
+        save_message.assert_called_once()
+        index_message.assert_called_once()
+        index_conversation.assert_called_once()
 
     def test_dashboard_thread_reply_preserves_safe_cc_with_reply_all_draft(self):
         posts = []
@@ -154,6 +238,7 @@ class GraphRetryPolicyTests(unittest.TestCase):
                 "reply-message-1",
                 "thread-1",
                 user_email="baylor.freelance@outlook.com",
+                client_id="client-1",
             )
 
         self.assertTrue(result["sent"])
@@ -218,6 +303,7 @@ class GraphRetryPolicyTests(unittest.TestCase):
                 "reply-message-1",
                 "thread-1",
                 user_email="baylor.freelance@outlook.com",
+                client_id="client-1",
             )
 
         self.assertTrue(result["sent"])
@@ -298,6 +384,7 @@ class GraphRetryPolicyTests(unittest.TestCase):
                 "reply-message-1",
                 "thread-1",
                 user_email="baylor.freelance@outlook.com",
+                client_id="client-1",
             )
 
         self.assertTrue(result["sent"])
@@ -362,6 +449,7 @@ class GraphRetryPolicyTests(unittest.TestCase):
                 user_email="baylor.freelance@outlook.com",
                 fallback_to_emails=["bp21harrison@gmail.com"],
                 fallback_cc_emails=["baylor@manifoldengineering.ai"],
+                client_id="client-1",
             )
 
         self.assertTrue(result["sent"])
@@ -427,6 +515,7 @@ class GraphRetryPolicyTests(unittest.TestCase):
                 user_email="baylor.freelance@outlook.com",
                 fallback_to_emails=["bp21harrison@gmail.com"],
                 fallback_cc_emails=["baylor@manifoldengineering.ai"],
+                client_id="client-1",
             )
 
         self.assertTrue(result["sent"])
@@ -510,6 +599,7 @@ class GraphRetryPolicyTests(unittest.TestCase):
                 "reply-message-1",
                 "thread-1",
                 user_email="baylor.freelance@outlook.com",
+                client_id="client-1",
             )
 
         self.assertTrue(result["sent"])
