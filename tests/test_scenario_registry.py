@@ -9,6 +9,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = (
     REPO_ROOT / "docs" / "release-safety" / "scenario-registry.json"
 )
+AUDIT_MATRIX_PATH = (
+    REPO_ROOT / "docs" / "release-safety" / "system-audit-matrix.json"
+)
 
 FAMILY_COUNTS = {
     "ACC": 5,
@@ -94,6 +97,9 @@ class TestScenarioRegistry(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.registry = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+        cls.audit_matrix = json.loads(
+            AUDIT_MATRIX_PATH.read_text(encoding="utf-8")
+        )
 
     def test_registry_is_the_authoritative_pre_gate_2_source(self):
         self.assertEqual(self.registry["schemaVersion"], 1)
@@ -179,10 +185,30 @@ class TestScenarioRegistry(unittest.TestCase):
         contract = self.registry["turn2ContractFreeze"]["contracts"][
             "verified_firebase_authority"
         ]
+        audit_contract = next(
+            invariant
+            for invariant in self.audit_matrix["crossRepoInvariants"]
+            if invariant["id"] == "verified_firebase_authority"
+        )
+        expected_sources = [
+            "verified_firebase_auth_uid",
+            "trusted_server_authority",
+        ]
 
-        self.assertEqual(contract["authoritySource"], "verified_firebase_auth")
-        self.assertFalse(contract["callerUidIsAuthority"])
-        self.assertFalse(contract["bodyUidIsAuthority"])
+        self.assertEqual(contract["authoritySources"], expected_sources)
+        self.assertEqual(audit_contract["authoritySources"], expected_sources)
+        self.assertFalse(contract["callerUidAuthorityAllowed"])
+        self.assertFalse(contract["bodyUidAuthorityAllowed"])
+        self.assertFalse(contract["ambientAuthorityAllowed"])
+        self.assertFalse(audit_contract["callerUidAuthorityAllowed"])
+        self.assertFalse(audit_contract["bodyUidAuthorityAllowed"])
+        self.assertFalse(audit_contract["ambientAuthorityAllowed"])
+        self.assertTrue(
+            contract["trustedServerAuthorityAuthenticationRequired"]
+        )
+        self.assertTrue(
+            audit_contract["trustedServerAuthorityAuthenticationRequired"]
+        )
         self.assertEqual(
             set(contract["failClosedPrincipals"]),
             {
@@ -234,10 +260,50 @@ class TestScenarioRegistry(unittest.TestCase):
         )
         self.assertTrue(contract["attemptPolicy"]["bounded"])
         self.assertTrue(contract["attemptPolicy"]["explicitCapRequired"])
+        self.assertTrue(contract["globalKillRequired"])
+        audit_contract = next(
+            invariant
+            for invariant in self.audit_matrix["crossRepoInvariants"]
+            if invariant["id"] == "durable_provider_effect"
+        )
+        self.assertTrue(audit_contract["globalKillRequired"])
         self.assertTrue(contract["terminalFailure"]["operatorVisible"])
         self.assertEqual(
             contract["terminalFailure"]["receiptState"],
             "terminal_failed",
+        )
+
+    def test_sec_04_preserves_pending_proof_and_waived_unperformed_rotation(self):
+        scenario = next(
+            item for item in self.registry["scenarios"] if item["id"] == "SEC-04"
+        )
+        expected_containment = {
+            "status": "not_run",
+            "disposition": "pending",
+        }
+        expected_rotation = {
+            "status": "waived_by_owner",
+            "performed": False,
+            "waivedAt": "2026-07-27",
+        }
+
+        self.assertEqual(scenario["latestResult"]["status"], "not_run")
+        self.assertEqual(
+            scenario["plaintextManualContainmentProof"],
+            expected_containment,
+        )
+        self.assertEqual(scenario["credentialRotation"], expected_rotation)
+        self.assertEqual(
+            self.audit_matrix["scenarioDispositions"]["SEC-04"][
+                "plaintextManualContainmentProof"
+            ],
+            expected_containment,
+        )
+        self.assertEqual(
+            self.audit_matrix["scenarioDispositions"]["SEC-04"][
+                "credentialRotation"
+            ],
+            expected_rotation,
         )
 
     def test_turn2_drive_trash_partial_failure_is_safe_to_reconcile(self):

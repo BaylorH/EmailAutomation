@@ -53,8 +53,16 @@
     },
     {
       "id": "verified_firebase_authority",
-      "rule": "Every privileged user scope comes from verified Firebase authentication. Caller or body UID is never authority, and anonymous, invalid, expired, revoked, or mismatched principals fail closed before provider construction, data access, or mutation.",
+      "rule": "User requests derive authority only from a verified Firebase UID; non-user service paths derive authority only from a separately authenticated trusted server authority. Caller or body UID and ambient trust are never authority, and untrusted principals fail closed before provider construction, data access, or mutation.",
       "incidentClass": "caller-controlled identity reaches backend authority",
+      "authoritySources": [
+        "verified_firebase_auth_uid",
+        "trusted_server_authority"
+      ],
+      "callerUidAuthorityAllowed": false,
+      "bodyUidAuthorityAllowed": false,
+      "ambientAuthorityAllowed": false,
+      "trustedServerAuthorityAuthenticationRequired": true,
       "packageAcceptance": [
         "frontend callable and HTTP boundaries",
         "backend API and worker boundaries",
@@ -63,8 +71,9 @@
     },
     {
       "id": "durable_provider_effect",
-      "rule": "Every Graph or provider business effect has a stable effect identity and separate content-idempotency identity, a durable receipt lifecycle, an immediately-before-effect cancellation check, explicit bounded attempt and cap policy, and operator-visible terminal failure.",
+      "rule": "Every Graph or provider business effect has a stable effect identity and separate content-idempotency identity, a durable receipt lifecycle, a required global kill gate, an immediately-before-effect cancellation check, explicit bounded attempt and cap policy, and operator-visible terminal failure.",
       "incidentClass": "duplicate or invisible provider side effect",
+      "globalKillRequired": true,
       "packageAcceptance": [
         "frontend Functions effect adapters",
         "backend Graph and provider adapters",
@@ -92,6 +101,19 @@
       ]
     }
   ],
+  "scenarioDispositions": {
+    "SEC-04": {
+      "plaintextManualContainmentProof": {
+        "status": "not_run",
+        "disposition": "pending"
+      },
+      "credentialRotation": {
+        "status": "waived_by_owner",
+        "performed": false,
+        "waivedAt": "2026-07-27"
+      }
+    }
+  },
   "releaseArtifactManifest": {
     "source": {
       "requiredFields": [

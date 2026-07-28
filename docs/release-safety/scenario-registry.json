@@ -43,9 +43,14 @@
           "SEC-03",
           "SEC-04"
         ],
-        "authoritySource": "verified_firebase_auth",
-        "callerUidIsAuthority": false,
-        "bodyUidIsAuthority": false,
+        "authoritySources": [
+          "verified_firebase_auth_uid",
+          "trusted_server_authority"
+        ],
+        "callerUidAuthorityAllowed": false,
+        "bodyUidAuthorityAllowed": false,
+        "ambientAuthorityAllowed": false,
+        "trustedServerAuthorityAuthenticationRequired": true,
         "failClosedPrincipals": [
           "anonymous",
           "missing_token",
@@ -95,6 +100,7 @@
           "reconciliation_required"
         ],
         "cancellationCheck": "immediately_before_provider_effect",
+        "globalKillRequired": true,
         "attemptPolicy": {
           "bounded": true,
           "explicitCapRequired": true
@@ -868,13 +874,22 @@
     {
       "id": "SEC-04",
       "family": "SEC",
-      "requiredResult": "Verified Firebase authentication is the only user authority; caller or body UID never grants authority, and anonymous, invalid, expired, or revoked credentials fail before any provider or privileged state effect.",
+      "requiredResult": "User requests derive authority only from a verified Firebase UID; non-user service paths derive authority only from a separately authenticated trusted server authority. Caller or body UID and ambient trust never grant authority, and untrusted principals fail before any provider or privileged state effect.",
       "owner": "shared",
       "executionLevels": ["L2", "L4"],
       "testPaths": [],
-      "explicitGap": "Turn 2 packages must satisfy the frozen identity contract before canonical L2 Functions-emulator and controlled L4 proof can run.",
+      "explicitGap": "Plaintext/manual containment proof remains pending and not_run; canonical L2 Functions-emulator and controlled L4 proof have not run.",
       "dataClassification": ["synthetic_emulator", "controlled_test_accounts"],
-      "latestResult": {"status": "not_run", "level": null, "date": "2026-07-27", "summary": "The cross-package authority contract is frozen; no execution status or Gate 2 authorization is implied."},
+      "latestResult": {"status": "not_run", "level": null, "date": "2026-07-27", "summary": "Plaintext/manual containment proof remains pending and not_run. Credential rotation was waived by owner risk acceptance on 2026-07-27 and was not performed; SEC-04 is not passing."},
+      "plaintextManualContainmentProof": {
+        "status": "not_run",
+        "disposition": "pending"
+      },
+      "credentialRotation": {
+        "status": "waived_by_owner",
+        "performed": false,
+        "waivedAt": "2026-07-27"
+      },
       "evidenceArtifact": "docs/release-safety/credential-free-l1-baseline-2026-07-24.md"
     },
     {
