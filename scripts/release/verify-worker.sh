@@ -183,6 +183,10 @@ try:
             safe_relative(member.name.rstrip("/"), "archive member")
             if member.issym() or member.islnk():
                 refuse("source archive links are not restorable")
+            if not (member.isfile() or member.isdir()):
+                refuse(
+                    "source archive special members are not restorable"
+                )
 except (tarfile.TarError, OSError):
     refuse("source archive is not a readable tar file")
 

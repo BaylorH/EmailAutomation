@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -102,6 +104,59 @@ class WorkerSourceRollbackContractTests(unittest.TestCase):
                 "--output",
                 str(self.output),
             ]
+        )
+
+    def _replace_archive_with_member(
+        self,
+        manifest_path: Path,
+        *,
+        name: str,
+        member_type: bytes,
+        linkname: str = "",
+    ) -> None:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        archive_path = manifest_path.parent / manifest["source"]["archive"]
+        tar_bytes = io.BytesIO()
+        with tarfile.open(
+            fileobj=tar_bytes,
+            mode="w",
+            format=tarfile.USTAR_FORMAT,
+        ) as archive:
+            member = tarfile.TarInfo(name)
+            member.type = member_type
+            member.linkname = linkname
+            member.mode = 0o644
+            member.size = 0
+            if member_type in (tarfile.CHRTYPE, tarfile.BLKTYPE):
+                member.devmajor = 1
+                member.devminor = 3
+            archive.addfile(member)
+        archive_path.write_bytes(tar_bytes.getvalue())
+
+        archive_sha = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        manifest["source"]["archiveSha256"] = archive_sha
+        identity_input = {
+            "commit": manifest["repository"]["commit"],
+            "sourceArchiveSha256": archive_sha,
+            "dockerfileSha256": manifest["build"]["dockerfileSha256"],
+            "lockfileSha256": manifest["build"]["lockfileSha256"],
+            "baseImage": manifest["build"]["baseImage"],
+            "gitPathspecs": manifest["source"]["gitPathspecs"],
+        }
+        source_build_identity = hashlib.sha256(
+            json.dumps(
+                identity_input,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        manifest["build"]["sourceBuildIdentity"] = source_build_identity
+        manifest["build"]["command"][5] = (
+            f"SOURCE_BUILD_IDENTITY={source_build_identity}"
+        )
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n",
+            encoding="utf-8",
         )
 
     def test_build_records_clean_commit_source_and_build_identity(self):
@@ -275,6 +330,55 @@ class WorkerSourceRollbackContractTests(unittest.TestCase):
                 self.assertNotRegex(
                     verified.stderr,
                     r"ENOENT.*private/secret",
+                )
+
+    def test_verify_rejects_every_non_regular_archive_member(self):
+        cases = (
+            ("absolute path", "/private/escape", tarfile.REGTYPE, ""),
+            ("traversal path", "../../escape", tarfile.REGTYPE, ""),
+            ("symbolic link", "safe-link", tarfile.SYMTYPE, "/private/secret"),
+            ("hard link", "safe-hardlink", tarfile.LNKTYPE, "target"),
+            ("fifo", "safe-fifo", tarfile.FIFOTYPE, ""),
+            ("character device", "safe-device", tarfile.CHRTYPE, ""),
+        )
+        for index, (label, name, member_type, linkname) in enumerate(cases):
+            with self.subTest(member=label):
+                output = self.root / f"malicious-artifact-{index}"
+                built = _run(
+                    [
+                        "bash",
+                        str(BUILD_SCRIPT),
+                        "--repo",
+                        str(self.repo),
+                        "--output",
+                        str(output),
+                    ]
+                )
+                self.assertEqual(built.returncode, 0, built.stderr)
+                manifest_path = output / "worker-release-manifest.json"
+                self._replace_archive_with_member(
+                    manifest_path,
+                    name=name,
+                    member_type=member_type,
+                    linkname=linkname,
+                )
+
+                verified = _run(
+                    [
+                        "bash",
+                        str(VERIFY_SCRIPT),
+                        "--manifest",
+                        str(manifest_path),
+                    ]
+                )
+                self.assertNotEqual(
+                    verified.returncode,
+                    0,
+                    f"{label} unexpectedly verified:\n{verified.stdout}",
+                )
+                self.assertRegex(
+                    verified.stderr.lower(),
+                    r"archive|member|unsafe|link|restorable|refus",
                 )
 
     def test_restore_defaults_dry_run_and_apply_never_calls_provider_tools(self):
