@@ -26,8 +26,57 @@ from .column_config import (
     response_requests_nonrequestable_fields,
 )
 
+try:
+    import sentry_sdk
+except ImportError:  # optional dependency; root owns the dependency manifest
+    sentry_sdk = None
+
 # Maximum retry attempts before giving up
 MAX_RESPONSE_ATTEMPTS = 5
+
+
+def _capture_pending_response_abandoned(
+    data: Dict[str, Any],
+):
+    """Emit a warning before a max-attempt item leaves the pending queue."""
+
+    if sentry_sdk is None:
+        return None
+
+    try:
+        attempts = int(data.get("attempts", 0))
+    except (TypeError, ValueError):
+        attempts = MAX_RESPONSE_ATTEMPTS
+    attempts = max(0, min(attempts, MAX_RESPONSE_ATTEMPTS))
+    context = {
+        "source": "pendingResponses",
+        "category": "max_attempt_terminal_drop",
+        "attempts": attempts,
+        "max_attempts": MAX_RESPONSE_ATTEMPTS,
+    }
+    try:
+        with sentry_sdk.new_scope() as scope:
+            scope.set_tag("worker", "pending_responses")
+            scope.set_tag("event_category", "max_attempt_terminal_drop")
+            scope.set_context("pending_response", context)
+            return sentry_sdk.capture_message(
+                f"Pending response abandoned after {MAX_RESPONSE_ATTEMPTS} retries",
+                level="warning",
+            )
+    except Exception:
+        # Observability is never allowed to strand terminal work in the queue.
+        print("⚠️ Pending-response warning capture failed; cleanup will continue")
+        return None
+
+
+def _terminalize_max_attempt_pending_response(
+    user_id: str,
+    doc,
+    data: Dict[str, Any],
+    reason: str,
+) -> None:
+    _capture_pending_response_abandoned(data)
+    _move_pending_response_to_dead_letter(user_id, doc, data, reason)
 
 
 def _preserve_pending_campaign_suppression(doc, decision) -> None:
@@ -232,7 +281,12 @@ def get_pending_responses(user_id: str, *, apply_send_gates: bool = True) -> lis
         if attempts >= MAX_RESPONSE_ATTEMPTS:
             reason = data.get("lastError") or f"Exceeded max attempts ({MAX_RESPONSE_ATTEMPTS})"
             print(f"☠️ Pending response exceeded max attempts ({MAX_RESPONSE_ATTEMPTS}): {doc.id[:30]}...")
-            _move_pending_response_to_dead_letter(user_id, doc, data, reason)
+            _terminalize_max_attempt_pending_response(
+                user_id,
+                doc,
+                data,
+                reason,
+            )
             continue
 
         valid.append({
@@ -328,7 +382,12 @@ def process_pending_responses(user_id: str, headers: Dict[str, str]) -> List[Dic
 
             if attempts >= MAX_RESPONSE_ATTEMPTS:
                 reason = data.get("lastError") or f"Exceeded max attempts ({MAX_RESPONSE_ATTEMPTS})"
-                _move_pending_response_to_dead_letter(user_id, doc, data, reason)
+                _terminalize_max_attempt_pending_response(
+                    user_id,
+                    doc,
+                    data,
+                    reason,
+                )
                 print(f"    ☠️ Pending response exceeded max attempts ({MAX_RESPONSE_ATTEMPTS})")
                 continue
 

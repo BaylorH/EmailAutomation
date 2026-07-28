@@ -15,6 +15,10 @@ Usage:
     python tests/multi_turn_live_test.py --wait 90          # Custom wait (seconds)
     python tests/multi_turn_live_test.py --cleanup          # Remove test data
     python tests/multi_turn_live_test.py --list             # List scenarios
+
+Live effects additionally require both:
+    SITESIFT_LIVE_TEST_AUTHORIZATION=I_UNDERSTAND_LIVE_PROVIDER_EFFECTS
+    --authorize-live-effects
 """
 
 import os
@@ -51,13 +55,11 @@ def load_dotenv():
             return True
     return False
 
-load_dotenv()
-
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from multi_turn_scenarios import (
+from tests.multi_turn_scenarios import (
     ALL_SCENARIOS, MultiTurnScenario, TurnSpec, TurnAction, PropertyStatus,
 )
 
@@ -80,7 +82,8 @@ OUTLOOK_USER_ID = "NO7lVYVp6BaplKYEfMlWCgBnpdh2"
 DEFAULT_WAIT_SECONDS = 75
 RESULTS_DIR = PROJECT_ROOT / "tests" / "results"
 STATE_FILE = PROJECT_ROOT / "tests" / ".multi_turn_state.json"
-RUN_PRODUCTION_SCRIPT = PROJECT_ROOT / "run_production.sh"
+LIVE_AUTHORIZATION_ENV = "SITESIFT_LIVE_TEST_AUTHORIZATION"
+LIVE_AUTHORIZATION_VALUE = "I_UNDERSTAND_LIVE_PROVIDER_EFFECTS"
 
 # Required fields for "complete" detection
 REQUIRED_FIELDS = ["Total SF", "Ops Ex /SF", "Drive Ins", "Docks", "Ceiling Ht", "Power"]
@@ -92,6 +95,22 @@ EXTRA_FIELDS = ["Rent/SF /Yr", "Listing Brokers Comments"]
 REDUNDANT_IN_COMMENTS = [
     "Total SF", "Ops Ex", "Drive Ins", "Docks", "Ceiling Ht", "Power",
 ]
+
+
+class LiveAuthorizationError(RuntimeError):
+    """Raised before credentials, clients, data, or providers can be touched."""
+
+
+def _require_live_authorization(*, cli_authorized=False):
+    environment_authorized = (
+        os.getenv(LIVE_AUTHORIZATION_ENV, "").strip()
+        == LIVE_AUTHORIZATION_VALUE
+    )
+    if not environment_authorized or cli_authorized is not True:
+        raise LiveAuthorizationError(
+            "Live multi-turn effects are disabled. Set the exact live-test "
+            "authorization environment value and pass --authorize-live-effects."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -178,16 +197,28 @@ class RunState:
 # Core orchestrator
 # ---------------------------------------------------------------------------
 class MultiTurnTestRunner:
-    def __init__(self, wait_seconds: int = DEFAULT_WAIT_SECONDS):
+    def __init__(
+        self,
+        wait_seconds: int = DEFAULT_WAIT_SECONDS,
+        *,
+        live_authorized: bool = False,
+    ):
         self.wait_seconds = wait_seconds
+        self.live_authorized = live_authorized is True
         self.graph_client: Optional[EmailTestClient] = None
         self.gmail_sender: Optional[GmailSender] = None
         self.sheets = None
         self.results: List[ScenarioResult] = []
         self._thread_client_ids: Dict[str, str] = {}  # thread_id -> actual clientId
 
+    def _require_live(self):
+        _require_live_authorization(
+            cli_authorized=self.live_authorized,
+        )
+
     def _init_clients(self):
         """Initialize Graph API and Gmail clients (and do deferred imports)."""
+        self._require_live()
         global EmailTestClient, GmailSender, _fs, _sheets_client
         global _read_header_row2, _header_index_map, _get_first_tab_title
         global _find_row_by_address_city, _get_thread_messages_chronological
@@ -242,6 +273,7 @@ class MultiTurnTestRunner:
         self, scenario: MultiTurnScenario, client_id: str, row_index: int = 3
     ) -> str:
         """Create an outbox entry in Firestore and return its doc ID."""
+        self._require_live()
         from google.cloud.firestore import SERVER_TIMESTAMP
 
         outbox_ref = (
@@ -276,14 +308,15 @@ class MultiTurnTestRunner:
     # ------------------------------------------------------------------
     def _run_pipeline(self) -> Tuple[float, str]:
         """
-        Run main.py via run_production.sh.
+        Run the tracked main.py module without any ignored shell launcher.
         Returns (duration_seconds, stdout_output).
         """
+        self._require_live()
         print(f"\n>>> Running pipeline (main.py) ...")
         start = time.time()
 
         result = subprocess.run(
-            ["bash", str(RUN_PRODUCTION_SCRIPT)],
+            [sys.executable, "-m", "main"],
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
@@ -511,6 +544,7 @@ class MultiTurnTestRunner:
         contact_name: str, contact_email: str,
     ) -> Optional[int]:
         """Insert a test property row into the sheet. Returns the row number."""
+        self._require_live()
         tab_title = _get_first_tab_title(self.sheets, sheet_id)
         header = _read_header_row2(self.sheets, sheet_id, tab_title)
         idx_map = _header_index_map(header)
@@ -587,6 +621,7 @@ class MultiTurnTestRunner:
 
     def _delete_test_rows(self, sheet_id: str, addresses: List[str]):
         """Delete test property rows from the sheet."""
+        self._require_live()
         tab_title = _get_first_tab_title(self.sheets, sheet_id)
         header = _read_header_row2(self.sheets, sheet_id, tab_title)
 
@@ -724,6 +759,7 @@ class MultiTurnTestRunner:
         self, scenario: MultiTurnScenario, client_id: str, row_index: int = 3
     ) -> TurnResult:
         """Execute the outreach turn: create outbox → run pipeline → verify send."""
+        self._require_live()
         start = time.time()
         start_dt = datetime.now(timezone.utc)
 
@@ -780,6 +816,7 @@ class MultiTurnTestRunner:
         row_index: int = None,
     ) -> TurnResult:
         """Send a broker reply via Gmail, wait, run pipeline, verify."""
+        self._require_live()
         start = time.time()
         start_dt = datetime.now(timezone.utc)
 
@@ -995,6 +1032,7 @@ class MultiTurnTestRunner:
         The frontend creates outbox entries which the backend sends and indexes.
         Then run pipeline to send it and index via scan_sent_items_for_manual_replies.
         """
+        self._require_live()
         start = time.time()
         start_dt = datetime.now(timezone.utc)
 
@@ -1112,6 +1150,7 @@ class MultiTurnTestRunner:
         state: Optional[RunState] = None,
     ) -> ScenarioResult:
         """Run a complete multi-turn scenario."""
+        self._require_live()
         print("\n" + "=" * 80)
         print(f"SCENARIO: {scenario.name}")
         print(f"  {scenario.description}")
@@ -1397,6 +1436,7 @@ class MultiTurnTestRunner:
         resume: bool = False,
     ) -> Dict[str, Any]:
         """Run specified scenarios (or all) and produce a report."""
+        self._require_live()
         self._init_clients()
 
         # Load or create state
@@ -1507,8 +1547,11 @@ class MultiTurnTestRunner:
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
-def cleanup_test_data():
+def cleanup_test_data(*, live_authorized: bool = False):
     """Remove test clients, threads, and notifications created by tests."""
+    _require_live_authorization(
+        cli_authorized=live_authorized is True,
+    )
     from email_automation.clients import _fs
 
     print("Cleaning up multi-turn test data...")
@@ -1591,6 +1634,11 @@ def main():
         action="store_true",
         help="List available scenarios",
     )
+    parser.add_argument(
+        "--authorize-live-effects",
+        action="store_true",
+        help="Required with the exact live-test authorization environment value",
+    )
 
     args = parser.parse_args()
 
@@ -1605,11 +1653,27 @@ def main():
                 print(f"      Turn {i+1}: [{turn.action.value}] {turn.description}")
         return
 
+    try:
+        _require_live_authorization(
+            cli_authorized=args.authorize_live_effects,
+        )
+    except LiveAuthorizationError as error:
+        parser.error(str(error))
+
+    # Credentials are discovered only after the explicit, process-external
+    # authorization check has passed.
+    load_dotenv()
+
     if args.cleanup:
-        cleanup_test_data()
+        cleanup_test_data(
+            live_authorized=args.authorize_live_effects,
+        )
         return
 
-    runner = MultiTurnTestRunner(wait_seconds=args.wait)
+    runner = MultiTurnTestRunner(
+        wait_seconds=args.wait,
+        live_authorized=args.authorize_live_effects,
+    )
 
     scenario_names = [args.scenario] if args.scenario else None
     report = runner.run(scenario_names=scenario_names, resume=args.resume)

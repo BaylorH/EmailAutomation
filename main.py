@@ -22,12 +22,42 @@ from email_automation.app_config import CLIENT_ID, CLIENT_SECRET, AUTHORITY, SCO
 from email_automation.scheduler_lease import run_with_scheduler_lease
 from email_automation.scheduler_scope import SchedulerScopeError, resolve_scheduler_user_ids
 from email_automation.system_health import record_user_health
+from email_automation.effect_gateway import (
+    EffectGateway,
+    EffectGatewayConfig,
+)
+from email_automation.observability import init_sentry
 
 # Thresholds for auto-cleanup (to stay within Firebase free tier)
 PROCESSED_MESSAGES_THRESHOLD = 500
 SHEET_CHANGELOG_THRESHOLD = 100
 GRAPH_TOKEN_REFRESH_BUFFER_SECONDS = 15 * 60
 PROCESSING_FAILURE_RETRY_DEFAULT_MAX_AGE_HOURS = 6
+
+
+def run_provider_effect_worker(
+    requests,
+    *,
+    receipt_store,
+    provider_adapters,
+    config=None,
+):
+    """Run requests through the one tracked provider-effect worker boundary.
+
+    The worker constructs no production adapter itself. Callers must inject
+    persistence and provider adapters, and omitted configuration is loaded
+    fail-closed from the environment.
+    """
+
+    resolved_config = (
+        config if config is not None else EffectGatewayConfig.from_env()
+    )
+    gateway = EffectGateway(
+        receipt_store,
+        provider_adapters,
+        resolved_config,
+    )
+    return tuple(gateway.execute(request) for request in requests)
 
 
 def _processing_failure_retry_enabled() -> bool:
@@ -489,6 +519,7 @@ def _install_sigterm_atexit_bridge() -> None:
 
 
 if __name__ == "__main__":
+    init_sentry()
     _validate_startup_env()
     _install_sigterm_atexit_bridge()
     run_with_scheduler_lease(run_all_users)

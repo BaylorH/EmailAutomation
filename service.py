@@ -48,8 +48,10 @@ import os
 from flask import Flask, jsonify, request
 
 from main import refresh_and_process_user
+from email_automation.observability import init_sentry
 from email_automation.scheduler_lease import run_with_user_lease
 
+init_sentry()
 app = Flask(__name__)
 
 _AUTH_ENV = "PROCESS_USER_AUTH"
