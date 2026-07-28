@@ -121,6 +121,108 @@ class SchedulerUserListingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "guarded email_automation.email.send_outboxes"):
                 scheduler_runner.send_outboxes("real-user-1", {"Authorization": "Bearer test"})
 
+    def test_every_legacy_raw_graph_helper_is_disabled_before_io_by_default(self):
+        cases = (
+            (
+                scheduler_runner.send_remaining_questions_email,
+                (
+                    "uid-1",
+                    "client-1",
+                    {"Authorization": "Bearer test"},
+                    "broker@example.com",
+                    ["Clear height"],
+                    "<thread@example.com>",
+                    3,
+                    "row-3",
+                ),
+            ),
+            (
+                scheduler_runner.send_closing_email,
+                (
+                    "uid-1",
+                    "client-1",
+                    {"Authorization": "Bearer test"},
+                    "broker@example.com",
+                    "<thread@example.com>",
+                    3,
+                    "row-3",
+                ),
+            ),
+            (
+                scheduler_runner.send_new_property_email,
+                (
+                    "uid-1",
+                    "client-1",
+                    {"Authorization": "Bearer test"},
+                    "broker@example.com",
+                    "123 Test Way",
+                    "Houston",
+                    3,
+                ),
+            ),
+            (
+                scheduler_runner.send_and_index_email,
+                (
+                    "uid-1",
+                    {"Authorization": "Bearer test"},
+                    "Hello",
+                    ["broker@example.com"],
+                    "client-1",
+                    3,
+                ),
+            ),
+            (
+                scheduler_runner.send_weekly_email,
+                (
+                    {"Authorization": "Bearer test"},
+                    ["broker@example.com"],
+                ),
+            ),
+            (
+                scheduler_runner.process_replies,
+                (
+                    {"Authorization": "Bearer test"},
+                    "uid-1",
+                ),
+            ),
+        )
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(
+                "SITESIFT_ENABLE_LEGACY_EMAIL_OPERATIONS",
+                None,
+            )
+            for function, arguments in cases:
+                with self.subTest(function=function.__name__), patch.object(
+                    scheduler_runner,
+                    "requests",
+                ) as graph_requests:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "legacy direct-Graph",
+                    ):
+                        function(*arguments)
+                    graph_requests.get.assert_not_called()
+                    graph_requests.post.assert_not_called()
+                    graph_requests.patch.assert_not_called()
+
+    def test_legacy_scheduler_opt_in_requires_exact_migration_value(self):
+        for value in ("true", " 1", "1 "):
+            with self.subTest(value=repr(value)), patch.dict(
+                os.environ,
+                {"SITESIFT_ENABLE_LEGACY_EMAIL_OPERATIONS": value},
+                clear=False,
+            ), patch.object(scheduler_runner, "requests") as graph_requests:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "legacy direct-Graph",
+                ):
+                    scheduler_runner.send_weekly_email(
+                        {"Authorization": "Bearer test"},
+                        ["broker@example.com"],
+                    )
+                graph_requests.post.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

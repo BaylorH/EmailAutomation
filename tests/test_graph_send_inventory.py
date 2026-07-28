@@ -1,8 +1,12 @@
 import ast
 import json
+import os
 import re
+import subprocess
+import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,12 +28,10 @@ IGNORED_PATH_PARTS = {
     "venv",
 }
 
-RAW_EMAIL_PROVIDER_SEND_PATTERN = re.compile(
-    r"get_provider\(['\"]email['\"]\)"
-    r"|RealEmailProvider\("
-    r"|\.(?:send_draft|send_new_message|reply_to_message)\("
-)
 LEGACY_EMAIL_OPERATIONS_FLAG = "SITESIFT_ENABLE_LEGACY_EMAIL_OPERATIONS"
+LEGACY_FINAL_SEND_PATTERN = re.compile(
+    r"/me/sendMail|/send\b|/reply\b"
+)
 
 
 def _repo_python_files():
@@ -51,6 +53,45 @@ def _workflow_files():
         for path in workflows_dir.glob("*")
         if path.suffix in {".yml", ".yaml"}
     )
+
+
+def _functions_with_legacy_final_send_literals(relative_path: str):
+    tree = ast.parse(
+        (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+    )
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    functions = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Constant, ast.JoinedStr)):
+            continue
+        rendered = ast.unparse(node)
+        if not LEGACY_FINAL_SEND_PATTERN.search(rendered):
+            continue
+        parent = node
+        while parent is not None and not isinstance(
+            parent,
+            (ast.FunctionDef, ast.AsyncFunctionDef),
+        ):
+            parent = parents.get(parent)
+        if parent is not None:
+            functions[parent.name] = parent
+    return tree, functions
+
+
+def _first_executable_statement(function):
+    body = list(function.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    return body[0] if body else None
 
 
 class GraphSendInventoryTests(unittest.TestCase):
@@ -125,8 +166,14 @@ class GraphSendInventoryTests(unittest.TestCase):
                     f"{path} is an active Graph send surface and must use the shared body policy",
                 )
 
-    def test_production_workflows_do_not_enable_legacy_email_operations(self):
-        for rel in _workflow_files():
+    def test_production_configs_do_not_enable_legacy_email_operations(self):
+        production_configs = (
+            *_workflow_files(),
+            Path("deploy/cloudrun-job.yaml"),
+            Path("deploy/cloudrun-service.yaml"),
+            Path("scripts/deploy_process_user.sh"),
+        )
+        for rel in production_configs:
             with self.subTest(path=str(rel)):
                 text = (REPO_ROOT / rel).read_text(errors="ignore")
                 self.assertNotIn(
@@ -135,14 +182,234 @@ class GraphSendInventoryTests(unittest.TestCase):
                     "Production workflows must not opt into legacy direct-Graph send helpers",
                 )
 
+    def test_every_exempt_legacy_raw_final_send_function_has_an_executable_gate(self):
+        expected_functions = {
+            "scheduler_runner.py": {
+                "send_remaining_questions_email",
+                "send_closing_email",
+                "send_new_property_email",
+                "send_and_index_email",
+                "send_weekly_email",
+                "process_replies",
+            },
+            "noPopup_signin_emails_to_excel.py": {
+                "send_weekly_email",
+                "process_replies",
+            },
+        }
+        for relative_path, expected_names in expected_functions.items():
+            _tree, functions = _functions_with_legacy_final_send_literals(
+                relative_path
+            )
+            with self.subTest(path=relative_path):
+                self.assertEqual(set(functions), expected_names)
+            for function_name, function in functions.items():
+                statement = _first_executable_statement(function)
+                with self.subTest(
+                    path=relative_path,
+                    function=function_name,
+                ):
+                    self.assertIsInstance(statement, ast.Expr)
+                    call = statement.value
+                    self.assertIsInstance(call, ast.Call)
+                    self.assertIsInstance(call.func, ast.Name)
+                    self.assertEqual(
+                        call.func.id,
+                        "_require_legacy_email_operations_enabled",
+                    )
+                    self.assertEqual(
+                        [ast.literal_eval(argument) for argument in call.args],
+                        [function_name],
+                    )
+
+    def test_nopopup_default_gate_precedes_side_effectful_imports(self):
+        tree, _functions = _functions_with_legacy_final_send_literals(
+            "noPopup_signin_emails_to_excel.py"
+        )
+        module_gates = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id
+            == "_require_legacy_email_operations_enabled"
+        ]
+        self.assertEqual(len(module_gates), 1)
+        module_gate = module_gates[0]
+        side_effectful_imports = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            and not (
+                isinstance(node, ast.Import)
+                and [alias.name for alias in node.names] == ["os"]
+            )
+        ]
+
+        self.assertEqual(
+            [ast.literal_eval(argument) for argument in module_gate.value.args],
+            ["module_import"],
+        )
+        self.assertTrue(side_effectful_imports)
+        self.assertLess(
+            module_gate.lineno,
+            min(node.lineno for node in side_effectful_imports),
+        )
+
+    def test_nopopup_default_execution_stops_at_the_legacy_gate(self):
+        environment = os.environ.copy()
+        environment.pop(LEGACY_EMAIL_OPERATIONS_FLAG, None)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "noPopup_signin_emails_to_excel.py"),
+            ],
+            cwd=REPO_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LegacyStandaloneEffectsDisabled", result.stderr)
+        self.assertIn("module_import is a legacy direct-Graph helper", result.stderr)
+        self.assertNotIn("FIREBASE_API_KEY is not set", result.stderr)
+
+    def test_nopopup_helpers_recheck_gate_before_requests_io_in_compiled_quarantine(self):
+        source = (
+            REPO_ROOT / "noPopup_signin_emails_to_excel.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        selected_names = {
+            "LegacyStandaloneEffectsDisabled",
+            "_require_legacy_email_operations_enabled",
+            "send_weekly_email",
+            "process_replies",
+        }
+        selected_nodes = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name)
+                and target.id == "LEGACY_EMAIL_OPERATIONS_FLAG"
+                for target in node.targets
+            ):
+                selected_nodes.append(node)
+            elif isinstance(node, (ast.ClassDef, ast.FunctionDef)) and (
+                node.name in selected_names
+            ):
+                selected_nodes.append(node)
+
+        quarantined_module = ast.Module(
+            body=selected_nodes,
+            type_ignores=[],
+        )
+        ast.fix_missing_locations(quarantined_module)
+        namespace = {"os": os}
+        exec(
+            compile(
+                quarantined_module,
+                "noPopup_signin_emails_to_excel.py",
+                "exec",
+            ),
+            namespace,
+        )
+        requests_module = mock.Mock()
+        namespace["requests"] = requests_module
+        namespace["headers"] = {"Authorization": "Bearer test"}
+
+        with mock.patch.dict(
+            os.environ,
+            {LEGACY_EMAIL_OPERATIONS_FLAG: "1"},
+            clear=False,
+        ), mock.patch.object(requests_module, "get") as graph_get, \
+             mock.patch.object(requests_module, "post") as graph_post, \
+             mock.patch.object(requests_module, "patch") as graph_patch:
+            self.assertIsNone(
+                namespace["_require_legacy_email_operations_enabled"](
+                    "controlled_probe"
+                )
+            )
+            graph_get.assert_not_called()
+            graph_post.assert_not_called()
+            graph_patch.assert_not_called()
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(LEGACY_EMAIL_OPERATIONS_FLAG, None)
+            cases = (
+                (namespace["send_weekly_email"], (["broker@example.com"],)),
+                (namespace["process_replies"], ()),
+            )
+            for function, arguments in cases:
+                with self.subTest(function=function.__name__), \
+                     mock.patch.object(requests_module, "get") as graph_get, \
+                     mock.patch.object(requests_module, "post") as graph_post, \
+                     mock.patch.object(requests_module, "patch") as graph_patch:
+                    with self.assertRaises(
+                        namespace["LegacyStandaloneEffectsDisabled"]
+                    ):
+                        function(*arguments)
+                    graph_get.assert_not_called()
+                    graph_post.assert_not_called()
+                    graph_patch.assert_not_called()
+
     def test_production_code_does_not_call_raw_email_provider_senders_directly(self):
         offenders = []
         for rel in _repo_python_files():
             if str(rel) == "email_automation/service_providers.py":
                 continue
-            text = (REPO_ROOT / rel).read_text(errors="ignore")
-            if RAW_EMAIL_PROVIDER_SEND_PATTERN.search(text):
-                offenders.append(str(rel))
+            tree = ast.parse(
+                (REPO_ROOT / rel).read_text(
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+            )
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                function = node.func
+                raw_provider_call = (
+                    isinstance(function, ast.Attribute)
+                    and function.attr
+                    in {
+                        "send_draft",
+                        "send_new_message",
+                        "reply_to_message",
+                    }
+                )
+                raw_provider_constructor = (
+                    (
+                        isinstance(function, ast.Name)
+                        and function.id == "RealEmailProvider"
+                    )
+                    or (
+                        isinstance(function, ast.Attribute)
+                        and function.attr == "RealEmailProvider"
+                    )
+                )
+                raw_provider_lookup = (
+                    (
+                        isinstance(function, ast.Name)
+                        and function.id == "get_provider"
+                    )
+                    or (
+                        isinstance(function, ast.Attribute)
+                        and function.attr == "get_provider"
+                    )
+                ) and bool(node.args) and (
+                    isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "email"
+                )
+                if (
+                    raw_provider_call
+                    or raw_provider_constructor
+                    or raw_provider_lookup
+                ):
+                    offenders.append(
+                        f"{rel}:{node.lineno}:{ast.unparse(node)}"
+                    )
 
         self.assertEqual(
             [],

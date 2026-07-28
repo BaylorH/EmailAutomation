@@ -9,6 +9,7 @@ WORKER_CONFIGS = (
     REPO_ROOT / ".github" / "workflows" / "email-dev-scoped.yml",
     REPO_ROOT / "deploy" / "cloudrun-job.yaml",
     REPO_ROOT / "deploy" / "cloudrun-service.yaml",
+    REPO_ROOT / "scripts" / "deploy_process_user.sh",
 )
 REQUIRED_EXACT_VALUES = {
     "SITESIFT_PROVIDER_EFFECTS_ENABLED": "true",
@@ -37,13 +38,31 @@ def _yaml_environment_value(source: str, name: str) -> str | None:
     return cloud_run_match.group(1) if cloud_run_match else None
 
 
+def _runtime_environment_value(path: Path, source: str, name: str) -> str | None:
+    if path.suffix != ".sh":
+        return _yaml_environment_value(source, name)
+    env_match = re.search(
+        r'^env_vars="([^"]*)"$',
+        source,
+        flags=re.MULTILINE,
+    )
+    if not env_match:
+        return None
+    configured = dict(
+        entry.split("=", 1)
+        for entry in env_match.group(1).split(",")
+        if "=" in entry
+    )
+    return configured.get(name)
+
+
 class EffectGatewayLaunchConfigTests(unittest.TestCase):
     def test_every_worker_runtime_explicitly_authorizes_the_fail_closed_gateway(self):
         for path in WORKER_CONFIGS:
             source = path.read_text(encoding="utf-8")
             with self.subTest(path=str(path.relative_to(REPO_ROOT))):
                 actual = {
-                    name: _yaml_environment_value(source, name)
+                    name: _runtime_environment_value(path, source, name)
                     for name in REQUIRED_EXACT_VALUES
                 }
                 self.assertEqual(actual, REQUIRED_EXACT_VALUES)

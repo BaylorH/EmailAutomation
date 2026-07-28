@@ -83,8 +83,8 @@
       "trigger": "Low-level Microsoft Graph provider methods used by higher-level sending code.",
       "risk": "A provider abstraction can become a bypass if product logic calls it directly without policy checks.",
       "currentControls": [
-        "provider returns Graph identity for auditing",
-        "callers are expected to enforce policy"
+        "provider remains a low-level implementation detail",
+        "repository-wide static test rejects every production caller of send_draft, send_new_message, reply_to_message, get_provider('email'), or RealEmailProvider"
       ],
       "nextGate": "Keep this provider dumb but add an inventory/code-review rule that only approved policy-aware modules call provider send methods."
     },
@@ -95,11 +95,14 @@
       "trigger": "Historical monolithic scheduler and standalone helper functions retained for compatibility/listing only.",
       "risk": "Contains old direct Graph send/reply helpers that would be unsafe if reactivated.",
       "currentControls": [
+        "every raw Graph final-send helper raises before I/O unless exact SITESIFT_ENABLE_LEGACY_EMAIL_OPERATIONS=1 is set for a controlled migration test",
+        "the script entrypoint is guarded by the same default-off flag",
+        "production workflows and deploy configs are tested not to set the legacy flag",
         "legacy send_outboxes raises RuntimeError",
         "send_email raises NotImplementedError",
         "active main.py imports email_automation.email.send_outboxes"
       ],
-      "nextGate": "Delete or quarantine direct legacy Graph send helpers after proving no production workflow imports them."
+      "nextGate": "Delete or quarantine direct legacy Graph send helpers; never enable the migration flag in production."
     },
     {
       "path": "noPopup_signin_emails_to_excel.py",
@@ -108,10 +111,13 @@
       "trigger": "Standalone historical script for sign-in/email-to-Excel flow.",
       "risk": "Not part of the production scheduler, but direct Graph send/reply calls should not be confused with approved SiteSift send paths.",
       "currentControls": [
+        "module import fails before firebase helpers, token acquisition, or other side effects unless exact SITESIFT_ENABLE_LEGACY_EMAIL_OPERATIONS=1 is set for a controlled migration test",
+        "each raw final-send helper repeats the executable runtime gate",
+        "production workflows and deploy configs are tested not to set the legacy flag",
         "not imported by main.py",
         "not part of GitHub Actions scheduler"
       ],
-      "nextGate": "Move to an archived scripts folder or add a runtime guard before any future cleanup broadens scheduler entrypoints."
+      "nextGate": "Move to an archived scripts folder; never enable the migration flag in production."
     }
   ]
 }

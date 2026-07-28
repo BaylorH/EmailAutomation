@@ -43,7 +43,10 @@ RELEASE_REVISION = "process-user-release-a-abc123"
 
 ENV_VARS = (
     "FIREBASE_BUCKET=email-automation-cache.firebasestorage.app,"
-    "ENFORCE_OPENAI_BUDGET=1,USAGE_MONTHLY_BUDGET_USD=100"
+    "ENFORCE_OPENAI_BUDGET=1,USAGE_MONTHLY_BUDGET_USD=100,"
+    "SITESIFT_PROVIDER_EFFECTS_ENABLED=true,SITESIFT_OUTBOUND_MODE=live,"
+    "SITESIFT_EFFECT_MAX_ATTEMPTS=3,SITESIFT_EFFECT_MAX_PER_RUN=100,"
+    "SITESIFT_EFFECT_MAX_PER_USER=50,SITESIFT_EFFECT_MAX_PER_PROVIDER=100"
 )
 SECRETS = (
     "AZURE_API_APP_ID=AZURE_API_APP_ID:latest,"
@@ -321,6 +324,37 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertEqual(
             self._gcloud_calls(),
             [*self._preflight_calls(), self._build_call(), self._digest_call(), self._deploy_call()],
+        )
+
+    def test_apply_sets_exact_provider_effect_authority_and_caps(self):
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        deploy = self._gcloud_calls()[-1]
+        env_vars = deploy[deploy.index("--set-env-vars") + 1]
+        configured = dict(
+            entry.split("=", 1)
+            for entry in env_vars.split(",")
+        )
+        self.assertEqual(
+            {
+                name: configured.get(name)
+                for name in (
+                    "SITESIFT_PROVIDER_EFFECTS_ENABLED",
+                    "SITESIFT_OUTBOUND_MODE",
+                    "SITESIFT_EFFECT_MAX_ATTEMPTS",
+                    "SITESIFT_EFFECT_MAX_PER_RUN",
+                    "SITESIFT_EFFECT_MAX_PER_USER",
+                    "SITESIFT_EFFECT_MAX_PER_PROVIDER",
+                )
+            },
+            {
+                "SITESIFT_PROVIDER_EFFECTS_ENABLED": "true",
+                "SITESIFT_OUTBOUND_MODE": "live",
+                "SITESIFT_EFFECT_MAX_ATTEMPTS": "3",
+                "SITESIFT_EFFECT_MAX_PER_RUN": "100",
+                "SITESIFT_EFFECT_MAX_PER_USER": "50",
+                "SITESIFT_EFFECT_MAX_PER_PROVIDER": "100",
+            },
         )
 
     def test_deploy_omits_service_wide_scaling_flags(self):

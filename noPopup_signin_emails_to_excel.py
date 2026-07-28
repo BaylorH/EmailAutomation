@@ -1,4 +1,24 @@
 import os
+
+LEGACY_EMAIL_OPERATIONS_FLAG = "SITESIFT_ENABLE_LEGACY_EMAIL_OPERATIONS"
+
+
+class LegacyStandaloneEffectsDisabled(RuntimeError):
+    """Raised before the historical standalone script can perform any effects."""
+
+
+def _require_legacy_email_operations_enabled(function_name: str) -> None:
+    if os.environ.get(LEGACY_EMAIL_OPERATIONS_FLAG) == "1":
+        return
+    raise LegacyStandaloneEffectsDisabled(
+        f"{function_name} is a legacy direct-Graph helper and is disabled by "
+        f"default. Set {LEGACY_EMAIL_OPERATIONS_FLAG}=1 only for a controlled "
+        "migration test."
+    )
+
+
+_require_legacy_email_operations_enabled("module_import")
+
 import json
 import atexit
 import requests
@@ -8,22 +28,16 @@ from msal import PublicClientApplication, SerializableTokenCache
 
 from firebase_helpers import download_token, upload_token, upload_excel
 
-FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
-
-if not FIREBASE_API_KEY:
-    raise RuntimeError("FIREBASE_API_KEY is not set in the environment.")
-
-download_token(FIREBASE_API_KEY)
-
 # ─── Configuration ──────────────────────────────────────
-CLIENT_ID      = os.getenv("CLIENT_ID")
-if not CLIENT_ID:
-    raise RuntimeError("Set CLIENT_ID in the environment")
-
 AUTHORITY      = "https://login.microsoftonline.com/common"
 SCOPES         = ["Mail.Send", "Mail.ReadWrite"]  # 'offline_access' is reserved and added automatically
 TOKEN_CACHE    = "msal_token_cache.bin"
 EXCEL_FILE     = "responses.xlsx"
+FIREBASE_API_KEY = None
+CLIENT_ID = None
+cache = None
+app = None
+headers = {}
 
 SUBJECT        = "Weekly Questions"
 BODY           = (
@@ -34,45 +48,57 @@ BODY           = (
 )
 THANK_YOU_BODY = "Thanks for your response."
 
-# ─── Persistent MSAL token cache ─────────────────────────
-cache = SerializableTokenCache()
-
-with open("msal_token_cache.bin", "r") as f:
-    cache.deserialize(f.read())
-    
 def _save_cache():
-    if cache.has_state_changed:
+    if cache is not None and cache.has_state_changed:
         with open("msal_token_cache.bin", "w") as f:
             f.write(cache.serialize())
         upload_token(FIREBASE_API_KEY, input_file="msal_token_cache.bin", user_id="default_user")
-        
-atexit.register(_save_cache)
 
-app = PublicClientApplication(
-    CLIENT_ID,
-    authority=AUTHORITY,
-    token_cache=cache
-)
 
-# ─── Acquire token silently or interactively ──────────────
-accounts = app.get_accounts()
-result   = None
-if accounts:
-    result = app.acquire_token_silent(SCOPES, account=accounts[0])
-if not result:
-    result = app.acquire_token_interactive(SCOPES)
+def _bootstrap_runtime():
+    """Perform the historical token/bootstrap effects only from guarded main."""
 
-access_token = result.get("access_token")
-if not access_token:
-    raise RuntimeError(f"Token acquisition failed: {json.dumps(result, indent=2)}")
+    _require_legacy_email_operations_enabled("bootstrap_runtime")
+    global FIREBASE_API_KEY, CLIENT_ID, cache, app, headers
 
-headers = {
-    "Authorization": f"Bearer {access_token}",
-    "Content-Type":  "application/json"
-}
+    FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
+    if not FIREBASE_API_KEY:
+        raise RuntimeError("FIREBASE_API_KEY is not set in the environment.")
+    CLIENT_ID = os.getenv("CLIENT_ID")
+    if not CLIENT_ID:
+        raise RuntimeError("Set CLIENT_ID in the environment")
+
+    download_token(FIREBASE_API_KEY)
+    cache = SerializableTokenCache()
+    with open(TOKEN_CACHE, "r") as cache_file:
+        cache.deserialize(cache_file.read())
+    atexit.register(_save_cache)
+
+    app = PublicClientApplication(
+        CLIENT_ID,
+        authority=AUTHORITY,
+        token_cache=cache,
+    )
+    accounts = app.get_accounts()
+    result = None
+    if accounts:
+        result = app.acquire_token_silent(SCOPES, account=accounts[0])
+    if not result:
+        result = app.acquire_token_interactive(SCOPES)
+
+    access_token = result.get("access_token")
+    if not access_token:
+        raise RuntimeError(
+            f"Token acquisition failed: {json.dumps(result, indent=2)}"
+        )
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
 
 # ─── Send weekly question email ───────────────────────────
 def send_weekly_email(to_addresses):
+    _require_legacy_email_operations_enabled("send_weekly_email")
     for addr in to_addresses:
         payload = {
             "message": {
@@ -92,6 +118,7 @@ def send_weekly_email(to_addresses):
 
 # ─── Thank repliers and log replies to Excel ──────────────
 def process_replies():
+    _require_legacy_email_operations_enabled("process_replies")
     # Fetch unread replies - try multiple filter approaches
     url = "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
     
@@ -198,6 +225,7 @@ def debug_api():
         print(f"Response: {e.response.text if e.response else 'No response'}")
 
 if __name__ == "__main__":
+    _bootstrap_runtime()
     # Replace or extend this list as needed
     recipients = ["bp21harrison@gmail.com"]
 

@@ -29,6 +29,21 @@ FIREBASE_BUCKET   = "email-automation-cache.firebasestorage.app"
 AUTHORITY         = "https://login.microsoftonline.com/common"
 SCOPES            = ["Mail.ReadWrite", "Mail.Send"]
 TOKEN_CACHE       = "msal_token_cache.bin"
+LEGACY_EMAIL_OPERATIONS_FLAG = "SITESIFT_ENABLE_LEGACY_EMAIL_OPERATIONS"
+
+
+class LegacySchedulerEffectsDisabled(RuntimeError):
+    """Raised when historical scheduler Graph effects are not explicitly enabled."""
+
+
+def _require_legacy_email_operations_enabled(function_name: str) -> None:
+    if os.environ.get(LEGACY_EMAIL_OPERATIONS_FLAG) == "1":
+        return
+    raise LegacySchedulerEffectsDisabled(
+        f"{function_name} is a legacy direct-Graph helper and is disabled by "
+        f"default. Use guarded email_automation modules or set "
+        f"{LEGACY_EMAIL_OPERATIONS_FLAG}=1 only for a controlled migration test."
+    )
 
 # OpenAI config
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -862,6 +877,9 @@ def send_remaining_questions_email(uid: str, client_id: str, headers: dict, reci
     Send a remaining questions email in the same thread (idempotent).
     Returns True if sent, False if skipped (duplicate).
     """
+    _require_legacy_email_operations_enabled(
+        "send_remaining_questions_email"
+    )
     try:
         # Create content hash for idempotency
         content_key = f"missing:{','.join(sorted(missing_fields))}"
@@ -946,6 +964,7 @@ Thanks!"""
 def send_closing_email(uid: str, client_id: str, headers: dict, recipient: str, 
                       thread_id: str, row_number: int, row_anchor: str) -> bool:
     """Send polite closing email when all required fields are complete."""
+    _require_legacy_email_operations_enabled("send_closing_email")
     try:
         body = """Hi,
 
@@ -997,6 +1016,7 @@ def send_new_property_email(uid: str, client_id: str, headers: dict, recipient: 
     Send a new thread email for a new property suggestion.
     Returns the new thread ID if successful.
     """
+    _require_legacy_email_operations_enabled("send_new_property_email")
     try:
         subject = f"{address}, {city}" if city else address
         
@@ -2381,6 +2401,7 @@ def _subject_for_recipient(uid: str, client_id: str, recipient_email: str) -> Op
 def send_and_index_email(user_id: str, headers: Dict[str, str], script: str, recipients: List[str], 
                         client_id_or_none: Optional[str] = None, row_number: int = None):
     """Send email and immediately index it in Firestore for reply tracking."""
+    _require_legacy_email_operations_enabled("send_and_index_email")
     if not recipients:
         return {"sent": [], "errors": {"_all": "No recipients"}}
 
@@ -3385,6 +3406,7 @@ def decode_token_payload(token):
 
 # --- Email Functions ---
 def send_weekly_email(headers, to_addresses):
+    _require_legacy_email_operations_enabled("send_weekly_email")
     for addr in to_addresses:
         payload = {
             "message": {
@@ -3399,6 +3421,7 @@ def send_weekly_email(headers, to_addresses):
         print(f"✅ Sent '{SUBJECT}' to {addr}")
 
 def process_replies(headers, user_id):
+    _require_legacy_email_operations_enabled("process_replies")
     url = "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
     params = {
         '$filter': f"isRead eq false and startswith(subject,'Re: {SUBJECT}')",
@@ -3508,6 +3531,7 @@ def refresh_and_process_user(user_id: str):
 
 # --- Entry ---
 if __name__ == "__main__":
+    _require_legacy_email_operations_enabled("scheduler_runner.__main__")
     all_users = list_user_ids()
     print(f"📦 Found {len(all_users)} token cache users: {all_users}")
 

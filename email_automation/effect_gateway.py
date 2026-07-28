@@ -53,12 +53,15 @@ class AuthorityState(str, Enum):
 
 
 def _positive_env_int(name: str) -> int:
-    raw = os.getenv(name, "").strip()
-    try:
-        parsed = int(raw)
-    except (TypeError, ValueError):
+    raw = os.getenv(name, "")
+    if (
+        not raw
+        or not raw.isascii()
+        or not raw.isdecimal()
+        or raw.startswith("0")
+    ):
         return 0
-    return parsed if parsed > 0 else 0
+    return int(raw)
 
 
 def _require_text(label: str, value: Any) -> str:

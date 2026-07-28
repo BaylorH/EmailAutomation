@@ -534,6 +534,73 @@ class EffectGatewayGateTests(unittest.TestCase):
         self.assertEqual(receipt.state, ReceiptState.SUCCEEDED)
         self.assertEqual(len(provider.calls), 1)
 
+    def test_every_padded_cap_fails_closed_before_provider_execution(self):
+        canonical_environment = {
+            **self._CAP_ENVIRONMENT,
+            "SITESIFT_PROVIDER_EFFECTS_ENABLED": "true",
+            "SITESIFT_OUTBOUND_MODE": "live",
+        }
+        for name, canonical_value in self._CAP_ENVIRONMENT.items():
+            for padded_value in (
+                f" {canonical_value}",
+                f"{canonical_value} ",
+            ):
+                with self.subTest(name=name, value=repr(padded_value)):
+                    environment = {
+                        **canonical_environment,
+                        name: padded_value,
+                    }
+                    with mock.patch.dict(
+                        os.environ,
+                        environment,
+                        clear=True,
+                    ):
+                        config = EffectGatewayConfig.from_env()
+                    store = InMemoryReceiptStore()
+                    provider = InMemoryProvider()
+
+                    receipt = EffectGateway(
+                        store,
+                        {"graph": provider},
+                        config,
+                    ).execute(request())
+
+                    self.assertFalse(config.limits.valid)
+                    self.assertEqual(receipt.state, ReceiptState.BLOCKED)
+                    self.assertEqual(
+                        receipt.reason,
+                        "invalid_or_missing_caps",
+                    )
+                    self.assertEqual(provider.calls, [])
+
+    def test_noncanonical_positive_decimal_caps_fail_closed(self):
+        canonical_environment = {
+            **self._CAP_ENVIRONMENT,
+            "SITESIFT_PROVIDER_EFFECTS_ENABLED": "true",
+            "SITESIFT_OUTBOUND_MODE": "live",
+        }
+        for noncanonical_value in ("+3", "03"):
+            with self.subTest(value=noncanonical_value):
+                environment = {
+                    **canonical_environment,
+                    "SITESIFT_EFFECT_MAX_ATTEMPTS": noncanonical_value,
+                }
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    config = EffectGatewayConfig.from_env()
+                store = InMemoryReceiptStore()
+                provider = InMemoryProvider()
+
+                receipt = EffectGateway(
+                    store,
+                    {"graph": provider},
+                    config,
+                ).execute(request())
+
+                self.assertFalse(config.limits.valid)
+                self.assertEqual(receipt.state, ReceiptState.BLOCKED)
+                self.assertEqual(receipt.reason, "invalid_or_missing_caps")
+                self.assertEqual(provider.calls, [])
+
     def test_global_kill_blocks_an_explicitly_enabled_gateway(self):
         store = InMemoryReceiptStore()
         provider = InMemoryProvider()
