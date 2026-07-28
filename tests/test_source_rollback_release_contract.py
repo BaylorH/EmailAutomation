@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -36,10 +37,18 @@ def _run(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    subprocess_env = os.environ.copy() if env is None else env.copy()
+    subprocess_env["PYTHON_BIN"] = sys.executable
+    interpreter_bin = str(Path(sys.executable).resolve().parent)
+    subprocess_env["PATH"] = (
+        interpreter_bin
+        + os.pathsep
+        + subprocess_env.get("PATH", "")
+    )
     return subprocess.run(
         command,
         cwd=cwd,
-        env=env,
+        env=subprocess_env,
         text=True,
         capture_output=True,
         check=False,
