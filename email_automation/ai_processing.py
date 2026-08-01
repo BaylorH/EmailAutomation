@@ -1930,10 +1930,12 @@ def _source_mentions_target_property(source_text: str, target_anchor: str) -> bo
 _NUMERIC_PROPERTY_VALUE_RE = re.compile(r"\$?\s*\d")
 _PROPERTY_CLAUSE_BREAK_RE = re.compile(r"(?<!\d)[.!?;](?!\d)|\n+")
 _MARKDOWN_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
-_DOCUMENT_CAPTION_NUMBER_RE = re.compile(
+_DOCUMENT_CAPTION_RE = re.compile(
     r"^\s*(?:table|figure|page|section|schedule|exhibit|version|revision)\s+"
-    r"(?:#\s*)?\d+(?:\.\d+)*(?:[a-z])?\s*"
-    r"(?::|[-–—]|\(|\bof\b|$|\.(?=\s))",
+    r"(?:#\s*)?"
+    r"(?:\d+(?:[.-]\d+)*(?:-?[a-z])?|[a-z](?:[-.]\d+)+|[a-z]\d+|"
+    r"[ivxlcdm]+|[a-z])"
+    r"(?=$|\s|[:(–—-]|\.(?=\s))(?P<suffix>.*)$",
     re.IGNORECASE,
 )
 _UNBOUND_IDENTITY_PREFIX_RE = re.compile(
@@ -1951,6 +1953,7 @@ _UNBOUND_IDENTITY_POSTFIX_RE = re.compile(
 )
 _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS = {
     "available space", "building", "building size", "ceiling",
+    "building facts", "building overview", "building summary",
     "ceiling clearance", "ceiling height", "ceiling ht", "clearance",
     "clear height", "clear ht", "dock", "dock doors", "docks",
     "drive in", "drive in doors", "drive ins", "electrical service",
@@ -1961,7 +1964,9 @@ _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS = {
     "warehouse area", "warehouse size",
     "building details", "building highlights", "building specifications",
     "details", "features", "highlights", "key features", "property details",
-    "property features", "property highlights", "property specifications",
+    "loading details", "property facts", "property features",
+    "property highlights", "property overview", "property specifications",
+    "property summary",
     "specifications",
 }
 _PROPERTY_NAME_SUFFIX_LABEL_TOKENS = {
@@ -2168,9 +2173,26 @@ def _property_table_clause_spans(text: str) -> List[tuple]:
     ]
 
 
-def _is_numbered_document_caption(text: str) -> bool:
-    """Distinguish structural caption numbers from property fact values."""
-    return bool(_DOCUMENT_CAPTION_NUMBER_RE.match(text or ""))
+def _document_caption_verdict(text: str) -> Optional[str]:
+    """Classify a numbered caption by its residual title, when present."""
+    caption = _DOCUMENT_CAPTION_RE.match(text or "")
+    if not caption:
+        return None
+    suffix = caption.group("suffix").strip()
+    if not suffix or re.fullmatch(
+        r"(?:of|/)\s*[a-z0-9]+(?:[-.][a-z0-9]+)*",
+        suffix,
+        re.IGNORECASE,
+    ):
+        return "structural"
+
+    parenthesized = suffix.startswith("(")
+    title = re.sub(r"^(?::|[-–—]|\.(?=\s)|\()\s*", "", suffix).strip()
+    if parenthesized and title.endswith(")"):
+        title = title[:-1].rstrip()
+    if not title or _is_property_fact_or_section_label(title):
+        return "structural"
+    return "competing"
 
 
 def _aligned_property_table_cells(text: str) -> List[tuple]:
@@ -2423,10 +2445,14 @@ def _unbound_identity_fact_spans(
 
     for clause_start, clause_end in clause_spans:
         clause = text[clause_start:clause_end]
+        caption_verdict = _document_caption_verdict(clause)
         if (
             _source_mentions_target_property(clause, target_anchor)
-            or _is_numbered_document_caption(clause)
+            or caption_verdict == "structural"
         ):
+            continue
+        if caption_verdict == "competing":
+            unbound_spans.append((clause_start, clause_end))
             continue
         identity = _UNBOUND_IDENTITY_PREFIX_RE.search(clause)
         if (
@@ -2455,10 +2481,14 @@ def _unbound_identity_fact_spans(
     for segment in re.finditer(r"(?:^|[.!?;\n])(?P<body>[^.!?;\n]+)", text):
         segment_start, segment_end = segment.span("body")
         segment_text = segment.group("body")
+        caption_verdict = _document_caption_verdict(segment_text)
         if (
             _source_mentions_target_property(segment_text, target_anchor)
-            or _is_numbered_document_caption(segment_text)
+            or caption_verdict == "structural"
         ):
+            continue
+        if caption_verdict == "competing":
+            unbound_spans.append((segment_start, segment_end))
             continue
         identity = _UNBOUND_IDENTITY_PREFIX_RE.search(segment_text)
         if (

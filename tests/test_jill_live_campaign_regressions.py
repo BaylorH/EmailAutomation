@@ -1397,6 +1397,10 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "Exhibit 6: Building Facts",
             "Version 7: Building Facts",
             "Revision 8 - Building Facts",
+            "Table IV: Property Summary",
+            "Figure A-1 — Building Facts",
+            "Exhibit B.2 (Property Summary)",
+            "Schedule 1-A: Property Summary",
             "Table: Building Facts",
         )
         expected_updates = [
@@ -1447,14 +1451,14 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         power = {"column": "Power", "value": "1200A 480V 3-phase"}
         cases = (
             (
-                "Figure 10: Markdown Facts",
+                "Figure 10: Building Facts",
                 "| Docks | Power |\n"
                 "| :--- | ---: |\n"
                 "| 6 | 1200A 480V 3-phase |\n"
                 "| 100 Main St | Oak Center |",
             ),
             (
-                "Section 11: CSV Facts",
+                "Section 11: Property Summary",
                 "Docks, Power\n"
                 "6, 1200A 480V 3-phase\n"
                 "100 Main St, Oak Center",
@@ -1490,6 +1494,15 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "Oak Center 1",
             "Oak Center 1: Building Facts",
             "Table Center 1: Building Facts",
+            "Table 1: Oak Center",
+            "Figure IV — Westgate Logistics Hub",
+            "Page A-1: Oak Center",
+            "Section 4.2: Oak Center",
+            "Schedule B.2 (Oak Center)",
+            "Schedule 1-A: Oak Center",
+            "Exhibit C-3: Westgate Logistics Hub",
+            "Version II: Oak Center",
+            "Revision 7A - Oak Center",
         )
 
         for heading in headings:
