@@ -1,8 +1,9 @@
 import json
 import unittest
 from dataclasses import FrozenInstanceError
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 
 from email_automation.campaign_capabilities import (
     CampaignCapabilitiesResolution,
@@ -110,6 +111,32 @@ class _FakeFirestore:
 class _NoReadFirestore:
     def collection(self, _name):
         raise AssertionError("database access must not occur for an invalid UID")
+
+
+class _BrokenTzinfoDatetime(datetime):
+    @property
+    def tzinfo(self):
+        raise RuntimeError("synthetic tzinfo failure")
+
+
+class _BrokenOffsetDatetime(datetime):
+    def utcoffset(self):
+        raise RuntimeError("synthetic UTC offset failure")
+
+
+class _HostileDict(dict):
+    def get(self, _key, _default=None):
+        raise RuntimeError("synthetic mapping getter failure")
+
+
+class _HostileString(str):
+    def strip(self, _chars=None):
+        raise RuntimeError("synthetic string normalization failure")
+
+
+class _HostileEquality:
+    def __eq__(self, _other):
+        raise RuntimeError("synthetic equality failure")
 
 
 class CampaignCapabilitiesTests(unittest.TestCase):
@@ -239,6 +266,104 @@ class CampaignCapabilitiesTests(unittest.TestCase):
             decisions=None,
         )
         self.assertFalse(capability_allowed(malformed, "start"))
+
+    def test_resolution_decision_mapping_and_values_are_deeply_immutable(self):
+        resolution = resolve_fixture(fixture("combination-111"))
+
+        self.assertIs(type(resolution.decisions), type(MappingProxyType({})))
+        with self.assertRaises(TypeError):
+            resolution.decisions["start"] = CapabilityDecision(
+                False, "capability_disabled"
+            )
+        with self.assertRaises(TypeError):
+            del resolution.decisions["start"]
+        with self.assertRaises(FrozenInstanceError):
+            resolution.decisions = {}
+        with self.assertRaises(FrozenInstanceError):
+            resolution.decisions["start"].allowed = False
+        self.assertTrue(resolution.decisions["start"].allowed)
+
+    def test_capability_allowed_rejects_manually_constructed_resolutions(self):
+        produced = resolve_fixture(fixture("combination-100"))
+        forged = CampaignCapabilitiesResolution(
+            source_path=produced.source_path,
+            schema_version=produced.schema_version,
+            revision=produced.revision,
+            decisions=MappingProxyType(
+                {
+                    "start": CapabilityDecision(True, "allowed"),
+                    "initialDispatch": CapabilityDecision(
+                        False, "capability_disabled"
+                    ),
+                    "inboundAutomation": CapabilityDecision(
+                        False, "capability_disabled"
+                    ),
+                }
+            ),
+        )
+
+        self.assertTrue(capability_allowed(produced, "start"))
+        self.assertFalse(capability_allowed(forged, "start"))
+        self.assertFalse(capability_allowed(produced, _HostileString("start")))
+        self.assertFalse(capability_allowed(produced, _HostileEquality()))
+
+    def test_oversized_revision_denies_without_raising(self):
+        candidate = fixture("combination-111")
+        test_input = materialize(candidate["input"])
+        test_input["data"]["revision"] = 10**10000
+
+        resolution = resolve_campaign_capabilities(
+            uid=test_input["uid"],
+            document_id=test_input["documentId"],
+            data=test_input["data"],
+        )
+
+        self.assertIsNone(resolution.revision)
+        for decision in resolution.decisions.values():
+            self.assertFalse(decision.allowed)
+            self.assertEqual("capability_revision_invalid", decision.reason_code)
+
+    def test_pathological_datetime_values_deny_without_raising(self):
+        candidate = fixture("combination-111")
+        test_input = materialize(candidate["input"])
+
+        for timestamp in (
+            _BrokenTzinfoDatetime(2026, 7, 31),
+            _BrokenOffsetDatetime(2026, 7, 31, tzinfo=timezone.utc),
+        ):
+            with self.subTest(timestamp_type=type(timestamp).__name__):
+                data = {**test_input["data"], "updatedAt": timestamp}
+                resolution = resolve_campaign_capabilities(
+                    uid=test_input["uid"],
+                    document_id=test_input["documentId"],
+                    data=data,
+                )
+                for decision in resolution.decisions.values():
+                    self.assertFalse(decision.allowed)
+                    self.assertEqual("capability_audit_invalid", decision.reason_code)
+
+    def test_pathological_mapping_and_uid_subclasses_deny_without_raising(self):
+        candidate = fixture("combination-111")
+        test_input = materialize(candidate["input"])
+
+        malformed_document = resolve_campaign_capabilities(
+            uid=test_input["uid"],
+            document_id=test_input["documentId"],
+            data=_HostileDict(test_input["data"]),
+        )
+        malformed_uid = resolve_campaign_capabilities(
+            uid=_HostileString(test_input["uid"]),
+            document_id=test_input["documentId"],
+            data=test_input["data"],
+        )
+
+        self.assertEqual(
+            "capability_document_malformed",
+            malformed_document.decisions["start"].reason_code,
+        )
+        self.assertEqual(
+            "capability_uid_invalid", malformed_uid.decisions["start"].reason_code
+        )
 
 
 if __name__ == "__main__":
