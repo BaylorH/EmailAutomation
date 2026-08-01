@@ -608,6 +608,8 @@ class JillJuneRegressionTests(unittest.TestCase):
             "The outparcel is under contract.",
             "That tour slot is no longer available.",
             "The 2:00 tour slot has been leased.",
+            "At 100 Main St, the trailer lot is leased separately.",
+            "100 Main St's parking lot has been leased to another tenant.",
         ):
             with self.subTest(message_text=message_text):
                 self.assertFalse(

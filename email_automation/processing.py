@@ -2073,9 +2073,6 @@ def _terminal_binding_clauses(message_text: str) -> List[str]:
             r"(?<=[.!?])\s+|\n+|\s*;\s*|"
             r",\s*(?:but|while|whereas)\s+|"
             r"\s+(?:but|while|whereas)\s+|"
-            r",?\s+and\s+(?="
-            r"(?:the\s+)?(?:property|building|space)\s+(?:at\s+)?\d{1,6}\b|"
-            r"\d{1,6}\s+[a-z])|"
             r",\s*and\s+(?=(?:i|we|here|attached|included|please)\b)|"
             r"\s+and\s+(?=(?:i|we|here|attached|included|please)\b)",
             message_text or "",
@@ -2206,6 +2203,33 @@ def _clause_has_ancillary_terminal_evidence(clause: str) -> bool:
     return any(re.search(pattern, text, re.IGNORECASE) for _reason, pattern in _UNAVAILABLE_PATTERNS)
 
 
+def _clause_has_target_terminal_after_ancillary(
+    clause: str,
+    row_anchor: str,
+) -> bool:
+    """Keep a later explicit target terminal from being masked by an ancillary one."""
+    target_bindings = [
+        (start, end)
+        for start, end, kind in _explicit_property_bindings(clause, row_anchor)
+        if kind == "target"
+    ]
+    ancillary_spans = [match.span() for match in _ANCILLARY_SUBJECT_RE.finditer(clause or "")]
+    for _reason, pattern in _UNAVAILABLE_PATTERNS:
+        for terminal in re.finditer(pattern, clause or "", re.IGNORECASE):
+            pre = (clause or "")[max(0, terminal.start() - 14):terminal.start()]
+            if re.search(r"\b(?:not|isn'?t|aren'?t|no)\s*$", pre, re.IGNORECASE):
+                continue
+            for _target_start, target_end in target_bindings:
+                if target_end > terminal.start():
+                    continue
+                if not any(
+                    target_end <= ancillary_start < terminal.start()
+                    for ancillary_start, _ancillary_end in ancillary_spans
+                ):
+                    return True
+    return False
+
+
 def _message_explicitly_keeps_row_viable(message_text: str, row_anchor: str) -> bool:
     last_explicit_binding = None
     for sentence in _terminal_binding_clauses(message_text):
@@ -2281,9 +2305,15 @@ def _property_unavailable_event_applies_to_row(
     last_explicit_binding = None
     for clause in _terminal_binding_clauses(message_text):
         explicit_bindings = _explicit_property_bindings(clause, row_anchor)
-        if _clause_has_ancillary_terminal_evidence(clause):
+        ancillary_terminal = _clause_has_ancillary_terminal_evidence(clause)
+        if ancillary_terminal:
             ancillary_terminal_seen = True
-        if _clause_has_terminal_property_evidence(clause, keywords):
+        if (
+            ancillary_terminal
+            and _clause_has_target_terminal_after_ancillary(clause, row_anchor)
+        ):
+            terminal_bindings.append("target")
+        elif _clause_has_terminal_property_evidence(clause, keywords):
             if _source_mentions_target_property(clause, row_anchor):
                 terminal_bindings.append("target")
             elif _clause_names_competing_property(clause, row_anchor):
