@@ -1929,6 +1929,7 @@ def _source_mentions_target_property(source_text: str, target_anchor: str) -> bo
 
 _NUMERIC_PROPERTY_VALUE_RE = re.compile(r"\$?\s*\d")
 _PROPERTY_CLAUSE_BREAK_RE = re.compile(r"(?<!\d)[.!?;](?!\d)|\n+")
+_MARKDOWN_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
 _UNBOUND_IDENTITY_PREFIX_RE = re.compile(
     r"^\s*(?P<label>[a-z][a-z0-9&'’/-]*"
     r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})"
@@ -2145,9 +2146,25 @@ def _property_clause_spans(text: str) -> List[tuple]:
     return spans
 
 
+def _property_table_clause_spans(text: str) -> List[tuple]:
+    """Return logical table rows without Markdown alignment separators."""
+    spans = _property_clause_spans(text)
+    return [
+        span for span in spans
+        if not (
+            "|" in text[span[0]:span[1]]
+            and (cells := _property_table_cells(text[span[0]:span[1]]))
+            and all(
+                _MARKDOWN_TABLE_SEPARATOR_CELL_RE.fullmatch(cell)
+                for cell in cells
+            )
+        )
+    ]
+
+
 def _aligned_property_table_cells(text: str) -> List[tuple]:
     """Return aligned label/value/identity cells from three-row tables."""
-    clause_spans = _property_clause_spans(text)
+    clause_spans = _property_table_clause_spans(text)
     aligned = []
     for label_span, value_span, identity_span in zip(
         clause_spans,
@@ -2253,7 +2270,7 @@ def _property_table_shape_spans(
     target_anchor: str,
 ) -> tuple:
     """Return structured label rows and malformed table spans."""
-    clause_spans = _property_clause_spans(text)
+    clause_spans = _property_table_clause_spans(text)
     structured_labels = set()
     malformed_spans = []
     table_prefixes = {}

@@ -1271,6 +1271,122 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 self.assertEqual([], result["events"])
                 self.assertEqual("Thanks.", result["response_email"])
 
+    def test_markdown_separator_rows_keep_property_cells_aligned(self):
+        docks = {"column": "Docks", "value": "6"}
+        power = {"column": "Power", "value": "1200A 480V 3-phase"}
+        drive_ins = {"column": "Drive Ins", "value": "2"}
+        cases = (
+            (
+                "bordered separator",
+                "| Docks | Power |\n"
+                "| --- | --- |\n"
+                "| 6 | 1200A 480V 3-phase |\n"
+                "| 100 Main St | Oak Center |",
+                [docks, power],
+                [docks],
+                True,
+            ),
+            (
+                "unbordered aligned separator",
+                "Power | Docks\n"
+                ":--- | ---:\n"
+                "1200A 480V 3-phase | 6\n"
+                "Oak Center | 100 Main St",
+                [power, docks],
+                [docks],
+                True,
+            ),
+            (
+                "centered separator with whitespace",
+                "  |  Docks  |  Power  |  \n"
+                "  |  :---:  |  ---:  |  \n"
+                "  |  6  |  1200A 480V 3-phase  |  \n"
+                "  |  100 Main St, Phoenix  |  Oak Center  |  ",
+                [docks, power],
+                [docks],
+                True,
+            ),
+            (
+                "separator has an extra cell",
+                "| Docks | Power |\n"
+                "| --- | --- | --- |\n"
+                "| 6 | 1200A 480V 3-phase |\n"
+                "| 100 Main St | Oak Center |",
+                [docks, power],
+                [docks],
+                True,
+            ),
+            (
+                "separator before malformed short identity row",
+                "| Docks | Power | Drive Ins |\n"
+                "| --- | --- |\n"
+                "| 6 | 1200A 480V 3-phase | 2 |\n"
+                "| 100 Main St | Oak Center |",
+                [docks, power, drive_ins],
+                [],
+                True,
+            ),
+            (
+                "separator before malformed value row",
+                "| Docks | Power | Drive Ins |\n"
+                "| :--- | :---: | ---: |\n"
+                "| 6 | 2 |\n"
+                "| 100 Main St | Oak Center | Westgate |",
+                [docks, power, drive_ins],
+                [],
+                True,
+            ),
+            (
+                "balanced all-target separator control",
+                "| Docks | Power |\n"
+                "| --- | --- |\n"
+                "| 6 | 1200A 480V 3-phase |\n"
+                "| 100 Main St | 100 Main St |",
+                [docks, power],
+                [docks, power],
+                False,
+            ),
+            (
+                "no-separator control",
+                "| Docks | Power |\n"
+                "| 6 | 1200A 480V 3-phase |\n"
+                "| 100 Main St | Oak Center |",
+                [docks, power],
+                [docks],
+                True,
+            ),
+        )
+
+        for name, table, updates, expected_updates, escalated in cases:
+            with self.subTest(name=name):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": list(updates),
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"100 Main St, Phoenix\n{table}",
+                    }],
+                )
+
+                self.assertEqual(expected_updates, result["updates"])
+                self.assertEqual(
+                    escalated,
+                    any(
+                        event.get("type") == "needs_user_input"
+                        and event.get("reason") == "multi_property_attachment"
+                        for event in result["events"]
+                    ),
+                )
+                self.assertEqual(
+                    None if escalated else "Thanks.",
+                    result["response_email"],
+                )
+
     def test_multi_column_target_tables_remain_supported(self):
         target_tables = (
             (
