@@ -2,7 +2,10 @@
 
 from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
+from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional
+from weakref import WeakSet
 
 
 _CAPABILITY_NAMES = ("start", "initialDispatch", "inboundAutomation")
@@ -16,7 +19,7 @@ class CapabilityDecision:
     reason_code: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class CampaignCapabilitiesResolution:
     source_path: str
     schema_version: Optional[int]
@@ -24,8 +27,11 @@ class CampaignCapabilitiesResolution:
     decisions: Mapping[str, CapabilityDecision]
 
 
+_MODULE_RESOLUTIONS: WeakSet[CampaignCapabilitiesResolution] = WeakSet()
+
+
 def _normalize_uid(uid: Any) -> str:
-    return uid.strip() if isinstance(uid, str) else ""
+    return uid.strip() if type(uid) is str else ""
 
 
 def _source_path(uid: Any) -> str:
@@ -33,30 +39,51 @@ def _source_path(uid: Any) -> str:
 
 
 def _normalized_revision(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if not float(value).is_integer() or value <= 0 or value > _MAX_SAFE_INTEGER:
-        return None
-    return int(value)
+    if type(value) is int:
+        return value if 0 < value <= _MAX_SAFE_INTEGER else None
+    if type(value) is float:
+        if isfinite(value) and value.is_integer() and 0 < value <= _MAX_SAFE_INTEGER:
+            return int(value)
+    return None
 
 
 def _schema_version(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) not in (int, float):
         return None
     return _SUPPORTED_SCHEMA_VERSION if value == _SUPPORTED_SCHEMA_VERSION else None
 
 
 def _is_firestore_timestamp(value: Any) -> bool:
-    if not isinstance(value, datetime):
-        return False
     try:
+        if not isinstance(value, datetime):
+            return False
         return value.tzinfo is not None and value.utcoffset() is not None
-    except (OverflowError, ValueError):
+    except Exception:
         return False
 
 
 def _decision(allowed: bool, reason_code: str) -> CapabilityDecision:
     return CapabilityDecision(allowed=allowed, reason_code=reason_code)
+
+
+def _resolution(
+    *,
+    uid: Any,
+    schema_version: Optional[int],
+    revision: Optional[int],
+    decisions: Mapping[str, CapabilityDecision],
+) -> CampaignCapabilitiesResolution:
+    immutable_decisions = MappingProxyType(
+        {name: decisions[name] for name in _CAPABILITY_NAMES}
+    )
+    resolved = CampaignCapabilitiesResolution(
+        source_path=_source_path(uid),
+        schema_version=schema_version,
+        revision=revision,
+        decisions=immutable_decisions,
+    )
+    _MODULE_RESOLUTIONS.add(resolved)
+    return resolved
 
 
 def _denied_resolution(
@@ -66,8 +93,8 @@ def _denied_resolution(
     schema_version: Optional[int] = None,
     revision: Optional[int] = None,
 ) -> CampaignCapabilitiesResolution:
-    return CampaignCapabilitiesResolution(
-        source_path=_source_path(uid),
+    return _resolution(
+        uid=uid,
         schema_version=schema_version,
         revision=revision,
         decisions={
@@ -91,63 +118,74 @@ def resolve_campaign_capabilities(
         return _denied_resolution(
             uid=uid, reason_code="capability_document_missing"
         )
-    if not isinstance(data, dict):
+    if type(data) is not dict:
         return _denied_resolution(
             uid=uid, reason_code="capability_document_malformed"
         )
 
-    schema_version = _schema_version(data.get("schemaVersion"))
-    revision = _normalized_revision(data.get("revision"))
+    schema_version = None
+    revision = None
+    try:
+        schema_version = _schema_version(data.get("schemaVersion"))
+        revision = _normalized_revision(data.get("revision"))
 
-    if document_id != normalized_uid:
-        return _denied_resolution(
-            uid=uid,
-            schema_version=schema_version,
-            revision=revision,
-            reason_code="capability_document_id_mismatch",
-        )
-    if schema_version is None:
-        return _denied_resolution(
-            uid=uid,
-            schema_version=schema_version,
-            revision=revision,
-            reason_code="capability_schema_unsupported",
-        )
-    if revision is None:
-        return _denied_resolution(
-            uid=uid,
-            schema_version=schema_version,
-            revision=revision,
-            reason_code="capability_revision_invalid",
-        )
-    if (
-        not _is_firestore_timestamp(data.get("updatedAt"))
-        or not isinstance(data.get("updatedBy"), str)
-        or not data["updatedBy"].strip()
-    ):
-        return _denied_resolution(
-            uid=uid,
-            schema_version=schema_version,
-            revision=revision,
-            reason_code="capability_audit_invalid",
-        )
+        if type(document_id) is not str or document_id != normalized_uid:
+            return _denied_resolution(
+                uid=uid,
+                schema_version=schema_version,
+                revision=revision,
+                reason_code="capability_document_id_mismatch",
+            )
+        if schema_version is None:
+            return _denied_resolution(
+                uid=uid,
+                schema_version=schema_version,
+                revision=revision,
+                reason_code="capability_schema_unsupported",
+            )
+        if revision is None:
+            return _denied_resolution(
+                uid=uid,
+                schema_version=schema_version,
+                revision=revision,
+                reason_code="capability_revision_invalid",
+            )
+        updated_by = data.get("updatedBy")
+        if (
+            not _is_firestore_timestamp(data.get("updatedAt"))
+            or type(updated_by) is not str
+            or not updated_by.strip()
+        ):
+            return _denied_resolution(
+                uid=uid,
+                schema_version=schema_version,
+                revision=revision,
+                reason_code="capability_audit_invalid",
+            )
 
-    decisions: Dict[str, CapabilityDecision] = {}
-    for name in _CAPABILITY_NAMES:
-        value = data.get(name)
-        if not isinstance(value, bool):
-            decisions[name] = _decision(False, "capability_value_invalid")
-        elif value:
-            decisions[name] = _decision(True, "allowed")
-        else:
-            decisions[name] = _decision(False, "capability_disabled")
+        decisions: Dict[str, CapabilityDecision] = {}
+        for name in _CAPABILITY_NAMES:
+            value = data.get(name)
+            if type(value) is not bool:
+                decisions[name] = _decision(False, "capability_value_invalid")
+            elif value:
+                decisions[name] = _decision(True, "allowed")
+            else:
+                decisions[name] = _decision(False, "capability_disabled")
 
-    return CampaignCapabilitiesResolution(
-        source_path=_source_path(uid),
-        schema_version=schema_version,
-        revision=revision,
-        decisions=decisions,
-    )
+        return _resolution(
+            uid=uid,
+            schema_version=schema_version,
+            revision=revision,
+            decisions=decisions,
+        )
+    except Exception:
+        return _denied_resolution(
+            uid=uid,
+            schema_version=schema_version,
+            revision=revision,
+            reason_code="capability_document_malformed",
+        )
 
 
 def read_campaign_capabilities(
@@ -187,12 +225,17 @@ def capability_allowed(
     """Return true only for an exact known capability with an allowed decision."""
 
     if (
-        capability_name not in _CAPABILITY_NAMES
-        or not isinstance(resolution, CampaignCapabilitiesResolution)
-        or not isinstance(resolution.decisions, Mapping)
+        type(capability_name) is not str
+        or capability_name not in _CAPABILITY_NAMES
+        or type(resolution) is not CampaignCapabilitiesResolution
     ):
         return False
-    decision_value = resolution.decisions.get(capability_name)
+    try:
+        if resolution not in _MODULE_RESOLUTIONS:
+            return False
+        decision_value = resolution.decisions.get(capability_name)
+    except Exception:
+        return False
     return (
         isinstance(decision_value, CapabilityDecision)
         and decision_value.allowed is True
