@@ -540,6 +540,69 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 ))
                 self.assertIsNone(result["response_email"])
 
+    def test_two_word_unbound_identity_clause_makes_target_address_pdf_mixed(self):
+        alternate_clauses = (
+            "westgate hub - Ceiling Ht: 32 feet clear.",
+            "oak center — Clear Height = 32 ft.",
+            "river park - Ceiling Clearance: 32 feet.",
+        )
+
+        for alternate_clause in alternate_clauses:
+            with self.subTest(alternate_clause=alternate_clause):
+                proposal = {
+                    "updates": [{"column": "Ceiling Ht", "value": "32"}],
+                    "events": [],
+                    "response_email": "Thanks.",
+                }
+
+                result = ai_processing._suppress_competing_attachment_updates(
+                    proposal,
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": (
+                            "100 Main St - 20,000 SF. "
+                            f"{alternate_clause}"
+                        ),
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
+    def test_two_word_target_spec_label_remains_supported(self):
+        target_specs = (
+            "clear height - 28 feet clear.",
+            "ceiling height - 28 feet clear.",
+        )
+
+        for target_spec in target_specs:
+            with self.subTest(target_spec=target_spec):
+                expected_update = {"column": "Ceiling Ht", "value": "28"}
+                proposal = {
+                    "updates": [expected_update],
+                    "events": [],
+                    "response_email": None,
+                }
+
+                result = ai_processing._suppress_competing_attachment_updates(
+                    proposal,
+                    _conversation("The target brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "100 Main St brochure.pdf",
+                        "text": f"100 Main St - 20,000 SF. {target_spec}",
+                    }],
+                )
+
+                self.assertEqual([expected_update], result["updates"])
+
     def test_versioned_addressless_attachment_is_competing_by_default(self):
         attachment_names = (
             "Oak Commerce Center brochure version 2.pdf",

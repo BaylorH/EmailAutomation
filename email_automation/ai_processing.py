@@ -1876,8 +1876,12 @@ _PROPERTY_FACT_SIGNAL_RE = re.compile(
 )
 _PROPERTY_CLAUSE_BREAK_RE = re.compile(r"(?<!\d)[.!?;](?!\d)|\n+")
 _UNBOUND_IDENTITY_PREFIX_RE = re.compile(
-    r"^\s*[a-z][a-z0-9&'’/-]*"
-    r"(?:\s+[a-z][a-z0-9&'’/-]*){2,7}\s*[-–—]\s*",
+    r"^\s*(?P<label>[a-z][a-z0-9&'’/-]*"
+    r"(?:\s+[a-z][a-z0-9&'’/-]*){1,7})\s*[-–—]\s*",
+    re.IGNORECASE,
+)
+_LABELED_PROPERTY_FACT_RE = re.compile(
+    r"^\s*[a-z][a-z0-9 /'’_-]{1,40}\s*[:=]\s*\$?\s*\d",
     re.IGNORECASE,
 )
 
@@ -1912,10 +1916,12 @@ def _unbound_identity_fact_spans(
         clause = text[clause_start:clause_end]
         if _source_mentions_target_property(clause, target_anchor):
             continue
-        if (
-            _UNBOUND_IDENTITY_PREFIX_RE.search(clause)
-            and _PROPERTY_FACT_SIGNAL_RE.search(clause)
-        ):
+        identity = _UNBOUND_IDENTITY_PREFIX_RE.search(clause)
+        if not identity or not _PROPERTY_FACT_SIGNAL_RE.search(clause):
+            continue
+        label_word_count = len(re.findall(r"[a-z0-9]+", identity.group("label")))
+        remainder = clause[identity.end():]
+        if label_word_count >= 3 or _LABELED_PROPERTY_FACT_RE.search(remainder):
             unbound_spans.append((clause_start, clause_end))
     return unbound_spans
 
