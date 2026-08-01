@@ -3,13 +3,28 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = str(Path(__file__).resolve().parents[1])
+
+
+def _bootstrap_repo_root() -> None:
+    while REPO_ROOT in sys.path:
+        sys.path.remove(REPO_ROOT)
+    sys.path.insert(0, REPO_ROOT)
+
+
+_bootstrap_repo_root()
+
 import importlib
 import ipaddress
 import os
 import socket
 import subprocess
-import sys
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from typing import Callable, MutableMapping, TextIO
 
@@ -227,6 +242,8 @@ class NetworkTripwire:
         original_connect_ex = socket.socket.connect_ex
         original_bind = socket.socket.bind
         original_sendto = socket.socket.sendto
+        original_sendmsg = getattr(socket.socket, "sendmsg", None)
+        original_getpeername = socket.socket.getpeername
         original_create_connection = socket.create_connection
         original_getaddrinfo = socket.getaddrinfo
         original_gethostbyname = socket.gethostbyname
@@ -255,6 +272,25 @@ class NetworkTripwire:
             if not self._allowed_socket_address(sock, address):
                 return self._activate()
             return original_sendto(sock, data, *args)
+
+        def guarded_sendmsg(sock, buffers, *args):
+            address = args[2] if len(args) >= 3 else None
+            if address is not None:
+                if not self._allowed_socket_address(sock, address):
+                    return self._activate()
+            elif sock.family in (socket.AF_INET, socket.AF_INET6):
+                try:
+                    peer = original_getpeername(sock)
+                except OSError:
+                    # An unconnected socket cannot send without a destination.
+                    # Preserve that local error from the original implementation.
+                    pass
+                else:
+                    if not self._allowed_socket_address(sock, peer):
+                        return self._activate()
+            elif sock.family != socket.AF_UNIX:
+                return self._activate()
+            return original_sendmsg(sock, buffers, *args)
 
         def guarded_create_connection(address, *args, **kwargs):
             if not isinstance(address, tuple) or not address:
@@ -314,6 +350,8 @@ class NetworkTripwire:
         self._replace(socket.socket, "connect_ex", guarded_connect_ex)
         self._replace(socket.socket, "bind", guarded_bind)
         self._replace(socket.socket, "sendto", guarded_sendto)
+        if original_sendmsg is not None:
+            self._replace(socket.socket, "sendmsg", guarded_sendmsg)
         self._replace(socket, "create_connection", guarded_create_connection)
         self._replace(socket, "getaddrinfo", guarded_getaddrinfo)
         self._replace(socket, "gethostbyname", guarded_gethostbyname)
@@ -406,6 +444,9 @@ class _DiscardingTextStream:
     def flush(self) -> None:
         return None
 
+    def isatty(self) -> bool:
+        return False
+
 
 def run_offline_tests(
     *,
@@ -422,16 +463,17 @@ def run_offline_tests(
     import_failures: list[ImportFailure] = []
     internal_errors = 0
     result = unittest.TestResult()
+    discarded = _DiscardingTextStream()
 
     try:
-        with tripwire:
+        with tripwire, redirect_stdout(discarded), redirect_stderr(discarded):
             suite, import_failures = build_allowlisted_suite(
                 import_module=import_module,
                 loader=loader,
             )
             if not import_failures:
                 result = unittest.TextTestRunner(
-                    stream=_DiscardingTextStream(),
+                    stream=discarded,
                     verbosity=0,
                 ).run(suite)
     except KeyboardInterrupt:
