@@ -2199,7 +2199,7 @@ def _nearest_property_binding(
 
 
 _VIABILITY_NEGATION_PREFIX_RE = re.compile(
-    r"\b(?:not|never|no\s+longer|"
+    r"\b(?:not|never|no\s+longer|hardly|barely|scarcely|"
     r"isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t|"
     r"doesn['’]?t|don['’]?t|didn['’]?t|"
     r"hasn['’]?t|haven['’]?t|hadn['’]?t|"

@@ -1030,6 +1030,106 @@ class JillJuneRegressionTests(unittest.TestCase):
                             self.assertEqual("stopped", patch["followUpStatus"])
                             self.assertEqual(reason, patch["pendingTerminalReason"])
 
+    def test_near_negated_availability_never_suppresses_target_terminal_event(self):
+        address_pairs = (
+            ("1 Main St", "2 Oak Ave"),
+            ("12 Main St", "34 Oak Ave"),
+            ("123 Main St", "456 Oak Ave"),
+            ("1234 Main St", "5678 Oak Ave"),
+            ("12345 Main St", "56789 Oak Ave"),
+            ("123456 Main St", "654321 Oak Ave"),
+        )
+        independent_templates = (
+            "{target} is {adverb} still available.",
+            "{target} {adverb} remains available.",
+        )
+        shared_templates = (
+            "{first} and {second} are {adverb} still available.",
+            "{first}, and {second}, are {adverb} still available.",
+            "{first} and {second} {adverb} remain available.",
+            "{first}, and {second}, {adverb} remain available.",
+        )
+
+        def assert_terminal(event, target_address, message_text):
+            patch = processing._pending_nonviable_followup_patch(
+                [event],
+                row_anchor=f"{target_address}, Phoenix",
+                message_text=message_text,
+            )
+            self.assertTrue(
+                processing._property_unavailable_event_applies_to_row(
+                    event,
+                    row_anchor=f"{target_address}, Phoenix",
+                    message_text=message_text,
+                )
+            )
+            self.assertIsNotNone(patch)
+            self.assertEqual("stopped", patch["followUpStatus"])
+            self.assertEqual(event["reason"], patch["pendingTerminalReason"])
+
+        for target_address, competitor_address in address_pairs:
+            for reason in ("leased", "sold", "no_space_available"):
+                event = {"type": "property_unavailable", "reason": reason}
+                for adverb in ("hardly", "barely", "scarcely"):
+                    for message_template in independent_templates:
+                        message_text = message_template.format(
+                            target=target_address,
+                            adverb=adverb,
+                        )
+                        with self.subTest(
+                            scope="independent",
+                            target_address=target_address,
+                            reason=reason,
+                            adverb=adverb,
+                            message_template=message_template,
+                        ):
+                            assert_terminal(event, target_address, message_text)
+
+                    for first, second in (
+                        (target_address, competitor_address),
+                        (competitor_address, target_address),
+                    ):
+                        for message_template in shared_templates:
+                            message_text = message_template.format(
+                                first=first,
+                                second=second,
+                                adverb=adverb,
+                            )
+                            with self.subTest(
+                                scope="shared",
+                                target_address=target_address,
+                                first=first,
+                                reason=reason,
+                                adverb=adverb,
+                                message_template=message_template,
+                            ):
+                                assert_terminal(event, target_address, message_text)
+
+    def test_affirmative_availability_adverbs_still_preserve_target(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+        messages = (
+            "100 Main St is definitely still available.",
+            "100 Main St clearly remains available.",
+            "100 Main St is very much still available.",
+        )
+
+        for message_text in messages:
+            with self.subTest(message_text=message_text):
+                self.assertFalse(
+                    processing._property_unavailable_event_applies_to_row(
+                        event,
+                        row_anchor="100 Main St, Phoenix",
+                        message_text=message_text,
+                    )
+                )
+                self.assertIsNone(
+                    processing._pending_nonviable_followup_patch(
+                        [event],
+                        row_anchor="100 Main St, Phoenix",
+                        message_text=message_text,
+                    )
+                )
+
     def test_shared_terminal_predicate_applies_to_target_in_address_list(self):
         message_text = "100 Main St, Phoenix, and 200 Oak Ave are both leased."
         proposal = ai_processing._augment_events_with_deterministic_signals(
