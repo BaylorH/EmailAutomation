@@ -633,36 +633,6 @@ def _looks_like_out_of_office(text: str) -> bool:
     )
 
 
-def _address_binding_numbers(text: str) -> set:
-    """Digit runs usable as an address-binding proxy, EXCLUDING size/price/rate
-    figures that are not street numbers (CodeRabbit PR#15).
-
-    The terminal detector uses raw 3-6 digit tokens to decide whether a terminal
-    phrase is bound to the TARGET address or a competing one. A size or price
-    figure sharing the terminal sentence ("It's been leased, 42,000 SF at
-    $8.75/SF NNN") must not be mistaken for a competing street address, which
-    would drop a genuine property_unavailable signal. Grouped thousands
-    separators are collapsed first ("42,000" -> one token) and figures adjacent
-    to $, #, SF/PSF, %, /SF, NNN, ' (clear height), or a range dash are dropped.
-    """
-    collapsed = re.sub(r"(?<=\d),(?=\d{3}(?:\D|$))", "", (text or "").lower())
-    numbers = set()
-    for m in re.finditer(r"\b(\d{3,6})\b", collapsed):
-        start, end = m.start(1), m.end(1)
-        before = collapsed[max(0, start - 1):start]
-        after = collapsed[end:end + 8]
-        if before in ("$", "#"):
-            continue  # price / suite number, not a street address
-        if re.match(
-            r"\s*(?:sf\b|s\.?\s*f\.?|sq\b|square|psf\b|/\s*sf|per\s+sf|%|k\b|"
-            r"nnn\b|'|’|-\s*\d)",
-            after,
-        ):
-            continue  # size / rate / clear-height / numeric-range figure
-        numbers.add(m.group(1))
-    return numbers
-
-
 _TERMINAL_SUBJECT_SEPARATOR_RE = re.compile(
     r",\s*(?:and|but|while|whereas)\s+|\s+(?:and|but|while|whereas)\s+",
     re.IGNORECASE,
@@ -708,7 +678,7 @@ def _detect_target_terminal_reason(latest_text: str, target_anchor: Optional[str
     asserts the target remains viable.
     """
     text = (latest_text or "").lower()
-    target_numbers = _address_binding_numbers(target_anchor or "")
+    target_identity = _target_street_identity(target_anchor or "")
     has_global_viability = bool(_VIABILITY_RE.search(text))
     sentences = _terminal_subject_clauses(text)
 
@@ -724,12 +694,15 @@ def _detect_target_terminal_reason(latest_text: str, target_anchor: Optional[str
                 continue  # negated terminal
             if _ANCILLARY_SUBJECT_RE.search(sentence) or re.search(r"\bleased\s+separately\b", sentence):
                 continue  # lease bound to an ancillary asset / tour slot
-            sentence_numbers = _address_binding_numbers(sentence)
-            if target_numbers and (target_numbers & sentence_numbers):
+            sentence_claims = _street_claim_spans(sentence)
+            if target_identity and any(
+                _claim_identity(claim) == target_identity
+                for claim in sentence_claims
+            ):
                 return reason  # terminal explicitly about the TARGET address
-            if sentence_numbers and target_numbers and not (target_numbers & sentence_numbers):
+            if sentence_claims and target_identity:
                 continue  # terminal about a competing named address
-            if sentence_numbers and not target_numbers:
+            if sentence_claims and not target_identity:
                 if has_global_viability:
                     continue
                 return reason
@@ -1958,7 +1931,7 @@ _PROPERTY_CLAUSE_BREAK_RE = re.compile(r"(?<!\d)[.!?;](?!\d)|\n+")
 _UNBOUND_IDENTITY_PREFIX_RE = re.compile(
     r"^\s*(?P<label>[a-z][a-z0-9&'’/-]*"
     r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})"
-    r"(?:\s*[-–—:=|•·,/>→(\[]\s*|\s+(?=\$?\d))",
+    r"(?:\s*[^a-z0-9$\s]+\s*|\s+(?=\$?\d))",
     re.IGNORECASE,
 )
 _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS = {
@@ -2021,7 +1994,8 @@ _PROPERTY_FACT_LABEL_FAMILIES = (
 )
 _STANDALONE_IDENTITY_LINE_RE = re.compile(
     r"^\s*(?P<label>[a-z][a-z0-9&'’/-]*"
-    r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})\s*[-–—:=|•·,/>→(\[]?\s*$",
+    r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})"
+    r"\s*(?:[^a-z0-9$\s]+)?\s*$",
     re.IGNORECASE,
 )
 

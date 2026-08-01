@@ -582,6 +582,47 @@ class JillJuneRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_upstream_terminal_grounding_handles_one_to_six_digit_addresses(self):
+        address_pairs = (
+            ("1", "2"),
+            ("12", "34"),
+            ("123", "456"),
+            ("1234", "5678"),
+            ("12345", "56789"),
+            ("123456", "654321"),
+        )
+
+        for target_number, competitor_number in address_pairs:
+            target_anchor = f"{target_number} Target Way, Phoenix"
+            with self.subTest(target_anchor=target_anchor, subject="target"):
+                target = ai_processing._augment_events_with_deterministic_signals(
+                    {"updates": [], "events": [], "response_email": "Thanks."},
+                    [{
+                        "direction": "inbound",
+                        "content": f"{target_number} Target Way has been leased.",
+                    }],
+                    target_anchor=target_anchor,
+                )
+                self.assertIn(
+                    "property_unavailable",
+                    [event.get("type") for event in target["events"]],
+                )
+
+            with self.subTest(target_anchor=target_anchor, subject="competitor"):
+                competitor = ai_processing._augment_events_with_deterministic_signals(
+                    {"updates": [], "events": [], "response_email": "Thanks."},
+                    [{
+                        "direction": "inbound",
+                        "content": f"{competitor_number} Rival Rd has been leased.",
+                    }],
+                    target_anchor=target_anchor,
+                )
+                self.assertNotIn(
+                    "property_unavailable",
+                    [event.get("type") for event in competitor["events"]],
+                )
+                self.assertEqual("Thanks.", competitor["response_email"])
+
     def test_addressless_unavailable_event_rejects_named_competitor_when_target_viable(self):
         event = {"type": "property_unavailable", "reason": "leased"}
 
