@@ -84,7 +84,7 @@ class JillJuneRegressionTests(unittest.TestCase):
         self.assertNotIn("tour_requested", event_types)
         self.assertNotIn("close_conversation", event_types)
 
-    def test_existing_unavailable_event_is_not_duplicated(self):
+    def test_existing_unavailable_event_is_not_duplicated_and_reason_is_canonicalized(self):
         proposal = {
             "updates": [],
             "events": [{"type": "property_unavailable", "reason": "model"}],
@@ -102,7 +102,7 @@ class JillJuneRegressionTests(unittest.TestCase):
         )
 
         self.assertEqual(1, len(augmented["events"]))
-        self.assertEqual("model", augmented["events"][0]["reason"])
+        self.assertEqual("no_longer_represented", augmented["events"][0]["reason"])
 
     def test_requirements_mismatch_adds_nonviable_event(self):
         proposal = {"updates": [], "events": []}
