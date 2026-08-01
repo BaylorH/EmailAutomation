@@ -8,6 +8,12 @@ from typing import Any, Dict, Mapping, Optional
 from weakref import WeakSet
 
 
+_BASE_DATETIME_TYPE = datetime
+_DATETIME_TZINFO_DESCRIPTOR = datetime.tzinfo
+_DATETIME_UTCOFFSET = datetime.utcoffset
+_BASE_TIMEDELTA_TYPE = timedelta
+_TIMEDELTA_TOTAL_SECONDS = timedelta.total_seconds
+_ISINSTANCE = isinstance
 _CAPABILITY_NAMES = ("start", "initialDispatch", "inboundAutomation")
 _SUPPORTED_SCHEMA_VERSION = 2
 _MAX_SAFE_INTEGER = (2**53) - 1
@@ -98,23 +104,35 @@ def _schema_version(value: Any) -> Optional[int]:
 
 def _is_firestore_timestamp(value: Any) -> bool:
     try:
-        if not isinstance(value, datetime):
-            return False
-        value_type = type(value)
-        if (
-            value_type.tzinfo is not datetime.tzinfo
-            or value_type.utcoffset is not datetime.utcoffset
-        ):
-            return False
+        base_datetime_type = _BASE_DATETIME_TYPE
+        datetime_tzinfo_descriptor = _DATETIME_TZINFO_DESCRIPTOR
+        datetime_utcoffset = _DATETIME_UTCOFFSET
+        base_timedelta_type = _BASE_TIMEDELTA_TYPE
+        timedelta_total_seconds = _TIMEDELTA_TOTAL_SECONDS
+        is_instance = _ISINSTANCE
+        max_offset_seconds = _MAX_UTC_OFFSET_SECONDS
 
-        intrinsic_tzinfo = datetime.tzinfo.__get__(value, value_type)
+        if not is_instance(value, base_datetime_type):
+            return False
+        intrinsic_tzinfo = datetime_tzinfo_descriptor.__get__(
+            value, base_datetime_type
+        )
         if intrinsic_tzinfo is None:
             return False
-        intrinsic_offset = datetime.utcoffset(value)
-        if not isinstance(intrinsic_offset, timedelta):
+        intrinsic_offset = datetime_utcoffset(value)
+        if not is_instance(intrinsic_offset, base_timedelta_type):
             return False
-        offset_seconds = timedelta.total_seconds(intrinsic_offset)
-        return -_MAX_UTC_OFFSET_SECONDS < offset_seconds < _MAX_UTC_OFFSET_SECONDS
+        offset_seconds = timedelta_total_seconds(intrinsic_offset)
+        if not -max_offset_seconds < offset_seconds < max_offset_seconds:
+            return False
+
+        public_tzinfo = value.tzinfo
+        public_offset = value.utcoffset()
+        return (
+            public_tzinfo is intrinsic_tzinfo
+            and is_instance(public_offset, base_timedelta_type)
+            and timedelta_total_seconds(public_offset) == offset_seconds
+        )
     except Exception:
         return False
 
