@@ -619,10 +619,15 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
     def test_short_unbound_identity_suppresses_every_mapped_fact_type(self):
         competing_facts = (
             ("Docks", "6", "Oak Center - 6 dock doors."),
+            ("Docks", "6", "Oak Center | Docks: 6."),
             ("Drive Ins", "2", "Oak Center - 2 drive-in doors."),
+            ("Drive Ins", "2", "Oak Center | Drive Ins: 2."),
             ("Power", "1200A 480V 3-phase", "Oak Center - 1200A 480V 3-phase power."),
+            ("Power", "1200A 480V 3-phase", "Oak Center | Power: 1200A 480V 3-phase."),
             ("Rent/SF/Yr", "6.75", "Oak Center - $6.75/SF NNN."),
+            ("Rent/SF/Yr", "6.75", "Oak Center | Rent/SF/Yr: $6.75 NNN."),
             ("Ops Ex/SF/Yr", "1.85", "Oak Center - $1.85/SF operating expenses."),
+            ("Ops Ex/SF/Yr", "1.85", "Oak Center | Op Ex: $1.85/SF."),
         )
 
         for column, value, competing_clause in competing_facts:
@@ -650,6 +655,31 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                     for event in result["events"]
                 ))
                 self.assertIsNone(result["response_email"])
+
+    def test_street_suffix_period_cannot_hide_competing_table_heading(self):
+        proposal = {
+            "updates": [{"column": "Docks", "value": "6"}],
+            "events": [],
+            "response_email": "Thanks.",
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            _conversation("The brochure is attached."),
+            "100 Main St, Phoenix",
+            [{
+                "name": "mixed brochure.pdf",
+                "text": "100 Main St. Oak Center | Docks: 6.",
+            }],
+        )
+
+        self.assertEqual([], result["updates"])
+        self.assertTrue(any(
+            event.get("type") == "needs_user_input"
+            and event.get("reason") == "multi_property_attachment"
+            for event in result["events"]
+        ))
+        self.assertIsNone(result["response_email"])
 
     def test_versioned_addressless_attachment_is_competing_by_default(self):
         attachment_names = (

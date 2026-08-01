@@ -2182,6 +2182,8 @@ def _clause_has_terminal_property_evidence(
     unavailable_keywords: List[str],
 ) -> bool:
     """Recognize market-unavailable and physical-mismatch terminal evidence."""
+    if _clause_has_ancillary_requirements_mismatch(clause):
+        return False
     if _detect_target_terminal_reason(clause, None):
         return True
     if _looks_like_requirements_mismatch_nonviable(clause):
@@ -2201,6 +2203,14 @@ def _clause_has_ancillary_terminal_evidence(clause: str) -> bool:
     ):
         return False
     return any(re.search(pattern, text, re.IGNORECASE) for _reason, pattern in _UNAVAILABLE_PATTERNS)
+
+
+def _clause_has_ancillary_requirements_mismatch(clause: str) -> bool:
+    """Recognize a physical non-fit scoped only to an ancillary asset."""
+    return bool(
+        _ANCILLARY_SUBJECT_RE.search(clause or "")
+        and _looks_like_requirements_mismatch_nonviable(clause)
+    )
 
 
 def _clause_has_target_terminal_after_ancillary(
@@ -2305,7 +2315,10 @@ def _property_unavailable_event_applies_to_row(
     last_explicit_binding = None
     for clause in _terminal_binding_clauses(message_text):
         explicit_bindings = _explicit_property_bindings(clause, row_anchor)
-        ancillary_terminal = _clause_has_ancillary_terminal_evidence(clause)
+        ancillary_terminal = bool(
+            _clause_has_ancillary_terminal_evidence(clause)
+            or _clause_has_ancillary_requirements_mismatch(clause)
+        )
         if ancillary_terminal:
             ancillary_terminal_seen = True
         if (

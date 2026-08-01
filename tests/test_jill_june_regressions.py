@@ -340,6 +340,57 @@ class JillJuneRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_ancillary_requirements_mismatch_does_not_terminalize_target(self):
+        event = {"type": "property_unavailable", "reason": "requirements_mismatch"}
+        messages = (
+            "The outparcel is mostly office.",
+            "At 100 Main St, the outparcel is mostly office.",
+            "The trailer yard does not have drive-in access.",
+            "At 100 Main St, the trailer yard does not have drive-in access.",
+        )
+
+        for message_text in messages:
+            with self.subTest(message_text=message_text):
+                proposal = ai_processing._augment_events_with_deterministic_signals(
+                    {"updates": [], "events": [], "response_email": "Thanks."},
+                    [{"direction": "inbound", "content": message_text}],
+                    target_anchor="100 Main St, Phoenix",
+                )
+                self.assertNotIn(
+                    "property_unavailable",
+                    [event.get("type") for event in proposal["events"]],
+                )
+                self.assertFalse(
+                    processing._property_unavailable_event_applies_to_row(
+                        event,
+                        row_anchor="100 Main St, Phoenix",
+                        message_text=message_text,
+                    )
+                )
+
+    def test_target_requirements_mismatch_survives_separate_ancillary_mismatch(self):
+        message_text = (
+            "The outparcel is mostly office. "
+            "100 Main St lacks warehouse space."
+        )
+        proposal = ai_processing._augment_events_with_deterministic_signals(
+            {"updates": [], "events": [], "response_email": "Thanks."},
+            [{"direction": "inbound", "content": message_text}],
+            target_anchor="100 Main St, Phoenix",
+        )
+
+        self.assertIn(
+            "property_unavailable",
+            [event.get("type") for event in proposal["events"]],
+        )
+        self.assertTrue(
+            processing._property_unavailable_event_applies_to_row(
+                {"type": "property_unavailable", "reason": "requirements_mismatch"},
+                row_anchor="100 Main St, Phoenix",
+                message_text=message_text,
+            )
+        )
+
     def test_downstream_guard_rejects_tour_only_unavailability_as_nonviable(self):
         event = {"type": "property_unavailable", "reason": "model"}
 

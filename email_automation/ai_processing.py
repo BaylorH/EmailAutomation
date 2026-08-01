@@ -703,6 +703,49 @@ def _detect_target_terminal_reason(latest_text: str, target_anchor: Optional[str
     return None
 
 
+def _detect_target_requirements_mismatch(
+    latest_text: str,
+    target_anchor: Optional[str],
+) -> bool:
+    """Bind a physical non-fit to the target, not an ancillary/competing asset."""
+    # Preserve message-wide remediation semantics before splitting into binding
+    # clauses; a later "the dock can be ramped" cures an earlier access absence.
+    if not _looks_like_requirements_mismatch_nonviable(latest_text):
+        return False
+    clauses = [
+        clause.strip()
+        for clause in re.split(
+            r"(?<=[.!?;])\s+|\n+|"
+            r",\s*(?:but|while|whereas)\s+|\s+(?:but|while|whereas)\s+|"
+            r",?\s+and\s+(?=\d{1,6}\s+[a-z])",
+            latest_text or "",
+            flags=re.IGNORECASE,
+        )
+        if clause.strip()
+    ]
+    last_explicit_binding = None
+    for clause in clauses:
+        explicit_binding = None
+        if target_anchor:
+            if _source_mentions_target_property(clause, target_anchor):
+                explicit_binding = "target"
+            elif _street_claim_spans(clause):
+                explicit_binding = "competing"
+
+        if _looks_like_requirements_mismatch_nonviable(clause):
+            if _ANCILLARY_SUBJECT_RE.search(clause):
+                if explicit_binding:
+                    last_explicit_binding = explicit_binding
+                continue
+            binding = explicit_binding or last_explicit_binding
+            if binding != "competing":
+                return True
+
+        if explicit_binding:
+            last_explicit_binding = explicit_binding
+    return False
+
+
 def _apply_event_retention_guards(
     events: List[dict],
     *,
@@ -1140,6 +1183,10 @@ def _augment_events_with_deterministic_signals(
         _alt_ref.search(sentence) and _alt_viable.search(sentence)
         for sentence in re.split(r"(?<=[.!?])\s+|\n+", latest_text)
     )
+    target_requirements_mismatch = _detect_target_requirements_mismatch(
+        latest_text,
+        target_anchor,
+    )
 
     # ---- Retention guards run first (on the LLM's own events) -----------------
     events = _apply_event_retention_guards(
@@ -1153,7 +1200,7 @@ def _augment_events_with_deterministic_signals(
     )
     access_remediation_requires_review = (
         _looks_like_access_remediation(latest_text)
-        and not _looks_like_requirements_mismatch_nonviable(latest_text)
+        and not target_requirements_mismatch
         and not _detect_target_terminal_reason(latest_text, target_anchor)
     )
     if access_remediation_requires_review:
@@ -1188,7 +1235,7 @@ def _augment_events_with_deterministic_signals(
     # "no longer available for tours" is a legitimately tour-scoped phrase that
     # looks_like_tour_only_unavailable owns.
     property_unavailable_reason = None
-    if _looks_like_requirements_mismatch_nonviable(latest_text):
+    if target_requirements_mismatch:
         property_unavailable_reason = "requirements_mismatch"
     elif not looks_like_tour_only_unavailable(latest_text_raw):
         property_unavailable_reason = _detect_target_terminal_reason(latest_text, target_anchor)
@@ -1871,6 +1918,13 @@ def _source_mentions_target_property(source_text: str, target_anchor: str) -> bo
 
 _PROPERTY_FACT_SIGNAL_RE = re.compile(
     r"(?:"
+    r"\b(?:total\s+sf|available\s+(?:space|sf)|building\s+size|"
+    r"clear\s+(?:height|ht)|ceiling\s+(?:height|ht|clearance)|"
+    r"docks?|dock\s+doors?|loading\s+docks?|"
+    r"drive[-\s]?ins?(?:\s+doors?)?|power(?:\s+service)?|"
+    r"rent(?:\s*/\s*sf(?:\s*/\s*(?:yr|year))?)?|lease\s+rate|"
+    r"op\s*ex|opex|operating\s+expenses?)"
+    r"\s*(?:[:=|–—-]\s*)?\$?\s*\d|"
     r"\$\s*\d+(?:,\d{3})*(?:\.\d+)?|"
     r"\b\d+(?:,\d{3})*(?:\.\d+)?\s*(?:"
     r"sf\b|sq\.?\s*ft\b|square\s+feet\b|feet\b|foot\b|ft\.?\b|['’]|"
@@ -1973,6 +2027,23 @@ def _unbound_identity_fact_spans(
         # closed as a new property identity.
         if label not in _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS:
             unbound_spans.append((clause_start, clause_end))
+
+    # A period after a street suffix is ambiguous: it may be the abbreviation
+    # in "Main St." or a real sentence boundary before another property. Scan
+    # punctuation-delimited segments independently so `100 Main St. Oak Center
+    # | Docks: 6` cannot inherit the target address merely because the normal
+    # clause splitter preserved `St.`.
+    for segment in re.finditer(r"(?:^|[.!?;\n])(?P<body>[^.!?;\n]+)", text):
+        segment_start, segment_end = segment.span("body")
+        segment_text = segment.group("body")
+        if _source_mentions_target_property(segment_text, target_anchor):
+            continue
+        identity = _UNBOUND_IDENTITY_PREFIX_RE.search(segment_text)
+        if not identity or not _PROPERTY_FACT_SIGNAL_RE.search(segment_text):
+            continue
+        label = " ".join(re.findall(r"[a-z0-9]+", identity.group("label").lower()))
+        if label not in _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS:
+            unbound_spans.append((segment_start, segment_end))
     return sorted(set(unbound_spans))
 
 
