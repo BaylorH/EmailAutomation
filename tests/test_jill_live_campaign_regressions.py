@@ -661,6 +661,107 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 ))
                 self.assertIsNone(result["response_email"])
 
+    def test_postfixed_unbound_identity_suppresses_every_mapped_fact_type(self):
+        competing_facts = (
+            ("Docks", "6", "Docks: 6 | Oak Center"),
+            ("Docks", "6", "6 Dock Doors | Oak Center"),
+            ("Docks", "6", "Docks: 6. Oak Center"),
+            ("Drive Ins", "2", "Grade Level Doors: 2 — Oak Center"),
+            ("Power", "1200A", "Electrical Capacity: 1200A • Oak Center"),
+            ("Power", "1200A", "Power: 1200A\tOak Center"),
+            ("Rent/SF/Yr", "6.75", "Asking Rate: $6.75 / Oak Center"),
+            ("Ops Ex/SF/Yr", "1.85", "CAM Charges: $1.85, Oak Center"),
+            ("Ceiling Ht", "32", "Clear Height: 32; Oak Center"),
+            ("Total SF", "45000", "Available Sq Ft: 45,000\nOak Center"),
+        )
+
+        for column, value, competing_clause in competing_facts:
+            with self.subTest(column=column, competing_clause=competing_clause):
+                proposal = {
+                    "updates": [{"column": column, "value": value}],
+                    "events": [],
+                    "response_email": "Thanks.",
+                }
+
+                result = ai_processing._suppress_competing_attachment_updates(
+                    proposal,
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": (
+                            "100 Main St - 20,000 SF. "
+                            f"{competing_clause}."
+                        ),
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
+    def test_exact_target_postfix_preserves_target_fact_updates(self):
+        target_clauses = (
+            "Docks: 6 | 100 Main St",
+            "Docks: 6; 100 Main St",
+            "Docks: 6\n100 Main St",
+        )
+
+        for target_clause in target_clauses:
+            with self.subTest(target_clause=target_clause):
+                expected_update = {"column": "Docks", "value": "6"}
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [expected_update],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The target brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "100 Main St brochure.pdf",
+                        "text": f"100 Main St - 20,000 SF. {target_clause}.",
+                    }],
+                )
+
+                self.assertEqual([expected_update], result["updates"])
+                self.assertEqual([], result["events"])
+                self.assertEqual("Thanks.", result["response_email"])
+
+    def test_postfixed_fact_token_property_names_remain_competing(self):
+        competing_headings = (
+            ("Docks", "6", "Docks: 6 | Power Center"),
+            ("Docks", "6", "Docks: 6 | Oak Docks"),
+            ("Power", "1200A", "Power: 1200A | Westgate Power"),
+        )
+
+        for column, value, competing_heading in competing_headings:
+            with self.subTest(competing_heading=competing_heading):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [{"column": column, "value": value}],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"100 Main St - 20,000 SF. {competing_heading}.",
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertIsNone(result["response_email"])
+                self.assertTrue(any(
+                    event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+
     def test_street_suffix_period_cannot_hide_competing_table_heading(self):
         proposal = {
             "updates": [{"column": "Docks", "value": "6"}],
@@ -691,7 +792,9 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             ("Docks", "6", "Dock Positions: 6"),
             ("Drive Ins", "2", "Grade Level Doors: 2"),
             ("Power", "1200A", "Electrical Capacity: 1200A"),
+            ("Power", "1200A 480V 3-phase", "Power: 1200A 480V 3-phase"),
             ("Rent/SF/Yr", "6.75", "Asking Rate: $6.75"),
+            ("Rent/SF/Yr", "6.75", "Asking Rate: $6.75/SF NNN"),
             ("Ops Ex/SF/Yr", "1.85", "CAM Charges: $1.85"),
             ("Total SF", "45000", "Available Sq Ft: 45000"),
         )

@@ -1934,6 +1934,13 @@ _UNBOUND_IDENTITY_PREFIX_RE = re.compile(
     r"(?:\s*[^a-z0-9$\s]+\s*|\s+(?=\$?\d))",
     re.IGNORECASE,
 )
+_UNBOUND_IDENTITY_POSTFIX_RE = re.compile(
+    r"(?:[|•·,;.!?>→~)\]}]+|\t+|"
+    r"(?:(?<=\s)[-–—/:]+|[-–—/:]+(?=\s)))"
+    r"\s*(?P<label>[a-z][a-z0-9&'’/-]*"
+    r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})\s*$",
+    re.IGNORECASE,
+)
 _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS = {
     "available space", "building", "building size", "ceiling",
     "ceiling clearance", "ceiling height", "ceiling ht", "clearance",
@@ -2015,6 +2022,33 @@ def _is_property_fact_or_section_label(label: str) -> bool:
     )
 
 
+def _contains_property_fact_label(text: str) -> bool:
+    """Find a semantic mapped-field label on either side of its value."""
+    tokens = re.findall(r"(?<![a-z0-9])[a-z][a-z0-9]*", (text or "").lower())
+    return any(
+        _is_property_fact_or_section_label(" ".join(tokens[start:end]))
+        for start in range(len(tokens))
+        for end in range(start + 1, min(start + 8, len(tokens)) + 1)
+    )
+
+
+def _postfixed_unbound_identity(fragment: str, target_anchor: str) -> bool:
+    """Whether a fact is followed by an unknown, non-address identity."""
+    if _source_mentions_target_property(fragment, target_anchor):
+        return False
+    identity = _UNBOUND_IDENTITY_POSTFIX_RE.search(fragment)
+    if not identity:
+        return False
+    fact_text = fragment[:identity.start()]
+    if (
+        not _NUMERIC_PROPERTY_VALUE_RE.search(fact_text)
+        or not _contains_property_fact_label(fact_text)
+    ):
+        return False
+    label = " ".join(re.findall(r"[a-z0-9]+", identity.group("label").lower()))
+    return not _is_property_fact_or_section_label(label)
+
+
 def _property_clause_spans(text: str) -> List[tuple]:
     """Split prose without treating decimal or street-suffix periods as boundaries."""
     text = text or ""
@@ -2064,6 +2098,26 @@ def _unbound_identity_fact_spans(
         if not _is_property_fact_or_section_label(line_label):
             unbound_spans.append((current[0], following[1]))
 
+    # The same table layout can extract in the opposite order: mapped fact
+    # first, property heading second. Start the boundary at the fact so its
+    # value cannot remain in the preceding target-bound segment.
+    for current, following in zip(clause_spans, clause_spans[1:]):
+        current_text = text[current[0]:current[1]]
+        following_text = text[following[0]:following[1]]
+        postfixed_identity = _STANDALONE_IDENTITY_LINE_RE.match(following_text)
+        if (
+            postfixed_identity
+            and not _source_mentions_target_property(following_text, target_anchor)
+            and _NUMERIC_PROPERTY_VALUE_RE.search(current_text)
+            and _contains_property_fact_label(current_text)
+        ):
+            postfixed_label = " ".join(re.findall(
+                r"[a-z0-9]+",
+                postfixed_identity.group("label").lower(),
+            ))
+            if not _is_property_fact_or_section_label(postfixed_label):
+                unbound_spans.append((current[0], following[1]))
+
     for clause_start, clause_end in clause_spans:
         clause = text[clause_start:clause_end]
         if _source_mentions_target_property(clause, target_anchor):
@@ -2080,6 +2134,11 @@ def _unbound_identity_fact_spans(
         # Preserve only the explicit label set; every unknown heading fails
         # closed as a new property identity.
         if not _is_property_fact_or_section_label(label):
+            unbound_spans.append((clause_start, clause_end))
+
+    for clause_start, clause_end in clause_spans:
+        clause = text[clause_start:clause_end]
+        if _postfixed_unbound_identity(clause, target_anchor):
             unbound_spans.append((clause_start, clause_end))
 
     # A period after a street suffix is ambiguous: it may be the abbreviation
@@ -2100,6 +2159,11 @@ def _unbound_identity_fact_spans(
             continue
         label = " ".join(re.findall(r"[a-z0-9]+", identity.group("label").lower()))
         if not _is_property_fact_or_section_label(label):
+            unbound_spans.append((segment_start, segment_end))
+
+    for segment in re.finditer(r"(?:^|[.!?;\n])(?P<body>[^.!?;\n]+)", text):
+        segment_start, segment_end = segment.span("body")
+        if _postfixed_unbound_identity(segment.group("body"), target_anchor):
             unbound_spans.append((segment_start, segment_end))
     return sorted(set(unbound_spans))
 
