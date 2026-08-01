@@ -695,17 +695,30 @@ class JillJuneRegressionTests(unittest.TestCase):
 
     def test_target_terminal_survives_ancillary_lease_in_same_clause(self):
         event = {"type": "property_unavailable", "reason": "leased"}
-
-        self.assertTrue(
-            processing._property_unavailable_event_applies_to_row(
-                event,
-                row_anchor="100 Main St, Phoenix",
-                message_text=(
-                    "The trailer lot is leased separately, and 100 Main St "
-                    "has been leased too."
-                ),
-            )
+        messages = (
+            "The trailer lot is leased separately, and 100 Main St has been leased too.",
+            "100 Main St has been leased, and the trailer lot is leased separately.",
         )
+
+        for message_text in messages:
+            with self.subTest(message_text=message_text):
+                proposal = ai_processing._augment_events_with_deterministic_signals(
+                    {"updates": [], "events": [], "response_email": "Thanks."},
+                    [{"direction": "inbound", "content": message_text}],
+                    target_anchor="100 Main St, Phoenix",
+                )
+                self.assertIn(
+                    "property_unavailable",
+                    [event.get("type") for event in proposal["events"]],
+                )
+                self.assertIsNone(proposal["response_email"])
+                self.assertTrue(
+                    processing._property_unavailable_event_applies_to_row(
+                        event,
+                        row_anchor="100 Main St, Phoenix",
+                        message_text=message_text,
+                    )
+                )
 
     def test_addressless_unavailable_event_preserves_explicitly_viable_target(self):
         event = {"type": "property_unavailable", "reason": "leased"}

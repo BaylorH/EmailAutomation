@@ -663,6 +663,41 @@ def _address_binding_numbers(text: str) -> set:
     return numbers
 
 
+_TERMINAL_SUBJECT_SEPARATOR_RE = re.compile(
+    r",\s*(?:and|but|while|whereas)\s+|\s+(?:and|but|while|whereas)\s+",
+    re.IGNORECASE,
+)
+
+
+def _contains_unavailable_signal(text: str) -> bool:
+    return any(re.search(pattern, text or "", re.IGNORECASE) for _reason, pattern in _UNAVAILABLE_PATTERNS)
+
+
+def _terminal_subject_clauses(text: str) -> List[str]:
+    """Split conjunctions only when each side owns a terminal assertion."""
+    clauses = [
+        clause.strip()
+        for clause in re.split(r"(?<=[.!?;])\s+|\n+", text or "")
+        if clause.strip()
+    ]
+    while True:
+        changed = False
+        expanded = []
+        for clause in clauses:
+            for separator in _TERMINAL_SUBJECT_SEPARATOR_RE.finditer(clause):
+                left = clause[:separator.start()].strip(" ,")
+                right = clause[separator.end():].strip(" ,")
+                if _contains_unavailable_signal(left) and _contains_unavailable_signal(right):
+                    expanded.extend((left, right))
+                    changed = True
+                    break
+            else:
+                expanded.append(clause)
+        clauses = expanded
+        if not changed:
+            return clauses
+
+
 def _detect_target_terminal_reason(latest_text: str, target_anchor: Optional[str]) -> Optional[str]:
     """Return a terminal reason ONLY when a terminal phrase binds to the TARGET
     property — negation-aware and target-grounded (A′ FIX-01, CodeRabbit PR#15).
@@ -675,10 +710,12 @@ def _detect_target_terminal_reason(latest_text: str, target_anchor: Optional[str
     text = (latest_text or "").lower()
     target_numbers = _address_binding_numbers(target_anchor or "")
     has_global_viability = bool(_VIABILITY_RE.search(text))
-    sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+    sentences = _terminal_subject_clauses(text)
 
-    for sentence in sentences:
-        for reason, pattern in _UNAVAILABLE_PATTERNS:
+    # Pattern order is canonical reason precedence; evaluate it across every
+    # subject clause before falling through to a less-specific reason.
+    for reason, pattern in _UNAVAILABLE_PATTERNS:
+        for sentence in sentences:
             match = re.search(pattern, sentence)
             if not match:
                 continue
@@ -1941,21 +1978,47 @@ _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS = {
 }
 _PROPERTY_NAME_SUFFIX_LABEL_TOKENS = {
     "building", "campus", "center", "centre", "commons", "complex",
-    "facility", "hub", "park", "plaza", "tower", "warehouse",
+    "crossing", "exchange", "facility", "heights", "hub", "landing",
+    "park", "place", "plaza", "point", "square", "station", "terrace",
+    "tower", "village", "warehouse", "works",
 }
-_PROPERTY_FACT_CORE_LABEL_TOKENS = {
-    "amperage", "amps", "area", "cam", "capacity", "ceiling", "charges",
-    "clear", "clearance", "dock", "docks", "doors", "drive", "electrical",
-    "expense", "expenses", "footage", "ft", "height", "ht", "lease",
-    "loading", "op", "opex", "ops", "positions", "power", "rate",
-    "rent", "sf", "size", "space", "sq", "voltage",
-}
-_PROPERTY_FACT_LABEL_VOCABULARY = _PROPERTY_FACT_CORE_LABEL_TOKENS | {
-    "annual", "asking", "available", "cam", "charges", "count", "ex",
-    "feet", "foot", "ft", "grade", "high", "in", "level", "monthly",
-    "nnn", "number", "operating", "per", "phase", "psf", "service",
-    "sq", "square", "supply", "total", "truck", "volts", "year", "yr",
-}
+_PROPERTY_FACT_LABEL_FAMILIES = (
+    (
+        {"area", "footage", "ft", "sf", "size", "space"},
+        {"area", "available", "building", "feet", "foot", "footage", "ft",
+         "office", "sf", "size", "space", "sq", "square", "total",
+         "warehouse"},
+    ),
+    (
+        {"ceiling", "clearance", "height", "ht"},
+        {"ceiling", "clear", "clearance", "height", "ht"},
+    ),
+    (
+        {"dock", "docks", "positions"},
+        {"count", "dock", "docks", "doors", "high", "loading", "number",
+         "positions", "total", "truck"},
+    ),
+    (
+        {"drive", "grade"},
+        {"count", "doors", "drive", "grade", "in", "level", "number",
+         "positions", "total"},
+    ),
+    (
+        {"amperage", "amps", "electrical", "power", "voltage"},
+        {"amperage", "amps", "capacity", "electrical", "phase", "power",
+         "service", "supply", "voltage", "volts"},
+    ),
+    (
+        {"lease", "rate", "rent"},
+        {"annual", "asking", "lease", "monthly", "nnn", "per", "psf",
+         "rate", "rent", "sf", "year", "yr"},
+    ),
+    (
+        {"cam", "charges", "expense", "expenses", "op", "opex", "ops"},
+        {"annual", "cam", "charges", "ex", "expense", "expenses", "nnn",
+         "op", "opex", "operating", "ops", "per", "psf", "sf"},
+    ),
+)
 _STANDALONE_IDENTITY_LINE_RE = re.compile(
     r"^\s*(?P<label>[a-z][a-z0-9&'’/-]*"
     r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})\s*[-–—:=|•·,/>→(\[]?\s*$",
@@ -1972,9 +2035,9 @@ def _is_property_fact_or_section_label(label: str) -> bool:
     if not tokens or tokens[-1] in _PROPERTY_NAME_SUFFIX_LABEL_TOKENS:
         return False
     token_set = set(tokens)
-    return bool(
-        token_set & _PROPERTY_FACT_CORE_LABEL_TOKENS
-        and token_set <= _PROPERTY_FACT_LABEL_VOCABULARY
+    return any(
+        token_set & required and token_set <= allowed
+        for required, allowed in _PROPERTY_FACT_LABEL_FAMILIES
     )
 
 

@@ -721,6 +721,7 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
     def test_fact_token_property_names_remain_competing(self):
         competing_headings = (
             ("Power", "1200A", "Power Center | 1200A"),
+            ("Power", "1200A", "Power Square | 1200A"),
             ("Power", "1200A", "Westgate Power | 1200A"),
             ("Docks", "6", "Oak Docks | 6"),
         )
