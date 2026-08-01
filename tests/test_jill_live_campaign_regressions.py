@@ -704,6 +704,37 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 ))
                 self.assertIsNone(result["response_email"])
 
+    def test_postfixed_identity_after_same_fragment_target_fails_closed(self):
+        mixed_fragments = (
+            "100 Main St | 20,000 SF | Docks: 6 | Oak Center",
+            "100 Main St - 20,000 SF, Docks: 6 | Oak Center",
+            "100 Main St — 20,000 SF — Docks: 6 — Oak Center",
+        )
+
+        for mixed_fragment in mixed_fragments:
+            with self.subTest(mixed_fragment=mixed_fragment):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [{"column": "Docks", "value": "6"}],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"{mixed_fragment}.",
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
     def test_exact_target_postfix_preserves_target_fact_updates(self):
         target_clauses = (
             "Docks: 6 | 100 Main St",

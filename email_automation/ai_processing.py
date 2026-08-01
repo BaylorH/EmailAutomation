@@ -2034,10 +2034,10 @@ def _contains_property_fact_label(text: str) -> bool:
 
 def _postfixed_unbound_identity(fragment: str, target_anchor: str) -> bool:
     """Whether a fact is followed by an unknown, non-address identity."""
-    if _source_mentions_target_property(fragment, target_anchor):
-        return False
     identity = _UNBOUND_IDENTITY_POSTFIX_RE.search(fragment)
     if not identity:
+        return False
+    if _source_mentions_target_property(fragment[identity.start():], target_anchor):
         return False
     fact_text = fragment[:identity.start()]
     if (
