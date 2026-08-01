@@ -2087,8 +2087,8 @@ def _terminal_binding_clauses(message_text: str) -> List[str]:
         clause.strip()
         for clause in re.split(
             r"(?<=[.!?])\s+|\n+|\s*;\s*|"
-            r",\s*(?:but|while|whereas)\s+|"
-            r"\s+(?:but|while|whereas)\s+|"
+            r",\s*(?:while|whereas)\s+|"
+            r"\s+(?:while|whereas)\s+|"
             r",\s*and\s+(?=(?:i|we|here|attached|included|please)\b)|"
             r"\s+and\s+(?=(?:i|we|here|attached|included|please)\b)",
             message_text or "",

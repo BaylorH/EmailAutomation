@@ -726,8 +726,8 @@ def _detect_target_requirements_mismatch(
         clause.strip()
         for clause in re.split(
             r"(?<=[.!?;])\s+|\n+|"
-            r",\s*(?:but|while|whereas)\s+|\s+(?:but|while|whereas)\s+|"
-            r",?\s+(?:and|or)\s+(?=\d{1,6}\s+[a-z])",
+            r",\s*(?:while|whereas)\s+|\s+(?:while|whereas)\s+|"
+            r",?\s+(?:and|but|or)\s+(?=\d{1,6}\s+[a-z])",
             latest_text or "",
             flags=re.IGNORECASE,
         )

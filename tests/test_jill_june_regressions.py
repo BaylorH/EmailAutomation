@@ -484,6 +484,49 @@ class JillJuneRegressionTests(unittest.TestCase):
                     )
                 )
 
+    def test_ancillary_only_but_stays_scoped_across_address_lengths(self):
+        event = {"type": "property_unavailable", "reason": "requirements_mismatch"}
+        street_addresses = (
+            "1 A St",
+            "12 B St",
+            "123 Main St",
+            "1234 Main St",
+            "12345 Long Rd",
+            "123456 Long Rd",
+        )
+
+        for street_address in street_addresses:
+            for conjunction in (", but ", " but "):
+                message_text = (
+                    f"At {street_address}, the outparcel is fully leased"
+                    f"{conjunction}mostly office."
+                )
+                with self.subTest(
+                    street_address=street_address,
+                    conjunction=conjunction,
+                ):
+                    proposal = ai_processing._augment_events_with_deterministic_signals(
+                        {"updates": [], "events": [], "response_email": "Thanks."},
+                        [{"direction": "inbound", "content": message_text}],
+                        target_anchor=f"{street_address}, Phoenix",
+                    )
+                    actual = {
+                        "generated": "property_unavailable" in [
+                            event.get("type") for event in proposal["events"]
+                        ],
+                        "applies_to_row": (
+                            processing._property_unavailable_event_applies_to_row(
+                                event,
+                                row_anchor=f"{street_address}, Phoenix",
+                                message_text=message_text,
+                            )
+                        ),
+                    }
+                    self.assertEqual(
+                        {"generated": False, "applies_to_row": False},
+                        actual,
+                    )
+
     def test_downstream_guard_rejects_tour_only_unavailability_as_nonviable(self):
         event = {"type": "property_unavailable", "reason": "model"}
 
