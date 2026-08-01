@@ -65,6 +65,12 @@ EXPECTED_PAYLOAD_HASH = (
 EXPECTED_SCRIPT_HASH = (
     "e7cd4fa9b3f5619c4dbc668aac27ca67e1e9dd879f4f34bdcc4a56784bfb499b"
 )
+UNICODE_DRIFT_BYTES_BASE64 = (
+    "eyJzY2hlbWFWZXJzaW9uIjoxLCJyZWNvdmVyeVByb2ZpbGUiOiJtYW5hZ2VkSW5pdGlhbE91dHJlYWNoTjEiLCJ1aWQiOiJzeW50aGV0aWMtdXNlci1hIiwiY2xpZW50SWQiOiJzeW50aGV0aWMtY2xpZW50LWEiLCJvdXRib3hJZCI6InN5bnRoZXRpYy1vdXRib3gtYSIsInJlY292ZXJ5UnVuSWQiOiJzeW50aGV0aWMtcnVuLWEiLCJzb3VyY2UiOiJtYW5hZ2VkX2luaXRpYWxfb3V0cmVhY2hfbjEiLCJhY3Rpb25UeXBlIjoiY2FtcGFpZ25fbGF1bmNoIiwiYXNzaWduZWRFbWFpbHMiOlsiYnJva2VyQGV4YW1wbGUudGVzdCJdLCJzY3JpcHQiOiJTeW50aGV0aWMgc2NyaXB0LiIsInN1YmplY3QiOiJTeW50aGV0aWMgc3ViamVjdCIsImFza0ZpZWxkcyI6WyLhsokiLCLhsooiLCLDiSIsIsOpIiwiQ0FQIFJhdGUiXSwicm93TnVtYmVyIjoxfQ=="
+)
+UNICODE_DRIFT_PAYLOAD_HASH = (
+    "6fd9f9947280458d39aa990c9ddb43db012ca49b058520b4600f77189f8da8e9"
+)
 PAYLOAD_KEYS = [
     "schemaVersion",
     "recoveryProfile",
@@ -89,6 +95,22 @@ def clone_known_input():
             **KNOWN_INPUT["outbox"],
             "assignedEmails": list(KNOWN_INPUT["outbox"]["assignedEmails"]),
             "askFields": list(KNOWN_INPUT["outbox"]["askFields"]),
+        },
+    }
+
+
+def unicode_drift_input():
+    return {
+        "uid": "synthetic-user-a",
+        "clientId": "synthetic-client-a",
+        "outboxId": "synthetic-outbox-a",
+        "recoveryRunId": "synthetic-run-a",
+        "outbox": {
+            "assignedEmails": ["Broker@Example.TEST"],
+            "script": "Synthetic script.",
+            "subject": "Synthetic subject",
+            "askFields": ["\u1c89", "\u1c8a", "É", "é", "CAP Rate", "cap rate"],
+            "rowNumber": 1,
         },
     }
 
@@ -127,6 +149,25 @@ class RecoveryPayloadTests(unittest.TestCase):
         self.assertEqual(["broker@example.test"], payload["assignedEmails"])
         self.assertEqual(["Rent/SF/YR", "CAP Rate"], payload["askFields"])
 
+    def test_uses_deterministic_ascii_only_folding_for_cross_language_parity(self):
+        import base64
+
+        payload = build_canonical_recovery_payload(unicode_drift_input())
+        serialized = serialize_canonical_recovery_payload(payload)
+
+        self.assertEqual(["broker@example.test"], payload["assignedEmails"])
+        self.assertEqual(
+            ["\u1c89", "\u1c8a", "É", "é", "CAP Rate"], payload["askFields"]
+        )
+        self.assertEqual(
+            UNICODE_DRIFT_BYTES_BASE64,
+            base64.b64encode(serialized).decode("ascii"),
+        )
+        self.assertEqual(
+            UNICODE_DRIFT_PAYLOAD_HASH,
+            hash_recovery_payload(payload),
+        )
+
     def test_accepts_null_row_number_and_empty_ask_fields(self):
         test_input = clone_known_input()
         test_input["outbox"]["rowNumber"] = None
@@ -159,6 +200,10 @@ class RecoveryPayloadTests(unittest.TestCase):
             "one@example.test",
             ["not-an-email"],
             ["bad@example"],
+            [".a@example.test"],
+            ["a.@example.test"],
+            ["a..b@example.test"],
+            ["K@example.test"],
             ["line\nbreak@example.test"],
             [7],
         ):
@@ -176,12 +221,17 @@ class RecoveryPayloadTests(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     build_canonical_recovery_payload(test_input)
 
-    def test_rejects_multiline_overlong_or_non_string_subjects(self):
+    def test_rejects_line_breaking_overlong_or_non_string_subjects(self):
         for value in (
             "",
             "  \t ",
             "first\nsecond",
             "first\rsecond",
+            "first\u000bsecond",
+            "first\u000csecond",
+            "first\u0085second",
+            "first\u2028second",
+            "first\u2029second",
             "x" * 256,
             7,
             None,

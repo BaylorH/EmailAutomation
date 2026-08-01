@@ -27,7 +27,8 @@ _PAYLOAD_KEYS = (
 )
 _ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _EMAIL_PATTERN = re.compile(
-    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
+    r"(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
     r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+"
 )
@@ -37,6 +38,7 @@ _ECMASCRIPT_TRIM_CHARACTERS = (
     "\u202f\u205f\u3000\ufeff\u000a\u000d\u2028\u2029"
 )
 _MAX_SAFE_INTEGER = (2**53) - 1
+_SUBJECT_LINE_BREAKS = frozenset("\u000a\u000b\u000c\u000d\u0085\u2028\u2029")
 
 
 def _require_exact_keys(value: Any, expected_keys: tuple[str, ...], label: str) -> dict:
@@ -66,8 +68,15 @@ def _normalize_id(value: Any, label: str) -> str:
     return normalized
 
 
+def _ascii_lower(value: str) -> str:
+    return "".join(
+        chr(ord(character) + 32) if "A" <= character <= "Z" else character
+        for character in value
+    )
+
+
 def _normalize_email(value: Any) -> str:
-    normalized = _trim(_require_string(value, "assigned email")).lower()
+    normalized = _ascii_lower(_trim(_require_string(value, "assigned email")))
     separator = normalized.rfind("@")
     if (
         len(normalized) > 254
@@ -98,7 +107,7 @@ def _normalize_subject(value: Any) -> str:
     subject = _trim(_require_string(value, "subject"))
     if not subject:
         raise TypeError("subject must be nonempty")
-    if any(separator in subject for separator in ("\r", "\n", "\u2028", "\u2029")):
+    if any(character in _SUBJECT_LINE_BREAKS for character in subject):
         raise TypeError("subject must be one line")
     if len(subject) > 255:
         raise TypeError("subject must be at most 255 characters")
@@ -115,7 +124,7 @@ def _normalize_ask_fields(value: Any) -> List[str]:
         field = _trim(_require_string(raw_field, "ask field"))
         if not field:
             raise TypeError("ask fields must be nonempty after trimming")
-        comparison_key = field.lower()
+        comparison_key = _ascii_lower(field)
         if comparison_key not in seen:
             seen.add(comparison_key)
             normalized.append(field)
