@@ -1401,6 +1401,12 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "Figure A-1 — Building Facts",
             "Exhibit B.2 (Property Summary)",
             "Schedule 1-A: Property Summary",
+            "Table (1): Building Facts",
+            "fIgUrE (IV) — Property Summary",
+            "Section (4.2): Loading Details",
+            "Schedule (A-1): Property Summary",
+            "Exhibit [B.2] (Property Summary)",
+            "VERSION [7A] - Building Facts",
             "Table: Building Facts",
         )
         expected_updates = [
@@ -1503,6 +1509,12 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "Exhibit C-3: Westgate Logistics Hub",
             "Version II: Oak Center",
             "Revision 7A - Oak Center",
+            "Table (1): Oak Center",
+            "fIgUrE (IV) — Westgate Logistics Hub",
+            "Section (4.2): Oak Center",
+            "Schedule (A-1): Oak Center",
+            "Exhibit [B.2] (Oak Center)",
+            "VERSION [7A] - Oak Center",
         )
 
         for heading in headings:

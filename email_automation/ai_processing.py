@@ -1930,11 +1930,16 @@ def _source_mentions_target_property(source_text: str, target_anchor: str) -> bo
 _NUMERIC_PROPERTY_VALUE_RE = re.compile(r"\$?\s*\d")
 _PROPERTY_CLAUSE_BREAK_RE = re.compile(r"(?<!\d)[.!?;](?!\d)|\n+")
 _MARKDOWN_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
+_DOCUMENT_CAPTION_DESIGNATOR_PATTERN = (
+    r"(?:\d+(?:[.-]\d+)*(?:-?[a-z])?|[a-z](?:[-.]\d+)+|[a-z]\d+|"
+    r"[ivxlcdm]+|[a-z])"
+)
 _DOCUMENT_CAPTION_RE = re.compile(
     r"^\s*(?:table|figure|page|section|schedule|exhibit|version|revision)\s+"
     r"(?:#\s*)?"
-    r"(?:\d+(?:[.-]\d+)*(?:-?[a-z])?|[a-z](?:[-.]\d+)+|[a-z]\d+|"
-    r"[ivxlcdm]+|[a-z])"
+    rf"(?:{_DOCUMENT_CAPTION_DESIGNATOR_PATTERN}|"
+    rf"\(\s*{_DOCUMENT_CAPTION_DESIGNATOR_PATTERN}\s*\)|"
+    rf"\[\s*{_DOCUMENT_CAPTION_DESIGNATOR_PATTERN}\s*\])"
     r"(?=$|\s|[:(–—-]|\.(?=\s))(?P<suffix>.*)$",
     re.IGNORECASE,
 )
@@ -2387,6 +2392,10 @@ def _unbound_identity_fact_spans(
     # a mapped property fact as a structural identity boundary while preserving
     # explicit field/section labels such as "Clear Height" and "Highlights".
     clause_spans = _property_clause_spans(text)
+    structural_caption_spans = [
+        span for span in clause_spans
+        if _document_caption_verdict(text[span[0]:span[1]]) == "structural"
+    ]
     for current, following in zip(clause_spans, clause_spans[1:]):
         if current in structured_table_labels:
             continue
@@ -2481,6 +2490,11 @@ def _unbound_identity_fact_spans(
     for segment in re.finditer(r"(?:^|[.!?;\n])(?P<body>[^.!?;\n]+)", text):
         segment_start, segment_end = segment.span("body")
         segment_text = segment.group("body")
+        if any(
+            start <= segment_start and segment_end <= end
+            for start, end in structural_caption_spans
+        ):
+            continue
         caption_verdict = _document_caption_verdict(segment_text)
         if (
             _source_mentions_target_property(segment_text, target_anchor)
@@ -2502,6 +2516,11 @@ def _unbound_identity_fact_spans(
 
     for segment in re.finditer(r"(?:^|[.!?;\n])(?P<body>[^.!?;\n]+)", text):
         segment_start, segment_end = segment.span("body")
+        if any(
+            start <= segment_start and segment_end <= end
+            for start, end in structural_caption_spans
+        ):
+            continue
         if _postfixed_unbound_identity(segment.group("body"), target_anchor):
             unbound_spans.append((segment_start, segment_end))
     return sorted(set(unbound_spans))
