@@ -1,8 +1,14 @@
 import re
 import time
 import random
+import errno
+import socket
+import ssl
 from typing import Optional, List, Dict, Any
+import httplib2
+from google.auth.exceptions import TransportError
 from googleapiclient.errors import HttpError
+from requests import exceptions as requests_exceptions
 from .clients import _sheets_client
 from .column_config import (
     CANONICAL_FIELDS,
@@ -19,11 +25,44 @@ MAX_DELAY_SECONDS = 60.0
 
 
 def is_retryable_sheets_error(error: Exception) -> bool:
-    """Return whether Google Sheets reported a temporary HTTP failure."""
-    if not isinstance(error, HttpError):
-        return False
-    status = getattr(error.resp, "status", None)
-    return status == 429 or (isinstance(status, int) and 500 <= status < 600)
+    """Return whether a read-like Sheets operation can be retried later.
+
+    This classifier is intentionally broader than ``_execute_with_retry``. The
+    latter sits below both reads and non-idempotent mutations and therefore only
+    replays explicit 429 responses. Callers such as the campaign recipient guard
+    use this function above a read-only operation to reschedule the whole item.
+    """
+    seen = set()
+    current = error
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, HttpError):
+            status = getattr(current.resp, "status", None)
+            if status == 429 or (isinstance(status, int) and 500 <= status < 600):
+                return True
+        if isinstance(
+            current,
+            (
+                socket.timeout,
+                ssl.SSLError,
+                ConnectionError,
+                httplib2.ServerNotFoundError,
+                TransportError,
+                requests_exceptions.Timeout,
+                requests_exceptions.ConnectionError,
+            ),
+        ):
+            return True
+        if isinstance(current, OSError) and current.errno in {
+            errno.ETIMEDOUT,
+            errno.EPIPE,
+            errno.ECONNABORTED,
+            errno.ECONNREFUSED,
+            errno.ECONNRESET,
+        }:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _execute_with_retry(request, operation_name: str = "Sheets API"):

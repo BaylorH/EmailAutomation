@@ -28,6 +28,7 @@ safety-relevant behavior that would FAIL if the guard regressed:
 """
 
 import os
+import socket
 import unittest
 from unittest import mock
 
@@ -387,6 +388,73 @@ class UploadMappingWrongRecipientTests(unittest.TestCase):
         self.assertIsNone(retry_patch["processingBy"])
         self.assertIsNone(retry_patch["processingAt"])
         mark_retrying.assert_called_once()
+
+    def test_transient_sheet_transport_errors_retry_without_dead_letter(self):
+        transient_errors = (
+            socket.timeout("sheet read timed out"),
+            ConnectionResetError("sheet connection reset"),
+        )
+
+        for index, transient_error in enumerate(transient_errors):
+            with self.subTest(error=type(transient_error).__name__):
+                data = {
+                    "source": "dashboard_new_campaign",
+                    "clientId": "client-1",
+                    "rowNumber": self.ROW_NUM,
+                    "attempts": 0,
+                }
+                doc_ref = _FakeOutboxDocRef(f"outbox-transport-{index}")
+
+                with mock.patch.object(
+                    email_mod,
+                    "_campaign_sheet_header_and_row",
+                    side_effect=transient_error,
+                ), mock.patch.object(
+                    email_mod,
+                    "_move_to_dead_letter",
+                ) as dead_letter, mock.patch.object(
+                    email_mod,
+                    "_mark_outbox_action_audit_retrying",
+                ) as mark_retrying:
+                    handled = email_mod._dead_letter_campaign_recipient_row_mismatch_if_needed(
+                        "user-1",
+                        doc_ref,
+                        data,
+                        "broker@example.com",
+                    )
+
+                self.assertTrue(handled)
+                dead_letter.assert_not_called()
+                retry_patch, merge = doc_ref.set_calls[0]
+                self.assertTrue(merge)
+                self.assertEqual("retrying", retry_patch["status"])
+                self.assertEqual(1, retry_patch["attempts"])
+                mark_retrying.assert_called_once()
+
+    def test_nontransport_sheet_verification_error_dead_letters(self):
+        data = {
+            "source": "dashboard_new_campaign",
+            "clientId": "client-1",
+            "rowNumber": self.ROW_NUM,
+            "attempts": 0,
+        }
+        doc_ref = _FakeOutboxDocRef("outbox-permanent-error")
+
+        with mock.patch.object(
+            email_mod,
+            "_campaign_sheet_header_and_row",
+            side_effect=ValueError("invalid sheet response"),
+        ), mock.patch.object(email_mod, "_move_to_dead_letter") as dead_letter:
+            handled = email_mod._dead_letter_campaign_recipient_row_mismatch_if_needed(
+                "user-1",
+                doc_ref,
+                data,
+                "broker@example.com",
+            )
+
+        self.assertTrue(handled)
+        dead_letter.assert_called_once()
+        self.assertEqual([], doc_ref.set_calls)
 
 
 class UploadMappingTerminalStateTests(unittest.TestCase):
