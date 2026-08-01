@@ -1024,6 +1024,42 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 [docks],
             ),
             (
+                "fully quoted csv rows",
+                "100 Main St, Phoenix",
+                "\"Docks\", \"Power\"\n"
+                "\"6\", \"1200A 480V 3-phase\"\n"
+                "\"100 Main St, Phoenix\", \"Oak Center\"",
+                [docks, power],
+                [docks],
+            ),
+            (
+                "mixed quoting and spaces",
+                "100 Main St, Phoenix",
+                "  \"Docks\"  ,   Power  \n"
+                "  \"6\"  ,   1200A 480V 3-phase  \n"
+                "  \"100 Main St, Phoenix\"  ,   Oak Center  ",
+                [docks, power],
+                [docks],
+            ),
+            (
+                "escaped quotes in labels and identities",
+                "100 Main St, Phoenix",
+                "\"Dock \"\"Doors\"\"\", \"Power\"\n"
+                "\"6\", \"1200A 480V 3-phase\"\n"
+                "\"100 Main St, Phoenix\", \"Oak \"\"Power\"\" Center\"",
+                [docks, power],
+                [docks],
+            ),
+            (
+                "fully quoted numeric comma",
+                "100 Main St, Phoenix",
+                "\"Total SF\",\"Docks\"\n"
+                "\"45,000\",\"6\"\n"
+                "\"100 Main St,Phoenix\",\"Oak Center\"",
+                [total_sf, docks],
+                [total_sf],
+            ),
+            (
                 "numeric and address commas",
                 "100 Main St, Phoenix",
                 "Total SF, Docks\n"

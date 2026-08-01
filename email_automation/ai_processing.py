@@ -2079,17 +2079,25 @@ def _property_table_cells(
 ) -> List[str]:
     """Split an extracted table row without splitting numeric commas."""
     row = (row or "").strip()
+    parsed_csv = False
     if "|" in row:
         cells = row.split("|")
     elif "\t" in row:
         cells = re.split(r"\t+", row)
-    elif identity_row and '"' in row and "," in row:
+    elif '"' in row and "," in row:
         cells = next(csv.reader([row], skipinitialspace=True))
+        parsed_csv = True
     elif re.search(r",\s+", row):
         cells = re.split(r",\s+", row)
     else:
         return [row]
-    cells = [cell.strip() for cell in cells]
+    if parsed_csv:
+        cells = [
+            " ".join(cell.replace('"', " ").split())
+            for cell in cells
+        ]
+    else:
+        cells = [cell.strip() for cell in cells]
     while cells and not cells[0]:
         cells.pop(0)
     while cells and not cells[-1]:
