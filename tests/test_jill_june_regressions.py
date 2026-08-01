@@ -928,6 +928,56 @@ class JillJuneRegressionTests(unittest.TestCase):
                     )
                 )
 
+    def test_shared_viability_predicate_preserves_target_across_address_lists(self):
+        address_pairs = (
+            ("1 Main St", "2 Oak Ave"),
+            ("123 Main St", "456 Oak Ave"),
+            ("123456 Main St", "654321 Oak Ave"),
+        )
+        shared_predicates = (
+            (", and ", "are both still available"),
+            (" and ", "are both still available"),
+            (", and ", "are still available"),
+            (" and ", "are still available"),
+            (", but ", "are both still available"),
+            (" but ", "are both still available"),
+            (", or ", "are both still available"),
+            (" or ", "are both still available"),
+        )
+
+        for target_address, competitor_address in address_pairs:
+            for first, second in (
+                (target_address, competitor_address),
+                (competitor_address, target_address),
+            ):
+                for conjunction, predicate in shared_predicates:
+                    message_text = f"{first}{conjunction}{second} {predicate}."
+                    event = {"type": "property_unavailable", "reason": "leased"}
+                    with self.subTest(
+                        target_address=target_address,
+                        first=first,
+                        conjunction=conjunction,
+                        predicate=predicate,
+                    ):
+                        patch = processing._pending_nonviable_followup_patch(
+                            [event],
+                            row_anchor=f"{target_address}, Phoenix",
+                            message_text=message_text,
+                        )
+                        self.assertEqual(
+                            {"applies_to_row": False, "pending_patch": None},
+                            {
+                                "applies_to_row": (
+                                    processing._property_unavailable_event_applies_to_row(
+                                        event,
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                ),
+                                "pending_patch": patch,
+                            },
+                        )
+
     def test_shared_terminal_predicate_applies_to_target_in_address_list(self):
         message_text = "100 Main St, Phoenix, and 200 Oak Ave are both leased."
         proposal = ai_processing._augment_events_with_deterministic_signals(

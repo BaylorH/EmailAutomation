@@ -2198,6 +2198,54 @@ def _nearest_property_binding(
     return next(iter(nearest_kinds)) if len(nearest_kinds) == 1 else None
 
 
+def _viability_is_shared_across_property_bindings(
+    clause: str,
+    bindings: List[tuple],
+    viability_match: re.Match,
+) -> bool:
+    """Whether one viability predicate governs a coordinated address list."""
+    if len(bindings) < 2 or any(
+        end > viability_match.start()
+        for _start, end, _kind in bindings
+    ):
+        return False
+
+    conjunctions = []
+    for previous, current in zip(bindings, bindings[1:]):
+        separator = (clause or "")[previous[1]:current[0]]
+        match = re.fullmatch(
+            r"\s*,?\s*(and|but|or)\s*",
+            separator,
+            re.IGNORECASE,
+        )
+        if not match:
+            return False
+        conjunctions.append(match.group(1).lower())
+
+    link_text = (clause or "")[bindings[-1][1]:viability_match.start()]
+    if not re.fullmatch(
+        r"[\s,]*(?:(?:are|remain|both)[\s,]*)*",
+        link_text,
+        re.IGNORECASE,
+    ):
+        return False
+
+    leading_text = (clause or "")[max(0, bindings[0][0] - 12):bindings[0][0]]
+    has_both = bool(
+        re.search(r"\bboth\s*$", leading_text, re.IGNORECASE)
+        or re.search(r"\bboth\b", link_text, re.IGNORECASE)
+    )
+    viability_text = viability_match.group(0).lower()
+    has_plural_link = bool(
+        re.search(r"\b(?:are|remain)\b", link_text, re.IGNORECASE)
+        or re.match(r"(?:are|remain)\b", viability_text)
+    )
+    return has_both or (
+        all(word == "and" for word in conjunctions)
+        and has_plural_link
+    )
+
+
 def _clause_names_competing_property(clause: str, row_anchor: str) -> bool:
     """Whether a clause explicitly names a non-target street or building."""
     if _source_mentions_target_property(clause, row_anchor):
@@ -2281,6 +2329,15 @@ def _message_explicitly_keeps_row_viable(message_text: str, row_anchor: str) -> 
     for sentence in _terminal_binding_clauses(message_text):
         bindings = _explicit_property_bindings(sentence, row_anchor)
         for viability_match in _VIABILITY_RE.finditer(sentence):
+            if (
+                _viability_is_shared_across_property_bindings(
+                    sentence,
+                    bindings,
+                    viability_match,
+                )
+                and any(kind == "target" for _start, _end, kind in bindings)
+            ):
+                return True
             binding = _nearest_property_binding(
                 bindings,
                 viability_match.start(),
