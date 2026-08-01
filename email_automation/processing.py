@@ -2209,11 +2209,48 @@ _VIABILITY_NEGATION_PREFIX_RE = re.compile(
 )
 
 
-def _viability_match_is_negated(clause: str, viability_match: re.Match) -> bool:
+def _neither_nor_binds_viability(
+    clause: str,
+    bindings: List[tuple],
+    viability_match: re.Match,
+) -> bool:
+    preceding_bindings = [
+        binding
+        for binding in bindings
+        if binding[1] <= viability_match.start()
+    ]
+    if len(preceding_bindings) < 2:
+        return False
+
+    first, second = preceding_bindings[-2:]
+    previous_end = (
+        preceding_bindings[-3][1]
+        if len(preceding_bindings) > 2
+        else 0
+    )
+    leading_text = (clause or "")[previous_end:first[0]]
+    separator = (clause or "")[first[1]:second[0]]
+    link_text = (clause or "")[second[1]:viability_match.start()]
+    return bool(
+        re.search(r"\bneither\s*$", leading_text, re.IGNORECASE)
+        and re.search(r"\bnor\s*$", separator, re.IGNORECASE)
+        and re.fullmatch(
+            r"[\s,]*(?:(?:is|are|both)[\s,]*)*",
+            link_text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _viability_match_is_negated(
+    clause: str,
+    bindings: List[tuple],
+    viability_match: re.Match,
+) -> bool:
     prefix = (clause or "")[:viability_match.start()]
     return bool(
         _VIABILITY_NEGATION_PREFIX_RE.search(prefix)
-        or re.search(r"\bneither\b.*\bnor\b", prefix, re.IGNORECASE | re.DOTALL)
+        or _neither_nor_binds_viability(clause, bindings, viability_match)
     )
 
 
@@ -2348,7 +2385,7 @@ def _message_explicitly_keeps_row_viable(message_text: str, row_anchor: str) -> 
     for sentence in _terminal_binding_clauses(message_text):
         bindings = _explicit_property_bindings(sentence, row_anchor)
         for viability_match in _VIABILITY_RE.finditer(sentence):
-            if _viability_match_is_negated(sentence, viability_match):
+            if _viability_match_is_negated(sentence, bindings, viability_match):
                 continue
             if (
                 _viability_is_shared_across_property_bindings(

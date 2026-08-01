@@ -1030,6 +1030,45 @@ class JillJuneRegressionTests(unittest.TestCase):
                             self.assertEqual("stopped", patch["followUpStatus"])
                             self.assertEqual(reason, patch["pendingTerminalReason"])
 
+    def test_unrelated_neither_nor_does_not_negate_later_target_viability(self):
+        target_addresses = (
+            "1 Main St",
+            "12 Main St",
+            "123 Main St",
+            "1234 Main St",
+            "12345 Main St",
+            "123456 Main St",
+        )
+        separators = (", but ", " but ", ". ", "; ")
+
+        for target_address in target_addresses:
+            for reason in ("leased", "sold", "no_space_available"):
+                event = {"type": "property_unavailable", "reason": reason}
+                for separator in separators:
+                    message_text = (
+                        f"Neither the broker nor the owner objected{separator}"
+                        f"{target_address} clearly remains available."
+                    )
+                    with self.subTest(
+                        target_address=target_address,
+                        reason=reason,
+                        separator=separator,
+                    ):
+                        self.assertFalse(
+                            processing._property_unavailable_event_applies_to_row(
+                                event,
+                                row_anchor=f"{target_address}, Phoenix",
+                                message_text=message_text,
+                            )
+                        )
+                        self.assertIsNone(
+                            processing._pending_nonviable_followup_patch(
+                                [event],
+                                row_anchor=f"{target_address}, Phoenix",
+                                message_text=message_text,
+                            )
+                        )
+
     def test_near_negated_availability_never_suppresses_target_terminal_event(self):
         address_pairs = (
             ("1 Main St", "2 Oak Ave"),
