@@ -23,10 +23,11 @@ from .messaging import (save_message, save_thread_root, index_message_id, index_
 from .logging import write_message_order_test
 from .ai_processing import (
     _VIABILITY_RE,
-    _address_binding_numbers,
     _append_ai_meta,
     _detect_target_terminal_reason,
+    _looks_like_requirements_mismatch_nonviable,
     _source_mentions_target_property,
+    _street_claim_spans,
     _target_street_identity,
     apply_proposal_to_sheet,
     check_missing_required_fields,
@@ -2062,42 +2063,147 @@ def _normalize_replacement_match_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
-def _message_has_competing_terminal_address(message_text: str, row_anchor: str) -> bool:
-    """Return whether a terminal clause names an address other than the row."""
-    target_numbers = _address_binding_numbers(row_anchor)
-    if not target_numbers:
-        return False
+def _terminal_binding_clauses(message_text: str) -> List[str]:
+    """Split independent property assertions without separating shared subjects."""
+    return [
+        clause.strip()
+        for clause in re.split(
+            r"(?<=[.!?])\s+|\n+|\s*;\s*|"
+            r",\s*(?:but|while|whereas)\s+|"
+            r"\s+(?:but|while|whereas)\s+|"
+            r",\s*and\s+(?=(?:i|we|here|attached|included|please)\b)|"
+            r"\s+and\s+(?=(?:i|we|here|attached|included|please)\b)",
+            message_text or "",
+            flags=re.IGNORECASE,
+        )
+        if clause.strip()
+    ]
 
-    binding_clauses = re.split(
-        r"(?<=[.!?])\s+|\n+|\s*;\s*|"
-        r",\s*(?:but|while|whereas)\s+|\s+(?:but|while|whereas)\s+",
-        message_text or "",
-        flags=re.IGNORECASE,
-    )
-    for clause in binding_clauses:
-        if not _detect_target_terminal_reason(clause, None):
-            continue
-        clause_numbers = _address_binding_numbers(clause)
-        if clause_numbers and target_numbers.isdisjoint(clause_numbers):
+
+_EXPLICIT_OTHER_PROPERTY_RE = re.compile(
+    r"\b(?:other|another|alternate|alternative|replacement|different|competing)\s+"
+    r"(?:building|property|space|suite|unit|warehouse|facility|center|centre|park|plaza|campus|complex)\b",
+    re.IGNORECASE,
+)
+_PROPER_NAMED_PROPERTY_RE = re.compile(
+    r"\b(?:[A-Z][A-Za-z0-9&'’-]*\s+){1,5}"
+    r"(?:Center|Centre|Park|Plaza|Campus|Complex|Building|Warehouse|Facility)\b",
+)
+_LOWER_NAMED_CENTER_RE = re.compile(
+    r"\b((?:[a-z][a-z0-9&'’-]*\s+){1,5})"
+    r"(?:center|centre|park|plaza|campus|complex)\b",
+    re.IGNORECASE,
+)
+_GENERIC_PROPERTY_NAME_TOKENS = {
+    "a", "an", "the", "this", "that", "current", "subject", "target",
+    "our", "your", "its", "new", "existing", "industrial", "commercial",
+    "commerce", "business", "logistics", "distribution", "office", "warehouse",
+}
+
+
+def _explicit_property_bindings(clause: str, row_anchor: str) -> List[tuple]:
+    """Return ``(start, end, target|competing)`` for explicit property claims."""
+    bindings = []
+    for claim in _street_claim_spans(clause):
+        start, end = claim[0], claim[1]
+        claim_text = clause[start:end]
+        binding = (
+            "target"
+            if _source_mentions_target_property(claim_text, row_anchor)
+            else "competing"
+        )
+        bindings.append((start, end, binding))
+
+    for pattern in (
+        _EXPLICIT_OTHER_PROPERTY_RE,
+        _PROPER_NAMED_PROPERTY_RE,
+        _LOWER_NAMED_CENTER_RE,
+    ):
+        for match in pattern.finditer(clause or ""):
+            match_text = match.group(0)
+            if pattern is _LOWER_NAMED_CENTER_RE:
+                name_tokens = set(re.findall(r"[a-z0-9]+", match.group(1).lower()))
+                if not name_tokens - _GENERIC_PROPERTY_NAME_TOKENS:
+                    continue
+            binding = (
+                "target"
+                if _source_mentions_target_property(match_text, row_anchor)
+                else "competing"
+            )
+            bindings.append((match.start(), match.end(), binding))
+
+    return sorted(set(bindings), key=lambda item: (item[0], item[1], item[2]))
+
+
+def _nearest_property_binding(
+    bindings: List[tuple],
+    evidence_start: int,
+    evidence_end: int,
+) -> Optional[str]:
+    if not bindings:
+        return None
+
+    def distance(binding: tuple) -> int:
+        start, end, _kind = binding
+        if end <= evidence_start:
+            return evidence_start - end
+        if start >= evidence_end:
+            return start - evidence_end
+        return 0
+
+    nearest_distance = min(distance(binding) for binding in bindings)
+    nearest_kinds = {
+        binding[2]
+        for binding in bindings
+        if distance(binding) == nearest_distance
+    }
+    return next(iter(nearest_kinds)) if len(nearest_kinds) == 1 else None
+
+
+def _clause_names_competing_property(clause: str, row_anchor: str) -> bool:
+    """Whether a clause explicitly names a non-target street or building."""
+    if _source_mentions_target_property(clause, row_anchor):
+        return False
+    if _street_claim_spans(clause):
+        return True
+    if _EXPLICIT_OTHER_PROPERTY_RE.search(clause) or _PROPER_NAMED_PROPERTY_RE.search(clause):
+        return True
+    for match in _LOWER_NAMED_CENTER_RE.finditer(clause or ""):
+        name_tokens = set(re.findall(r"[a-z0-9]+", match.group(1).lower()))
+        if name_tokens - _GENERIC_PROPERTY_NAME_TOKENS:
             return True
     return False
 
 
-def _message_explicitly_keeps_row_viable(message_text: str, row_anchor: str) -> bool:
-    row_norm = _normalize_replacement_match_text(row_anchor)
-    row_candidates = {
-        row_norm,
-        row_norm.split(",", 1)[0].strip(),
-    }
-    row_candidates = {candidate for candidate in row_candidates if len(candidate) >= 6}
+def _clause_has_terminal_property_evidence(
+    clause: str,
+    unavailable_keywords: List[str],
+) -> bool:
+    """Recognize market-unavailable and physical-mismatch terminal evidence."""
+    if _detect_target_terminal_reason(clause, None):
+        return True
+    if _looks_like_requirements_mismatch_nonviable(clause):
+        return True
+    clause_norm = _normalize_replacement_match_text(clause)
+    return any(keyword in clause_norm for keyword in unavailable_keywords)
 
-    for sentence in re.split(r"(?<=[.!?])\s+|\n+", message_text or ""):
-        sentence_norm = _normalize_replacement_match_text(sentence)
-        if (
-            any(candidate in sentence_norm for candidate in row_candidates)
-            and _VIABILITY_RE.search(sentence)
-        ):
-            return True
+
+def _message_explicitly_keeps_row_viable(message_text: str, row_anchor: str) -> bool:
+    last_explicit_binding = None
+    for sentence in _terminal_binding_clauses(message_text):
+        bindings = _explicit_property_bindings(sentence, row_anchor)
+        for viability_match in _VIABILITY_RE.finditer(sentence):
+            binding = _nearest_property_binding(
+                bindings,
+                viability_match.start(),
+                viability_match.end(),
+            )
+            if binding is None:
+                binding = last_explicit_binding or "target"
+            if binding == "target":
+                return True
+        if bindings:
+            last_explicit_binding = bindings[-1][2]
     return False
 
 
@@ -2129,6 +2235,11 @@ def _property_unavailable_event_applies_to_row(
         if keyword
     ]
 
+    # An explicit statement that the target remains viable wins over an
+    # addressless model event, regardless of what happened to another property.
+    if row_norm and message_norm and _message_explicitly_keeps_row_viable(message_text, row_anchor):
+        return False
+
     event_property = _format_event_property(event)
     if event_property:
         event_norm = _normalize_replacement_match_text(event_property)
@@ -2144,65 +2255,39 @@ def _property_unavailable_event_applies_to_row(
             )
         )
 
-    if (
-        _nonviable_status_reason(event) != "requirements_mismatch"
-        and _message_has_competing_terminal_address(message_text, row_anchor)
-    ):
-        row_is_named = any(
-            candidate in message_norm
-            for candidate in {
-                row_norm,
-                row_norm.split(",", 1)[0].strip(),
-            }
-            if len(candidate) >= 6
-        )
-        if not row_is_named or _message_explicitly_keeps_row_viable(message_text, row_anchor):
-            return False
-
     if not row_norm or not message_norm:
         return True
 
-    row_candidates = [
-        candidate
-        for candidate in {
-            row_norm,
-            row_norm.split(",", 1)[0].strip(),
-        }
-        if len(candidate) >= 6
-    ]
-    row_positions = [
-        idx
-        for candidate in row_candidates
-        for idx in [message_norm.find(candidate)]
-        if idx >= 0
-    ]
-    if not row_positions:
+    terminal_bindings = []
+    last_explicit_binding = None
+    for clause in _terminal_binding_clauses(message_text):
+        explicit_bindings = _explicit_property_bindings(clause, row_anchor)
+        if _clause_has_terminal_property_evidence(clause, keywords):
+            if _source_mentions_target_property(clause, row_anchor):
+                terminal_bindings.append("target")
+            elif _clause_names_competing_property(clause, row_anchor):
+                terminal_bindings.append("competing")
+            elif last_explicit_binding:
+                terminal_bindings.append(last_explicit_binding)
+            else:
+                terminal_bindings.append("addressless")
+        if explicit_bindings:
+            last_explicit_binding = explicit_bindings[-1][2]
+
+    if "target" in terminal_bindings:
+        return True
+    if "competing" in terminal_bindings:
+        # Bare language alongside an explicitly competing terminal statement is
+        # not enough to terminalize the target. A genuinely bare current-context
+        # reply has no competing binding and remains accepted below.
+        return False
+    if "addressless" in terminal_bindings:
         return True
 
-    keyword_positions = [
-        idx
-        for keyword in keywords
-        for idx in [message_norm.find(keyword)]
-        if idx >= 0
-    ]
-    if not keyword_positions:
-        return True
-
-    row_number_match = re.search(r"\b\d{2,6}\b", row_norm)
-    row_number = row_number_match.group(0) if row_number_match else None
-
-    for row_pos in row_positions:
-        for keyword_pos in keyword_positions:
-            if 0 <= keyword_pos - row_pos <= 180:
-                return True
-            if 0 <= row_pos - keyword_pos <= 80:
-                previous_window = message_norm[max(0, keyword_pos - 120):keyword_pos]
-                previous_numbers = set(re.findall(r"\b\d{2,6}\b", previous_window))
-                if previous_numbers and (not row_number or previous_numbers != {row_number}):
-                    continue
-                return True
-
-    return False
+    # Addressless property_unavailable events are normal model output. Preserve
+    # them only when the fresh message contains no explicit competing terminal
+    # evidence that can be grounded deterministically.
+    return True
 
 
 def _active_replacement_context(thread_data: Optional[Dict[str, Any]], message_text: str = "") -> Optional[Dict[str, Any]]:

@@ -492,6 +492,112 @@ class JillJuneRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_addressless_unavailable_event_does_not_bind_target_specs_to_competing_terminal(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertFalse(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text=(
+                    "200 Oak Ave is leased. "
+                    "I attached the requested specs for 100 Main St."
+                ),
+            )
+        )
+
+    def test_addressless_requirements_mismatch_rejects_competing_property(self):
+        event = {"type": "property_unavailable", "reason": "requirements_mismatch"}
+
+        self.assertFalse(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text=(
+                    "200 Oak Ave is not the right fit because it is mostly office. "
+                    "Here are the requested specs."
+                ),
+            )
+        )
+
+    def test_addressless_unavailable_event_handles_single_digit_target_street_number(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertFalse(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="1 Kuhlke Dr",
+                message_text="200 Oak Ave is leased. I attached specs.",
+            )
+        )
+
+    def test_addressless_unavailable_event_rejects_named_competitor_when_target_viable(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertFalse(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text=(
+                    "Oak Commerce Center is leased. "
+                    "100 Main St is still available."
+                ),
+            )
+        )
+
+    def test_competitor_viability_does_not_override_target_terminal(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        for message_text in (
+            "200 Oak Ave is still available and 100 Main St is leased.",
+            "100 Main St is leased and 200 Oak Ave is still available.",
+        ):
+            with self.subTest(message_text=message_text):
+                self.assertTrue(
+                    processing._property_unavailable_event_applies_to_row(
+                        event,
+                        row_anchor="100 Main St, Phoenix",
+                        message_text=message_text,
+                    )
+                )
+
+    def test_shared_terminal_predicate_applies_to_target_in_address_list(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertTrue(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text=(
+                    "100 Main St, Phoenix, and 200 Oak Ave are both leased."
+                ),
+            )
+        )
+
+    def test_bare_terminal_pronoun_inherits_named_competitor(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertFalse(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text=(
+                    "Oak Commerce Center is the other property. It is leased."
+                ),
+            )
+        )
+
+    def test_bare_terminal_pronoun_inherits_explicit_target(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertTrue(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text="100 Main St is the subject. It is leased.",
+            )
+        )
+
     def test_addressless_unavailable_event_preserves_explicitly_viable_target(self):
         event = {"type": "property_unavailable", "reason": "leased"}
 
@@ -527,6 +633,17 @@ class JillJuneRegressionTests(unittest.TestCase):
                 event,
                 row_anchor="100 Main St, Phoenix",
                 message_text="It has been leased.",
+            )
+        )
+
+    def test_addressless_unavailable_event_keeps_bare_no_longer_available(self):
+        event = {"type": "property_unavailable", "reason": "no_longer_available"}
+
+        self.assertTrue(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text="It is no longer available.",
             )
         )
 
