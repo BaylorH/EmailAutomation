@@ -963,6 +963,101 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 ))
                 self.assertIsNone(result["response_email"])
 
+    def test_comma_table_address_cells_keep_column_alignment(self):
+        docks = {"column": "Docks", "value": "6"}
+        power = {"column": "Power", "value": "1200A 480V 3-phase"}
+        total_sf = {"column": "Total SF", "value": "45000"}
+        drive_ins = {"column": "Drive Ins", "value": "2"}
+        cases = (
+            (
+                "target city first",
+                "100 Main St, Phoenix",
+                "Docks, Power\n"
+                "6, 1200A 480V 3-phase\n"
+                "100 Main St, Phoenix, Oak Center",
+                [docks, power],
+                [docks],
+            ),
+            (
+                "target city last",
+                "100 Main St, Phoenix",
+                "Power, Docks\n"
+                "1200A 480V 3-phase, 6\n"
+                "Oak Center, 100 Main St, Phoenix",
+                [power, docks],
+                [docks],
+            ),
+            (
+                "target city state zip in middle column",
+                "100 Main St, Phoenix, AZ 85001",
+                "Docks, Power, Drive Ins\n"
+                "6, 1200A 480V 3-phase, 2\n"
+                "Oak Center, 100 Main St, Phoenix, AZ 85001, Westgate",
+                [docks, power, drive_ins],
+                [power],
+            ),
+            (
+                "target and competitor addresses with cities",
+                "100 Main St, Phoenix",
+                "Docks, Power\n"
+                "6, 1200A 480V 3-phase\n"
+                "100 Main St, Phoenix, 200 Oak Ave, Tempe",
+                [docks, power],
+                [docks],
+            ),
+            (
+                "quoted address and unknown cells",
+                "100 Main St, Phoenix",
+                "Docks, Power\n"
+                "6, 1200A 480V 3-phase\n"
+                "\"100 Main St, Phoenix\", \"Oak Center\"",
+                [docks, power],
+                [docks],
+            ),
+            (
+                "compact quoted csv cells",
+                "100 Main St, Phoenix",
+                "Docks, Power\n"
+                "6, 1200A 480V 3-phase\n"
+                "\"100 Main St,Phoenix\",\"Oak Center\"",
+                [docks, power],
+                [docks],
+            ),
+            (
+                "numeric and address commas",
+                "100 Main St, Phoenix",
+                "Total SF, Docks\n"
+                "45,000, 6\n"
+                "100 Main St, Phoenix, Oak Center",
+                [total_sf, docks],
+                [total_sf],
+            ),
+        )
+
+        for name, target_anchor, table, updates, expected_updates in cases:
+            with self.subTest(name=name):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": list(updates),
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    target_anchor,
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"{target_anchor}\n{table}",
+                    }],
+                )
+
+                self.assertEqual(expected_updates, result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
     def test_multi_column_target_tables_remain_supported(self):
         target_tables = (
             (

@@ -1,3 +1,4 @@
+import csv
 import json
 import hashlib
 import logging
@@ -2032,13 +2033,58 @@ def _contains_property_fact_label(text: str) -> bool:
     )
 
 
-def _property_table_cells(row: str) -> List[str]:
+def _merge_comma_address_cells(
+    cells: List[str],
+    expected_count: int,
+) -> List[str]:
+    """Rejoin address-location fragments while preserving table columns."""
+    if (
+        expected_count < 1
+        or len(cells) <= expected_count
+        or not any(_street_claim_spans(cell) for cell in cells)
+    ):
+        return cells
+
+    merged = []
+    cursor = 0
+    while len(merged) < expected_count and cursor < len(cells):
+        columns_left = expected_count - len(merged)
+        if columns_left == 1:
+            merged.append(", ".join(cells[cursor:]).strip())
+            cursor = len(cells)
+            break
+
+        end = cursor + 1
+        if _street_claim_spans(cells[cursor]):
+            # Consume city/state/ZIP fragments, but stop at the next address
+            # and reserve at least one fragment for every remaining column.
+            latest_end = len(cells) - (columns_left - 1)
+            while (
+                end < latest_end
+                and not _street_claim_spans(cells[end])
+            ):
+                end += 1
+        merged.append(", ".join(cells[cursor:end]).strip())
+        cursor = end
+
+    if cursor != len(cells) or len(merged) != expected_count:
+        return cells
+    return merged
+
+
+def _property_table_cells(
+    row: str,
+    expected_count: Optional[int] = None,
+    identity_row: bool = False,
+) -> List[str]:
     """Split an extracted table row without splitting numeric commas."""
     row = (row or "").strip()
     if "|" in row:
         cells = row.split("|")
     elif "\t" in row:
         cells = re.split(r"\t+", row)
+    elif identity_row and '"' in row and "," in row:
+        cells = next(csv.reader([row], skipinitialspace=True))
     elif re.search(r",\s+", row):
         cells = re.split(r",\s+", row)
     else:
@@ -2048,6 +2094,8 @@ def _property_table_cells(row: str) -> List[str]:
         cells.pop(0)
     while cells and not cells[-1]:
         cells.pop()
+    if identity_row and expected_count is not None:
+        cells = _merge_comma_address_cells(cells, expected_count)
     return cells
 
 
@@ -2094,15 +2142,24 @@ def _aligned_property_table_cells(text: str) -> List[tuple]:
         clause_spans[1:],
         clause_spans[2:],
     ):
-        cell_rows = [
-            _property_table_cells(text[start:end])
-            for start, end in (label_span, value_span, identity_span)
-        ]
-        if not cell_rows[0] or len({len(cells) for cells in cell_rows}) != 1:
+        label_cells = _property_table_cells(text[label_span[0]:label_span[1]])
+        value_cells = _property_table_cells(text[value_span[0]:value_span[1]])
+        if not label_cells or len(label_cells) != len(value_cells):
+            continue
+        identity_cells = _property_table_cells(
+            text[identity_span[0]:identity_span[1]],
+            expected_count=len(label_cells),
+            identity_row=True,
+        )
+        if len(identity_cells) != len(label_cells):
             continue
         aligned.extend(
             (label_span, identity_span, label, value, identity)
-            for label, value, identity in zip(*cell_rows)
+            for label, value, identity in zip(
+                label_cells,
+                value_cells,
+                identity_cells,
+            )
         )
     return aligned
 
