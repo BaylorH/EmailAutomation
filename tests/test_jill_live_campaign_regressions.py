@@ -682,6 +682,72 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         ))
         self.assertIsNone(result["response_email"])
 
+    def test_exact_target_pdf_preserves_semantic_fact_label_synonym(self):
+        target_facts = (
+            ("Docks", "6", "Dock Positions: 6"),
+            ("Drive Ins", "2", "Grade Level Doors: 2"),
+            ("Power", "1200A", "Electrical Capacity: 1200A"),
+            ("Rent/SF/Yr", "6.75", "Asking Rate: $6.75"),
+            ("Ops Ex/SF/Yr", "1.85", "CAM Charges: $1.85"),
+            ("Total SF", "45000", "Available Sq Ft: 45000"),
+        )
+
+        for column, value, target_fact in target_facts:
+            with self.subTest(column=column, target_fact=target_fact):
+                expected_update = {"column": column, "value": value}
+                proposal = {
+                    "updates": [expected_update],
+                    "events": [],
+                    "response_email": "Thanks for confirming.",
+                }
+
+                result = ai_processing._suppress_competing_attachment_updates(
+                    proposal,
+                    _conversation("The 100 Main St brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "100 Main St brochure.pdf",
+                        "text": f"100 Main St. {target_fact}.",
+                    }],
+                )
+
+                self.assertEqual([expected_update], result["updates"])
+                self.assertEqual([], result["events"])
+                self.assertEqual(
+                    "Thanks for confirming.",
+                    result["response_email"],
+                )
+
+    def test_fact_token_property_names_remain_competing(self):
+        competing_headings = (
+            ("Power", "1200A", "Power Center | 1200A"),
+            ("Power", "1200A", "Westgate Power | 1200A"),
+            ("Docks", "6", "Oak Docks | 6"),
+        )
+
+        for column, value, competing_heading in competing_headings:
+            with self.subTest(competing_heading=competing_heading):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [{"column": column, "value": value}],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"100 Main St. {competing_heading}.",
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertIsNone(result["response_email"])
+                self.assertTrue(any(
+                    event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+
     def test_versioned_addressless_attachment_is_competing_by_default(self):
         attachment_names = (
             "Oak Commerce Center brochure version 2.pdf",

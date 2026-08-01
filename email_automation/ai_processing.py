@@ -1939,11 +1939,43 @@ _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS = {
     "property features", "property highlights", "property specifications",
     "specifications",
 }
+_PROPERTY_NAME_SUFFIX_LABEL_TOKENS = {
+    "building", "campus", "center", "centre", "commons", "complex",
+    "facility", "hub", "park", "plaza", "tower", "warehouse",
+}
+_PROPERTY_FACT_CORE_LABEL_TOKENS = {
+    "amperage", "amps", "area", "cam", "capacity", "ceiling", "charges",
+    "clear", "clearance", "dock", "docks", "doors", "drive", "electrical",
+    "expense", "expenses", "footage", "ft", "height", "ht", "lease",
+    "loading", "op", "opex", "ops", "positions", "power", "rate",
+    "rent", "sf", "size", "space", "sq", "voltage",
+}
+_PROPERTY_FACT_LABEL_VOCABULARY = _PROPERTY_FACT_CORE_LABEL_TOKENS | {
+    "annual", "asking", "available", "cam", "charges", "count", "ex",
+    "feet", "foot", "ft", "grade", "high", "in", "level", "monthly",
+    "nnn", "number", "operating", "per", "phase", "psf", "service",
+    "sq", "square", "supply", "total", "truck", "volts", "year", "yr",
+}
 _STANDALONE_IDENTITY_LINE_RE = re.compile(
     r"^\s*(?P<label>[a-z][a-z0-9&'’/-]*"
     r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})\s*[-–—:=|•·,/>→(\[]?\s*$",
     re.IGNORECASE,
 )
+
+
+def _is_property_fact_or_section_label(label: str) -> bool:
+    """Recognize mapped-field synonyms without blessing property names."""
+    normalized = " ".join(re.findall(r"[a-z0-9]+", (label or "").lower()))
+    if normalized in _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS:
+        return True
+    tokens = normalized.split()
+    if not tokens or tokens[-1] in _PROPERTY_NAME_SUFFIX_LABEL_TOKENS:
+        return False
+    token_set = set(tokens)
+    return bool(
+        token_set & _PROPERTY_FACT_CORE_LABEL_TOKENS
+        and token_set <= _PROPERTY_FACT_LABEL_VOCABULARY
+    )
 
 
 def _property_clause_spans(text: str) -> List[tuple]:
@@ -1985,13 +2017,14 @@ def _unbound_identity_fact_spans(
         if (
             not identity_line
             or _source_mentions_target_property(current_text, target_anchor)
+            or _source_mentions_target_property(following_text, target_anchor)
             or not _NUMERIC_PROPERTY_VALUE_RE.search(following_text)
         ):
             continue
         line_label = " ".join(
             re.findall(r"[a-z0-9]+", identity_line.group("label").lower())
         )
-        if line_label not in _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS:
+        if not _is_property_fact_or_section_label(line_label):
             unbound_spans.append((current[0], following[1]))
 
     for clause_start, clause_end in clause_spans:
@@ -2009,7 +2042,7 @@ def _unbound_identity_fact_spans(
         # labels ("clear height") or property names ("Oak Center" / "Westgate").
         # Preserve only the explicit label set; every unknown heading fails
         # closed as a new property identity.
-        if label not in _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS:
+        if not _is_property_fact_or_section_label(label):
             unbound_spans.append((clause_start, clause_end))
 
     # A period after a street suffix is ambiguous: it may be the abbreviation
@@ -2029,7 +2062,7 @@ def _unbound_identity_fact_spans(
         ):
             continue
         label = " ".join(re.findall(r"[a-z0-9]+", identity.group("label").lower()))
-        if label not in _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS:
+        if not _is_property_fact_or_section_label(label):
             unbound_spans.append((segment_start, segment_end))
     return sorted(set(unbound_spans))
 
