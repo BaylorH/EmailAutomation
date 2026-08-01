@@ -1869,77 +1869,55 @@ def _source_mentions_target_property(source_text: str, target_anchor: str) -> bo
     return reversed_anchor in normalized_source
 
 
-_NAMED_PROPERTY_RE = re.compile(
-    r"\b(?:[A-Z][A-Za-z0-9&'’-]*\s+){1,5}"
-    r"(?:Center|Centre|Commons?|Complex|Campus|Park|Plaza|Crossing|Exchange|"
-    r"Point|Square|Towers?|Yards?)"
-    r"(?:\s+Phase\s+(?:[IVX]+|\d+))?\b"
-)
-_ALTERNATE_PROPERTY_CLAUSE_RE = re.compile(
-    r"\b(?:separately|alternatively|meanwhile)\b|"
-    r"\b(?:another|alternate|alternative|additional|different|other|secondary|"
-    r"backup|second|third|fourth|fifth)\s+"
-    r"(?:property|building|space|suite|unit|option|choice|location|site)\b",
-    re.IGNORECASE,
-)
 _PROPERTY_FACT_SIGNAL_RE = re.compile(
     r"\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*"
     r"(?:sf|sq\.?\s*ft|square\s+feet|feet|foot|ft\.?|['’])\b",
     re.IGNORECASE,
 )
-_PROPERTY_CLAUSE_BREAK_RE = re.compile(r"[.!?;\n]+")
+_PROPERTY_CLAUSE_BREAK_RE = re.compile(r"(?<!\d)[.!?;](?!\d)|\n+")
+_UNBOUND_IDENTITY_PREFIX_RE = re.compile(
+    r"^\s*[a-z][a-z0-9&'’/-]*"
+    r"(?:\s+[a-z][a-z0-9&'’/-]*){2,7}\s*[-–—]\s*",
+    re.IGNORECASE,
+)
 
 
-def _property_clause_bounds(text: str, start: int, end: int) -> tuple:
-    left = 0
-    for boundary in _PROPERTY_CLAUSE_BREAK_RE.finditer(text or "", 0, start):
-        left = boundary.end()
-    next_boundary = _PROPERTY_CLAUSE_BREAK_RE.search(text or "", end)
-    right = next_boundary.start() if next_boundary else len(text or "")
-    return left, right
+def _property_clause_spans(text: str) -> List[tuple]:
+    """Split prose without treating decimal or street-suffix periods as boundaries."""
+    text = text or ""
+    street_claim_ends = {claim[1] for claim in _street_claim_spans(text)}
+    spans = []
+    start = 0
+    for boundary in _PROPERTY_CLAUSE_BREAK_RE.finditer(text):
+        if boundary.group(0) == "." and boundary.start() in street_claim_ends:
+            continue
+        if start < boundary.start():
+            spans.append((start, boundary.start()))
+        start = boundary.end()
+    if start < len(text):
+        spans.append((start, len(text)))
+    return spans
 
 
-def _named_property_matches_target_anchor(name: str, target_anchor: str) -> bool:
-    name_tokens = set(re.findall(r"[a-z0-9]+", (name or "").lower()))
-    target_tokens = {
-        token
-        for token in re.findall(
-            r"[a-z0-9]+",
-            (target_anchor or "").split(",", 1)[0].lower(),
-        )
-        if not token.isdigit() and token not in STREET_SUFFIX_TOKENS
-    }
-    return bool(name_tokens and name_tokens.issubset(target_tokens))
-
-
-def _competing_named_property_spans(
+def _unbound_identity_fact_spans(
     text: str,
     target_anchor: str,
 ) -> List[tuple]:
-    """Find named-property clauses that cannot safely inherit target identity."""
+    """Find fact clauses carrying a new identity without an exact address."""
     text = text or ""
-    source_mentions_target = _source_mentions_target_property(text, target_anchor)
-    competing_spans = []
-    for match in _NAMED_PROPERTY_RE.finditer(text):
-        if _named_property_matches_target_anchor(match.group(0), target_anchor):
-            continue
-        clause_start, clause_end = _property_clause_bounds(
-            text,
-            match.start(),
-            match.end(),
-        )
+    if not _source_mentions_target_property(text, target_anchor):
+        return []
+    unbound_spans = []
+    for clause_start, clause_end in _property_clause_spans(text):
         clause = text[clause_start:clause_end]
-        clause_mentions_target = _source_mentions_target_property(
-            clause,
-            target_anchor,
-        )
-        if _ALTERNATE_PROPERTY_CLAUSE_RE.search(clause) or (
-            source_mentions_target
-            and not clause_mentions_target
+        if _source_mentions_target_property(clause, target_anchor):
+            continue
+        if (
+            _UNBOUND_IDENTITY_PREFIX_RE.search(clause)
             and _PROPERTY_FACT_SIGNAL_RE.search(clause)
         ):
-            competing_spans.append((match.start(), match.end()))
-    return competing_spans
+            unbound_spans.append((clause_start, clause_end))
+    return unbound_spans
 
 
 def _attachment_property_verdict(source_text: str, target_anchor: str) -> str:
@@ -1952,7 +1930,7 @@ def _attachment_property_verdict(source_text: str, target_anchor: str) -> str:
     if all(matches):
         return (
             "mixed"
-            if _competing_named_property_spans(source_text, target_anchor)
+            if _unbound_identity_fact_spans(source_text, target_anchor)
             else "target"
         )
     if any(matches):
@@ -2083,6 +2061,37 @@ def _update_supported_in_current_segment(update: dict, text: str) -> bool:
     return bool(normalized_value and normalized_value in normalized_text)
 
 
+def _exact_target_clause_segments(
+    source_text: str,
+    target_anchor: str,
+) -> List[str]:
+    """Return only clauses whose facts carry an exact target-address binding."""
+    target_identity = _target_street_identity(target_anchor)
+    if target_identity is None:
+        return []
+
+    segments = []
+    for clause_start, clause_end in _property_clause_spans(source_text):
+        clause = source_text[clause_start:clause_end]
+        claims = _street_claim_spans(clause)
+        if not claims:
+            if _source_mentions_target_property(clause, target_anchor):
+                segments.append(clause)
+            continue
+        matches = [_claim_identity(claim) == target_identity for claim in claims]
+        if all(matches):
+            segments.append(clause)
+            continue
+        for index, claim in enumerate(claims):
+            if not matches[index]:
+                continue
+            next_claim_start = (
+                claims[index + 1][0] if index + 1 < len(claims) else None
+            )
+            segments.append(clause[claim[0]:next_claim_start])
+    return segments
+
+
 def _target_bound_source_segments(
     source_text: str,
     target_anchor: str,
@@ -2098,15 +2107,16 @@ def _target_bound_source_segments(
     claims = _street_claim_spans(source_text)
     if target_identity is None:
         return []
-    property_boundaries = sorted({
-        claim[0] for claim in claims
-    } | {
-        start
-        for start, _ in _competing_named_property_spans(
-            source_text,
-            target_anchor,
-        )
-    })
+    property_boundaries = sorted(
+        {claim[0] for claim in claims}
+        | {
+            start
+            for start, _ in _unbound_identity_fact_spans(
+                source_text,
+                target_anchor,
+            )
+        }
+    )
     return [
         source_text[
             claim[0]:next(
@@ -2183,17 +2193,18 @@ _ATTACHMENT_NAME_NOISE = {
     "brochure", "brochures", "flyer", "flyers", "marketing", "package",
     "offering", "memorandum", "om", "pdf", "floorplan", "floorplans",
 }
-_ATTACHMENT_VERSION_TOKEN_RE = re.compile(
-    r"(?:v|ver|version|rev|revision)\d+",
+_ATTACHMENT_COPY_SUFFIX_RE = re.compile(
+    r"\s*(?:\(\d+\)|(?:version|ver|revision|rev)\s*\d+|v\d+)"
+    r"(?=\s*(?:\.[a-z0-9]+)?$)",
     re.IGNORECASE,
 )
 
 
 def _attachment_name_tokens(name: str) -> List[str]:
+    normalized_name = _ATTACHMENT_COPY_SUFFIX_RE.sub("", name or "")
     return [
-        token for token in re.findall(r"[a-z0-9]+", (name or "").lower())
+        token for token in re.findall(r"[a-z0-9]+", normalized_name.lower())
         if token not in _ATTACHMENT_NAME_NOISE
-        and not _ATTACHMENT_VERSION_TOKEN_RE.fullmatch(token)
     ]
 
 
@@ -2212,11 +2223,18 @@ def _attachment_name_matches_text(name: str, text: str) -> bool:
     return bool(_attachment_name_spans(name, text))
 
 
-def _attachment_name_has_alternate_clause(name: str, text: str) -> bool:
+def _attachment_name_bound_to_target(
+    name: str,
+    text: str,
+    target_anchor: str,
+) -> bool:
     text = text or ""
-    for start, end in _attachment_name_spans(name, text):
-        clause_start, clause_end = _property_clause_bounds(text, start, end)
-        if _ALTERNATE_PROPERTY_CLAUSE_RE.search(text[clause_start:clause_end]):
+    for clause_start, clause_end in _property_clause_spans(text):
+        clause = text[clause_start:clause_end]
+        if (
+            _attachment_name_matches_text(name, clause)
+            and _source_mentions_target_property(clause, target_anchor)
+        ):
             return True
     return False
 
@@ -2242,58 +2260,24 @@ def _suppress_competing_attachment_updates(
         return proposal
 
     fresh_text = _fresh_inbound_text(conversation)
-    fresh_transition = _ALTERNATE_PROPERTY_TRANSITION_RE.search(fresh_text)
-    competing_name_spans = _competing_named_property_spans(
-        fresh_text,
-        target_anchor,
-    )
-    target_cutoffs = [start for start, _ in competing_name_spans]
-    if fresh_transition:
-        target_cutoffs.append(fresh_transition.start())
-    target_cutoff = min(target_cutoffs) if target_cutoffs else None
-    fresh_target_text = (
-        fresh_text[:target_cutoff] if target_cutoff is not None else fresh_text
-    )
-    fresh_alternate_text = (
-        fresh_text[target_cutoff:] if target_cutoff is not None else ""
-    )
+    multiple_attachments = len(pdf_manifest) > 1
     classified_sources = []
     for pdf in pdf_manifest:
+        name = str((pdf or {}).get("name") or "")
         source = "\n".join((
-            str((pdf or {}).get("name") or ""),
+            name,
             str((pdf or {}).get("text") or ""),
         ))
         verdict = _attachment_property_verdict(source, target_anchor)
-        if (
-            verdict == "addressless"
-            and (
-                _attachment_name_has_alternate_clause(
-                    str((pdf or {}).get("name") or ""),
-                    fresh_text,
-                )
-                or (
-                    fresh_alternate_text
-                    and _attachment_name_matches_text(
-                        str((pdf or {}).get("name") or ""),
-                        fresh_alternate_text,
-                    )
-                )
-            )
-        ):
-            verdict = "competing"
-        elif (
-            verdict == "addressless"
-            and _attachment_can_supply_target_facts(
-                source,
+        if verdict == "addressless":
+            if _attachment_name_bound_to_target(
+                name,
+                fresh_text,
                 target_anchor,
-                fresh_target_text,
-            )
-            and _attachment_name_matches_text(
-                str((pdf or {}).get("name") or ""),
-                fresh_target_text,
-            )
-        ):
-            verdict = "target"
+            ):
+                verdict = "target"
+            elif multiple_attachments:
+                verdict = "competing"
         classified_sources.append((
             source,
             verdict,
@@ -2306,7 +2290,12 @@ def _suppress_competing_attachment_updates(
         )
         for source, verdict in classified_sources
     )
-    if not explicitly_other:
+    already_escalated = any(
+        (event or {}).get("type") == "needs_user_input"
+        and (event or {}).get("reason") == "multi_property_attachment"
+        for event in proposal.get("events") or []
+    )
+    if not explicitly_other and not already_escalated:
         return proposal
 
     target_evidence_sources = [
@@ -2318,15 +2307,9 @@ def _suppress_competing_attachment_updates(
             verdict,
         )
     ]
-    fresh_verdict = _attachment_property_verdict(fresh_target_text, target_anchor)
-    target_evidence_sources.extend(_target_bound_source_segments(
-        fresh_target_text,
-        target_anchor,
-        fresh_verdict,
-    ))
-    if fresh_verdict == "addressless":
-        if _CURRENT_PROPERTY_AFFIRMATION_RE.search(fresh_target_text):
-            target_evidence_sources.append(fresh_target_text)
+    target_evidence_sources.extend(
+        _exact_target_clause_segments(fresh_text, target_anchor)
+    )
     proposal["updates"] = [
         update for update in (proposal.get("updates") or [])
         if any(

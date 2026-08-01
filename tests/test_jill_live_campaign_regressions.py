@@ -428,6 +428,179 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         ))
         self.assertIsNone(result["response_email"])
 
+    def test_addressless_attachment_is_untrusted_with_multiple_attachments(self):
+        introductions = (
+            "As a fallback, Oak Commerce Center is attached.",
+            "The backup is Oak Commerce Center.",
+            "For comparison, Oak Commerce Center is attached.",
+            "Plan B is Oak Commerce Center.",
+            "Instead, consider Oak Commerce Center.",
+        )
+
+        for introduction in introductions:
+            with self.subTest(introduction=introduction):
+                proposal = {
+                    "updates": [{"column": "Ceiling Ht", "value": "32"}],
+                    "events": [{
+                        "type": "needs_user_input",
+                        "reason": "multi_property_attachment",
+                        "question": "Which property is this for?",
+                    }],
+                    "response_email": "Thanks.",
+                }
+
+                result = ai_processing._suppress_competing_attachment_updates(
+                    proposal,
+                    _conversation(introduction),
+                    "100 Main St, Phoenix",
+                    [
+                        {
+                            "name": "100 Main St brochure.pdf",
+                            "text": "100 Main St - 20,000 SF.",
+                        },
+                        {
+                            "name": "Oak Commerce Center brochure.pdf",
+                            "text": "Ceiling Ht: 32 feet clear.",
+                        },
+                    ],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertIsNone(result["response_email"])
+
+    def test_generic_fresh_text_cannot_prove_competing_attachment_value(self):
+        messages = (
+            "This property has 28 feet clear. As a fallback.",
+            "In contrast, Oak Commerce Center has 32 feet clear.",
+        )
+
+        for message in messages:
+            with self.subTest(message=message):
+                proposal = {
+                    "updates": [{"column": "Ceiling Ht", "value": "32"}],
+                    "events": [{
+                        "type": "needs_user_input",
+                        "reason": "multi_property_attachment",
+                        "question": "Which property is this for?",
+                    }],
+                    "response_email": "Thanks.",
+                }
+
+                result = ai_processing._suppress_competing_attachment_updates(
+                    proposal,
+                    _conversation(message),
+                    "100 Main St, Phoenix",
+                    [
+                        {
+                            "name": "100 Main St brochure.pdf",
+                            "text": "100 Main St - 20,000 SF.",
+                        },
+                        {
+                            "name": "200 Oak Ave brochure.pdf",
+                            "text": "200 Oak Ave - Ceiling Ht: 32 feet clear.",
+                        },
+                    ],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertIsNone(result["response_email"])
+
+    def test_unbound_identity_clause_makes_single_target_address_pdf_mixed(self):
+        alternate_clauses = (
+            "oak commerce center - Ceiling Ht: 32 feet clear.",
+            "Westgate Logistics Hub - Ceiling Ht: 32 feet clear.",
+        )
+
+        for alternate_clause in alternate_clauses:
+            with self.subTest(alternate_clause=alternate_clause):
+                proposal = {
+                    "updates": [{"column": "Ceiling Ht", "value": "32"}],
+                    "events": [],
+                    "response_email": "Thanks.",
+                }
+
+                result = ai_processing._suppress_competing_attachment_updates(
+                    proposal,
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": (
+                            "100 Main St - 20,000 SF. "
+                            f"{alternate_clause}"
+                        ),
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
+    def test_versioned_addressless_attachment_is_competing_by_default(self):
+        attachment_names = (
+            "Oak Commerce Center brochure version 2.pdf",
+            "Oak Commerce Center brochure (2).pdf",
+        )
+
+        for attachment_name in attachment_names:
+            with self.subTest(attachment_name=attachment_name):
+                proposal = {
+                    "updates": [{"column": "Ceiling Ht", "value": "32"}],
+                    "events": [],
+                    "response_email": "Thanks.",
+                }
+
+                result = ai_processing._suppress_competing_attachment_updates(
+                    proposal,
+                    _conversation(
+                        "Another option is Oak Commerce Center; brochure attached."
+                    ),
+                    "100 Main St, Phoenix",
+                    [
+                        {
+                            "name": "100 Main St brochure.pdf",
+                            "text": "100 Main St - 20,000 SF.",
+                        },
+                        {
+                            "name": attachment_name,
+                            "text": "Ceiling Ht: 32 feet clear.",
+                        },
+                    ],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertIsNone(result["response_email"])
+
+    def test_exact_target_address_clause_preserves_value(self):
+        expected_update = {"column": "Ceiling Ht", "value": "28"}
+        proposal = {
+            "updates": [expected_update],
+            "events": [],
+            "response_email": None,
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            _conversation("100 Main St has 28 feet clear."),
+            "100 Main St, Phoenix",
+            [
+                {
+                    "name": "100 Main St brochure.pdf",
+                    "text": "100 Main St - 20,000 SF.",
+                },
+                {
+                    "name": "200 Oak Ave brochure.pdf",
+                    "text": "200 Oak Ave - Ceiling Ht: 32 feet clear.",
+                },
+            ],
+        )
+
+        self.assertEqual([expected_update], result["updates"])
+
     def test_independent_target_attachment_evidence_preserves_value(self):
         expected_update = {
             "column": "Ceiling Ht",
@@ -458,10 +631,9 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
 
         self.assertEqual([expected_update], result["updates"])
 
-    def test_fresh_target_bound_evidence_preserves_attachment_value(self):
-        expected_update = {"column": "Ceiling Ht", "value": "32"}
+    def test_generic_this_property_does_not_prove_attachment_value(self):
         proposal = {
-            "updates": [expected_update],
+            "updates": [{"column": "Ceiling Ht", "value": "32"}],
             "events": [],
             "response_email": None,
         }
@@ -485,7 +657,7 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual([expected_update], result["updates"])
+        self.assertEqual([], result["updates"])
 
     def test_attachment_classification_does_not_depend_on_offer_wording(self):
         proposal = {
