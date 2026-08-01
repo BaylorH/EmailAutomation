@@ -478,6 +478,72 @@ class JillJuneRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_addressless_unavailable_event_rejects_terminal_bound_to_other_address(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertFalse(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text=(
+                    "The other building at 200 Oak Ave is leased. "
+                    "I attached the requested specs."
+                ),
+            )
+        )
+
+    def test_addressless_unavailable_event_preserves_explicitly_viable_target(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertFalse(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text=(
+                    "200 Oak Ave is leased. "
+                    "100 Main St is still available."
+                ),
+            )
+        )
+
+    def test_addressless_unavailable_event_binds_competing_terminal_within_same_sentence(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertFalse(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text=(
+                    "200 Oak Ave is leased, but 100 Main St is still available."
+                ),
+            )
+        )
+
+    def test_addressless_unavailable_event_keeps_bare_target_context_terminal(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertTrue(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text="It has been leased.",
+            )
+        )
+
+    def test_addressless_requirements_mismatch_keeps_current_row_behavior(self):
+        event = {"type": "property_unavailable", "reason": "requirements_mismatch"}
+
+        self.assertTrue(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text=(
+                    "It is not the right fit because it is mostly office and "
+                    "lacks warehouse space."
+                ),
+            )
+        )
+
     def test_unavailable_event_with_different_address_does_not_apply_to_current_row(self):
         event = {
             "type": "property_unavailable",

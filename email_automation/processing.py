@@ -22,7 +22,10 @@ from .messaging import (save_message, save_thread_root, index_message_id, index_
                        update_thread_status, get_thread_status, THREAD_STATUS)
 from .logging import write_message_order_test
 from .ai_processing import (
+    _VIABILITY_RE,
+    _address_binding_numbers,
     _append_ai_meta,
+    _detect_target_terminal_reason,
     _source_mentions_target_property,
     _target_street_identity,
     apply_proposal_to_sheet,
@@ -2059,6 +2062,45 @@ def _normalize_replacement_match_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
+def _message_has_competing_terminal_address(message_text: str, row_anchor: str) -> bool:
+    """Return whether a terminal clause names an address other than the row."""
+    target_numbers = _address_binding_numbers(row_anchor)
+    if not target_numbers:
+        return False
+
+    binding_clauses = re.split(
+        r"(?<=[.!?])\s+|\n+|\s*;\s*|"
+        r",\s*(?:but|while|whereas)\s+|\s+(?:but|while|whereas)\s+",
+        message_text or "",
+        flags=re.IGNORECASE,
+    )
+    for clause in binding_clauses:
+        if not _detect_target_terminal_reason(clause, None):
+            continue
+        clause_numbers = _address_binding_numbers(clause)
+        if clause_numbers and target_numbers.isdisjoint(clause_numbers):
+            return True
+    return False
+
+
+def _message_explicitly_keeps_row_viable(message_text: str, row_anchor: str) -> bool:
+    row_norm = _normalize_replacement_match_text(row_anchor)
+    row_candidates = {
+        row_norm,
+        row_norm.split(",", 1)[0].strip(),
+    }
+    row_candidates = {candidate for candidate in row_candidates if len(candidate) >= 6}
+
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", message_text or ""):
+        sentence_norm = _normalize_replacement_match_text(sentence)
+        if (
+            any(candidate in sentence_norm for candidate in row_candidates)
+            and _VIABILITY_RE.search(sentence)
+        ):
+            return True
+    return False
+
+
 def _property_unavailable_event_applies_to_row(
     event: Dict[str, Any],
     *,
@@ -2101,6 +2143,21 @@ def _property_unavailable_event_applies_to_row(
                 or row_primary in event_norm
             )
         )
+
+    if (
+        _nonviable_status_reason(event) != "requirements_mismatch"
+        and _message_has_competing_terminal_address(message_text, row_anchor)
+    ):
+        row_is_named = any(
+            candidate in message_norm
+            for candidate in {
+                row_norm,
+                row_norm.split(",", 1)[0].strip(),
+            }
+            if len(candidate) >= 6
+        )
+        if not row_is_named or _message_explicitly_keeps_row_viable(message_text, row_anchor):
+            return False
 
     if not row_norm or not message_norm:
         return True
