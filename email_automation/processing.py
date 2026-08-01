@@ -3010,6 +3010,47 @@ def _pending_nonviable_followup_patch(
     return None
 
 
+def _stage_row_thread_roots_for_terminal_transition(
+    user_id: str,
+    client_id: str,
+    row_number: int,
+    pending_patch: Dict[str, Any],
+) -> int:
+    """Make every thread root for a row non-sendable before Sheet mutation."""
+    try:
+        if not client_id or row_number is None:
+            raise ValueError("clientId and rowNumber are required")
+
+        threads_ref = (
+            _fs.collection("users")
+            .document(user_id)
+            .collection("threads")
+        )
+        matching_thread_ids = []
+        for thread in threads_ref.stream():
+            thread_data = thread.to_dict() or {}
+            if (
+                thread_data.get("clientId") == client_id
+                and thread_data.get("rowNumber") == row_number
+            ):
+                matching_thread_ids.append(thread.id)
+        if not matching_thread_ids:
+            raise ValueError("no Firestore thread roots matched the terminal row")
+
+        batch = _fs.batch()
+        for matching_thread_id in matching_thread_ids:
+            batch.update(
+                threads_ref.document(matching_thread_id),
+                dict(pending_patch),
+            )
+        batch.commit()
+        return len(matching_thread_ids)
+    except Exception as exc:
+        raise RetryableProcessingError(
+            f"Row thread terminal staging failed: {exc}"
+        ) from exc
+
+
 _PROPERTY_ANCHOR_STOPWORDS = {
     "adjacent", "building", "built", "city", "development", "location",
     "new", "newly", "park", "property", "tbd", "the", "to", "town",
@@ -4779,10 +4820,16 @@ def process_inbox_message(
                 message_text=_full_text,
             )
             if pending_nonviable_patch:
-                thread_ref.update(pending_nonviable_patch)
+                staged_thread_count = _stage_row_thread_roots_for_terminal_transition(
+                    user_id,
+                    client_id,
+                    rownum,
+                    pending_nonviable_patch,
+                )
                 thread_data.update(pending_nonviable_patch)
                 print(
-                    "🛑 Follow-up eligibility stopped before non-viable sheet work"
+                    "🛑 Follow-up eligibility stopped before non-viable sheet work "
+                    f"for {staged_thread_count} row thread root(s)"
                 )
             print(f"\n{'='*60}")
             print(f"📋 EVENT PROCESSING: {len(events)} event(s) detected by AI")

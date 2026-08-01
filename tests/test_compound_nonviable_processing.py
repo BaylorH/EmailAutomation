@@ -18,9 +18,10 @@ class FakeSnapshot:
 
 
 class FakeDocumentRef:
-    def __init__(self, data=None, exists=True):
+    def __init__(self, data=None, exists=True, update_error=None):
         self._data = data or {}
         self._exists = exists
+        self._update_error = update_error
 
     def get(self):
         return FakeSnapshot(self._data, self._exists)
@@ -32,6 +33,8 @@ class FakeDocumentRef:
             self._data = dict(data)
 
     def update(self, data):
+        if self._update_error:
+            raise self._update_error
         self._data.update(data)
 
 
@@ -80,6 +83,24 @@ class FakeCollection:
     def where(self, *args, **kwargs):
         return FakeQuery(self.docs)
 
+    def stream(self):
+        return FakeQuery(self.docs).stream()
+
+
+class FakeWriteBatch:
+    def __init__(self):
+        self._updates = []
+
+    def update(self, document_ref, data):
+        self._updates.append((document_ref, data))
+
+    def commit(self):
+        for document_ref, _data in self._updates:
+            if document_ref._update_error:
+                raise document_ref._update_error
+        for document_ref, data in self._updates:
+            document_ref.update(data)
+
 
 class FakeFirestore:
     def __init__(self, thread_ref, client_ref, thread_docs=None):
@@ -100,6 +121,9 @@ class FakeFirestore:
                 "allowedUids": [],
             }))
         return FakeCollection(FakeDocumentRef({}, exists=False))
+
+    def batch(self):
+        return FakeWriteBatch()
 
 
 class CompoundNonviableProcessingTests(unittest.TestCase):
@@ -148,6 +172,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         contact_name="Ryan",
         from_email="bp21harrison@gmail.com",
         row_below_nonviable=False,
+        ensure_divider_side_effect=None,
     ):
         client_id = "client-1"
         msg = self._common_graph_message(
@@ -201,6 +226,9 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             status_updates.append({"status": status, "reason": reason})
 
         move_row = MagicMock(return_value=11)
+        ensure_divider = MagicMock(return_value=10)
+        if ensure_divider_side_effect is not None:
+            ensure_divider.side_effect = ensure_divider_side_effect
         stop_threads = MagicMock(return_value=1)
         call_trace = []
 
@@ -251,7 +279,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             patch.object(processing, "write_notification", side_effect=fake_write_notification),
             patch.object(processing, "mark_event_handled", side_effect=fake_mark_event_handled),
             patch.object(processing, "_is_row_below_nonviable", return_value=row_below_nonviable),
-            patch.object(processing, "ensure_nonviable_divider", return_value=10),
+            patch.object(processing, "ensure_nonviable_divider", new=ensure_divider),
             patch.object(processing, "move_row_below_divider", side_effect=move_row),
             patch.object(processing, "sync_thread_row_numbers_after_move"),
             patch.object(processing, "stop_threads_for_row", side_effect=stop_threads),
@@ -284,12 +312,130 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "handledEvents": handled_events,
             "statusUpdates": status_updates,
             "moveRow": move_row,
+            "ensureDivider": ensure_divider,
             "stopThreads": stop_threads,
             "sendReply": send_reply,
             "markClientCompleted": mark_client_completed,
             "callTrace": call_trace,
             "threadRef": thread_ref,
         }
+
+    def test_nonviable_sheet_failure_stages_all_split_roots_before_mutation(self):
+        body = "Hi Baylor,\n\n951 E FM 646 is no longer available.\n\nBest,\nRyan"
+        thread_id = "thread-current-root"
+        current_root = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "followUpStatus": "waiting",
+            "followUpConfig.processingBy": "worker-current",
+            "followUpConfig.processingAt": "claimed-current",
+            "followUpConfig.nextFollowUpAt": "scheduled-current",
+        })
+        sibling_root = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "followUpStatus": "waiting",
+            "followUpConfig.processingBy": "worker-sibling",
+            "followUpConfig.processingAt": "claimed-sibling",
+            "followUpConfig.nextFollowUpAt": "scheduled-sibling",
+        })
+        mutation_observations = []
+
+        def fail_sheet_mutation(*_args, **_kwargs):
+            mutation_observations.append([
+                {
+                    "pendingTerminalReason": root._data.get("pendingTerminalReason"),
+                    "followUpStatus": root._data.get("followUpStatus"),
+                    "nextFollowUpAt": root._data.get("followUpConfig.nextFollowUpAt"),
+                    "processingBy": root._data.get("followUpConfig.processingBy"),
+                    "processingAt": root._data.get("followUpConfig.processingAt"),
+                }
+                for root in (current_root, sibling_root)
+            ])
+            raise RuntimeError("nonviable Sheet mutation failed")
+
+        proposal = {
+            "updates": [],
+            "events": [{"type": "property_unavailable", "reason": "no_longer_available"}],
+            "response_email": None,
+        }
+
+        with self.assertRaisesRegex(
+            processing.RetryableProcessingError,
+            "property_unavailable event failed",
+        ):
+            self._run_tour_invite_reply_processing(
+                thread_id=thread_id,
+                body=body,
+                proposal=proposal,
+                thread_ref=current_root,
+                thread_docs={
+                    thread_id: current_root,
+                    "thread-sibling-root": sibling_root,
+                },
+                row_anchor="951 E FM 646",
+                ensure_divider_side_effect=fail_sheet_mutation,
+            )
+
+        self.assertEqual(1, len(mutation_observations))
+        for staged_root in mutation_observations[0]:
+            self.assertEqual("no_longer_available", staged_root["pendingTerminalReason"])
+            self.assertEqual("stopped", staged_root["followUpStatus"])
+            self.assertIsNone(staged_root["nextFollowUpAt"])
+            self.assertIsNone(staged_root["processingBy"])
+            self.assertIsNone(staged_root["processingAt"])
+        self.assertEqual(processing.THREAD_STATUS["active"], current_root._data["status"])
+        self.assertEqual(processing.THREAD_STATUS["active"], sibling_root._data["status"])
+
+    def test_nonviable_sibling_staging_failure_blocks_sheet_mutation(self):
+        body = "Hi Baylor,\n\n951 E FM 646 is no longer available.\n\nBest,\nRyan"
+        thread_id = "thread-current-root"
+        current_root = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "followUpStatus": "waiting",
+        })
+        sibling_root = FakeDocumentRef(
+            {
+                "clientId": "client-1",
+                "email": ["bp21harrison@gmail.com"],
+                "status": processing.THREAD_STATUS["active"],
+                "rowNumber": 3,
+                "followUpStatus": "waiting",
+            },
+            update_error=RuntimeError("sibling stage write failed"),
+        )
+        sheet_mutations = []
+        proposal = {
+            "updates": [],
+            "events": [{"type": "property_unavailable", "reason": "no_longer_available"}],
+            "response_email": None,
+        }
+
+        with self.assertRaisesRegex(
+            processing.RetryableProcessingError,
+            "terminal staging failed",
+        ):
+            self._run_tour_invite_reply_processing(
+                thread_id=thread_id,
+                body=body,
+                proposal=proposal,
+                thread_ref=current_root,
+                thread_docs={
+                    thread_id: current_root,
+                    "thread-sibling-root": sibling_root,
+                },
+                row_anchor="951 E FM 646",
+                ensure_divider_side_effect=lambda *_args, **_kwargs: sheet_mutations.append(True),
+            )
+
+        self.assertEqual([], sheet_mutations)
 
     def test_property_unavailable_already_below_nonviable_stops_thread_without_moving_row(self):
         body = "Hi Baylor,\n\nThis space would not be a good fit for your client.\n\nBest,\nBP21"
@@ -925,7 +1071,15 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             status_updates.append({"status": status, "reason": reason})
 
         patches = [
-            patch.object(processing, "_fs", FakeFirestore(thread_ref, client_ref)),
+            patch.object(
+                processing,
+                "_fs",
+                FakeFirestore(
+                    thread_ref,
+                    client_ref,
+                    thread_docs={thread_id: thread_ref},
+                ),
+            ),
             patch.object(processing, "exponential_backoff_request", return_value=full_body_response),
             patch.object(processing.requests, "get", return_value=me_response),
             patch.object(processing, "lookup_thread_by_message_id", return_value=thread_id),
