@@ -7,6 +7,7 @@ from types import MappingProxyType
 
 from google.api_core.datetime_helpers import DatetimeWithNanoseconds
 
+import email_automation.campaign_capabilities as campaign_capabilities_module
 from email_automation.campaign_capabilities import (
     CampaignCapabilitiesResolution,
     CapabilityDecision,
@@ -137,6 +138,15 @@ class _LyingDatetime(datetime):
 
 class _AwareDatetimeSubclass(datetime):
     pass
+
+
+class _FaithfulAwareDatetimeSubclass(datetime):
+    @property
+    def tzinfo(self):
+        return datetime.tzinfo.__get__(self, type(self))
+
+    def utcoffset(self):
+        return datetime.utcoffset(self)
 
 
 class _InvalidOffsetTypeTimezone(tzinfo):
@@ -439,6 +449,69 @@ class CampaignCapabilitiesTests(unittest.TestCase):
                     data={**test_input["data"], "updatedAt": timestamp},
                 )
                 self.assertEqual(candidate["expected"], as_contract(resolution))
+
+    def test_faithful_aware_datetime_overrides_remain_supported(self):
+        candidate = fixture("combination-111")
+        test_input = materialize(candidate["input"])
+        timestamp = _FaithfulAwareDatetimeSubclass(
+            2026, 7, 31, tzinfo=timezone.utc
+        )
+
+        resolution = resolve_campaign_capabilities(
+            uid=test_input["uid"],
+            document_id=test_input["documentId"],
+            data={**test_input["data"], "updatedAt": timestamp},
+        )
+
+        self.assertEqual(candidate["expected"], as_contract(resolution))
+
+    def test_datetime_metaclass_cannot_replace_validator_globals(self):
+        candidate = fixture("combination-111")
+        test_input = materialize(candidate["input"])
+        original_datetime = campaign_capabilities_module.datetime
+        original_timedelta = campaign_capabilities_module.timedelta
+
+        class FakeTzinfoDescriptor:
+            def __get__(self, _instance, _owner=None):
+                return timezone.utc
+
+        class FakeTimedelta:
+            @staticmethod
+            def total_seconds(_value):
+                return 0.0
+
+        fake_datetime = type("FakeDatetimeGlobal", (), {})()
+        fake_datetime.tzinfo = FakeTzinfoDescriptor()
+        fake_offset = FakeTimedelta()
+        fake_datetime.utcoffset = lambda _value: fake_offset
+
+        class ReplacingDatetimeMeta(type):
+            def __getattribute__(cls, name):
+                if name in ("tzinfo", "utcoffset"):
+                    campaign_capabilities_module.datetime = fake_datetime
+                    campaign_capabilities_module.timedelta = FakeTimedelta
+                    return getattr(fake_datetime, name)
+                return type.__getattribute__(cls, name)
+
+        class ReplacingDatetime(datetime, metaclass=ReplacingDatetimeMeta):
+            pass
+
+        try:
+            resolution = resolve_campaign_capabilities(
+                uid=test_input["uid"],
+                document_id=test_input["documentId"],
+                data={
+                    **test_input["data"],
+                    "updatedAt": ReplacingDatetime(2026, 7, 31),
+                },
+            )
+        finally:
+            campaign_capabilities_module.datetime = original_datetime
+            campaign_capabilities_module.timedelta = original_timedelta
+
+        for decision in resolution.decisions.values():
+            self.assertFalse(decision.allowed)
+            self.assertEqual("capability_audit_invalid", decision.reason_code)
 
     def test_invalid_intrinsic_datetime_offsets_deny_without_raising(self):
         candidate = fixture("combination-111")
