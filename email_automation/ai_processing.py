@@ -2032,6 +2032,25 @@ def _contains_property_fact_label(text: str) -> bool:
     )
 
 
+def _property_table_cells(row: str) -> List[str]:
+    """Split an extracted table row without splitting numeric commas."""
+    row = (row or "").strip()
+    if "|" in row:
+        cells = row.split("|")
+    elif "\t" in row:
+        cells = re.split(r"\t+", row)
+    elif re.search(r",\s+", row):
+        cells = re.split(r",\s+", row)
+    else:
+        return [row]
+    cells = [cell.strip() for cell in cells]
+    while cells and not cells[0]:
+        cells.pop(0)
+    while cells and not cells[-1]:
+        cells.pop()
+    return cells
+
+
 def _postfixed_unbound_identity(fragment: str, target_anchor: str) -> bool:
     """Whether a fact is followed by an unknown, non-address identity."""
     identity = _UNBOUND_IDENTITY_POSTFIX_RE.search(fragment)
@@ -2064,6 +2083,60 @@ def _property_clause_spans(text: str) -> List[tuple]:
     if start < len(text):
         spans.append((start, len(text)))
     return spans
+
+
+def _aligned_property_table_cells(text: str) -> List[tuple]:
+    """Return aligned label/value/identity cells from three-row tables."""
+    clause_spans = _property_clause_spans(text)
+    aligned = []
+    for label_span, value_span, identity_span in zip(
+        clause_spans,
+        clause_spans[1:],
+        clause_spans[2:],
+    ):
+        cell_rows = [
+            _property_table_cells(text[start:end])
+            for start, end in (label_span, value_span, identity_span)
+        ]
+        if not cell_rows[0] or len({len(cells) for cells in cell_rows}) != 1:
+            continue
+        aligned.extend(
+            (label_span, identity_span, label, value, identity)
+            for label, value, identity in zip(*cell_rows)
+        )
+    return aligned
+
+
+def _property_identity_cell_verdict(
+    identity_text: str,
+    target_anchor: str,
+) -> str:
+    """Classify one table identity cell as target, competing, or other."""
+    claims = _street_claim_spans(identity_text)
+    target_identity = _target_street_identity(target_anchor)
+    if claims:
+        if not target_identity or any(
+            _claim_identity(claim) != target_identity for claim in claims
+        ):
+            return "competing"
+        residual = []
+        cursor = 0
+        for claim in claims:
+            residual.append(identity_text[cursor:claim[0]])
+            cursor = claim[1]
+        residual.append(identity_text[cursor:])
+        residual_tokens = set(re.findall(r"[a-z0-9]+", " ".join(residual).lower()))
+        location_tokens = set(re.findall(
+            r"[a-z0-9]+",
+            (target_anchor or "").partition(",")[2].lower(),
+        ))
+        return "target" if residual_tokens <= location_tokens else "competing"
+    if _source_mentions_target_property(identity_text, target_anchor):
+        return "target"
+    identity = _STANDALONE_IDENTITY_LINE_RE.match(identity_text)
+    if identity and not _is_property_fact_or_section_label(identity.group("label")):
+        return "competing"
+    return "other"
 
 
 def _unbound_identity_fact_spans(
@@ -2118,31 +2191,19 @@ def _unbound_identity_fact_spans(
             if not _is_property_fact_or_section_label(postfixed_label):
                 unbound_spans.append((current[0], following[1]))
 
-    # Some extracted tables put the mapped label, its value, and the property
-    # identity on three separate rows. Bind the first two rows before deciding
-    # whether the third is an unknown postfixed identity.
-    for label_span, value_span, identity_span in zip(
-        clause_spans,
-        clause_spans[1:],
-        clause_spans[2:],
+    # Extracted tables can put mapped labels, values, and property identities
+    # on three aligned rows with one or more columns. Bind each label/value cell
+    # before deciding whether its identity cell is an unknown property.
+    for label_span, identity_span, label_text, value_text, identity_text in (
+        _aligned_property_table_cells(text)
     ):
-        label_line = _STANDALONE_IDENTITY_LINE_RE.match(
-            text[label_span[0]:label_span[1]]
-        )
-        value_text = text[value_span[0]:value_span[1]]
-        postfixed_identity = _STANDALONE_IDENTITY_LINE_RE.match(
-            text[identity_span[0]:identity_span[1]]
-        )
+        label_line = _STANDALONE_IDENTITY_LINE_RE.match(label_text)
         if (
             not label_line
             or not _is_property_fact_or_section_label(label_line.group("label"))
             or not _NUMERIC_PROPERTY_VALUE_RE.search(value_text)
-            or not postfixed_identity
-            or _source_mentions_target_property(
-                text[identity_span[0]:identity_span[1]],
-                target_anchor,
-            )
-            or _is_property_fact_or_section_label(postfixed_identity.group("label"))
+            or _property_identity_cell_verdict(identity_text, target_anchor)
+            != "competing"
         ):
             continue
         unbound_spans.append((label_span[0], identity_span[1]))
@@ -2369,6 +2430,37 @@ def _exact_target_clause_segments(
     return segments
 
 
+def _target_bound_table_fact_segments(
+    source_text: str,
+    target_anchor: str,
+) -> List[str]:
+    """Return aligned table facts whose identity cell is the exact target."""
+    segments = []
+    for _, _, label_text, value_text, identity_text in (
+        _aligned_property_table_cells(source_text)
+    ):
+        label_line = _STANDALONE_IDENTITY_LINE_RE.match(label_text)
+        if (
+            label_line
+            and _is_property_fact_or_section_label(label_line.group("label"))
+            and _NUMERIC_PROPERTY_VALUE_RE.search(value_text)
+            and _property_identity_cell_verdict(identity_text, target_anchor)
+            == "target"
+        ):
+            label_tokens = set(re.findall(r"[a-z0-9]+", label_text.lower()))
+            is_area_label = bool(
+                label_tokens & {"area", "footage", "ft", "sf", "size", "space"}
+                and not label_tokens & {
+                    "cam", "charges", "expense", "expenses", "lease", "op",
+                    "opex", "ops", "rate", "rent",
+                }
+            )
+            segments.append(
+                f"{value_text} SF" if is_area_label else f"{value_text} {label_text}"
+            )
+    return segments
+
+
 def _target_bound_source_segments(
     source_text: str,
     target_anchor: str,
@@ -2394,7 +2486,7 @@ def _target_bound_source_segments(
             )
         }
     )
-    return [
+    segments = [
         source_text[
             claim[0]:next(
                 (
@@ -2408,6 +2500,8 @@ def _target_bound_source_segments(
         for claim in claims
         if _claim_identity(claim) == target_identity
     ]
+    segments.extend(_target_bound_table_fact_segments(source_text, target_anchor))
+    return segments
 
 
 def _suppress_cross_property_current_row_updates(

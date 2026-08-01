@@ -801,6 +801,218 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 self.assertEqual([], result["events"])
                 self.assertEqual("Thanks.", result["response_email"])
 
+    def test_multi_column_postfixed_identity_tables_fail_closed(self):
+        competing_tables = (
+            (
+                "Docks | Power\n"
+                "6 | 1200A 480V 3-phase\n"
+                "Oak Center | Westgate Logistics Hub"
+            ),
+            (
+                "| Docks | Power |\n"
+                "| 6 | 1200A 480V 3-phase |\n"
+                "| Oak Center | Westgate Logistics Hub |"
+            ),
+            (
+                "Docks, Power\n"
+                "6, 1200A 480V 3-phase\n"
+                "Oak Center, Westgate Logistics Hub"
+            ),
+            (
+                "Docks\tPower\n"
+                "6\t1200A 480V 3-phase\n"
+                "Oak Center\tWestgate Logistics Hub"
+            ),
+            (
+                "Power | Docks\n"
+                "1200A 480V 3-phase | 6\n"
+                "Westgate Logistics Hub | Oak Center"
+            ),
+            (
+                "Docks | Power\n"
+                "6 | 1200A\n"
+                "Power Center | Westgate Power"
+            ),
+            (
+                "Docks | Power\n"
+                "6 | 1200A 480V 3-phase\n"
+                "200 Oak Ave | 300 Pine Rd"
+            ),
+            (
+                "Docks | Power\n"
+                "6 | 1200A 480V 3-phase\n"
+                "100 Main St / Oak Center | Westgate Logistics Hub"
+            ),
+        )
+
+        for competing_table in competing_tables:
+            with self.subTest(competing_table=competing_table):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [
+                            {"column": "Docks", "value": "6"},
+                            {"column": "Power", "value": "1200A 480V 3-phase"},
+                        ],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"100 Main St\n{competing_table}",
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
+    def test_multi_column_mixed_target_cells_keep_only_target_updates(self):
+        mixed_tables = (
+            (
+                "Docks | Power\n"
+                "6 | 1200A 480V 3-phase\n"
+                "100 Main St | Oak Center",
+                {"column": "Docks", "value": "6"},
+                {"column": "Power", "value": "1200A 480V 3-phase"},
+            ),
+            (
+                "Power | Docks\n"
+                "1200A 480V 3-phase | 6\n"
+                "Oak Center | 100 Main St",
+                {"column": "Docks", "value": "6"},
+                {"column": "Power", "value": "1200A 480V 3-phase"},
+            ),
+            (
+                "Drive Ins | Power\n"
+                "2 | 1200A\n"
+                "100 Main St | Oak Center",
+                {"column": "Drive Ins", "value": "2"},
+                {"column": "Power", "value": "1200A"},
+            ),
+            (
+                "Docks | Power\n"
+                "6 | 1200A 480V 3-phase\n"
+                "Oak Center | 100 Main St",
+                {"column": "Power", "value": "1200A 480V 3-phase"},
+                {"column": "Docks", "value": "6"},
+            ),
+            (
+                "Clear Height | Docks\n"
+                "32 | 6\n"
+                "100 Main St | Oak Center",
+                {"column": "Ceiling Ht", "value": "32"},
+                {"column": "Docks", "value": "6"},
+            ),
+            (
+                "Total SF | Docks\n"
+                "45,000 | 6\n"
+                "100 Main St | Oak Center",
+                {"column": "Total SF", "value": "45000"},
+                {"column": "Docks", "value": "6"},
+            ),
+            (
+                "Asking Rate | Docks\n"
+                "$6.75/SF NNN | 6\n"
+                "100 Main St | Oak Center",
+                {"column": "Rent/SF/Yr", "value": "6.75"},
+                {"column": "Docks", "value": "6"},
+            ),
+            (
+                "CAM Charges | Docks\n"
+                "$1.85/SF | 6\n"
+                "100 Main St | Oak Center",
+                {"column": "Ops Ex/SF/Yr", "value": "1.85"},
+                {"column": "Docks", "value": "6"},
+            ),
+            (
+                "Docks | Power\n"
+                "6 | 1200A 480V 3-phase\n"
+                "100 Main St | 200 Oak Ave",
+                {"column": "Docks", "value": "6"},
+                {"column": "Power", "value": "1200A 480V 3-phase"},
+            ),
+        )
+
+        for mixed_table, expected_update, competing_update in mixed_tables:
+            with self.subTest(mixed_table=mixed_table, expected_update=expected_update):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [expected_update, competing_update],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"100 Main St\n{mixed_table}",
+                    }],
+                )
+
+                self.assertEqual([expected_update], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
+    def test_multi_column_target_tables_remain_supported(self):
+        target_tables = (
+            (
+                "Docks | Power\n"
+                "6 | 1200A 480V 3-phase"
+            ),
+            (
+                "Docks | Power\n"
+                "6 | 1200A 480V 3-phase\n"
+                "100 Main St | 100 Main St"
+            ),
+            (
+                "Docks | Power\n"
+                "6 | 1200A 480V 3-phase\n"
+                "100 Main St, Phoenix | 100 Main St, Phoenix"
+            ),
+            (
+                "Asking Rate | Power\n"
+                "$6.75/SF NNN | 1200A 480V 3-phase"
+            ),
+            (
+                "Power, Docks\n"
+                "1200A 480V 3-phase, 6"
+            ),
+        )
+
+        for target_table in target_tables:
+            with self.subTest(target_table=target_table):
+                expected_updates = [
+                    {"column": "Docks", "value": "6"},
+                    {"column": "Power", "value": "1200A 480V 3-phase"},
+                ]
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": list(expected_updates),
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The target brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "100 Main St brochure.pdf",
+                        "text": f"100 Main St\n{target_table}",
+                    }],
+                )
+
+                self.assertEqual(expected_updates, result["updates"])
+                self.assertEqual([], result["events"])
+                self.assertEqual("Thanks.", result["response_email"])
+
     def test_exact_target_postfix_preserves_target_fact_updates(self):
         target_clauses = (
             "Docks: 6 | 100 Main St",
