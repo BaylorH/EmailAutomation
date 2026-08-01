@@ -42,8 +42,8 @@ ROLLBACK_IMAGE = (
 RELEASE_REVISION = "process-user-release-a-abc123"
 
 ENV_VARS = (
-    "FIREBASE_BUCKET=email-automation-cache.firebasestorage.app,"
-    "ENFORCE_OPENAI_BUDGET=1,USAGE_MONTHLY_BUDGET_USD=100,"
+    "^:^FIREBASE_BUCKET=email-automation-cache.firebasestorage.app:"
+    "ENFORCE_OPENAI_BUDGET=1:USAGE_MONTHLY_BUDGET_USD=100:"
     "SITESIFT_AUTO_REPLY_ALLOWLIST="
     "NO7lVYVp6BaplKYEfMlWCgBnpdh2,C4X3UH1r6QhgP3ivXD1QjyhuGyI2"
 )
