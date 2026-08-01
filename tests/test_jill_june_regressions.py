@@ -601,11 +601,42 @@ class JillJuneRegressionTests(unittest.TestCase):
     def test_addressless_ancillary_lease_does_not_terminalize_target_property(self):
         event = {"type": "property_unavailable", "reason": "leased"}
 
-        self.assertFalse(
+        for message_text in (
+            "The trailer lot is leased separately.",
+            "The parking lot has been leased to another tenant.",
+            "The yard is already leased.",
+            "The outparcel is under contract.",
+            "That tour slot is no longer available.",
+            "The 2:00 tour slot has been leased.",
+        ):
+            with self.subTest(message_text=message_text):
+                self.assertFalse(
+                    processing._property_unavailable_event_applies_to_row(
+                        event,
+                        row_anchor="100 Main St, Phoenix",
+                        message_text=message_text,
+                    )
+                )
+
+    def test_addressless_current_property_lease_remains_terminal(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertTrue(
             processing._property_unavailable_event_applies_to_row(
                 event,
                 row_anchor="100 Main St, Phoenix",
-                message_text="The trailer lot is leased separately.",
+                message_text="It has been leased.",
+            )
+        )
+
+    def test_explicit_target_address_lease_remains_terminal(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertTrue(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text="100 Main St has been leased.",
             )
         )
 

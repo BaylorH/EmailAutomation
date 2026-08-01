@@ -22,6 +22,8 @@ from .messaging import (save_message, save_thread_root, index_message_id, index_
                        update_thread_status, get_thread_status, THREAD_STATUS)
 from .logging import write_message_order_test
 from .ai_processing import (
+    _ANCILLARY_SUBJECT_RE,
+    _UNAVAILABLE_PATTERNS,
     _VIABILITY_RE,
     _append_ai_meta,
     _detect_target_terminal_reason,
@@ -2184,8 +2186,21 @@ def _clause_has_terminal_property_evidence(
         return True
     if _looks_like_requirements_mismatch_nonviable(clause):
         return True
+    if _clause_has_ancillary_terminal_evidence(clause):
+        return False
     clause_norm = _normalize_replacement_match_text(clause)
     return any(keyword in clause_norm for keyword in unavailable_keywords)
+
+
+def _clause_has_ancillary_terminal_evidence(clause: str) -> bool:
+    """Recognize a terminal phrase scoped to a non-target asset or tour slot."""
+    text = clause or ""
+    if not (
+        _ANCILLARY_SUBJECT_RE.search(text)
+        or re.search(r"\bleased\s+separately\b", text, re.IGNORECASE)
+    ):
+        return False
+    return any(re.search(pattern, text, re.IGNORECASE) for _reason, pattern in _UNAVAILABLE_PATTERNS)
 
 
 def _message_explicitly_keeps_row_viable(message_text: str, row_anchor: str) -> bool:
@@ -2259,9 +2274,12 @@ def _property_unavailable_event_applies_to_row(
         return True
 
     terminal_bindings = []
+    ancillary_terminal_seen = False
     last_explicit_binding = None
     for clause in _terminal_binding_clauses(message_text):
         explicit_bindings = _explicit_property_bindings(clause, row_anchor)
+        if _clause_has_ancillary_terminal_evidence(clause):
+            ancillary_terminal_seen = True
         if _clause_has_terminal_property_evidence(clause, keywords):
             if _source_mentions_target_property(clause, row_anchor):
                 terminal_bindings.append("target")
@@ -2283,6 +2301,8 @@ def _property_unavailable_event_applies_to_row(
         return False
     if "addressless" in terminal_bindings:
         return True
+    if ancillary_terminal_seen:
+        return False
 
     # Addressless property_unavailable events are normal model output. Preserve
     # them only when the fresh message contains no explicit competing terminal
