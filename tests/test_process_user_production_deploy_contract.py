@@ -44,8 +44,7 @@ RELEASE_REVISION = "process-user-release-a-abc123"
 ENV_VARS = (
     "^:^FIREBASE_BUCKET=email-automation-cache.firebasestorage.app:"
     "ENFORCE_OPENAI_BUDGET=1:USAGE_MONTHLY_BUDGET_USD=100:"
-    "SITESIFT_AUTO_REPLY_ALLOWLIST="
-    "NO7lVYVp6BaplKYEfMlWCgBnpdh2,C4X3UH1r6QhgP3ivXD1QjyhuGyI2"
+    "SITESIFT_AUTO_REPLY_ALLOWLIST=NO7lVYVp6BaplKYEfMlWCgBnpdh2"
 )
 SECRETS = (
     "AZURE_API_APP_ID=AZURE_API_APP_ID:latest,"
@@ -328,6 +327,15 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertNotIn("--cpu=1", deploy)
         self.assertNotIn("--memory=1Gi", deploy)
 
+    def test_deploy_updates_config_without_erasing_panic_switch_or_other_secrets(self):
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        deploy = self._gcloud_calls()[-1]
+        self.assertIn("--update-env-vars", deploy)
+        self.assertIn("--update-secrets", deploy)
+        self.assertNotIn("--set-env-vars", deploy)
+        self.assertNotIn("--set-secrets", deploy)
+
     def test_every_gcloud_call_binds_explicit_account_and_project(self):
         result = self._run("--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -422,8 +430,8 @@ class DeployScriptContractTests(unittest.TestCase):
             "--min-instances", "0",
             "--max-instances", "10",
             "--no-allow-unauthenticated",
-            "--set-env-vars", ENV_VARS,
-            "--set-secrets", SECRETS,
+            "--update-env-vars", ENV_VARS,
+            "--update-secrets", SECRETS,
             "--no-traffic",
             "--tag", "release-a",
         ]
