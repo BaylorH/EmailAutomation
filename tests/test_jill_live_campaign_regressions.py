@@ -140,6 +140,192 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
 
         self.assertEqual([{"column": "Total SF", "value": "7500"}], result["updates"])
 
+    def test_target_brochure_does_not_bless_value_from_competing_brochure(self):
+        proposal = {
+            "updates": [
+                {"column": "Ceiling Ht", "value": "32", "confidence": 0.96},
+                {"column": "Total SF", "value": "20000", "confidence": 0.98},
+            ],
+            "events": [],
+            "response_email": None,
+        }
+        target_brochure = {
+            "name": "100 Main St brochure.pdf",
+            "text": "100 Main St - 20,000 SF industrial building.",
+        }
+        competing_brochure = {
+            "name": "200 Oak Ave brochure.pdf",
+            "text": "200 Oak Ave - Ceiling Ht: 32 feet clear.",
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            _conversation("We have two options; the brochures are attached."),
+            "100 Main St, Phoenix",
+            [target_brochure, competing_brochure],
+        )
+
+        self.assertEqual(
+            [{"column": "Total SF", "value": "20000", "confidence": 0.98}],
+            result["updates"],
+        )
+
+    def test_independent_target_attachment_evidence_preserves_value(self):
+        expected_update = {
+            "column": "Ceiling Ht",
+            "value": "32",
+            "confidence": 0.96,
+        }
+        proposal = {
+            "updates": [expected_update],
+            "events": [],
+            "response_email": None,
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            _conversation("We have two options; the brochures are attached."),
+            "100 Main St, Phoenix",
+            [
+                {
+                    "name": "100 Main St brochure.pdf",
+                    "text": "100 Main St - Ceiling Ht: 32 feet clear.",
+                },
+                {
+                    "name": "200 Oak Ave brochure.pdf",
+                    "text": "200 Oak Ave - Ceiling Ht: 32 feet clear.",
+                },
+            ],
+        )
+
+        self.assertEqual([expected_update], result["updates"])
+
+    def test_fresh_target_bound_evidence_preserves_attachment_value(self):
+        expected_update = {"column": "Ceiling Ht", "value": "32"}
+        proposal = {
+            "updates": [expected_update],
+            "events": [],
+            "response_email": None,
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            _conversation(
+                "This property has 32 feet clear. We also have another option; "
+                "the brochures are attached."
+            ),
+            "100 Main St, Phoenix",
+            [
+                {
+                    "name": "100 Main St brochure.pdf",
+                    "text": "100 Main St - 20,000 SF industrial building.",
+                },
+                {
+                    "name": "200 Oak Ave brochure.pdf",
+                    "text": "200 Oak Ave - Ceiling Ht: 32 feet clear.",
+                },
+            ],
+        )
+
+        self.assertEqual([expected_update], result["updates"])
+
+    def test_attachment_classification_does_not_depend_on_offer_wording(self):
+        proposal = {
+            "updates": [{"column": "Ceiling Ht", "value": "32"}],
+            "events": [],
+            "response_email": None,
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            _conversation("Please see the attached brochures."),
+            "100 Main St, Phoenix",
+            [
+                {
+                    "name": "100 Main St brochure.pdf",
+                    "text": "100 Main St - 20,000 SF industrial building.",
+                },
+                {
+                    "name": "200 Oak Ave brochure.pdf",
+                    "text": "200 Oak Ave - Ceiling Ht: 32 feet clear.",
+                },
+            ],
+        )
+
+        self.assertEqual([], result["updates"])
+
+    def test_target_fact_before_brokerage_footer_address_remains_supported(self):
+        expected_update = {"column": "Ceiling Ht", "value": "28"}
+        proposal = {
+            "updates": [expected_update],
+            "events": [],
+            "response_email": None,
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            _conversation("Please see the attached brochure."),
+            "105 W Dewey Ave, Wharton",
+            [{
+                "name": "105 W Dewey Ave brochure.pdf",
+                "text": (
+                    "105 W Dewey Ave FOR LEASE. Ceiling Ht: 28 feet clear. "
+                    "Garden State Realty, 204 Passaic Ave, Fairfield."
+                ),
+            }],
+        )
+
+        self.assertEqual([expected_update], result["updates"])
+
+    def test_target_address_number_is_not_ceiling_height_evidence(self):
+        proposal = {
+            "updates": [{"column": "Ceiling Ht", "value": "32"}],
+            "events": [],
+            "response_email": None,
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            _conversation("Please see the attached brochures."),
+            "32 Main St, Phoenix",
+            [
+                {
+                    "name": "32 Main St brochure.pdf",
+                    "text": "32 Main St - 20,000 SF industrial building.",
+                },
+                {
+                    "name": "200 Oak Ave brochure.pdf",
+                    "text": "200 Oak Ave - Ceiling Ht: 32 feet clear.",
+                },
+            ],
+        )
+
+        self.assertEqual([], result["updates"])
+
+    def test_new_property_event_keeps_attachment_binding_owned_by_event_path(self):
+        expected_update = {"column": "Ceiling Ht", "value": "32"}
+        proposal = {
+            "updates": [expected_update],
+            "events": [
+                {"type": "new_property", "address": "200 Oak Ave", "city": "Phoenix"}
+            ],
+            "response_email": "Thanks for the option.",
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            _conversation("The alternate brochure is attached."),
+            "100 Main St, Phoenix",
+            [{
+                "name": "200 Oak Ave brochure.pdf",
+                "text": "200 Oak Ave - Ceiling Ht: 32 feet clear.",
+            }],
+        )
+
+        self.assertEqual([expected_update], result["updates"])
+        self.assertEqual("new_property", result["events"][0]["type"])
+        self.assertEqual("Thanks for the option.", result["response_email"])
+
     def test_competing_multi_property_brochure_escalates_instead_of_writing_current_row(self):
         proposal = {
             "updates": [

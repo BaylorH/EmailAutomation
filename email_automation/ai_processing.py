@@ -1956,6 +1956,30 @@ def _event_address_boundary(text: str, events: List[dict]) -> Optional[int]:
     return min(candidates) if candidates else None
 
 
+_CEILING_HEIGHT_VALUE_RES = (
+    re.compile(
+        r"\b(?:clear(?:\s+height)?|ceiling(?:\s+(?:height|ht|clearance))?|clearance)"
+        r"\s*(?:is|of|at|:|=|-)?\s*(\d{1,3}(?:\.\d+)?)\s*"
+        r"(?:feet|foot|ft\.?|['’])?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(\d{1,3}(?:\.\d+)?)\s*(?:feet|foot|ft\.?|['’])?\s*"
+        r"(?:clear(?:\s+height)?|ceiling(?:\s+height)?|clearance)\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _ceiling_height_values(text: str) -> set[Decimal]:
+    return {
+        normalized
+        for pattern in _CEILING_HEIGHT_VALUE_RES
+        for match in pattern.finditer(text or "")
+        if (normalized := _normalized_numeric_value(match.group(1))) is not None
+    }
+
+
 def _update_supported_in_current_segment(update: dict, text: str) -> bool:
     """Require a proposed current-row value to be evidenced before the alternate."""
     column = str((update or {}).get("column") or "").strip().lower()
@@ -1974,10 +1998,34 @@ def _update_supported_in_current_segment(update: dict, text: str) -> bool:
         return expected == _normalized_numeric_value(_extract_drive_in_count_from_text(text))
     if "dock" in column:
         return expected == _normalized_numeric_value(_extract_dock_count_from_text(text))
+    if "ceiling" in column or "clear height" in column or "clearance" in column:
+        return expected in _ceiling_height_values(text)
 
     normalized_value = " ".join(re.findall(r"[a-z0-9]+", str(value).lower()))
     normalized_text = " ".join(re.findall(r"[a-z0-9]+", text.lower()))
     return bool(normalized_value and normalized_value in normalized_text)
+
+
+def _target_bound_source_segments(
+    source_text: str,
+    target_anchor: str,
+    verdict: str,
+) -> List[str]:
+    """Return only source regions whose nearest address claim is the target."""
+    if verdict == "target":
+        return [source_text]
+    if verdict != "mixed":
+        return []
+
+    target_identity = _target_street_identity(target_anchor)
+    claims = _street_claim_spans(source_text)
+    if target_identity is None:
+        return []
+    return [
+        source_text[claim[0]:(claims[index + 1][0] if index + 1 < len(claims) else None)]
+        for index, claim in enumerate(claims)
+        if _claim_identity(claim) == target_identity
+    ]
 
 
 def _suppress_cross_property_current_row_updates(
@@ -2032,11 +2080,6 @@ def _suppress_cross_property_current_row_updates(
     return proposal
 
 
-_OFFERED_PROPERTY_LANGUAGE_RE = re.compile(
-    r"\b(?:i|we)\s+have\b|\b(?:another|alternative|other)\s+"
-    r"(?:building|property|space|suite|unit)\b|\b\d+\s+buildings?\b",
-    re.IGNORECASE,
-)
 _ROUTE_ADDRESS_RE = re.compile(
     r"\b\d{1,6}\s+(?:[a-z]+\s+){0,3}(?:sc|us|fm|sr)[-\s]?\d+\b",
     re.IGNORECASE,
@@ -2049,34 +2092,68 @@ def _suppress_competing_attachment_updates(
     target_anchor: str,
     pdf_manifest: List[dict],
 ) -> dict:
-    """Escalate an offered off-row brochure when the model misses its property event."""
+    """Keep mixed attachment evidence from leaking onto the current row.
+
+    Each attachment is classified independently. When any source is competing
+    or mixed, every proposed value must also occur in a target-bound source
+    segment (or target-bound fresh message segment) before it can survive.
+    """
     if not proposal or not pdf_manifest:
         return proposal
     if any((event or {}).get("type") == "new_property" for event in proposal.get("events") or []):
         return proposal
 
     fresh_text = _fresh_inbound_text(conversation)
-    if not _OFFERED_PROPERTY_LANGUAGE_RE.search(fresh_text):
-        return proposal
-
-    sources = [
-        "\n".join((
+    classified_sources = []
+    for pdf in pdf_manifest:
+        source = "\n".join((
             str((pdf or {}).get("name") or ""),
             str((pdf or {}).get("text") or ""),
         ))
-        for pdf in pdf_manifest
-    ]
-    if any(_source_mentions_target_property(source, target_anchor) for source in sources):
-        return proposal
+        classified_sources.append((
+            source,
+            _attachment_property_verdict(source, target_anchor),
+        ))
     explicitly_other = any(
-        _attachment_property_verdict(source, target_anchor) == "competing"
-        or _ROUTE_ADDRESS_RE.search(source)
-        for source in sources
+        verdict in {"competing", "mixed"}
+        or (
+            _ROUTE_ADDRESS_RE.search(source)
+            and not _source_mentions_target_property(source, target_anchor)
+        )
+        for source, verdict in classified_sources
     )
     if not explicitly_other:
         return proposal
 
-    proposal["updates"] = []
+    target_evidence_sources = [
+        segment
+        for source, verdict in classified_sources
+        for segment in _target_bound_source_segments(
+            source,
+            target_anchor,
+            verdict,
+        )
+    ]
+    fresh_verdict = _attachment_property_verdict(fresh_text, target_anchor)
+    target_evidence_sources.extend(_target_bound_source_segments(
+        fresh_text,
+        target_anchor,
+        fresh_verdict,
+    ))
+    if fresh_verdict == "addressless":
+        transition = _ALTERNATE_PROPERTY_TRANSITION_RE.search(fresh_text)
+        current_segment = (
+            fresh_text[:transition.start()] if transition else fresh_text
+        )
+        if _CURRENT_PROPERTY_AFFIRMATION_RE.search(current_segment):
+            target_evidence_sources.append(current_segment)
+    proposal["updates"] = [
+        update for update in (proposal.get("updates") or [])
+        if any(
+            _update_supported_in_current_segment(update, source)
+            for source in target_evidence_sources
+        )
+    ]
     proposal["events"] = [
         event for event in (proposal.get("events") or [])
         if (event or {}).get("type") != "tour_requested"
