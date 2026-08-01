@@ -997,6 +997,15 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 [power],
             ),
             (
+                "short identity row with target city",
+                "100 Main St, Phoenix",
+                "Docks, Power, Drive Ins\n"
+                "6, 1200A 480V 3-phase, 2\n"
+                "100 Main St, Phoenix, Oak Center",
+                [docks, power, drive_ins],
+                [docks],
+            ),
+            (
                 "target and competitor addresses with cities",
                 "100 Main St, Phoenix",
                 "Docks, Power\n"
@@ -1094,6 +1103,174 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 ))
                 self.assertIsNone(result["response_email"])
 
+    def test_malformed_multi_column_table_shapes_fail_closed(self):
+        updates = [
+            {"column": "Docks", "value": "6"},
+            {"column": "Power", "value": "1200A 480V 3-phase"},
+            {"column": "Drive Ins", "value": "2"},
+        ]
+        malformed_tables = (
+            (
+                "quoted short identity row",
+                "\"Docks\",\"Power\",\"Drive Ins\"\n"
+                "\"6\",\"1200A 480V 3-phase\",\"2\"\n"
+                "\"100 Main St, Phoenix\",\"Oak Center\"",
+            ),
+            (
+                "unquoted short identity row",
+                "Docks, Power, Drive Ins\n"
+                "6, 1200A 480V 3-phase, 2\n"
+                "100 Main St, Oak Center",
+            ),
+            (
+                "pipe extra label",
+                "Docks | Power | Drive Ins\n"
+                "6 | 1200A 480V 3-phase\n"
+                "100 Main St | Oak Center",
+            ),
+            (
+                "tab missing label",
+                "Docks\tDrive Ins\n"
+                "6\t1200A 480V 3-phase\t2\n"
+                "100 Main St\tOak Center\tWestgate",
+            ),
+            (
+                "quoted missing trailing label",
+                "\"Docks\",\n"
+                "\"6\",\"1200A 480V 3-phase\"\n"
+                "\"100 Main St\",\"Oak Center\"",
+            ),
+            (
+                "quoted missing value cell",
+                "\"Docks\",\"Power\",\"Drive Ins\"\n"
+                "\"6\",,\"2\"\n"
+                "\"100 Main St\",\"Oak Center\",\"Westgate\"",
+            ),
+            (
+                "unquoted extra value",
+                "Docks, Power\n"
+                "6, 1200A 480V 3-phase, 2\n"
+                "100 Main St, Oak Center",
+            ),
+            (
+                "quoted two-row extra value",
+                "\"Docks\",\"Power\"\n"
+                "\"6\",\"1200A 480V 3-phase\",\"2\"",
+            ),
+            (
+                "pipe missing identity cell",
+                "Docks | Power | Drive Ins\n"
+                "6 | 1200A 480V 3-phase | 2\n"
+                "100 Main St | | Oak Center",
+            ),
+            (
+                "tab extra identity",
+                "Docks\tPower\n"
+                "6\t1200A 480V 3-phase\n"
+                "100 Main St\tOak Center\tWestgate",
+            ),
+            (
+                "unquoted extra all-target identity",
+                "Docks, Power\n"
+                "6, 1200A 480V 3-phase\n"
+                "100 Main St, 100 Main St, 100 Main St",
+            ),
+            (
+                "quoted extra all-target identity",
+                "\"Docks\",\"Power\"\n"
+                "\"6\",\"1200A 480V 3-phase\"\n"
+                "\"100 Main St\",\"100 Main St\",\"100 Main St\"",
+            ),
+            (
+                "pipe extra all-target identity",
+                "Docks | Power\n"
+                "6 | 1200A 480V 3-phase\n"
+                "100 Main St | 100 Main St | 100 Main St",
+            ),
+            (
+                "tab extra all-target identity",
+                "Docks\tPower\n"
+                "6\t1200A 480V 3-phase\n"
+                "100 Main St\t100 Main St\t100 Main St",
+            ),
+        )
+
+        for name, malformed_table in malformed_tables:
+            with self.subTest(name=name):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": list(updates),
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"100 Main St, Phoenix\n{malformed_table}",
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
+    def test_balanced_three_column_table_shapes_remain_supported(self):
+        updates = [
+            {"column": "Docks", "value": "6"},
+            {"column": "Power", "value": "1200A 480V 3-phase"},
+            {"column": "Drive Ins", "value": "2"},
+        ]
+        target_tables = (
+            (
+                "Docks, Power, Drive Ins\n"
+                "6, 1200A 480V 3-phase, 2\n"
+                "100 Main St, 100 Main St, 100 Main St"
+            ),
+            (
+                "\"Docks\",\"Power\",\"Drive Ins\"\n"
+                "\"6\",\"1200A 480V 3-phase\",\"2\"\n"
+                "\"100 Main St, Phoenix\",\"100 Main St, Phoenix\","
+                "\"100 Main St, Phoenix\""
+            ),
+            (
+                "| Docks | Power | Drive Ins |\n"
+                "| 6 | 1200A 480V 3-phase | 2 |\n"
+                "| 100 Main St, Phoenix | 100 Main St, Phoenix | "
+                "100 Main St, Phoenix |"
+            ),
+            (
+                "Docks\tPower\tDrive Ins\n"
+                "6\t1200A 480V 3-phase\t2\n"
+                "100 Main St, Phoenix\t100 Main St, Phoenix\t"
+                "100 Main St, Phoenix"
+            ),
+        )
+
+        for target_table in target_tables:
+            with self.subTest(target_table=target_table):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": list(updates),
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "100 Main St brochure.pdf",
+                        "text": f"100 Main St, Phoenix\n{target_table}",
+                    }],
+                )
+
+                self.assertEqual(updates, result["updates"])
+                self.assertEqual([], result["events"])
+                self.assertEqual("Thanks.", result["response_email"])
+
     def test_multi_column_target_tables_remain_supported(self):
         target_tables = (
             (
@@ -1117,6 +1294,10 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             (
                 "Power, Docks\n"
                 "1200A 480V 3-phase, 6"
+            ),
+            (
+                "Docks\tPower\n"
+                "6\t1200A 480V 3-phase"
             ),
         )
 

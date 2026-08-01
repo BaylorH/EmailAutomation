@@ -2038,10 +2038,12 @@ def _merge_comma_address_cells(
     expected_count: int,
 ) -> List[str]:
     """Rejoin address-location fragments while preserving table columns."""
+    street_cell_count = sum(bool(_street_claim_spans(cell)) for cell in cells)
     if (
         expected_count < 1
         or len(cells) <= expected_count
-        or not any(_street_claim_spans(cell) for cell in cells)
+        or street_cell_count < 1
+        or street_cell_count > expected_count
     ):
         return cells
 
@@ -2080,6 +2082,7 @@ def _property_table_cells(
     """Split an extracted table row without splitting numeric commas."""
     row = (row or "").strip()
     parsed_csv = False
+    merge_address_fragments = False
     if "|" in row:
         cells = row.split("|")
     elif "\t" in row:
@@ -2089,6 +2092,7 @@ def _property_table_cells(
         parsed_csv = True
     elif re.search(r",\s+", row):
         cells = re.split(r",\s+", row)
+        merge_address_fragments = True
     else:
         return [row]
     if parsed_csv:
@@ -2102,7 +2106,7 @@ def _property_table_cells(
         cells.pop(0)
     while cells and not cells[-1]:
         cells.pop()
-    if identity_row and expected_count is not None:
+    if identity_row and expected_count is not None and merge_address_fragments:
         cells = _merge_comma_address_cells(cells, expected_count)
     return cells
 
@@ -2159,7 +2163,14 @@ def _aligned_property_table_cells(text: str) -> List[tuple]:
             expected_count=len(label_cells),
             identity_row=True,
         )
-        if len(identity_cells) != len(label_cells):
+        if (
+            len(identity_cells) != len(label_cells)
+            or any(
+                not cell
+                for cells in (label_cells, value_cells, identity_cells)
+                for cell in cells
+            )
+        ):
             continue
         aligned.extend(
             (label_span, identity_span, label, value, identity)
@@ -2204,6 +2215,110 @@ def _property_identity_cell_verdict(
     return "other"
 
 
+def _property_fact_label_cell(cell: str) -> bool:
+    """Whether one parsed table cell is a mapped property-fact label."""
+    label_line = _STANDALONE_IDENTITY_LINE_RE.match(cell or "")
+    return bool(
+        label_line
+        and _is_property_fact_or_section_label(label_line.group("label"))
+    )
+
+
+def _split_target_location_identity(
+    identity_cells: List[str],
+    target_anchor: str,
+) -> bool:
+    """Detect a target address whose city was mistaken for another column."""
+    target_identity = _target_street_identity(target_anchor)
+    location_tokens = set(re.findall(
+        r"[a-z0-9]+",
+        (target_anchor or "").partition(",")[2].lower(),
+    ))
+    if not target_identity or not location_tokens:
+        return False
+    for current, following in zip(identity_cells, identity_cells[1:]):
+        claims = _street_claim_spans(current)
+        following_tokens = set(re.findall(r"[a-z0-9]+", following.lower()))
+        if (
+            any(_claim_identity(claim) == target_identity for claim in claims)
+            and following_tokens
+            and following_tokens <= location_tokens
+        ):
+            return True
+    return False
+
+
+def _property_table_shape_spans(
+    text: str,
+    target_anchor: str,
+) -> tuple:
+    """Return structured label rows and malformed table spans."""
+    clause_spans = _property_clause_spans(text)
+    structured_labels = set()
+    malformed_spans = []
+    table_prefixes = {}
+    for label_span, value_span in zip(clause_spans, clause_spans[1:]):
+        label_cells = _property_table_cells(text[label_span[0]:label_span[1]])
+        value_cells = _property_table_cells(text[value_span[0]:value_span[1]])
+        recognized_labels = sum(
+            _property_fact_label_cell(cell)
+            for cell in label_cells
+            if cell
+        )
+        if not recognized_labels or not any(
+            _NUMERIC_PROPERTY_VALUE_RE.search(cell)
+            for cell in value_cells
+            if cell
+        ):
+            continue
+        structured_labels.add(label_span)
+        table_prefixes[label_span] = (label_cells, value_cells)
+        if (
+            len(label_cells) != len(value_cells)
+            or any(
+                not cell
+                for cells in (label_cells, value_cells)
+                for cell in cells
+            )
+        ):
+            malformed_spans.append((label_span[0], value_span[1]))
+
+    for label_span, _, identity_span in zip(
+        clause_spans,
+        clause_spans[1:],
+        clause_spans[2:],
+    ):
+        if label_span not in table_prefixes:
+            continue
+        label_cells, value_cells = table_prefixes[label_span]
+
+        identity_cells = _property_table_cells(
+            text[identity_span[0]:identity_span[1]],
+            expected_count=len(label_cells),
+            identity_row=True,
+        )
+        identity_verdicts = [
+            _property_identity_cell_verdict(cell, target_anchor)
+            for cell in identity_cells
+            if cell
+        ]
+        if not any(
+            verdict in {"target", "competing"}
+            for verdict in identity_verdicts
+        ):
+            continue
+
+        cell_rows = (label_cells, value_cells, identity_cells)
+        malformed = (
+            len({len(cells) for cells in cell_rows}) != 1
+            or any(not cell for cells in cell_rows for cell in cells)
+            or _split_target_location_identity(identity_cells, target_anchor)
+        )
+        if malformed:
+            malformed_spans.append((label_span[0], identity_span[1]))
+    return structured_labels, malformed_spans
+
+
 def _unbound_identity_fact_spans(
     text: str,
     target_anchor: str,
@@ -2212,7 +2327,10 @@ def _unbound_identity_fact_spans(
     text = text or ""
     if not _source_mentions_target_property(text, target_anchor):
         return []
-    unbound_spans = []
+    structured_table_labels, malformed_table_spans = (
+        _property_table_shape_spans(text, target_anchor)
+    )
+    unbound_spans = list(malformed_table_spans)
 
     # PDF table extraction often places a property name on one line and its
     # first value on the next. Treat an unknown standalone heading followed by
@@ -2220,6 +2338,8 @@ def _unbound_identity_fact_spans(
     # explicit field/section labels such as "Clear Height" and "Highlights".
     clause_spans = _property_clause_spans(text)
     for current, following in zip(clause_spans, clause_spans[1:]):
+        if current in structured_table_labels:
+            continue
         current_text = text[current[0]:current[1]]
         following_text = text[following[0]:following[1]]
         identity_line = _STANDALONE_IDENTITY_LINE_RE.match(current_text)
