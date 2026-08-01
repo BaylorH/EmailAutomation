@@ -2071,9 +2071,10 @@ _ADDRESS_LED_TERMINAL_SEPARATOR_RE = re.compile(
 )
 
 
-def _clause_owns_terminal_assertion(clause: str) -> bool:
+def _clause_owns_property_assertion(clause: str) -> bool:
     return bool(
-        _looks_like_requirements_mismatch_nonviable(clause)
+        _VIABILITY_RE.search(clause or "")
+        or _looks_like_requirements_mismatch_nonviable(clause)
         or any(
             re.search(pattern, clause or "", re.IGNORECASE)
             for _reason, pattern in _UNAVAILABLE_PATTERNS
@@ -2104,8 +2105,8 @@ def _terminal_binding_clauses(message_text: str) -> List[str]:
                 left = clause[:separator.start()].strip(" ,")
                 right = clause[separator.end():].strip(" ,")
                 if (
-                    _clause_owns_terminal_assertion(left)
-                    and _clause_owns_terminal_assertion(right)
+                    _clause_owns_property_assertion(left)
+                    and _clause_owns_property_assertion(right)
                 ):
                     expanded.extend((left, right))
                     changed = True

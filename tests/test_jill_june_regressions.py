@@ -512,6 +512,48 @@ class JillJuneRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_competitor_mismatch_does_not_bind_to_viable_target_across_conjunctions(self):
+        address_pairs = (
+            ("1 Target Way", "2 Rival Rd"),
+            ("12 Target Way", "34 Rival Rd"),
+            ("123 Target Way", "456 Rival Rd"),
+            ("1234 Target Way", "5678 Rival Rd"),
+            ("12345 Target Way", "56789 Rival Rd"),
+            ("123456 Target Way", "654321 Rival Rd"),
+        )
+
+        for target_address, competitor_address in address_pairs:
+            for conjunction in (", and ", " and ", ", but ", " but ", ", or ", " or "):
+                message_text = (
+                    f"{competitor_address} is mostly office{conjunction}"
+                    f"{target_address} remains available."
+                )
+                for reason in ("requirements_mismatch", "physical_non_fit"):
+                    event = {"type": "property_unavailable", "reason": reason}
+                    with self.subTest(
+                        target_address=target_address,
+                        conjunction=conjunction,
+                        reason=reason,
+                    ):
+                        patch = processing._pending_nonviable_followup_patch(
+                            [event],
+                            row_anchor=f"{target_address}, Phoenix",
+                            message_text=message_text,
+                        )
+                        self.assertEqual(
+                            {"applies_to_row": False, "pending_patch": None},
+                            {
+                                "applies_to_row": (
+                                    processing._property_unavailable_event_applies_to_row(
+                                        event,
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                ),
+                                "pending_patch": patch,
+                            },
+                        )
+
     def test_target_binding_after_ancillary_supports_address_led_conjunctions(self):
         street_addresses = (
             "1 A St",
