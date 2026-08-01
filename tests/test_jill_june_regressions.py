@@ -1182,6 +1182,64 @@ class JillJuneRegressionTests(unittest.TestCase):
                                     patch["pendingTerminalReason"],
                                 )
 
+    def test_neither_nor_does_not_cross_subordinate_or_relative_clause(self):
+        address_pairs = (
+            ("1 Main St", "2 Oak Ave"),
+            ("12 Main St", "34 Oak Ave"),
+            ("123 Main St", "456 Oak Ave"),
+            ("1234 Main St", "5678 Oak Ave"),
+            ("12345 Main St", "56789 Oak Ave"),
+            ("123456 Main St", "654321 Oak Ave"),
+        )
+        subordinate_links = (
+            "since each",
+            "because each",
+            "although each",
+            "while each",
+            "when each",
+            "where each",
+            "if each",
+            "unless each",
+            "which means each",
+            "that means each",
+            "who says each",
+        )
+
+        for target_address, competitor_address in address_pairs:
+            for first, second in (
+                (target_address, competitor_address),
+                (competitor_address, target_address),
+            ):
+                for reason in ("leased", "sold", "no_space_available"):
+                    event = {"type": "property_unavailable", "reason": reason}
+                    for subordinate_link in subordinate_links:
+                        for punctuation in (" ", ", "):
+                            message_text = (
+                                f"Neither {first} nor {second} was rejected"
+                                f"{punctuation}{subordinate_link} remains available."
+                            )
+                            with self.subTest(
+                                target_address=target_address,
+                                first=first,
+                                reason=reason,
+                                subordinate_link=subordinate_link,
+                                punctuation=punctuation,
+                            ):
+                                self.assertFalse(
+                                    processing._property_unavailable_event_applies_to_row(
+                                        event,
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+                                self.assertIsNone(
+                                    processing._pending_nonviable_followup_patch(
+                                        [event],
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+
     def test_near_negated_availability_never_suppresses_target_terminal_event(self):
         address_pairs = (
             ("1 Main St", "2 Oak Ave"),

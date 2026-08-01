@@ -2212,10 +2212,22 @@ _COORDINATED_LINK_CLAUSE_WORD_RE = re.compile(
     r"\b(?:and|but|or|nor|while|whereas|although|though|because)\b",
     re.IGNORECASE,
 )
+_COORDINATED_LINK_AUXILIARIES = {
+    "am", "is", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "have", "has", "had",
+    "can", "could", "will", "would", "shall", "should",
+    "may", "might", "must", "ought", "to",
+    "appear", "appears", "appeared", "seem", "seems", "seemed",
+}
+_COORDINATED_LINK_IRREGULAR_ADVERBS = {
+    "almost", "already", "also", "even", "ever", "just", "maybe",
+    "never", "now", "often", "perhaps", "quite", "rather", "since",
+    "still", "then", "yet",
+}
 
 
 def _is_bounded_coordinated_viability_link(link_text: str) -> bool:
-    """Accept a short modifier bridge, but never another clause."""
+    """Accept a short auxiliary/adverb bridge, but never another clause."""
     normalized = (link_text or "").strip()
     if normalized.startswith(","):
         normalized = normalized[1:].strip()
@@ -2223,13 +2235,20 @@ def _is_bounded_coordinated_viability_link(link_text: str) -> bool:
         return True
     if "," in normalized or _COORDINATED_LINK_CLAUSE_WORD_RE.search(normalized):
         return False
-    return bool(
-        re.fullmatch(
-            r"[a-z]+(?:[-'’][a-z]+)*"
-            r"(?:[ \t]+[a-z]+(?:[-'’][a-z]+)*){0,5}",
-            normalized,
-            re.IGNORECASE,
-        )
+    if not re.fullmatch(
+        r"[a-z]+(?:[-'’][a-z]+)*"
+        r"(?:[ \t]+[a-z]+(?:[-'’][a-z]+)*){0,5}",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return False
+    words = normalized.lower().replace("’", "'").split()
+    return all(
+        word in _COORDINATED_LINK_AUXILIARIES
+        or word in _COORDINATED_LINK_IRREGULAR_ADVERBS
+        or word.endswith("ly")
+        or word.endswith("n't")
+        for word in words
     )
 
 
@@ -2402,11 +2421,24 @@ def _clause_has_target_terminal_after_ancillary(
 
 def _message_explicitly_keeps_row_viable(message_text: str, row_anchor: str) -> bool:
     last_explicit_binding = None
+    last_explicit_kinds = set()
     for sentence in _terminal_binding_clauses(message_text):
         bindings = _explicit_property_bindings(sentence, row_anchor)
         for viability_match in _VIABILITY_RE.finditer(sentence):
             if _viability_match_is_negated(sentence, bindings, viability_match):
                 continue
+            if (
+                re.search(
+                    r"\b(?:both|each)\s*$",
+                    sentence[:viability_match.start()],
+                    re.IGNORECASE,
+                )
+                and "target" in (
+                    {kind for _start, _end, kind in bindings}
+                    or last_explicit_kinds
+                )
+            ):
+                return True
             if (
                 _viability_is_shared_across_property_bindings(
                     sentence,
@@ -2427,6 +2459,10 @@ def _message_explicitly_keeps_row_viable(message_text: str, row_anchor: str) -> 
                 return True
         if bindings:
             last_explicit_binding = bindings[-1][2]
+            last_explicit_kinds = {
+                kind
+                for _start, _end, kind in bindings
+            }
     return False
 
 
