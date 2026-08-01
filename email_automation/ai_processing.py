@@ -1869,6 +1869,79 @@ def _source_mentions_target_property(source_text: str, target_anchor: str) -> bo
     return reversed_anchor in normalized_source
 
 
+_NAMED_PROPERTY_RE = re.compile(
+    r"\b(?:[A-Z][A-Za-z0-9&'’-]*\s+){1,5}"
+    r"(?:Center|Centre|Commons?|Complex|Campus|Park|Plaza|Crossing|Exchange|"
+    r"Point|Square|Towers?|Yards?)"
+    r"(?:\s+Phase\s+(?:[IVX]+|\d+))?\b"
+)
+_ALTERNATE_PROPERTY_CLAUSE_RE = re.compile(
+    r"\b(?:separately|alternatively|meanwhile)\b|"
+    r"\b(?:another|alternate|alternative|additional|different|other|secondary|"
+    r"backup|second|third|fourth|fifth)\s+"
+    r"(?:property|building|space|suite|unit|option|choice|location|site)\b",
+    re.IGNORECASE,
+)
+_PROPERTY_FACT_SIGNAL_RE = re.compile(
+    r"\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*"
+    r"(?:sf|sq\.?\s*ft|square\s+feet|feet|foot|ft\.?|['’])\b",
+    re.IGNORECASE,
+)
+_PROPERTY_CLAUSE_BREAK_RE = re.compile(r"[.!?;\n]+")
+
+
+def _property_clause_bounds(text: str, start: int, end: int) -> tuple:
+    left = 0
+    for boundary in _PROPERTY_CLAUSE_BREAK_RE.finditer(text or "", 0, start):
+        left = boundary.end()
+    next_boundary = _PROPERTY_CLAUSE_BREAK_RE.search(text or "", end)
+    right = next_boundary.start() if next_boundary else len(text or "")
+    return left, right
+
+
+def _named_property_matches_target_anchor(name: str, target_anchor: str) -> bool:
+    name_tokens = set(re.findall(r"[a-z0-9]+", (name or "").lower()))
+    target_tokens = {
+        token
+        for token in re.findall(
+            r"[a-z0-9]+",
+            (target_anchor or "").split(",", 1)[0].lower(),
+        )
+        if not token.isdigit() and token not in STREET_SUFFIX_TOKENS
+    }
+    return bool(name_tokens and name_tokens.issubset(target_tokens))
+
+
+def _competing_named_property_spans(
+    text: str,
+    target_anchor: str,
+) -> List[tuple]:
+    """Find named-property clauses that cannot safely inherit target identity."""
+    text = text or ""
+    source_mentions_target = _source_mentions_target_property(text, target_anchor)
+    competing_spans = []
+    for match in _NAMED_PROPERTY_RE.finditer(text):
+        if _named_property_matches_target_anchor(match.group(0), target_anchor):
+            continue
+        clause_start, clause_end = _property_clause_bounds(
+            text,
+            match.start(),
+            match.end(),
+        )
+        clause = text[clause_start:clause_end]
+        clause_mentions_target = _source_mentions_target_property(
+            clause,
+            target_anchor,
+        )
+        if _ALTERNATE_PROPERTY_CLAUSE_RE.search(clause) or (
+            source_mentions_target
+            and not clause_mentions_target
+            and _PROPERTY_FACT_SIGNAL_RE.search(clause)
+        ):
+            competing_spans.append((match.start(), match.end()))
+    return competing_spans
+
+
 def _attachment_property_verdict(source_text: str, target_anchor: str) -> str:
     """Classify attachment text as target-bound, competing, or addressless."""
     claims = _street_claim_spans(source_text)
@@ -1877,7 +1950,11 @@ def _attachment_property_verdict(source_text: str, target_anchor: str) -> str:
     target_identity = _target_street_identity(target_anchor)
     matches = [_claim_identity(claim) == target_identity for claim in claims]
     if all(matches):
-        return "target"
+        return (
+            "mixed"
+            if _competing_named_property_spans(source_text, target_anchor)
+            else "target"
+        )
     if any(matches):
         return "mixed"
     return "competing"
@@ -2011,7 +2088,7 @@ def _target_bound_source_segments(
     target_anchor: str,
     verdict: str,
 ) -> List[str]:
-    """Return only source regions whose nearest address claim is the target."""
+    """Return only source regions whose nearest property claim is the target."""
     if verdict == "target":
         return [source_text]
     if verdict != "mixed":
@@ -2021,9 +2098,27 @@ def _target_bound_source_segments(
     claims = _street_claim_spans(source_text)
     if target_identity is None:
         return []
+    property_boundaries = sorted({
+        claim[0] for claim in claims
+    } | {
+        start
+        for start, _ in _competing_named_property_spans(
+            source_text,
+            target_anchor,
+        )
+    })
     return [
-        source_text[claim[0]:(claims[index + 1][0] if index + 1 < len(claims) else None)]
-        for index, claim in enumerate(claims)
+        source_text[
+            claim[0]:next(
+                (
+                    boundary
+                    for boundary in property_boundaries
+                    if boundary > claim[0]
+                ),
+                None,
+            )
+        ]
+        for claim in claims
         if _claim_identity(claim) == target_identity
     ]
 
@@ -2088,18 +2183,42 @@ _ATTACHMENT_NAME_NOISE = {
     "brochure", "brochures", "flyer", "flyers", "marketing", "package",
     "offering", "memorandum", "om", "pdf", "floorplan", "floorplans",
 }
+_ATTACHMENT_VERSION_TOKEN_RE = re.compile(
+    r"(?:v|ver|version|rev|revision)\d+",
+    re.IGNORECASE,
+)
+
+
+def _attachment_name_tokens(name: str) -> List[str]:
+    return [
+        token for token in re.findall(r"[a-z0-9]+", (name or "").lower())
+        if token not in _ATTACHMENT_NAME_NOISE
+        and not _ATTACHMENT_VERSION_TOKEN_RE.fullmatch(token)
+    ]
+
+
+def _attachment_name_spans(name: str, text: str) -> List[tuple]:
+    tokens = _attachment_name_tokens(name)
+    if not tokens or (len(tokens) == 1 and len(tokens[0]) < 5):
+        return []
+    pattern = r"\b" + r"[^a-z0-9]+".join(map(re.escape, tokens)) + r"\b"
+    return [
+        (match.start(), match.end())
+        for match in re.finditer(pattern, text or "", re.IGNORECASE)
+    ]
 
 
 def _attachment_name_matches_text(name: str, text: str) -> bool:
-    tokens = [
-        token for token in re.findall(r"[a-z0-9]+", (name or "").lower())
-        if token not in _ATTACHMENT_NAME_NOISE
-    ]
-    if not tokens or (len(tokens) == 1 and len(tokens[0]) < 5):
-        return False
-    phrase = " ".join(tokens)
-    normalized_text = " ".join(re.findall(r"[a-z0-9]+", (text or "").lower()))
-    return f" {phrase} " in f" {normalized_text} "
+    return bool(_attachment_name_spans(name, text))
+
+
+def _attachment_name_has_alternate_clause(name: str, text: str) -> bool:
+    text = text or ""
+    for start, end in _attachment_name_spans(name, text):
+        clause_start, clause_end = _property_clause_bounds(text, start, end)
+        if _ALTERNATE_PROPERTY_CLAUSE_RE.search(text[clause_start:clause_end]):
+            return True
+    return False
 
 
 def _suppress_competing_attachment_updates(
@@ -2124,11 +2243,19 @@ def _suppress_competing_attachment_updates(
 
     fresh_text = _fresh_inbound_text(conversation)
     fresh_transition = _ALTERNATE_PROPERTY_TRANSITION_RE.search(fresh_text)
+    competing_name_spans = _competing_named_property_spans(
+        fresh_text,
+        target_anchor,
+    )
+    target_cutoffs = [start for start, _ in competing_name_spans]
+    if fresh_transition:
+        target_cutoffs.append(fresh_transition.start())
+    target_cutoff = min(target_cutoffs) if target_cutoffs else None
     fresh_target_text = (
-        fresh_text[:fresh_transition.start()] if fresh_transition else fresh_text
+        fresh_text[:target_cutoff] if target_cutoff is not None else fresh_text
     )
     fresh_alternate_text = (
-        fresh_text[fresh_transition.start():] if fresh_transition else ""
+        fresh_text[target_cutoff:] if target_cutoff is not None else ""
     )
     classified_sources = []
     for pdf in pdf_manifest:
@@ -2139,10 +2266,18 @@ def _suppress_competing_attachment_updates(
         verdict = _attachment_property_verdict(source, target_anchor)
         if (
             verdict == "addressless"
-            and fresh_alternate_text
-            and _attachment_name_matches_text(
-                str((pdf or {}).get("name") or ""),
-                fresh_alternate_text,
+            and (
+                _attachment_name_has_alternate_clause(
+                    str((pdf or {}).get("name") or ""),
+                    fresh_text,
+                )
+                or (
+                    fresh_alternate_text
+                    and _attachment_name_matches_text(
+                        str((pdf or {}).get("name") or ""),
+                        fresh_alternate_text,
+                    )
+                )
             )
         ):
             verdict = "competing"
