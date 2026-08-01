@@ -1,9 +1,11 @@
 import json
 import unittest
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from types import MappingProxyType
+
+from google.api_core.datetime_helpers import DatetimeWithNanoseconds
 
 from email_automation.campaign_capabilities import (
     CampaignCapabilitiesResolution,
@@ -122,6 +124,29 @@ class _BrokenTzinfoDatetime(datetime):
 class _BrokenOffsetDatetime(datetime):
     def utcoffset(self):
         raise RuntimeError("synthetic UTC offset failure")
+
+
+class _LyingDatetime(datetime):
+    @property
+    def tzinfo(self):
+        return object()
+
+    def utcoffset(self):
+        return object()
+
+
+class _AwareDatetimeSubclass(datetime):
+    pass
+
+
+class _InvalidOffsetTypeTimezone(tzinfo):
+    def utcoffset(self, _value):
+        return object()
+
+
+class _OutOfRangeTimezone(tzinfo):
+    def utcoffset(self, _value):
+        return timedelta(hours=24)
 
 
 class _HostileDict(dict):
@@ -379,6 +404,63 @@ class CampaignCapabilitiesTests(unittest.TestCase):
                 for decision in resolution.decisions.values():
                     self.assertFalse(decision.allowed)
                     self.assertEqual("capability_audit_invalid", decision.reason_code)
+
+    def test_deceptive_datetime_subclass_cannot_forge_audit_metadata(self):
+        candidate = fixture("combination-111")
+        test_input = materialize(candidate["input"])
+        data = {
+            **test_input["data"],
+            "updatedAt": _LyingDatetime(2026, 7, 31),
+        }
+
+        resolution = resolve_campaign_capabilities(
+            uid=test_input["uid"],
+            document_id=test_input["documentId"],
+            data=data,
+        )
+
+        for decision in resolution.decisions.values():
+            self.assertFalse(decision.allowed)
+            self.assertEqual("capability_audit_invalid", decision.reason_code)
+
+    def test_genuine_aware_datetime_subclasses_remain_supported(self):
+        candidate = fixture("combination-111")
+        test_input = materialize(candidate["input"])
+        timestamps = (
+            _AwareDatetimeSubclass(2026, 7, 31, tzinfo=timezone.utc),
+            DatetimeWithNanoseconds(2026, 7, 31, tzinfo=timezone.utc),
+        )
+
+        for timestamp in timestamps:
+            with self.subTest(timestamp_type=type(timestamp).__name__):
+                resolution = resolve_campaign_capabilities(
+                    uid=test_input["uid"],
+                    document_id=test_input["documentId"],
+                    data={**test_input["data"], "updatedAt": timestamp},
+                )
+                self.assertEqual(candidate["expected"], as_contract(resolution))
+
+    def test_invalid_intrinsic_datetime_offsets_deny_without_raising(self):
+        candidate = fixture("combination-111")
+        test_input = materialize(candidate["input"])
+        timestamps = (
+            datetime(2026, 7, 31, tzinfo=_InvalidOffsetTypeTimezone()),
+            datetime(2026, 7, 31, tzinfo=_OutOfRangeTimezone()),
+        )
+
+        for timestamp in timestamps:
+            intrinsic_timezone = datetime.tzinfo.__get__(timestamp)
+            with self.subTest(timezone_type=type(intrinsic_timezone).__name__):
+                resolution = resolve_campaign_capabilities(
+                    uid=test_input["uid"],
+                    document_id=test_input["documentId"],
+                    data={**test_input["data"], "updatedAt": timestamp},
+                )
+                for decision in resolution.decisions.values():
+                    self.assertFalse(decision.allowed)
+                    self.assertEqual(
+                        "capability_audit_invalid", decision.reason_code
+                    )
 
     def test_pathological_mapping_and_uid_subclasses_deny_without_raising(self):
         candidate = fixture("combination-111")

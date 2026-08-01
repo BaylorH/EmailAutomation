@@ -1,7 +1,7 @@
 """Fail-closed resolution of per-user v2 campaign capabilities."""
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import isfinite
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional
@@ -11,6 +11,7 @@ from weakref import WeakSet
 _CAPABILITY_NAMES = ("start", "initialDispatch", "inboundAutomation")
 _SUPPORTED_SCHEMA_VERSION = 2
 _MAX_SAFE_INTEGER = (2**53) - 1
+_MAX_UTC_OFFSET_SECONDS = 24 * 60 * 60
 _BOUNDARY_WHITESPACE = frozenset(
     (
         "\u0009",
@@ -99,7 +100,21 @@ def _is_firestore_timestamp(value: Any) -> bool:
     try:
         if not isinstance(value, datetime):
             return False
-        return value.tzinfo is not None and value.utcoffset() is not None
+        value_type = type(value)
+        if (
+            value_type.tzinfo is not datetime.tzinfo
+            or value_type.utcoffset is not datetime.utcoffset
+        ):
+            return False
+
+        intrinsic_tzinfo = datetime.tzinfo.__get__(value, value_type)
+        if intrinsic_tzinfo is None:
+            return False
+        intrinsic_offset = datetime.utcoffset(value)
+        if not isinstance(intrinsic_offset, timedelta):
+            return False
+        offset_seconds = timedelta.total_seconds(intrinsic_offset)
+        return -_MAX_UTC_OFFSET_SECONDS < offset_seconds < _MAX_UTC_OFFSET_SECONDS
     except Exception:
         return False
 
