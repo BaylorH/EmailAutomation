@@ -38,7 +38,7 @@ class FakeThreadRef:
     def update(self, data):
         self.updates.append(data)
 
-    def get(self):
+    def get(self, transaction=None):
         return FakeThreadSnapshot(self._data)
 
 
@@ -64,8 +64,60 @@ class FakeFirestore:
     def update(self, data):
         self.thread_ref.update(data)
 
-    def get(self):
-        return self.thread_ref.get()
+    def get(self, transaction=None):
+        return self.thread_ref.get(transaction=transaction)
+
+    def transaction(self):
+        return FakeTransaction()
+
+
+class FakeTransaction:
+    def __init__(self):
+        self.updates = []
+
+    def update(self, ref, data):
+        payload = dict(data)
+        self.updates.append((ref, payload))
+        ref.update(payload)
+
+
+class StaleWaitingThreads:
+    def __init__(self, stale_data, backing_ref):
+        self.backing_ref = backing_ref
+        self.transaction = FakeTransaction()
+        self.stale_doc = type("StaleWaitingDoc", (), {
+            "id": "thread-stale",
+            "reference": backing_ref,
+            "to_dict": lambda self: dict(stale_data),
+        })()
+
+    def where(self, *_args, **_kwargs):
+        return self
+
+    def stream(self):
+        return [self.stale_doc]
+
+    def document(self, _thread_id):
+        return self.backing_ref
+
+
+class StaleWaitingFirestore:
+    def __init__(self, stale_data, current_data):
+        self.backing_ref = FakeThreadRef(current_data)
+        self.threads = StaleWaitingThreads(stale_data, self.backing_ref)
+
+    def document(self, _user_id):
+        return self
+
+    def collection(self, name):
+        if name == "users":
+            return self
+        if name == "threads":
+            return self.threads
+        raise AssertionError(f"Unexpected collection: {name}")
+
+    def transaction(self):
+        return self.threads.transaction
 
 
 def _fixed_datetime(value):
@@ -117,7 +169,8 @@ class FakeFollowupThreadNode:
         self.updates.append(data)
 
     def get(self):
-        return FakeThreadSnapshot(self.thread_data)
+        thread_data = self.thread_data() if callable(self.thread_data) else self.thread_data
+        return FakeThreadSnapshot(thread_data)
 
 
 class FakeFollowupThreadsCollection:
@@ -336,6 +389,69 @@ class FollowupTerminalStateTests(unittest.TestCase):
         )
         self._optout_patch.start()
         self.addCleanup(self._optout_patch.stop)
+
+    def test_claim_rechecks_stale_waiting_query_and_rejects_terminal_reply(self):
+        past = datetime.now(timezone.utc) - followup.timedelta(hours=1)
+        stale_data = {
+            "clientId": "client-1",
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": {
+                "enabled": True,
+                "nextFollowUpAt": past,
+                "currentFollowUpIndex": 0,
+                "followUps": [{"message": "Following up."}],
+            },
+        }
+        current_data = {
+            **stale_data,
+            "status": "stopped",
+            "statusReason": "requirements_mismatch",
+            "followUpStatus": "stopped",
+            "pendingTerminalReason": "requirements_mismatch",
+            "hasInboundReply": True,
+        }
+        fake_fs = StaleWaitingFirestore(stale_data, current_data)
+
+        with patch.object(followup, "_fs", fake_fs), patch.object(
+            followup, "_next_business_followup_time", side_effect=lambda now, _cfg: now
+        ), patch("google.cloud.firestore.transactional", lambda fn: fn), patch.object(
+            followup, "_send_followup_email"
+        ) as send_followup:
+            states = followup.check_and_send_followups(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        self.assertEqual([], states)
+        send_followup.assert_not_called()
+        self.assertEqual([], fake_fs.threads.transaction.updates)
+        self.assertEqual([], fake_fs.backing_ref.updates)
+
+    def test_claim_returns_the_owner_written_by_its_transaction(self):
+        past = datetime.now(timezone.utc) - followup.timedelta(hours=1)
+        thread_ref = FakeThreadRef({
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": {
+                "enabled": True,
+                "nextFollowUpAt": past,
+                "currentFollowUpIndex": 0,
+                "followUps": [{"message": "Following up."}],
+            },
+        })
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ):
+            claim_owner = followup._claim_followup("uid-1", "thread-1", 0)
+
+        self.assertIsInstance(claim_owner, str)
+        self.assertEqual(
+            claim_owner,
+            thread_ref.updates[-1]["followUpConfig.processingBy"],
+        )
 
     def test_followup_blocks_note_field_request_before_graph(self):
         self.campaign_decision.return_value = CampaignAutomationDecision(
@@ -923,6 +1039,107 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertEqual("terminal", followup._send_followup_email.campaign_suppression_kind)
         self.assertIn("client_stopped_by_user", followup._send_followup_email.last_error)
 
+    def test_followup_rechecks_thread_state_immediately_before_graph_send(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+        })
+        snapshots = iter([
+            {
+                "clientId": "client-1",
+                "status": "active",
+                "followUpStatus": "waiting",
+                "hasInboundReply": False,
+                "followUpConfig": {"enabled": True, "currentFollowUpIndex": 0},
+            },
+            {
+                "clientId": "client-1",
+                "status": "stopped",
+                "statusReason": "requirements_mismatch",
+                "followUpStatus": "stopped",
+                "pendingTerminalReason": "requirements_mismatch",
+                "hasInboundReply": True,
+                "followUpConfig": {"enabled": False, "currentFollowUpIndex": 0},
+            },
+        ])
+        fake_fs = FakeFollowupFirestore([outbound], thread_data=lambda: next(snapshots))
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "followUps": [{"message": "Hi Riley,\n\nJust following up."}],
+        }
+        thread_data = {
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "contactName": "Riley Broker",
+        }
+        posts = []
+
+        def run_request(func, **_kwargs):
+            return func()
+
+        def fake_get(url, **_kwargs):
+            if "/me/messages?" in url:
+                return FakeResponse(200, {"value": []})
+            return FakeResponse(200, {
+                "value": [{"id": "graph-root", "subject": "0 Gemini Ave", "conversationId": "conv-1"}]
+            })
+
+        def fake_post(url, **_kwargs):
+            posts.append(url)
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "reply-draft-terminal",
+                    "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
+                    "ccRecipients": [],
+                })
+            if url.endswith("/send"):
+                return FakeResponse(202, {})
+            return FakeResponse(201, {})
+
+        with patch.object(followup, "_fs", fake_fs), patch.object(
+            followup, "exponential_backoff_request", side_effect=run_request
+        ), patch.object(requests, "get", side_effect=fake_get), patch.object(
+            requests, "post", side_effect=fake_post
+        ), patch.object(requests, "patch", return_value=FakeResponse(200)), patch(
+            "email_automation.processing.is_contact_opted_out", return_value=None
+        ), patch(
+            "email_automation.email._hydrate_reply_all_draft_recipients",
+            side_effect=lambda _headers, draft, **_kwargs: draft,
+        ), patch(
+            "email_automation.email._source_message_reply_all_fallback",
+            side_effect=lambda draft, _source: draft,
+        ), patch(
+            "email_automation.email._reviewed_recipient_reply_all_fallback",
+            side_effect=lambda draft, **_kwargs: draft,
+        ), patch(
+            "email_automation.email._filter_reply_all_draft_recipients",
+            return_value={
+                "payload": {
+                    "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
+                    "ccRecipients": [],
+                },
+                "sentRecipients": ["bp21harrison@gmail.com"],
+            },
+        ), patch.object(
+            followup, "_save_followup_message", return_value=True
+        ), patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+            )
+
+        self.assertFalse(result)
+        self.assertFalse(any(url.endswith("/send") for url in posts))
+        delete_draft.assert_called_once()
+        self.assertIn("requirements_mismatch", followup._send_followup_email.last_error)
+        self.assertTrue(followup._send_followup_email.guard_failed_closed)
+
     def test_followup_rechecks_action_needed_state_before_reply_all_draft(self):
         outbound = FakeMessageDoc({
             "direction": "outbound",
@@ -1221,10 +1438,19 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertTrue(followup._send_followup_email.guard_failed_closed)
 
     def test_guard_lookup_failure_release_marks_manual_review(self):
-        thread_ref = FakeThreadRef()
+        thread_ref = FakeThreadRef({
+            "status": "active",
+            "followUpStatus": "waiting",
+            "followUpConfig": {
+                "enabled": True,
+                "currentFollowUpIndex": 1,
+            },
+        })
         attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
 
-        with patch.object(followup, "_fs", FakeFirestore(thread_ref)):
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ):
             followup._release_followup_claim(
                 "uid-1",
                 "thread-1",
@@ -1240,6 +1466,65 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertEqual(update["statusReason"], "followup_send_guard_failed")
         self.assertFalse(update["followUpConfig.enabled"])
         self.assertEqual(update["followUpConfig.lastSendAttemptIndex"], 1)
+
+    def test_fail_closed_release_preserves_terminal_status_and_reason(self):
+        terminal_data = {
+            "status": "stopped",
+            "statusReason": "requirements_mismatch",
+            "followUpStatus": "stopped",
+            "pendingTerminalReason": "requirements_mismatch",
+            "hasInboundReply": True,
+            "followUpConfig": {
+                "enabled": False,
+                "currentFollowUpIndex": 1,
+                "processingBy": "followup-worker",
+            },
+        }
+        thread_ref = FakeThreadRef(terminal_data)
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ):
+            followup._release_followup_claim(
+                "uid-1",
+                "thread-1",
+                reason="Follow-up stopped because the broker replied",
+                current_index=1,
+                fail_closed=True,
+            )
+
+        update = thread_ref.updates[-1]
+        self.assertNotIn("status", update)
+        self.assertNotIn("statusReason", update)
+        self.assertNotIn("followUpStatus", update)
+        self.assertIsNone(update["followUpConfig.processingBy"])
+        self.assertIsNone(update["followUpConfig.processingAt"])
+
+    def test_release_does_not_clear_a_claim_owned_by_another_worker(self):
+        thread_ref = FakeThreadRef({
+            "status": "active",
+            "followUpStatus": "waiting",
+            "followUpConfig": {
+                "enabled": True,
+                "currentFollowUpIndex": 1,
+                "processingBy": "new-owner",
+            },
+        })
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ):
+            released = followup._release_followup_claim(
+                "uid-1",
+                "thread-1",
+                reason="old worker failed",
+                current_index=1,
+                claim_owner="old-owner",
+                fail_closed=True,
+            )
+
+        self.assertFalse(released)
+        self.assertEqual([], thread_ref.updates)
 
     def test_schedule_next_followup_clears_previous_retry_guard_state(self):
         thread_ref = FakeThreadRef()

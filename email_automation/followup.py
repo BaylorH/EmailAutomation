@@ -14,11 +14,13 @@ Key features:
 Called from main.py after inbox scanning.
 """
 
+import socket
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 from google.cloud.firestore import SERVER_TIMESTAMP
 
@@ -248,15 +250,14 @@ def _next_business_followup_time(
     return local_monday.astimezone(timezone.utc)
 
 
-def _claim_followup(user_id: str, thread_id: str, current_index: int) -> bool:
+def _claim_followup(user_id: str, thread_id: str, current_index: int) -> Optional[str]:
     """
     Atomically claim a follow-up for processing to prevent duplicate sends.
 
-    Uses a transaction to check that:
-    1. No other process is currently sending this follow-up
-    2. The current index hasn't changed since we read it
+    The transaction revalidates that the thread is still waiting, sendable,
+    due, and at the expected index before replacing any stale claim.
 
-    Returns True if successfully claimed, False if already being processed.
+    Returns the unique claim owner if successful, otherwise None.
     """
     from google.cloud.firestore import transactional
 
@@ -266,22 +267,49 @@ def _claim_followup(user_id: str, thread_id: str, current_index: int) -> bool:
     def claim_transaction(transaction, thread_ref, expected_index):
         snapshot = thread_ref.get(transaction=transaction)
         if not snapshot.exists:
-            return False
+            return None
 
         data = snapshot.to_dict() or {}
         followup_config = data.get("followUpConfig", {})
+
+        block_reason = _followup_terminal_block_reason(
+            data,
+            followup_config,
+            expected_index,
+        )
+        if block_reason:
+            print(f"   ⏭️ Follow-up no longer sendable: {block_reason}")
+            return None
+
+        followup_status = str(data.get("followUpStatus") or "").strip().lower()
+        if followup_status != "waiting":
+            print(f"   ⏭️ Follow-up state changed to {followup_status or 'unset'}, skipping")
+            return None
 
         # Check if index has changed (another process already sent)
         actual_index = followup_config.get("currentFollowUpIndex", 0)
         if actual_index != expected_index:
             print(f"   ⏭️ Follow-up index changed ({expected_index} → {actual_index}), skipping")
-            return False
+            return None
 
         # Check if already being processed
         processing_by = followup_config.get("processingBy")
         processing_at = followup_config.get("processingAt")
 
         now = datetime.now(timezone.utc)
+
+        next_followup_at = followup_config.get("nextFollowUpAt")
+        try:
+            next_followup_dt = datetime.fromtimestamp(
+                next_followup_at.timestamp(),
+                tz=timezone.utc,
+            )
+        except (AttributeError, TypeError, ValueError, OSError):
+            print("   ⏭️ Follow-up no longer has a valid due time, skipping")
+            return None
+        if now < next_followup_dt:
+            print("   ⏭️ Follow-up due time moved into the future, skipping")
+            return None
 
         if processing_by and processing_at:
             if hasattr(processing_at, 'timestamp'):
@@ -291,23 +319,22 @@ def _claim_followup(user_id: str, thread_id: str, current_index: int) -> bool:
 
             if claim_age < FOLLOWUP_CLAIM_TIMEOUT_SECONDS:
                 print(f"   ⏭️ Follow-up already being processed by {processing_by} ({int(claim_age)}s ago)")
-                return False
+                return None
 
         # Claim the follow-up
-        import socket
-        worker_id = f"followup-{socket.gethostname()[:20]}"
+        worker_id = f"followup-{socket.gethostname()[:20]}-{uuid4().hex}"
         transaction.update(thread_ref, {
             "followUpConfig.processingBy": worker_id,
             "followUpConfig.processingAt": now
         })
-        return True
+        return worker_id
 
     try:
         transaction = _fs.transaction()
         return claim_transaction(transaction, thread_ref, current_index)
     except Exception as e:
         print(f"   ⚠️ Failed to claim follow-up for {thread_id[:20]}...: {e}")
-        return False
+        return None
 
 
 def _release_followup_claim(
@@ -317,32 +344,75 @@ def _release_followup_claim(
     reason: Optional[str] = None,
     attempted_at: Optional[datetime] = None,
     current_index: Optional[int] = None,
+    claim_owner: Optional[str] = None,
     fail_closed: bool = False,
-):
-    """Release claim on a follow-up (called on failure to allow retry)."""
+) -> bool:
+    """Release an owned claim without overwriting newer or terminal state."""
+    from google.cloud.firestore import transactional
+
     try:
         thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
-        update_payload = {
-            "followUpConfig.processingBy": None,
-            "followUpConfig.processingAt": None,
-        }
-        if reason:
-            update_payload["followUpConfig.lastSendError"] = reason
-        if attempted_at:
-            update_payload["followUpConfig.lastSendAttemptAt"] = attempted_at
-        if current_index is not None:
-            update_payload["followUpConfig.lastSendAttemptIndex"] = current_index
-        if fail_closed:
-            update_payload.update({
-                "followUpStatus": "needs_review",
-                "status": "action_needed",
-                "statusReason": "followup_send_guard_failed",
-                "followUpConfig.enabled": False,
-                "followUpConfig.nextFollowUpAt": None,
-            })
-        thread_ref.update(update_payload)
+
+        @transactional
+        def release_transaction(transaction, thread_ref):
+            snapshot = thread_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                return False
+
+            data = snapshot.to_dict() or {}
+            followup_config = data.get("followUpConfig", {})
+            current_owner = followup_config.get("processingBy")
+            if claim_owner is not None and current_owner != claim_owner:
+                print(
+                    f"   ⏭️ Follow-up claim ownership changed from {claim_owner} "
+                    f"to {current_owner}; not releasing"
+                )
+                return False
+
+            actual_index = followup_config.get("currentFollowUpIndex", 0)
+            if current_index is not None and actual_index != current_index:
+                print(
+                    f"   ⏭️ Follow-up index changed from {current_index} "
+                    f"to {actual_index}; not releasing"
+                )
+                return False
+
+            update_payload = {
+                "followUpConfig.processingBy": None,
+                "followUpConfig.processingAt": None,
+            }
+            if reason:
+                update_payload["followUpConfig.lastSendError"] = reason
+            if attempted_at:
+                update_payload["followUpConfig.lastSendAttemptAt"] = attempted_at
+            if current_index is not None:
+                update_payload["followUpConfig.lastSendAttemptIndex"] = current_index
+            if fail_closed:
+                block_reason = _followup_terminal_block_reason(
+                    data,
+                    followup_config,
+                    actual_index,
+                )
+                if block_reason:
+                    print(
+                        f"   ⏭️ Preserving newer blocked follow-up state: {block_reason}"
+                    )
+                else:
+                    update_payload.update({
+                        "followUpStatus": "needs_review",
+                        "status": "action_needed",
+                        "statusReason": "followup_send_guard_failed",
+                        "followUpConfig.enabled": False,
+                        "followUpConfig.nextFollowUpAt": None,
+                    })
+            transaction.update(thread_ref, update_payload)
+            return True
+
+        transaction = _fs.transaction()
+        return release_transaction(transaction, thread_ref)
     except Exception as e:
         print(f"   ⚠️ Failed to release follow-up claim: {e}")
+        return False
 
 
 def _save_followup_message(
@@ -449,7 +519,7 @@ def _followup_terminal_block_reason(
         return "the broker has already replied"
     if status in {"stopped", "completed", "archived", "action_needed", "paused"}:
         return f"the thread is {status}"
-    if followup_status in {"paused", "needs_review", "max_reached", "complete", "completed", "stopped"}:
+    if followup_status and followup_status != "waiting":
         return f"follow-up tracking is {followup_status}"
     if status_reason in {"manual_continuation", "followup_send_guard_failed"}:
         return f"the thread requires review for {status_reason}"
@@ -465,6 +535,47 @@ def _followup_terminal_block_reason(
         return "the max follow-up count has already been reached"
 
     return None
+
+
+def _read_followup_send_precondition(
+    user_id: str,
+    thread_id: str,
+    followup_index: int,
+    fallback_config: Dict[str, Any],
+    *,
+    claim_owner: Optional[str] = None,
+):
+    """Read current thread state and return ``(data, block_reason)``."""
+    latest_thread_doc = (
+        _fs.collection("users")
+        .document(user_id)
+        .collection("threads")
+        .document(thread_id)
+        .get()
+    )
+    if not latest_thread_doc.exists:
+        return {}, "the thread no longer exists"
+
+    latest_thread_data = latest_thread_doc.to_dict() or {}
+    if "followUpConfig" in latest_thread_data:
+        latest_followup_config = latest_thread_data.get("followUpConfig") or {}
+    else:
+        latest_followup_config = fallback_config
+
+    block_reason = _followup_terminal_block_reason(
+        latest_thread_data,
+        latest_followup_config,
+        followup_index,
+    )
+    if not block_reason and claim_owner is not None:
+        current_owner = latest_followup_config.get("processingBy")
+        if current_owner != claim_owner:
+            block_reason = (
+                f"follow-up claim ownership changed from {claim_owner} "
+                f"to {current_owner}"
+            )
+
+    return latest_thread_data, block_reason
 
 
 def _followup_operation_state(
@@ -614,8 +725,10 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
             continue
 
         # Claim the follow-up to prevent duplicate sends
-        if not _claim_followup(user_id, thread_id, current_index):
+        claim_result = _claim_followup(user_id, thread_id, current_index)
+        if not claim_result:
             continue
+        claim_owner = claim_result if isinstance(claim_result, str) else None
 
         # Send the follow-up
         _reset_followup_send_outcome()
@@ -625,7 +738,8 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
             thread_id=thread_id,
             thread_data=thread_data,
             followup_config=followup_config,
-            followup_index=current_index
+            followup_index=current_index,
+            claim_owner=claim_owner,
         )
 
         if success:
@@ -670,6 +784,7 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
                     thread_id,
                     reason=send_outcome.error,
                     current_index=current_index,
+                    claim_owner=claim_owner,
                     fail_closed=False,
                 )
                 continue
@@ -681,6 +796,7 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
                 reason=send_outcome.error,
                 attempted_at=send_outcome.attempt_at,
                 current_index=current_index,
+                claim_owner=claim_owner,
                 fail_closed=send_outcome.guard_failed_closed,
             )
             # Swallowed per-item Graph send failure -> surface to the health rail.
@@ -702,7 +818,8 @@ def _send_followup_email(
     thread_id: str,
     thread_data: Dict,
     followup_config: Dict,
-    followup_index: int
+    followup_index: int,
+    claim_owner: Optional[str] = None,
 ) -> bool:
     """Send a follow-up email for a specific thread."""
     import requests
@@ -962,14 +1079,13 @@ def _send_followup_email(
         _set_followup_send_outcome(attempt_at=send_attempt_at)
 
         try:
-            latest_thread_doc = (
-                _fs.collection("users")
-                .document(user_id)
-                .collection("threads")
-                .document(thread_id)
-                .get()
+            latest_thread_data, terminal_reason = _read_followup_send_precondition(
+                user_id,
+                thread_id,
+                followup_index,
+                followup_config,
+                claim_owner=claim_owner,
             )
-            latest_thread_data = latest_thread_doc.to_dict() if latest_thread_doc.exists else thread_data
         except Exception as exc:
             failure_reason = (
                 f"Could not verify latest follow-up thread state: {exc}; "
@@ -979,12 +1095,6 @@ def _send_followup_email(
             print(f"   🛑 {failure_reason}")
             return False
 
-        latest_followup_config = (latest_thread_data or {}).get("followUpConfig") or followup_config
-        terminal_reason = _followup_terminal_block_reason(
-            latest_thread_data or thread_data,
-            latest_followup_config,
-            followup_index,
-        )
         if terminal_reason:
             failure_reason = (
                 f"Follow-up stopped before send because {terminal_reason}; "
@@ -1168,6 +1278,34 @@ def _send_followup_email(
         )
         if contract_error:
             failure_reason = f"{contract_error}; manual review required before sending follow-up"
+            _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            print(f"   🛑 {failure_reason}")
+            return False
+
+        try:
+            _final_thread_data, terminal_reason = _read_followup_send_precondition(
+                user_id,
+                thread_id,
+                followup_index,
+                followup_config,
+                claim_owner=claim_owner,
+            )
+        except Exception as exc:
+            failure_reason = (
+                f"Could not revalidate follow-up thread state at Graph send: {exc}; "
+                "manual review required before sending follow-up"
+            )
+            _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            print(f"   🛑 {failure_reason}")
+            return False
+
+        if terminal_reason:
+            failure_reason = (
+                f"Follow-up stopped at Graph send because {terminal_reason}; "
+                "manual review required before sending follow-up"
+            )
             _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
             _delete_graph_reply_draft(headers, reply_draft_id, base=base)
             print(f"   🛑 {failure_reason}")
