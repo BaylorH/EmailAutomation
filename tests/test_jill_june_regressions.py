@@ -1043,23 +1043,30 @@ class JillJuneRegressionTests(unittest.TestCase):
         unrelated_prefixes = (
             "Neither the broker nor the owner objected",
             "Neither the broker for {competitor} nor the owner objected",
+            "Neither {competitor} nor 999 Side Rd objected",
+        )
+        affirmative_predicates = (
+            "clearly remains available",
+            "could possibly remain available",
+            "could quite conceivably still remain available",
+            "appears to theoretically remain available",
         )
 
         for target_address, competitor_address in address_pairs:
             for reason in ("leased", "sold", "no_space_available"):
                 event = {"type": "property_unavailable", "reason": reason}
-                for modifier in ("clearly", "currently", "actually", "now"):
+                for predicate in affirmative_predicates:
                     for prefix_template in unrelated_prefixes:
                         prefix = prefix_template.format(competitor=competitor_address)
                         for separator in separators:
                             message_text = (
                                 f"{prefix}{separator}{target_address} "
-                                f"{modifier} remains available."
+                                f"{predicate}."
                             )
                             with self.subTest(
                                 target_address=target_address,
                                 reason=reason,
-                                modifier=modifier,
+                                predicate=predicate,
                                 prefix_template=prefix_template,
                                 separator=separator,
                             ):
@@ -1078,6 +1085,32 @@ class JillJuneRegressionTests(unittest.TestCase):
                                     )
                                 )
 
+                for separator in separators:
+                    message_text = (
+                        f"Neither {competitor_address} nor {target_address} "
+                        f"was rejected{separator}it could possibly remain available."
+                    )
+                    with self.subTest(
+                        target_address=target_address,
+                        reason=reason,
+                        scope="bounded_link_clause_break",
+                        separator=separator,
+                    ):
+                        self.assertFalse(
+                            processing._property_unavailable_event_applies_to_row(
+                                event,
+                                row_anchor=f"{target_address}, Phoenix",
+                                message_text=message_text,
+                            )
+                        )
+                        self.assertIsNone(
+                            processing._pending_nonviable_followup_patch(
+                                [event],
+                                row_anchor=f"{target_address}, Phoenix",
+                                message_text=message_text,
+                            )
+                        )
+
     def test_neither_nor_property_subject_supports_predicate_modifiers(self):
         address_pairs = (
             ("1 Main St", "2 Oak Ave"),
@@ -1087,18 +1120,23 @@ class JillJuneRegressionTests(unittest.TestCase):
             ("12345 Main St", "56789 Oak Ave"),
             ("123456 Main St", "654321 Oak Ave"),
         )
-        predicates = (
-            "currently remains available",
-            "actually remains available",
-            "now remains available",
-            "still remains available",
-            "presently remains available",
-            "really remains available",
-            "is currently still available",
-            "is actually still available",
-            "can still remain available",
-            "will still remain available",
-            "appears to remain available",
+        adverb_phrases = (
+            "possibly",
+            "conceivably",
+            "currently",
+            "quite possibly",
+            "quite conceivably still",
+            "theoretically even now",
+        )
+        predicate_frames = (
+            "could {adverbs} remain available",
+            "is {adverbs} still available",
+            "appears to {adverbs} remain available",
+        )
+        predicates = tuple(
+            frame.format(adverbs=adverbs)
+            for frame in predicate_frames
+            for adverbs in adverb_phrases
         )
 
         for target_address, competitor_address in address_pairs:

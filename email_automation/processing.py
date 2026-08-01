@@ -2208,6 +2208,30 @@ _VIABILITY_NEGATION_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+_COORDINATED_LINK_CLAUSE_WORD_RE = re.compile(
+    r"\b(?:and|but|or|nor|while|whereas|although|though|because)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_bounded_coordinated_viability_link(link_text: str) -> bool:
+    """Accept a short modifier bridge, but never another clause."""
+    normalized = (link_text or "").strip()
+    if normalized.startswith(","):
+        normalized = normalized[1:].strip()
+    if not normalized:
+        return True
+    if "," in normalized or _COORDINATED_LINK_CLAUSE_WORD_RE.search(normalized):
+        return False
+    return bool(
+        re.fullmatch(
+            r"[a-z]+(?:[-'’][a-z]+)*"
+            r"(?:[ \t]+[a-z]+(?:[-'’][a-z]+)*){0,5}",
+            normalized,
+            re.IGNORECASE,
+        )
+    )
+
 
 def _neither_nor_binds_viability(
     clause: str,
@@ -2234,16 +2258,7 @@ def _neither_nor_binds_viability(
     return bool(
         re.search(r"\bneither\s*$", leading_text, re.IGNORECASE)
         and re.search(r"\bnor\s*$", separator, re.IGNORECASE)
-        and re.fullmatch(
-            r"[\s,]*(?:(?:"
-            r"is|are|was|were|do|does|did|"
-            r"can|could|will|would|may|might|should|"
-            r"both|currently|actually|still|now|presently|really|even|"
-            r"apparently|reportedly|appear|appears|seem|seems|to"
-            r")[\s,]*)*",
-            link_text,
-            re.IGNORECASE,
-        )
+        and _is_bounded_coordinated_viability_link(link_text)
     )
 
 
