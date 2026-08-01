@@ -416,10 +416,17 @@ class JillJuneRegressionTests(unittest.TestCase):
         )
 
     def test_target_binding_after_ancillary_supports_address_led_conjunctions(self):
-        event = {"type": "property_unavailable", "reason": "requirements_mismatch"}
+        street_addresses = (
+            "1 A St",
+            "12 B St",
+            "123 Main St",
+            "1234 Main St",
+            "12345 Long Rd",
+            "123456 Long Rd",
+        )
 
-        for street_address in ("1 A St", "100 Main St", "123456 Long Rd"):
-            for conjunction in (", and ", ", but ", ", or ", " and ", " but ", " or "):
+        for street_address in street_addresses:
+            for conjunction in (", and ", " and ", ", but ", " but ", ", or ", " or "):
                 message_text = (
                     f"The outparcel is fully leased{conjunction}"
                     f"{street_address} is mostly office."
@@ -428,9 +435,23 @@ class JillJuneRegressionTests(unittest.TestCase):
                     street_address=street_address,
                     conjunction=conjunction,
                 ):
+                    proposal = ai_processing._augment_events_with_deterministic_signals(
+                        {"updates": [], "events": [], "response_email": "Thanks."},
+                        [{"direction": "inbound", "content": message_text}],
+                        target_anchor=f"{street_address}, Phoenix",
+                    )
+                    unavailable = [
+                        event
+                        for event in proposal["events"]
+                        if event.get("type") == "property_unavailable"
+                    ]
+                    self.assertEqual(
+                        ["requirements_mismatch"],
+                        [event.get("reason") for event in unavailable],
+                    )
                     self.assertTrue(
                         processing._property_unavailable_event_applies_to_row(
-                            event,
+                            unavailable[0],
                             row_anchor=f"{street_address}, Phoenix",
                             message_text=message_text,
                         )
@@ -446,6 +467,15 @@ class JillJuneRegressionTests(unittest.TestCase):
 
         for message_text in messages:
             with self.subTest(message_text=message_text):
+                proposal = ai_processing._augment_events_with_deterministic_signals(
+                    {"updates": [], "events": [], "response_email": "Thanks."},
+                    [{"direction": "inbound", "content": message_text}],
+                    target_anchor="100 Main St, Phoenix",
+                )
+                self.assertNotIn(
+                    "property_unavailable",
+                    [event.get("type") for event in proposal["events"]],
+                )
                 self.assertFalse(
                     processing._property_unavailable_event_applies_to_row(
                         event,
@@ -717,15 +747,24 @@ class JillJuneRegressionTests(unittest.TestCase):
                 )
 
     def test_shared_terminal_predicate_applies_to_target_in_address_list(self):
-        event = {"type": "property_unavailable", "reason": "leased"}
+        message_text = "100 Main St, Phoenix, and 200 Oak Ave are both leased."
+        proposal = ai_processing._augment_events_with_deterministic_signals(
+            {"updates": [], "events": [], "response_email": "Thanks."},
+            [{"direction": "inbound", "content": message_text}],
+            target_anchor="100 Main St, Phoenix",
+        )
+        unavailable = [
+            event
+            for event in proposal["events"]
+            if event.get("type") == "property_unavailable"
+        ]
 
+        self.assertEqual(["leased"], [event.get("reason") for event in unavailable])
         self.assertTrue(
             processing._property_unavailable_event_applies_to_row(
-                event,
+                unavailable[0],
                 row_anchor="100 Main St, Phoenix",
-                message_text=(
-                    "100 Main St, Phoenix, and 200 Oak Ave are both leased."
-                ),
+                message_text=message_text,
             )
         )
 
