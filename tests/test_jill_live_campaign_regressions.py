@@ -620,6 +620,7 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         competing_facts = (
             ("Docks", "6", "Oak Center - 6 dock doors."),
             ("Docks", "6", "Oak Center | Docks: 6."),
+            ("Docks", "6", "Oak Center | Dock Positions: 6."),
             ("Drive Ins", "2", "Oak Center - 2 drive-in doors."),
             ("Drive Ins", "2", "Oak Center | Drive Ins: 2."),
             ("Power", "1200A 480V 3-phase", "Oak Center - 1200A 480V 3-phase power."),

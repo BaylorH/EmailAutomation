@@ -1916,26 +1916,7 @@ def _source_mentions_target_property(source_text: str, target_anchor: str) -> bo
     return reversed_anchor in normalized_source
 
 
-_PROPERTY_FACT_SIGNAL_RE = re.compile(
-    r"(?:"
-    r"\b(?:total\s+sf|available\s+(?:space|sf)|building\s+size|"
-    r"clear\s+(?:height|ht)|ceiling\s+(?:height|ht|clearance)|"
-    r"docks?|dock\s+doors?|loading\s+docks?|"
-    r"drive[-\s]?ins?(?:\s+doors?)?|power(?:\s+service)?|"
-    r"rent(?:\s*/\s*sf(?:\s*/\s*(?:yr|year))?)?|lease\s+rate|"
-    r"op\s*ex|opex|operating\s+expenses?)"
-    r"\s*(?:[:=|–—-]\s*)?\$?\s*\d|"
-    r"\$\s*\d+(?:,\d{3})*(?:\.\d+)?|"
-    r"\b\d+(?:,\d{3})*(?:\.\d+)?\s*(?:"
-    r"sf\b|sq\.?\s*ft\b|square\s+feet\b|feet\b|foot\b|ft\.?\b|['’]|"
-    r"/\s*sf\b|per\s+sf\b|psf\b|nnn\b|"
-    r"docks?\b|dock\s+doors?\b|loading\s+docks?\b|"
-    r"drive[-\s]?ins?\b(?:\s+doors?\b)?|"
-    r"amps?\b|amperes?\b|a\b|volts?\b|v\b|(?:-\s*)?phase\b"
-    r")"
-    r")",
-    re.IGNORECASE,
-)
+_NUMERIC_PROPERTY_VALUE_RE = re.compile(r"\$?\s*\d")
 _PROPERTY_CLAUSE_BREAK_RE = re.compile(r"(?<!\d)[.!?;](?!\d)|\n+")
 _UNBOUND_IDENTITY_PREFIX_RE = re.compile(
     r"^\s*(?P<label>[a-z][a-z0-9&'’/-]*"
@@ -2004,7 +1985,7 @@ def _unbound_identity_fact_spans(
         if (
             not identity_line
             or _source_mentions_target_property(current_text, target_anchor)
-            or not _PROPERTY_FACT_SIGNAL_RE.search(following_text)
+            or not _NUMERIC_PROPERTY_VALUE_RE.search(following_text)
         ):
             continue
         line_label = " ".join(
@@ -2018,7 +1999,10 @@ def _unbound_identity_fact_spans(
         if _source_mentions_target_property(clause, target_anchor):
             continue
         identity = _UNBOUND_IDENTITY_PREFIX_RE.search(clause)
-        if not identity or not _PROPERTY_FACT_SIGNAL_RE.search(clause):
+        if (
+            not identity
+            or not _NUMERIC_PROPERTY_VALUE_RE.search(clause[identity.end():])
+        ):
             continue
         label = " ".join(re.findall(r"[a-z0-9]+", identity.group("label").lower()))
         # Brochure headings are ambiguous: they can be ordinary fact/section
@@ -2039,7 +2023,10 @@ def _unbound_identity_fact_spans(
         if _source_mentions_target_property(segment_text, target_anchor):
             continue
         identity = _UNBOUND_IDENTITY_PREFIX_RE.search(segment_text)
-        if not identity or not _PROPERTY_FACT_SIGNAL_RE.search(segment_text):
+        if (
+            not identity
+            or not _NUMERIC_PROPERTY_VALUE_RE.search(segment_text[identity.end():])
+        ):
             continue
         label = " ".join(re.findall(r"[a-z0-9]+", identity.group("label").lower()))
         if label not in _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS:
