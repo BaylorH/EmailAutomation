@@ -179,17 +179,47 @@ class CampaignCapabilitiesTests(unittest.TestCase):
             with self.subTest(case=candidate["id"]):
                 self.assertEqual(candidate["expected"], as_contract(resolved))
 
-    def test_resolver_trims_uid_and_requires_authoritative_document_id(self):
-        candidate = fixture("combination-100")
-        test_input = materialize(candidate["input"])
+    def test_resolver_rejects_padded_bom_nel_and_path_separated_uids(self):
+        for case_id in (
+            "uid-ascii-padded",
+            "uid-bom-wrapped",
+            "uid-nel-wrapped",
+            "uid-path-separator",
+        ):
+            candidate = fixture(case_id)
+            with self.subTest(case=case_id):
+                self.assertEqual(
+                    candidate["expected"], as_contract(resolve_fixture(candidate))
+                )
 
-        resolved = resolve_campaign_capabilities(
-            uid=f"  {test_input['uid']}  ",
-            document_id=test_input["documentId"],
-            data=test_input["data"],
-        )
+    def test_shared_boundary_whitespace_rejects_uid_edges_and_blank_actors(self):
+        valid = materialize(fixture("combination-111")["input"])
 
-        self.assertEqual(candidate["expected"], as_contract(resolved))
+        for encoded in CONTRACT["boundaryWhitespaceCodePoints"]:
+            whitespace = chr(int(encoded, 16))
+            for uid in (f"{whitespace}{valid['uid']}", f"{valid['uid']}{whitespace}"):
+                with self.subTest(kind="uid", code_point=encoded, uid=repr(uid)):
+                    resolution = resolve_campaign_capabilities(
+                        uid=uid,
+                        document_id=valid["documentId"],
+                        data=valid["data"],
+                    )
+                    self.assertEqual("campaignCapabilities/", resolution.source_path)
+                    self.assertEqual(
+                        "capability_uid_invalid",
+                        resolution.decisions["start"].reason_code,
+                    )
+
+            with self.subTest(kind="actor", code_point=encoded):
+                resolution = resolve_campaign_capabilities(
+                    uid=valid["uid"],
+                    document_id=valid["documentId"],
+                    data={**valid["data"], "updatedBy": whitespace},
+                )
+                self.assertEqual(
+                    "capability_audit_invalid",
+                    resolution.decisions["start"].reason_code,
+                )
 
     def test_reader_fetches_only_the_authoritative_requested_document(self):
         candidate = fixture("combination-110")
@@ -239,15 +269,23 @@ class CampaignCapabilitiesTests(unittest.TestCase):
 
         self.assertEqual(candidate["expected"], as_contract(resolved))
 
-    def test_reader_rejects_blank_uid_before_database_access(self):
-        candidate = fixture("uid-blank")
-
-        resolved = read_campaign_capabilities(
-            firestore_client=_NoReadFirestore(),
-            uid=candidate["input"]["uid"],
-        )
-
-        self.assertEqual(candidate["expected"], as_contract(resolved))
+    def test_reader_rejects_every_invalid_uid_before_database_access(self):
+        firestore_client = _NoReadFirestore()
+        for case_id in (
+            "uid-blank",
+            "uid-null",
+            "uid-ascii-padded",
+            "uid-bom-wrapped",
+            "uid-nel-wrapped",
+            "uid-path-separator",
+        ):
+            candidate = fixture(case_id)
+            with self.subTest(case=case_id):
+                resolved = read_campaign_capabilities(
+                    firestore_client=firestore_client,
+                    uid=candidate["input"]["uid"],
+                )
+                self.assertEqual(candidate["expected"], as_contract(resolved))
 
     def test_capability_allowed_requires_an_exact_allowed_decision(self):
         candidate = fixture("combination-100")

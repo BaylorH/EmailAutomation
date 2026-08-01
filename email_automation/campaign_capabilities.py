@@ -11,6 +11,36 @@ from weakref import WeakSet
 _CAPABILITY_NAMES = ("start", "initialDispatch", "inboundAutomation")
 _SUPPORTED_SCHEMA_VERSION = 2
 _MAX_SAFE_INTEGER = (2**53) - 1
+_BOUNDARY_WHITESPACE = frozenset(
+    (
+        "\u0009",
+        "\u000a",
+        "\u000b",
+        "\u000c",
+        "\u000d",
+        "\u0020",
+        "\u0085",
+        "\u00a0",
+        "\u1680",
+        "\u2000",
+        "\u2001",
+        "\u2002",
+        "\u2003",
+        "\u2004",
+        "\u2005",
+        "\u2006",
+        "\u2007",
+        "\u2008",
+        "\u2009",
+        "\u200a",
+        "\u2028",
+        "\u2029",
+        "\u202f",
+        "\u205f",
+        "\u3000",
+        "\ufeff",
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -30,12 +60,24 @@ class CampaignCapabilitiesResolution:
 _MODULE_RESOLUTIONS: WeakSet[CampaignCapabilitiesResolution] = WeakSet()
 
 
-def _normalize_uid(uid: Any) -> str:
-    return uid.strip() if type(uid) is str else ""
+def _is_exact_uid(uid: Any) -> bool:
+    return (
+        type(uid) is str
+        and bool(uid)
+        and uid[0] not in _BOUNDARY_WHITESPACE
+        and uid[-1] not in _BOUNDARY_WHITESPACE
+        and "/" not in uid
+    )
 
 
 def _source_path(uid: Any) -> str:
-    return f"campaignCapabilities/{_normalize_uid(uid)}"
+    return f"campaignCapabilities/{uid}" if _is_exact_uid(uid) else "campaignCapabilities/"
+
+
+def _is_nonblank_audit_actor(value: Any) -> bool:
+    return type(value) is str and any(
+        character not in _BOUNDARY_WHITESPACE for character in value
+    )
 
 
 def _normalized_revision(value: Any) -> Optional[int]:
@@ -111,8 +153,7 @@ def resolve_campaign_capabilities(
 ) -> CampaignCapabilitiesResolution:
     """Resolve one authoritative capability document without implication edges."""
 
-    normalized_uid = _normalize_uid(uid)
-    if not normalized_uid:
+    if not _is_exact_uid(uid):
         return _denied_resolution(uid=uid, reason_code="capability_uid_invalid")
     if data is None:
         return _denied_resolution(
@@ -129,7 +170,7 @@ def resolve_campaign_capabilities(
         schema_version = _schema_version(data.get("schemaVersion"))
         revision = _normalized_revision(data.get("revision"))
 
-        if type(document_id) is not str or document_id != normalized_uid:
+        if type(document_id) is not str or document_id != uid:
             return _denied_resolution(
                 uid=uid,
                 schema_version=schema_version,
@@ -153,8 +194,7 @@ def resolve_campaign_capabilities(
         updated_by = data.get("updatedBy")
         if (
             not _is_firestore_timestamp(data.get("updatedAt"))
-            or type(updated_by) is not str
-            or not updated_by.strip()
+            or not _is_nonblank_audit_actor(updated_by)
         ):
             return _denied_resolution(
                 uid=uid,
@@ -195,18 +235,13 @@ def read_campaign_capabilities(
 ) -> CampaignCapabilitiesResolution:
     """Read only ``campaignCapabilities/{uid}`` and convert errors to denial."""
 
-    normalized_uid = _normalize_uid(uid)
-    if not normalized_uid:
-        return resolve_campaign_capabilities(
-            uid=uid,
-            document_id="",
-            data=None,
-        )
+    if not _is_exact_uid(uid):
+        return _denied_resolution(uid=uid, reason_code="capability_uid_invalid")
 
     try:
         snapshot = (
             firestore_client.collection("campaignCapabilities")
-            .document(normalized_uid)
+            .document(uid)
             .get()
         )
         return resolve_campaign_capabilities(
