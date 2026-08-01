@@ -47,6 +47,11 @@ from .campaign_safety import (
     stopped_followup_patch,
 )
 from .outbound_safety import validate_outbound_body
+from .email import (
+    OUTBOUND_MODE_LIVE,
+    _kill_switch_suppressed,
+    resolve_outbound_mode,
+)
 from .column_config import (
     get_column_config_error,
     response_requests_nonrequestable_fields,
@@ -825,6 +830,18 @@ def _send_followup_email(
     import requests
 
     _reset_followup_send_outcome()
+    outbound_mode = resolve_outbound_mode()
+    if outbound_mode != OUTBOUND_MODE_LIVE:
+        reason = (
+            "suppressed_by_kill_switch "
+            f"(SITESIFT_OUTBOUND_MODE={outbound_mode})"
+        )
+        _set_followup_send_outcome(error=reason)
+        _kill_switch_suppressed(
+            outbound_mode,
+            context=f"_send_followup_email thread {thread_id}",
+        )
+        return False
 
     try:
         campaign_decision = get_client_automation_decision(
@@ -1309,6 +1326,20 @@ def _send_followup_email(
             _set_followup_send_outcome(error=failure_reason, guard_failed_closed=True)
             _delete_graph_reply_draft(headers, reply_draft_id, base=base)
             print(f"   🛑 {failure_reason}")
+            return False
+
+        outbound_mode = resolve_outbound_mode()
+        if outbound_mode != OUTBOUND_MODE_LIVE:
+            reason = (
+                "suppressed_by_kill_switch "
+                f"(SITESIFT_OUTBOUND_MODE={outbound_mode})"
+            )
+            _set_followup_send_outcome(error=reason)
+            _kill_switch_suppressed(
+                outbound_mode,
+                context=f"_send_followup_email thread {thread_id} at Graph send",
+            )
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
             return False
 
         reply_resp = exponential_backoff_request(

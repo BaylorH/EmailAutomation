@@ -19,6 +19,9 @@ os.environ.setdefault(
 )
 
 from email_automation import email as email_module
+from email_automation import followup, processing
+from email_automation.campaign_safety import CampaignAutomationDecision
+from email_automation.column_config import get_default_column_config
 
 
 OUTBOUND_MODE_ENV = "SITESIFT_OUTBOUND_MODE"
@@ -80,6 +83,20 @@ def _make_graph_response():
     return resp
 
 
+class _GraphResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.headers = {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise AssertionError(f"Unexpected HTTP status {self.status_code}")
+
+
 def _fake_requests():
     resp = _make_graph_response()
     fake = MagicMock(name="requests")
@@ -87,6 +104,96 @@ def _fake_requests():
     fake.get = Mock(return_value=resp)
     fake.patch = Mock(return_value=resp)
     return fake
+
+
+def _allow_campaign_decision():
+    return CampaignAutomationDecision(
+        state="allow",
+        reason="",
+        client_data={
+            "status": "live",
+            "columnConfig": get_default_column_config(),
+        },
+        metadata={"terminal": False, "stopKind": "none"},
+    )
+
+
+class _MessageDoc:
+    def __init__(self, data):
+        self._data = data
+
+    def to_dict(self):
+        return dict(self._data)
+
+
+class _DirectSendFirestoreNode:
+    """Minimal Firestore double for direct reply/follow-up send tests."""
+
+    def __init__(self, docs, messages, updates, path=()):
+        self.docs = docs
+        self.messages = messages
+        self.updates = updates
+        self.path = path
+
+    def collection(self, name):
+        return _DirectSendFirestoreNode(
+            self.docs,
+            self.messages,
+            self.updates,
+            self.path + (name,),
+        )
+
+    def document(self, name):
+        return _DirectSendFirestoreNode(
+            self.docs,
+            self.messages,
+            self.updates,
+            self.path + (name,),
+        )
+
+    def get(self):
+        return _GateSnapshot(self.docs.get(self.path))
+
+    def where(self, *_args, **_kwargs):
+        return self
+
+    def order_by(self, *_args, **_kwargs):
+        return self
+
+    def limit(self, *_args, **_kwargs):
+        return self
+
+    def stream(self):
+        if self.path[-1:] == ("messages",):
+            return list(self.messages)
+        return []
+
+    def update(self, data):
+        self.updates.append(dict(data))
+
+
+def _direct_send_firestore():
+    thread_data = {
+        "clientId": CLIENT_ID,
+        "status": "active",
+        "followUpStatus": "waiting",
+        "email": ["broker@example.com"],
+    }
+    docs = {
+        ("users", "user-1"): {
+            "email": "sender@example.com",
+            "signatureMode": "none",
+        },
+        ("users", "user-1", "threads", "thread-1"): thread_data,
+    }
+    messages = [
+        _MessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-08-01T12:00:00Z",
+        })
+    ]
+    return _DirectSendFirestoreNode(docs, messages, [])
 
 
 class ResolveOutboundModeTests(unittest.TestCase):
@@ -263,6 +370,297 @@ class SingleOutboxItemKillSwitchTests(unittest.TestCase):
         claim.assert_not_called()
         fake.post.assert_not_called()
         self.assertFalse(ref.deleted)
+
+
+class DirectAutoReplyKillSwitchTests(unittest.TestCase):
+    def setUp(self):
+        self._env = patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+
+    def test_paused_and_invalid_modes_stop_auto_reply_at_entry(self):
+        for mode in ("paused", "Live!"):
+            with self.subTest(mode=mode), patch.dict(
+                os.environ,
+                {
+                    OUTBOUND_MODE_ENV: mode,
+                    "SITESIFT_AUTO_REPLY_ALLOWLIST": "user-1",
+                },
+            ), patch.object(
+                processing,
+                "get_client_automation_decision",
+                side_effect=AssertionError("entry kill switch must run first"),
+            ) as campaign_gate, patch("requests.post") as graph_post:
+                sent = processing.send_reply_in_thread(
+                    user_id="user-1",
+                    headers={"Authorization": "Bearer token"},
+                    body="Hi Alex,\n\nThanks for the update.",
+                    current_msg_id="message-1",
+                    recipient="broker@example.com",
+                    thread_id="thread-1",
+                )
+
+            self.assertFalse(sent)
+            campaign_gate.assert_not_called()
+            graph_post.assert_not_called()
+            self.assertEqual(
+                processing.send_reply_in_thread.last_outcome,
+                "suppressed_by_kill_switch",
+            )
+            self.assertIn(
+                "suppressed_by_kill_switch",
+                processing.send_reply_in_thread.last_error,
+            )
+
+    def test_mode_change_to_paused_or_invalid_stops_auto_reply_at_send_boundary(self):
+        for changed_mode in ("paused", "Live!"):
+            with self.subTest(changed_mode=changed_mode):
+                os.environ[OUTBOUND_MODE_ENV] = "live"
+                os.environ["SITESIFT_AUTO_REPLY_ALLOWLIST"] = "user-1"
+                post_urls = []
+
+                def run_request(callback, *_args, **_kwargs):
+                    return callback()
+
+                def fake_post(url, **_kwargs):
+                    post_urls.append(url)
+                    if url.endswith("/createReplyAll"):
+                        return _GraphResponse(201, {
+                            "id": "reply-draft-1",
+                            "toRecipients": [{
+                                "emailAddress": {"address": "broker@example.com"}
+                            }],
+                            "ccRecipients": [],
+                        })
+                    raise AssertionError(f"kill switch allowed irreversible Graph POST {url}")
+
+                def fake_patch(_url, **_kwargs):
+                    os.environ[OUTBOUND_MODE_ENV] = changed_mode
+                    return _GraphResponse(204, {})
+
+                current_meta = {
+                    "conversationId": "conversation-1",
+                    "subject": "RE: 100 Safety Way",
+                }
+                recipient_result = {
+                    "payload": {
+                        "toRecipients": [{
+                            "emailAddress": {"address": "broker@example.com"}
+                        }],
+                        "ccRecipients": [],
+                    },
+                    "skipped": {},
+                }
+
+                with patch("email_automation.clients._fs", _direct_send_firestore()), \
+                     patch.object(
+                         processing,
+                         "get_client_automation_decision",
+                         return_value=_allow_campaign_decision(),
+                     ), \
+                     patch(
+                         "email_automation.utils.exponential_backoff_request",
+                         side_effect=run_request,
+                     ), \
+                     patch("requests.get", return_value=_GraphResponse(200, current_meta)), \
+                     patch("requests.post", side_effect=fake_post), \
+                     patch("requests.patch", side_effect=fake_patch), \
+                     patch(
+                         "email_automation.email._hydrate_reply_all_draft_recipients",
+                         side_effect=lambda _headers, draft, base=None: draft,
+                     ), \
+                     patch(
+                         "email_automation.email._source_message_reply_all_fallback",
+                         side_effect=lambda draft, _source: draft,
+                     ), \
+                     patch(
+                         "email_automation.email._reviewed_recipient_reply_all_fallback",
+                         side_effect=lambda draft, to_emails=None: draft,
+                     ), \
+                     patch(
+                         "email_automation.email._filter_reply_all_draft_recipients",
+                         return_value=recipient_result,
+                     ), \
+                     patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
+                    sent = processing.send_reply_in_thread(
+                        user_id="user-1",
+                        headers={"Authorization": "Bearer token"},
+                        body="Hi Alex,\n\nThanks for the update.",
+                        current_msg_id="message-1",
+                        recipient="broker@example.com",
+                        thread_id="thread-1",
+                    )
+
+                self.assertFalse(sent)
+                self.assertEqual(
+                    [url for url in post_urls if url.endswith("/createReplyAll")],
+                    ["https://graph.microsoft.com/v1.0/me/messages/message-1/createReplyAll"],
+                )
+                self.assertFalse(any(url.endswith("/send") for url in post_urls))
+                delete_draft.assert_called_once()
+                self.assertEqual(
+                    processing.send_reply_in_thread.last_outcome,
+                    "suppressed_by_kill_switch",
+                )
+
+
+class DirectFollowupKillSwitchTests(unittest.TestCase):
+    def setUp(self):
+        self._env = patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+
+    def test_paused_and_invalid_modes_stop_followup_at_entry(self):
+        for mode in ("paused", "Live!"):
+            with self.subTest(mode=mode), patch.dict(
+                os.environ,
+                {OUTBOUND_MODE_ENV: mode},
+            ), patch.object(
+                followup,
+                "get_client_automation_decision",
+                side_effect=AssertionError("entry kill switch must run first"),
+            ) as campaign_gate, patch("requests.post") as graph_post:
+                sent = followup._send_followup_email(
+                    user_id="user-1",
+                    headers={"Authorization": "Bearer token"},
+                    thread_id="thread-1",
+                    thread_data={
+                        "clientId": CLIENT_ID,
+                        "email": ["broker@example.com"],
+                    },
+                    followup_config={
+                        "followUps": [{"message": "Hi Alex, following up."}],
+                    },
+                    followup_index=0,
+                )
+
+            self.assertFalse(sent)
+            campaign_gate.assert_not_called()
+            graph_post.assert_not_called()
+            self.assertIn(
+                "suppressed_by_kill_switch",
+                followup._send_followup_email.last_error,
+            )
+            self.assertFalse(followup._send_followup_email.guard_failed_closed)
+
+    def test_mode_change_to_paused_or_invalid_stops_followup_at_send_boundary(self):
+        for changed_mode in ("paused", "Live!"):
+            with self.subTest(changed_mode=changed_mode):
+                os.environ[OUTBOUND_MODE_ENV] = "live"
+                post_urls = []
+                thread_data = {
+                    "clientId": CLIENT_ID,
+                    "email": ["broker@example.com"],
+                    "contactName": "Alex Broker",
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                }
+                followup_config = {
+                    "enabled": True,
+                    "currentFollowUpIndex": 0,
+                    "followUps": [{"message": "Hi Alex, following up."}],
+                }
+
+                def run_request(callback, *_args, **_kwargs):
+                    return callback()
+
+                def fake_get(url, **_kwargs):
+                    if url.endswith("/me/messages"):
+                        return _GraphResponse(200, {"value": [{
+                            "id": "graph-root",
+                            "subject": "100 Safety Way",
+                            "conversationId": "conversation-1",
+                        }]})
+                    raise AssertionError(f"Unexpected Graph GET {url}")
+
+                def fake_post(url, **_kwargs):
+                    post_urls.append(url)
+                    if url.endswith("/createReplyAll"):
+                        return _GraphResponse(201, {
+                            "id": "reply-draft-1",
+                            "toRecipients": [{
+                                "emailAddress": {"address": "broker@example.com"}
+                            }],
+                            "ccRecipients": [],
+                        })
+                    raise AssertionError(f"kill switch allowed irreversible Graph POST {url}")
+
+                def fake_patch(_url, **_kwargs):
+                    os.environ[OUTBOUND_MODE_ENV] = changed_mode
+                    return _GraphResponse(200, {})
+
+                recipient_result = {
+                    "payload": {
+                        "toRecipients": [{
+                            "emailAddress": {"address": "broker@example.com"}
+                        }],
+                        "ccRecipients": [],
+                    },
+                    "sentRecipients": ["broker@example.com"],
+                }
+
+                with patch.object(followup, "_fs", _direct_send_firestore()), \
+                     patch.object(
+                         followup,
+                         "get_client_automation_decision",
+                         return_value=_allow_campaign_decision(),
+                     ), \
+                     patch.object(
+                         followup,
+                         "_read_followup_send_precondition",
+                         return_value=(thread_data, None),
+                     ), \
+                     patch.object(
+                         followup,
+                         "exponential_backoff_request",
+                         side_effect=run_request,
+                     ), \
+                     patch("email_automation.processing.is_contact_opted_out", return_value=None), \
+                     patch("requests.get", side_effect=fake_get), \
+                     patch("requests.post", side_effect=fake_post), \
+                     patch("requests.patch", side_effect=fake_patch), \
+                     patch(
+                         "email_automation.email._hydrate_reply_all_draft_recipients",
+                         side_effect=lambda _headers, draft, base=None: draft,
+                     ), \
+                     patch(
+                         "email_automation.email._source_message_reply_all_fallback",
+                         side_effect=lambda draft, _source: draft,
+                     ), \
+                     patch(
+                         "email_automation.email._reviewed_recipient_reply_all_fallback",
+                         side_effect=lambda draft, to_emails=None, cc_emails=None: draft,
+                     ), \
+                     patch(
+                         "email_automation.email._filter_reply_all_draft_recipients",
+                         return_value=recipient_result,
+                     ), \
+                     patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
+                    sent = followup._send_followup_email(
+                        user_id="user-1",
+                        headers={"Authorization": "Bearer token"},
+                        thread_id="thread-1",
+                        thread_data=thread_data,
+                        followup_config=followup_config,
+                        followup_index=0,
+                    )
+
+                self.assertFalse(sent)
+                self.assertEqual(
+                    [url for url in post_urls if url.endswith("/createReplyAll")],
+                    ["https://graph.microsoft.com/v1.0/me/messages/graph-root/createReplyAll"],
+                )
+                self.assertFalse(any(url.endswith("/send") for url in post_urls))
+                delete_draft.assert_called_once()
+                self.assertIn(
+                    "suppressed_by_kill_switch",
+                    followup._send_followup_email.last_error,
+                )
+                self.assertFalse(followup._send_followup_email.guard_failed_closed)
 
 
 if __name__ == "__main__":

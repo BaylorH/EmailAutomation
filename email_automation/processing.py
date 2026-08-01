@@ -51,6 +51,11 @@ from .tour_scheduling import (
     tour_date_from_thread_data,
 )
 from .outbound_safety import validate_outbound_body
+from .email import (
+    OUTBOUND_MODE_LIVE,
+    _kill_switch_suppressed,
+    resolve_outbound_mode,
+)
 from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    parse_references_header, normalize_message_id, fetch_url_as_text, _sanitize_url,
                    format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff,
@@ -3573,6 +3578,21 @@ def _tour_actions_allowed(user_id: str) -> bool:
 def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     _reset_reply_send_outcome()
+    outbound_mode = resolve_outbound_mode()
+    if outbound_mode != OUTBOUND_MODE_LIVE:
+        reason = (
+            "suppressed_by_kill_switch "
+            f"(SITESIFT_OUTBOUND_MODE={outbound_mode})"
+        )
+        _set_reply_send_outcome(
+            error=reason,
+            outcome="suppressed_by_kill_switch",
+        )
+        _kill_switch_suppressed(
+            outbound_mode,
+            context=f"send_reply_in_thread thread {thread_id}",
+        )
+        return False
     body_validation = validate_outbound_body(body)
     if not body_validation.is_safe:
         _set_reply_send_outcome(
@@ -3781,6 +3801,23 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             _set_reply_campaign_suppression(decision)
             _delete_graph_reply_draft(headers, reply_draft_id, base=base)
             print(f"   🛑 {_get_reply_send_outcome().error}")
+            return False
+
+        outbound_mode = resolve_outbound_mode()
+        if outbound_mode != OUTBOUND_MODE_LIVE:
+            reason = (
+                "suppressed_by_kill_switch "
+                f"(SITESIFT_OUTBOUND_MODE={outbound_mode})"
+            )
+            _set_reply_send_outcome(
+                error=reason,
+                outcome="suppressed_by_kill_switch",
+            )
+            _kill_switch_suppressed(
+                outbound_mode,
+                context=f"send_reply_in_thread thread {thread_id} at Graph send",
+            )
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
             return False
 
         reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
