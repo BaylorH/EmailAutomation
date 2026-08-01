@@ -1387,6 +1387,137 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                     result["response_email"],
                 )
 
+    def test_numbered_document_captions_do_not_create_property_boundaries(self):
+        captions = (
+            "Table 1: Building Facts",
+            "Figure 2 - Building Overview",
+            "Page 3 of 12",
+            "Section 4.2: Loading Details",
+            "Schedule 5 — Property Facts",
+            "Exhibit 6: Building Facts",
+            "Version 7: Building Facts",
+            "Revision 8 - Building Facts",
+            "Table: Building Facts",
+        )
+        expected_updates = [
+            {"column": "Docks", "value": "6"},
+            {"column": "Power", "value": "1200A 480V 3-phase"},
+        ]
+        target_tables = (
+            (
+                "markdown",
+                "| Docks | Power |\n"
+                "| --- | --- |\n"
+                "| 6 | 1200A 480V 3-phase |\n"
+                "| 100 Main St | 100 Main St |",
+            ),
+            (
+                "csv",
+                "Docks, Power\n"
+                "6, 1200A 480V 3-phase\n"
+                "100 Main St, 100 Main St",
+            ),
+        )
+
+        for caption in captions:
+            for table_format, target_table in target_tables:
+                with self.subTest(caption=caption, table_format=table_format):
+                    result = ai_processing._suppress_competing_attachment_updates(
+                        {
+                            "updates": list(expected_updates),
+                            "events": [],
+                            "response_email": "Thanks.",
+                        },
+                        _conversation("The brochure is attached."),
+                        "100 Main St, Phoenix",
+                        [{
+                            "name": "100 Main St brochure.pdf",
+                            "text": (
+                                f"100 Main St, Phoenix\n{caption}\n{target_table}"
+                            ),
+                        }],
+                    )
+
+                    self.assertEqual(expected_updates, result["updates"])
+                    self.assertEqual([], result["events"])
+                    self.assertEqual("Thanks.", result["response_email"])
+
+    def test_numbered_captions_preserve_mixed_table_competitor_detection(self):
+        docks = {"column": "Docks", "value": "6"}
+        power = {"column": "Power", "value": "1200A 480V 3-phase"}
+        cases = (
+            (
+                "Figure 10: Markdown Facts",
+                "| Docks | Power |\n"
+                "| :--- | ---: |\n"
+                "| 6 | 1200A 480V 3-phase |\n"
+                "| 100 Main St | Oak Center |",
+            ),
+            (
+                "Section 11: CSV Facts",
+                "Docks, Power\n"
+                "6, 1200A 480V 3-phase\n"
+                "100 Main St, Oak Center",
+            ),
+        )
+
+        for caption, table in cases:
+            with self.subTest(caption=caption):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [docks, power],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"100 Main St, Phoenix\n{caption}\n{table}",
+                    }],
+                )
+
+                self.assertEqual([docks], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
+    def test_numbered_unknown_property_headings_still_fail_closed(self):
+        headings = (
+            "Oak Center 1",
+            "Oak Center 1: Building Facts",
+            "Table Center 1: Building Facts",
+        )
+
+        for heading in headings:
+            with self.subTest(heading=heading):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [{"column": "Docks", "value": "6"}],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": (
+                            f"100 Main St, Phoenix\n{heading}\nDocks: 6"
+                        ),
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
     def test_multi_column_target_tables_remain_supported(self):
         target_tables = (
             (

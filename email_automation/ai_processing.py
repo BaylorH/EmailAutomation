@@ -1930,6 +1930,12 @@ def _source_mentions_target_property(source_text: str, target_anchor: str) -> bo
 _NUMERIC_PROPERTY_VALUE_RE = re.compile(r"\$?\s*\d")
 _PROPERTY_CLAUSE_BREAK_RE = re.compile(r"(?<!\d)[.!?;](?!\d)|\n+")
 _MARKDOWN_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
+_DOCUMENT_CAPTION_NUMBER_RE = re.compile(
+    r"^\s*(?:table|figure|page|section|schedule|exhibit|version|revision)\s+"
+    r"(?:#\s*)?\d+(?:\.\d+)*(?:[a-z])?\s*"
+    r"(?::|[-–—]|\(|\bof\b|$|\.(?=\s))",
+    re.IGNORECASE,
+)
 _UNBOUND_IDENTITY_PREFIX_RE = re.compile(
     r"^\s*(?P<label>[a-z][a-z0-9&'’/-]*"
     r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})"
@@ -2160,6 +2166,11 @@ def _property_table_clause_spans(text: str) -> List[tuple]:
             )
         )
     ]
+
+
+def _is_numbered_document_caption(text: str) -> bool:
+    """Distinguish structural caption numbers from property fact values."""
+    return bool(_DOCUMENT_CAPTION_NUMBER_RE.match(text or ""))
 
 
 def _aligned_property_table_cells(text: str) -> List[tuple]:
@@ -2412,7 +2423,10 @@ def _unbound_identity_fact_spans(
 
     for clause_start, clause_end in clause_spans:
         clause = text[clause_start:clause_end]
-        if _source_mentions_target_property(clause, target_anchor):
+        if (
+            _source_mentions_target_property(clause, target_anchor)
+            or _is_numbered_document_caption(clause)
+        ):
             continue
         identity = _UNBOUND_IDENTITY_PREFIX_RE.search(clause)
         if (
@@ -2441,7 +2455,10 @@ def _unbound_identity_fact_spans(
     for segment in re.finditer(r"(?:^|[.!?;\n])(?P<body>[^.!?;\n]+)", text):
         segment_start, segment_end = segment.span("body")
         segment_text = segment.group("body")
-        if _source_mentions_target_property(segment_text, target_anchor):
+        if (
+            _source_mentions_target_property(segment_text, target_anchor)
+            or _is_numbered_document_caption(segment_text)
+        ):
             continue
         identity = _UNBOUND_IDENTITY_PREFIX_RE.search(segment_text)
         if (
