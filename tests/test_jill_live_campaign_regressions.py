@@ -170,6 +170,103 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             result["updates"],
         )
 
+    def test_named_alternate_in_fresh_text_cannot_be_target_evidence(self):
+        proposal = {
+            "updates": [{"column": "Ceiling Ht", "value": "32"}],
+            "events": [],
+            "response_email": "Thanks.",
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            _conversation(
+                "100 Main St remains available. Another option, Oak Commerce "
+                "Center, has 32 feet clear. Brochures attached."
+            ),
+            "100 Main St, Phoenix",
+            [
+                {
+                    "name": "100 Main St brochure.pdf",
+                    "text": "100 Main St - 20,000 SF.",
+                },
+                {
+                    "name": "200 Oak Ave brochure.pdf",
+                    "text": "200 Oak Ave - Ceiling Ht: 32 feet clear.",
+                },
+            ],
+        )
+
+        self.assertEqual([], result["updates"])
+        self.assertTrue(any(
+            event.get("type") == "needs_user_input"
+            and event.get("reason") == "multi_property_attachment"
+            for event in result["events"]
+        ))
+        self.assertIsNone(result["response_email"])
+
+    def test_named_addressless_alternate_brochure_is_competing(self):
+        proposal = {
+            "updates": [{"column": "Ceiling Ht", "value": "32"}],
+            "events": [],
+            "response_email": "Thanks.",
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            _conversation(
+                "We also have another option, Oak Commerce Center; brochures "
+                "attached."
+            ),
+            "100 Main St, Phoenix",
+            [
+                {
+                    "name": "100 Main St brochure.pdf",
+                    "text": "100 Main St - 20,000 SF.",
+                },
+                {
+                    "name": "Oak Commerce Center brochure.pdf",
+                    "text": "Oak Commerce Center - Ceiling Ht: 32 feet clear.",
+                },
+            ],
+        )
+
+        self.assertEqual([], result["updates"])
+        self.assertTrue(any(
+            event.get("type") == "needs_user_input"
+            and event.get("reason") == "multi_property_attachment"
+            for event in result["events"]
+        ))
+        self.assertIsNone(result["response_email"])
+
+    def test_addressless_target_attachment_survives_parseable_competitor(self):
+        expected_update = {"column": "Ceiling Ht", "value": "28"}
+        proposal = {
+            "updates": [expected_update],
+            "events": [],
+            "response_email": None,
+        }
+
+        result = ai_processing._suppress_competing_attachment_updates(
+            proposal,
+            _conversation(
+                "For 100 Main St, use current-property specs.pdf: it has the target "
+                "property specifications. 200 Oak Ave is the other option."
+            ),
+            "100 Main St, Phoenix",
+            [
+                {
+                    "name": "current-property specs.pdf",
+                    "text": "Ceiling Ht: 28 feet clear.",
+                },
+                {
+                    "name": "200 Oak Ave brochure.pdf",
+                    "text": "200 Oak Ave - Ceiling Ht: 32 feet clear.",
+                },
+            ],
+        )
+
+        self.assertEqual([expected_update], result["updates"])
+
     def test_independent_target_attachment_evidence_preserves_value(self):
         expected_update = {
             "column": "Ceiling Ht",

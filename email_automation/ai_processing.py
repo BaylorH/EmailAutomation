@@ -2084,6 +2084,22 @@ _ROUTE_ADDRESS_RE = re.compile(
     r"\b\d{1,6}\s+(?:[a-z]+\s+){0,3}(?:sc|us|fm|sr)[-\s]?\d+\b",
     re.IGNORECASE,
 )
+_ATTACHMENT_NAME_NOISE = {
+    "brochure", "brochures", "flyer", "flyers", "marketing", "package",
+    "offering", "memorandum", "om", "pdf", "floorplan", "floorplans",
+}
+
+
+def _attachment_name_matches_text(name: str, text: str) -> bool:
+    tokens = [
+        token for token in re.findall(r"[a-z0-9]+", (name or "").lower())
+        if token not in _ATTACHMENT_NAME_NOISE
+    ]
+    if not tokens or (len(tokens) == 1 and len(tokens[0]) < 5):
+        return False
+    phrase = " ".join(tokens)
+    normalized_text = " ".join(re.findall(r"[a-z0-9]+", (text or "").lower()))
+    return f" {phrase} " in f" {normalized_text} "
 
 
 def _suppress_competing_attachment_updates(
@@ -2100,19 +2116,52 @@ def _suppress_competing_attachment_updates(
     """
     if not proposal or not pdf_manifest:
         return proposal
-    if any((event or {}).get("type") == "new_property" for event in proposal.get("events") or []):
+    if any(
+        (event or {}).get("type") == "new_property"
+        for event in proposal.get("events") or []
+    ):
         return proposal
 
     fresh_text = _fresh_inbound_text(conversation)
+    fresh_transition = _ALTERNATE_PROPERTY_TRANSITION_RE.search(fresh_text)
+    fresh_target_text = (
+        fresh_text[:fresh_transition.start()] if fresh_transition else fresh_text
+    )
+    fresh_alternate_text = (
+        fresh_text[fresh_transition.start():] if fresh_transition else ""
+    )
     classified_sources = []
     for pdf in pdf_manifest:
         source = "\n".join((
             str((pdf or {}).get("name") or ""),
             str((pdf or {}).get("text") or ""),
         ))
+        verdict = _attachment_property_verdict(source, target_anchor)
+        if (
+            verdict == "addressless"
+            and fresh_alternate_text
+            and _attachment_name_matches_text(
+                str((pdf or {}).get("name") or ""),
+                fresh_alternate_text,
+            )
+        ):
+            verdict = "competing"
+        elif (
+            verdict == "addressless"
+            and _attachment_can_supply_target_facts(
+                source,
+                target_anchor,
+                fresh_target_text,
+            )
+            and _attachment_name_matches_text(
+                str((pdf or {}).get("name") or ""),
+                fresh_target_text,
+            )
+        ):
+            verdict = "target"
         classified_sources.append((
             source,
-            _attachment_property_verdict(source, target_anchor),
+            verdict,
         ))
     explicitly_other = any(
         verdict in {"competing", "mixed"}
@@ -2134,19 +2183,15 @@ def _suppress_competing_attachment_updates(
             verdict,
         )
     ]
-    fresh_verdict = _attachment_property_verdict(fresh_text, target_anchor)
+    fresh_verdict = _attachment_property_verdict(fresh_target_text, target_anchor)
     target_evidence_sources.extend(_target_bound_source_segments(
-        fresh_text,
+        fresh_target_text,
         target_anchor,
         fresh_verdict,
     ))
     if fresh_verdict == "addressless":
-        transition = _ALTERNATE_PROPERTY_TRANSITION_RE.search(fresh_text)
-        current_segment = (
-            fresh_text[:transition.start()] if transition else fresh_text
-        )
-        if _CURRENT_PROPERTY_AFFIRMATION_RE.search(current_segment):
-            target_evidence_sources.append(current_segment)
+        if _CURRENT_PROPERTY_AFFIRMATION_RE.search(fresh_target_text):
+            target_evidence_sources.append(fresh_target_text)
     proposal["updates"] = [
         update for update in (proposal.get("updates") or [])
         if any(
