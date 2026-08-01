@@ -2198,6 +2198,25 @@ def _nearest_property_binding(
     return next(iter(nearest_kinds)) if len(nearest_kinds) == 1 else None
 
 
+_VIABILITY_NEGATION_PREFIX_RE = re.compile(
+    r"\b(?:not|never|no\s+longer|"
+    r"isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t|"
+    r"doesn['’]?t|don['’]?t|didn['’]?t|"
+    r"hasn['’]?t|haven['’]?t|hadn['’]?t|"
+    r"cannot|can['’]?t|couldn['’]?t|wouldn['’]?t|shouldn['’]?t)"
+    r"\s+(?:(?:all|both|currently|necessarily)\s+)*$",
+    re.IGNORECASE,
+)
+
+
+def _viability_match_is_negated(clause: str, viability_match: re.Match) -> bool:
+    prefix = (clause or "")[:viability_match.start()]
+    return bool(
+        _VIABILITY_NEGATION_PREFIX_RE.search(prefix)
+        or re.search(r"\bneither\b.*\bnor\b", prefix, re.IGNORECASE | re.DOTALL)
+    )
+
+
 def _viability_is_shared_across_property_bindings(
     clause: str,
     bindings: List[tuple],
@@ -2329,6 +2348,8 @@ def _message_explicitly_keeps_row_viable(message_text: str, row_anchor: str) -> 
     for sentence in _terminal_binding_clauses(message_text):
         bindings = _explicit_property_bindings(sentence, row_anchor)
         for viability_match in _VIABILITY_RE.finditer(sentence):
+            if _viability_match_is_negated(sentence, viability_match):
+                continue
             if (
                 _viability_is_shared_across_property_bindings(
                     sentence,

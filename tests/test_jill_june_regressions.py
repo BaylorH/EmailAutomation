@@ -978,6 +978,58 @@ class JillJuneRegressionTests(unittest.TestCase):
                             },
                         )
 
+    def test_negated_availability_never_suppresses_target_terminal_event(self):
+        address_pairs = (
+            ("1 Main St", "2 Oak Ave"),
+            ("12 Main St", "34 Oak Ave"),
+            ("123 Main St", "456 Oak Ave"),
+            ("1234 Main St", "5678 Oak Ave"),
+            ("12345 Main St", "56789 Oak Ave"),
+            ("123456 Main St", "654321 Oak Ave"),
+        )
+        messages = (
+            "Neither {first} nor {second} remains available.",
+            "Neither {first}, nor {second}, remains available.",
+            "{first} and {second} are not still available.",
+            "{first}, and {second}, are not still available.",
+            "{first} and {second} do not remain available.",
+            "{first}, and {second}, do not remain available.",
+        )
+
+        for target_address, competitor_address in address_pairs:
+            for first, second in (
+                (target_address, competitor_address),
+                (competitor_address, target_address),
+            ):
+                for reason in ("leased", "sold", "no_space_available"):
+                    for message_template in messages:
+                        message_text = message_template.format(
+                            first=first,
+                            second=second,
+                        )
+                        event = {"type": "property_unavailable", "reason": reason}
+                        with self.subTest(
+                            target_address=target_address,
+                            first=first,
+                            reason=reason,
+                            message_template=message_template,
+                        ):
+                            patch = processing._pending_nonviable_followup_patch(
+                                [event],
+                                row_anchor=f"{target_address}, Phoenix",
+                                message_text=message_text,
+                            )
+                            self.assertTrue(
+                                processing._property_unavailable_event_applies_to_row(
+                                    event,
+                                    row_anchor=f"{target_address}, Phoenix",
+                                    message_text=message_text,
+                                )
+                            )
+                            self.assertIsNotNone(patch)
+                            self.assertEqual("stopped", patch["followUpStatus"])
+                            self.assertEqual(reason, patch["pendingTerminalReason"])
+
     def test_shared_terminal_predicate_applies_to_target_in_address_list(self):
         message_text = "100 Main St, Phoenix, and 200 Oak Ave are both leased."
         proposal = ai_processing._augment_events_with_deterministic_signals(
