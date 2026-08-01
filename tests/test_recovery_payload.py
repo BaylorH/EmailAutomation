@@ -71,6 +71,9 @@ UNICODE_DRIFT_BYTES_BASE64 = (
 UNICODE_DRIFT_PAYLOAD_HASH = (
     "6fd9f9947280458d39aa990c9ddb43db012ca49b058520b4600f77189f8da8e9"
 )
+UNICODE_DRIFT_SCRIPT_HASH = (
+    "76dce26a3e1a55316d1c13ed6c295aac1464155350488da3a1418a1ad96d0b82"
+)
 PAYLOAD_KEYS = [
     "schemaVersion",
     "recoveryProfile",
@@ -113,6 +116,56 @@ def unicode_drift_input():
             "rowNumber": 1,
         },
     }
+
+
+class DeceptiveString(str):
+    def __new__(cls, actual, replacement):
+        instance = super().__new__(cls, actual)
+        instance.replacement = replacement
+        return instance
+
+    def strip(self, *_args, **_kwargs):
+        return self.replacement
+
+    def replace(self, *_args, **_kwargs):
+        return self.replacement
+
+
+class DeceptiveInteger(int):
+    def __le__(self, _other):
+        return False
+
+    def __gt__(self, _other):
+        return False
+
+
+class LyingAskFields(list):
+    def __init__(self):
+        super().__init__()
+        self.iteration_count = 0
+
+    def __len__(self):
+        return 0
+
+    def __iter__(self):
+        self.iteration_count += 1
+        for index in range(251):
+            yield f"field-{index}"
+
+
+class EffectList(list):
+    pass
+
+
+class CountingKey(str):
+    def __new__(cls, value, counter):
+        instance = super().__new__(cls, value)
+        instance.counter = counter
+        return instance
+
+    def __hash__(self):
+        self.counter["count"] += 1
+        return super().__hash__()
 
 
 class RecoveryPayloadTests(unittest.TestCase):
@@ -167,6 +220,102 @@ class RecoveryPayloadTests(unittest.TestCase):
             UNICODE_DRIFT_PAYLOAD_HASH,
             hash_recovery_payload(payload),
         )
+        self.assertEqual(
+            UNICODE_DRIFT_SCRIPT_HASH,
+            hash_recovery_script(payload["script"]),
+        )
+
+    def test_rejects_deceptive_string_subclasses_across_builder_fields(self):
+        cases = (
+            ("uid", DeceptiveString("bad/id", "synthetic-user-a")),
+            ("email", DeceptiveString("not-an-email", "broker@example.test")),
+            ("script", DeceptiveString("", "Synthetic script.")),
+            ("subject", DeceptiveString("first\nsecond", "Synthetic subject")),
+            ("askField", DeceptiveString("", "CAP Rate")),
+        )
+        for location, value in cases:
+            with self.subTest(location=location):
+                test_input = clone_known_input()
+                if location == "uid":
+                    test_input["uid"] = value
+                elif location == "email":
+                    test_input["outbox"]["assignedEmails"] = [value]
+                elif location == "askField":
+                    test_input["outbox"]["askFields"] = [value]
+                else:
+                    test_input["outbox"][location] = value
+                with self.assertRaises((TypeError, ValueError)):
+                    build_canonical_recovery_payload(test_input)
+
+    def test_rejects_string_subclasses_for_canonical_constants(self):
+        constants = (
+            ("recoveryProfile", "managedInitialOutreachN1"),
+            ("source", "managed_initial_outreach_n1"),
+            ("actionType", "campaign_launch"),
+        )
+        for key, value in constants:
+            with self.subTest(key=key):
+                payload = build_canonical_recovery_payload(clone_known_input())
+                payload[key] = DeceptiveString(value, value)
+                with self.assertRaises((TypeError, ValueError)):
+                    serialize_canonical_recovery_payload(payload)
+
+    def test_rejects_deceptive_integer_subclass_for_row_number(self):
+        test_input = clone_known_input()
+        test_input["outbox"]["rowNumber"] = DeceptiveInteger(-1)
+
+        with self.assertRaises((TypeError, ValueError)):
+            build_canonical_recovery_payload(test_input)
+
+    def test_rejects_string_subclass_keys_without_hashing_them(self):
+        counter = {"count": 0}
+        deceptive_key = CountingKey("uid", counter)
+        test_input = clone_known_input()
+        uid = test_input.pop("uid")
+        test_input[deceptive_key] = uid
+        counter["count"] = 0
+
+        error = None
+        try:
+            build_canonical_recovery_payload(test_input)
+        except (TypeError, ValueError) as caught:
+            error = caught
+
+        self.assertEqual(0, counter["count"])
+        self.assertIsNotNone(error)
+
+    def test_rejects_lying_list_subclass_without_iterating_it(self):
+        test_input = clone_known_input()
+        ask_fields = LyingAskFields()
+        test_input["outbox"]["askFields"] = ask_fields
+
+        error = None
+        try:
+            build_canonical_recovery_payload(test_input)
+        except (TypeError, ValueError) as caught:
+            error = caught
+
+        self.assertEqual(0, ask_fields.iteration_count)
+        self.assertIsNotNone(error)
+
+    def test_rejects_list_subclasses_with_hidden_effect_attributes(self):
+        cases = ("assignedEmails", "askFields")
+        for key in cases:
+            with self.subTest(location=f"builder.{key}"):
+                test_input = clone_known_input()
+                values = EffectList(test_input["outbox"][key])
+                values.effect = True
+                test_input["outbox"][key] = values
+                with self.assertRaises((TypeError, ValueError)):
+                    build_canonical_recovery_payload(test_input)
+
+            with self.subTest(location=f"serializer.{key}"):
+                payload = build_canonical_recovery_payload(clone_known_input())
+                values = EffectList(payload[key])
+                values.effect = True
+                payload[key] = values
+                with self.assertRaises((TypeError, ValueError)):
+                    serialize_canonical_recovery_payload(payload)
 
     def test_accepts_null_row_number_and_empty_ask_fields(self):
         test_input = clone_known_input()
