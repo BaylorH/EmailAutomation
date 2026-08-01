@@ -2322,9 +2322,14 @@ def _property_unavailable_event_applies_to_row(
         if keyword
     ]
 
-    # An explicit statement that the target remains viable wins over an
-    # addressless model event, regardless of what happened to another property.
-    if row_norm and message_norm and _message_explicitly_keeps_row_viable(message_text, row_anchor):
+    # Market availability contradicts a stale lease/off-market event, but it does
+    # not cure an independent physical requirements mismatch on the same target.
+    if (
+        _nonviable_status_reason(event) != "requirements_mismatch"
+        and row_norm
+        and message_norm
+        and _message_explicitly_keeps_row_viable(message_text, row_anchor)
+    ):
         return False
 
     event_property = _format_event_property(event)

@@ -415,6 +415,103 @@ class JillJuneRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_target_availability_does_not_cancel_requirements_mismatch_terminalization(self):
+        messages = (
+            (
+                "The outparcel is fully leased, but 100 Main St is still "
+                "available but mostly office."
+            ),
+            "100 Main St is still available but mostly office.",
+            "100 Main St is still available. It is mostly office.",
+        )
+
+        for message_text in messages:
+            with self.subTest(message_text=message_text):
+                proposal = ai_processing._augment_events_with_deterministic_signals(
+                    {"updates": [], "events": [], "response_email": "Thanks."},
+                    [{"direction": "inbound", "content": message_text}],
+                    target_anchor="100 Main St, Phoenix",
+                )
+                unavailable = [
+                    event
+                    for event in proposal["events"]
+                    if event.get("type") == "property_unavailable"
+                ]
+                event = unavailable[0] if unavailable else {}
+                applies_to_row = (
+                    processing._property_unavailable_event_applies_to_row(
+                        event,
+                        row_anchor="100 Main St, Phoenix",
+                        message_text=message_text,
+                    )
+                )
+                patch = processing._pending_nonviable_followup_patch(
+                    unavailable,
+                    row_anchor="100 Main St, Phoenix",
+                    message_text=message_text,
+                )
+
+                self.assertEqual(
+                    {
+                        "reasons": ["requirements_mismatch"],
+                        "applies_to_row": True,
+                        "follow_up_status": "stopped",
+                        "pending_reason": "requirements_mismatch",
+                    },
+                    {
+                        "reasons": [event.get("reason") for event in unavailable],
+                        "applies_to_row": applies_to_row,
+                        "follow_up_status": (patch or {}).get("followUpStatus"),
+                        "pending_reason": (patch or {}).get("pendingTerminalReason"),
+                    },
+                )
+
+    def test_target_availability_does_not_cancel_normalized_mismatch_reasons(self):
+        message_text = "100 Main St is still available but mostly office."
+
+        for reason in (
+            "requirements_mismatch",
+            "physical_non_fit",
+            "physical_mismatch",
+            "bad_fit",
+            "requirements_non_fit",
+        ):
+            with self.subTest(reason=reason):
+                self.assertTrue(
+                    processing._property_unavailable_event_applies_to_row(
+                        {"type": "property_unavailable", "reason": reason},
+                        row_anchor="100 Main St, Phoenix",
+                        message_text=message_text,
+                    )
+                )
+
+    def test_competitor_availability_does_not_cancel_target_requirements_mismatch(self):
+        message_text = (
+            "200 Oak Ave is still available, but 100 Main St is mostly office."
+        )
+        proposal = ai_processing._augment_events_with_deterministic_signals(
+            {"updates": [], "events": [], "response_email": "Thanks."},
+            [{"direction": "inbound", "content": message_text}],
+            target_anchor="100 Main St, Phoenix",
+        )
+        unavailable = [
+            event
+            for event in proposal["events"]
+            if event.get("type") == "property_unavailable"
+        ]
+
+        self.assertEqual(
+            ["requirements_mismatch"],
+            [event.get("reason") for event in unavailable],
+        )
+        self.assertTrue(
+            processing._property_unavailable_event_applies_to_row(
+                unavailable[0],
+                row_anchor="100 Main St, Phoenix",
+                message_text=message_text,
+            )
+        )
+
     def test_target_binding_after_ancillary_supports_address_led_conjunctions(self):
         street_addresses = (
             "1 A St",
