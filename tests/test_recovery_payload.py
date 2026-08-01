@@ -2,6 +2,7 @@ import unittest
 
 
 try:
+    import email_automation.recovery_payload as recovery_payload
     from email_automation.recovery_payload import (
         build_canonical_recovery_payload,
         hash_recovery_payload,
@@ -89,6 +90,15 @@ PAYLOAD_KEYS = [
     "askFields",
     "rowNumber",
 ]
+SUBJECT_FORBIDDEN_SEPARATORS = (
+    ("LF", "\u000a"),
+    ("VT", "\u000b"),
+    ("FF", "\u000c"),
+    ("CR", "\u000d"),
+    ("NEL", "\u0085"),
+    ("LS", "\u2028"),
+    ("PS", "\u2029"),
+)
 
 
 def clone_known_input():
@@ -172,6 +182,17 @@ class RecoveryPayloadTests(unittest.TestCase):
     def setUp(self):
         if _IMPORT_ERROR is not None:
             self.fail(f"recovery payload module must be implemented: {_IMPORT_ERROR}")
+
+    def test_exports_exactly_the_four_public_apis(self):
+        self.assertEqual(
+            (
+                "build_canonical_recovery_payload",
+                "serialize_canonical_recovery_payload",
+                "hash_recovery_payload",
+                "hash_recovery_script",
+            ),
+            getattr(recovery_payload, "__all__", None),
+        )
 
     def test_builds_shared_normalized_n1_payload_in_fixed_key_order(self):
         payload = build_canonical_recovery_payload(clone_known_input())
@@ -390,6 +411,19 @@ class RecoveryPayloadTests(unittest.TestCase):
                 test_input["outbox"]["subject"] = value
                 with self.assertRaises((TypeError, ValueError)):
                     build_canonical_recovery_payload(test_input)
+
+    def test_rejects_every_forbidden_separator_at_subject_edges_before_trimming(self):
+        for separator_name, separator in SUBJECT_FORBIDDEN_SEPARATORS:
+            for edge in ("leading", "trailing"):
+                with self.subTest(separator=separator_name, edge=edge):
+                    test_input = clone_known_input()
+                    test_input["outbox"]["subject"] = (
+                        f"{separator}Synthetic subject"
+                        if edge == "leading"
+                        else f"Synthetic subject{separator}"
+                    )
+                    with self.assertRaises((TypeError, ValueError)):
+                        build_canonical_recovery_payload(test_input)
 
     def test_rejects_malformed_ask_fields(self):
         for value in ("Rent", [""], ["   "], [7], ["field"] * 251):

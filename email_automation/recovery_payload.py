@@ -8,6 +8,14 @@ import re
 from typing import Any, Dict, List
 
 
+__all__ = (
+    "build_canonical_recovery_payload",
+    "serialize_canonical_recovery_payload",
+    "hash_recovery_payload",
+    "hash_recovery_script",
+)
+
+
 _INPUT_KEYS = ("uid", "clientId", "outboxId", "recoveryRunId", "outbox")
 _OUTBOX_KEYS = ("assignedEmails", "script", "subject", "askFields", "rowNumber")
 _PAYLOAD_KEYS = (
@@ -112,11 +120,12 @@ def _normalize_script(value: Any) -> str:
 
 
 def _normalize_subject(value: Any) -> str:
-    subject = _trim(_require_string(value, "subject"))
+    raw_subject = _require_string(value, "subject")
+    if any(character in _SUBJECT_LINE_BREAKS for character in raw_subject):
+        raise TypeError("subject must be one line")
+    subject = _trim(raw_subject)
     if not subject:
         raise TypeError("subject must be nonempty")
-    if any(character in _SUBJECT_LINE_BREAKS for character in subject):
-        raise TypeError("subject must be one line")
     if len(subject) > 255:
         raise TypeError("subject must be at most 255 characters")
     return subject
