@@ -2235,7 +2235,12 @@ def _neither_nor_binds_viability(
         re.search(r"\bneither\s*$", leading_text, re.IGNORECASE)
         and re.search(r"\bnor\s*$", separator, re.IGNORECASE)
         and re.fullmatch(
-            r"[\s,]*(?:(?:is|are|both)[\s,]*)*",
+            r"[\s,]*(?:(?:"
+            r"is|are|was|were|do|does|did|"
+            r"can|could|will|would|may|might|should|"
+            r"both|currently|actually|still|now|presently|really|even|"
+            r"apparently|reportedly|appear|appears|seem|seems|to"
+            r")[\s,]*)*",
             link_text,
             re.IGNORECASE,
         )

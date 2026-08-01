@@ -1031,43 +1031,118 @@ class JillJuneRegressionTests(unittest.TestCase):
                             self.assertEqual(reason, patch["pendingTerminalReason"])
 
     def test_unrelated_neither_nor_does_not_negate_later_target_viability(self):
-        target_addresses = (
-            "1 Main St",
-            "12 Main St",
-            "123 Main St",
-            "1234 Main St",
-            "12345 Main St",
-            "123456 Main St",
+        address_pairs = (
+            ("1 Main St", "2 Oak Ave"),
+            ("12 Main St", "34 Oak Ave"),
+            ("123 Main St", "456 Oak Ave"),
+            ("1234 Main St", "5678 Oak Ave"),
+            ("12345 Main St", "56789 Oak Ave"),
+            ("123456 Main St", "654321 Oak Ave"),
         )
         separators = (", but ", " but ", ". ", "; ")
+        unrelated_prefixes = (
+            "Neither the broker nor the owner objected",
+            "Neither the broker for {competitor} nor the owner objected",
+        )
 
-        for target_address in target_addresses:
+        for target_address, competitor_address in address_pairs:
             for reason in ("leased", "sold", "no_space_available"):
                 event = {"type": "property_unavailable", "reason": reason}
-                for separator in separators:
-                    message_text = (
-                        f"Neither the broker nor the owner objected{separator}"
-                        f"{target_address} clearly remains available."
-                    )
-                    with self.subTest(
-                        target_address=target_address,
-                        reason=reason,
-                        separator=separator,
-                    ):
-                        self.assertFalse(
-                            processing._property_unavailable_event_applies_to_row(
-                                event,
-                                row_anchor=f"{target_address}, Phoenix",
-                                message_text=message_text,
+                for modifier in ("clearly", "currently", "actually", "now"):
+                    for prefix_template in unrelated_prefixes:
+                        prefix = prefix_template.format(competitor=competitor_address)
+                        for separator in separators:
+                            message_text = (
+                                f"{prefix}{separator}{target_address} "
+                                f"{modifier} remains available."
                             )
-                        )
-                        self.assertIsNone(
-                            processing._pending_nonviable_followup_patch(
-                                [event],
-                                row_anchor=f"{target_address}, Phoenix",
-                                message_text=message_text,
-                            )
-                        )
+                            with self.subTest(
+                                target_address=target_address,
+                                reason=reason,
+                                modifier=modifier,
+                                prefix_template=prefix_template,
+                                separator=separator,
+                            ):
+                                self.assertFalse(
+                                    processing._property_unavailable_event_applies_to_row(
+                                        event,
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+                                self.assertIsNone(
+                                    processing._pending_nonviable_followup_patch(
+                                        [event],
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+
+    def test_neither_nor_property_subject_supports_predicate_modifiers(self):
+        address_pairs = (
+            ("1 Main St", "2 Oak Ave"),
+            ("12 Main St", "34 Oak Ave"),
+            ("123 Main St", "456 Oak Ave"),
+            ("1234 Main St", "5678 Oak Ave"),
+            ("12345 Main St", "56789 Oak Ave"),
+            ("123456 Main St", "654321 Oak Ave"),
+        )
+        predicates = (
+            "currently remains available",
+            "actually remains available",
+            "now remains available",
+            "still remains available",
+            "presently remains available",
+            "really remains available",
+            "is currently still available",
+            "is actually still available",
+            "can still remain available",
+            "will still remain available",
+            "appears to remain available",
+        )
+
+        for target_address, competitor_address in address_pairs:
+            for first, second in (
+                (target_address, competitor_address),
+                (competitor_address, target_address),
+            ):
+                for reason in ("leased", "sold", "no_space_available"):
+                    event = {"type": "property_unavailable", "reason": reason}
+                    for predicate in predicates:
+                        for punctuation in (False, True):
+                            if punctuation:
+                                message_text = (
+                                    f"Neither {first}, nor {second}, {predicate}."
+                                )
+                            else:
+                                message_text = (
+                                    f"Neither {first} nor {second} {predicate}."
+                                )
+                            with self.subTest(
+                                target_address=target_address,
+                                first=first,
+                                reason=reason,
+                                predicate=predicate,
+                                punctuation=punctuation,
+                            ):
+                                patch = processing._pending_nonviable_followup_patch(
+                                    [event],
+                                    row_anchor=f"{target_address}, Phoenix",
+                                    message_text=message_text,
+                                )
+                                self.assertTrue(
+                                    processing._property_unavailable_event_applies_to_row(
+                                        event,
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+                                self.assertIsNotNone(patch)
+                                self.assertEqual("stopped", patch["followUpStatus"])
+                                self.assertEqual(
+                                    reason,
+                                    patch["pendingTerminalReason"],
+                                )
 
     def test_near_negated_availability_never_suppresses_target_terminal_event(self):
         address_pairs = (
