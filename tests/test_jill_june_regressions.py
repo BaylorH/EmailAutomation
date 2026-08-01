@@ -391,6 +391,69 @@ class JillJuneRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_target_requirements_mismatch_after_ancillary_comma_and_reaches_row_guard(self):
+        message_text = (
+            "The outparcel is fully leased, and 100 Main St is mostly office."
+        )
+        proposal = ai_processing._augment_events_with_deterministic_signals(
+            {"updates": [], "events": [], "response_email": "Thanks."},
+            [{"direction": "inbound", "content": message_text}],
+            target_anchor="100 Main St, Phoenix",
+        )
+        unavailable = [
+            event
+            for event in proposal["events"]
+            if event.get("type") == "property_unavailable"
+        ]
+
+        self.assertEqual("requirements_mismatch", unavailable[0]["reason"])
+        self.assertTrue(
+            processing._property_unavailable_event_applies_to_row(
+                unavailable[0],
+                row_anchor="100 Main St, Phoenix",
+                message_text=message_text,
+            )
+        )
+
+    def test_target_binding_after_ancillary_supports_address_led_conjunctions(self):
+        event = {"type": "property_unavailable", "reason": "requirements_mismatch"}
+
+        for street_address in ("1 A St", "100 Main St", "123456 Long Rd"):
+            for conjunction in (", and ", ", but ", ", or ", " and ", " but ", " or "):
+                message_text = (
+                    f"The outparcel is fully leased{conjunction}"
+                    f"{street_address} is mostly office."
+                )
+                with self.subTest(
+                    street_address=street_address,
+                    conjunction=conjunction,
+                ):
+                    self.assertTrue(
+                        processing._property_unavailable_event_applies_to_row(
+                            event,
+                            row_anchor=f"{street_address}, Phoenix",
+                            message_text=message_text,
+                        )
+                    )
+
+    def test_ancillary_conjunction_without_independent_target_assertion_stays_scoped(self):
+        event = {"type": "property_unavailable", "reason": "requirements_mismatch"}
+        messages = (
+            "The outparcel is fully leased, and mostly office.",
+            "The outparcel is fully leased, or mostly office.",
+            "At 100 Main St, the outparcel is fully leased, and mostly office.",
+        )
+
+        for message_text in messages:
+            with self.subTest(message_text=message_text):
+                self.assertFalse(
+                    processing._property_unavailable_event_applies_to_row(
+                        event,
+                        row_anchor="100 Main St, Phoenix",
+                        message_text=message_text,
+                    )
+                )
+
     def test_downstream_guard_rejects_tour_only_unavailability_as_nonviable(self):
         event = {"type": "property_unavailable", "reason": "model"}
 

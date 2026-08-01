@@ -2065,9 +2065,25 @@ def _normalize_replacement_match_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
+_ADDRESS_LED_TERMINAL_SEPARATOR_RE = re.compile(
+    r",?\s+(?:and|but|or)\s+(?=\d{1,6}\s+[a-z])",
+    re.IGNORECASE,
+)
+
+
+def _clause_owns_terminal_assertion(clause: str) -> bool:
+    return bool(
+        _looks_like_requirements_mismatch_nonviable(clause)
+        or any(
+            re.search(pattern, clause or "", re.IGNORECASE)
+            for _reason, pattern in _UNAVAILABLE_PATTERNS
+        )
+    )
+
+
 def _terminal_binding_clauses(message_text: str) -> List[str]:
     """Split independent property assertions without separating shared subjects."""
-    return [
+    clauses = [
         clause.strip()
         for clause in re.split(
             r"(?<=[.!?])\s+|\n+|\s*;\s*|"
@@ -2080,6 +2096,25 @@ def _terminal_binding_clauses(message_text: str) -> List[str]:
         )
         if clause.strip()
     ]
+    while True:
+        expanded = []
+        changed = False
+        for clause in clauses:
+            for separator in _ADDRESS_LED_TERMINAL_SEPARATOR_RE.finditer(clause):
+                left = clause[:separator.start()].strip(" ,")
+                right = clause[separator.end():].strip(" ,")
+                if (
+                    _clause_owns_terminal_assertion(left)
+                    and _clause_owns_terminal_assertion(right)
+                ):
+                    expanded.extend((left, right))
+                    changed = True
+                    break
+            else:
+                expanded.append(clause)
+        clauses = expanded
+        if not changed:
+            return clauses
 
 
 _EXPLICIT_OTHER_PROPERTY_RE = re.compile(
