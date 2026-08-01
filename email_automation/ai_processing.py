@@ -2118,6 +2118,35 @@ def _unbound_identity_fact_spans(
             if not _is_property_fact_or_section_label(postfixed_label):
                 unbound_spans.append((current[0], following[1]))
 
+    # Some extracted tables put the mapped label, its value, and the property
+    # identity on three separate rows. Bind the first two rows before deciding
+    # whether the third is an unknown postfixed identity.
+    for label_span, value_span, identity_span in zip(
+        clause_spans,
+        clause_spans[1:],
+        clause_spans[2:],
+    ):
+        label_line = _STANDALONE_IDENTITY_LINE_RE.match(
+            text[label_span[0]:label_span[1]]
+        )
+        value_text = text[value_span[0]:value_span[1]]
+        postfixed_identity = _STANDALONE_IDENTITY_LINE_RE.match(
+            text[identity_span[0]:identity_span[1]]
+        )
+        if (
+            not label_line
+            or not _is_property_fact_or_section_label(label_line.group("label"))
+            or not _NUMERIC_PROPERTY_VALUE_RE.search(value_text)
+            or not postfixed_identity
+            or _source_mentions_target_property(
+                text[identity_span[0]:identity_span[1]],
+                target_anchor,
+            )
+            or _is_property_fact_or_section_label(postfixed_identity.group("label"))
+        ):
+            continue
+        unbound_spans.append((label_span[0], identity_span[1]))
+
     for clause_start, clause_end in clause_spans:
         clause = text[clause_start:clause_end]
         if _source_mentions_target_property(clause, target_anchor):

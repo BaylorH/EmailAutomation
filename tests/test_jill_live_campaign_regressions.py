@@ -735,6 +735,72 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 ))
                 self.assertIsNone(result["response_email"])
 
+    def test_three_row_postfixed_identity_suppresses_every_mapped_fact_type(self):
+        competing_tables = (
+            ("Docks", "6", "Docks\n6\nOak Center"),
+            ("Drive Ins", "2", "Drive Ins\n2\nOak Center"),
+            ("Power", "1200A", "Power\n1200A\nOak Center"),
+            ("Ceiling Ht", "32", "Clear Height\n32\nOak Center"),
+            ("Total SF", "45000", "Total SF\n45000\nOak Center"),
+            ("Rent/SF/Yr", "6.75", "Asking Rate\n$6.75/SF NNN\nOak Center"),
+            ("Ops Ex/SF/Yr", "1.85", "CAM Charges\n$1.85/SF\nOak Center"),
+            ("Docks", "6", "Docks\n6\nPower Center"),
+            ("Power", "1200A", "Power\n1200A\nWestgate Power"),
+        )
+
+        for column, value, competing_table in competing_tables:
+            with self.subTest(column=column, competing_table=competing_table):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [{"column": column, "value": value}],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"100 Main St\n{competing_table}",
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
+    def test_three_row_target_tables_remain_supported(self):
+        target_tables = (
+            ("Docks", "6", "Docks\n6"),
+            ("Docks", "6", "Docks\n6\n100 Main St"),
+            ("Power", "1200A 480V 3-phase", "Power\n1200A 480V 3-phase"),
+            ("Rent/SF/Yr", "6.75", "Asking Rate\n$6.75/SF NNN"),
+        )
+
+        for column, value, target_table in target_tables:
+            with self.subTest(column=column, target_table=target_table):
+                expected_update = {"column": column, "value": value}
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [expected_update],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The target brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "100 Main St brochure.pdf",
+                        "text": f"100 Main St\n{target_table}",
+                    }],
+                )
+
+                self.assertEqual([expected_update], result["updates"])
+                self.assertEqual([], result["events"])
+                self.assertEqual("Thanks.", result["response_email"])
+
     def test_exact_target_postfix_preserves_target_fact_updates(self):
         target_clauses = (
             "Docks: 6 | 100 Main St",
