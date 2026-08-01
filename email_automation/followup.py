@@ -14,12 +14,15 @@ Key features:
 Called from main.py after inbox scanning.
 """
 
+import hashlib
+import json
 import socket
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Any
+from enum import Enum
+from typing import Dict, List, Optional, Any, Tuple
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 from google.cloud.firestore import SERVER_TIMESTAMP
@@ -59,6 +62,7 @@ from .column_config import (
 
 # Claim timeout for follow-up processing (prevent duplicate sends)
 FOLLOWUP_CLAIM_TIMEOUT_SECONDS = 60
+FOLLOWUP_SEND_LEASE_SECONDS = 10 * 60
 SYNTHETIC_OUTBOUND_SOURCES = {"dashboard_outbox_reply", "followup_scheduler"}
 DEFAULT_FOLLOWUP_BUSINESS_TIMEZONE = "America/New_York"
 FOLLOWUP_BUSINESS_START_HOUR = 9
@@ -83,6 +87,28 @@ class FollowupSendOutcome:
     guard_failed_closed: bool = False
     campaign_suppression_kind: Optional[str] = None
     campaign_decision: Optional[Any] = None
+    attempt_id: Optional[str] = None
+    attempt_marker: Optional[Dict[str, Any]] = None
+    attempt_expected_absent: bool = False
+
+
+@dataclass(frozen=True)
+class FollowupClaim:
+    owner: str
+    index: int
+    thread_data: Dict[str, Any]
+    followup_config: Dict[str, Any]
+    reconciliation_required: bool = False
+
+
+class FollowupScheduleOutcome(str, Enum):
+    SCHEDULED = "scheduled"
+    MAX_REACHED = "max_reached"
+    INBOUND_PRESERVED = "inbound_preserved"
+    TERMINAL_PRESERVED = "terminal_preserved"
+    PAUSED_PRESERVED = "paused_preserved"
+    ALREADY_COMMITTED = "already_committed"
+    AMBIGUOUS = "ambiguous"
 
 
 _FOLLOWUP_SEND_OUTCOME = ContextVar(
@@ -134,6 +160,178 @@ def _get_followup_campaign_suppression():
 def _get_local_followup_campaign_suppression():
     """Return suppression produced by this execution context only."""
     return _get_followup_campaign_suppression()
+
+
+_FOLLOWUP_CONFIG_RUNTIME_FIELDS = {
+    "processingBy",
+    "processingAt",
+    "processingLeaseUntil",
+    "lastSendError",
+    "lastSendAttemptAt",
+    "lastSendAttemptIndex",
+    "lastFollowUpSentAt",
+    "lastWeekendDeferralAt",
+    "automationSuppressedAt",
+    "automationSuppressedReason",
+    "automationSuppressedState",
+}
+
+
+def _canonical_followup_value(value: Any) -> Any:
+    """Convert Firestore values into deterministic JSON-compatible values."""
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_followup_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_followup_value(item) for item in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _followup_config_fingerprint(followup_config: Dict[str, Any]) -> str:
+    """Fingerprint durable scheduling inputs while excluding runtime claim fields."""
+    durable_config = {
+        key: value
+        for key, value in (followup_config or {}).items()
+        if key not in _FOLLOWUP_CONFIG_RUNTIME_FIELDS
+    }
+    encoded = json.dumps(
+        _canonical_followup_value(durable_config),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _followup_retry_signature(
+    thread_data: Dict[str, Any],
+    followup_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return the exact retry fence that a claimed worker observed."""
+    return _canonical_followup_value({
+        "lastSendError": (followup_config or {}).get("lastSendError"),
+        "lastSendAttemptAt": (followup_config or {}).get("lastSendAttemptAt"),
+        "lastSendAttemptIndex": (followup_config or {}).get("lastSendAttemptIndex"),
+        "followUpSendAttempt": (thread_data or {}).get("followUpSendAttempt"),
+    })
+
+
+def _followup_raw_message(followup_config: Dict[str, Any], followup_index: int) -> str:
+    followups = (followup_config or {}).get("followUps") or []
+    if not isinstance(followups, list) or followup_index >= len(followups):
+        return ""
+    step = followups[followup_index]
+    if not isinstance(step, dict):
+        return ""
+    return str(step.get("message") or "")
+
+
+def _followup_primary_recipient(thread_data: Dict[str, Any]) -> str:
+    recipient_emails = (thread_data or {}).get("email", [])
+    if isinstance(recipient_emails, list):
+        recipient = recipient_emails[0] if recipient_emails else ""
+    else:
+        recipient = recipient_emails
+    return str(recipient or "").strip().lower()
+
+
+def _normalize_followup_recipients(recipients: Any) -> List[str]:
+    """Return ordered, case-normalized addresses from strings or Graph entries."""
+    normalized = []
+    seen = set()
+    if isinstance(recipients, (str, dict)):
+        recipients = [recipients]
+    for item in recipients or []:
+        if isinstance(item, dict):
+            address = ((item.get("emailAddress") or {}).get("address") or "")
+        else:
+            address = item
+        address = str(address or "").strip().lower()
+        if address and address not in seen:
+            seen.add(address)
+            normalized.append(address)
+    return normalized
+
+
+def _followup_send_identity(
+    thread_data: Dict[str, Any],
+    followup_config: Dict[str, Any],
+    followup_index: int,
+) -> Dict[str, Any]:
+    """Capture Firestore inputs that can change the external send."""
+    cc_recipients = (
+        (thread_data or {}).get("ccEmails")
+        or (thread_data or {}).get("ccRecipients")
+        or []
+    )
+    return _canonical_followup_value({
+        "clientId": (thread_data or {}).get("clientId"),
+        "recipient": _followup_primary_recipient(thread_data),
+        "rawMessage": _followup_raw_message(followup_config, followup_index),
+        "contactName": (thread_data or {}).get("contactName") or "",
+        "ccRecipients": cc_recipients,
+        "configFingerprint": _followup_config_fingerprint(followup_config),
+    })
+
+
+def _followup_send_identity_matches(
+    left: Any,
+    right: Any,
+    *,
+    allow_config_fingerprint_change: bool = False,
+) -> bool:
+    """Compare send inputs, optionally tolerating terminal scheduling changes."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    canonical_left = _canonical_followup_value(left)
+    canonical_right = _canonical_followup_value(right)
+    if canonical_left == canonical_right:
+        return True
+    if not allow_config_fingerprint_change:
+        return False
+    canonical_left = dict(canonical_left)
+    canonical_right = dict(canonical_right)
+    canonical_left.pop("configFingerprint", None)
+    canonical_right.pop("configFingerprint", None)
+    return canonical_left == canonical_right
+
+
+def _followup_preservation_outcome(
+    thread_data: Dict[str, Any],
+) -> Optional[FollowupScheduleOutcome]:
+    """Classify a newer business state that accepted-send bookkeeping preserves."""
+    data = thread_data or {}
+    status = str(data.get("status") or "").strip().lower()
+    followup_status = str(data.get("followUpStatus") or "").strip().lower()
+    status_reason = str(data.get("statusReason") or "").strip().lower()
+    pending_terminal_reason = str(
+        data.get("pendingTerminalReason") or ""
+    ).strip().lower()
+    if data.get("hasInboundReply"):
+        return FollowupScheduleOutcome.INBOUND_PRESERVED
+    if (
+        status == "paused"
+        or followup_status == "paused"
+        or status_reason == "manual_continuation"
+    ):
+        return FollowupScheduleOutcome.PAUSED_PRESERVED
+    if (
+        pending_terminal_reason
+        or status in {"stopped", "completed", "archived", "action_needed"}
+        or (followup_status and followup_status != "waiting")
+    ):
+        return FollowupScheduleOutcome.TERMINAL_PRESERVED
+    return None
 
 
 def _followup_column_contract_error(message: str, campaign_decision) -> Optional[str]:
@@ -255,14 +453,18 @@ def _next_business_followup_time(
     return local_monday.astimezone(timezone.utc)
 
 
-def _claim_followup(user_id: str, thread_id: str, current_index: int) -> Optional[str]:
+def _claim_followup(
+    user_id: str,
+    thread_id: str,
+    current_index: int,
+) -> Optional[FollowupClaim]:
     """
     Atomically claim a follow-up for processing to prevent duplicate sends.
 
     The transaction revalidates that the thread is still waiting, sendable,
     due, and at the expected index before replacing any stale claim.
 
-    Returns the unique claim owner if successful, otherwise None.
+    Returns the unique owner plus the authoritative transaction snapshot.
     """
     from google.cloud.firestore import transactional
 
@@ -276,47 +478,148 @@ def _claim_followup(user_id: str, thread_id: str, current_index: int) -> Optiona
 
         data = snapshot.to_dict() or {}
         followup_config = data.get("followUpConfig", {})
-
-        block_reason = _followup_terminal_block_reason(
-            data,
-            followup_config,
-            expected_index,
-        )
-        if block_reason:
-            print(f"   ⏭️ Follow-up no longer sendable: {block_reason}")
+        if not isinstance(followup_config, dict):
             return None
 
-        followup_status = str(data.get("followUpStatus") or "").strip().lower()
-        if followup_status != "waiting":
-            print(f"   ⏭️ Follow-up state changed to {followup_status or 'unset'}, skipping")
-            return None
-
-        # Check if index has changed (another process already sent)
         actual_index = followup_config.get("currentFollowUpIndex", 0)
+        processing_by = followup_config.get("processingBy")
+        processing_at = followup_config.get("processingAt")
+        send_attempt = data.get("followUpSendAttempt")
+        if not isinstance(send_attempt, dict):
+            send_attempt = {}
+        attempt_state = str(send_attempt.get("state") or "").strip().lower()
+        if attempt_state == "needs_review":
+            print(
+                "   ⏭️ Follow-up send attempt requires manual review before "
+                "the sequence can resume"
+            )
+            return None
+        if (
+            attempt_state in {"sending", "uncertain"}
+            and send_attempt.get("index") != actual_index
+        ):
+            attempt_index = send_attempt.get("index")
+            reason = (
+                "unresolved durable follow-up attempt exists at a different "
+                f"index ({attempt_index} vs {actual_index}); manual review required"
+            )
+            inconsistent_update = {
+                "followUpConfig.enabled": False,
+                "followUpConfig.nextFollowUpAt": None,
+                "followUpConfig.processingBy": None,
+                "followUpConfig.processingAt": None,
+                "followUpConfig.processingLeaseUntil": None,
+                "followUpConfig.lastSendError": reason,
+                "updatedAt": SERVER_TIMESTAMP,
+            }
+            review_attempt = dict(send_attempt)
+            review_attempt.update({
+                "state": "needs_review",
+                "resolution": "ambiguous",
+                "error": reason,
+                "finalizedAt": datetime.now(timezone.utc),
+            })
+            inconsistent_update["followUpSendAttempt"] = review_attempt
+            current_status = str(data.get("status") or "").strip().lower()
+            current_followup_status = str(
+                data.get("followUpStatus") or ""
+            ).strip().lower()
+            preserves_business_state = (
+                data.get("hasInboundReply")
+                or current_status in {
+                    "paused", "stopped", "completed", "archived", "action_needed"
+                }
+                or (
+                    current_followup_status
+                    and current_followup_status != "waiting"
+                )
+            )
+            if not preserves_business_state:
+                inconsistent_update.update({
+                    "followUpStatus": "needs_review",
+                    "status": "action_needed",
+                    "statusReason": "followup_send_guard_failed",
+                })
+            transaction.update(thread_ref, inconsistent_update)
+            print(f"   🛑 {reason}")
+            return None
+        if (
+            send_attempt.get("index") == actual_index
+            and attempt_state == "committed"
+        ):
+            print(
+                "   ⏭️ Follow-up send attempt is already committed at "
+                f"index {expected_index}, skipping"
+            )
+            return None
+        reconciliation_required = (
+            send_attempt.get("index") == actual_index
+            and attempt_state in {"sending", "uncertain"}
+        )
+
         if actual_index != expected_index:
             print(f"   ⏭️ Follow-up index changed ({expected_index} → {actual_index}), skipping")
             return None
 
-        # Check if already being processed
-        processing_by = followup_config.get("processingBy")
-        processing_at = followup_config.get("processingAt")
+        # Ordinary sends require a waiting, enabled, non-terminal thread.
+        # An unresolved durable attempt is recovery-only: it must be claimed
+        # even if an inbound reply or terminal/manual state arrived after
+        # Graph acceptance, and that business state is preserved later.
+        if not reconciliation_required:
+            block_reason = _followup_terminal_block_reason(
+                data,
+                followup_config,
+                expected_index,
+            )
+            if block_reason:
+                print(f"   ⏭️ Follow-up no longer sendable: {block_reason}")
+                return None
+
+            followup_status = str(data.get("followUpStatus") or "").strip().lower()
+            if followup_status != "waiting":
+                print(
+                    f"   ⏭️ Follow-up state changed to "
+                    f"{followup_status or 'unset'}, skipping"
+                )
+                return None
 
         now = datetime.now(timezone.utc)
 
-        next_followup_at = followup_config.get("nextFollowUpAt")
-        try:
-            next_followup_dt = datetime.fromtimestamp(
-                next_followup_at.timestamp(),
-                tz=timezone.utc,
-            )
-        except (AttributeError, TypeError, ValueError, OSError):
-            print("   ⏭️ Follow-up no longer has a valid due time, skipping")
-            return None
-        if now < next_followup_dt:
-            print("   ⏭️ Follow-up due time moved into the future, skipping")
-            return None
+        if not reconciliation_required:
+            next_followup_at = followup_config.get("nextFollowUpAt")
+            try:
+                next_followup_dt = datetime.fromtimestamp(
+                    next_followup_at.timestamp(),
+                    tz=timezone.utc,
+                )
+            except (AttributeError, TypeError, ValueError, OSError):
+                print("   ⏭️ Follow-up no longer has a valid due time, skipping")
+                return None
+            if now < next_followup_dt:
+                print("   ⏭️ Follow-up due time moved into the future, skipping")
+                return None
 
-        if processing_by and processing_at:
+        lease_until = (
+            send_attempt.get("leaseUntil")
+            if reconciliation_required
+            else followup_config.get("processingLeaseUntil")
+        )
+        if lease_until is not None:
+            try:
+                lease_until_dt = datetime.fromtimestamp(
+                    lease_until.timestamp(),
+                    tz=timezone.utc,
+                )
+            except (AttributeError, TypeError, ValueError, OSError):
+                lease_until_dt = None
+            if lease_until_dt is not None and now < lease_until_dt:
+                print(
+                    f"   ⏭️ Follow-up send lease is active until "
+                    f"{lease_until_dt.isoformat()}"
+                )
+                return None
+
+        if processing_by and processing_at and not reconciliation_required:
             if hasattr(processing_at, 'timestamp'):
                 claim_age = (now - processing_at.replace(tzinfo=timezone.utc)).total_seconds()
             else:
@@ -328,11 +631,48 @@ def _claim_followup(user_id: str, thread_id: str, current_index: int) -> Optiona
 
         # Claim the follow-up
         worker_id = f"followup-{socket.gethostname()[:20]}-{uuid4().hex}"
-        transaction.update(thread_ref, {
+        claim_update = {
             "followUpConfig.processingBy": worker_id,
-            "followUpConfig.processingAt": now
+            "followUpConfig.processingAt": now,
+            "followUpConfig.processingLeaseUntil": (
+                now + timedelta(seconds=FOLLOWUP_SEND_LEASE_SECONDS)
+                if reconciliation_required
+                else None
+            ),
+        }
+
+        claimed_attempt = send_attempt
+        if reconciliation_required:
+            claimed_attempt = dict(send_attempt)
+            claimed_attempt.update({
+                "state": "uncertain",
+                "reconciliationOwner": worker_id,
+                "leaseUntil": now + timedelta(seconds=FOLLOWUP_SEND_LEASE_SECONDS),
+            })
+            claim_update["followUpSendAttempt"] = claimed_attempt
+
+        transaction.update(thread_ref, claim_update)
+
+        claimed_config = dict(followup_config)
+        claimed_config.update({
+            "processingBy": worker_id,
+            "processingAt": now,
+            "processingLeaseUntil": claim_update[
+                "followUpConfig.processingLeaseUntil"
+            ],
         })
-        return worker_id
+        claimed_data = dict(data)
+        claimed_data["followUpConfig"] = claimed_config
+        if reconciliation_required:
+            claimed_data["followUpSendAttempt"] = claimed_attempt
+
+        return FollowupClaim(
+            owner=worker_id,
+            index=actual_index,
+            thread_data=claimed_data,
+            followup_config=claimed_config,
+            reconciliation_required=reconciliation_required,
+        )
 
     try:
         transaction = _fs.transaction()
@@ -350,6 +690,9 @@ def _release_followup_claim(
     attempted_at: Optional[datetime] = None,
     current_index: Optional[int] = None,
     claim_owner: Optional[str] = None,
+    send_attempt_id: Optional[str] = None,
+    send_attempt_marker: Optional[Dict[str, Any]] = None,
+    expected_no_send_attempt: bool = False,
     fail_closed: bool = False,
 ) -> bool:
     """Release an owned claim without overwriting newer or terminal state."""
@@ -382,9 +725,38 @@ def _release_followup_claim(
                 )
                 return False
 
+            current_attempt_raw = data.get("followUpSendAttempt")
+            current_attempt = (
+                current_attempt_raw
+                if isinstance(current_attempt_raw, dict)
+                else None
+            )
+            if send_attempt_id:
+                current_attempt_id = (
+                    current_attempt.get("id")
+                    if current_attempt is not None
+                    else None
+                )
+                if current_attempt_id != send_attempt_id:
+                    expected_absence_matches = (
+                        expected_no_send_attempt
+                        and current_attempt_raw is None
+                        and isinstance(send_attempt_marker, dict)
+                        and send_attempt_marker.get("id") == send_attempt_id
+                    )
+                    if expected_absence_matches:
+                        current_attempt = None
+                    else:
+                        print(
+                            f"   ⏭️ Follow-up send attempt changed from "
+                            f"{send_attempt_id} to {current_attempt_id}; not releasing"
+                        )
+                        return False
+
             update_payload = {
                 "followUpConfig.processingBy": None,
                 "followUpConfig.processingAt": None,
+                "followUpConfig.processingLeaseUntil": None,
             }
             if reason:
                 update_payload["followUpConfig.lastSendError"] = reason
@@ -393,6 +765,28 @@ def _release_followup_claim(
             if current_index is not None:
                 update_payload["followUpConfig.lastSendAttemptIndex"] = current_index
             if fail_closed:
+                update_payload.update({
+                    "followUpConfig.enabled": False,
+                    "followUpConfig.nextFollowUpAt": None,
+                })
+                review_source = current_attempt
+                if (
+                    review_source is None
+                    and send_attempt_id
+                    and expected_no_send_attempt
+                    and isinstance(send_attempt_marker, dict)
+                    and send_attempt_marker.get("id") == send_attempt_id
+                ):
+                    review_source = send_attempt_marker
+                if send_attempt_id and isinstance(review_source, dict):
+                    review_attempt = dict(review_source)
+                    review_attempt.update({
+                        "state": "needs_review",
+                        "resolution": "ambiguous",
+                        "error": reason or "follow-up send guard failed",
+                        "finalizedAt": datetime.now(timezone.utc),
+                    })
+                    update_payload["followUpSendAttempt"] = review_attempt
                 block_reason = _followup_terminal_block_reason(
                     data,
                     followup_config,
@@ -407,8 +801,6 @@ def _release_followup_claim(
                         "followUpStatus": "needs_review",
                         "status": "action_needed",
                         "statusReason": "followup_send_guard_failed",
-                        "followUpConfig.enabled": False,
-                        "followUpConfig.nextFollowUpAt": None,
                     })
             transaction.update(thread_ref, update_payload)
             return True
@@ -418,6 +810,90 @@ def _release_followup_claim(
     except Exception as e:
         print(f"   ⚠️ Failed to release follow-up claim: {e}")
         return False
+
+
+def _terminalize_owned_followup(
+    user_id: str,
+    thread_id: str,
+    *,
+    reason: str,
+    current_index: int,
+    claim_owner: Optional[str],
+    expected_client_id: Optional[str],
+) -> Tuple[bool, Optional[str]]:
+    """Apply campaign terminal state only to the exact active claim."""
+    from google.cloud.firestore import transactional
+
+    thread_ref = (
+        _fs.collection("users")
+        .document(user_id)
+        .collection("threads")
+        .document(thread_id)
+    )
+
+    @transactional
+    def terminalize_transaction(transaction, thread_ref):
+        snapshot = thread_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return False, "the thread no longer exists"
+
+        data = snapshot.to_dict() or {}
+        current_client_id = data.get("clientId")
+        if current_client_id != expected_client_id:
+            return False, (
+                f"the thread client changed from {expected_client_id} "
+                f"to {current_client_id}"
+            )
+        current_config = data.get("followUpConfig")
+        if not isinstance(current_config, dict):
+            return False, "the current follow-up config is missing"
+        current_owner = current_config.get("processingBy")
+        if not claim_owner or current_owner != claim_owner:
+            return False, (
+                f"claim ownership changed from {claim_owner} to {current_owner}"
+            )
+        actual_index = current_config.get("currentFollowUpIndex", 0)
+        if actual_index != current_index:
+            return False, (
+                f"the follow-up index changed from {current_index} to {actual_index}"
+            )
+
+        current_attempt = data.get("followUpSendAttempt")
+        if isinstance(current_attempt, dict) and str(
+            current_attempt.get("state") or ""
+        ).strip().lower() in {"sending", "uncertain"}:
+            return False, "an unresolved durable send attempt appeared"
+
+        status = str(data.get("status") or "").strip().lower()
+        followup_status = str(data.get("followUpStatus") or "").strip().lower()
+        preserve_business_state = (
+            data.get("hasInboundReply")
+            or status in {
+                "paused", "stopped", "completed", "archived", "action_needed"
+            }
+            or (followup_status and followup_status != "waiting")
+        )
+        if preserve_business_state:
+            terminal_patch = {
+                "automationPaused": True,
+                "automationPauseReason": reason,
+                "followUpConfig.enabled": False,
+                "followUpConfig.nextFollowUpAt": None,
+                "followUpConfig.processingBy": None,
+                "followUpConfig.processingAt": None,
+                "followUpConfig.processingLeaseUntil": None,
+                "updatedAt": SERVER_TIMESTAMP,
+            }
+        else:
+            terminal_patch = stopped_followup_patch(reason)
+            terminal_patch["followUpConfig.processingLeaseUntil"] = None
+        transaction.update(thread_ref, terminal_patch)
+        return True, None
+
+    try:
+        return terminalize_transaction(_fs.transaction(), thread_ref)
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _save_followup_message(
@@ -430,10 +906,16 @@ def _save_followup_message(
     signature_mode: str = None,
     user_email: str = None,
     cc_recipients: Optional[List[str]] = None,
+    to_recipients: Optional[List[str]] = None,
+    attempt_id: Optional[str] = None,
 ) -> bool:
     """Persist a sent follow-up into thread history for dashboard reconciliation."""
     try:
-        synthetic_id = f"followup-{thread_id}-{int(time.time() * 1000)}"
+        synthetic_id = (
+            f"followup-{thread_id}-{attempt_id}"
+            if attempt_id
+            else f"followup-{thread_id}-{int(time.time() * 1000)}"
+        )
         html_body = format_email_body_with_footer(
             body,
             user_signature,
@@ -447,8 +929,12 @@ def _save_followup_message(
             {
                 "direction": "outbound",
                 "from": "me",
-                "to": [recipient] if recipient else [],
-                "cc": cc_recipients or [],
+                "to": (
+                    _normalize_followup_recipients(to_recipients)
+                    if to_recipients is not None
+                    else ([recipient] if recipient else [])
+                ),
+                "cc": _normalize_followup_recipients(cc_recipients),
                 "subject": subject,
                 "body": html_body,
                 "bodyPreview": safe_preview(body, 300),
@@ -583,6 +1069,645 @@ def _read_followup_send_precondition(
     return latest_thread_data, block_reason
 
 
+def _persist_followup_send_intent(
+    user_id: str,
+    thread_id: str,
+    *,
+    claim_owner: str,
+    followup_index: int,
+    expected_thread_data: Dict[str, Any],
+    expected_followup_config: Dict[str, Any],
+    recipient: str,
+    body: str,
+    subject: str,
+    conversation_id: Optional[str],
+    draft_id: str,
+    to_recipients: Optional[List[str]] = None,
+    cc_recipients: Optional[List[str]] = None,
+):
+    """Fence an irreversible Graph send with an exact transactional intent."""
+    from google.cloud.firestore import transactional
+
+    expected_identity = _followup_send_identity(
+        expected_thread_data,
+        expected_followup_config,
+        followup_index,
+    )
+    expected_retry = _followup_retry_signature(
+        expected_thread_data,
+        expected_followup_config,
+    )
+    normalized_to_recipients = _normalize_followup_recipients(
+        to_recipients if to_recipients is not None else [recipient]
+    )
+    normalized_cc_recipients = _normalize_followup_recipients(
+        cc_recipients
+        if cc_recipients is not None
+        else expected_identity.get("ccRecipients")
+    )
+    expected_body = (
+        _followup_raw_message(expected_followup_config, followup_index)
+        or _get_default_followup_message(followup_index)
+    )
+    thread_ref = (
+        _fs.collection("users")
+        .document(user_id)
+        .collection("threads")
+        .document(thread_id)
+    )
+
+    @transactional
+    def persist_transaction(transaction, thread_ref):
+        snapshot = thread_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return None, "the thread no longer exists"
+
+        data = snapshot.to_dict() or {}
+        current_config = data.get("followUpConfig")
+        if not isinstance(current_config, dict):
+            return None, "the current follow-up config is missing"
+
+        block_reason = _followup_terminal_block_reason(
+            data,
+            current_config,
+            followup_index,
+        )
+        followup_status = str(data.get("followUpStatus") or "").strip().lower()
+        if block_reason or followup_status != "waiting":
+            return None, block_reason or f"follow-up tracking is {followup_status or 'unset'}"
+
+        current_owner = current_config.get("processingBy")
+        if not claim_owner or current_owner != claim_owner:
+            return None, (
+                f"follow-up claim ownership changed from {claim_owner} "
+                f"to {current_owner}"
+            )
+
+        current_index = current_config.get("currentFollowUpIndex", 0)
+        if current_index != followup_index:
+            return None, (
+                f"the follow-up index changed from {followup_index} to {current_index}"
+            )
+
+        current_identity = _followup_send_identity(
+            data,
+            current_config,
+            followup_index,
+        )
+        if current_identity != expected_identity:
+            return None, "recipient, message, client, or follow-up config changed"
+        if _followup_retry_signature(data, current_config) != expected_retry:
+            return None, "follow-up retry metadata changed"
+        if current_identity.get("recipient") != str(recipient or "").strip().lower():
+            return None, "the normalized primary recipient changed"
+        if str(body or "") != expected_body:
+            return None, "the final follow-up body differs from the claimed message"
+        if current_identity.get("recipient") not in normalized_to_recipients:
+            return None, "the primary recipient is missing from the final Graph payload"
+
+        existing_attempt = data.get("followUpSendAttempt")
+        if isinstance(existing_attempt, dict):
+            existing_state = str(existing_attempt.get("state") or "").strip().lower()
+            if (
+                existing_state in {"sending", "uncertain", "needs_review"}
+                or (
+                    existing_attempt.get("index") == followup_index
+                    and existing_state == "committed"
+                )
+            ):
+                return None, (
+                    f"follow-up attempt {existing_attempt.get('id')} is already "
+                    f"{existing_state}"
+                )
+
+        now = datetime.now(timezone.utc)
+        send_started_at = now - timedelta(seconds=5)
+        lease_until = now + timedelta(seconds=FOLLOWUP_SEND_LEASE_SECONDS)
+        attempt_id = f"followup-attempt-{uuid4().hex}"
+        marker_identity = {
+            **expected_identity,
+            "body": body,
+            "subject": subject,
+            "conversationId": conversation_id,
+            "draftId": draft_id,
+            "toRecipients": normalized_to_recipients,
+            "ccRecipients": normalized_cc_recipients,
+        }
+        input_hash = hashlib.sha256(
+            json.dumps(
+                _canonical_followup_value(marker_identity),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        marker = {
+            "id": attempt_id,
+            "state": "sending",
+            "owner": claim_owner,
+            "index": followup_index,
+            "createdAt": now,
+            "sendStartedAt": send_started_at,
+            "leaseUntil": lease_until,
+            "inputHash": input_hash,
+            "sendIdentity": expected_identity,
+            "configFingerprint": expected_identity.get("configFingerprint"),
+            "clientId": expected_identity.get("clientId"),
+            "recipient": recipient,
+            "body": body,
+            "subject": subject,
+            "conversationId": conversation_id,
+            "draftId": draft_id,
+            "toRecipients": normalized_to_recipients,
+            "ccRecipients": normalized_cc_recipients,
+        }
+        transaction.update(thread_ref, {
+            "followUpSendAttempt": marker,
+            "followUpConfig.processingAt": now,
+            "followUpConfig.processingLeaseUntil": lease_until,
+            "followUpConfig.lastSendError": "Graph send outcome pending reconciliation",
+            "followUpConfig.lastSendAttemptAt": send_started_at,
+            "followUpConfig.lastSendAttemptIndex": followup_index,
+            "updatedAt": SERVER_TIMESTAMP,
+        })
+        return marker, None
+
+    return persist_transaction(_fs.transaction(), thread_ref)
+
+
+def _record_reconciled_followup_attempt(
+    user_id: str,
+    thread_id: str,
+    *,
+    claim_owner: Optional[str],
+    followup_index: int,
+    expected_attempt: Dict[str, Any],
+    expected_identity: Dict[str, Any],
+    expected_retry: Dict[str, Any],
+    sent_match: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """CAS a Sent Items match before writing any reconciliation audit state."""
+    from google.cloud.firestore import transactional
+
+    thread_ref = (
+        _fs.collection("users")
+        .document(user_id)
+        .collection("threads")
+        .document(thread_id)
+    )
+
+    @transactional
+    def record_transaction(transaction, thread_ref):
+        snapshot = thread_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return None, "the thread no longer exists"
+
+        data = snapshot.to_dict() or {}
+        current_config = data.get("followUpConfig")
+        if not isinstance(current_config, dict):
+            return None, "the current follow-up config is missing"
+
+        current_owner = current_config.get("processingBy")
+        if not claim_owner or current_owner != claim_owner:
+            return None, (
+                f"claim ownership changed from {claim_owner} to {current_owner}"
+            )
+
+        current_index = current_config.get("currentFollowUpIndex", 0)
+        if current_index != followup_index:
+            return None, (
+                f"the follow-up index changed from {followup_index} to {current_index}"
+            )
+
+        current_attempt = data.get("followUpSendAttempt")
+        if not isinstance(current_attempt, dict):
+            return None, "the durable send attempt is missing"
+        if _canonical_followup_value(current_attempt) != expected_attempt:
+            return None, "the durable send attempt changed"
+        current_state = str(current_attempt.get("state") or "").strip().lower()
+        if current_state not in {"sending", "uncertain"}:
+            return None, f"the durable send attempt is already {current_state or 'unset'}"
+
+        current_identity = _followup_send_identity(
+            data,
+            current_config,
+            followup_index,
+        )
+        preservation_outcome = _followup_preservation_outcome(data)
+        allow_terminal_config_change = preservation_outcome is not None
+        if not _followup_send_identity_matches(
+            current_identity,
+            expected_identity,
+            allow_config_fingerprint_change=allow_terminal_config_change,
+        ):
+            return None, "recipient, message, client, or follow-up config changed"
+        marker_identity = current_attempt.get("sendIdentity")
+        if (
+            isinstance(marker_identity, dict)
+            and not _followup_send_identity_matches(
+                marker_identity,
+                current_identity,
+                allow_config_fingerprint_change=allow_terminal_config_change,
+            )
+        ):
+            return None, "current inputs differ from the accepted send attempt"
+        if _followup_retry_signature(data, current_config) != expected_retry:
+            return None, "follow-up retry metadata changed"
+
+        reconciled_at = datetime.now(timezone.utc)
+        reconciled_attempt = dict(current_attempt)
+        reconciled_attempt.update({
+            "reconciliationOwner": claim_owner,
+            "reconciledAt": reconciled_at,
+            "sentMatchId": sent_match.get("id"),
+            "sentMatchDateTime": sent_match.get("sentDateTime"),
+        })
+        transaction.update(thread_ref, {
+            "followUpSendAttempt": reconciled_attempt,
+            "lastOutboundAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+            "followUpConfig.lastFollowUpSentAt": SERVER_TIMESTAMP,
+            "followUpConfig.lastSendError": None,
+            "followUpConfig.lastSendAttemptAt": sent_match.get("sentDateTime"),
+        })
+        return reconciled_attempt, None
+
+    return record_transaction(_fs.transaction(), thread_ref)
+
+
+def _legacy_followup_attempt_components(
+    user_id: str,
+    thread_id: str,
+    *,
+    followup_index: int,
+    expected_thread_data: Dict[str, Any],
+    expected_followup_config: Dict[str, Any],
+    recipient: str,
+    body: str,
+    subject: str,
+    conversation_id: Optional[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any], str, str]:
+    """Build the deterministic identity for a pre-marker ambiguous send."""
+    expected_identity = _followup_send_identity(
+        expected_thread_data,
+        expected_followup_config,
+        followup_index,
+    )
+    expected_retry = _followup_retry_signature(
+        expected_thread_data,
+        expected_followup_config,
+    )
+    legacy_payload = _canonical_followup_value({
+        "userId": user_id,
+        "threadId": thread_id,
+        "index": followup_index,
+        "sendIdentity": expected_identity,
+        "retry": expected_retry,
+        "recipient": recipient,
+        "body": body,
+        "subject": subject,
+        "conversationId": conversation_id,
+    })
+    legacy_digest = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    attempt_id = f"followup-legacy-{legacy_digest[:32]}"
+    return expected_identity, expected_retry, legacy_digest, attempt_id
+
+
+def _legacy_followup_review_attempt(
+    user_id: str,
+    thread_id: str,
+    *,
+    claim_owner: Optional[str],
+    followup_index: int,
+    expected_thread_data: Dict[str, Any],
+    expected_followup_config: Dict[str, Any],
+    recipient: str,
+    body: str,
+    subject: str,
+    conversation_id: Optional[str],
+    sent_match: Dict[str, Any],
+    error: str,
+) -> Dict[str, Any]:
+    """Build a deterministic marker for a legacy ambiguity requiring review."""
+    expected_identity, _expected_retry, legacy_digest, attempt_id = (
+        _legacy_followup_attempt_components(
+            user_id,
+            thread_id,
+            followup_index=followup_index,
+            expected_thread_data=expected_thread_data,
+            expected_followup_config=expected_followup_config,
+            recipient=recipient,
+            body=body,
+            subject=subject,
+            conversation_id=conversation_id,
+        )
+    )
+    now = datetime.now(timezone.utc)
+    return {
+        "id": attempt_id,
+        "state": "needs_review",
+        "resolution": "ambiguous",
+        "error": error,
+        "owner": claim_owner,
+        "index": followup_index,
+        "createdAt": now,
+        "finalizedAt": now,
+        "sendStartedAt": (
+            expected_followup_config.get("lastSendAttemptAt")
+            or now - timedelta(seconds=5)
+        ),
+        "inputHash": legacy_digest,
+        "sendIdentity": expected_identity,
+        "configFingerprint": expected_identity.get("configFingerprint"),
+        "clientId": expected_identity.get("clientId"),
+        "recipient": recipient,
+        "body": body,
+        "subject": subject,
+        "conversationId": conversation_id,
+        "toRecipients": _normalize_followup_recipients([recipient]),
+        "ccRecipients": _normalize_followup_recipients(
+            expected_identity.get("ccRecipients")
+        ),
+        "legacyRecovered": True,
+        "sentMatchId": sent_match.get("id"),
+        "sentMatchDateTime": sent_match.get("sentDateTime"),
+    }
+
+
+def _migrate_legacy_sent_match(
+    user_id: str,
+    thread_id: str,
+    *,
+    claim_owner: Optional[str],
+    followup_index: int,
+    expected_thread_data: Dict[str, Any],
+    expected_followup_config: Dict[str, Any],
+    recipient: str,
+    body: str,
+    subject: str,
+    conversation_id: Optional[str],
+    sent_match: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], str]:
+    """Migrate a pre-marker Sent Items match into the durable protocol."""
+    from google.cloud.firestore import transactional
+
+    expected_identity, expected_retry, legacy_digest, attempt_id = (
+        _legacy_followup_attempt_components(
+            user_id,
+            thread_id,
+            followup_index=followup_index,
+            expected_thread_data=expected_thread_data,
+            expected_followup_config=expected_followup_config,
+            recipient=recipient,
+            body=body,
+            subject=subject,
+            conversation_id=conversation_id,
+        )
+    )
+    thread_ref = (
+        _fs.collection("users")
+        .document(user_id)
+        .collection("threads")
+        .document(thread_id)
+    )
+
+    @transactional
+    def migrate_transaction(transaction, thread_ref):
+        snapshot = thread_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return None, "the thread no longer exists"
+
+        data = snapshot.to_dict() or {}
+        current_config = data.get("followUpConfig")
+        if not isinstance(current_config, dict):
+            return None, "the current follow-up config is missing"
+
+        current_owner = current_config.get("processingBy")
+        if not claim_owner or current_owner != claim_owner:
+            return None, (
+                f"claim ownership changed from {claim_owner} to {current_owner}"
+            )
+        current_index = current_config.get("currentFollowUpIndex", 0)
+        if current_index != followup_index:
+            return None, (
+                f"the follow-up index changed from {followup_index} to {current_index}"
+            )
+        if _followup_send_identity(
+            data,
+            current_config,
+            followup_index,
+        ) != expected_identity:
+            return None, "recipient, message, client, or follow-up config changed"
+        if _followup_retry_signature(data, current_config) != expected_retry:
+            return None, "follow-up retry metadata changed"
+
+        now = datetime.now(timezone.utc)
+        lease_until = now + timedelta(seconds=FOLLOWUP_SEND_LEASE_SECONDS)
+        send_started_at = (
+            expected_followup_config.get("lastSendAttemptAt")
+            or now - timedelta(seconds=5)
+        )
+        marker = {
+            "id": attempt_id,
+            "state": "uncertain",
+            "owner": claim_owner,
+            "reconciliationOwner": claim_owner,
+            "index": followup_index,
+            "createdAt": now,
+            "sendStartedAt": send_started_at,
+            "leaseUntil": lease_until,
+            "inputHash": legacy_digest,
+            "sendIdentity": expected_identity,
+            "configFingerprint": expected_identity.get("configFingerprint"),
+            "clientId": expected_identity.get("clientId"),
+            "recipient": recipient,
+            "body": body,
+            "subject": subject,
+            "conversationId": conversation_id,
+            "toRecipients": _normalize_followup_recipients([recipient]),
+            "ccRecipients": _normalize_followup_recipients(
+                expected_identity.get("ccRecipients")
+            ),
+            "legacyRecovered": True,
+            "reconciledAt": now,
+            "sentMatchId": sent_match.get("id"),
+            "sentMatchDateTime": sent_match.get("sentDateTime"),
+        }
+        transaction.update(thread_ref, {
+            "followUpSendAttempt": marker,
+            "lastOutboundAt": SERVER_TIMESTAMP,
+            "updatedAt": SERVER_TIMESTAMP,
+            "followUpConfig.processingAt": now,
+            "followUpConfig.processingLeaseUntil": lease_until,
+            "followUpConfig.lastFollowUpSentAt": SERVER_TIMESTAMP,
+            "followUpConfig.lastSendError": None,
+            "followUpConfig.lastSendAttemptAt": sent_match.get("sentDateTime"),
+            "followUpConfig.lastSendAttemptIndex": followup_index,
+        })
+        return marker, None
+
+    marker, error = migrate_transaction(_fs.transaction(), thread_ref)
+    return marker, error, attempt_id
+
+
+def _reconcile_durable_followup_attempt(
+    user_id: str,
+    thread_id: str,
+    headers: Dict[str, str],
+    thread_data: Dict[str, Any],
+    followup_index: int,
+    claim_owner: Optional[str],
+) -> Optional[bool]:
+    """Resolve an uncertain durable attempt without ever blindly resending it."""
+    marker = (thread_data or {}).get("followUpSendAttempt")
+    if not isinstance(marker, dict) or marker.get("index") != followup_index:
+        return None
+    marker_state = str(marker.get("state") or "").strip().lower()
+    if marker_state not in {"sending", "uncertain"}:
+        return None
+
+    expected_attempt = _canonical_followup_value(marker)
+    expected_config = (thread_data or {}).get("followUpConfig") or {}
+    expected_identity = _followup_send_identity(
+        thread_data,
+        expected_config,
+        followup_index,
+    )
+    expected_retry = _followup_retry_signature(thread_data, expected_config)
+
+    recipient = str(marker.get("recipient") or "").strip()
+    body = str(marker.get("body") or "")
+    subject = str(marker.get("subject") or "Follow-up")
+    conversation_id = marker.get("conversationId")
+    sent_after = sent_after_from_retry_data({
+        "lastSendAttemptAt": marker.get("sendStartedAt") or marker.get("createdAt"),
+    })
+
+    try:
+        sent_match = find_matching_sent_message_for_retry(
+            headers,
+            recipient=recipient,
+            body=body,
+            subject=subject,
+            conversation_id=conversation_id,
+            sent_after=sent_after,
+        )
+    except SentMailGuardLookupError as exc:
+        failure_reason = f"Sent Items durable-attempt guard failed: {exc}"
+        _set_followup_send_outcome(
+            error=failure_reason,
+            attempt_at=marker.get("sendStartedAt"),
+            attempt_id=marker.get("id"),
+            attempt_marker=marker,
+            guard_failed_closed=True,
+        )
+        print(f"   ⚠️ {failure_reason}")
+        return False
+
+    if sent_match:
+        print("   ⚠️ Durable follow-up attempt found in Sent Items; not resending")
+        try:
+            reconciled_attempt, reconcile_error = _record_reconciled_followup_attempt(
+                user_id,
+                thread_id,
+                claim_owner=claim_owner,
+                followup_index=followup_index,
+                expected_attempt=expected_attempt,
+                expected_identity=expected_identity,
+                expected_retry=expected_retry,
+                sent_match=sent_match,
+            )
+        except Exception as exc:
+            reconciled_attempt = None
+            reconcile_error = f"could not persist reconciliation audit: {exc}"
+
+        if not reconciled_attempt:
+            failure_reason = (
+                f"Durable follow-up reconciliation state changed: {reconcile_error}; "
+                "manual review required"
+            )
+            _set_followup_send_outcome(
+                error=failure_reason,
+                attempt_at=marker.get("sendStartedAt"),
+                attempt_id=marker.get("id"),
+                attempt_marker=marker,
+                guard_failed_closed=True,
+            )
+            print(f"   🛑 {failure_reason}")
+            return False
+
+        _set_followup_send_outcome(
+            attempt_at=marker.get("sendStartedAt"),
+            attempt_id=marker.get("id"),
+            attempt_marker=reconciled_attempt,
+        )
+        history_saved = _save_followup_message(
+            user_id,
+            thread_id,
+            recipient,
+            subject,
+            body,
+            to_recipients=(
+                marker.get("toRecipients")
+                or ([recipient] if recipient else [])
+            ),
+            cc_recipients=marker.get("ccRecipients") or [],
+            attempt_id=marker.get("id"),
+        )
+        if not history_saved:
+            failure_reason = (
+                "Durable follow-up matched Sent Items but history persistence "
+                "failed; reconciliation will retry"
+            )
+            _set_followup_send_outcome(error=failure_reason)
+            print(f"   ⚠️ {failure_reason}")
+            return False
+        return True
+
+    try:
+        manual_continuation = find_sent_conversation_continuation_for_retry(
+            headers,
+            conversation_id=conversation_id,
+            sent_after=sent_after,
+        )
+    except SentMailGuardLookupError as exc:
+        failure_reason = f"Sent Items durable continuation guard failed: {exc}"
+        _set_followup_send_outcome(
+            error=failure_reason,
+            attempt_at=marker.get("sendStartedAt"),
+            attempt_id=marker.get("id"),
+            attempt_marker=marker,
+            guard_failed_closed=True,
+        )
+        print(f"   ⚠️ {failure_reason}")
+        return False
+
+    if manual_continuation:
+        failure_reason = (
+            "Durable follow-up attempt overlaps a manual conversation continuation; "
+            "manual review required"
+        )
+    else:
+        failure_reason = (
+            "Durable follow-up send outcome could not be conclusively matched in "
+            "Sent Items; manual review required and automatic resend suppressed"
+        )
+    _set_followup_send_outcome(
+        error=failure_reason,
+        attempt_at=marker.get("sendStartedAt"),
+        attempt_id=marker.get("id"),
+        attempt_marker=marker,
+        guard_failed_closed=True,
+    )
+    print(f"   🛑 {failure_reason}")
+    return False
+
+
 def _followup_operation_state(
     status: str,
     thread_id: Optional[str] = None,
@@ -621,8 +1746,9 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
     # Query threads with active follow-up tracking
     threads_ref = _fs.collection("users").document(user_id).collection("threads")
 
-    # Find threads that are waiting for follow-up
-    # Status must be 'waiting' and nextFollowUpAt must be in the past
+    # Ordinary sends come from waiting threads. Recovery is queried
+    # independently so an inbound reply/manual pause/terminal transition that
+    # lands after Graph acceptance cannot strand an unresolved durable marker.
     try:
         query = threads_ref.where("followUpStatus", "==", "waiting")
         waiting_threads = list(query.stream())
@@ -630,110 +1756,94 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
         print(f"   Error querying follow-up threads: {e}")
         return operation_states
 
+    recovery_threads = []
+    try:
+        for attempt_state in ("sending", "uncertain"):
+            recovery_query = threads_ref.where(
+                "followUpSendAttempt.state",
+                "==",
+                attempt_state,
+            )
+            recovery_threads.extend(recovery_query.stream())
+    except Exception as e:
+        print(f"   ⚠️ Error querying unresolved follow-up attempts: {e}")
+
+    threads_by_id = {}
+    for thread_doc in [*waiting_threads, *recovery_threads]:
+        threads_by_id[thread_doc.id] = thread_doc
+    waiting_threads = list(threads_by_id.values())
+
     if not waiting_threads:
-        print("   No threads waiting for follow-up")
+        print("   No threads waiting for follow-up or recovery")
         return operation_states
 
-    print(f"   Found {len(waiting_threads)} threads with follow-up tracking")
+    print(f"   Found {len(waiting_threads)} threads with follow-up tracking or recovery")
     total_threads = len(waiting_threads)
 
     for idx, thread_doc in enumerate(waiting_threads):
         thread_data = thread_doc.to_dict()
         thread_id = thread_doc.id
 
-        campaign_decision = get_client_automation_decision(
-            user_id,
-            thread_data.get("clientId"),
-        )
-        suppression_kind = classify_campaign_suppression(campaign_decision)
-        if suppression_kind == "terminal":
-            print(
-                f"   ⏹️ Thread {thread_id[:20]}... belongs to stopped client; "
-                "stopping follow-up tracking"
-            )
-            try:
-                thread_doc.reference.update(stopped_followup_patch(campaign_decision.reason))
-            except Exception as e:
-                print(f"   ⚠️ Failed to stop follow-up for stopped client: {e}")
-            continue
-        if suppression_kind:
-            print(
-                f"   ⏸️ Thread {thread_id[:20]}... automation is suppressed; "
-                "preserving follow-up schedule for retry"
-            )
-            try:
-                thread_doc.reference.update({
-                    "followUpConfig.processingBy": None,
-                    "followUpConfig.processingAt": None,
-                    "followUpConfig.automationSuppressedState": campaign_decision.state,
-                    "followUpConfig.automationSuppressedReason": campaign_decision.reason,
-                    "followUpConfig.automationSuppressedAt": SERVER_TIMESTAMP,
-                    "updatedAt": SERVER_TIMESTAMP,
-                })
-            except Exception as e:
-                print(f"   ⚠️ Failed to preserve suppressed follow-up: {e}")
-            continue
-
         followup_config = thread_data.get("followUpConfig", {})
+        send_attempt = thread_data.get("followUpSendAttempt")
+        recovery_hint = (
+            isinstance(send_attempt, dict)
+            and str(send_attempt.get("state") or "").strip().lower()
+            in {"sending", "uncertain"}
+        )
 
-        if not followup_config.get("enabled", False):
+        if not recovery_hint and not followup_config.get("enabled", False):
             continue
 
         next_followup_at = followup_config.get("nextFollowUpAt")
-        if not next_followup_at:
+        if not recovery_hint and not next_followup_at:
             continue
 
-        # Convert Firestore timestamp to datetime
-        if hasattr(next_followup_at, 'timestamp'):
+        # Convert Firestore timestamp to datetime for ordinary sends. Durable
+        # recovery is lease-driven inside the authoritative claim transaction.
+        if not recovery_hint and hasattr(next_followup_at, 'timestamp'):
             next_followup_dt = datetime.fromtimestamp(
                 next_followup_at.timestamp(),
                 tz=timezone.utc
             )
-        else:
+        elif not recovery_hint:
             continue
 
         # Check if it's time for follow-up
-        if now < next_followup_dt:
+        if not recovery_hint and now < next_followup_dt:
             time_remaining = next_followup_dt - now
             print(f"   Thread {thread_id[:20]}... - {time_remaining} until follow-up")
             continue
 
-        safe_send_time = _next_business_followup_time(now, followup_config)
-        if safe_send_time > now:
-            print(
-                f"   🗓️ Weekend follow-up window for {thread_id[:20]}...; "
-                f"deferring until {safe_send_time.strftime('%Y-%m-%d %H:%M')} UTC"
-            )
-            try:
-                thread_doc.reference.update({
-                    "followUpConfig.nextFollowUpAt": safe_send_time,
-                    "followUpConfig.lastWeekendDeferralAt": SERVER_TIMESTAMP,
-                    "updatedAt": SERVER_TIMESTAMP,
-                })
-            except Exception as e:
-                print(f"   ⚠️ Could not defer weekend follow-up for {thread_id[:20]}...: {e}")
-            continue
+        if not recovery_hint:
+            safe_send_time = _next_business_followup_time(now, followup_config)
+            if safe_send_time > now:
+                print(
+                    f"   🗓️ Weekend follow-up window for {thread_id[:20]}...; "
+                    f"waiting until {safe_send_time.strftime('%Y-%m-%d %H:%M')} UTC"
+                )
+                continue
 
-        # Check if broker has responded
-        if thread_data.get("hasInboundReply", False):
-            # Broker responded - pause the follow-up sequence
-            _pause_followup(user_id, thread_id)
-            continue
-
-        # Get current follow-up index and messages
+        # Query values are hints only. The transaction below is authoritative
+        # for reply/terminal state, index, config, and retry metadata.
         current_index = followup_config.get("currentFollowUpIndex", 0)
-        followups = followup_config.get("followUps", [])
-
-        if current_index >= len(followups):
-            # All follow-ups exhausted
-            _mark_followup_complete(user_id, thread_id, "max_reached")
-            continue
 
         # Claim the follow-up to prevent duplicate sends
         claim_result = _claim_followup(user_id, thread_id, current_index)
         if not claim_result:
             continue
-        claim_owner = claim_result if isinstance(claim_result, str) else None
+        if isinstance(claim_result, FollowupClaim) or all(
+            hasattr(claim_result, attribute)
+            for attribute in ("owner", "index", "thread_data", "followup_config")
+        ):
+            claim_owner = claim_result.owner
+            current_index = claim_result.index
+            thread_data = claim_result.thread_data
+            followup_config = claim_result.followup_config
+        else:
+            # Compatibility for older injected test doubles. Production claims
+            # always return FollowupClaim and therefore authoritative data.
+            claim_owner = claim_result if isinstance(claim_result, str) else None
 
         # Send the follow-up
         _reset_followup_send_outcome()
@@ -749,21 +1859,23 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
 
         if success:
             followups_sent += 1
+            send_outcome = _get_followup_send_outcome()
             try:
                 # Schedule next follow-up if there are more. This must surface
                 # transaction failures: the Graph send has already happened,
                 # so leaving the claim/index untouched could resend it later.
-                _schedule_next_followup(
+                schedule_outcome = _schedule_next_followup(
                     user_id=user_id,
                     thread_id=thread_id,
                     followup_config=followup_config,
                     just_sent_index=current_index,
                     claim_owner=claim_owner,
+                    send_attempt_id=send_outcome.attempt_id,
+                    send_attempt_marker=send_outcome.attempt_marker,
                 )
             except Exception as exc:
                 failure_reason = f"Follow-up post-send scheduling failed: {exc}"
                 print(f"   ⚠️ {failure_reason}")
-                send_outcome = _get_followup_send_outcome()
                 persisted = _release_followup_claim(
                     user_id,
                     thread_id,
@@ -771,6 +1883,9 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
                     attempted_at=send_outcome.attempt_at,
                     current_index=current_index,
                     claim_owner=claim_owner,
+                    send_attempt_id=send_outcome.attempt_id,
+                    send_attempt_marker=send_outcome.attempt_marker,
+                    expected_no_send_attempt=send_outcome.attempt_expected_absent,
                     fail_closed=True,
                 )
                 if not persisted:
@@ -783,9 +1898,45 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
                     )
                 )
             else:
-                operation_states.append(
-                    _followup_operation_state("healthy", thread_id=thread_id)
-                )
+                safe_outcomes = {
+                    FollowupScheduleOutcome.SCHEDULED,
+                    FollowupScheduleOutcome.MAX_REACHED,
+                    FollowupScheduleOutcome.INBOUND_PRESERVED,
+                    FollowupScheduleOutcome.TERMINAL_PRESERVED,
+                    FollowupScheduleOutcome.PAUSED_PRESERVED,
+                    FollowupScheduleOutcome.ALREADY_COMMITTED,
+                }
+                if schedule_outcome not in safe_outcomes:
+                    failure_reason = (
+                        "Follow-up post-send scheduling is ambiguous: "
+                        f"{getattr(schedule_outcome, 'value', schedule_outcome)!r}"
+                    )
+                    print(f"   ⚠️ {failure_reason}")
+                    persisted = _release_followup_claim(
+                        user_id,
+                        thread_id,
+                        reason=failure_reason,
+                        attempted_at=send_outcome.attempt_at,
+                        current_index=current_index,
+                        claim_owner=claim_owner,
+                        send_attempt_id=send_outcome.attempt_id,
+                        send_attempt_marker=send_outcome.attempt_marker,
+                        expected_no_send_attempt=send_outcome.attempt_expected_absent,
+                        fail_closed=True,
+                    )
+                    if not persisted:
+                        failure_reason += "; reconciliation fence could not be updated"
+                    operation_states.append(
+                        _followup_operation_state(
+                            "error",
+                            thread_id=thread_id,
+                            error=failure_reason,
+                        )
+                    )
+                else:
+                    operation_states.append(
+                        _followup_operation_state("healthy", thread_id=thread_id)
+                    )
 
             # Stagger follow-up sends by 2 minutes to avoid spam detection
             # Only sleep if there are more threads to process
@@ -797,17 +1948,32 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
             send_outcome = _get_followup_send_outcome()
             campaign_suppression_kind = send_outcome.campaign_suppression_kind
             if campaign_suppression_kind == "terminal":
-                try:
-                    stop_reason = (
-                        send_outcome.campaign_decision.reason
-                        if send_outcome.campaign_decision
-                        else send_outcome.error
+                stop_reason = (
+                    send_outcome.campaign_decision.reason
+                    if send_outcome.campaign_decision
+                    else send_outcome.error
+                )
+                terminalized, terminalize_error = _terminalize_owned_followup(
+                    user_id,
+                    thread_id,
+                    reason=stop_reason,
+                    current_index=current_index,
+                    claim_owner=claim_owner,
+                    expected_client_id=thread_data.get("clientId"),
+                )
+                if not terminalized:
+                    failure_reason = (
+                        "Stopped-campaign follow-up transition was not applied: "
+                        f"{terminalize_error}"
                     )
-                    thread_doc.reference.update(
-                        stopped_followup_patch(stop_reason)
+                    print(f"   ⚠️ {failure_reason}")
+                    operation_states.append(
+                        _followup_operation_state(
+                            "error",
+                            thread_id=thread_id,
+                            error=failure_reason,
+                        )
                     )
-                except Exception as e:
-                    print(f"   ⚠️ Failed to terminalize stopped follow-up: {e}")
                 continue
             if campaign_suppression_kind in {"maintenance", "unknown"}:
                 _release_followup_claim(
@@ -816,6 +1982,9 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
                     reason=send_outcome.error,
                     current_index=current_index,
                     claim_owner=claim_owner,
+                    send_attempt_id=send_outcome.attempt_id,
+                    send_attempt_marker=send_outcome.attempt_marker,
+                    expected_no_send_attempt=send_outcome.attempt_expected_absent,
                     fail_closed=False,
                 )
                 continue
@@ -828,6 +1997,9 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
                 attempted_at=send_outcome.attempt_at,
                 current_index=current_index,
                 claim_owner=claim_owner,
+                send_attempt_id=send_outcome.attempt_id,
+                send_attempt_marker=send_outcome.attempt_marker,
+                expected_no_send_attempt=send_outcome.attempt_expected_absent,
                 fail_closed=send_outcome.guard_failed_closed,
             )
             # Swallowed per-item Graph send failure -> surface to the health rail.
@@ -856,6 +2028,17 @@ def _send_followup_email(
     import requests
 
     _reset_followup_send_outcome()
+    reconciliation_result = _reconcile_durable_followup_attempt(
+        user_id,
+        thread_id,
+        headers,
+        thread_data,
+        followup_index,
+        claim_owner,
+    )
+    if reconciliation_result is not None:
+        return reconciliation_result
+
     outbound_mode = resolve_outbound_mode()
     if outbound_mode != OUTBOUND_MODE_LIVE:
         reason = (
@@ -1084,17 +2267,77 @@ def _send_followup_email(
 
             if sent_match:
                 print(f"   ⚠️ Prior follow-up send found in Sent Items; recording without resending")
-                _save_followup_message(
-                    user_id, thread_id, recipient, subject,
-                    followup_message, user_signature, signature_mode, user_email
+                try:
+                    legacy_attempt, migrate_error, legacy_attempt_id = (
+                        _migrate_legacy_sent_match(
+                            user_id,
+                            thread_id,
+                            claim_owner=claim_owner,
+                            followup_index=followup_index,
+                            expected_thread_data=thread_data,
+                            expected_followup_config=followup_config,
+                            recipient=recipient,
+                            body=followup_message,
+                            subject=subject,
+                            conversation_id=conversation_id,
+                            sent_match=sent_match,
+                        )
+                    )
+                except Exception as exc:
+                    legacy_attempt = None
+                    migrate_error = f"could not persist legacy reconciliation: {exc}"
+                    legacy_attempt_id = "followup-legacy-unpersisted"
+
+                if not legacy_attempt:
+                    failure_reason = (
+                        "legacy reconciliation state changed: "
+                        f"{migrate_error}; manual review required"
+                    )
+                    legacy_review_attempt = _legacy_followup_review_attempt(
+                        user_id,
+                        thread_id,
+                        claim_owner=claim_owner,
+                        followup_index=followup_index,
+                        expected_thread_data=thread_data,
+                        expected_followup_config=followup_config,
+                        recipient=recipient,
+                        body=followup_message,
+                        subject=subject,
+                        conversation_id=conversation_id,
+                        sent_match=sent_match,
+                        error=failure_reason,
+                    )
+                    _set_followup_send_outcome(
+                        error=failure_reason,
+                        attempt_at=legacy_review_attempt.get("sendStartedAt"),
+                        attempt_id=legacy_review_attempt.get("id"),
+                        attempt_marker=legacy_review_attempt,
+                        attempt_expected_absent=True,
+                        guard_failed_closed=True,
+                    )
+                    print(f"   🛑 {failure_reason}")
+                    return False
+
+                _set_followup_send_outcome(
+                    attempt_at=legacy_attempt.get("sendStartedAt"),
+                    attempt_id=legacy_attempt.get("id"),
+                    attempt_marker=legacy_attempt,
                 )
-                _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
-                    "lastOutboundAt": SERVER_TIMESTAMP,
-                    "updatedAt": SERVER_TIMESTAMP,
-                    "followUpConfig.lastFollowUpSentAt": SERVER_TIMESTAMP,
-                    "followUpConfig.lastSendError": None,
-                    "followUpConfig.lastSendAttemptAt": sent_match.get("sentDateTime"),
-                })
+                history_saved = _save_followup_message(
+                    user_id, thread_id, recipient, subject,
+                    followup_message, user_signature, signature_mode, user_email,
+                    to_recipients=legacy_attempt.get("toRecipients") or [recipient],
+                    cc_recipients=legacy_attempt.get("ccRecipients") or [],
+                    attempt_id=legacy_attempt.get("id"),
+                )
+                if not history_saved:
+                    failure_reason = (
+                        "Prior follow-up was found in Sent Items but history "
+                        "persistence failed; reconciliation will retry"
+                    )
+                    _set_followup_send_outcome(error=failure_reason)
+                    print(f"   ⚠️ {failure_reason}")
+                    return False
                 return True
             try:
                 manual_continuation = find_sent_conversation_continuation_for_retry(
@@ -1245,11 +2488,12 @@ def _send_followup_email(
             print(f"   ❌ {failure_reason}")
             return False
 
-        final_cc_recipients = [
-            ((cc_recipient.get("emailAddress") or {}).get("address") or "").strip()
-            for cc_recipient in recipient_payload["ccRecipients"]
-            if ((cc_recipient.get("emailAddress") or {}).get("address") or "").strip()
-        ]
+        final_to_recipients = _normalize_followup_recipients(
+            recipient_payload["toRecipients"]
+        )
+        final_cc_recipients = _normalize_followup_recipients(
+            recipient_payload["ccRecipients"]
+        )
 
         patch_resp = exponential_backoff_request(
             lambda: requests.patch(
@@ -1368,6 +2612,58 @@ def _send_followup_email(
             _delete_graph_reply_draft(headers, reply_draft_id, base=base)
             return False
 
+        if not claim_owner:
+            failure_reason = (
+                "Follow-up stopped at Graph send because the durable claim owner "
+                "is missing; manual review required before sending follow-up"
+            )
+            _set_followup_send_outcome(
+                error=failure_reason,
+                guard_failed_closed=True,
+            )
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            print(f"   🛑 {failure_reason}")
+            return False
+
+        try:
+            send_attempt, intent_error = _persist_followup_send_intent(
+                user_id,
+                thread_id,
+                claim_owner=claim_owner,
+                followup_index=followup_index,
+                expected_thread_data=thread_data,
+                expected_followup_config=followup_config,
+                recipient=recipient,
+                body=followup_message,
+                subject=subject,
+                conversation_id=conversation_id,
+                draft_id=reply_draft_id,
+                to_recipients=final_to_recipients,
+                cc_recipients=final_cc_recipients,
+            )
+        except Exception as exc:
+            send_attempt = None
+            intent_error = f"could not persist durable send intent: {exc}"
+
+        if not send_attempt:
+            failure_reason = (
+                f"Follow-up stopped at Graph send because {intent_error}; "
+                "manual review required before sending follow-up"
+            )
+            _set_followup_send_outcome(
+                error=failure_reason,
+                guard_failed_closed=True,
+            )
+            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            print(f"   🛑 {failure_reason}")
+            return False
+
+        _set_followup_send_outcome(
+            attempt_at=send_attempt.get("sendStartedAt"),
+            attempt_id=send_attempt.get("id"),
+            attempt_marker=send_attempt,
+        )
+
         reply_resp = exponential_backoff_request(
             lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
             max_retries=1,
@@ -1376,11 +2672,21 @@ def _send_followup_email(
 
         if reply_resp.status_code in [200, 201, 202]:
             print(f"   Sent follow-up #{followup_index + 1} for thread {thread_id[:20]}...")
-            _save_followup_message(
+            history_saved = _save_followup_message(
                 user_id, thread_id, recipient, subject,
                 followup_message, user_signature, signature_mode, user_email,
+                to_recipients=final_to_recipients,
                 cc_recipients=final_cc_recipients,
+                attempt_id=send_attempt.get("id"),
             )
+            if not history_saved:
+                failure_reason = (
+                    "Follow-up was accepted by Graph but history persistence "
+                    "failed; reconciliation will retry"
+                )
+                _set_followup_send_outcome(error=failure_reason)
+                print(f"   ⚠️ {failure_reason}")
+                return False
 
             # Update thread
             _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
@@ -1409,11 +2715,13 @@ def _schedule_next_followup(
     followup_config: Dict,
     just_sent_index: int,
     claim_owner: str,
-) -> bool:
+    send_attempt_id: Optional[str] = None,
+    send_attempt_marker: Optional[Dict[str, Any]] = None,
+) -> FollowupScheduleOutcome:
     """Advance the exact active claim without overwriting newer thread state.
 
-    ``followup_config`` is the pre-claim query snapshot; the transactional read
-    below is authoritative for every post-send decision.
+    ``followup_config`` is the authoritative snapshot returned by the claim;
+    the transactional read below fences every post-send decision against it.
     """
     from google.cloud.firestore import transactional
 
@@ -1428,12 +2736,41 @@ def _schedule_next_followup(
     def schedule_transaction(transaction, thread_ref):
         snapshot = thread_ref.get(transaction=transaction)
         if not snapshot.exists:
-            return "skipped", None
+            return FollowupScheduleOutcome.AMBIGUOUS, None
 
         data = snapshot.to_dict() or {}
         current_config = data.get("followUpConfig")
         if not isinstance(current_config, dict):
-            return "skipped", None
+            return FollowupScheduleOutcome.AMBIGUOUS, None
+
+        current_attempt = data.get("followUpSendAttempt")
+        if not isinstance(current_attempt, dict):
+            current_attempt = {}
+        current_attempt_id = current_attempt.get("id")
+
+        def committed_attempt_update():
+            if not send_attempt_id or current_attempt_id != send_attempt_id:
+                return {}
+            committed_attempt = dict(current_attempt)
+            committed_attempt.update({
+                "state": "committed",
+                "finalizedAt": datetime.now(timezone.utc),
+                "resolution": "sent",
+                "error": None,
+            })
+            return {"followUpSendAttempt": committed_attempt}
+
+        followup_status = str(data.get("followUpStatus") or "").strip().lower()
+        preservation_outcome = _followup_preservation_outcome(data)
+
+        current_index = current_config.get("currentFollowUpIndex", 0)
+        if (
+            current_index == just_sent_index + 1
+            and send_attempt_id
+            and current_attempt_id == send_attempt_id
+            and current_attempt.get("state") == "committed"
+        ):
+            return FollowupScheduleOutcome.ALREADY_COMMITTED, None
 
         current_owner = current_config.get("processingBy")
         if not claim_owner or current_owner != claim_owner:
@@ -1441,43 +2778,122 @@ def _schedule_next_followup(
                 f"   ⏭️ Follow-up claim ownership changed from {claim_owner} "
                 f"to {current_owner}; not advancing"
             )
-            return "skipped", None
+            return FollowupScheduleOutcome.AMBIGUOUS, None
 
-        current_index = current_config.get("currentFollowUpIndex", 0)
         if current_index != just_sent_index:
             print(
                 f"   ⏭️ Follow-up index changed from {just_sent_index} "
                 f"to {current_index}; not advancing"
             )
-            return "skipped", None
+            return FollowupScheduleOutcome.AMBIGUOUS, None
+
+        if send_attempt_id and current_attempt_id != send_attempt_id:
+            print(
+                f"   ⏭️ Durable send attempt changed from {send_attempt_id} "
+                f"to {current_attempt_id}; not advancing"
+            )
+            return FollowupScheduleOutcome.AMBIGUOUS, None
+        if send_attempt_id:
+            current_attempt_state = str(
+                current_attempt.get("state") or ""
+            ).strip().lower()
+            if current_attempt_state not in {"sending", "uncertain"}:
+                print(
+                    "   ⏭️ Durable send attempt is no longer active: "
+                    f"{current_attempt_state or 'unset'}"
+                )
+                return FollowupScheduleOutcome.AMBIGUOUS, None
+            attempt_owner_matches = (
+                current_attempt.get("owner") == claim_owner
+                or current_attempt.get("reconciliationOwner") == claim_owner
+            )
+            if not attempt_owner_matches:
+                print("   ⏭️ Durable send attempt ownership changed")
+                return FollowupScheduleOutcome.AMBIGUOUS, None
+            if (
+                send_attempt_marker is not None
+                and _canonical_followup_value(current_attempt)
+                != _canonical_followup_value(send_attempt_marker)
+            ):
+                print("   ⏭️ Durable send attempt changed after acceptance")
+                return FollowupScheduleOutcome.AMBIGUOUS, None
+
+            sent_identity = current_attempt.get("sendIdentity")
+            current_identity = _followup_send_identity(
+                data,
+                current_config,
+                just_sent_index,
+            )
+            allow_terminal_config_change = preservation_outcome is not None
+            if not _followup_send_identity_matches(
+                sent_identity,
+                current_identity,
+                allow_config_fingerprint_change=allow_terminal_config_change,
+            ):
+                print("   ⏭️ Accepted send inputs differ from current thread state")
+                return FollowupScheduleOutcome.AMBIGUOUS, None
+
+        config_changed = (
+            _followup_config_fingerprint(current_config)
+            != _followup_config_fingerprint(followup_config)
+        )
+        if config_changed and not (preservation_outcome and send_attempt_id):
+            print("   ⏭️ Follow-up config changed after send; not advancing")
+            return FollowupScheduleOutcome.AMBIGUOUS, None
+
+        # Once every accepted-send fence matches, preserve a reply or
+        # terminal/manual state that landed after Graph acceptance. Only the
+        # attempt/index bookkeeping is finalized; business state is never
+        # revived, paused, or terminalized again.
+        if preservation_outcome:
+            preservation_update = {
+                "followUpConfig.currentFollowUpIndex": just_sent_index + 1,
+                "followUpConfig.processingBy": None,
+                "followUpConfig.processingAt": None,
+                "followUpConfig.processingLeaseUntil": None,
+                "followUpConfig.lastSendError": None,
+                "followUpConfig.lastSendAttemptAt": None,
+                "followUpConfig.lastSendAttemptIndex": None,
+                "updatedAt": SERVER_TIMESTAMP,
+            }
+            attempt_update = committed_attempt_update()
+            if attempt_update:
+                preservation_update.update(attempt_update)
+            transaction.update(thread_ref, preservation_update)
+            return preservation_outcome, None
 
         block_reason = _followup_terminal_block_reason(
             data,
             current_config,
             just_sent_index,
         )
-        followup_status = str(data.get("followUpStatus") or "").strip().lower()
         if block_reason or followup_status != "waiting":
             reason = block_reason or f"follow-up tracking is {followup_status or 'unset'}"
-            print(f"   ⏭️ Preserving newer follow-up state: {reason}")
-            return "skipped", None
+            print(f"   ⏭️ Follow-up state is blocked but unclassified: {reason}")
+            return FollowupScheduleOutcome.AMBIGUOUS, None
 
         followups = current_config.get("followUps")
         if not isinstance(followups, list) or not followups:
             print("   ⏭️ Current follow-up sequence is missing; not advancing")
-            return "skipped", None
+            return FollowupScheduleOutcome.AMBIGUOUS, None
 
         next_index = just_sent_index + 1
         if next_index >= len(followups):
-            transaction.update(thread_ref, {
+            update_payload = {
                 "followUpStatus": "max_reached",
                 "followUpConfig.processingBy": None,
                 "followUpConfig.processingAt": None,
+                "followUpConfig.processingLeaseUntil": None,
+                "followUpConfig.lastSendError": None,
+                "followUpConfig.lastSendAttemptAt": None,
+                "followUpConfig.lastSendAttemptIndex": None,
                 "status": "stopped",
                 "statusReason": "max_followups_reached",
                 "updatedAt": SERVER_TIMESTAMP,
-            })
-            return "max_reached", None
+            }
+            update_payload.update(committed_attempt_update())
+            transaction.update(thread_ref, update_payload)
+            return FollowupScheduleOutcome.MAX_REACHED, None
 
         # Calculate from the transaction's current config, not the stale query
         # snapshot. Stored config remains untrusted, so wait bounds stay clamped.
@@ -1489,32 +2905,33 @@ def _schedule_next_followup(
             datetime.now(timezone.utc) + delta,
             current_config,
         )
-        transaction.update(thread_ref, {
+        update_payload = {
             "followUpConfig.currentFollowUpIndex": next_index,
             "followUpConfig.nextFollowUpAt": next_followup_at,
             "followUpConfig.processingBy": None,
             "followUpConfig.processingAt": None,
+            "followUpConfig.processingLeaseUntil": None,
             "followUpConfig.lastSendError": None,
             "followUpConfig.lastSendAttemptAt": None,
             "followUpConfig.lastSendAttemptIndex": None,
             "followUpStatus": "waiting",
             "updatedAt": SERVER_TIMESTAMP,
-        })
-        return "scheduled", next_followup_at
+        }
+        update_payload.update(committed_attempt_update())
+        transaction.update(thread_ref, update_payload)
+        return FollowupScheduleOutcome.SCHEDULED, next_followup_at
 
     outcome, next_followup_at = schedule_transaction(_fs.transaction(), thread_ref)
 
-    if outcome == "max_reached":
+    if outcome == FollowupScheduleOutcome.MAX_REACHED:
         _clear_followup_row_highlight(user_id, thread_id)
         print(f"   Follow-up sequence complete for thread {thread_id[:20]}... (max_reached)")
-        return True
-    if outcome == "scheduled":
+    elif outcome == FollowupScheduleOutcome.SCHEDULED:
         print(
             f"   Next follow-up scheduled for "
             f"{next_followup_at.strftime('%Y-%m-%d %H:%M')} UTC"
         )
-        return True
-    return False
+    return outcome
 
 
 def schedule_followup_after_auto_response(user_id: str, thread_id: str) -> bool:
