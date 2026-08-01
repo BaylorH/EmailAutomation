@@ -640,6 +640,20 @@ class JillJuneRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_target_terminal_survives_ancillary_lease_in_same_clause(self):
+        event = {"type": "property_unavailable", "reason": "leased"}
+
+        self.assertTrue(
+            processing._property_unavailable_event_applies_to_row(
+                event,
+                row_anchor="100 Main St, Phoenix",
+                message_text=(
+                    "The trailer lot is leased separately, and 100 Main St "
+                    "has been leased too."
+                ),
+            )
+        )
+
     def test_addressless_unavailable_event_preserves_explicitly_viable_target(self):
         event = {"type": "property_unavailable", "reason": "leased"}
 

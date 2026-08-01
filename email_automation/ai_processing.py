@@ -1870,20 +1870,35 @@ def _source_mentions_target_property(source_text: str, target_anchor: str) -> bo
 
 
 _PROPERTY_FACT_SIGNAL_RE = re.compile(
-    r"\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*"
-    r"(?:sf|sq\.?\s*ft|square\s+feet|feet|foot|ft\.?|['’])\b",
+    r"(?:"
+    r"\$\s*\d+(?:,\d{3})*(?:\.\d+)?|"
+    r"\b\d+(?:,\d{3})*(?:\.\d+)?\s*(?:"
+    r"sf\b|sq\.?\s*ft\b|square\s+feet\b|feet\b|foot\b|ft\.?\b|['’]|"
+    r"/\s*sf\b|per\s+sf\b|psf\b|nnn\b|"
+    r"docks?\b|dock\s+doors?\b|loading\s+docks?\b|"
+    r"drive[-\s]?ins?\b(?:\s+doors?\b)?|"
+    r"amps?\b|amperes?\b|a\b|volts?\b|v\b|(?:-\s*)?phase\b"
+    r")"
+    r")",
     re.IGNORECASE,
 )
 _PROPERTY_CLAUSE_BREAK_RE = re.compile(r"(?<!\d)[.!?;](?!\d)|\n+")
 _UNBOUND_IDENTITY_PREFIX_RE = re.compile(
     r"^\s*(?P<label>[a-z][a-z0-9&'’/-]*"
-    r"(?:\s+[a-z][a-z0-9&'’/-]*){1,7})\s*[-–—]\s*",
+    r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})\s*[-–—:=]\s*",
     re.IGNORECASE,
 )
-_LABELED_PROPERTY_FACT_RE = re.compile(
-    r"^\s*[a-z][a-z0-9 /'’_-]{1,40}\s*[:=]\s*\$?\s*\d",
-    re.IGNORECASE,
-)
+_KNOWN_SHORT_PROPERTY_FACT_LABELS = {
+    "available space", "building", "building size", "ceiling",
+    "ceiling clearance", "ceiling height", "ceiling ht", "clearance",
+    "clear height", "clear ht", "dock", "dock doors", "docks",
+    "drive in", "drive in doors", "drive ins", "electrical service",
+    "height", "lease rate", "loading docks", "op ex", "opex",
+    "operating expense", "operating expenses", "power", "power service",
+    "rent", "rental rate", "size", "square footage", "total area",
+    "total sf", "total size", "total space", "warehouse",
+    "warehouse area", "warehouse size",
+}
 
 
 def _property_clause_spans(text: str) -> List[tuple]:
@@ -1919,9 +1934,13 @@ def _unbound_identity_fact_spans(
         identity = _UNBOUND_IDENTITY_PREFIX_RE.search(clause)
         if not identity or not _PROPERTY_FACT_SIGNAL_RE.search(clause):
             continue
-        label_word_count = len(re.findall(r"[a-z0-9]+", identity.group("label")))
-        remainder = clause[identity.end():]
-        if label_word_count >= 3 or _LABELED_PROPERTY_FACT_RE.search(remainder):
+        label = " ".join(re.findall(r"[a-z0-9]+", identity.group("label").lower()))
+        label_word_count = len(label.split())
+        # One- and two-word brochure headings are ambiguous: they can be either
+        # ordinary fact labels ("clear height") or short property names
+        # ("Oak Center" / "Westgate").  Preserve only the explicit label set;
+        # every unknown short heading fails closed as a new property identity.
+        if label_word_count >= 3 or label not in _KNOWN_SHORT_PROPERTY_FACT_LABELS:
             unbound_spans.append((clause_start, clause_end))
     return unbound_spans
 

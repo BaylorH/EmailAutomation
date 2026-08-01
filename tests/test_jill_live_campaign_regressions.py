@@ -545,6 +545,8 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "westgate hub - Ceiling Ht: 32 feet clear.",
             "oak center — Clear Height = 32 ft.",
             "river park - Ceiling Clearance: 32 feet.",
+            "Oak Center - 32 feet clear.",
+            "Westgate: 32 ft clear.",
         )
 
         for alternate_clause in alternate_clauses:
@@ -580,6 +582,8 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         target_specs = (
             "clear height - 28 feet clear.",
             "ceiling height - 28 feet clear.",
+            "ceiling ht: 28 feet clear.",
+            "ceiling clearance = 28 ft clear.",
         )
 
         for target_spec in target_specs:
@@ -602,6 +606,41 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 )
 
                 self.assertEqual([expected_update], result["updates"])
+
+    def test_short_unbound_identity_suppresses_every_mapped_fact_type(self):
+        competing_facts = (
+            ("Docks", "6", "Oak Center - 6 dock doors."),
+            ("Drive Ins", "2", "Oak Center - 2 drive-in doors."),
+            ("Power", "1200A 480V 3-phase", "Oak Center - 1200A 480V 3-phase power."),
+            ("Rent/SF/Yr", "6.75", "Oak Center - $6.75/SF NNN."),
+            ("Ops Ex/SF/Yr", "1.85", "Oak Center - $1.85/SF operating expenses."),
+        )
+
+        for column, value, competing_clause in competing_facts:
+            with self.subTest(column=column, competing_clause=competing_clause):
+                proposal = {
+                    "updates": [{"column": column, "value": value}],
+                    "events": [],
+                    "response_email": "Thanks.",
+                }
+
+                result = ai_processing._suppress_competing_attachment_updates(
+                    proposal,
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"100 Main St - 20,000 SF. {competing_clause}",
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
 
     def test_versioned_addressless_attachment_is_competing_by_default(self):
         attachment_names = (

@@ -2073,6 +2073,9 @@ def _terminal_binding_clauses(message_text: str) -> List[str]:
             r"(?<=[.!?])\s+|\n+|\s*;\s*|"
             r",\s*(?:but|while|whereas)\s+|"
             r"\s+(?:but|while|whereas)\s+|"
+            r",?\s+and\s+(?="
+            r"(?:the\s+)?(?:property|building|space)\s+(?:at\s+)?\d{1,6}\b|"
+            r"\d{1,6}\s+[a-z])|"
             r",\s*and\s+(?=(?:i|we|here|attached|included|please)\b)|"
             r"\s+and\s+(?=(?:i|we|here|attached|included|please)\b)",
             message_text or "",
