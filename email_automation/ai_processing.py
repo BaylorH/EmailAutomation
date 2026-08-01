@@ -289,20 +289,41 @@ def _latest_inbound_text(conversation: List[dict]) -> str:
 
 def _looks_like_access_remediation(text: str) -> bool:
     latest_text = _strip_quoted_history(text or "").lower()
-    return bool(
-        re.search(
-            r"\b(?:dock|door|opening)\b.{0,55}\b"
-            r"(?:can|could|may|might|possible\s+to)\b.{0,35}\b"
-            r"(?:ramp(?:ed)?|convert(?:ed)?|modify|add(?:ed)?|install(?:ed)?)\b",
-            latest_text,
-        )
-        or re.search(
-            r"\b(?:can|could|may|might|possible\s+to)\b.{0,35}\b"
-            r"(?:ramp(?:ed)?|convert(?:ed)?|modify|add(?:ed)?|install(?:ed)?)\b"
-            r".{0,45}\b(?:dock|door|drive[-\s]?in|grade[-\s]?level)\b",
-            latest_text,
-        )
+    if not latest_text:
+        return False
+
+    access_re = re.compile(
+        r"\b(?:dock|door|opening|drive[-\s]?in|grade[-\s]?level|access)\b"
     )
+    remediation_re = re.compile(
+        r"\b(?:rampable|convertible|ramp(?:ed|ing)?|convert(?:ed|ing)?|"
+        r"modify|modified|add(?:ed|ing)?|install(?:ed|ing)?)\b"
+    )
+    capability_re = re.compile(
+        r"\b(?:can|could|may|might|possible\s+to|able\s+to|"
+        r"(?:owner|landlord|seller)\s+(?:can|could|will|would)|will)\b"
+    )
+    negated_before_re = re.compile(
+        r"\b(?:not|never|cannot|can[’']?t|could\s+not|couldn[’']?t|"
+        r"will\s+not|won[’']?t|unable\s+to|not\s+able\s+to)\s+"
+        r"(?:be\s+)?$"
+    )
+    negated_after_re = re.compile(
+        r"^\s*(?:is\s+|would\s+be\s+)?(?:not\s+possible|impossible|prohibited)\b"
+    )
+
+    for clause in re.split(r"(?<=[.!?;])\s+|\n+", latest_text):
+        if not access_re.search(clause):
+            continue
+        for match in remediation_re.finditer(clause):
+            before = clause[max(0, match.start() - 55):match.start()]
+            after = clause[match.end():match.end() + 35]
+            if negated_before_re.search(before) or negated_after_re.search(after):
+                continue
+            term = match.group(0).lower()
+            if term in {"rampable", "convertible"} or capability_re.search(before):
+                return True
+    return False
 
 
 def _looks_like_requirements_mismatch_nonviable(text: str) -> bool:
@@ -395,14 +416,18 @@ def _looks_like_requirements_mismatch_nonviable(text: str) -> bool:
         )
     )
 
+    access_remediation = _looks_like_access_remediation(latest_text)
     physical_mismatch = (
         office_mismatch
         or warehouse_mismatch
-        or (access_mismatch and not _looks_like_access_remediation(latest_text))
+        or (access_mismatch and not access_remediation)
         or height_mismatch
     )
 
-    return bool(fit_rejection or physical_mismatch)
+    # A generic fit rejection is not terminal when the only stated defect is an
+    # access condition the broker says can be remediated. Independent office,
+    # warehouse, or height mismatches remain terminal through physical_mismatch.
+    return bool((fit_rejection and not access_remediation) or physical_mismatch)
 
 
 def _looks_like_tour_slot_reply(conversation: List[dict], latest_text: str) -> bool:
@@ -1126,23 +1151,20 @@ def _augment_events_with_deterministic_signals(
         sender_name=sender_name,
         contact_name=contact_name,
     )
-    if (
+    access_remediation_requires_review = (
         _looks_like_access_remediation(latest_text)
         and not _looks_like_requirements_mismatch_nonviable(latest_text)
-    ):
+        and not _detect_target_terminal_reason(latest_text, target_anchor)
+    )
+    if access_remediation_requires_review:
         removed_terminal = any(
             (event or {}).get("type") == "property_unavailable"
-            and str((event or {}).get("reason") or "").strip() == "requirements_mismatch"
             for event in events
         )
         if removed_terminal:
             events = [
                 event for event in events
-                if not (
-                    (event or {}).get("type") == "property_unavailable"
-                    and str((event or {}).get("reason") or "").strip()
-                    == "requirements_mismatch"
-                )
+                if (event or {}).get("type") != "property_unavailable"
             ]
             if not any((event or {}).get("type") == "needs_user_input" for event in events):
                 events.append({
@@ -1181,7 +1203,13 @@ def _augment_events_with_deterministic_signals(
             event for event in events
             if (event or {}).get("type") not in conflicting_event_types
         ]
-        if not any((event or {}).get("type") == "property_unavailable" for event in retained_events):
+        existing_unavailable = False
+        for event in retained_events:
+            if (event or {}).get("type") != "property_unavailable":
+                continue
+            event["reason"] = property_unavailable_reason
+            existing_unavailable = True
+        if not existing_unavailable:
             retained_events.insert(0, {
                 "type": "property_unavailable",
                 "reason": property_unavailable_reason,
@@ -1362,7 +1390,8 @@ _OPS_EX_RE = re.compile(
 # from mistaking such a rent line for OpEx (which would overwrite a valid LLM
 # OpEx and land rent+opex on mixed bases before #15 annualizes).
 _RENT_KW_BEFORE_FIGURE_RE = re.compile(
-    r"(?:asking|base\s+rent|lease\s+rate|rent|rate)\b[^\d$]{0,10}$",
+    r"(?:asking\s+(?:rental\s+)?rate|base\s+rent|lease\s+rate|"
+    r"rental\s+rate|rent|rate)\b[^\d$]{0,32}$",
     re.IGNORECASE,
 )
 
@@ -1375,11 +1404,17 @@ def _opex_match_is_rent_basis_line(text: str, m: "re.Match") -> bool:
     rent keyword, it is the asking rent stated on a triple-net basis, so it must
     not be mined as OpEx.
     """
+    matched_text = m.group(0).lower()
     if m.group(1) is None:
-        return False  # keyword-first hit ($ after the label) is a genuine OpEx figure
+        # "NNN lease rate is $14" is keyword-first syntactically, but the words
+        # between NNN and the figure bind it to rent rather than operating costs.
+        return bool(
+            re.match(r"\s*nnn\b", matched_text)
+            and re.search(r"\b(?:asking\s+|base\s+|lease\s+|rental\s+)?rate\b|\brent\b", matched_text)
+        )
     if not m.group(0).rstrip().lower().endswith("nnn"):
         return False
-    before = text[max(0, m.start() - 26): m.start()]
+    before = text[max(0, m.start() - 72): m.start()]
     return bool(_RENT_KW_BEFORE_FIGURE_RE.search(before))
 # Total SF as an area (thousands-grouped or 4+ digits), not a $/SF rate figure.
 _TOTAL_SF_RE = re.compile(
@@ -1893,6 +1928,57 @@ _CURRENT_PROPERTY_AFFIRMATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ALTERNATE_PROPERTY_TRANSITION_RE = re.compile(
+    r"\b(?:we|i)\s+also\s+have\b|\b(?:also|another|alternative|replacement|other)\s+"
+    r"(?:building|property|space|suite|unit|option)\b",
+    re.IGNORECASE,
+)
+
+
+def _event_address_boundary(text: str, events: List[dict]) -> Optional[int]:
+    """Find the earliest explicit alternate-property label in the fresh reply."""
+    candidates = []
+    for event in events:
+        address = str((event or {}).get("address") or "")
+        tokens = [
+            token for token in re.findall(r"[a-z0-9]+", address.lower())
+            if token != "tbd"
+        ]
+        if not tokens:
+            continue
+        # Try the complete label, then progressively shorter distinctive tails.
+        for width in range(len(tokens), 1, -1):
+            phrase = r"\b" + r"[^a-z0-9]+".join(map(re.escape, tokens[-width:])) + r"\b"
+            match = re.search(phrase, text, re.IGNORECASE)
+            if match:
+                candidates.append(match.start())
+                break
+    return min(candidates) if candidates else None
+
+
+def _update_supported_in_current_segment(update: dict, text: str) -> bool:
+    """Require a proposed current-row value to be evidenced before the alternate."""
+    column = str((update or {}).get("column") or "").strip().lower()
+    value = (update or {}).get("value")
+    if not column or value is None:
+        return False
+
+    expected = _normalized_numeric_value(value)
+    if "total sf" in column or "square footage" in column:
+        return expected == _normalized_numeric_value(_extract_total_sf_from_text(text))
+    if "rent" in column and "gross" not in column:
+        return expected == _normalized_numeric_value(_extract_rent_sf_yr_from_text(text))
+    if "ops" in column or "opex" in column or "operating" in column:
+        return expected == _normalized_numeric_value(_extract_ops_ex_sf_from_text(text))
+    if "drive" in column or "grade" in column:
+        return expected == _normalized_numeric_value(_extract_drive_in_count_from_text(text))
+    if "dock" in column:
+        return expected == _normalized_numeric_value(_extract_dock_count_from_text(text))
+
+    normalized_value = " ".join(re.findall(r"[a-z0-9]+", str(value).lower()))
+    normalized_text = " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+    return bool(normalized_value and normalized_value in normalized_text)
+
 
 def _suppress_cross_property_current_row_updates(
     proposal: dict,
@@ -1912,21 +1998,37 @@ def _suppress_cross_property_current_row_updates(
         return proposal
 
     fresh_text = _fresh_inbound_text(conversation)
-    if _CURRENT_PROPERTY_AFFIRMATION_RE.search(fresh_text):
-        return proposal
-    if _source_mentions_target_property(fresh_text, target_anchor):
+    new_property_events = [
+        event for event in events if (event or {}).get("type") == "new_property"
+    ]
+    address_boundary = _event_address_boundary(fresh_text, new_property_events)
+    transition = _ALTERNATE_PROPERTY_TRANSITION_RE.search(fresh_text)
+    boundary_candidates = [
+        position for position in (
+            address_boundary,
+            transition.start() if transition else None,
+        ) if position is not None
+    ]
+    if not boundary_candidates:
+        proposal["updates"] = []
         return proposal
 
-    target_identity = _target_street_identity(target_anchor)
-    competing_claim_present = bool(
-        target_identity
-        and any(
-            _claim_identity(claim) != target_identity
-            for claim in _street_claim_spans(fresh_text)
-        )
+    current_segment = fresh_text[:min(boundary_candidates)]
+    explicitly_names_target = _source_mentions_target_property(
+        current_segment, target_anchor
     )
-    if competing_claim_present:
+    has_transitioned_current_affirmation = bool(
+        transition
+        and _CURRENT_PROPERTY_AFFIRMATION_RE.search(current_segment)
+    )
+    if not explicitly_names_target and not has_transitioned_current_affirmation:
         proposal["updates"] = []
+        return proposal
+
+    proposal["updates"] = [
+        update for update in (proposal.get("updates") or [])
+        if _update_supported_in_current_segment(update, current_segment)
+    ]
     return proposal
 
 

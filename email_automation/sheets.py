@@ -28,7 +28,12 @@ def is_retryable_sheets_error(error: Exception) -> bool:
 
 def _execute_with_retry(request, operation_name: str = "Sheets API"):
     """
-    Execute a Google Sheets API request with backoff for temporary HTTP failures.
+    Execute a Google Sheets API request with backoff for explicit rate limits.
+
+    A 5xx response is ambiguous for mutation requests: the server may have
+    committed the write before returning the error. Retrying it here can append,
+    insert, or move twice. Callers that can safely restart a larger idempotent
+    operation may still use ``is_retryable_sheets_error`` to schedule that retry.
 
     Args:
         request: The prepared API request (before .execute())
@@ -44,26 +49,27 @@ def _execute_with_retry(request, operation_name: str = "Sheets API"):
         try:
             return request.execute()
         except HttpError as e:
-            if is_retryable_sheets_error(e):
+            if getattr(e.resp, "status", None) == 429:
                 delay = min(BASE_DELAY_SECONDS * (2 ** attempt), MAX_DELAY_SECONDS)
                 jitter = random.uniform(0, delay * 0.25)
                 total_delay = delay + jitter
 
                 if attempt < MAX_RETRIES - 1:
                     print(
-                        f"⏳ Temporary Sheets HTTP {e.resp.status} on {operation_name}, "
+                        f"⏳ Sheets rate limit on {operation_name}, "
                         f"retrying in {total_delay:.1f}s "
                         f"(attempt {attempt + 1}/{MAX_RETRIES})"
                     )
                     time.sleep(total_delay)
                 else:
                     print(
-                        f"❌ Temporary Sheets HTTP {e.resp.status} persisted for "
+                        f"❌ Sheets rate limit persisted for "
                         f"{operation_name} after {MAX_RETRIES} attempts"
                     )
                     raise
             else:
-                # Permanent client/auth errors need operator review, not retries.
+                # Client/auth failures and ambiguous server failures are not
+                # safe to replay at this generic request boundary.
                 raise
 
     # Should not reach here, but just in case

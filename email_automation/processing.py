@@ -24,6 +24,7 @@ from .logging import write_message_order_test
 from .ai_processing import (
     _append_ai_meta,
     _source_mentions_target_property,
+    _target_street_identity,
     apply_proposal_to_sheet,
     check_missing_required_fields,
     get_row_anchor,
@@ -2894,9 +2895,14 @@ def _select_automatic_response_body(
     contact_name: Optional[str],
 ) -> str:
     """Use LLM copy only when it does not request configured Note/Skip fields."""
-    if llm_response_email and not _response_requests_nonrequestable_fields(
+    truth_locked_mismatch = scenario.startswith("requirements_mismatch")
+    if (
+        llm_response_email
+        and not truth_locked_mismatch
+        and not _response_requests_nonrequestable_fields(
         llm_response_email,
         column_config,
+        )
     ):
         return llm_response_email
 
@@ -2912,6 +2918,16 @@ I'll review the new property details and get back to you if I have any questions
 Thank you for letting me know that property is no longer available.
 
 Do you have any other properties that might be a good fit for our requirements?""",
+        "requirements_mismatch_with_alternative": f"""{greeting}
+
+Thank you for clarifying that the current property does not meet the requirements, and for suggesting the alternative property.
+
+I'll review the alternative and get back to you if I have any questions.""",
+        "requirements_mismatch": f"""{greeting}
+
+Thank you for clarifying that the property does not meet the requirements.
+
+Do you have any other properties that might be a better fit?""",
         "complete": f"""{greeting}
 
 Thank you for providing all the requested information! We now have everything we need for your property details.
@@ -2955,7 +2971,14 @@ def _build_property_unavailable_comment(current_date: str, found_keyword: str, e
 
 
 def _nonviable_status_reason(event: Dict[str, Any]) -> str:
-    return _event_text(event or {}, "reason") or "property_unavailable"
+    reason = _event_text(event or {}, "reason") or "property_unavailable"
+    normalized = reason.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {
+        "requirements_mismatch", "physical_non_fit", "physical_mismatch",
+        "bad_fit", "requirements_non_fit",
+    }:
+        return "requirements_mismatch"
+    return normalized
 
 
 def _pending_nonviable_followup_patch(
@@ -3022,6 +3045,38 @@ def _attachment_matches_event_property(
     return len(anchor_tokens & source_tokens) >= 2
 
 
+def _attachment_event_match_score(
+    attachment: Dict[str, Any],
+    event: Dict[str, Any],
+) -> int:
+    """Score address evidence without letting a shared city decide ownership."""
+    source = _attachment_source_text(attachment)
+    address = _event_text(event, "address")
+    if not address:
+        return 0
+    if _target_street_identity(address) and _source_mentions_target_property(source, address):
+        return 1000
+
+    address_tokens = [
+        token for token in re.findall(r"[a-z0-9]+", address.lower())
+        if token != "tbd" and token not in _PROPERTY_ANCHOR_STOPWORDS
+    ]
+    if len(address_tokens) < 2:
+        return 0
+    source_token_list = re.findall(r"[a-z0-9]+", source.lower())
+    if any(
+        source_token_list[index:index + len(address_tokens)] == address_tokens
+        for index in range(len(source_token_list) - len(address_tokens) + 1)
+    ):
+        return 500 + len(address_tokens)
+    source_tokens = set(source_token_list)
+    matched = sum(token in source_tokens for token in address_tokens)
+    ratio = matched / len(address_tokens)
+    if matched < 2 or ratio < 0.6:
+        return 0
+    return int(ratio * 100) + matched
+
+
 def _partition_property_attachments(
     pdf_manifest: List[Dict[str, Any]],
     *,
@@ -3052,19 +3107,26 @@ def _partition_property_attachments(
     event_assets: List[List[Dict[str, Any]]] = [[] for _ in new_property_events]
     for attachment in (pdf_manifest or []):
         source = _attachment_source_text(attachment)
-        if _source_mentions_target_property(source, current_anchor):
+        current_match = _source_mentions_target_property(source, current_anchor)
+        scores = [
+            _attachment_event_match_score(attachment, event)
+            for event in new_property_events
+        ]
+        best_score = max(scores, default=0)
+        best_indexes = [
+            index for index, score in enumerate(scores)
+            if score == best_score and score > 0
+        ]
+
+        # A brochure that names both the established row and an alternate stays
+        # attached to the message for review; it must not seed either row.
+        if current_match and best_indexes:
+            continue
+        if current_match:
             current_assets.append(attachment)
             continue
-
-        matched_index = next((
-            index for index, event in enumerate(new_property_events)
-            if _attachment_matches_event_property(attachment, event)
-        ), None)
-        if matched_index is None:
-            # In a replacement-property reply, an unresolved asset is safer on
-            # the pending replacement than on the established current row.
-            matched_index = 0
-        event_assets[matched_index].append(attachment)
+        if len(best_indexes) == 1:
+            event_assets[best_indexes[0]].append(attachment)
 
     return current_assets, event_assets
 
@@ -5942,12 +6004,22 @@ def process_inbox_message(
                     proposal.get("response_email"),
                     contact_name,
                 )
+                requirements_mismatch_nonviable = any(
+                    (event or {}).get("type") == "property_unavailable"
+                    and _nonviable_status_reason(event) == "requirements_mismatch"
+                    for event in events
+                )
 
                 # Scenario 1: Property became non-viable AND new property was suggested
                 if old_row_became_nonviable and has_new_property_path:
                     print(f"   📍 SCENARIO 1: Non-viable + new property suggested")
+                    response_scenario = (
+                        "requirements_mismatch_with_alternative"
+                        if requirements_mismatch_nonviable
+                        else "nonviable_with_alternative"
+                    )
                     response_body = _select_automatic_response_body(
-                        "nonviable_with_alternative",
+                        response_scenario,
                         llm_response_email,
                         column_config,
                         contact_name,
@@ -5970,8 +6042,13 @@ def process_inbox_message(
                 # Scenario 2: Property became non-viable but NO new property suggested
                 elif old_row_became_nonviable and not has_new_property_path:
                     print(f"   📍 SCENARIO 2: Non-viable, no new property")
+                    response_scenario = (
+                        "requirements_mismatch"
+                        if requirements_mismatch_nonviable
+                        else "nonviable"
+                    )
                     response_body = _select_automatic_response_body(
-                        "nonviable",
+                        response_scenario,
                         llm_response_email,
                         column_config,
                         contact_name,

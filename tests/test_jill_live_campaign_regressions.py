@@ -29,6 +29,13 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 "The lease price is $15.50 psf nnn and estimated "
                 "Taxes & CAM are $3.00 psf."
             ): "3.00",
+            (
+                "The NNN lease rate is $14.00 per SF; OPEX is $4.00 per SF."
+            ): "4.00",
+            (
+                "The asking rental rate for the space is $14.00/SF NNN, and "
+                "$4.00/SF in operating expenses."
+            ): "4.00",
         }
 
         for text, expected in examples.items():
@@ -69,6 +76,51 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 "ramped for drive-in access, but there is almost no warehouse."
             )
         )
+
+    def test_access_remediation_variants_do_not_terminalize_the_property(self):
+        examples = (
+            "No drive-in door. The loading dock is rampable for drive-in access.",
+            "There is no grade-level door today, but the owner will convert the "
+            "loading dock to grade-level access.",
+            "This is not a fit as-is because there is no drive-in, but the dock "
+            "can be ramped for drive-in access.",
+        )
+
+        for body in examples:
+            with self.subTest(body=body):
+                proposal = {
+                    "updates": [],
+                    "events": [
+                        {
+                            "type": "property_unavailable",
+                            "reason": "requirements_mismatch",
+                        }
+                    ],
+                    "response_email": "We'll cross this one off.",
+                }
+                result = ai_processing._augment_events_with_deterministic_signals(
+                    proposal,
+                    _conversation(body),
+                    target_anchor="102 Iron Mountain Rd, Mine Hill",
+                )
+
+                event_types = [event.get("type") for event in result["events"]]
+                self.assertNotIn("property_unavailable", event_types)
+                self.assertIn("needs_user_input", event_types)
+                self.assertIsNone(result["response_email"])
+
+    def test_negated_access_remediation_remains_terminal(self):
+        examples = (
+            "No drive-in door, and the loading dock could not be ramped.",
+            "There is no grade-level access and the dock is not rampable.",
+        )
+
+        for body in examples:
+            with self.subTest(body=body):
+                self.assertFalse(ai_processing._looks_like_access_remediation(body))
+                self.assertTrue(
+                    ai_processing._looks_like_requirements_mismatch_nonviable(body)
+                )
 
     def test_matching_route_address_brochure_is_not_treated_as_competing(self):
         proposal = {
@@ -185,6 +237,69 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
 
         self.assertEqual(2, len(result["updates"]))
 
+    def test_replacement_this_building_language_cannot_update_original_row(self):
+        proposal = {
+            "updates": [
+                {"column": "Total SF", "value": "8000", "confidence": 0.93}
+            ],
+            "events": [
+                {"type": "new_property", "address": "Suite B", "city": "Phoenix"}
+            ],
+        }
+
+        result = ai_processing._suppress_cross_property_current_row_updates(
+            proposal,
+            _conversation("This building is Suite B and has 8,000 SF."),
+            "100 SiteSift Canary Way, Phoenix",
+        )
+
+        self.assertEqual([], result["updates"])
+
+    def test_target_mention_does_not_license_alternate_property_updates(self):
+        proposal = {
+            "updates": [
+                {"column": "Total SF", "value": "8000", "confidence": 0.93}
+            ],
+            "events": [
+                {"type": "new_property", "address": "Suite B", "city": "Phoenix"}
+            ],
+        }
+
+        result = ai_processing._suppress_cross_property_current_row_updates(
+            proposal,
+            _conversation(
+                "For 100 SiteSift Canary Way, see the prior note. The alternative "
+                "Suite B has 8,000 SF."
+            ),
+            "100 SiteSift Canary Way, Phoenix",
+        )
+
+        self.assertEqual([], result["updates"])
+
+    def test_explicit_current_facts_before_alternate_remain_on_current_row(self):
+        proposal = {
+            "updates": [
+                {"column": "Total SF", "value": "7200", "confidence": 0.95}
+            ],
+            "events": [
+                {"type": "new_property", "address": "Suite B", "city": "Phoenix"}
+            ],
+        }
+
+        result = ai_processing._suppress_cross_property_current_row_updates(
+            proposal,
+            _conversation(
+                "100 SiteSift Canary Way is 7,200 SF. We also have Suite B, "
+                "which is 8,000 SF."
+            ),
+            "100 SiteSift Canary Way, Phoenix",
+        )
+
+        self.assertEqual(
+            [{"column": "Total SF", "value": "7200", "confidence": 0.95}],
+            result["updates"],
+        )
+
     def test_sterling_attachments_are_partitioned_by_property(self):
         permit = {
             "name": "2121 American Wall Beds Co PERMIT REV2 11 18 22.pdf",
@@ -252,6 +367,82 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         self.assertEqual([brochure], current)
         self.assertEqual([], by_event)
 
+    def test_same_city_phase_attachments_route_to_the_unique_event(self):
+        phase_one = {
+            "name": "Sterling Plaza Phase I brochure.pdf",
+            "text": "Sterling Plaza Phase I, Phoenix - 5,000 SF",
+        }
+        phase_two = {
+            "name": "Sterling Plaza Phase II brochure.pdf",
+            "text": "Sterling Plaza Phase II, Phoenix - 8,000 SF",
+        }
+        events = [
+            {
+                "type": "new_property",
+                "address": "Sterling Plaza Phase I",
+                "city": "Phoenix",
+            },
+            {
+                "type": "new_property",
+                "address": "Sterling Plaza Phase II",
+                "city": "Phoenix",
+            },
+        ]
+
+        current, by_event = processing._partition_property_attachments(
+            [phase_one, phase_two],
+            current_anchor="100 SiteSift Canary Way, Phoenix",
+            events=events,
+        )
+
+        self.assertEqual([], current)
+        self.assertEqual([phase_one], by_event[0])
+        self.assertEqual([phase_two], by_event[1])
+
+    def test_unresolved_replacement_attachment_is_not_defaulted_to_first_event(self):
+        ambiguous = {
+            "name": "Phoenix options brochure.pdf",
+            "text": "Two industrial options are available in Phoenix.",
+        }
+        events = [
+            {"type": "new_property", "address": "Suite A", "city": "Phoenix"},
+            {"type": "new_property", "address": "Suite B", "city": "Phoenix"},
+        ]
+
+        current, by_event = processing._partition_property_attachments(
+            [ambiguous],
+            current_anchor="100 SiteSift Canary Way, Phoenix",
+            events=events,
+        )
+
+        self.assertEqual([], current)
+        self.assertEqual([[], []], by_event)
+
+    def test_mixed_current_and_alternate_brochure_is_left_for_review(self):
+        mixed = {
+            "name": "Current and Suite B brochure.pdf",
+            "text": (
+                "100 SiteSift Canary Way - 7,500 SF. "
+                "200 Alternate Road Suite B - 8,000 SF."
+            ),
+        }
+        events = [
+            {
+                "type": "new_property",
+                "address": "200 Alternate Road Suite B",
+                "city": "Phoenix",
+            }
+        ]
+
+        current, by_event = processing._partition_property_attachments(
+            [mixed],
+            current_anchor="100 SiteSift Canary Way, Phoenix",
+            events=events,
+        )
+
+        self.assertEqual([], current)
+        self.assertEqual([[]], by_event)
+
     def test_requirements_mismatch_has_truthful_terminal_label(self):
         event = {"type": "property_unavailable", "reason": "requirements_mismatch"}
 
@@ -266,6 +457,61 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         )
         self.assertIn("does not meet client requirements", comment.lower())
         self.assertNotIn("marked unavailable", comment.lower())
+
+    def test_deterministic_mismatch_normalizes_model_reason(self):
+        for model_reason in ("physical_non_fit", "Requirements_Mismatch", "bad_fit"):
+            with self.subTest(model_reason=model_reason):
+                proposal = {
+                    "updates": [],
+                    "events": [
+                        {
+                            "type": "property_unavailable",
+                            "reason": model_reason,
+                        }
+                    ],
+                    "response_email": "Thanks for the update.",
+                }
+                result = ai_processing._augment_events_with_deterministic_signals(
+                    proposal,
+                    _conversation(
+                        "The space is too office-heavy and does not meet the "
+                        "client's warehouse requirements."
+                    ),
+                    target_anchor="100 SiteSift Canary Way, Phoenix",
+                )
+
+                unavailable = [
+                    event
+                    for event in result["events"]
+                    if event.get("type") == "property_unavailable"
+                ]
+                self.assertEqual(1, len(unavailable))
+                self.assertEqual("requirements_mismatch", unavailable[0]["reason"])
+                self.assertIsNone(result["response_email"])
+
+    def test_requirements_mismatch_fallback_never_claims_property_is_unavailable(self):
+        body = processing._select_automatic_response_body(
+            "requirements_mismatch",
+            None,
+            {},
+            "Baylor",
+        )
+
+        self.assertIn("does not meet", body.lower())
+        self.assertIn("requirements", body.lower())
+        self.assertNotIn("no longer available", body.lower())
+
+    def test_requirements_mismatch_with_alternative_fallback_is_truthful(self):
+        body = processing._select_automatic_response_body(
+            "requirements_mismatch_with_alternative",
+            None,
+            {},
+            "Baylor",
+        )
+
+        self.assertIn("does not meet", body.lower())
+        self.assertIn("alternative", body.lower())
+        self.assertNotIn("no longer available", body.lower())
 
     def test_requirements_mismatch_stops_followups_before_sheet_move(self):
         events = [{"type": "property_unavailable", "reason": "requirements_mismatch"}]
