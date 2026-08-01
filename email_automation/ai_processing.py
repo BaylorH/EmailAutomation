@@ -1885,10 +1885,11 @@ _PROPERTY_FACT_SIGNAL_RE = re.compile(
 _PROPERTY_CLAUSE_BREAK_RE = re.compile(r"(?<!\d)[.!?;](?!\d)|\n+")
 _UNBOUND_IDENTITY_PREFIX_RE = re.compile(
     r"^\s*(?P<label>[a-z][a-z0-9&'’/-]*"
-    r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})\s*[-–—:=]\s*",
+    r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})"
+    r"(?:\s*[-–—:=|•·,/>→(\[]\s*|\s+(?=\$?\d))",
     re.IGNORECASE,
 )
-_KNOWN_SHORT_PROPERTY_FACT_LABELS = {
+_KNOWN_PROPERTY_FACT_OR_SECTION_LABELS = {
     "available space", "building", "building size", "ceiling",
     "ceiling clearance", "ceiling height", "ceiling ht", "clearance",
     "clear height", "clear ht", "dock", "dock doors", "docks",
@@ -1898,7 +1899,16 @@ _KNOWN_SHORT_PROPERTY_FACT_LABELS = {
     "rent", "rental rate", "size", "square footage", "total area",
     "total sf", "total size", "total space", "warehouse",
     "warehouse area", "warehouse size",
+    "building details", "building highlights", "building specifications",
+    "details", "features", "highlights", "key features", "property details",
+    "property features", "property highlights", "property specifications",
+    "specifications",
 }
+_STANDALONE_IDENTITY_LINE_RE = re.compile(
+    r"^\s*(?P<label>[a-z][a-z0-9&'’/-]*"
+    r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})\s*[-–—:=|•·,/>→(\[]?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _property_clause_spans(text: str) -> List[tuple]:
@@ -1927,7 +1937,29 @@ def _unbound_identity_fact_spans(
     if not _source_mentions_target_property(text, target_anchor):
         return []
     unbound_spans = []
-    for clause_start, clause_end in _property_clause_spans(text):
+
+    # PDF table extraction often places a property name on one line and its
+    # first value on the next. Treat an unknown standalone heading followed by
+    # a mapped property fact as a structural identity boundary while preserving
+    # explicit field/section labels such as "Clear Height" and "Highlights".
+    clause_spans = _property_clause_spans(text)
+    for current, following in zip(clause_spans, clause_spans[1:]):
+        current_text = text[current[0]:current[1]]
+        following_text = text[following[0]:following[1]]
+        identity_line = _STANDALONE_IDENTITY_LINE_RE.match(current_text)
+        if (
+            not identity_line
+            or _source_mentions_target_property(current_text, target_anchor)
+            or not _PROPERTY_FACT_SIGNAL_RE.search(following_text)
+        ):
+            continue
+        line_label = " ".join(
+            re.findall(r"[a-z0-9]+", identity_line.group("label").lower())
+        )
+        if line_label not in _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS:
+            unbound_spans.append((current[0], following[1]))
+
+    for clause_start, clause_end in clause_spans:
         clause = text[clause_start:clause_end]
         if _source_mentions_target_property(clause, target_anchor):
             continue
@@ -1935,14 +1967,13 @@ def _unbound_identity_fact_spans(
         if not identity or not _PROPERTY_FACT_SIGNAL_RE.search(clause):
             continue
         label = " ".join(re.findall(r"[a-z0-9]+", identity.group("label").lower()))
-        label_word_count = len(label.split())
-        # One- and two-word brochure headings are ambiguous: they can be either
-        # ordinary fact labels ("clear height") or short property names
-        # ("Oak Center" / "Westgate").  Preserve only the explicit label set;
-        # every unknown short heading fails closed as a new property identity.
-        if label_word_count >= 3 or label not in _KNOWN_SHORT_PROPERTY_FACT_LABELS:
+        # Brochure headings are ambiguous: they can be ordinary fact/section
+        # labels ("clear height") or property names ("Oak Center" / "Westgate").
+        # Preserve only the explicit label set; every unknown heading fails
+        # closed as a new property identity.
+        if label not in _KNOWN_PROPERTY_FACT_OR_SECTION_LABELS:
             unbound_spans.append((clause_start, clause_end))
-    return unbound_spans
+    return sorted(set(unbound_spans))
 
 
 def _attachment_property_verdict(source_text: str, target_anchor: str) -> str:

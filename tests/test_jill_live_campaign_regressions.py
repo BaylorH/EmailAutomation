@@ -547,6 +547,13 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "river park - Ceiling Clearance: 32 feet.",
             "Oak Center - 32 feet clear.",
             "Westgate: 32 ft clear.",
+            "Oak Center | 32 feet clear.",
+            "Oak Center • 32 feet clear.",
+            "Oak Center / 32 feet clear.",
+            "Oak Center, 32 feet clear.",
+            "Oak Center  32 feet clear.",
+            "Oak Center\n32 feet clear.",
+            "Oak Center\nCeiling Ht: 32 feet clear.",
         )
 
         for alternate_clause in alternate_clauses:
@@ -584,6 +591,8 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "ceiling height - 28 feet clear.",
             "ceiling ht: 28 feet clear.",
             "ceiling clearance = 28 ft clear.",
+            "clear height\n28 feet clear.",
+            "Property Highlights\n28 feet clear.",
         )
 
         for target_spec in target_specs:
