@@ -42,13 +42,21 @@ _SUBJECT_LINE_BREAKS = frozenset("\u000a\u000b\u000c\u000d\u0085\u2028\u2029")
 
 
 def _require_exact_keys(value: Any, expected_keys: tuple[str, ...], label: str) -> dict:
-    if type(value) is not dict or set(value) != set(expected_keys):
+    if type(value) is not dict:
         raise TypeError(f"{label} fields are invalid")
+    actual_keys = tuple(value)
+    if len(actual_keys) != len(expected_keys) or any(
+        type(key) is not str for key in actual_keys
+    ):
+        raise TypeError(f"{label} fields are invalid")
+    for expected_key in expected_keys:
+        if not any(actual_key == expected_key for actual_key in actual_keys):
+            raise TypeError(f"{label} fields are invalid")
     return value
 
 
 def _require_string(value: Any, label: str) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise TypeError(f"{label} must be a string")
     try:
         value.encode("utf-8")
@@ -89,7 +97,7 @@ def _normalize_email(value: Any) -> str:
 
 
 def _normalize_assigned_emails(value: Any) -> List[str]:
-    if not isinstance(value, list) or len(value) != 1:
+    if type(value) is not list or len(value) != 1:
         raise TypeError("assignedEmails must contain exactly one recipient")
     return [_normalize_email(value[0])]
 
@@ -115,7 +123,7 @@ def _normalize_subject(value: Any) -> str:
 
 
 def _normalize_ask_fields(value: Any) -> List[str]:
-    if not isinstance(value, list) or len(value) > 250:
+    if type(value) is not list or len(value) > 250:
         raise TypeError("askFields must be an array of at most 250 strings")
 
     normalized: List[str] = []
@@ -135,8 +143,7 @@ def _normalize_row_number(value: Any) -> int | None:
     if value is None:
         return None
     if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
+        type(value) is not int
         or value <= 0
         or value > _MAX_SAFE_INTEGER
     ):
@@ -174,12 +181,12 @@ def _canonical_payload_from_output(payload: Any) -> Dict[str, Any]:
     if (
         type(candidate["schemaVersion"]) is not int
         or candidate["schemaVersion"] != 1
+        or type(candidate["recoveryProfile"]) is not str
         or candidate["recoveryProfile"] != "managedInitialOutreachN1"
-        or not isinstance(candidate["recoveryProfile"], str)
+        or type(candidate["source"]) is not str
         or candidate["source"] != "managed_initial_outreach_n1"
-        or not isinstance(candidate["source"], str)
+        or type(candidate["actionType"]) is not str
         or candidate["actionType"] != "campaign_launch"
-        or not isinstance(candidate["actionType"], str)
     ):
         raise TypeError("canonical recovery payload constants are invalid")
 
