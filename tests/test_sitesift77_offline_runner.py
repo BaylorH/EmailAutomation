@@ -1,10 +1,13 @@
 import io
 import os
+import runpy
 import socket
 import subprocess
+import sys
 import types
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 from tests import run_sitesift77_offline as runner
@@ -178,6 +181,38 @@ class NetworkTripwireTests(unittest.TestCase):
             self.assertEqual(2, tripwire.activation_count)
             original_connect_ex.assert_called_once()
             original_sendto.assert_called_once()
+
+    def test_sendmsg_blocks_explicit_external_address_and_allows_safe_forms(self):
+        self.assertTrue(hasattr(socket.socket, "sendmsg"))
+        with patch.object(
+            socket.socket, "sendmsg", autospec=True, return_value=9
+        ) as original_sendmsg, patch.object(
+            socket.socket,
+            "getpeername",
+            autospec=True,
+            side_effect=[("127.0.0.1", 9), ("203.0.113.89", 9)],
+        ) as original_getpeername:
+            tripwire = runner.NetworkTripwire()
+            with tripwire:
+                datagram = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.addCleanup(datagram.close)
+                self.assertEqual(9, datagram.sendmsg([b"connected-form"]))
+                self.assertEqual(
+                    9,
+                    datagram.sendmsg(
+                        [b"loopback-form"], [], 0, ("127.0.0.1", 9)
+                    ),
+                )
+                with self.assertRaises(runner.OfflineNetworkAccessBlocked):
+                    datagram.sendmsg(
+                        [b"blocked-form"], [], 0, ("203.0.113.88", 9)
+                    )
+                with self.assertRaises(runner.OfflineNetworkAccessBlocked):
+                    datagram.sendmsg([b"blocked-connected-form"])
+
+            self.assertEqual(2, tripwire.activation_count)
+            self.assertEqual(2, original_sendmsg.call_count)
+            self.assertEqual(2, original_getpeername.call_count)
 
     def test_create_connection_cannot_bypass_tripwire(self):
         result = object()
@@ -537,11 +572,55 @@ class ExitStatusTests(unittest.TestCase):
         self.assertEqual(1, status)
         self.assertIn("network_tripwire_activations=1", output.getvalue())
 
+    def test_import_and_test_stdout_stderr_are_discarded_before_summary(self):
+        marker = "synthetic-secret-marker-must-not-escape"
+        outside = io.StringIO()
+        summary = io.StringIO()
+
+        def noisy_test():
+            print(marker)
+            print(marker, file=sys.stderr)
+
+        def importer(name):
+            print(marker)
+            test = noisy_test if name == EXPECTED_MODULE_ALLOWLIST[0] else lambda: None
+            return types.SimpleNamespace(
+                __name__=name,
+                suite=unittest.TestSuite((unittest.FunctionTestCase(test),)),
+            )
+
+        with redirect_stdout(outside), redirect_stderr(outside):
+            status = runner.run_offline_tests(
+                environ={},
+                import_module=importer,
+                loader=_SuiteLoader(),
+                stream=summary,
+            )
+
+        self.assertEqual(0, status)
+        self.assertNotIn(marker, outside.getvalue())
+        self.assertNotIn(marker, summary.getvalue())
+        self.assertEqual(1, len(summary.getvalue().splitlines()))
+        self.assertTrue(summary.getvalue().startswith("SiteSift77 offline result:"))
+
 
 class ImportBehaviorTests(unittest.TestCase):
     def test_import_does_not_execute_the_allowlisted_suite(self):
         self.assertTrue(callable(runner.main))
         self.assertEqual(0, runner.suite_execution_count())
+
+    def test_direct_script_bootstraps_exact_repo_root_before_allowlisted_imports(self):
+        script_path = Path(runner.__file__).resolve()
+        repo_root = str(script_path.parents[1])
+        isolated_path = [str(script_path.parent), "/synthetic-stdlib-placeholder"]
+
+        with patch.object(sys, "path", isolated_path):
+            namespace = runpy.run_path(
+                str(script_path), run_name="sitesift77_bootstrap_probe"
+            )
+            self.assertEqual(repo_root, namespace["REPO_ROOT"])
+            self.assertEqual(repo_root, sys.path[0])
+            self.assertEqual(1, sys.path.count(repo_root))
 
 
 if __name__ == "__main__":
