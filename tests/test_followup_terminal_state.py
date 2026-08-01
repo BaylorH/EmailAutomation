@@ -453,6 +453,55 @@ class FollowupTerminalStateTests(unittest.TestCase):
             thread_ref.updates[-1]["followUpConfig.processingBy"],
         )
 
+    def test_post_send_schedule_failure_fails_closed_and_surfaces_error(self):
+        past = datetime.now(timezone.utc) - followup.timedelta(hours=1)
+        attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
+        stale_data = {
+            "clientId": "client-1",
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": {
+                "enabled": True,
+                "nextFollowUpAt": past,
+                "currentFollowUpIndex": 0,
+                "followUps": [
+                    {"waitTime": 1, "waitUnit": "hours", "message": "Following up."},
+                ],
+            },
+        }
+        fake_fs = StaleWaitingFirestore(stale_data, stale_data)
+
+        def sent_followup(**_kwargs):
+            followup._set_followup_send_outcome(attempt_at=attempted_at)
+            return True
+
+        with patch.object(followup, "_fs", fake_fs), patch.object(
+            followup, "_next_business_followup_time", side_effect=lambda now, _cfg: now
+        ), patch.object(
+            followup, "_claim_followup", return_value="claim-owner"
+        ), patch.object(
+            followup, "_send_followup_email", side_effect=sent_followup
+        ), patch.object(
+            followup,
+            "_schedule_next_followup",
+            side_effect=RuntimeError("transaction unavailable"),
+        ), patch.object(
+            followup, "_release_followup_claim", return_value=True
+        ) as release:
+            states = followup.check_and_send_followups(
+                "uid-1", {"Authorization": "Bearer token"}
+            )
+
+        release.assert_called_once()
+        self.assertEqual("claim-owner", release.call_args.kwargs["claim_owner"])
+        self.assertEqual(0, release.call_args.kwargs["current_index"])
+        self.assertEqual(attempted_at, release.call_args.kwargs["attempted_at"])
+        self.assertTrue(release.call_args.kwargs["fail_closed"])
+        self.assertIn("post-send scheduling failed", release.call_args.kwargs["reason"])
+        self.assertEqual("error", states[0]["status"])
+        self.assertIn("post-send scheduling failed", states[0]["error"])
+
     def test_followup_blocks_note_field_request_before_graph(self):
         self.campaign_decision.return_value = CampaignAutomationDecision(
             state="allow",
@@ -1527,8 +1576,10 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertEqual([], thread_ref.updates)
 
     def test_schedule_next_followup_clears_previous_retry_guard_state(self):
-        thread_ref = FakeThreadRef()
         followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
             "lastSendError": "Read timed out",
             "lastSendAttemptAt": "2026-06-26T12:05:00Z",
             "lastSendAttemptIndex": 0,
@@ -1537,20 +1588,197 @@ class FollowupTerminalStateTests(unittest.TestCase):
                 {"waitTime": 2, "waitUnit": "hours", "message": "Second"},
             ],
         }
+        thread_ref = FakeThreadRef({
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": dict(followup_config),
+        })
 
-        with patch.object(followup, "_fs", FakeFirestore(thread_ref)):
-            followup._schedule_next_followup(
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ):
+            advanced = followup._schedule_next_followup(
                 "uid-1",
                 "thread-1",
                 followup_config,
                 just_sent_index=0,
+                claim_owner="claim-owner",
             )
 
+        self.assertTrue(advanced)
         update = thread_ref.updates[-1]
         self.assertEqual(update["followUpConfig.currentFollowUpIndex"], 1)
         self.assertIsNone(update["followUpConfig.lastSendError"])
         self.assertIsNone(update["followUpConfig.lastSendAttemptAt"])
         self.assertIsNone(update["followUpConfig.lastSendAttemptIndex"])
+
+    def test_schedule_next_followup_propagates_transaction_failure(self):
+        class ExplodingFirestore(FakeFirestore):
+            def transaction(self):
+                raise RuntimeError("transaction unavailable")
+
+        current_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "followUps": [
+                {"waitTime": 1, "waitUnit": "hours", "message": "Only"},
+            ],
+        }
+        thread_ref = FakeThreadRef({
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": current_config,
+        })
+
+        with patch.object(followup, "_fs", ExplodingFirestore(thread_ref)), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ), self.assertRaisesRegex(RuntimeError, "transaction unavailable"):
+            followup._schedule_next_followup(
+                "uid-1",
+                "thread-1",
+                current_config,
+                just_sent_index=0,
+                claim_owner="claim-owner",
+            )
+
+    def test_post_send_schedule_preserves_reply_terminal_and_manual_pause(self):
+        followups = [
+            {"waitTime": 1, "waitUnit": "hours", "message": "First"},
+            {"waitTime": 2, "waitUnit": "hours", "message": "Second"},
+        ]
+        cases = {
+            "inbound_reply": {
+                "status": "active",
+                "followUpStatus": "waiting",
+                "hasInboundReply": True,
+            },
+            "terminal": {
+                "status": "stopped",
+                "statusReason": "requirements_mismatch",
+                "followUpStatus": "stopped",
+                "pendingTerminalReason": "requirements_mismatch",
+                "hasInboundReply": True,
+            },
+            "manual_pause": {
+                "status": "paused",
+                "statusReason": "manual_continuation",
+                "followUpStatus": "paused",
+                "hasInboundReply": False,
+            },
+        }
+
+        for name, state in cases.items():
+            with self.subTest(name=name):
+                current_config = {
+                    "enabled": True,
+                    "currentFollowUpIndex": 0,
+                    "processingBy": "claim-owner",
+                    "followUps": followups,
+                }
+                thread_ref = FakeThreadRef({
+                    **state,
+                    "followUpConfig": current_config,
+                })
+
+                with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    advanced = followup._schedule_next_followup(
+                        "uid-1",
+                        "thread-1",
+                        current_config,
+                        just_sent_index=0,
+                        claim_owner="claim-owner",
+                    )
+
+                self.assertFalse(advanced)
+                self.assertEqual([], thread_ref.updates)
+
+    def test_post_send_schedule_preserves_newer_owner_and_index(self):
+        followups = [
+            {"waitTime": 1, "waitUnit": "hours", "message": "First"},
+            {"waitTime": 2, "waitUnit": "hours", "message": "Second"},
+        ]
+        stale_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "followUps": followups,
+        }
+        cases = {
+            "new_owner": {"currentFollowUpIndex": 0, "processingBy": "new-owner"},
+            "new_index": {"currentFollowUpIndex": 1, "processingBy": "claim-owner"},
+        }
+
+        for name, claim_state in cases.items():
+            with self.subTest(name=name):
+                current_config = {
+                    "enabled": True,
+                    "followUps": followups,
+                    **claim_state,
+                }
+                thread_ref = FakeThreadRef({
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "hasInboundReply": False,
+                    "followUpConfig": current_config,
+                })
+
+                with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    advanced = followup._schedule_next_followup(
+                        "uid-1",
+                        "thread-1",
+                        stale_config,
+                        just_sent_index=0,
+                        claim_owner="claim-owner",
+                    )
+
+                self.assertFalse(advanced)
+                self.assertEqual([], thread_ref.updates)
+
+    @patch.object(followup, "_clear_followup_row_highlight", create=True)
+    def test_post_send_schedule_marks_max_reached_for_exact_active_claim(
+        self,
+        clear_highlight,
+    ):
+        current_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "followUps": [
+                {"waitTime": 1, "waitUnit": "hours", "message": "Only"},
+            ],
+        }
+        thread_ref = FakeThreadRef({
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": current_config,
+        })
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ):
+            advanced = followup._schedule_next_followup(
+                "uid-1",
+                "thread-1",
+                current_config,
+                just_sent_index=0,
+                claim_owner="claim-owner",
+            )
+
+        self.assertTrue(advanced)
+        update = thread_ref.updates[-1]
+        self.assertEqual("max_reached", update["followUpStatus"])
+        self.assertEqual("stopped", update["status"])
+        self.assertEqual("max_followups_reached", update["statusReason"])
+        self.assertIsNone(update["followUpConfig.processingBy"])
+        clear_highlight.assert_called_once_with("uid-1", "thread-1")
 
 
 if __name__ == "__main__":

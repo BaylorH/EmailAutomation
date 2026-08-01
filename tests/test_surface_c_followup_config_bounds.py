@@ -37,7 +37,7 @@ class FakeThreadRef:
     def update(self, data):
         self.updates.append(data)
 
-    def get(self):
+    def get(self, transaction=None):
         return FakeThreadSnapshot(self._data)
 
 
@@ -63,8 +63,16 @@ class FakeFirestore:
     def update(self, data):
         self.thread_ref.update(data)
 
-    def get(self):
-        return self.thread_ref.get()
+    def get(self, transaction=None):
+        return self.thread_ref.get(transaction=transaction)
+
+    def transaction(self):
+        return FakeTransaction()
+
+
+class FakeTransaction:
+    def update(self, ref, data):
+        ref.update(dict(data))
 
 
 def _fixed_datetime(value):
@@ -202,16 +210,27 @@ class MidFlightWaitClampTests(unittest.TestCase):
     """Stored configs (writable straight to Firestore) are clamped in-flight."""
 
     def test_schedule_next_followup_clamps_non_positive_wait_to_default(self):
-        thread_ref = FakeThreadRef()
         followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
             "followUps": [
                 {"waitTime": 1, "waitUnit": "hours", "message": "first"},
                 {"waitTime": -10, "waitUnit": "hours", "message": "second"},
             ],
         }
+        thread_ref = FakeThreadRef({
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": followup_config,
+        })
         with patch.object(followup, "_fs", FakeFirestore(thread_ref)), \
-             patch.object(followup, "datetime", _fixed_datetime(MONDAY_NOW)):
-            followup._schedule_next_followup("uid-1", "thread-1", followup_config, 0)
+             patch.object(followup, "datetime", _fixed_datetime(MONDAY_NOW)), \
+             patch("google.cloud.firestore.transactional", lambda fn: fn):
+            followup._schedule_next_followup(
+                "uid-1", "thread-1", followup_config, 0, "claim-owner"
+            )
 
         update = thread_ref.updates[-1]
         scheduled = update["followUpConfig.nextFollowUpAt"]
@@ -219,16 +238,27 @@ class MidFlightWaitClampTests(unittest.TestCase):
         self.assertEqual(scheduled.isoformat(), "2026-06-22T18:00:00+00:00")
 
     def test_schedule_next_followup_clamps_excessive_wait_to_unit_max(self):
-        thread_ref = FakeThreadRef()
         followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
             "followUps": [
                 {"waitTime": 1, "waitUnit": "days", "message": "first"},
                 {"waitTime": 100000, "waitUnit": "days", "message": "second"},
             ],
         }
+        thread_ref = FakeThreadRef({
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": followup_config,
+        })
         with patch.object(followup, "_fs", FakeFirestore(thread_ref)), \
-             patch.object(followup, "datetime", _fixed_datetime(MONDAY_NOW)):
-            followup._schedule_next_followup("uid-1", "thread-1", followup_config, 0)
+             patch.object(followup, "datetime", _fixed_datetime(MONDAY_NOW)), \
+             patch("google.cloud.firestore.transactional", lambda fn: fn):
+            followup._schedule_next_followup(
+                "uid-1", "thread-1", followup_config, 0, "claim-owner"
+            )
 
         scheduled = thread_ref.updates[-1]["followUpConfig.nextFollowUpAt"]
         self.assertGreater(scheduled, MONDAY_NOW)

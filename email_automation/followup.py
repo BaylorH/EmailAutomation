@@ -749,17 +749,43 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
 
         if success:
             followups_sent += 1
-            operation_states.append(
-                _followup_operation_state("healthy", thread_id=thread_id)
-            )
-
-            # Schedule next follow-up if there are more
-            _schedule_next_followup(
-                user_id=user_id,
-                thread_id=thread_id,
-                followup_config=followup_config,
-                just_sent_index=current_index
-            )
+            try:
+                # Schedule next follow-up if there are more. This must surface
+                # transaction failures: the Graph send has already happened,
+                # so leaving the claim/index untouched could resend it later.
+                _schedule_next_followup(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    followup_config=followup_config,
+                    just_sent_index=current_index,
+                    claim_owner=claim_owner,
+                )
+            except Exception as exc:
+                failure_reason = f"Follow-up post-send scheduling failed: {exc}"
+                print(f"   ⚠️ {failure_reason}")
+                send_outcome = _get_followup_send_outcome()
+                persisted = _release_followup_claim(
+                    user_id,
+                    thread_id,
+                    reason=failure_reason,
+                    attempted_at=send_outcome.attempt_at,
+                    current_index=current_index,
+                    claim_owner=claim_owner,
+                    fail_closed=True,
+                )
+                if not persisted:
+                    failure_reason += "; fail-closed state could not be persisted"
+                operation_states.append(
+                    _followup_operation_state(
+                        "error",
+                        thread_id=thread_id,
+                        error=failure_reason,
+                    )
+                )
+            else:
+                operation_states.append(
+                    _followup_operation_state("healthy", thread_id=thread_id)
+                )
 
             # Stagger follow-up sends by 2 minutes to avoid spam detection
             # Only sleep if there are more threads to process
@@ -1381,39 +1407,114 @@ def _schedule_next_followup(
     user_id: str,
     thread_id: str,
     followup_config: Dict,
-    just_sent_index: int
-):
-    """Schedule the next follow-up in the sequence."""
-    followups = followup_config.get("followUps", [])
-    next_index = just_sent_index + 1
+    just_sent_index: int,
+    claim_owner: str,
+) -> bool:
+    """Advance the exact active claim without overwriting newer thread state.
 
-    if next_index >= len(followups):
-        # No more follow-ups
-        _mark_followup_complete(user_id, thread_id, "max_reached")
-        return
+    ``followup_config`` is the pre-claim query snapshot; the transactional read
+    below is authoritative for every post-send decision.
+    """
+    from google.cloud.firestore import transactional
 
-    # Calculate next follow-up time (clamped: stored config is untrusted)
-    next_followup = followups[next_index]
-    delta, wait_time, wait_unit = _followup_wait_delta(next_followup, default_wait=3)
-
-    next_followup_at = _next_business_followup_time(
-        datetime.now(timezone.utc) + delta,
-        followup_config,
+    thread_ref = (
+        _fs.collection("users")
+        .document(user_id)
+        .collection("threads")
+        .document(thread_id)
     )
 
-    _fs.collection("users").document(user_id).collection("threads").document(thread_id).update({
-        "followUpConfig.currentFollowUpIndex": next_index,
-        "followUpConfig.nextFollowUpAt": next_followup_at,
-        "followUpConfig.processingBy": None,
-        "followUpConfig.processingAt": None,
-        "followUpConfig.lastSendError": None,
-        "followUpConfig.lastSendAttemptAt": None,
-        "followUpConfig.lastSendAttemptIndex": None,
-        "followUpStatus": "waiting",
-        "updatedAt": SERVER_TIMESTAMP
-    })
+    @transactional
+    def schedule_transaction(transaction, thread_ref):
+        snapshot = thread_ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return "skipped", None
 
-    print(f"   Next follow-up scheduled for {next_followup_at.strftime('%Y-%m-%d %H:%M')} UTC")
+        data = snapshot.to_dict() or {}
+        current_config = data.get("followUpConfig")
+        if not isinstance(current_config, dict):
+            return "skipped", None
+
+        current_owner = current_config.get("processingBy")
+        if not claim_owner or current_owner != claim_owner:
+            print(
+                f"   ⏭️ Follow-up claim ownership changed from {claim_owner} "
+                f"to {current_owner}; not advancing"
+            )
+            return "skipped", None
+
+        current_index = current_config.get("currentFollowUpIndex", 0)
+        if current_index != just_sent_index:
+            print(
+                f"   ⏭️ Follow-up index changed from {just_sent_index} "
+                f"to {current_index}; not advancing"
+            )
+            return "skipped", None
+
+        block_reason = _followup_terminal_block_reason(
+            data,
+            current_config,
+            just_sent_index,
+        )
+        followup_status = str(data.get("followUpStatus") or "").strip().lower()
+        if block_reason or followup_status != "waiting":
+            reason = block_reason or f"follow-up tracking is {followup_status or 'unset'}"
+            print(f"   ⏭️ Preserving newer follow-up state: {reason}")
+            return "skipped", None
+
+        followups = current_config.get("followUps")
+        if not isinstance(followups, list) or not followups:
+            print("   ⏭️ Current follow-up sequence is missing; not advancing")
+            return "skipped", None
+
+        next_index = just_sent_index + 1
+        if next_index >= len(followups):
+            transaction.update(thread_ref, {
+                "followUpStatus": "max_reached",
+                "followUpConfig.processingBy": None,
+                "followUpConfig.processingAt": None,
+                "status": "stopped",
+                "statusReason": "max_followups_reached",
+                "updatedAt": SERVER_TIMESTAMP,
+            })
+            return "max_reached", None
+
+        # Calculate from the transaction's current config, not the stale query
+        # snapshot. Stored config remains untrusted, so wait bounds stay clamped.
+        delta, _wait_time, _wait_unit = _followup_wait_delta(
+            followups[next_index],
+            default_wait=3,
+        )
+        next_followup_at = _next_business_followup_time(
+            datetime.now(timezone.utc) + delta,
+            current_config,
+        )
+        transaction.update(thread_ref, {
+            "followUpConfig.currentFollowUpIndex": next_index,
+            "followUpConfig.nextFollowUpAt": next_followup_at,
+            "followUpConfig.processingBy": None,
+            "followUpConfig.processingAt": None,
+            "followUpConfig.lastSendError": None,
+            "followUpConfig.lastSendAttemptAt": None,
+            "followUpConfig.lastSendAttemptIndex": None,
+            "followUpStatus": "waiting",
+            "updatedAt": SERVER_TIMESTAMP,
+        })
+        return "scheduled", next_followup_at
+
+    outcome, next_followup_at = schedule_transaction(_fs.transaction(), thread_ref)
+
+    if outcome == "max_reached":
+        _clear_followup_row_highlight(user_id, thread_id)
+        print(f"   Follow-up sequence complete for thread {thread_id[:20]}... (max_reached)")
+        return True
+    if outcome == "scheduled":
+        print(
+            f"   Next follow-up scheduled for "
+            f"{next_followup_at.strftime('%Y-%m-%d %H:%M')} UTC"
+        )
+        return True
+    return False
 
 
 def schedule_followup_after_auto_response(user_id: str, thread_id: str) -> bool:
