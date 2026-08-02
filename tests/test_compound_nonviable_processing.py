@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("E2E_TEST_MODE", "true")
 
 with patch("google.cloud.firestore.Client", return_value=MagicMock()):
-    from email_automation import campaign_safety, processing
+    from email_automation import campaign_safety, processing, sheet_operations
 
 
 class FakeSnapshot:
@@ -88,13 +88,16 @@ class FakeCollection:
 
 
 class FakeWriteBatch:
-    def __init__(self):
+    def __init__(self, commit_error=None):
         self._updates = []
+        self._commit_error = commit_error
 
     def update(self, document_ref, data):
         self._updates.append((document_ref, data))
 
     def commit(self):
+        if self._commit_error:
+            raise self._commit_error
         for document_ref, _data in self._updates:
             if document_ref._update_error:
                 raise document_ref._update_error
@@ -103,10 +106,11 @@ class FakeWriteBatch:
 
 
 class FakeFirestore:
-    def __init__(self, thread_ref, client_ref, thread_docs=None):
+    def __init__(self, thread_ref, client_ref, thread_docs=None, batch_commit_errors=None):
         self.thread_ref = thread_ref
         self.client_ref = client_ref
         self.thread_docs = thread_docs or {}
+        self.batch_commit_errors = list(batch_commit_errors or [])
         self.client_ref._data.update({
             "status": "live",
             "automationPaused": False,
@@ -123,7 +127,8 @@ class FakeFirestore:
         return FakeCollection(FakeDocumentRef({}, exists=False))
 
     def batch(self):
-        return FakeWriteBatch()
+        commit_error = self.batch_commit_errors.pop(0) if self.batch_commit_errors else None
+        return FakeWriteBatch(commit_error=commit_error)
 
 
 class CompoundNonviableProcessingTests(unittest.TestCase):
@@ -173,6 +178,17 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         from_email="bp21harrison@gmail.com",
         row_below_nonviable=False,
         ensure_divider_side_effect=None,
+        move_row_side_effect=None,
+        notes_header="Notes",
+        existing_note="",
+        note_read_error=None,
+        note_write_error=None,
+        sync_thread_count=None,
+        stop_thread_count=None,
+        mark_event_handled_result=True,
+        update_thread_status_result=True,
+        finalization_error=None,
+        capture=None,
     ):
         client_id = "client-1"
         msg = self._common_graph_message(
@@ -201,6 +217,9 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "10.00",
             "3.31",
         ]
+        if notes_header is not None:
+            header.append(notes_header)
+            rowvals.append(existing_note)
         client_ref = FakeDocumentRef({"criteria": "Industrial search"})
         full_body_response = MagicMock()
         full_body_response.json.return_value = {
@@ -221,15 +240,18 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
 
         def fake_mark_event_handled(_user_id, _thread_id, event_key, _msg_id, notif_id):
             handled_events.append({"eventKey": event_key, "notifId": notif_id})
+            return mark_event_handled_result
 
         def fake_update_thread_status(_user_id, _thread_id, status, reason):
             status_updates.append({"status": status, "reason": reason})
+            return update_thread_status_result
 
         move_row = MagicMock(return_value=11)
+        if move_row_side_effect is not None:
+            move_row.side_effect = move_row_side_effect
         ensure_divider = MagicMock(return_value=10)
         if ensure_divider_side_effect is not None:
             ensure_divider.side_effect = ensure_divider_side_effect
-        stop_threads = MagicMock(return_value=1)
         call_trace = []
 
         def fake_send_reply(*args, **kwargs):
@@ -243,8 +265,58 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         send_reply = MagicMock(side_effect=fake_send_reply)
         mark_client_completed = MagicMock(side_effect=fake_mark_client_completed)
         thread_docs = thread_docs or {thread_id: thread_ref}
+        expected_thread_count = len(thread_docs)
+        sync_threads = MagicMock(
+            return_value=expected_thread_count if sync_thread_count is None else sync_thread_count
+        )
+        stop_threads = MagicMock(
+            return_value=expected_thread_count if stop_thread_count is None else stop_thread_count
+        )
+
+        sheets = MagicMock()
+        values_api = sheets.spreadsheets.return_value.values.return_value
+        note_get_request = MagicMock()
+        if note_read_error is not None:
+            note_get_request.execute.side_effect = note_read_error
+        elif existing_note:
+            note_get_request.execute.return_value = {"values": [[existing_note]]}
+        else:
+            note_get_request.execute.return_value = {"values": []}
+        values_api.get.return_value = note_get_request
+
+        note_update_request = MagicMock()
+        if note_write_error is not None:
+            note_update_request.execute.side_effect = note_write_error
+        else:
+            note_update_request.execute.return_value = {}
+        values_api.update.return_value = note_update_request
+
+        if capture is not None:
+            capture.update({
+                "handledEvents": handled_events,
+                "notifications": notifications,
+                "statusUpdates": status_updates,
+                "moveRow": move_row,
+                "ensureDivider": ensure_divider,
+                "syncThreads": sync_threads,
+                "stopThreads": stop_threads,
+                "sendReply": send_reply,
+                "markClientCompleted": mark_client_completed,
+                "callTrace": call_trace,
+                "noteGet": values_api.get,
+                "noteUpdate": values_api.update,
+                "threadRef": thread_ref,
+            })
+        firestore = FakeFirestore(
+            thread_ref,
+            client_ref,
+            thread_docs=thread_docs,
+            batch_commit_errors=[None, finalization_error] if finalization_error else None,
+        )
+        if capture is not None:
+            capture["firestore"] = firestore
         patches = [
-            patch.object(processing, "_fs", FakeFirestore(thread_ref, client_ref, thread_docs=thread_docs)),
+            patch.object(processing, "_fs", firestore),
             patch.object(processing, "exponential_backoff_request", return_value=full_body_response),
             patch.object(processing.requests, "get", return_value=me_response),
             patch.object(processing, "lookup_thread_by_message_id", return_value=thread_id),
@@ -273,7 +345,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             patch.object(processing, "write_message_order_test"),
             patch.object(processing, "fetch_url_as_text", return_value=None),
             patch.object(processing, "propose_sheet_updates", return_value=proposal),
-            patch.object(processing, "_sheets_client", return_value=MagicMock()),
+            patch.object(processing, "_sheets_client", return_value=sheets),
             patch.object(processing, "_get_first_tab_title", return_value="Sheet1"),
             patch.object(processing, "is_event_handled", return_value=False),
             patch.object(processing, "write_notification", side_effect=fake_write_notification),
@@ -281,9 +353,8 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             patch.object(processing, "_is_row_below_nonviable", return_value=row_below_nonviable),
             patch.object(processing, "ensure_nonviable_divider", new=ensure_divider),
             patch.object(processing, "move_row_below_divider", side_effect=move_row),
-            patch.object(processing, "sync_thread_row_numbers_after_move"),
+            patch.object(processing, "sync_thread_row_numbers_after_move", side_effect=sync_threads),
             patch.object(processing, "stop_threads_for_row", side_effect=stop_threads),
-            patch.object(processing, "find_notes_comment_column_index", return_value=None),
             patch.object(processing, "format_sheet_columns_autosize_with_exceptions"),
             patch.object(processing, "clear_row_highlight"),
             patch.object(processing, "highlight_row"),
@@ -313,6 +384,7 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             "statusUpdates": status_updates,
             "moveRow": move_row,
             "ensureDivider": ensure_divider,
+            "syncThreads": sync_threads,
             "stopThreads": stop_threads,
             "sendReply": send_reply,
             "markClientCompleted": mark_client_completed,
@@ -391,6 +463,289 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         self.assertEqual(processing.THREAD_STATUS["active"], current_root._data["status"])
         self.assertEqual(processing.THREAD_STATUS["active"], sibling_root._data["status"])
 
+    def test_property_unavailable_atomic_move_failure_has_no_terminal_side_effects(self):
+        body = "Hi Baylor,\n\n951 E FM 646 is no longer available.\n\nBest,\nRyan"
+        thread_id = "thread-atomic-sheet-failure"
+        current_root = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "followUpStatus": "waiting",
+        })
+        sibling_root = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "followUpStatus": "waiting",
+        })
+        proposal = {
+            "updates": [],
+            "events": [{"type": "property_unavailable", "reason": "no_longer_available"}],
+            "response_email": "Thank you for letting me know.",
+        }
+        capture = {}
+
+        with self.assertRaisesRegex(
+            processing.RetryableProcessingError,
+            "property_unavailable event failed",
+        ):
+            self._run_tour_invite_reply_processing(
+                thread_id=thread_id,
+                body=body,
+                proposal=proposal,
+                thread_ref=current_root,
+                thread_docs={
+                    thread_id: current_root,
+                    "thread-atomic-sheet-sibling": sibling_root,
+                },
+                row_anchor="951 E FM 646",
+                existing_note="Broker supplied availability details",
+                move_row_side_effect=RuntimeError("atomic Sheet batch failed"),
+                capture=capture,
+            )
+
+        capture["noteGet"].assert_called_once()
+        move_kwargs = capture["moveRow"].call_args.kwargs
+        self.assertEqual(8, move_kwargs["notes_column_index"])
+        self.assertEqual(
+            "Broker supplied availability details | "
+            "[06/19/2026] Property marked unavailable - contact said: 'no longer available'",
+            move_kwargs["notes_value"],
+        )
+        capture["syncThreads"].assert_not_called()
+        capture["stopThreads"].assert_not_called()
+        self.assertEqual([], capture["statusUpdates"])
+        self.assertEqual([], capture["handledEvents"])
+        self.assertEqual([], capture["notifications"])
+        capture["sendReply"].assert_not_called()
+        capture["noteUpdate"].assert_not_called()
+        for root in (current_root, sibling_root):
+            self.assertEqual("stopped", root._data["followUpStatus"])
+            self.assertEqual("no_longer_available", root._data["pendingTerminalReason"])
+            self.assertEqual(processing.THREAD_STATUS["active"], root._data["status"])
+
+    def test_property_unavailable_missing_notes_column_fails_closed(self):
+        body = "Hi Baylor,\n\n951 E FM 646 is no longer available.\n\nBest,\nRyan"
+        thread_id = "thread-missing-notes-column"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+            "followUpStatus": "waiting",
+        })
+        proposal = {
+            "updates": [],
+            "events": [{"type": "property_unavailable", "reason": "no_longer_available"}],
+            "response_email": "Thank you for letting me know.",
+        }
+        capture = {}
+
+        with self.assertRaisesRegex(
+            processing.RetryableProcessingError,
+            "Notes/Comments column is required",
+        ):
+            self._run_tour_invite_reply_processing(
+                thread_id=thread_id,
+                body=body,
+                proposal=proposal,
+                thread_ref=thread_ref,
+                row_anchor="951 E FM 646",
+                notes_header=None,
+                capture=capture,
+            )
+
+        self.assertEqual("stopped", thread_ref._data["followUpStatus"])
+        self.assertEqual("no_longer_available", thread_ref._data["pendingTerminalReason"])
+        capture["ensureDivider"].assert_not_called()
+        capture["moveRow"].assert_not_called()
+        capture["syncThreads"].assert_not_called()
+        capture["stopThreads"].assert_not_called()
+        self.assertEqual([], capture["statusUpdates"])
+        self.assertEqual([], capture["handledEvents"])
+        capture["sendReply"].assert_not_called()
+
+    def test_property_unavailable_existing_stable_note_is_not_duplicated(self):
+        stable_note = (
+            "[06/19/2026] Property marked unavailable - contact said: "
+            "'no longer available'"
+        )
+        thread_id = "thread-existing-terminal-note"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+        })
+        proposal = {
+            "updates": [],
+            "events": [{"type": "property_unavailable", "reason": "no_longer_available"}],
+            "response_email": None,
+        }
+
+        result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body="This property is no longer available.",
+            proposal=proposal,
+            thread_ref=thread_ref,
+            row_anchor="951 E FM 646",
+            existing_note=stable_note,
+        )
+
+        persisted_note = result["moveRow"].call_args.kwargs["notes_value"]
+        self.assertEqual(stable_note, persisted_note)
+        self.assertEqual(1, persisted_note.count(stable_note))
+
+    def test_property_unavailable_already_below_note_failure_blocks_terminalization(self):
+        thread_id = "thread-already-below-note-failure"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 11,
+        })
+        proposal = {
+            "updates": [],
+            "events": [{"type": "property_unavailable", "reason": "requirements_mismatch"}],
+            "response_email": "Understood, thank you.",
+        }
+        capture = {}
+
+        with self.assertRaisesRegex(
+            processing.RetryableProcessingError,
+            "already-below note repair failed",
+        ):
+            self._run_tour_invite_reply_processing(
+                thread_id=thread_id,
+                body="This space would not be a good fit for your client.",
+                proposal=proposal,
+                thread_ref=thread_ref,
+                row_anchor="951 Tristar Dr",
+                rownum=11,
+                row_below_nonviable=True,
+                existing_note="Legacy operator note",
+                note_write_error=RuntimeError("already-below note repair failed"),
+                capture=capture,
+            )
+
+        capture["moveRow"].assert_not_called()
+        capture["noteUpdate"].assert_called_once()
+        capture["stopThreads"].assert_not_called()
+        self.assertEqual([], capture["statusUpdates"])
+        self.assertEqual([], capture["handledEvents"])
+        capture["sendReply"].assert_not_called()
+        self.assertEqual(processing.THREAD_STATUS["active"], thread_ref._data["status"])
+
+    def test_requirements_mismatch_full_path_persists_truthful_stable_note(self):
+        thread_id = "thread-requirements-mismatch-note"
+        thread_ref = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+        })
+        proposal = {
+            "updates": [],
+            "events": [{"type": "property_unavailable", "reason": "requirements_mismatch"}],
+            "response_email": None,
+        }
+
+        result = self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body="This space would not be a good fit for your client.",
+            proposal=proposal,
+            thread_ref=thread_ref,
+            row_anchor="951 Tristar Dr",
+            existing_note="Reviewed loading configuration",
+        )
+
+        persisted_note = result["moveRow"].call_args.kwargs["notes_value"]
+        self.assertIn("[06/19/2026]", persisted_note)
+        self.assertIn("does not meet client requirements", persisted_note.lower())
+        self.assertNotIn("marked unavailable", persisted_note.lower())
+
+    def test_property_unavailable_finalization_batch_failure_retries_exact_staged_roots(self):
+        thread_id = "thread-finalization-power-loss"
+        current_root = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+        })
+        sibling_root = FakeDocumentRef({
+            "clientId": "client-1",
+            "email": ["bp21harrison@gmail.com"],
+            "status": processing.THREAD_STATUS["active"],
+            "rowNumber": 3,
+        })
+        proposal = {
+            "updates": [],
+            "events": [{"type": "property_unavailable", "reason": "no_longer_available"}],
+            "response_email": "Thank you for letting me know.",
+        }
+        first_capture = {}
+
+        with self.assertRaisesRegex(
+            processing.RetryableProcessingError,
+            "terminal Firestore finalization failed",
+        ):
+            self._run_tour_invite_reply_processing(
+                thread_id=thread_id,
+                body="This property is no longer available.",
+                proposal=proposal,
+                thread_ref=current_root,
+                thread_docs={
+                    thread_id: current_root,
+                    "thread-finalization-power-loss-sibling": sibling_root,
+                },
+                row_anchor="951 E FM 646",
+                finalization_error=RuntimeError("simulated power loss before Firestore commit"),
+                capture=first_capture,
+            )
+
+        first_capture["moveRow"].assert_called_once()
+        first_capture["sendReply"].assert_not_called()
+        stable_note = first_capture["moveRow"].call_args.kwargs["notes_value"]
+        for root in (current_root, sibling_root):
+            self.assertEqual(processing.THREAD_STATUS["active"], root._data["status"])
+            self.assertEqual(3, root._data["rowNumber"])
+            self.assertEqual("stopped", root._data["followUpStatus"])
+            self.assertEqual("no_longer_available", root._data["pendingTerminalReason"])
+            self.assertEqual(3, root._data["pendingTerminalSourceRow"])
+
+        second_capture = {}
+        self._run_tour_invite_reply_processing(
+            thread_id=thread_id,
+            body="This property is no longer available.",
+            proposal=proposal,
+            thread_ref=current_root,
+            thread_docs={
+                thread_id: current_root,
+                "thread-finalization-power-loss-sibling": sibling_root,
+            },
+            row_anchor="951 E FM 646",
+            rownum=11,
+            row_below_nonviable=True,
+            existing_note=stable_note,
+            capture=second_capture,
+        )
+
+        second_capture["moveRow"].assert_not_called()
+        second_capture["noteUpdate"].assert_not_called()
+        second_capture["sendReply"].assert_called_once()
+        self.assertEqual(["send", "complete"], second_capture["callTrace"])
+        for root in (current_root, sibling_root):
+            self.assertEqual(processing.THREAD_STATUS["stopped"], root._data["status"])
+            self.assertEqual(11, root._data["rowNumber"])
+            self.assertEqual("no_longer_available", root._data["nonViableReason"])
+            self.assertIsNone(root._data["pendingTerminalReason"])
+            self.assertIsNone(root._data["pendingTerminalSourceRow"])
+        self.assertTrue(
+            any(key.startswith("handledEvents.property_unavailable") for key in current_root._data)
+        )
+
     def test_nonviable_sibling_staging_failure_blocks_sheet_mutation(self):
         body = "Hi Baylor,\n\n951 E FM 646 is no longer available.\n\nBest,\nRyan"
         thread_id = "thread-current-root"
@@ -463,22 +818,16 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
         )
 
         result["moveRow"].assert_not_called()
-        result["stopThreads"].assert_called_once_with(
-            "NO7lVYVp6BaplKYEfMlWCgBnpdh2",
-            11,
-            client_id="client-1",
-            reason="requirements_mismatch",
+        result["stopThreads"].assert_not_called()
+        self.assertEqual(
+            processing.THREAD_STATUS["stopped"],
+            thread_ref._data["status"],
         )
-        self.assertIn(
-            {"status": processing.THREAD_STATUS["stopped"], "reason": "requirements_mismatch"},
-            result["statusUpdates"],
-        )
+        self.assertEqual("requirements_mismatch", thread_ref._data["statusReason"])
+        self.assertEqual("requirements_mismatch", thread_ref._data["nonViableReason"])
+        self.assertEqual("stopped", thread_ref._data["followUpStatus"])
         self.assertTrue(
-            any(
-                handled["eventKey"].startswith("property_unavailable")
-                and handled["notifId"] is None
-                for handled in result["handledEvents"]
-            )
+            any(key.startswith("handledEvents.property_unavailable") for key in thread_ref._data)
         )
 
     def test_property_unavailable_acknowledges_before_campaign_completion(self):
@@ -1117,7 +1466,6 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             patch.object(processing, "move_row_below_divider", return_value=11),
             patch.object(processing, "sync_thread_row_numbers_after_move"),
             patch.object(processing, "stop_threads_for_row", return_value=1),
-            patch.object(processing, "find_notes_comment_column_index", return_value=None),
             patch.object(processing, "format_sheet_columns_autosize_with_exceptions"),
             patch.object(processing, "clear_row_highlight"),
             patch.object(processing, "_property_exists_in_sheet", return_value=False),
@@ -1175,6 +1523,62 @@ class CompoundNonviableProcessingTests(unittest.TestCase):
             ),
             "stale tour event should be marked handled without a dashboard notification",
         )
+
+
+class TerminalNoteSheetBatchTests(unittest.TestCase):
+    def test_move_row_batch_copies_note_and_deletes_source_atomically(self):
+        sheets = MagicMock()
+        spreadsheets = sheets.spreadsheets.return_value
+
+        metadata_request = MagicMock()
+        metadata_request.execute.return_value = {
+            "sheets": [{"properties": {"sheetId": 123, "title": "Broker's Sheet"}}]
+        }
+        spreadsheets.get.return_value = metadata_request
+
+        header_request = MagicMock()
+        header_request.execute.return_value = {
+            "values": [[f"Column {index}" for index in range(1, 30)]]
+        }
+        spreadsheets.values.return_value.get.return_value = header_request
+
+        batch_request = MagicMock()
+        batch_request.execute.return_value = {}
+        spreadsheets.batchUpdate.return_value = batch_request
+
+        new_row = sheet_operations.move_row_below_divider(
+            sheets,
+            "sheet-1",
+            "Broker's Sheet",
+            3,
+            10,
+            notes_column_index=27,
+            notes_value="Existing note | [06/19/2026] Property does not meet client requirements",
+        )
+
+        self.assertEqual(10, new_row)
+        spreadsheets.batchUpdate.assert_called_once()
+        requests = spreadsheets.batchUpdate.call_args.kwargs["body"]["requests"]
+        self.assertEqual(
+            ["insertDimension", "copyPaste", "updateCells", "deleteDimension"],
+            [next(iter(request)) for request in requests],
+        )
+        note_request = requests[2]["updateCells"]
+        self.assertEqual(
+            {
+                "sheetId": 123,
+                "startRowIndex": 10,
+                "endRowIndex": 11,
+                "startColumnIndex": 26,
+                "endColumnIndex": 27,
+            },
+            note_request["range"],
+        )
+        self.assertEqual(
+            "Existing note | [06/19/2026] Property does not meet client requirements",
+            note_request["rows"][0]["values"][0]["userEnteredValue"]["stringValue"],
+        )
+        self.assertEqual("userEnteredValue", note_request["fields"])
 
 
 if __name__ == "__main__":

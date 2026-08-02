@@ -381,9 +381,24 @@ def ensure_nonviable_divider(sheets, spreadsheet_id: str, tab_title: str) -> int
         print(f"❌ Failed to ensure NON-VIABLE divider: {e}")
         raise
 
-def move_row_below_divider(sheets, spreadsheet_id: str, tab_title: str, src_row: int, divider_row: int) -> int:
+def move_row_below_divider(
+    sheets,
+    spreadsheet_id: str,
+    tab_title: str,
+    src_row: int,
+    divider_row: int,
+    *,
+    notes_column_index: Optional[int] = None,
+    notes_value: Optional[str] = None,
+) -> int:
     """
     Move src_row to immediately below the divider *and* keep the divider as the boundary.
+
+    When ``notes_column_index`` and ``notes_value`` are provided, the copied row's
+    terminal note is written in the same Sheets batch before the source row is
+    deleted. ``notes_column_index`` follows the repository's header-index contract
+    and is 1-based.
+
     Returns the new row number of the moved row (immediately below the divider after the operation).
     All row numbers are 1-based in the function signature.
     """
@@ -407,6 +422,16 @@ def move_row_below_divider(sheets, spreadsheet_id: str, tab_title: str, src_row:
         header = _read_header_row2(sheets, spreadsheet_id, tab_title)
         num_cols = max(1, len(header))
 
+        has_notes_column = notes_column_index is not None
+        has_notes_value = notes_value is not None
+        if has_notes_column != has_notes_value:
+            raise ValueError("notes_column_index and notes_value must be provided together")
+        if has_notes_column:
+            if not isinstance(notes_column_index, int) or not 1 <= notes_column_index <= num_cols:
+                raise ValueError("notes_column_index must identify a 1-based header column")
+            if not str(notes_value).strip():
+                raise ValueError("notes_value must contain the durable terminal reason")
+
         # 2) COPY the source row to the new blank row just inserted (at divider_row+1 in 1-based terms)
         requests.append({
             "copyPaste": {
@@ -428,7 +453,29 @@ def move_row_below_divider(sheets, spreadsheet_id: str, tab_title: str, src_row:
             }
         })
 
-        # 3) DELETE the original source row (above the divider), which lifts divider up by one
+        # 3) When requested, overwrite the copied row's Notes/Comments cell in
+        # this same batch. The Sheets API uses zero-based column indexes.
+        if has_notes_column:
+            notes_column_zero_based = notes_column_index - 1
+            requests.append({
+                "updateCells": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": divider_row,
+                        "endRowIndex": divider_row + 1,
+                        "startColumnIndex": notes_column_zero_based,
+                        "endColumnIndex": notes_column_zero_based + 1,
+                    },
+                    "rows": [{
+                        "values": [{
+                            "userEnteredValue": {"stringValue": str(notes_value)}
+                        }]
+                    }],
+                    "fields": "userEnteredValue",
+                }
+            })
+
+        # 4) DELETE the original source row (above the divider), which lifts divider up by one
         requests.append({
             "deleteDimension": {
                 "range": {

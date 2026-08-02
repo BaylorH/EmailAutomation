@@ -13,7 +13,7 @@ from urllib.parse import quote
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
 
 from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
-from .sheets import AssetLinkWriteError, format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, append_links_to_floorplan_column, write_property_image_columns, is_floorplan_filename, _header_index_map, _find_row_by_email, clear_row_highlight, highlight_row, ROW_HIGHLIGHT_BLUE
+from .sheets import AssetLinkWriteError, format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, append_links_to_floorplan_column, write_property_image_columns, is_floorplan_filename, _header_index_map, _find_row_by_email, clear_row_highlight, highlight_row, ROW_HIGHLIGHT_BLUE, _execute_with_retry, _col_letter
 from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move, stop_threads_for_row, complete_threads_for_row
 from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
                        dump_thread_from_firestore, has_processed, mark_processed, set_last_scan_iso,
@@ -3830,6 +3830,99 @@ def _build_property_unavailable_comment(current_date: str, found_keyword: str, e
     return f"{base} ({'; '.join(alternates)})"
 
 
+def _terminal_note_date(message: Dict[str, Any]) -> str:
+    """Return a retry-stable UTC date from the inbound Graph envelope."""
+    for field_name in ("receivedDateTime", "sentDateTime"):
+        raw_value = str((message or {}).get(field_name) or "").strip()
+        if not raw_value:
+            continue
+        try:
+            normalized = raw_value[:-1] + "+00:00" if raw_value.endswith("Z") else raw_value
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).strftime("%m/%d/%Y")
+        except (TypeError, ValueError):
+            continue
+    return datetime.now(timezone.utc).strftime("%m/%d/%Y")
+
+
+def _terminal_note_range(tab_title: str, notes_column_index: int, row_number: int) -> str:
+    """Build a safely quoted A1 range from 1-based row/column indexes."""
+    if not isinstance(notes_column_index, int) or notes_column_index < 1:
+        raise ValueError("notes_column_index must be a positive 1-based column")
+    if not isinstance(row_number, int) or row_number < 1:
+        raise ValueError("row_number must be a positive 1-based row")
+    safe_title = str(tab_title or "").replace("'", "''")
+    if not safe_title:
+        raise ValueError("tab_title is required for terminal note persistence")
+    return f"'{safe_title}'!{_col_letter(notes_column_index)}{row_number}"
+
+
+def _read_terminal_note(
+    sheets,
+    spreadsheet_id: str,
+    tab_title: str,
+    row_number: int,
+    notes_column_index: int,
+) -> str:
+    note_range = _terminal_note_range(tab_title, notes_column_index, row_number)
+    response = _execute_with_retry(
+        sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=note_range,
+        ),
+        "read_terminal_note",
+    )
+    values = response.get("values", []) if isinstance(response, dict) else []
+    if not values or not values[0]:
+        return ""
+    return str(values[0][0] or "").strip()
+
+
+def _merge_terminal_note(existing_note: str, terminal_note: str) -> str:
+    existing = str(existing_note or "").strip()
+    durable_note = str(terminal_note or "").strip()
+    if not durable_note:
+        raise ValueError("terminal note cannot be blank")
+    if durable_note in existing:
+        return existing
+    return f"{existing} | {durable_note}" if existing else durable_note
+
+
+def _ensure_terminal_note(
+    sheets,
+    spreadsheet_id: str,
+    tab_title: str,
+    row_number: int,
+    notes_column_index: int,
+    terminal_note: str,
+) -> str:
+    """Idempotently validate or repair a terminal note on an existing row."""
+    existing_note = _read_terminal_note(
+        sheets,
+        spreadsheet_id,
+        tab_title,
+        row_number,
+        notes_column_index,
+    )
+    merged_note = _merge_terminal_note(existing_note, terminal_note)
+    if merged_note == existing_note:
+        return merged_note
+
+    note_range = _terminal_note_range(tab_title, notes_column_index, row_number)
+    _execute_with_retry(
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=note_range,
+            valueInputOption="RAW",
+            body={"values": [[merged_note]]},
+        ),
+        "repair_terminal_note",
+    )
+    return merged_note
+
+
 def _nonviable_status_reason(event: Dict[str, Any]) -> str:
     reason = _event_text(event or {}, "reason") or "property_unavailable"
     normalized = reason.strip().lower().replace("-", "_").replace(" ", "_")
@@ -3875,39 +3968,155 @@ def _stage_row_thread_roots_for_terminal_transition(
     client_id: str,
     row_number: int,
     pending_patch: Dict[str, Any],
-) -> int:
+    *,
+    current_thread_id: str,
+) -> List[str]:
     """Make every thread root for a row non-sendable before Sheet mutation."""
     try:
-        if not client_id or row_number is None:
-            raise ValueError("clientId and rowNumber are required")
+        if not client_id or row_number is None or not current_thread_id:
+            raise ValueError("clientId, rowNumber, and current thread are required")
 
         threads_ref = (
             _fs.collection("users")
             .document(user_id)
             .collection("threads")
         )
+        terminal_reason = pending_patch.get("pendingTerminalReason")
         matching_thread_ids = []
         for thread in threads_ref.stream():
             thread_data = thread.to_dict() or {}
+            is_source_row = thread_data.get("rowNumber") == row_number
+            is_recovering_source_row = (
+                thread_data.get("pendingTerminalSourceRow") == row_number
+                and thread_data.get("pendingTerminalReason") == terminal_reason
+            )
             if (
                 thread_data.get("clientId") == client_id
-                and thread_data.get("rowNumber") == row_number
+                and (is_source_row or is_recovering_source_row)
             ):
                 matching_thread_ids.append(thread.id)
         if not matching_thread_ids:
             raise ValueError("no Firestore thread roots matched the terminal row")
+        if current_thread_id not in matching_thread_ids:
+            raise ValueError("current Firestore thread root did not match the terminal row")
 
         batch = _fs.batch()
+        staged_patch = {
+            **pending_patch,
+            "pendingTerminalSourceRow": row_number,
+        }
         for matching_thread_id in matching_thread_ids:
             batch.update(
                 threads_ref.document(matching_thread_id),
-                dict(pending_patch),
+                dict(staged_patch),
             )
         batch.commit()
-        return len(matching_thread_ids)
+        return matching_thread_ids
     except Exception as exc:
         raise RetryableProcessingError(
             f"Row thread terminal staging failed: {exc}"
+        ) from exc
+
+
+def _finalize_terminal_thread_roots(
+    user_id: str,
+    client_id: str,
+    staged_thread_ids: List[str],
+    *,
+    current_thread_id: str,
+    source_row: int,
+    final_row: int,
+    divider_row: Optional[int],
+    terminal_reason: str,
+    event_key: str,
+    message_id: str,
+    notification_id: Optional[str],
+) -> int:
+    """Atomically reconcile exact staged roots and record terminal event evidence.
+
+    Keeping the stopped status and handled-event marker in one Firestore batch
+    prevents a retry from being hidden behind the terminal-thread early exit.
+    """
+    try:
+        exact_ids = list(dict.fromkeys(staged_thread_ids or []))
+        if not exact_ids or current_thread_id not in exact_ids:
+            raise ValueError("exact staged thread roots are required for finalization")
+        if source_row is None or final_row is None:
+            raise ValueError("source and final row numbers are required")
+
+        threads_ref = (
+            _fs.collection("users")
+            .document(user_id)
+            .collection("threads")
+        )
+        snapshots = list(threads_ref.stream())
+        snapshots_by_id = {snapshot.id: snapshot for snapshot in snapshots}
+        missing_ids = [thread_id for thread_id in exact_ids if thread_id not in snapshots_by_id]
+        if missing_ids:
+            raise ValueError(f"staged thread roots disappeared: {missing_ids}")
+
+        batch = _fs.batch()
+        staged_id_set = set(exact_ids)
+        finalized_ids = set()
+        terminal_patch = {
+            "rowNumber": final_row,
+            "status": THREAD_STATUS["stopped"],
+            "statusReason": terminal_reason,
+            "statusUpdatedAt": SERVER_TIMESTAMP,
+            "nonViableAt": SERVER_TIMESTAMP,
+            "nonViableReason": terminal_reason,
+            "followUpStatus": "stopped",
+            "followUpConfig.nextFollowUpAt": None,
+            "followUpConfig.processingBy": None,
+            "followUpConfig.processingAt": None,
+            "pendingTerminalReason": None,
+            "pendingTerminalAt": None,
+            "pendingTerminalSourceRow": None,
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+
+        for snapshot in snapshots:
+            thread_data = snapshot.to_dict() or {}
+            if thread_data.get("clientId") != client_id:
+                continue
+
+            if snapshot.id in staged_id_set:
+                current_row = thread_data.get("rowNumber")
+                pending_source_row = thread_data.get("pendingTerminalSourceRow")
+                if current_row not in {source_row, final_row} and pending_source_row != source_row:
+                    raise ValueError(
+                        f"staged thread root {snapshot.id} no longer matches terminal rows"
+                    )
+                root_patch = dict(terminal_patch)
+                if snapshot.id == current_thread_id:
+                    root_patch[f"handledEvents.{event_key}"] = {
+                        "detectedAt": SERVER_TIMESTAMP,
+                        "detectedInMessageId": message_id,
+                        "notificationId": notification_id,
+                    }
+                batch.update(threads_ref.document(snapshot.id), root_patch)
+                finalized_ids.add(snapshot.id)
+                continue
+
+            current_row = thread_data.get("rowNumber")
+            if (
+                divider_row is not None
+                and source_row < final_row
+                and isinstance(current_row, int)
+                and source_row < current_row <= divider_row
+            ):
+                batch.update(
+                    threads_ref.document(snapshot.id),
+                    {"rowNumber": current_row - 1, "updatedAt": SERVER_TIMESTAMP},
+                )
+
+        if finalized_ids != staged_id_set:
+            raise ValueError("not every staged thread root was included in finalization")
+        batch.commit()
+        return len(finalized_ids)
+    except Exception as exc:
+        raise RetryableProcessingError(
+            f"terminal Firestore finalization failed: {exc}"
         ) from exc
 
 
@@ -5711,17 +5920,26 @@ def process_inbox_message(
                 row_anchor=row_anchor,
                 message_text=_full_text,
             )
+            staged_terminal_thread_ids = []
+            terminal_source_row = rownum
             if pending_nonviable_patch:
-                staged_thread_count = _stage_row_thread_roots_for_terminal_transition(
+                pending_source_row = thread_data.get("pendingTerminalSourceRow")
+                if isinstance(pending_source_row, int) and pending_source_row > 0:
+                    terminal_source_row = pending_source_row
+                staged_terminal_thread_ids = _stage_row_thread_roots_for_terminal_transition(
                     user_id,
                     client_id,
-                    rownum,
+                    terminal_source_row,
                     pending_nonviable_patch,
+                    current_thread_id=thread_id,
                 )
-                thread_data.update(pending_nonviable_patch)
+                thread_data.update({
+                    **pending_nonviable_patch,
+                    "pendingTerminalSourceRow": terminal_source_row,
+                })
                 print(
                     "🛑 Follow-up eligibility stopped before non-viable sheet work "
-                    f"for {staged_thread_count} row thread root(s)"
+                    f"for {len(staged_terminal_thread_ids)} row thread root(s)"
                 )
             print(f"\n{'='*60}")
             print(f"📋 EVENT PROCESSING: {len(events)} event(s) detected by AI")
@@ -6049,53 +6267,7 @@ def process_inbox_message(
                         continue
 
                     terminal_reason = _nonviable_status_reason(event)
-
-                    # Check if row is already below NON-VIABLE divider - if so, skip processing
-                    try:
-                        tab_title = _get_first_tab_title(sheets, sheet_id)
-                        if _is_row_below_nonviable(sheets, sheet_id, tab_title, rownum):
-                            print(
-                                f"ℹ️ Row {rownum} already below NON-VIABLE divider; "
-                                "terminalizing thread state without moving the sheet row"
-                            )
-                            stopped_thread_count = stop_threads_for_row(
-                                user_id,
-                                rownum,
-                                client_id=client_id,
-                                reason=terminal_reason,
-                            )
-                            update_thread_status(
-                                user_id,
-                                thread_id,
-                                THREAD_STATUS["stopped"],
-                                terminal_reason,
-                            )
-                            unavailable_thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
-                            unavailable_thread_ref.set({
-                                "nonViableAt": SERVER_TIMESTAMP,
-                                "nonViableReason": terminal_reason,
-                                "followUpStatus": "stopped",
-                                "updatedAt": SERVER_TIMESTAMP,
-                            }, merge=True)
-                            mark_event_handled(user_id, thread_id, event_key, msg_id, None)
-                            old_row_became_nonviable = True
-                            proposal["skip_response"] = True
-                            print(
-                                "🛑 Stopped already non-viable row thread(s): "
-                                f"{stopped_thread_count} row root(s) plus current thread"
-                            )
-                            if not any((evt or {}).get("type") == "new_property" for evt in events):
-                                _maybe_mark_client_completed(user_id, client_id)
-                            continue
-                    except Exception as e:
-                        print(f"⚠️ Failed to check if row is below divider: {e}")
-                        # Continue processing if we can't determine position
-                    
-                    # Move row below divider and create notification
-                    # Trust AI detection - GPT-5.2 already analyzed the message context
                     message_content = _full_text.lower()
-
-                    # Find keyword for logging purposes (optional - AI already detected unavailability)
                     found_keyword = next((kw for kw in PROPERTY_UNAVAILABLE_KEYWORDS if kw in message_content), "AI-detected unavailability")
                     comment_reason = (
                         terminal_reason
@@ -6105,111 +6277,177 @@ def process_inbox_message(
                     print(f"🔍 Processing property_unavailable event (trigger: '{found_keyword}')")
 
                     try:
-                            
-                            divider_row = ensure_nonviable_divider(sheets, sheet_id, tab_title)
-                            new_rownum = move_row_below_divider(sheets, sheet_id, tab_title, rownum, divider_row)
-
-                            # Sync thread rowNumbers after row movement to prevent stale anchors
-                            sync_thread_row_numbers_after_move(user_id, rownum, divider_row, new_rownum, client_id=client_id)
-
-                            stopped_thread_count = stop_threads_for_row(
-                                user_id,
-                                new_rownum,
-                                client_id=client_id,
-                                reason=terminal_reason,
+                        tab_title = _get_first_tab_title(sheets, sheet_id)
+                        comments_col_idx = find_notes_comment_column_index(header)
+                        if comments_col_idx is None:
+                            raise ValueError(
+                                "Notes/Comments column is required for a terminal transition"
                             )
-                            if stopped_thread_count == 0:
-                                update_thread_status(
+
+                        unavailable_comment = _build_property_unavailable_comment(
+                            _terminal_note_date(msg),
+                            comment_reason,
+                            events,
+                        )
+                        row_already_nonviable = _is_row_below_nonviable(
+                            sheets,
+                            sheet_id,
+                            tab_title,
+                            rownum,
+                        )
+
+                        if row_already_nonviable:
+                            print(
+                                f"ℹ️ Row {rownum} already below NON-VIABLE divider; "
+                                "repairing terminal evidence before finalizing thread state"
+                            )
+                            _ensure_terminal_note(
+                                sheets,
+                                sheet_id,
+                                tab_title,
+                                rownum,
+                                comments_col_idx,
+                                unavailable_comment,
+                            )
+
+                            # A retry after a committed Sheet move reuses the same
+                            # deterministic notification before atomically stopping
+                            # the exact staged roots and recording the handled event.
+                            recovery_notif_id = None
+                            if terminal_source_row != rownum:
+                                recovery_notif_id = write_notification(
                                     user_id,
-                                    thread_id,
-                                    THREAD_STATUS["stopped"],
-                                    terminal_reason,
+                                    client_id,
+                                    kind="property_unavailable",
+                                    priority="important",
+                                    email=to_addr_lower,
+                                    thread_id=thread_id,
+                                    row_number=rownum,
+                                    row_anchor=row_anchor,
+                                    meta={
+                                        "address": event.get("address", ""),
+                                        "city": event.get("city", ""),
+                                        "reason": terminal_reason,
+                                    },
+                                    dedupe_key=(
+                                        f"property_unavailable:{thread_id}:{rownum}:moved"
+                                    ),
                                 )
-                            unavailable_thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
-                            unavailable_thread_ref.set({
-                                "rowNumber": new_rownum,
-                                "nonViableAt": SERVER_TIMESTAMP,
-                                "nonViableReason": terminal_reason,
-                                "followUpStatus": "stopped",
-                                "updatedAt": SERVER_TIMESTAMP,
-                            }, merge=True)
 
-                            # Add comment to the best available notes column explaining why it was marked unviable.
-                            try:
-                                comments_col_idx = find_notes_comment_column_index(header)
-
-                                if comments_col_idx:
-                                    # Get current date for the comment
-                                    from datetime import datetime
-                                    current_date = datetime.now().strftime("%m/%d/%Y")
-                                    
-                                    # Create comment explaining why property was marked unviable.
-                                    unavailable_comment = _build_property_unavailable_comment(
-                                        current_date,
-                                        comment_reason,
-                                        events,
-                                    )
-                                    
-                                    # Get existing comments to append to them
-                                    existing_resp = sheets.spreadsheets().values().get(
-                                        spreadsheetId=sheet_id,
-                                        range=f"{tab_title}!{chr(64 + comments_col_idx)}{new_rownum}"
-                                    ).execute()
-                                    existing_comment = ""
-                                    if existing_resp.get("values"):
-                                        existing_comment = existing_resp["values"][0][0] if existing_resp["values"][0] else ""
-                                    
-                                    # Combine existing and new comments
-                                    if existing_comment.strip():
-                                        final_comment = f"{existing_comment.strip()} | {unavailable_comment}"
-                                    else:
-                                        final_comment = unavailable_comment
-                                    
-                                    # Update the comments cell
-                                    sheets.spreadsheets().values().update(
-                                        spreadsheetId=sheet_id,
-                                        range=f"{tab_title}!{chr(64 + comments_col_idx)}{new_rownum}",
-                                        valueInputOption="RAW",
-                                        body={"values": [[final_comment]]}
-                                    ).execute()
-                                    
-                                    print(f"💬 Added unavailability comment: {unavailable_comment}")
-                                else:
-                                    print(f"⚠️ Could not find notes column to add unavailability reason")
-                            except Exception as comment_error:
-                                print(f"⚠️ Failed to add unavailability comment: {comment_error}")
-                            
-                            # Reformat after move
-                            format_sheet_columns_autosize_with_exceptions(sheet_id, header)
-                            
-                            # mark the row as non-viable for this run
-                            old_row_became_nonviable = True
-                            rownum = new_rownum  # keep our pointer accurate if used later
-
-                            # Clear highlight - row is NON-VIABLE, no longer under system control
-                            try:
-                                clear_row_highlight(sheet_id, new_rownum)
-                            except Exception as e:
-                                print(f"⚠️ Could not clear row highlight: {e}")
-
-                            # Create notification only after successful move
-                            notif_id = write_notification(
-                                user_id, client_id,
-                                kind="property_unavailable",
-                                priority="important",
-                                email=to_addr_lower,
-                                thread_id=thread_id,
-                                row_number=new_rownum,
-                                row_anchor=row_anchor,
-                                meta={
-                                    "address": event.get("address", ""),
-                                    "city": event.get("city", ""),
-                                    "reason": terminal_reason,
-                                },
-                                dedupe_key=f"property_unavailable:{thread_id}:{new_rownum}:moved"
+                            finalized_thread_count = _finalize_terminal_thread_roots(
+                                user_id,
+                                client_id,
+                                staged_terminal_thread_ids,
+                                current_thread_id=thread_id,
+                                source_row=terminal_source_row,
+                                final_row=rownum,
+                                divider_row=(
+                                    rownum if terminal_source_row < rownum else None
+                                ),
+                                terminal_reason=terminal_reason,
+                                event_key=event_key,
+                                message_id=msg_id,
+                                notification_id=recovery_notif_id,
                             )
-                            mark_event_handled(user_id, thread_id, event_key, msg_id, notif_id)
-                            print(f"🚫 Moved property to non-viable and created notification")
+                            old_row_became_nonviable = True
+                            # A recovered partial transition still owes the
+                            # terminal acknowledgement. A legacy row that was
+                            # already non-viable before this message does not.
+                            proposal["skip_response"] = terminal_source_row == rownum
+                            print(
+                                "🛑 Finalized already non-viable row evidence for "
+                                f"{finalized_thread_count} exact thread root(s)"
+                            )
+                            if (
+                                terminal_source_row == rownum
+                                and not any(
+                                    (evt or {}).get("type") == "new_property"
+                                    for evt in events
+                                )
+                            ):
+                                _maybe_mark_client_completed(user_id, client_id)
+                            continue
+
+                        if terminal_source_row != rownum:
+                            raise ValueError(
+                                "pending terminal source row does not match the live source row"
+                            )
+
+                        existing_comment = _read_terminal_note(
+                            sheets,
+                            sheet_id,
+                            tab_title,
+                            rownum,
+                            comments_col_idx,
+                        )
+                        final_comment = _merge_terminal_note(
+                            existing_comment,
+                            unavailable_comment,
+                        )
+                        divider_row = ensure_nonviable_divider(
+                            sheets,
+                            sheet_id,
+                            tab_title,
+                        )
+                        new_rownum = move_row_below_divider(
+                            sheets,
+                            sheet_id,
+                            tab_title,
+                            rownum,
+                            divider_row,
+                            notes_column_index=comments_col_idx,
+                            notes_value=final_comment,
+                        )
+
+                        # The stable notification is written before the terminal
+                        # Firestore batch so an ambiguous commit can never leave a
+                        # stopped thread without its handled-event evidence.
+                        notif_id = write_notification(
+                            user_id, client_id,
+                            kind="property_unavailable",
+                            priority="important",
+                            email=to_addr_lower,
+                            thread_id=thread_id,
+                            row_number=new_rownum,
+                            row_anchor=row_anchor,
+                            meta={
+                                "address": event.get("address", ""),
+                                "city": event.get("city", ""),
+                                "reason": terminal_reason,
+                            },
+                            dedupe_key=f"property_unavailable:{thread_id}:{new_rownum}:moved"
+                        )
+                        finalized_thread_count = _finalize_terminal_thread_roots(
+                            user_id,
+                            client_id,
+                            staged_terminal_thread_ids,
+                            current_thread_id=thread_id,
+                            source_row=terminal_source_row,
+                            final_row=new_rownum,
+                            divider_row=divider_row,
+                            terminal_reason=terminal_reason,
+                            event_key=event_key,
+                            message_id=msg_id,
+                            notification_id=notif_id,
+                        )
+
+                        # Reformatting is cosmetic and must not turn a committed
+                        # terminal transition into a retry hidden by stopped state.
+                        try:
+                            format_sheet_columns_autosize_with_exceptions(sheet_id, header)
+                        except Exception as format_error:
+                            print(f"⚠️ Could not reformat terminal row: {format_error}")
+
+                        old_row_became_nonviable = True
+                        rownum = new_rownum
+                        try:
+                            clear_row_highlight(sheet_id, new_rownum)
+                        except Exception as e:
+                            print(f"⚠️ Could not clear row highlight: {e}")
+                        print(
+                            "🚫 Moved property with durable terminal note and finalized "
+                            f"{finalized_thread_count} exact thread root(s)"
+                        )
                     except Exception as e:
                         print(f"❌ Failed to handle property_unavailable: {e}")
                         import traceback
