@@ -547,42 +547,84 @@ _VIABILITY_NEGATION_MODIFIER_PATTERN = r"(?:all|both|currently|necessarily)"
 _VIABILITY_QUALIFIER_WORDS = frozenset({
     "anticipated", "expected", "likely", "projected", "scheduled",
 })
+_VIABILITY_NEGATOR_LINK_WORDS = frozenset({
+    "cannot", "longer", "no", "not",
+})
 _VIABILITY_QUALIFIER_PATTERN = (
     r"(?:expected|likely|anticipated|projected|scheduled)"
 )
-_VIABILITY_NEGATION_PREFIX_RE = re.compile(
-    rf"\b{_VIABILITY_NEGATOR_PATTERN}\s+"
-    rf"(?:{_VIABILITY_NEGATION_MODIFIER_PATTERN}\s+)*$",
+_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN = (
+    rf"(?:{_VIABILITY_NEGATOR_PATTERN}|"
+    rf"{_VIABILITY_NEGATION_MODIFIER_PATTERN})"
+)
+_VIABILITY_QUALIFIED_NEGATION_SCOPE_RE = re.compile(
+    rf"\b(?P<scope>"
+    rf"(?:{_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN}\s+){{0,6}}"
+    rf"(?:{_VIABILITY_QUALIFIER_PATTERN}|unlikely)\s+"
+    rf"(?:{_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN}\s+){{0,3}}"
+    rf"to\s+)$",
     re.IGNORECASE,
 )
-_VIABILITY_NEGATED_QUALIFIER_PREFIX_RE = re.compile(
-    rf"(?:\b{_VIABILITY_NEGATOR_PATTERN}\s+"
-    rf"(?:{_VIABILITY_NEGATION_MODIFIER_PATTERN}\s+){{0,3}}"
-    rf"{_VIABILITY_QUALIFIER_PATTERN}\s+to\s+|"
-    rf"\b{_VIABILITY_QUALIFIER_PATTERN}\s+(?:not|never)\s+to\s+)$",
+_VIABILITY_POST_INFINITIVE_NEGATION_SCOPE_RE = re.compile(
+    rf"\b(?P<scope>"
+    rf"(?:{_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN}\s+){{0,6}}"
+    rf"(?:{_VIABILITY_QUALIFIER_PATTERN}|unlikely)\s+to\s+"
+    rf"(?:{_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN}\s+){{1,3}})$",
     re.IGNORECASE,
 )
-_VIABILITY_UNLIKELY_PREFIX_RE = re.compile(
-    r"\bunlikely\s+to\s+$",
+_VIABILITY_DIRECT_INFINITIVE_NEGATION_SCOPE_RE = re.compile(
+    rf"\b(?P<scope>"
+    rf"(?:{_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN}\s+){{1,6}}"
+    rf"to\s+)$",
     re.IGNORECASE,
 )
+_VIABILITY_DIRECT_NEGATION_SCOPE_RE = re.compile(
+    rf"\b(?P<scope>"
+    rf"(?:{_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN}\s+){{1,6}})$",
+    re.IGNORECASE,
+)
+_VIABILITY_NEGATOR_RE = re.compile(
+    rf"\b{_VIABILITY_NEGATOR_PATTERN}\b",
+    re.IGNORECASE,
+)
+_VIABILITY_UNLIKELY_WORD_RE = re.compile(
+    r"\bunlikely\b",
+    re.IGNORECASE,
+)
+
+
+def _viability_lexical_negator_count(text: str) -> int:
+    normalized = text or ""
+    return sum(
+        1 for _match in _VIABILITY_NEGATOR_RE.finditer(normalized)
+    ) + sum(
+        1 for _match in _VIABILITY_UNLIKELY_WORD_RE.finditer(normalized)
+    )
+
+
+def _viability_prefix_negation_count(prefix: str) -> Optional[int]:
+    """Count negators in one bounded direct or qualified viability scope."""
+    normalized = prefix or ""
+    matched_scope = None
+    for scope_pattern in (
+        _VIABILITY_QUALIFIED_NEGATION_SCOPE_RE,
+        _VIABILITY_POST_INFINITIVE_NEGATION_SCOPE_RE,
+        _VIABILITY_DIRECT_INFINITIVE_NEGATION_SCOPE_RE,
+        _VIABILITY_DIRECT_NEGATION_SCOPE_RE,
+    ):
+        scope_match = scope_pattern.search(normalized)
+        if scope_match:
+            matched_scope = scope_match.group("scope")
+            break
+    if matched_scope is None:
+        return None
+    return _viability_lexical_negator_count(matched_scope)
 
 
 def _viability_prefix_is_lexically_negated(prefix: str) -> bool:
-    """Whether a viability predicate is directly or qualificationally negated."""
-    normalized = prefix or ""
-    if (
-        _VIABILITY_NEGATION_PREFIX_RE.search(normalized)
-        or _VIABILITY_NEGATED_QUALIFIER_PREFIX_RE.search(normalized)
-    ):
-        return True
-    unlikely = _VIABILITY_UNLIKELY_PREFIX_RE.search(normalized)
-    return bool(
-        unlikely
-        and not _VIABILITY_NEGATION_PREFIX_RE.search(
-            normalized[:unlikely.start()]
-        )
-    )
+    """Evaluate bounded direct and qualified negators by odd/even parity."""
+    negator_count = _viability_prefix_negation_count(prefix)
+    return negator_count is not None and negator_count % 2 == 1
 
 # Ancillary / non-target subjects a lease reference may bind to. A lease about one
 # of these (or a tour slot/window) is not the property going away (M15, M19, M20).

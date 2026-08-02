@@ -24,6 +24,7 @@ from .logging import write_message_order_test
 from .ai_processing import (
     _ANCILLARY_SUBJECT_RE,
     _UNAVAILABLE_PATTERNS,
+    _VIABILITY_NEGATOR_LINK_WORDS,
     _VIABILITY_QUALIFIER_WORDS,
     _VIABILITY_RE,
     _append_ai_meta,
@@ -32,6 +33,8 @@ from .ai_processing import (
     _source_mentions_target_property,
     _street_claim_spans,
     _target_street_identity,
+    _viability_lexical_negator_count,
+    _viability_prefix_negation_count,
     _viability_prefix_is_lexically_negated,
     apply_proposal_to_sheet,
     check_missing_required_fields,
@@ -2309,13 +2312,24 @@ def _is_bounded_coordinated_viability_link(link_text: str) -> bool:
     ):
         return False
     words = normalized.lower().replace("’", "'").split()
-    return all(
+    if not all(
         word in _COORDINATED_LINK_AUXILIARIES
         or word in _COORDINATED_LINK_IRREGULAR_ADVERBS
+        or word in _VIABILITY_NEGATOR_LINK_WORDS
         or word in _COORDINATED_LINK_VIABILITY_QUALIFIERS
         or word.endswith("ly")
         or word.endswith("n't")
         for word in words
+    ):
+        return False
+    total_negators = _viability_lexical_negator_count(normalized)
+    if total_negators == 0:
+        return True
+    scoped_negators = _viability_prefix_negation_count(f"{normalized} ")
+    return bool(
+        scoped_negators is not None
+        and scoped_negators == total_negators
+        and scoped_negators % 2 == 0
     )
 
 
