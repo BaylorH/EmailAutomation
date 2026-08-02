@@ -2247,6 +2247,10 @@ _QUANTIFIED_ADDRESS_LIST_RELATION_RE = re.compile(
     r"\b(?:for|at|across|covering|serving|assigned\s+to)\s*$",
     re.IGNORECASE,
 )
+_IMPLICIT_QUANTIFIED_ADDRESS_SUBJECT_RE = re.compile(
+    r"(?:of(?:\s+(?:the|these|those))?)?",
+    re.IGNORECASE,
+)
 
 
 def _is_bounded_coordinated_viability_link(link_text: str) -> bool:
@@ -2288,14 +2292,17 @@ def _bounded_subject_is_property_set(subject_text: str) -> Optional[bool]:
 
 
 def _address_list_subject_is_property_set(subject_text: str) -> Optional[bool]:
-    """Classify the bounded noun phrase before a quantified address list."""
+    """Classify a quantified address-list subject, failing closed if explicit."""
     normalized = (subject_text or "").strip(" \t,")
     relation = _QUANTIFIED_ADDRESS_LIST_RELATION_RE.search(normalized)
     if relation:
         normalized = normalized[:relation.start()].strip(" \t,")
-    if not normalized or _is_bounded_coordinated_viability_link(normalized):
+    if _IMPLICIT_QUANTIFIED_ADDRESS_SUBJECT_RE.fullmatch(normalized):
+        return True
+    if _is_bounded_coordinated_viability_link(normalized):
         return None
-    return _bounded_subject_is_property_set(normalized)
+    classified_subject = _bounded_subject_is_property_set(normalized)
+    return classified_subject if classified_subject is not None else False
 
 
 def _quantified_subject_is_property_set(
@@ -2305,10 +2312,10 @@ def _quantified_subject_is_property_set(
 ) -> Optional[bool]:
     """Classify a bounded ``each``/``both`` subject before viability.
 
-    True means the quantifier governs the preceding property set. False means
-    it explicitly governs another subject, so the viability predicate must not
-    inherit a nearby address. None means there is no bounded quantified subject
-    for this predicate and the normal nearest-property rules should apply.
+    True means the quantifier governs the property set. False means it governs
+    another explicit subject, including one outside the bounded grammar, so the
+    viability predicate must not inherit a nearby address. None means there is
+    no quantified subject for this predicate and normal binding should apply.
     """
     prefix = (clause or "")[:viability_match.start()]
     quantifiers = list(_PROPERTY_SET_QUANTIFIER_RE.finditer(prefix))
