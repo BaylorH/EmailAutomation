@@ -1503,6 +1503,12 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "Schedule [A-1 - {residual}",
             "Exhibit B.2) ({residual})",
             "VERSION IV] — {residual}",
+            "Figure ((IV)): {residual}",
+            "Figure ([IV]): {residual}",
+            "Figure [[IV]]: {residual}",
+            "Figure (IV)): {residual}",
+            "Table ((1)): {residual}",
+            "Schedule [[A-1]] — {residual}",
         )
         residuals = ("Building Facts", "Oak Center")
 
@@ -1531,6 +1537,21 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                         for event in result["events"]
                     ))
                     self.assertIsNone(result["response_email"])
+
+    def test_caption_syntax_precheck_ignores_property_name_tokens(self):
+        property_names = (
+            "Figure (Ivy Commerce Park)",
+            "Table [Rock Center]",
+            "Page (Commerce Center)",
+            "Section [Eight Plaza]",
+            "Exhibit Westgate Logistics Hub",
+        )
+
+        for property_name in property_names:
+            with self.subTest(property_name=property_name):
+                self.assertIsNone(
+                    ai_processing._document_caption_verdict(property_name)
+                )
 
     def test_numbered_unknown_property_headings_still_fail_closed(self):
         headings = (

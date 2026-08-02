@@ -1943,6 +1943,15 @@ _DOCUMENT_CAPTION_RE = re.compile(
     r"(?=$|\s|[:(–—-]|\.(?=\s))(?P<suffix>.*)$",
     re.IGNORECASE,
 )
+_DOCUMENT_CAPTION_LIKE_RE = re.compile(
+    r"^\s*(?:table|figure|page|section|schedule|exhibit|version|revision)\s+"
+    r"(?:#\s*)?(?:"
+    rf"(?:[\[(]\s*)+{_DOCUMENT_CAPTION_DESIGNATOR_PATTERN}"
+    r"(?=$|\s|[)\]]|[:(–—-]|\.(?=\s))|"
+    rf"{_DOCUMENT_CAPTION_DESIGNATOR_PATTERN}\s*(?=[)\]])"
+    r")",
+    re.IGNORECASE,
+)
 _UNBOUND_IDENTITY_PREFIX_RE = re.compile(
     r"^\s*(?P<label>[a-z][a-z0-9&'’/-]*"
     r"(?:\s+[a-z][a-z0-9&'’/-]*){0,7})"
@@ -2182,7 +2191,11 @@ def _document_caption_verdict(text: str) -> Optional[str]:
     """Classify a numbered caption by its residual title, when present."""
     caption = _DOCUMENT_CAPTION_RE.match(text or "")
     if not caption:
-        return None
+        return (
+            "competing"
+            if _DOCUMENT_CAPTION_LIKE_RE.match(text or "")
+            else None
+        )
     wrapper_pair = (
         caption.group("open_wrapper"),
         caption.group("close_wrapper"),
