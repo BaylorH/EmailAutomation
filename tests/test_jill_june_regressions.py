@@ -1240,6 +1240,111 @@ class JillJuneRegressionTests(unittest.TestCase):
                                     )
                                 )
 
+    def test_property_set_quantifiers_bind_all_preceding_addresses(self):
+        address_pairs = (
+            ("1 Main St", "2 Oak Ave"),
+            ("12 Main St", "34 Oak Ave"),
+            ("123 Main St", "456 Oak Ave"),
+            ("1234 Main St", "5678 Oak Ave"),
+            ("12345 Main St", "56789 Oak Ave"),
+            ("123456 Main St", "654321 Oak Ave"),
+        )
+        connectors = (", and ", " and ", ", but ", " but ", ", ", ". ", "; ")
+        quantifier_phrases = (
+            "both are still available",
+            "each property is still available",
+            "both properties remain available",
+            "each site currently remains available",
+        )
+
+        for target_address, competitor_address in address_pairs:
+            for first, second in (
+                (target_address, competitor_address),
+                (competitor_address, target_address),
+            ):
+                for reason in ("leased", "sold", "no_space_available"):
+                    event = {"type": "property_unavailable", "reason": reason}
+                    for connector in connectors:
+                        for quantifier_phrase in quantifier_phrases:
+                            message_text = (
+                                f"{first} and {second}{connector}"
+                                f"{quantifier_phrase}."
+                            )
+                            with self.subTest(
+                                target_address=target_address,
+                                first=first,
+                                reason=reason,
+                                connector=connector,
+                                quantifier_phrase=quantifier_phrase,
+                            ):
+                                self.assertFalse(
+                                    processing._property_unavailable_event_applies_to_row(
+                                        event,
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+                                self.assertIsNone(
+                                    processing._pending_nonviable_followup_patch(
+                                        [event],
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+
+    def test_nonproperty_set_quantifiers_do_not_bind_preceding_addresses(self):
+        address_pairs = (
+            ("1 Main St", "2 Oak Ave"),
+            ("123 Main St", "456 Oak Ave"),
+            ("123456 Main St", "654321 Oak Ave"),
+        )
+        connectors = (", and ", " and ", ", but ", " but ", ", ", ". ", "; ")
+        quantifier_phrases = (
+            "both brokers are still available",
+            "each owner is still available",
+            "both prices remain available",
+            "each property manager is still available",
+        )
+
+        for target_address, competitor_address in address_pairs:
+            for first, second in (
+                (target_address, competitor_address),
+                (competitor_address, target_address),
+            ):
+                for reason in ("leased", "sold", "no_space_available"):
+                    event = {"type": "property_unavailable", "reason": reason}
+                    for connector in connectors:
+                        for quantifier_phrase in quantifier_phrases:
+                            message_text = (
+                                f"{first} and {second}{connector}"
+                                f"{quantifier_phrase}."
+                            )
+                            with self.subTest(
+                                target_address=target_address,
+                                first=first,
+                                reason=reason,
+                                connector=connector,
+                                quantifier_phrase=quantifier_phrase,
+                            ):
+                                patch = processing._pending_nonviable_followup_patch(
+                                    [event],
+                                    row_anchor=f"{target_address}, Phoenix",
+                                    message_text=message_text,
+                                )
+                                self.assertTrue(
+                                    processing._property_unavailable_event_applies_to_row(
+                                        event,
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+                                self.assertIsNotNone(patch)
+                                self.assertEqual("stopped", patch["followUpStatus"])
+                                self.assertEqual(
+                                    reason,
+                                    patch["pendingTerminalReason"],
+                                )
+
     def test_near_negated_availability_never_suppresses_target_terminal_event(self):
         address_pairs = (
             ("1 Main St", "2 Oak Ave"),

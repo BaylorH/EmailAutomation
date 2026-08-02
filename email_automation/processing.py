@@ -2224,6 +2224,17 @@ _COORDINATED_LINK_IRREGULAR_ADVERBS = {
     "never", "now", "often", "perhaps", "quite", "rather", "since",
     "still", "then", "yet",
 }
+_PROPERTY_SET_QUANTIFIER_RE = re.compile(r"\b(?:both|each)\b", re.IGNORECASE)
+_PROPERTY_SET_SUBJECT_RE = re.compile(
+    r"^(?:(?:of\s+)?(?:the\s+|these\s+|those\s+)?)?"
+    r"(?:propert(?:y|ies)|buildings?|sites?|spaces?|listings?)\b",
+    re.IGNORECASE,
+)
+_BOUNDED_QUANTIFIED_SUBJECT_RE = re.compile(
+    r"[a-z]+(?:[-'’][a-z]+)*"
+    r"(?:[ \t]+[a-z]+(?:[-'’][a-z]+)*){0,9}",
+    re.IGNORECASE,
+)
 
 
 def _is_bounded_coordinated_viability_link(link_text: str) -> bool:
@@ -2250,6 +2261,57 @@ def _is_bounded_coordinated_viability_link(link_text: str) -> bool:
         or word.endswith("n't")
         for word in words
     )
+
+
+def _quantified_subject_is_property_set(
+    clause: str,
+    bindings: List[tuple],
+    viability_match: re.Match,
+) -> Optional[bool]:
+    """Classify a bounded ``each``/``both`` subject before viability.
+
+    True means the quantifier governs the preceding property set. False means
+    it explicitly governs another subject, so the viability predicate must not
+    inherit a nearby address. None means there is no bounded quantified subject
+    for this predicate and the normal nearest-property rules should apply.
+    """
+    prefix = (clause or "")[:viability_match.start()]
+    quantifiers = list(_PROPERTY_SET_QUANTIFIER_RE.finditer(prefix))
+    if not quantifiers:
+        return None
+
+    quantifier = quantifiers[-1]
+    if any(
+        start >= quantifier.end() and end <= viability_match.start()
+        for start, end, _kind in bindings
+    ):
+        return None
+
+    subject_and_link = prefix[quantifier.end():].strip()
+    if _is_bounded_coordinated_viability_link(subject_and_link):
+        return True
+
+    property_subject = _PROPERTY_SET_SUBJECT_RE.match(subject_and_link)
+    if property_subject and _is_bounded_coordinated_viability_link(
+        subject_and_link[property_subject.end():]
+    ):
+        return True
+
+    if not _BOUNDED_QUANTIFIED_SUBJECT_RE.fullmatch(subject_and_link):
+        return None
+
+    word_spans = list(
+        re.finditer(
+            r"[a-z]+(?:[-'’][a-z]+)*",
+            subject_and_link,
+            re.IGNORECASE,
+        )
+    )
+    for subject_word_count in range(1, min(5, len(word_spans)) + 1):
+        subject_end = word_spans[subject_word_count - 1].end()
+        if _is_bounded_coordinated_viability_link(subject_and_link[subject_end:]):
+            return False
+    return None
 
 
 def _neither_nor_binds_viability(
@@ -2422,23 +2484,39 @@ def _clause_has_target_terminal_after_ancillary(
 def _message_explicitly_keeps_row_viable(message_text: str, row_anchor: str) -> bool:
     last_explicit_binding = None
     last_explicit_kinds = set()
+    last_explicit_binding_count = 0
     for sentence in _terminal_binding_clauses(message_text):
         bindings = _explicit_property_bindings(sentence, row_anchor)
         for viability_match in _VIABILITY_RE.finditer(sentence):
             if _viability_match_is_negated(sentence, bindings, viability_match):
                 continue
+            quantified_property_set = _quantified_subject_is_property_set(
+                sentence,
+                bindings,
+                viability_match,
+            )
+            preceding_bindings = [
+                binding
+                for binding in bindings
+                if binding[1] <= viability_match.start()
+            ]
+            quantified_kinds = (
+                {kind for _start, _end, kind in preceding_bindings}
+                or last_explicit_kinds
+            )
+            quantified_binding_count = (
+                len(preceding_bindings)
+                if preceding_bindings
+                else last_explicit_binding_count
+            )
             if (
-                re.search(
-                    r"\b(?:both|each)\s*$",
-                    sentence[:viability_match.start()],
-                    re.IGNORECASE,
-                )
-                and "target" in (
-                    {kind for _start, _end, kind in bindings}
-                    or last_explicit_kinds
-                )
+                quantified_property_set is True
+                and quantified_binding_count >= 2
+                and "target" in quantified_kinds
             ):
                 return True
+            if quantified_property_set is False:
+                continue
             if (
                 _viability_is_shared_across_property_bindings(
                     sentence,
@@ -2463,6 +2541,7 @@ def _message_explicitly_keeps_row_viable(message_text: str, row_anchor: str) -> 
                 kind
                 for _start, _end, kind in bindings
             }
+            last_explicit_binding_count = len(bindings)
     return False
 
 
