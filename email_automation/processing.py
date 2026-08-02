@@ -2237,13 +2237,27 @@ _PROPERTY_SET_SUBJECT_NOUNS = {
     "warehouse", "warehouses", "facility", "facilities", "premises",
     "unit", "units", "suite", "suites",
 }
+_BOUNDED_QUANTIFIED_SUBJECT_WORD_PATTERN = (
+    r"[a-z]+(?:[-'’][a-z]+)*(?:['’])?"
+)
+_BOUNDED_QUANTIFIED_SUBJECT_NUMERIC_PATTERN = (
+    r"\d+(?:,\d{3})*(?:\.\d+)?(?:[a-z]+)?(?:-[a-z0-9]+)*"
+)
+_BOUNDED_QUANTIFIED_SUBJECT_TOKEN_PATTERN = (
+    rf"(?:{_BOUNDED_QUANTIFIED_SUBJECT_WORD_PATTERN}|"
+    rf"{_BOUNDED_QUANTIFIED_SUBJECT_NUMERIC_PATTERN})"
+)
 _BOUNDED_QUANTIFIED_SUBJECT_WORD_RE = re.compile(
-    r"[a-z]+(?:[-'’][a-z]+)*(?:['’])?",
+    _BOUNDED_QUANTIFIED_SUBJECT_WORD_PATTERN,
+    re.IGNORECASE,
+)
+_BOUNDED_QUANTIFIED_SUBJECT_TOKEN_RE = re.compile(
+    _BOUNDED_QUANTIFIED_SUBJECT_TOKEN_PATTERN,
     re.IGNORECASE,
 )
 _BOUNDED_QUANTIFIED_SUBJECT_RE = re.compile(
-    r"[a-z]+(?:[-'’][a-z]+)*(?:['’])?"
-    r"(?:[ \t]+[a-z]+(?:[-'’][a-z]+)*(?:['’])?){0,9}",
+    rf"{_BOUNDED_QUANTIFIED_SUBJECT_TOKEN_PATTERN}"
+    rf"(?:[ \t]+{_BOUNDED_QUANTIFIED_SUBJECT_TOKEN_PATTERN}){{0,9}}",
     re.IGNORECASE,
 )
 _QUANTIFIED_ADDRESS_LIST_RELATION_RE = re.compile(
@@ -2287,10 +2301,13 @@ def _bounded_subject_is_property_set(subject_text: str) -> Optional[bool]:
     normalized = (subject_text or "").strip()
     if not normalized or not _BOUNDED_QUANTIFIED_SUBJECT_RE.fullmatch(normalized):
         return None
-    words = list(_BOUNDED_QUANTIFIED_SUBJECT_WORD_RE.finditer(normalized))
-    if not words:
+    tokens = list(_BOUNDED_QUANTIFIED_SUBJECT_TOKEN_RE.finditer(normalized))
+    if not tokens:
         return None
-    head = words[-1].group(0).lower().rstrip("'’")
+    head_token = tokens[-1].group(0)
+    if not _BOUNDED_QUANTIFIED_SUBJECT_WORD_RE.fullmatch(head_token):
+        return False
+    head = head_token.lower().rstrip("'’")
     return head in _PROPERTY_SET_SUBJECT_NOUNS
 
 
@@ -2354,11 +2371,11 @@ def _quantified_subject_is_property_set(
     if not _BOUNDED_QUANTIFIED_SUBJECT_RE.fullmatch(subject_and_link):
         return None
 
-    word_spans = list(
-        _BOUNDED_QUANTIFIED_SUBJECT_WORD_RE.finditer(subject_and_link)
+    subject_tokens = list(
+        _BOUNDED_QUANTIFIED_SUBJECT_TOKEN_RE.finditer(subject_and_link)
     )
-    for subject_word_count in range(1, len(word_spans) + 1):
-        subject_end = word_spans[subject_word_count - 1].end()
+    for subject_token_count in range(1, len(subject_tokens) + 1):
+        subject_end = subject_tokens[subject_token_count - 1].end()
         if _is_bounded_coordinated_viability_link(subject_and_link[subject_end:]):
             return _bounded_subject_is_property_set(subject_and_link[:subject_end])
     return None
