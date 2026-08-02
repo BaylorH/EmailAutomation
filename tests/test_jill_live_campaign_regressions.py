@@ -1596,6 +1596,94 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
         ))
         self.assertIsNone(result["response_email"])
 
+    def test_one_cell_caption_rows_do_not_break_target_table_alignment(self):
+        caption_rows = (
+            "Figure I",
+            "| Figure I |",
+            "|| Figure I ||",
+            '| "Figure I" |',
+            '"| Figure I |"',
+            "“Figure I”",
+        )
+        table_formats = (
+            "{caption}\n| Docks |\n| --- |\n| 6 |\n| 100 Main St |",
+            "| Docks |\n{caption}\n| --- |\n| 6 |\n| 100 Main St |",
+            "| Docks |\n| --- |\n| 6 |\n{caption}\n| 100 Main St |",
+            "| Docks |\n| --- |\n| 6 |\n| 100 Main St |\n{caption}",
+        )
+
+        for caption in caption_rows:
+            for table_format in table_formats:
+                with self.subTest(caption=caption, table_format=table_format):
+                    result = ai_processing._suppress_competing_attachment_updates(
+                        {
+                            "updates": [{"column": "Docks", "value": "6"}],
+                            "events": [],
+                            "response_email": "Thanks.",
+                        },
+                        _conversation("The brochure is attached."),
+                        "100 Main St, Phoenix",
+                        [{
+                            "name": "100 Main St brochure.pdf",
+                            "text": (
+                                "100 Main St, Phoenix\n"
+                                f"{table_format.format(caption=caption)}"
+                            ),
+                        }],
+                    )
+
+                    self.assertEqual(
+                        [{"column": "Docks", "value": "6"}],
+                        result["updates"],
+                    )
+                    self.assertEqual([], result["events"])
+                    self.assertEqual("Thanks.", result["response_email"])
+
+    def test_one_cell_unsafe_caption_rows_still_fail_closed(self):
+        caption_rows = (
+            "| Figure I Oak Center |",
+            '| "Figure I Oak Center" |',
+            '"| Figure I Oak Center |"',
+            "| Figure (I]: Building Facts |",
+            "| Figure ((I)): Building Facts |",
+        )
+
+        for caption in caption_rows:
+            with self.subTest(caption=caption):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [{"column": "Docks", "value": "6"}],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"100 Main St, Phoenix\n{caption}\nDocks: 6",
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
+    def test_caption_cell_normalization_does_not_collapse_multi_cell_rows(self):
+        multi_cell_rows = (
+            "| Figure I | Oak Center |",
+            "Figure I | Building Facts",
+        )
+
+        for row in multi_cell_rows:
+            with self.subTest(row=row):
+                self.assertIsNone(
+                    ai_processing._document_caption_verdict(row)
+                )
+
     def test_malformed_caption_designator_wrappers_fail_closed(self):
         caption_formats = (
             "Table (1]: {residual}",

@@ -2202,15 +2202,47 @@ def _property_table_clause_spans(text: str) -> List[tuple]:
     ]
 
 
+_DOCUMENT_CAPTION_QUOTE_PAIRS = (
+    ('"', '"'),
+    ("'", "'"),
+    ("“", "”"),
+    ("‘", "’"),
+)
+
+
+def _strip_caption_outer_quotes(text: str) -> str:
+    """Strip one balanced quote layer from a possible caption cell."""
+    text = (text or "").strip()
+    for opening, closing in _DOCUMENT_CAPTION_QUOTE_PAIRS:
+        if len(text) >= 2 and text.startswith(opening) and text.endswith(closing):
+            return text[1:-1].strip()
+    return text
+
+
+def _document_caption_candidate_text(text: str) -> Optional[str]:
+    """Extract one safe logical table cell for caption classification."""
+    raw_text = (text or "").strip()
+    unquoted_text = _strip_caption_outer_quotes(raw_text)
+    cells = _property_table_cells(unquoted_text)
+    if len(cells) != 1:
+        if "|" in unquoted_text:
+            return None
+        return raw_text
+    return _strip_caption_outer_quotes(cells[0])
+
+
 def _document_caption_verdict(text: str) -> Optional[str]:
     """Classify a document caption by its designator and residual title."""
-    caption = _DOCUMENT_CAPTION_RE.match(text or "")
+    caption_text = _document_caption_candidate_text(text)
+    if caption_text is None:
+        return None
+    caption = _DOCUMENT_CAPTION_RE.match(caption_text)
     if not caption:
         return (
             "competing"
             if (
-                _DOCUMENT_CAPTION_LIKE_RE.match(text or "")
-                or _DOCUMENT_CAPTION_ALPHA_TOKEN_RE.match(text or "")
+                _DOCUMENT_CAPTION_LIKE_RE.match(caption_text)
+                or _DOCUMENT_CAPTION_ALPHA_TOKEN_RE.match(caption_text)
             )
             else None
         )
