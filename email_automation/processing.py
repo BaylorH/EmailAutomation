@@ -2082,6 +2082,9 @@ _TERMINAL_ABBREVIATION_RE = re.compile(
 _TERMINAL_MEASUREMENT_ABBREVIATIONS = {
     "ft", "in", "sf",
 }
+_TERMINAL_ABBREVIATED_PROPERTY_CONTINUATIONS = {
+    "bldg", "ste", "whse",
+}
 _TERMINAL_MEASUREMENT_CONTINUATION_WORDS = {
     "across", "at", "building", "buildings", "by", "ceiling", "clear",
     "clearance", "deep", "depth", "door", "doors", "facility", "facilities",
@@ -2089,7 +2092,7 @@ _TERMINAL_MEASUREMENT_CONTINUATION_WORDS = {
     "of", "premises", "property", "properties", "site", "sites", "space",
     "spaces", "suite", "suites", "tall", "unit", "units", "warehouse",
     "warehouses", "wide", "width", "to",
-}
+} | _TERMINAL_ABBREVIATED_PROPERTY_CONTINUATIONS
 _TERMINAL_TITLE_ABBREVIATIONS = {
     "dr", "mr", "mrs", "ms", "prof",
 }
@@ -2150,7 +2153,11 @@ def _terminal_period_continues_abbreviation(
     if abbreviation in _TERMINAL_MEASUREMENT_ABBREVIATIONS:
         if next_token_lower not in _TERMINAL_MEASUREMENT_CONTINUATION_WORDS:
             return False
-        if next_token[0].islower():
+        if (
+            next_token[0].islower()
+            and next_token_lower
+            not in _TERMINAL_ABBREVIATED_PROPERTY_CONTINUATIONS
+        ):
             return True
         local_prefix = re.split(
             r"\n+|\s*;\s*|,\s*(?:while|whereas)\s+|"
@@ -2184,11 +2191,29 @@ def _terminal_period_continues_abbreviation(
         )
         return bool(
             identifier_owner
-            and (next_token[0].isdigit() or next_token.startswith("#"))
+            and (
+                next_token[0].isdigit()
+                or next_token.startswith("#")
+                or (len(next_token) == 1 and next_token.isupper())
+            )
         )
     if abbreviation in _TERMINAL_IDENTIFIER_ABBREVIATIONS:
-        if re.match(r"no\.\s+(?:#?\d+)", following, re.IGNORECASE):
-            return True
+        stacked_identifier = re.match(
+            r"no\.\s+(#?\d+|[a-z]+)",
+            following,
+            re.IGNORECASE,
+        )
+        if stacked_identifier:
+            identifier_token = stacked_identifier.group(1)
+            if (
+                identifier_token[0].isdigit()
+                or identifier_token.startswith("#")
+                or (
+                    len(identifier_token) == 1
+                    and identifier_token.isupper()
+                )
+            ):
+                return True
         return bool(
             next_token[0].isdigit()
             or next_token.startswith("#")
@@ -2368,8 +2393,12 @@ _PROPERTY_SET_SUBJECT_NOUNS = {
     "warehouse", "warehouses", "facility", "facilities", "premises",
     "unit", "units", "suite", "suites",
 }
+_ABBREVIATED_PROPERTY_SET_SUBJECT_NOUNS = {
+    "bldg.", "ste.", "whse.",
+}
 _BOUNDED_QUANTIFIED_SUBJECT_ABBREVIATION_PATTERN = (
-    r"(?:(?:sq|cu)\.(?:ft|in)\.|s\.f\.|(?:sq|cu)\.|ft\.|in\.|sf\.)"
+    r"(?:(?:sq|cu)\.(?:ft|in)\.|s\.f\.|(?:sq|cu)\.|ft\.|in\.|sf\.|"
+    r"(?:bldg|ste|whse)\.|no\.)"
 )
 _BOUNDED_QUANTIFIED_SUBJECT_WORD_PATTERN = (
     rf"(?:{_BOUNDED_QUANTIFIED_SUBJECT_ABBREVIATION_PATTERN}|"
@@ -2398,7 +2427,7 @@ _BOUNDED_QUANTIFIED_SUBJECT_NUMERIC_COMPOUND_PATTERN = (
     rf"{_BOUNDED_QUANTIFIED_SUBJECT_NUMERIC_ATOM_PATTERN})"
 )
 _BOUNDED_QUANTIFIED_SUBJECT_NUMERIC_PATTERN = (
-    rf"(?:±)?{_BOUNDED_QUANTIFIED_SUBJECT_NUMERIC_COMPOUND_PATTERN}"
+    rf"#?(?:±)?{_BOUNDED_QUANTIFIED_SUBJECT_NUMERIC_COMPOUND_PATTERN}"
     r"(?:\+)?(?:-[a-z][a-z0-9]*)*"
 )
 _BOUNDED_QUANTIFIED_SUBJECT_SYMBOL_PATTERN = (
@@ -2411,6 +2440,10 @@ _BOUNDED_QUANTIFIED_SUBJECT_TOKEN_PATTERN = (
 )
 _BOUNDED_QUANTIFIED_SUBJECT_WORD_RE = re.compile(
     _BOUNDED_QUANTIFIED_SUBJECT_WORD_PATTERN,
+    re.IGNORECASE,
+)
+_BOUNDED_QUANTIFIED_SUBJECT_NUMERIC_RE = re.compile(
+    _BOUNDED_QUANTIFIED_SUBJECT_NUMERIC_PATTERN,
     re.IGNORECASE,
 )
 _BOUNDED_QUANTIFIED_SUBJECT_TOKEN_RE = re.compile(
@@ -2478,11 +2511,23 @@ def _bounded_subject_is_property_set(subject_text: str) -> Optional[bool]:
     tokens = list(_BOUNDED_QUANTIFIED_SUBJECT_TOKEN_RE.finditer(normalized))
     if not tokens:
         return None
-    head_token = tokens[-1].group(0)
+    token_texts = [token.group(0) for token in tokens]
+    if (
+        len(token_texts) >= 3
+        and token_texts[-2].lower() == "no."
+        and _BOUNDED_QUANTIFIED_SUBJECT_NUMERIC_RE.fullmatch(token_texts[-1])
+        and token_texts[-3].lower()
+        in _ABBREVIATED_PROPERTY_SET_SUBJECT_NOUNS
+    ):
+        return True
+    head_token = token_texts[-1]
     if not _BOUNDED_QUANTIFIED_SUBJECT_WORD_RE.fullmatch(head_token):
         return False
     head = head_token.lower().rstrip("'’")
-    return head in _PROPERTY_SET_SUBJECT_NOUNS
+    return bool(
+        head in _PROPERTY_SET_SUBJECT_NOUNS
+        or head in _ABBREVIATED_PROPERTY_SET_SUBJECT_NOUNS
+    )
 
 
 def _address_list_subject_is_property_set(subject_text: str) -> Optional[bool]:
