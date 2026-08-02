@@ -2872,6 +2872,129 @@ class JillJuneRegressionTests(unittest.TestCase):
                     processing._terminal_binding_clauses(message_text),
                 )
 
+    def test_unsupported_stacked_identifiers_remain_fail_closed_in_both_orders(self):
+        target_address = "17 Harbor Pkwy"
+        competitor_address = "8021 Copper Mesa Blvd"
+        event = {"type": "property_unavailable", "reason": "been_leased"}
+        modifiers = (
+            "100,000 SF",
+            "100,000 sq. ft.",
+            "100,000 cu.ft.",
+            "100,000 CU. FT.",
+        )
+        property_heads = (
+            ("Bldg.", "manager"),
+            ("Whse.", "contact"),
+            ("Ste.", "broker"),
+        )
+        unsupported_identifier_pairs = (
+            ("AA", "Z"),
+            ("IV", "IX"),
+            ("?", "!"),
+        )
+
+        for first, second in (
+            (target_address, competitor_address),
+            (competitor_address, target_address),
+        ):
+            for modifier in modifiers:
+                for property_head, nonproperty_head in property_heads:
+                    for first_identifier, second_identifier in (
+                        unsupported_identifier_pairs
+                    ):
+                        unsupported_subject = (
+                            f"{modifier} {property_head} No. {first_identifier}"
+                        )
+                        property_message = (
+                            f"Both {unsupported_subject} at {first} and "
+                            f"{property_head} No. {second_identifier} at {second} "
+                            "are still available."
+                        )
+                        nonproperty_message = (
+                            f"Both {unsupported_subject} {nonproperty_head} "
+                            f"at {first} and {property_head} No. "
+                            f"{second_identifier} {nonproperty_head} at {second} "
+                            "are still available."
+                        )
+
+                        for scope, message_text, subject_text in (
+                            ("property", property_message, unsupported_subject),
+                            (
+                                "nonproperty",
+                                nonproperty_message,
+                                f"{unsupported_subject} {nonproperty_head}",
+                            ),
+                        ):
+                            with self.subTest(
+                                first=first,
+                                first_identifier=first_identifier,
+                                modifier=modifier,
+                                property_head=property_head,
+                                scope=scope,
+                            ):
+                                self.assertFalse(
+                                    processing._address_list_subject_is_property_set(
+                                        f"{subject_text} at"
+                                    )
+                                )
+                                self.assertEqual(
+                                    [message_text],
+                                    processing._terminal_binding_clauses(
+                                        message_text
+                                    ),
+                                )
+                                self.assertTrue(
+                                    processing._property_unavailable_event_applies_to_row(
+                                        event,
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+                                patch = processing._pending_nonviable_followup_patch(
+                                    [event],
+                                    row_anchor=f"{target_address}, Phoenix",
+                                    message_text=message_text,
+                                )
+                                self.assertIsNotNone(patch)
+                                self.assertEqual(
+                                    "been_leased",
+                                    patch["pendingTerminalReason"],
+                                )
+
+        sentence_controls = (
+            (
+                "Please review Bldg. No. I have not approved it.",
+                ["Please review Bldg.", "No.", "I have not approved it."],
+            ),
+            (
+                "Both managers reviewed 100,000 SF. Bldg. No. "
+                "This remains unresolved.",
+                [
+                    "Both managers reviewed 100,000 SF.",
+                    "Bldg.",
+                    "No.",
+                    "This remains unresolved.",
+                ],
+            ),
+            (
+                "The code is No. ? Please confirm.",
+                ["The code is No.", "?", "Please confirm."],
+            ),
+            (
+                "Bldg. I remains available. Bldg. J has been leased.",
+                [
+                    "Bldg. I remains available.",
+                    "Bldg. J has been leased.",
+                ],
+            ),
+        )
+        for message_text, expected_clauses in sentence_controls:
+            with self.subTest(message_text=message_text, scope="sentence_boundary"):
+                self.assertEqual(
+                    expected_clauses,
+                    processing._terminal_binding_clauses(message_text),
+                )
+
     def test_numeric_modifiers_do_not_promote_nonproperty_heads(self):
         target_address = "17 Harbor Pkwy"
         competitor_address = "8021 Copper Mesa Blvd"

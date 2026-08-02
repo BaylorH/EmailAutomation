@@ -2108,6 +2108,65 @@ _TERMINAL_NUMERIC_NOUN_PHRASE_PREFIX_RE = re.compile(
     r"a|an|our|that|the|their|these|this|those|your)\s+(?:±\s*)?\d",
     re.IGNORECASE,
 )
+_TERMINAL_CONTEXTUAL_IDENTIFIER_TOKEN_PATTERN = r"(?:[A-Z]{1,8}|[?!])"
+_TERMINAL_CONTEXTUAL_IDENTIFIER_LINK_PATTERN = (
+    r"(?:[ \t]+(?i:[a-z]+(?:[-'’][a-z]+)*))?"
+    r"[ \t]+(?i:(?:for|at|across|covering|serving|assigned[ \t]+to))\b"
+)
+_TERMINAL_CONTEXTUAL_IDENTIFIER_AFTER_HEAD_RE = re.compile(
+    rf"^(?i:no)\.[ \t]+{_TERMINAL_CONTEXTUAL_IDENTIFIER_TOKEN_PATTERN}"
+    rf"{_TERMINAL_CONTEXTUAL_IDENTIFIER_LINK_PATTERN}"
+)
+_TERMINAL_CONTEXTUAL_IDENTIFIER_AFTER_NO_RE = re.compile(
+    rf"^{_TERMINAL_CONTEXTUAL_IDENTIFIER_TOKEN_PATTERN}"
+    rf"{_TERMINAL_CONTEXTUAL_IDENTIFIER_LINK_PATTERN}"
+)
+_TERMINAL_CONTEXTUAL_IDENTIFIER_AFTER_PUNCTUATION_RE = re.compile(
+    r"^(?:(?i:[a-z]+(?:[-'’][a-z]+)*)[ \t]+)?"
+    r"(?i:(?:for|at|across|covering|serving|assigned[ \t]+to))\b"
+)
+
+
+def _terminal_boundary_continues_contextual_identifier(
+    text: str,
+    boundary_start: int,
+    boundary_end: int,
+    fragment_start: int,
+) -> bool:
+    """Retain a bounded identifier structurally without promoting its meaning."""
+    local_prefix = re.split(
+        r"\n+|\s*;\s*|,\s*(?:while|whereas)\s+|"
+        r"\s+(?:while|whereas)\s+",
+        (text or "")[fragment_start:boundary_start],
+        flags=re.IGNORECASE,
+    )[-1]
+    if not _TERMINAL_NUMERIC_NOUN_PHRASE_PREFIX_RE.search(local_prefix):
+        return False
+
+    following = (text or "")[boundary_end:]
+    if re.search(r"\b(?:bldg|ste|whse)\.$", local_prefix, re.IGNORECASE):
+        return bool(
+            _TERMINAL_CONTEXTUAL_IDENTIFIER_AFTER_HEAD_RE.match(following)
+        )
+    if re.search(
+        r"\b(?:bldg|ste|whse)\.\s+no\.$",
+        local_prefix,
+        re.IGNORECASE,
+    ):
+        return bool(
+            _TERMINAL_CONTEXTUAL_IDENTIFIER_AFTER_NO_RE.match(following)
+        )
+    if re.search(
+        r"\b(?:bldg|ste|whse)\.\s+no\.\s+[?!]$",
+        local_prefix,
+        re.IGNORECASE,
+    ):
+        return bool(
+            _TERMINAL_CONTEXTUAL_IDENTIFIER_AFTER_PUNCTUATION_RE.match(
+                following
+            )
+        )
+    return False
 
 
 def _clause_owns_property_assertion(clause: str) -> bool:
@@ -2194,7 +2253,11 @@ def _terminal_period_continues_abbreviation(
             and (
                 next_token[0].isdigit()
                 or next_token.startswith("#")
-                or (len(next_token) == 1 and next_token.isupper())
+                or (
+                    len(next_token) == 1
+                    and next_token.isupper()
+                    and next_token != "I"
+                )
             )
         )
     if abbreviation in _TERMINAL_IDENTIFIER_ABBREVIATIONS:
@@ -2211,13 +2274,17 @@ def _terminal_period_continues_abbreviation(
                 or (
                     len(identifier_token) == 1
                     and identifier_token.isupper()
+                    and identifier_token != "I"
                 )
             ):
                 return True
         return bool(
             next_token[0].isdigit()
             or next_token.startswith("#")
-            or (len(next_token) == 1 and next_token.isupper())
+            or (
+                len(next_token) == 1
+                and next_token.isupper()
+            )
         )
     return False
 
@@ -2228,6 +2295,13 @@ def _terminal_sentence_fragments(message_text: str) -> List[str]:
     fragments = []
     fragment_start = 0
     for boundary in _TERMINAL_SENTENCE_BOUNDARY_RE.finditer(text):
+        if _terminal_boundary_continues_contextual_identifier(
+            text,
+            boundary.start(),
+            boundary.end(),
+            fragment_start,
+        ):
+            continue
         if (
             text[boundary.start() - 1] == "."
             and _terminal_period_continues_abbreviation(
