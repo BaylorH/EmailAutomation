@@ -2460,6 +2460,15 @@ class JillJuneRegressionTests(unittest.TestCase):
             "100,000 S.F.",
             "100,000 Sq. Ft.",
             "40 FT.",
+            "100,000 sq.ft.",
+            "144 sq.in.",
+            "100,000 cu.ft.",
+            "100,000 SQ.FT.",
+            "144 SQ.IN.",
+            "100,000 CU.FT.",
+            "100,000 Sq.Ft.",
+            "144 Sq.In.",
+            "100,000 Cu.Ft.",
         )
         property_heads = (
             ("warehouse", "warehouses"),
@@ -2554,6 +2563,18 @@ class JillJuneRegressionTests(unittest.TestCase):
                 ["The building is 100,000 SF.", "It remains available."],
             ),
             (
+                "The building is 100,000 sq.ft. It remains available.",
+                ["The building is 100,000 sq.ft.", "It remains available."],
+            ),
+            (
+                "The opening is 144 sq.in. It remains available.",
+                ["The opening is 144 sq.in.", "It remains available."],
+            ),
+            (
+                "The volume is 100,000 cu.ft. It remains available.",
+                ["The volume is 100,000 cu.ft.", "It remains available."],
+            ),
+            (
                 "The range is 36 ft. - 40 ft. It remains available.",
                 ["The range is 36 ft. - 40 ft.", "It remains available."],
             ),
@@ -2631,13 +2652,24 @@ class JillJuneRegressionTests(unittest.TestCase):
             "Both 100000 sq ft unit prices",
             "Both brokers' 100,000 SF facility operators",
             "Each of the owners’ 50k-SF warehouse agents",
+            "Both 100,000 sq.ft. warehouse managers",
+            "Each 144 sq.in. facility contact",
+            "Both 100,000 cu.ft. building owners",
+            "Both 100,000 SQ.FT. property brokers",
+            "Each 144 SQ.IN. site contact",
+            "Both 100,000 CU.FT. listing agents",
         )
 
         for first, second in (
             (target_address, competitor_address),
             (competitor_address, target_address),
         ):
-            for reason in ("leased", "sold", "no_space_available"):
+            for reason in (
+                "leased",
+                "sold",
+                "no_space_available",
+                "been_leased",
+            ):
                 event = {"type": "property_unavailable", "reason": reason}
                 for quantified_subject in quantified_subjects:
                     message_text = (

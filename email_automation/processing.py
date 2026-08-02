@@ -2369,7 +2369,7 @@ _PROPERTY_SET_SUBJECT_NOUNS = {
     "unit", "units", "suite", "suites",
 }
 _BOUNDED_QUANTIFIED_SUBJECT_ABBREVIATION_PATTERN = (
-    r"(?:s\.f\.|sq\.|ft\.|in\.|sf\.)"
+    r"(?:sq\.(?:ft|in)\.|cu\.ft\.|s\.f\.|sq\.|ft\.|in\.|sf\.)"
 )
 _BOUNDED_QUANTIFIED_SUBJECT_WORD_PATTERN = (
     rf"(?:{_BOUNDED_QUANTIFIED_SUBJECT_ABBREVIATION_PATTERN}|"
