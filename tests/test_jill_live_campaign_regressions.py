@@ -1553,6 +1553,65 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                     ai_processing._document_caption_verdict(property_name)
                 )
 
+    def test_valid_roman_caption_designators_remain_structural(self):
+        roman_numerals = (
+            "I", "ii", "III", "iv", "VIII", "ix", "XIV", "xlii",
+            "XCIX", "cdxliv", "CMXCIX", "M", "MMXXIV", "mMmCmXcIx",
+        )
+
+        for roman_numeral in roman_numerals:
+            for wrapper_format in ("({})", "[{}]"):
+                caption = (
+                    f"Figure {wrapper_format.format(roman_numeral)}: "
+                    "Building Facts"
+                )
+                with self.subTest(caption=caption):
+                    self.assertEqual(
+                        "structural",
+                        ai_processing._document_caption_verdict(caption),
+                    )
+
+    def test_invalid_roman_like_caption_tokens_fail_closed(self):
+        caption_bases = (
+            "Figure (Civic)",
+            "Table [Mill]",
+            "Page (Civil)",
+            "Section [Mid]",
+            "Exhibit (Livid)",
+            "Figure (MMMM)",
+            "Figure ((IIII))",
+            "Table ([VV])",
+            "Page [IC]]",
+            "Section (XM]",
+        )
+        residuals = ("", ": Building Facts", ": Oak Center")
+
+        for caption_base in caption_bases:
+            for residual in residuals:
+                caption = f"{caption_base}{residual}"
+                with self.subTest(caption=caption):
+                    result = ai_processing._suppress_competing_attachment_updates(
+                        {
+                            "updates": [{"column": "Docks", "value": "6"}],
+                            "events": [],
+                            "response_email": "Thanks.",
+                        },
+                        _conversation("The brochure is attached."),
+                        "100 Main St, Phoenix",
+                        [{
+                            "name": "mixed brochure.pdf",
+                            "text": f"100 Main St, Phoenix\n{caption}\nDocks: 6",
+                        }],
+                    )
+
+                    self.assertEqual([], result["updates"])
+                    self.assertTrue(any(
+                        event.get("type") == "needs_user_input"
+                        and event.get("reason") == "multi_property_attachment"
+                        for event in result["events"]
+                    ))
+                    self.assertIsNone(result["response_email"])
+
     def test_numbered_unknown_property_headings_still_fail_closed(self):
         headings = (
             "Oak Center 1",

@@ -1930,9 +1930,14 @@ def _source_mentions_target_property(source_text: str, target_anchor: str) -> bo
 _NUMERIC_PROPERTY_VALUE_RE = re.compile(r"\$?\s*\d")
 _PROPERTY_CLAUSE_BREAK_RE = re.compile(r"(?<!\d)[.!?;](?!\d)|\n+")
 _MARKDOWN_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
+# Canonical subtractive Roman numerals from 1 through 3999.
+_DOCUMENT_CAPTION_ROMAN_PATTERN = (
+    r"(?=[ivxlcdm])m{0,3}(?:cm|cd|d?c{0,3})"
+    r"(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})"
+)
 _DOCUMENT_CAPTION_DESIGNATOR_PATTERN = (
     r"(?:\d+(?:[.-]\d+)*(?:-?[a-z])?|[a-z](?:[-.]\d+)+|[a-z]\d+|"
-    r"[ivxlcdm]+|[a-z])"
+    rf"{_DOCUMENT_CAPTION_ROMAN_PATTERN}|[a-z])"
 )
 _DOCUMENT_CAPTION_RE = re.compile(
     r"^\s*(?:table|figure|page|section|schedule|exhibit|version|revision)\s+"
@@ -1949,6 +1954,15 @@ _DOCUMENT_CAPTION_LIKE_RE = re.compile(
     rf"(?:[\[(]\s*)+{_DOCUMENT_CAPTION_DESIGNATOR_PATTERN}"
     r"(?=$|\s|[)\]]|[:(–—-]|\.(?=\s))|"
     rf"{_DOCUMENT_CAPTION_DESIGNATOR_PATTERN}\s*(?=[)\]])"
+    r")",
+    re.IGNORECASE,
+)
+_DOCUMENT_CAPTION_ALPHA_TOKEN_RE = re.compile(
+    r"^\s*(?:table|figure|page|section|schedule|exhibit|version|revision)\s+"
+    r"(?:#\s*)?(?:"
+    r"(?:[\[(]\s*)+[a-z]{2,}"
+    r"(?=\s*(?:[)\]]|[:(–—-])|$|\.(?=\s))|"
+    r"[a-z]{2,}\s*(?=[)\]]|[:(–—-])"
     r")",
     re.IGNORECASE,
 )
@@ -2188,12 +2202,15 @@ def _property_table_clause_spans(text: str) -> List[tuple]:
 
 
 def _document_caption_verdict(text: str) -> Optional[str]:
-    """Classify a numbered caption by its residual title, when present."""
+    """Classify a document caption by its designator and residual title."""
     caption = _DOCUMENT_CAPTION_RE.match(text or "")
     if not caption:
         return (
             "competing"
-            if _DOCUMENT_CAPTION_LIKE_RE.match(text or "")
+            if (
+                _DOCUMENT_CAPTION_LIKE_RE.match(text or "")
+                or _DOCUMENT_CAPTION_ALPHA_TOKEN_RE.match(text or "")
+            )
             else None
         )
     wrapper_pair = (
