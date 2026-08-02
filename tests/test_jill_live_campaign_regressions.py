@@ -1495,6 +1495,43 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 ))
                 self.assertIsNone(result["response_email"])
 
+    def test_malformed_caption_designator_wrappers_fail_closed(self):
+        caption_formats = (
+            "Table (1]: {residual}",
+            "fIgUrE [IV) — {residual}",
+            "Section (4.2: {residual}",
+            "Schedule [A-1 - {residual}",
+            "Exhibit B.2) ({residual})",
+            "VERSION IV] — {residual}",
+        )
+        residuals = ("Building Facts", "Oak Center")
+
+        for caption_format in caption_formats:
+            for residual in residuals:
+                caption = caption_format.format(residual=residual)
+                with self.subTest(caption=caption):
+                    result = ai_processing._suppress_competing_attachment_updates(
+                        {
+                            "updates": [{"column": "Docks", "value": "6"}],
+                            "events": [],
+                            "response_email": "Thanks.",
+                        },
+                        _conversation("The brochure is attached."),
+                        "100 Main St, Phoenix",
+                        [{
+                            "name": "mixed brochure.pdf",
+                            "text": f"100 Main St, Phoenix\n{caption}\nDocks: 6",
+                        }],
+                    )
+
+                    self.assertEqual([], result["updates"])
+                    self.assertTrue(any(
+                        event.get("type") == "needs_user_input"
+                        and event.get("reason") == "multi_property_attachment"
+                        for event in result["events"]
+                    ))
+                    self.assertIsNone(result["response_email"])
+
     def test_numbered_unknown_property_headings_still_fail_closed(self):
         headings = (
             "Oak Center 1",

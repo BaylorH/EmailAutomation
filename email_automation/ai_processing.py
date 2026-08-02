@@ -1937,9 +1937,9 @@ _DOCUMENT_CAPTION_DESIGNATOR_PATTERN = (
 _DOCUMENT_CAPTION_RE = re.compile(
     r"^\s*(?:table|figure|page|section|schedule|exhibit|version|revision)\s+"
     r"(?:#\s*)?"
-    rf"(?:{_DOCUMENT_CAPTION_DESIGNATOR_PATTERN}|"
-    rf"\(\s*{_DOCUMENT_CAPTION_DESIGNATOR_PATTERN}\s*\)|"
-    rf"\[\s*{_DOCUMENT_CAPTION_DESIGNATOR_PATTERN}\s*\])"
+    r"(?P<open_wrapper>\(|\[)?\s*"
+    rf"{_DOCUMENT_CAPTION_DESIGNATOR_PATTERN}\s*"
+    r"(?P<close_wrapper>\)|\])?"
     r"(?=$|\s|[:(–—-]|\.(?=\s))(?P<suffix>.*)$",
     re.IGNORECASE,
 )
@@ -2183,6 +2183,12 @@ def _document_caption_verdict(text: str) -> Optional[str]:
     caption = _DOCUMENT_CAPTION_RE.match(text or "")
     if not caption:
         return None
+    wrapper_pair = (
+        caption.group("open_wrapper"),
+        caption.group("close_wrapper"),
+    )
+    if wrapper_pair not in {(None, None), ("(", ")"), ("[", "]")}:
+        return "competing"
     suffix = caption.group("suffix").strip()
     if not suffix or re.fullmatch(
         r"(?:of|/)\s*[a-z0-9]+(?:[-.][a-z0-9]+)*",
