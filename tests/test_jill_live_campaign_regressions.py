@@ -1672,10 +1672,111 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                 ))
                 self.assertIsNone(result["response_email"])
 
+    def test_balanced_escaped_caption_quotes_follow_caption_verdict(self):
+        cases = (
+            (r'| \"Figure I\" |', "structural"),
+            (r'| \"Figure I Building Facts\" |', "structural"),
+            (r'| \"Figure I Oak Center\" |', "competing"),
+            (r'| \"Figure (I]: Building Facts\" |', "competing"),
+        )
+
+        for caption, expected_verdict in cases:
+            with self.subTest(caption=caption):
+                self.assertEqual(
+                    expected_verdict,
+                    ai_processing._document_caption_verdict(caption),
+                )
+                escalated = expected_verdict == "competing"
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [{"column": "Docks", "value": "6"}],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "100 Main St brochure.pdf",
+                        "text": (
+                            "100 Main St, Phoenix\n"
+                            "| Docks |\n"
+                            "| --- |\n"
+                            "| 6 |\n"
+                            f"{caption}\n"
+                            "| 100 Main St |"
+                        ),
+                    }],
+                )
+
+                self.assertEqual(
+                    [] if escalated else [{"column": "Docks", "value": "6"}],
+                    result["updates"],
+                )
+                self.assertEqual(
+                    escalated,
+                    any(
+                        event.get("type") == "needs_user_input"
+                        and event.get("reason") == "multi_property_attachment"
+                        for event in result["events"]
+                    ),
+                )
+                self.assertEqual(
+                    None if escalated else "Thanks.",
+                    result["response_email"],
+                )
+
+    def test_unbalanced_caption_quotes_fail_closed_across_positions(self):
+        caption_rows = (
+            '| "Figure I |',
+            '| Figure I" |',
+            "| “Figure I Building Facts |",
+            "| Figure I Building Facts” |",
+            "| 'Figure I Oak Center’ |",
+            r'| \"Figure I Building Facts |',
+            r'| Figure I Oak Center\" |',
+            r'| \"Figure (I]: Building Facts" |',
+        )
+        fragment_formats = (
+            "{caption}\nDocks: 6",
+            "Docks: 6\n{caption}",
+            "| Docks |\n| --- |\n| 6 |\n{caption}\n| 100 Main St |",
+        )
+
+        for caption in caption_rows:
+            self.assertEqual(
+                "competing",
+                ai_processing._document_caption_verdict(caption),
+            )
+            for fragment_format in fragment_formats:
+                fragment = fragment_format.format(caption=caption)
+                with self.subTest(caption=caption, fragment=fragment):
+                    result = ai_processing._suppress_competing_attachment_updates(
+                        {
+                            "updates": [{"column": "Docks", "value": "6"}],
+                            "events": [],
+                            "response_email": "Thanks.",
+                        },
+                        _conversation("The brochure is attached."),
+                        "100 Main St, Phoenix",
+                        [{
+                            "name": "mixed brochure.pdf",
+                            "text": f"100 Main St, Phoenix\n{fragment}",
+                        }],
+                    )
+
+                    self.assertEqual([], result["updates"])
+                    self.assertTrue(any(
+                        event.get("type") == "needs_user_input"
+                        and event.get("reason") == "multi_property_attachment"
+                        for event in result["events"]
+                    ))
+                    self.assertIsNone(result["response_email"])
+
     def test_caption_cell_normalization_does_not_collapse_multi_cell_rows(self):
         multi_cell_rows = (
             "| Figure I | Oak Center |",
             "Figure I | Building Facts",
+            '| "Figure I | Oak Center |',
         )
 
         for row in multi_cell_rows:

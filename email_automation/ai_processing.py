@@ -2203,6 +2203,10 @@ def _property_table_clause_spans(text: str) -> List[tuple]:
 
 
 _DOCUMENT_CAPTION_QUOTE_PAIRS = (
+    ('\\"', '\\"'),
+    ("\\'", "\\'"),
+    ("\\“", "\\”"),
+    ("\\‘", "\\’"),
     ('"', '"'),
     ("'", "'"),
     ("“", "”"),
@@ -2210,42 +2214,64 @@ _DOCUMENT_CAPTION_QUOTE_PAIRS = (
 )
 
 
-def _strip_caption_outer_quotes(text: str) -> str:
-    """Strip one balanced quote layer from a possible caption cell."""
+def _normalize_caption_quote_edges(text: str) -> tuple:
+    """Strip quote layers and report unmatched or mixed edge syntax."""
     text = (text or "").strip()
-    for opening, closing in _DOCUMENT_CAPTION_QUOTE_PAIRS:
-        if len(text) >= 2 and text.startswith(opening) and text.endswith(closing):
-            return text[1:-1].strip()
-    return text
+    malformed = False
+    while text:
+        opening = next((
+            token for token, _ in _DOCUMENT_CAPTION_QUOTE_PAIRS
+            if text.startswith(token)
+        ), None)
+        closing = next((
+            token for _, token in _DOCUMENT_CAPTION_QUOTE_PAIRS
+            if text.endswith(token)
+        ), None)
+        if not opening and not closing:
+            break
+
+        valid_pair = any(
+            opening == expected_opening and closing == expected_closing
+            for expected_opening, expected_closing
+            in _DOCUMENT_CAPTION_QUOTE_PAIRS
+        )
+        if not valid_pair or len(text) < len(opening) + len(closing):
+            malformed = True
+
+        start = len(opening) if opening else 0
+        end = len(text) - len(closing) if closing else len(text)
+        text = text[start:max(start, end)].strip()
+    return text, malformed
 
 
-def _document_caption_candidate_text(text: str) -> Optional[str]:
+def _document_caption_candidate_text(text: str) -> tuple:
     """Extract one safe logical table cell for caption classification."""
     raw_text = (text or "").strip()
-    unquoted_text = _strip_caption_outer_quotes(raw_text)
+    unquoted_text, malformed_quotes = _normalize_caption_quote_edges(raw_text)
     cells = _property_table_cells(unquoted_text)
     if len(cells) != 1:
         if "|" in unquoted_text:
-            return None
-        return raw_text
-    return _strip_caption_outer_quotes(cells[0])
+            return None, False
+        return raw_text, malformed_quotes
+    caption_text, malformed_cell_quotes = _normalize_caption_quote_edges(cells[0])
+    return caption_text, malformed_quotes or malformed_cell_quotes
 
 
 def _document_caption_verdict(text: str) -> Optional[str]:
     """Classify a document caption by its designator and residual title."""
-    caption_text = _document_caption_candidate_text(text)
+    caption_text, malformed_quotes = _document_caption_candidate_text(text)
     if caption_text is None:
         return None
     caption = _DOCUMENT_CAPTION_RE.match(caption_text)
+    caption_like = bool(
+        caption
+        or _DOCUMENT_CAPTION_LIKE_RE.match(caption_text)
+        or _DOCUMENT_CAPTION_ALPHA_TOKEN_RE.match(caption_text)
+    )
+    if malformed_quotes:
+        return "competing" if caption_like else None
     if not caption:
-        return (
-            "competing"
-            if (
-                _DOCUMENT_CAPTION_LIKE_RE.match(caption_text)
-                or _DOCUMENT_CAPTION_ALPHA_TOKEN_RE.match(caption_text)
-            )
-            else None
-        )
+        return "competing" if caption_like else None
     wrapper_pair = (
         caption.group("open_wrapper"),
         caption.group("close_wrapper"),
