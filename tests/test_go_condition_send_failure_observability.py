@@ -392,6 +392,8 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
         }), patch.object(
             processing_module, "send_reply_in_thread", new=fake_send_reply_in_thread
         ), patch.object(
+            processing_module, "_maybe_mark_client_completed", return_value=False
+        ) as maybe_mark_completed, patch.object(
             processing_module, "_reset_reply_send_outcome", return_value=send_outcome
         ), patch.object(
             processing_module, "_get_reply_send_outcome", return_value=send_outcome
@@ -400,6 +402,7 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
                 "uid-1", {"Authorization": "Bearer token"}
             )
 
+        maybe_mark_completed.assert_called_once_with("uid-1", "client-1")
         self.assertEqual(len(states), 1)
         self.assertEqual(states[0]["status"], "healthy")
         self.assertEqual(states[0]["operation"], "pending_response_send")
