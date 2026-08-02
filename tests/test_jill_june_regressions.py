@@ -1345,6 +1345,132 @@ class JillJuneRegressionTests(unittest.TestCase):
                                     patch["pendingTerminalReason"],
                                 )
 
+    def test_nonproperty_quantifiers_before_address_lists_do_not_bind_properties(self):
+        address_pairs = (
+            ("1 Harbor Pkwy", "2 Copper Mesa Blvd"),
+            ("12 Harbor Pkwy", "34 Copper Mesa Blvd"),
+            ("123 Harbor Pkwy", "456 Copper Mesa Blvd"),
+            ("1234 Harbor Pkwy", "5678 Copper Mesa Blvd"),
+            ("12345 Harbor Pkwy", "56789 Copper Mesa Blvd"),
+            ("123456 Harbor Pkwy", "654321 Copper Mesa Blvd"),
+        )
+        address_list_templates = (
+            "{first} and {second}",
+            "{first}, and {second}",
+            "{first} and {second},",
+            "{first}, and {second},",
+        )
+        quantified_subjects = (
+            ("brokers", "for", "are still available"),
+            ("owners", "at", "remain available"),
+            ("prices", "across", "are still available"),
+            ("contacts", "for", "remain available"),
+            ("agents", "at", "are currently still available"),
+        )
+
+        for target_address, competitor_address in address_pairs:
+            for first, second in (
+                (target_address, competitor_address),
+                (competitor_address, target_address),
+            ):
+                for reason in ("leased", "sold", "no_space_available"):
+                    event = {"type": "property_unavailable", "reason": reason}
+                    for address_list_template in address_list_templates:
+                        address_list = address_list_template.format(
+                            first=first,
+                            second=second,
+                        )
+                        for subject, preposition, predicate in quantified_subjects:
+                            message_text = (
+                                f"Both {subject} {preposition} {address_list} "
+                                f"{predicate}."
+                            )
+                            with self.subTest(
+                                target_address=target_address,
+                                first=first,
+                                reason=reason,
+                                address_list_template=address_list_template,
+                                subject=subject,
+                            ):
+                                patch = processing._pending_nonviable_followup_patch(
+                                    [event],
+                                    row_anchor=f"{target_address}, Phoenix",
+                                    message_text=message_text,
+                                )
+                                self.assertTrue(
+                                    processing._property_unavailable_event_applies_to_row(
+                                        event,
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+                                self.assertIsNotNone(patch)
+                                self.assertEqual("stopped", patch["followUpStatus"])
+                                self.assertEqual(
+                                    reason,
+                                    patch["pendingTerminalReason"],
+                                )
+
+    def test_property_quantifiers_before_address_lists_bind_properties(self):
+        address_pairs = (
+            ("1 Harbor Pkwy", "2 Copper Mesa Blvd"),
+            ("12 Harbor Pkwy", "34 Copper Mesa Blvd"),
+            ("123 Harbor Pkwy", "456 Copper Mesa Blvd"),
+            ("1234 Harbor Pkwy", "5678 Copper Mesa Blvd"),
+            ("12345 Harbor Pkwy", "56789 Copper Mesa Blvd"),
+            ("123456 Harbor Pkwy", "654321 Copper Mesa Blvd"),
+        )
+        address_list_templates = (
+            "{first} and {second}",
+            "{first}, and {second}",
+            "{first} and {second},",
+            "{first}, and {second},",
+        )
+        quantified_subjects = (
+            ("properties", "at", "are still available"),
+            ("buildings", "at", "remain available"),
+            ("sites", "across", "are currently still available"),
+        )
+
+        for target_address, competitor_address in address_pairs:
+            for first, second in (
+                (target_address, competitor_address),
+                (competitor_address, target_address),
+            ):
+                for reason in ("leased", "sold", "no_space_available"):
+                    event = {"type": "property_unavailable", "reason": reason}
+                    for address_list_template in address_list_templates:
+                        address_list = address_list_template.format(
+                            first=first,
+                            second=second,
+                        )
+                        for subject, preposition, predicate in quantified_subjects:
+                            message_text = (
+                                f"Both {subject} {preposition} {address_list} "
+                                f"{predicate}."
+                            )
+                            with self.subTest(
+                                target_address=target_address,
+                                first=first,
+                                reason=reason,
+                                address_list_template=address_list_template,
+                                subject=subject,
+                            ):
+                                self.assertFalse(
+                                    processing._property_unavailable_event_applies_to_row(
+                                        event,
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+                                self.assertIsNone(
+                                    processing._pending_nonviable_followup_patch(
+                                        [event],
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+
     def test_near_negated_availability_never_suppresses_target_terminal_event(self):
         address_pairs = (
             ("1 Main St", "2 Oak Ave"),

@@ -2235,6 +2235,10 @@ _BOUNDED_QUANTIFIED_SUBJECT_RE = re.compile(
     r"(?:[ \t]+[a-z]+(?:[-'’][a-z]+)*){0,9}",
     re.IGNORECASE,
 )
+_QUANTIFIED_ADDRESS_LIST_RELATION_RE = re.compile(
+    r"\b(?:for|at|across|covering|serving|assigned\s+to)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _is_bounded_coordinated_viability_link(link_text: str) -> bool:
@@ -2263,6 +2267,21 @@ def _is_bounded_coordinated_viability_link(link_text: str) -> bool:
     )
 
 
+def _address_list_subject_is_property_set(subject_text: str) -> Optional[bool]:
+    """Classify the bounded noun phrase before a quantified address list."""
+    normalized = (subject_text or "").strip(" \t,")
+    relation = _QUANTIFIED_ADDRESS_LIST_RELATION_RE.search(normalized)
+    if relation:
+        normalized = normalized[:relation.start()].strip(" \t,")
+    if (
+        not normalized
+        or _is_bounded_coordinated_viability_link(normalized)
+        or not _BOUNDED_QUANTIFIED_SUBJECT_RE.fullmatch(normalized)
+    ):
+        return None
+    return bool(_PROPERTY_SET_SUBJECT_RE.fullmatch(normalized))
+
+
 def _quantified_subject_is_property_set(
     clause: str,
     bindings: List[tuple],
@@ -2281,10 +2300,19 @@ def _quantified_subject_is_property_set(
         return None
 
     quantifier = quantifiers[-1]
-    if any(
-        start >= quantifier.end() and end <= viability_match.start()
-        for start, end, _kind in bindings
-    ):
+    intervening_bindings = [
+        binding
+        for binding in bindings
+        if binding[0] >= quantifier.end()
+        and binding[1] <= viability_match.start()
+    ]
+    if intervening_bindings:
+        first_binding_start = min(binding[0] for binding in intervening_bindings)
+        address_list_subject = _address_list_subject_is_property_set(
+            prefix[quantifier.end():first_binding_start]
+        )
+        if address_list_subject is not None:
+            return address_list_subject
         return None
 
     subject_and_link = prefix[quantifier.end():].strip()
