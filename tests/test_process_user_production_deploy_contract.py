@@ -17,6 +17,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy_process_user.sh"
 PREFLIGHT_HELPER = REPO_ROOT / "scripts" / "process_user_gcloud_preflight.sh"
 DEPLOY_README = REPO_ROOT / "deploy" / "README.md"
+GCLOUD_IGNORE = REPO_ROOT / ".gcloudignore"
+GIT_IGNORE = REPO_ROOT / ".gitignore"
 
 ACCOUNT = "bp21harrison@gmail.com"
 PROJECT = "email-automation-cache"
@@ -206,6 +208,122 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertIn("process_user_gcloud_preflight", script)
         self.assertNotIn("gcloud auth list", script)
         self.assertNotIn("gcloud projects describe", script)
+
+    def test_gcloudignore_excludes_local_state_and_includes_repo_safety_rules(self):
+        self.assertTrue(
+            GCLOUD_IGNORE.is_file(),
+            "an explicit .gcloudignore must make the HEAD-tagged build context reproducible",
+        )
+        rules = [
+            line.strip()
+            for line in GCLOUD_IGNORE.read_text(encoding="utf-8").splitlines()
+            if line.strip() and (not line.lstrip().startswith("#") or line.startswith("#!include:"))
+        ]
+        self.assertEqual(
+            [
+                ".gcloudignore",
+                ".git",
+                ".gitignore",
+                "#!include:.gitignore",
+                ".pytest_cache/",
+            ],
+            rules,
+        )
+
+        gitignore = GIT_IGNORE.read_text(encoding="utf-8").splitlines()
+        for required_rule in (
+            ".venv/",
+            ".env",
+            "*credentials*.json",
+            "*service-account*.json",
+            "*.pem",
+            "*.key",
+            "msal_token_cache.bin",
+            "token_cache.bin",
+            "run_production.sh",
+            "logs/",
+        ):
+            self.assertIn(required_rule, gitignore)
+
+        effective_rules = []
+        for line in GCLOUD_IGNORE.read_text(encoding="utf-8").splitlines():
+            if line.strip() == "#!include:.gitignore":
+                effective_rules.extend(gitignore)
+            else:
+                effective_rules.append(line)
+
+        tracked_python = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-files", "*.py"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.splitlines()
+        required_paths = {
+            ".dockerignore",
+            "Dockerfile",
+            "requirements.lock",
+            "service.py",
+            "main.py",
+            "config.py",
+            "scripts/deploy_process_user.sh",
+            *(
+                path
+                for path in tracked_python
+                if not path.startswith("tests/")
+                and "/venv/" not in path
+                and "/.venv/" not in path
+            ),
+        }
+        forbidden_paths = {
+            ".env",
+            ".env.local",
+            ".gcloudignore",
+            ".pytest_cache/v/cache/nodeids",
+            ".venv/bin/python",
+            "local-credentials.json",
+            "logs/process-user.log",
+            "msal_token_cache.bin",
+            "private.key",
+            "private.pem",
+            "run_production.sh",
+            "service-account.json",
+            "token_cache.bin",
+        }
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            sandbox = Path(tempdir)
+            subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=sandbox,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            (sandbox / ".gitignore").write_text(
+                "\n".join(effective_rules) + "\n",
+                encoding="utf-8",
+            )
+            for relative_path in sorted(required_paths | forbidden_paths):
+                path = sandbox / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+
+            def is_ignored(relative_path: str) -> bool:
+                result = subprocess.run(
+                    ["git", "check-ignore", "--no-index", "--quiet", "--", relative_path],
+                    cwd=sandbox,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertIn(result.returncode, (0, 1), result.stderr)
+                return result.returncode == 0
+
+            for relative_path in sorted(required_paths):
+                self.assertTrue((REPO_ROOT / relative_path).is_file(), relative_path)
+                self.assertFalse(is_ignored(relative_path), relative_path)
+            for relative_path in sorted(forbidden_paths):
+                self.assertTrue(is_ignored(relative_path), relative_path)
 
     def test_explicit_dry_run_makes_zero_gcloud_calls(self):
         result = self._run("--dry-run")

@@ -1,0 +1,8 @@
+# Keep the Cloud Build context tied to reviewed repository source.
+.gcloudignore
+.git
+.gitignore
+#!include:.gitignore
+
+# Pytest ignores this directory with a nested file that gcloud does not load.
+.pytest_cache/
