@@ -2230,9 +2230,17 @@ _PROPERTY_SET_SUBJECT_RE = re.compile(
     r"(?:propert(?:y|ies)|buildings?|sites?|spaces?|listings?)\b",
     re.IGNORECASE,
 )
+_PROPERTY_SET_SUBJECT_NOUNS = {
+    "property", "properties", "building", "buildings", "site", "sites",
+    "space", "spaces", "listing", "listings",
+}
+_BOUNDED_QUANTIFIED_SUBJECT_WORD_RE = re.compile(
+    r"[a-z]+(?:[-'’][a-z]+)*(?:['’])?",
+    re.IGNORECASE,
+)
 _BOUNDED_QUANTIFIED_SUBJECT_RE = re.compile(
-    r"[a-z]+(?:[-'’][a-z]+)*"
-    r"(?:[ \t]+[a-z]+(?:[-'’][a-z]+)*){0,9}",
+    r"[a-z]+(?:[-'’][a-z]+)*(?:['’])?"
+    r"(?:[ \t]+[a-z]+(?:[-'’][a-z]+)*(?:['’])?){0,9}",
     re.IGNORECASE,
 )
 _QUANTIFIED_ADDRESS_LIST_RELATION_RE = re.compile(
@@ -2267,19 +2275,27 @@ def _is_bounded_coordinated_viability_link(link_text: str) -> bool:
     )
 
 
+def _bounded_subject_is_property_set(subject_text: str) -> Optional[bool]:
+    """Classify a bounded noun phrase by its final, possibly possessive head."""
+    normalized = (subject_text or "").strip()
+    if not normalized or not _BOUNDED_QUANTIFIED_SUBJECT_RE.fullmatch(normalized):
+        return None
+    words = list(_BOUNDED_QUANTIFIED_SUBJECT_WORD_RE.finditer(normalized))
+    if not words:
+        return None
+    head = words[-1].group(0).lower().rstrip("'’")
+    return head in _PROPERTY_SET_SUBJECT_NOUNS
+
+
 def _address_list_subject_is_property_set(subject_text: str) -> Optional[bool]:
     """Classify the bounded noun phrase before a quantified address list."""
     normalized = (subject_text or "").strip(" \t,")
     relation = _QUANTIFIED_ADDRESS_LIST_RELATION_RE.search(normalized)
     if relation:
         normalized = normalized[:relation.start()].strip(" \t,")
-    if (
-        not normalized
-        or _is_bounded_coordinated_viability_link(normalized)
-        or not _BOUNDED_QUANTIFIED_SUBJECT_RE.fullmatch(normalized)
-    ):
+    if not normalized or _is_bounded_coordinated_viability_link(normalized):
         return None
-    return bool(_PROPERTY_SET_SUBJECT_RE.fullmatch(normalized))
+    return _bounded_subject_is_property_set(normalized)
 
 
 def _quantified_subject_is_property_set(
@@ -2329,16 +2345,12 @@ def _quantified_subject_is_property_set(
         return None
 
     word_spans = list(
-        re.finditer(
-            r"[a-z]+(?:[-'’][a-z]+)*",
-            subject_and_link,
-            re.IGNORECASE,
-        )
+        _BOUNDED_QUANTIFIED_SUBJECT_WORD_RE.finditer(subject_and_link)
     )
-    for subject_word_count in range(1, min(5, len(word_spans)) + 1):
+    for subject_word_count in range(1, len(word_spans) + 1):
         subject_end = word_spans[subject_word_count - 1].end()
         if _is_bounded_coordinated_viability_link(subject_and_link[subject_end:]):
-            return False
+            return _bounded_subject_is_property_set(subject_and_link[:subject_end])
     return None
 
 
