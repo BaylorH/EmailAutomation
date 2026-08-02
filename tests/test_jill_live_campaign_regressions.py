@@ -1407,6 +1407,8 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
             "Schedule (A-1): Property Summary",
             "Exhibit [B.2] (Property Summary)",
             "VERSION [7A] - Building Facts",
+            "Figure I",
+            "Figure I Building Facts",
             "Table: Building Facts",
         )
         expected_updates = [
@@ -1452,6 +1454,74 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                     self.assertEqual([], result["events"])
                     self.assertEqual("Thanks.", result["response_email"])
 
+    def test_structural_caption_lines_do_not_bind_neighboring_facts(self):
+        fragments = (
+            "Figure I\nDocks: 6",
+            "Docks: 6\nFigure I",
+            "Figure I Building Facts\nDocks: 6",
+            "Docks: 6\nFigure I Building Facts",
+            "Figure (I)\nDocks: 6",
+            "Docks: 6\nFigure [I]: Building Facts",
+            "Docks\nFigure I\n6\n100 Main St",
+        )
+
+        for fragment in fragments:
+            with self.subTest(fragment=fragment):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [{"column": "Docks", "value": "6"}],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "100 Main St brochure.pdf",
+                        "text": f"100 Main St, Phoenix\n{fragment}",
+                    }],
+                )
+
+                self.assertEqual(
+                    [{"column": "Docks", "value": "6"}],
+                    result["updates"],
+                )
+                self.assertEqual([], result["events"])
+                self.assertEqual("Thanks.", result["response_email"])
+
+    def test_caption_property_residuals_fail_closed_next_to_facts(self):
+        fragments = (
+            "Figure I Oak Center\nDocks: 6",
+            "Docks: 6\nFigure I Oak Center",
+            "Figure (I): Oak Center\nDocks: 6",
+            "Docks: 6\nFigure [I]: Oak Center",
+            "Oak Center\nFigure I\nDocks: 6",
+            "Docks: 6\nFigure I\nOak Center",
+        )
+
+        for fragment in fragments:
+            with self.subTest(fragment=fragment):
+                result = ai_processing._suppress_competing_attachment_updates(
+                    {
+                        "updates": [{"column": "Docks", "value": "6"}],
+                        "events": [],
+                        "response_email": "Thanks.",
+                    },
+                    _conversation("The brochure is attached."),
+                    "100 Main St, Phoenix",
+                    [{
+                        "name": "mixed brochure.pdf",
+                        "text": f"100 Main St, Phoenix\n{fragment}",
+                    }],
+                )
+
+                self.assertEqual([], result["updates"])
+                self.assertTrue(any(
+                    event.get("type") == "needs_user_input"
+                    and event.get("reason") == "multi_property_attachment"
+                    for event in result["events"]
+                ))
+                self.assertIsNone(result["response_email"])
+
     def test_numbered_captions_preserve_mixed_table_competitor_detection(self):
         docks = {"column": "Docks", "value": "6"}
         power = {"column": "Power", "value": "1200A 480V 3-phase"}
@@ -1494,6 +1564,37 @@ class JillLiveCampaignRegressionTests(unittest.TestCase):
                     for event in result["events"]
                 ))
                 self.assertIsNone(result["response_email"])
+
+    def test_structural_caption_rows_do_not_break_mixed_table_alignment(self):
+        docks = {"column": "Docks", "value": "6"}
+        power = {"column": "Power", "value": "1200A 480V 3-phase"}
+        result = ai_processing._suppress_competing_attachment_updates(
+            {
+                "updates": [docks, power],
+                "events": [],
+                "response_email": "Thanks.",
+            },
+            _conversation("The brochure is attached."),
+            "100 Main St, Phoenix",
+            [{
+                "name": "mixed brochure.pdf",
+                "text": (
+                    "100 Main St, Phoenix\n"
+                    "| Docks | Power |\n"
+                    "Figure I\n"
+                    "| 6 | 1200A 480V 3-phase |\n"
+                    "| 100 Main St | Oak Center |"
+                ),
+            }],
+        )
+
+        self.assertEqual([docks], result["updates"])
+        self.assertTrue(any(
+            event.get("type") == "needs_user_input"
+            and event.get("reason") == "multi_property_attachment"
+            for event in result["events"]
+        ))
+        self.assertIsNone(result["response_email"])
 
     def test_malformed_caption_designator_wrappers_fail_closed(self):
         caption_formats = (

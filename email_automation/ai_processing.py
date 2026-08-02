@@ -2188,9 +2188,10 @@ def _property_clause_spans(text: str) -> List[tuple]:
 def _property_table_clause_spans(text: str) -> List[tuple]:
     """Return logical table rows without Markdown alignment separators."""
     spans = _property_clause_spans(text)
+    structural_caption_spans = _structural_caption_span_set(text, spans)
     return [
         span for span in spans
-        if not (
+        if span not in structural_caption_spans and not (
             "|" in text[span[0]:span[1]]
             and (cells := _property_table_cells(text[span[0]:span[1]]))
             and all(
@@ -2234,6 +2235,22 @@ def _document_caption_verdict(text: str) -> Optional[str]:
     if not title or _is_property_fact_or_section_label(title):
         return "structural"
     return "competing"
+
+
+def _structural_caption_span_set(text: str, spans: List[tuple]) -> set:
+    """Return complete spans whose caption syntax is verified structural."""
+    return {
+        span for span in spans
+        if _document_caption_verdict(text[span[0]:span[1]]) == "structural"
+    }
+
+
+def _span_within_any(span: tuple, containing_spans: set) -> bool:
+    """Whether a span is wholly contained by one of the supplied spans."""
+    return any(
+        start <= span[0] and span[1] <= end
+        for start, end in containing_spans
+    )
 
 
 def _aligned_property_table_cells(text: str) -> List[tuple]:
@@ -2418,6 +2435,12 @@ def _unbound_identity_fact_spans(
     text = text or ""
     if not _source_mentions_target_property(text, target_anchor):
         return []
+    clause_spans = _property_clause_spans(text)
+    structural_caption_spans = _structural_caption_span_set(text, clause_spans)
+    scannable_clause_spans = [
+        span for span in clause_spans
+        if span not in structural_caption_spans
+    ]
     structured_table_labels, malformed_table_spans = (
         _property_table_shape_spans(text, target_anchor)
     )
@@ -2427,12 +2450,10 @@ def _unbound_identity_fact_spans(
     # first value on the next. Treat an unknown standalone heading followed by
     # a mapped property fact as a structural identity boundary while preserving
     # explicit field/section labels such as "Clear Height" and "Highlights".
-    clause_spans = _property_clause_spans(text)
-    structural_caption_spans = [
-        span for span in clause_spans
-        if _document_caption_verdict(text[span[0]:span[1]]) == "structural"
-    ]
-    for current, following in zip(clause_spans, clause_spans[1:]):
+    for current, following in zip(
+        scannable_clause_spans,
+        scannable_clause_spans[1:],
+    ):
         if current in structured_table_labels:
             continue
         current_text = text[current[0]:current[1]]
@@ -2454,7 +2475,10 @@ def _unbound_identity_fact_spans(
     # The same table layout can extract in the opposite order: mapped fact
     # first, property heading second. Start the boundary at the fact so its
     # value cannot remain in the preceding target-bound segment.
-    for current, following in zip(clause_spans, clause_spans[1:]):
+    for current, following in zip(
+        scannable_clause_spans,
+        scannable_clause_spans[1:],
+    ):
         current_text = text[current[0]:current[1]]
         following_text = text[following[0]:following[1]]
         postfixed_identity = _STANDALONE_IDENTITY_LINE_RE.match(following_text)
@@ -2488,13 +2512,10 @@ def _unbound_identity_fact_spans(
             continue
         unbound_spans.append((label_span[0], identity_span[1]))
 
-    for clause_start, clause_end in clause_spans:
+    for clause_start, clause_end in scannable_clause_spans:
         clause = text[clause_start:clause_end]
         caption_verdict = _document_caption_verdict(clause)
-        if (
-            _source_mentions_target_property(clause, target_anchor)
-            or caption_verdict == "structural"
-        ):
+        if _source_mentions_target_property(clause, target_anchor):
             continue
         if caption_verdict == "competing":
             unbound_spans.append((clause_start, clause_end))
@@ -2513,7 +2534,7 @@ def _unbound_identity_fact_spans(
         if not _is_property_fact_or_section_label(label):
             unbound_spans.append((clause_start, clause_end))
 
-    for clause_start, clause_end in clause_spans:
+    for clause_start, clause_end in scannable_clause_spans:
         clause = text[clause_start:clause_end]
         if _postfixed_unbound_identity(clause, target_anchor):
             unbound_spans.append((clause_start, clause_end))
@@ -2526,9 +2547,9 @@ def _unbound_identity_fact_spans(
     for segment in re.finditer(r"(?:^|[.!?;\n])(?P<body>[^.!?;\n]+)", text):
         segment_start, segment_end = segment.span("body")
         segment_text = segment.group("body")
-        if any(
-            start <= segment_start and segment_end <= end
-            for start, end in structural_caption_spans
+        if _span_within_any(
+            (segment_start, segment_end),
+            structural_caption_spans,
         ):
             continue
         caption_verdict = _document_caption_verdict(segment_text)
@@ -2552,9 +2573,9 @@ def _unbound_identity_fact_spans(
 
     for segment in re.finditer(r"(?:^|[.!?;\n])(?P<body>[^.!?;\n]+)", text):
         segment_start, segment_end = segment.span("body")
-        if any(
-            start <= segment_start and segment_end <= end
-            for start, end in structural_caption_spans
+        if _span_within_any(
+            (segment_start, segment_end),
+            structural_caption_spans,
         ):
             continue
         if _postfixed_unbound_identity(segment.group("body"), target_anchor):
