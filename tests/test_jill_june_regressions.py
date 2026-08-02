@@ -1030,6 +1030,254 @@ class JillJuneRegressionTests(unittest.TestCase):
                             self.assertEqual("stopped", patch["followUpStatus"])
                             self.assertEqual(reason, patch["pendingTerminalReason"])
 
+    def test_qualified_negated_viability_never_suppresses_terminal_event(self):
+        target_address = "17 Harbor Pkwy"
+        competitor_address = "8021 Copper Mesa Blvd"
+        predicates = (
+            (
+                "is not expected to remain available",
+                "are not expected to remain available",
+            ),
+            (
+                "is not likely to remain available",
+                "are not likely to remain available",
+            ),
+            (
+                "is not anticipated to remain available",
+                "are not anticipated to remain available",
+            ),
+            (
+                "is not projected to remain available",
+                "are not projected to remain available",
+            ),
+            (
+                "is not scheduled to remain available",
+                "are not scheduled to remain available",
+            ),
+            (
+                "is unlikely to remain available",
+                "are unlikely to remain available",
+            ),
+            (
+                "is not currently expected to remain available",
+                "are not currently expected to remain available",
+            ),
+            (
+                "is expected not to remain available",
+                "are expected not to remain available",
+            ),
+            (
+                "isn't necessarily likely to remain available",
+                "aren't necessarily likely to remain available",
+            ),
+            (
+                "may not remain available",
+                "may not remain available",
+            ),
+        )
+
+        for first, second in (
+            (target_address, competitor_address),
+            (competitor_address, target_address),
+        ):
+            for reason in ("leased", "sold", "no_space_available"):
+                event = {"type": "property_unavailable", "reason": reason}
+                for singular_predicate, plural_predicate in predicates:
+                    messages = (
+                        (
+                            "explicit",
+                            f"{target_address} has been leased and "
+                            f"{singular_predicate}.",
+                        ),
+                        (
+                            "shared",
+                            f"{first} and {second} {plural_predicate}.",
+                        ),
+                        (
+                            "quantified_address_list",
+                            f"Both properties at {first} and {second} "
+                            f"{plural_predicate}.",
+                        ),
+                        (
+                            "following_quantifier",
+                            f"{first} and {second}, both properties "
+                            f"{plural_predicate}.",
+                        ),
+                    )
+                    for scope, message_text in messages:
+                        with self.subTest(
+                            first=first,
+                            reason=reason,
+                            singular_predicate=singular_predicate,
+                            scope=scope,
+                        ):
+                            patch = processing._pending_nonviable_followup_patch(
+                                [event],
+                                row_anchor=f"{target_address}, Phoenix",
+                                message_text=message_text,
+                            )
+                            self.assertTrue(
+                                processing._property_unavailable_event_applies_to_row(
+                                    event,
+                                    row_anchor=f"{target_address}, Phoenix",
+                                    message_text=message_text,
+                                )
+                            )
+                            self.assertIsNotNone(patch)
+                            self.assertEqual("stopped", patch["followUpStatus"])
+                            self.assertEqual(
+                                reason,
+                                patch["pendingTerminalReason"],
+                            )
+
+    def test_addressless_qualified_negation_keeps_been_leased_signal(self):
+        target_address = "17 Harbor Pkwy"
+        negative_predicates = (
+            "is not expected to remain available",
+            "is not likely to remain available",
+            "is not anticipated to remain available",
+            "is not projected to remain available",
+            "is not scheduled to remain available",
+            "is unlikely to remain available",
+            "is expected not to remain available",
+            "isn't necessarily likely to remain available",
+        )
+
+        for predicate in negative_predicates:
+            message_text = f"It has been leased and {predicate}."
+            with self.subTest(predicate=predicate):
+                proposal = ai_processing._augment_events_with_deterministic_signals(
+                    {"updates": [], "events": [], "response_email": None},
+                    [{"direction": "inbound", "content": message_text}],
+                    target_anchor=f"{target_address}, Phoenix",
+                )
+                unavailable_events = [
+                    event
+                    for event in proposal["events"]
+                    if event.get("type") == "property_unavailable"
+                ]
+                self.assertEqual(
+                    ["been_leased"],
+                    [event.get("reason") for event in unavailable_events],
+                )
+                patch = processing._pending_nonviable_followup_patch(
+                    unavailable_events,
+                    row_anchor=f"{target_address}, Phoenix",
+                    message_text=message_text,
+                )
+                self.assertIsNotNone(patch)
+                self.assertEqual("stopped", patch["followUpStatus"])
+                self.assertEqual("been_leased", patch["pendingTerminalReason"])
+
+        for predicate in (
+            "is expected to remain available",
+            "is likely to remain available",
+        ):
+            message_text = f"It has been leased but {predicate}."
+            with self.subTest(predicate=predicate, scope="affirmative_control"):
+                proposal = ai_processing._augment_events_with_deterministic_signals(
+                    {"updates": [], "events": [], "response_email": None},
+                    [{"direction": "inbound", "content": message_text}],
+                    target_anchor=f"{target_address}, Phoenix",
+                )
+                self.assertNotIn(
+                    "property_unavailable",
+                    [event.get("type") for event in proposal["events"]],
+                )
+
+    def test_affirmative_qualified_viability_still_preserves_target(self):
+        target_address = "17 Harbor Pkwy"
+        competitor_address = "8021 Copper Mesa Blvd"
+        predicates = (
+            (
+                "is expected to remain available",
+                "are expected to remain available",
+            ),
+            (
+                "is likely to remain available",
+                "are likely to remain available",
+            ),
+            (
+                "is anticipated to remain available",
+                "are anticipated to remain available",
+            ),
+            (
+                "is projected to remain available",
+                "are projected to remain available",
+            ),
+            (
+                "is scheduled to remain available",
+                "are scheduled to remain available",
+            ),
+        )
+
+        for first, second in (
+            (target_address, competitor_address),
+            (competitor_address, target_address),
+        ):
+            for reason in ("leased", "sold", "no_space_available"):
+                event = {"type": "property_unavailable", "reason": reason}
+                for singular_predicate, plural_predicate in predicates:
+                    messages = (
+                        ("explicit", f"{target_address} {singular_predicate}."),
+                        (
+                            "shared",
+                            f"{first} and {second} {plural_predicate}.",
+                        ),
+                        (
+                            "quantified_address_list",
+                            f"Both properties at {first} and {second} "
+                            f"{plural_predicate}.",
+                        ),
+                        (
+                            "following_quantifier",
+                            f"{first} and {second}, both properties "
+                            f"{plural_predicate}.",
+                        ),
+                    )
+                    for scope, message_text in messages:
+                        with self.subTest(
+                            first=first,
+                            reason=reason,
+                            singular_predicate=singular_predicate,
+                            scope=scope,
+                        ):
+                            self.assertFalse(
+                                processing._property_unavailable_event_applies_to_row(
+                                    event,
+                                    row_anchor=f"{target_address}, Phoenix",
+                                    message_text=message_text,
+                                )
+                            )
+                            self.assertIsNone(
+                                processing._pending_nonviable_followup_patch(
+                                    [event],
+                                    row_anchor=f"{target_address}, Phoenix",
+                                    message_text=message_text,
+                                )
+                            )
+
+        for reason in ("leased", "sold", "no_space_available"):
+            event = {"type": "property_unavailable", "reason": reason}
+            message_text = (
+                f"{target_address} is not unlikely to remain available."
+            )
+            with self.subTest(reason=reason, scope="double_negation"):
+                self.assertFalse(
+                    processing._property_unavailable_event_applies_to_row(
+                        event,
+                        row_anchor=f"{target_address}, Phoenix",
+                        message_text=message_text,
+                    )
+                )
+                self.assertIsNone(
+                    processing._pending_nonviable_followup_patch(
+                        [event],
+                        row_anchor=f"{target_address}, Phoenix",
+                        message_text=message_text,
+                    )
+                )
+
     def test_unrelated_neither_nor_does_not_negate_later_target_viability(self):
         address_pairs = (
             ("1 Main St", "2 Oak Ave"),

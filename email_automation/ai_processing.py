@@ -536,6 +536,54 @@ _VIABILITY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_VIABILITY_NEGATOR_PATTERN = (
+    r"(?:not|never|no\s+longer|hardly|barely|scarcely|"
+    r"isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t|"
+    r"doesn['’]?t|don['’]?t|didn['’]?t|"
+    r"hasn['’]?t|haven['’]?t|hadn['’]?t|"
+    r"cannot|can['’]?t|couldn['’]?t|wouldn['’]?t|shouldn['’]?t)"
+)
+_VIABILITY_NEGATION_MODIFIER_PATTERN = r"(?:all|both|currently|necessarily)"
+_VIABILITY_QUALIFIER_WORDS = frozenset({
+    "anticipated", "expected", "likely", "projected", "scheduled",
+})
+_VIABILITY_QUALIFIER_PATTERN = (
+    r"(?:expected|likely|anticipated|projected|scheduled)"
+)
+_VIABILITY_NEGATION_PREFIX_RE = re.compile(
+    rf"\b{_VIABILITY_NEGATOR_PATTERN}\s+"
+    rf"(?:{_VIABILITY_NEGATION_MODIFIER_PATTERN}\s+)*$",
+    re.IGNORECASE,
+)
+_VIABILITY_NEGATED_QUALIFIER_PREFIX_RE = re.compile(
+    rf"(?:\b{_VIABILITY_NEGATOR_PATTERN}\s+"
+    rf"(?:{_VIABILITY_NEGATION_MODIFIER_PATTERN}\s+){{0,3}}"
+    rf"{_VIABILITY_QUALIFIER_PATTERN}\s+to\s+|"
+    rf"\b{_VIABILITY_QUALIFIER_PATTERN}\s+(?:not|never)\s+to\s+)$",
+    re.IGNORECASE,
+)
+_VIABILITY_UNLIKELY_PREFIX_RE = re.compile(
+    r"\bunlikely\s+to\s+$",
+    re.IGNORECASE,
+)
+
+
+def _viability_prefix_is_lexically_negated(prefix: str) -> bool:
+    """Whether a viability predicate is directly or qualificationally negated."""
+    normalized = prefix or ""
+    if (
+        _VIABILITY_NEGATION_PREFIX_RE.search(normalized)
+        or _VIABILITY_NEGATED_QUALIFIER_PREFIX_RE.search(normalized)
+    ):
+        return True
+    unlikely = _VIABILITY_UNLIKELY_PREFIX_RE.search(normalized)
+    return bool(
+        unlikely
+        and not _VIABILITY_NEGATION_PREFIX_RE.search(
+            normalized[:unlikely.start()]
+        )
+    )
+
 # Ancillary / non-target subjects a lease reference may bind to. A lease about one
 # of these (or a tour slot/window) is not the property going away (M15, M19, M20).
 _ANCILLARY_SUBJECT_RE = re.compile(
@@ -680,7 +728,10 @@ def _detect_target_terminal_reason(latest_text: str, target_anchor: Optional[str
     """
     text = (latest_text or "").lower()
     target_identity = _target_street_identity(target_anchor or "")
-    has_global_viability = bool(_VIABILITY_RE.search(text))
+    has_global_viability = any(
+        not _viability_prefix_is_lexically_negated(text[:match.start()])
+        for match in _VIABILITY_RE.finditer(text)
+    )
     sentences = _terminal_subject_clauses(text)
 
     # Pattern order is canonical reason precedence; evaluate it across every

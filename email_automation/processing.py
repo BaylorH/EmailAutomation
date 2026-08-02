@@ -24,6 +24,7 @@ from .logging import write_message_order_test
 from .ai_processing import (
     _ANCILLARY_SUBJECT_RE,
     _UNAVAILABLE_PATTERNS,
+    _VIABILITY_QUALIFIER_WORDS,
     _VIABILITY_RE,
     _append_ai_meta,
     _detect_target_terminal_reason,
@@ -31,6 +32,7 @@ from .ai_processing import (
     _source_mentions_target_property,
     _street_claim_spans,
     _target_street_identity,
+    _viability_prefix_is_lexically_negated,
     apply_proposal_to_sheet,
     check_missing_required_fields,
     get_row_anchor,
@@ -2198,16 +2200,6 @@ def _nearest_property_binding(
     return next(iter(nearest_kinds)) if len(nearest_kinds) == 1 else None
 
 
-_VIABILITY_NEGATION_PREFIX_RE = re.compile(
-    r"\b(?:not|never|no\s+longer|hardly|barely|scarcely|"
-    r"isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t|"
-    r"doesn['’]?t|don['’]?t|didn['’]?t|"
-    r"hasn['’]?t|haven['’]?t|hadn['’]?t|"
-    r"cannot|can['’]?t|couldn['’]?t|wouldn['’]?t|shouldn['’]?t)"
-    r"\s+(?:(?:all|both|currently|necessarily)\s+)*$",
-    re.IGNORECASE,
-)
-
 _COORDINATED_LINK_CLAUSE_WORD_RE = re.compile(
     r"\b(?:and|but|or|nor|while|whereas|although|though|because)\b",
     re.IGNORECASE,
@@ -2224,6 +2216,9 @@ _COORDINATED_LINK_IRREGULAR_ADVERBS = {
     "never", "now", "often", "perhaps", "quite", "rather", "since",
     "still", "then", "yet",
 }
+_COORDINATED_LINK_VIABILITY_QUALIFIERS = (
+    _VIABILITY_QUALIFIER_WORDS | {"unlikely"}
+)
 _PROPERTY_SET_QUANTIFIER_RE = re.compile(r"\b(?:both|each)\b", re.IGNORECASE)
 _PROPERTY_SET_SUBJECT_RE = re.compile(
     r"^(?:(?:of\s+)?(?:the\s+|these\s+|those\s+)?)?"
@@ -2317,6 +2312,7 @@ def _is_bounded_coordinated_viability_link(link_text: str) -> bool:
     return all(
         word in _COORDINATED_LINK_AUXILIARIES
         or word in _COORDINATED_LINK_IRREGULAR_ADVERBS
+        or word in _COORDINATED_LINK_VIABILITY_QUALIFIERS
         or word.endswith("ly")
         or word.endswith("n't")
         for word in words
@@ -2444,7 +2440,7 @@ def _viability_match_is_negated(
 ) -> bool:
     prefix = (clause or "")[:viability_match.start()]
     return bool(
-        _VIABILITY_NEGATION_PREFIX_RE.search(prefix)
+        _viability_prefix_is_lexically_negated(prefix)
         or _neither_nor_binds_viability(clause, bindings, viability_match)
     )
 
@@ -2474,11 +2470,7 @@ def _viability_is_shared_across_property_bindings(
         conjunctions.append(match.group(1).lower())
 
     link_text = (clause or "")[bindings[-1][1]:viability_match.start()]
-    if not re.fullmatch(
-        r"[\s,]*(?:(?:are|remain|both)[\s,]*)*",
-        link_text,
-        re.IGNORECASE,
-    ):
+    if not _is_bounded_coordinated_viability_link(link_text):
         return False
 
     leading_text = (clause or "")[max(0, bindings[0][0] - 12):bindings[0][0]]
