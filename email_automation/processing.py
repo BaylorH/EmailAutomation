@@ -2145,7 +2145,7 @@ def _terminal_period_continues_abbreviation(
     next_token = next_token_match.group(0)
     next_token_lower = next_token.lower()
 
-    if abbreviation == "sq":
+    if abbreviation in {"sq", "cu"}:
         return next_token_lower in {"ft", "feet", "in", "inch", "inches"}
     if abbreviation in _TERMINAL_MEASUREMENT_ABBREVIATIONS:
         if next_token_lower not in _TERMINAL_MEASUREMENT_CONTINUATION_WORDS:
@@ -2369,7 +2369,7 @@ _PROPERTY_SET_SUBJECT_NOUNS = {
     "unit", "units", "suite", "suites",
 }
 _BOUNDED_QUANTIFIED_SUBJECT_ABBREVIATION_PATTERN = (
-    r"(?:sq\.(?:ft|in)\.|cu\.ft\.|s\.f\.|sq\.|ft\.|in\.|sf\.)"
+    r"(?:(?:sq|cu)\.(?:ft|in)\.|s\.f\.|(?:sq|cu)\.|ft\.|in\.|sf\.)"
 )
 _BOUNDED_QUANTIFIED_SUBJECT_WORD_PATTERN = (
     rf"(?:{_BOUNDED_QUANTIFIED_SUBJECT_ABBREVIATION_PATTERN}|"

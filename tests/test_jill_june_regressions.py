@@ -2469,6 +2469,15 @@ class JillJuneRegressionTests(unittest.TestCase):
             "100,000 Sq.Ft.",
             "144 Sq.In.",
             "100,000 Cu.Ft.",
+            "144 cu.in.",
+            "144 CU.IN.",
+            "144 Cu.In.",
+            "100,000 cu. ft.",
+            "144 cu. in.",
+            "100,000 CU. FT.",
+            "144 CU. IN.",
+            "100,000 Cu. Ft.",
+            "144 Cu. In.",
         )
         property_heads = (
             ("warehouse", "warehouses"),
@@ -2575,6 +2584,18 @@ class JillJuneRegressionTests(unittest.TestCase):
                 ["The volume is 100,000 cu.ft.", "It remains available."],
             ),
             (
+                "The volume is 100,000 cu. ft. It remains available.",
+                ["The volume is 100,000 cu. ft.", "It remains available."],
+            ),
+            (
+                "The opening is 144 cu. in. It remains available.",
+                ["The opening is 144 cu. in.", "It remains available."],
+            ),
+            (
+                "The opening is 144 cu.in. It remains available.",
+                ["The opening is 144 cu.in.", "It remains available."],
+            ),
+            (
                 "The range is 36 ft. - 40 ft. It remains available.",
                 ["The range is 36 ft. - 40 ft.", "It remains available."],
             ),
@@ -2658,6 +2679,12 @@ class JillJuneRegressionTests(unittest.TestCase):
             "Both 100,000 SQ.FT. property brokers",
             "Each 144 SQ.IN. site contact",
             "Both 100,000 CU.FT. listing agents",
+            "Both 100,000 cu. ft. building owners",
+            "Each 144 cu. in. facility contact",
+            "Both 144 cu.in. warehouse managers",
+            "Both 100,000 CU. FT. property brokers",
+            "Each 144 CU. IN. site contact",
+            "Both 144 CU.IN. listing agents",
         )
 
         for first, second in (
