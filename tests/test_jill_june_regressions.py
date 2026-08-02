@@ -2443,6 +2443,183 @@ class JillJuneRegressionTests(unittest.TestCase):
                                 )
                             )
 
+    def test_terminal_clause_splitter_preserves_measurement_abbreviations(self):
+        target_address = "17 Harbor Pkwy"
+        competitor_address = "8021 Copper Mesa Blvd"
+        modifiers = (
+            "100,000 sq. ft.",
+            "40 ft.",
+            "12 in.",
+            "40 ft. x 60 ft.",
+            "36 ft. - 40 ft.",
+            "36 ft. – 40 ft.",
+            "36 ft. to 40 ft.",
+            "12 in. / 18 in.",
+            "144 sq. in.",
+            "100,000 SF.",
+            "100,000 S.F.",
+            "100,000 Sq. Ft.",
+            "40 FT.",
+        )
+        property_heads = (
+            ("warehouse", "warehouses"),
+            ("building", "buildings"),
+            ("property", "properties"),
+            ("site", "sites"),
+            ("listing", "listings"),
+            ("Building", "Buildings"),
+            ("PROPERTY", "PROPERTIES"),
+        )
+
+        for first, second in (
+            (target_address, competitor_address),
+            (competitor_address, target_address),
+        ):
+            for reason in (
+                "leased",
+                "sold",
+                "no_space_available",
+                "been_leased",
+            ):
+                event = {"type": "property_unavailable", "reason": reason}
+                for modifier in modifiers:
+                    for singular_head, plural_head in property_heads:
+                        first_explicit = (
+                            f"The {modifier} {singular_head} at {first} "
+                            "is still available."
+                        )
+                        second_explicit = (
+                            f"The {modifier} {singular_head} at {second} "
+                            "is still available."
+                        )
+                        messages = (
+                            (
+                                "explicit",
+                                f"{first_explicit} {second_explicit}",
+                                [first_explicit, second_explicit],
+                            ),
+                            (
+                                "shared",
+                                f"The {modifier} {plural_head} at {first} and "
+                                f"{second} are still available.",
+                                None,
+                            ),
+                            (
+                                "quantified",
+                                f"Each {modifier} {singular_head} at {first} and "
+                                f"{second} is still available.",
+                                None,
+                            ),
+                        )
+                        for scope, message_text, expected_clauses in messages:
+                            with self.subTest(
+                                first=first,
+                                modifier=modifier,
+                                property_head=singular_head,
+                                reason=reason,
+                                scope=scope,
+                            ):
+                                self.assertEqual(
+                                    expected_clauses or [message_text],
+                                    processing._terminal_binding_clauses(
+                                        message_text
+                                    ),
+                                )
+                                self.assertFalse(
+                                    processing._property_unavailable_event_applies_to_row(
+                                        event,
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+                                self.assertIsNone(
+                                    processing._pending_nonviable_followup_patch(
+                                        [event],
+                                        row_anchor=f"{target_address}, Phoenix",
+                                        message_text=message_text,
+                                    )
+                                )
+
+        sentence_controls = (
+            (
+                "The clear height is 40 ft. It has been leased.",
+                ["The clear height is 40 ft.", "It has been leased."],
+            ),
+            (
+                "The door is 12 in. It remains available.",
+                ["The door is 12 in.", "It remains available."],
+            ),
+            (
+                "The building is 100,000 SF. It remains available.",
+                ["The building is 100,000 SF.", "It remains available."],
+            ),
+            (
+                "The range is 36 ft. - 40 ft. It remains available.",
+                ["The range is 36 ft. - 40 ft.", "It remains available."],
+            ),
+            (
+                "The clear height is 40 ft. it has been leased.",
+                ["The clear height is 40 ft.", "it has been leased."],
+            ),
+            (
+                "The clear height is 40 ft. 17 Harbor Pkwy remains available.",
+                [
+                    "The clear height is 40 ft.",
+                    "17 Harbor Pkwy remains available.",
+                ],
+            ),
+            (
+                "The clear height is 40 FT. Building A has been leased.",
+                ["The clear height is 40 FT.", "Building A has been leased."],
+            ),
+            (
+                "The clear height: 40 FT. Building A has been leased.",
+                ["The clear height: 40 FT.", "Building A has been leased."],
+            ),
+            (
+                "Please contact Mr. Smith. The warehouse remains available.",
+                [
+                    "Please contact Mr. Smith.",
+                    "The warehouse remains available.",
+                ],
+            ),
+            (
+                "Please contact Dr. J. Smith. The warehouse remains available.",
+                [
+                    "Please contact Dr. J. Smith.",
+                    "The warehouse remains available.",
+                ],
+            ),
+            (
+                "Suite No. 4 remains available. Suite No. 5 has been leased.",
+                [
+                    "Suite No. 4 remains available.",
+                    "Suite No. 5 has been leased.",
+                ],
+            ),
+            (
+                "No. I have not received the flyer.",
+                ["No.", "I have not received the flyer."],
+            ),
+            (
+                "No. 17 Harbor Pkwy remains available.",
+                ["No.", "17 Harbor Pkwy remains available."],
+            ),
+            (
+                "Bldg. No. 4 remains available. Ste. No. 5 has been leased.",
+                [
+                    "Bldg. No. 4 remains available.",
+                    "Ste. No. 5 has been leased.",
+                ],
+            ),
+        )
+        for message_text, expected_clauses in sentence_controls:
+            with self.subTest(message_text=message_text, scope="sentence_boundary"):
+                self.assertEqual(
+                    expected_clauses,
+                    processing._terminal_binding_clauses(message_text),
+                )
+
     def test_numeric_modifiers_do_not_promote_nonproperty_heads(self):
         target_address = "17 Harbor Pkwy"
         competitor_address = "8021 Copper Mesa Blvd"

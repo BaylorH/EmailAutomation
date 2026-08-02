@@ -2074,6 +2074,37 @@ _ADDRESS_LED_TERMINAL_SEPARATOR_RE = re.compile(
     r",?\s+(?:and|but|or)\s+(?=\d{1,6}\s+[a-z])",
     re.IGNORECASE,
 )
+_TERMINAL_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])[ \t]+")
+_TERMINAL_ABBREVIATION_RE = re.compile(
+    r"\b((?:[a-z]\.)*[a-z]+)\.$",
+    re.IGNORECASE,
+)
+_TERMINAL_MEASUREMENT_ABBREVIATIONS = {
+    "ft", "in", "sf",
+}
+_TERMINAL_MEASUREMENT_CONTINUATION_WORDS = {
+    "across", "at", "building", "buildings", "by", "ceiling", "clear",
+    "clearance", "deep", "depth", "door", "doors", "facility", "facilities",
+    "high", "height", "listing", "listings", "long", "maximum", "minimum",
+    "of", "premises", "property", "properties", "site", "sites", "space",
+    "spaces", "suite", "suites", "tall", "unit", "units", "warehouse",
+    "warehouses", "wide", "width", "to",
+}
+_TERMINAL_TITLE_ABBREVIATIONS = {
+    "dr", "mr", "mrs", "ms", "prof",
+}
+_TERMINAL_IDENTIFIER_ABBREVIATIONS = {
+    "bldg", "ste", "whse",
+}
+_TERMINAL_SENTENCE_STARTERS = {
+    "a", "an", "he", "i", "it", "our", "she", "that", "the", "these",
+    "they", "this", "those", "we", "you",
+}
+_TERMINAL_NUMERIC_NOUN_PHRASE_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:both|each)(?:\s+of\s+(?:the\s+)?)?|"
+    r"a|an|our|that|the|their|these|this|those|your)\s+(?:±\s*)?\d",
+    re.IGNORECASE,
+)
 
 
 def _clause_owns_property_assertion(clause: str) -> bool:
@@ -2087,17 +2118,119 @@ def _clause_owns_property_assertion(clause: str) -> bool:
     )
 
 
+def _terminal_period_continues_abbreviation(
+    text: str,
+    boundary_start: int,
+    boundary_end: int,
+    fragment_start: int,
+) -> bool:
+    """Keep only context-proven abbreviation periods inside a sentence."""
+    abbreviation_match = _TERMINAL_ABBREVIATION_RE.search(
+        (text or "")[:boundary_start]
+    )
+    if not abbreviation_match:
+        return False
+
+    abbreviation = abbreviation_match.group(1).replace(".", "").lower()
+    following = (text or "")[boundary_end:]
+    if (
+        abbreviation in _TERMINAL_MEASUREMENT_ABBREVIATIONS
+        and re.match(r"(?:[x×/]|[-–—])\s*\d", following, re.IGNORECASE)
+    ):
+        return True
+
+    next_token_match = re.match(r"(?:#?\d+|[a-z]+)", following, re.IGNORECASE)
+    if not next_token_match:
+        return False
+    next_token = next_token_match.group(0)
+    next_token_lower = next_token.lower()
+
+    if abbreviation == "sq":
+        return next_token_lower in {"ft", "feet", "in", "inch", "inches"}
+    if abbreviation in _TERMINAL_MEASUREMENT_ABBREVIATIONS:
+        if next_token_lower not in _TERMINAL_MEASUREMENT_CONTINUATION_WORDS:
+            return False
+        if next_token[0].islower():
+            return True
+        local_prefix = re.split(
+            r"\n+|\s*;\s*|,\s*(?:while|whereas)\s+|"
+            r"\s+(?:while|whereas)\s+",
+            (text or "")[fragment_start:boundary_start],
+            flags=re.IGNORECASE,
+        )[-1]
+        return bool(_TERMINAL_NUMERIC_NOUN_PHRASE_PREFIX_RE.search(local_prefix))
+    if abbreviation in _TERMINAL_TITLE_ABBREVIATIONS:
+        return bool(
+            next_token[0].isupper()
+            and next_token_lower not in _TERMINAL_SENTENCE_STARTERS
+        )
+    if len(abbreviation) == 1:
+        title_initial_prefix = re.search(
+            r"\b(?:dr|mr|mrs|ms|prof)\.\s+(?:[a-z]\.\s+)*$",
+            (text or "")[:abbreviation_match.start()],
+            re.IGNORECASE,
+        )
+        return bool(
+            title_initial_prefix
+            and next_token[0].isupper()
+            and next_token_lower not in _TERMINAL_SENTENCE_STARTERS
+        )
+    if abbreviation == "no":
+        identifier_owner = re.search(
+            r"\b(?:bldg\.?|building|listing|lot|parcel|property|site|space|"
+            r"ste\.?|suite|unit|warehouse|whse\.?)\s*$",
+            (text or "")[:abbreviation_match.start()],
+            re.IGNORECASE,
+        )
+        return bool(
+            identifier_owner
+            and (next_token[0].isdigit() or next_token.startswith("#"))
+        )
+    if abbreviation in _TERMINAL_IDENTIFIER_ABBREVIATIONS:
+        if re.match(r"no\.\s+(?:#?\d+)", following, re.IGNORECASE):
+            return True
+        return bool(
+            next_token[0].isdigit()
+            or next_token.startswith("#")
+            or (len(next_token) == 1 and next_token.isupper())
+        )
+    return False
+
+
+def _terminal_sentence_fragments(message_text: str) -> List[str]:
+    """Split real sentence endings while retaining known abbreviation periods."""
+    text = message_text or ""
+    fragments = []
+    fragment_start = 0
+    for boundary in _TERMINAL_SENTENCE_BOUNDARY_RE.finditer(text):
+        if (
+            text[boundary.start() - 1] == "."
+            and _terminal_period_continues_abbreviation(
+                text,
+                boundary.start(),
+                boundary.end(),
+                fragment_start,
+            )
+        ):
+            continue
+        fragments.append(text[fragment_start:boundary.start()])
+        fragment_start = boundary.end()
+    fragments.append(text[fragment_start:])
+    return fragments
+
+
 def _terminal_binding_clauses(message_text: str) -> List[str]:
     """Split independent property assertions without separating shared subjects."""
     clauses = [
         clause.strip()
+        for sentence in _terminal_sentence_fragments(message_text or "")
         for clause in re.split(
-            r"(?<=[.!?])\s+|\n+|\s*;\s*|"
+            r"\n+|\s*;\s*|"
             r",\s*(?:while|whereas)\s+|"
             r"\s+(?:while|whereas)\s+|"
             r",\s*and\s+(?=(?:i|we|here|attached|included|please)\b)|"
             r"\s+and\s+(?=(?:i|we|here|attached|included|please)\b)",
-            message_text or "",
+            sentence,
             flags=re.IGNORECASE,
         )
         if clause.strip()
@@ -2235,8 +2368,12 @@ _PROPERTY_SET_SUBJECT_NOUNS = {
     "warehouse", "warehouses", "facility", "facilities", "premises",
     "unit", "units", "suite", "suites",
 }
+_BOUNDED_QUANTIFIED_SUBJECT_ABBREVIATION_PATTERN = (
+    r"(?:s\.f\.|sq\.|ft\.|in\.|sf\.)"
+)
 _BOUNDED_QUANTIFIED_SUBJECT_WORD_PATTERN = (
-    r"[a-z]+(?:[-'’][a-z]+)*(?:['’])?"
+    rf"(?:{_BOUNDED_QUANTIFIED_SUBJECT_ABBREVIATION_PATTERN}|"
+    r"[a-z]+(?:[-'’][a-z]+)*(?:['’])?)"
 )
 _BOUNDED_QUANTIFIED_SUBJECT_NUMBER_PATTERN = (
     r"\d+(?:,\d{3})*(?:\.\d+)?"
