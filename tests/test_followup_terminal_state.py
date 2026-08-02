@@ -575,6 +575,192 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertEqual([], fake_fs.threads.transaction.updates)
         self.assertEqual([], fake_fs.backing_ref.updates)
 
+    def test_followup_query_failures_surface_health_without_processing(self):
+        waiting_doc = type("WaitingDoc", (), {
+            "id": "thread-waiting",
+            "to_dict": lambda self: {
+                "followUpStatus": "waiting",
+                "followUpConfig": {
+                    "enabled": True,
+                    "nextFollowUpAt": (
+                        datetime.now(timezone.utc) - followup.timedelta(hours=1)
+                    ),
+                    "currentFollowUpIndex": 0,
+                    "followUps": [{"message": "Following up."}],
+                },
+            },
+        })()
+
+        class QueryResult:
+            def __init__(self, docs, error=None):
+                self.docs = docs
+                self.error = error
+
+            def stream(self):
+                if self.error is not None:
+                    raise self.error
+                return list(self.docs)
+
+        class QueryThreads:
+            def __init__(
+                self,
+                waiting_docs,
+                *,
+                waiting_error=None,
+                recovery_error=None,
+            ):
+                self.waiting_docs = waiting_docs
+                self.waiting_error = waiting_error
+                self.recovery_error = recovery_error
+                self.where_calls = []
+
+            def where(self, field, _operator, value):
+                self.where_calls.append((field, value))
+                if field == "followUpStatus":
+                    return QueryResult(self.waiting_docs, self.waiting_error)
+                if field == "followUpSendAttempt.state":
+                    return QueryResult([], self.recovery_error)
+                raise AssertionError(f"Unexpected query field: {field}")
+
+        class QueryFirestore:
+            def __init__(self, threads):
+                self.threads = threads
+
+            def collection(self, name):
+                if name == "users":
+                    return self
+                if name == "threads":
+                    return self.threads
+                raise AssertionError(f"Unexpected collection: {name}")
+
+            def document(self, _document_id):
+                return self
+
+        cases = (
+            (
+                "recovery_failure_empty_waiting",
+                [],
+                None,
+                RuntimeError("recovery index unavailable"),
+                "followup_recovery_query",
+                "followup_recovery_query_failed",
+                2,
+            ),
+            (
+                "recovery_failure_nonempty_waiting",
+                [waiting_doc],
+                None,
+                RuntimeError("recovery unavailable: permission denied"),
+                "followup_recovery_query",
+                "followup_recovery_query_failed",
+                2,
+            ),
+            (
+                "waiting_failure_stops_before_recovery",
+                [waiting_doc],
+                RuntimeError("waiting index unavailable"),
+                RuntimeError("recovery query must not run"),
+                "followup_waiting_query",
+                "followup_waiting_query_failed",
+                1,
+            ),
+        )
+
+        for (
+            name,
+            waiting_docs,
+            waiting_error,
+            recovery_error,
+            expected_operation,
+            expected_code,
+            expected_query_count,
+        ) in cases:
+            with self.subTest(name=name):
+                threads = QueryThreads(
+                    waiting_docs,
+                    waiting_error=waiting_error,
+                    recovery_error=recovery_error,
+                )
+                with patch.object(
+                    followup,
+                    "_fs",
+                    QueryFirestore(threads),
+                ), patch.object(
+                    followup,
+                    "_claim_followup",
+                    return_value=None,
+                ) as claim, patch.object(
+                    followup,
+                    "_send_followup_email",
+                ) as send, patch.object(
+                    followup,
+                    "_release_followup_claim",
+                ) as release:
+                    states = followup.check_and_send_followups(
+                        "uid-1",
+                        {"Authorization": "Bearer token"},
+                    )
+
+                self.assertEqual(1, len(states))
+                self.assertEqual("error", states[0]["status"])
+                self.assertEqual(expected_operation, states[0]["operation"])
+                self.assertEqual(expected_code, states[0]["code"])
+                self.assertIn("unavailable", states[0]["error"])
+                self.assertEqual(expected_query_count, len(threads.where_calls))
+                claim.assert_not_called()
+                send.assert_not_called()
+                release.assert_not_called()
+
+    def test_followup_empty_query_health_isolated_from_prior_query_error(self):
+        class QueryResult:
+            def __init__(self, error=None):
+                self.error = error
+
+            def stream(self):
+                if self.error is not None:
+                    raise self.error
+                return []
+
+        class QueryThreads:
+            def __init__(self, recovery_error=None):
+                self.recovery_error = recovery_error
+
+            def where(self, field, _operator, _value):
+                if field == "followUpStatus":
+                    return QueryResult()
+                if field == "followUpSendAttempt.state":
+                    return QueryResult(self.recovery_error)
+                raise AssertionError(f"Unexpected query field: {field}")
+
+        class QueryFirestore:
+            def __init__(self, recovery_error=None):
+                self.threads = QueryThreads(recovery_error)
+
+            def collection(self, name):
+                return self if name == "users" else self.threads
+
+            def document(self, _document_id):
+                return self
+
+        with patch.object(
+            followup,
+            "_fs",
+            QueryFirestore(RuntimeError("transient recovery failure")),
+        ):
+            failed_states = followup.check_and_send_followups(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+            )
+
+        with patch.object(followup, "_fs", QueryFirestore()):
+            healthy_states = followup.check_and_send_followups(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+            )
+
+        self.assertEqual("error", failed_states[0]["status"])
+        self.assertEqual([], healthy_states)
+
     def test_scheduler_recovers_unresolved_attempt_from_paused_thread(self):
         expired_at = datetime.now(timezone.utc) - followup.timedelta(hours=1)
         current_data = {

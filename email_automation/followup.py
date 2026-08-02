@@ -2561,12 +2561,17 @@ def _followup_operation_state(
     status: str,
     thread_id: Optional[str] = None,
     error: Optional[Any] = None,
+    *,
+    operation: str = "followup_send",
+    code: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build a Graph operation-state for a follow-up send outcome.
+    """Build an operation-state for a follow-up scan or send outcome.
 
     Shape matches ``main._combine_graph_operation_states`` (GO-condition #3).
     """
-    state: Dict[str, Any] = {"status": status, "operation": "followup_send"}
+    state: Dict[str, Any] = {"status": status, "operation": operation}
+    if code:
+        state["code"] = code
     if thread_id:
         state["threadId"] = thread_id
     if error is not None:
@@ -2603,7 +2608,14 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
         waiting_threads = list(query.stream())
     except Exception as e:
         print(f"   Error querying follow-up threads: {e}")
-        return operation_states
+        return [
+            _followup_operation_state(
+                "error",
+                error=e,
+                operation="followup_waiting_query",
+                code="followup_waiting_query_failed",
+            )
+        ]
 
     recovery_threads = []
     try:
@@ -2616,6 +2628,14 @@ def check_and_send_followups(user_id: str, headers: Dict[str, str]) -> List[Dict
             recovery_threads.extend(recovery_query.stream())
     except Exception as e:
         print(f"   ⚠️ Error querying unresolved follow-up attempts: {e}")
+        return [
+            _followup_operation_state(
+                "error",
+                error=e,
+                operation="followup_recovery_query",
+                code="followup_recovery_query_failed",
+            )
+        ]
 
     threads_by_id = {}
     for thread_doc in [*waiting_threads, *recovery_threads]:
