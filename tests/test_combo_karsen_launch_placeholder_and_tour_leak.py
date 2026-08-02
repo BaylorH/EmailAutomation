@@ -370,6 +370,11 @@ class KarsenLaunchPlaceholderAndTourLeakComboTests(unittest.TestCase):
         }), \
              patch.object(processing_module, "send_reply_in_thread", new=recorder), \
              patch.object(
+                 processing_module,
+                 "_maybe_mark_client_completed",
+                 return_value=False,
+             ) as maybe_mark_completed, \
+             patch.object(
                  pending_responses,
                  "get_client_automation_decision",
                  return_value=CampaignAutomationDecision(
@@ -384,6 +389,7 @@ class KarsenLaunchPlaceholderAndTourLeakComboTests(unittest.TestCase):
                    side_effect=lambda fn: fn()):
             sent_count = pending_responses.process_pending_responses(self.UID, self.HEADERS)
 
+        maybe_mark_completed.assert_called_once_with(self.UID, "karsen")
         return fake_fs, recorder, sent_count
 
     def _dead_letter_for(self, fake_fs, original_doc_id):
@@ -475,6 +481,11 @@ class KarsenLaunchPlaceholderAndTourLeakComboTests(unittest.TestCase):
         }), \
              patch.object(processing_module, "send_reply_in_thread", new=recorder), \
              patch.object(
+                 processing_module,
+                 "_maybe_mark_client_completed",
+                 return_value=False,
+             ) as maybe_mark_completed, \
+             patch.object(
                  pending_responses,
                  "get_client_automation_decision",
                  return_value=CampaignAutomationDecision(
@@ -489,6 +500,7 @@ class KarsenLaunchPlaceholderAndTourLeakComboTests(unittest.TestCase):
                    side_effect=lambda fn: fn()):
             op_states = pending_responses.process_pending_responses(self.UID, self.HEADERS)
 
+        maybe_mark_completed.assert_called_once_with(self.UID, "karsen")
         self.assertEqual(
             1, len([s for s in op_states if s.get("status") == "healthy"]),
             "the clean, uncollided reply sends exactly once",
