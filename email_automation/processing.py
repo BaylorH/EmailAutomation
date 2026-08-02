@@ -2227,12 +2227,15 @@ _COORDINATED_LINK_IRREGULAR_ADVERBS = {
 _PROPERTY_SET_QUANTIFIER_RE = re.compile(r"\b(?:both|each)\b", re.IGNORECASE)
 _PROPERTY_SET_SUBJECT_RE = re.compile(
     r"^(?:(?:of\s+)?(?:the\s+|these\s+|those\s+)?)?"
-    r"(?:propert(?:y|ies)|buildings?|sites?|spaces?|listings?)\b",
+    r"(?:propert(?:y|ies)|buildings?|sites?|spaces?|listings?|"
+    r"warehouses?|facilit(?:y|ies)|premises|units?|suites?)\b",
     re.IGNORECASE,
 )
 _PROPERTY_SET_SUBJECT_NOUNS = {
     "property", "properties", "building", "buildings", "site", "sites",
     "space", "spaces", "listing", "listings",
+    "warehouse", "warehouses", "facility", "facilities", "premises",
+    "unit", "units", "suite", "suites",
 }
 _BOUNDED_QUANTIFIED_SUBJECT_WORD_RE = re.compile(
     r"[a-z]+(?:[-'’][a-z]+)*(?:['’])?",

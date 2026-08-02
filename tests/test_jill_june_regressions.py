@@ -1722,6 +1722,105 @@ class JillJuneRegressionTests(unittest.TestCase):
                             )
                         )
 
+    def test_addressable_property_heads_bind_quantified_address_lists(self):
+        target_address = "17 Harbor Pkwy"
+        competitor_address = "8021 Copper Mesa Blvd"
+        quantified_subjects = (
+            ("Both warehouses", "are currently still available"),
+            ("Each warehouse", "is still available"),
+            ("Both facilities", "are currently still available"),
+            ("Each facility", "is still available"),
+            ("Both premises", "are currently still available"),
+            ("Both units", "are currently still available"),
+            ("Each unit", "is still available"),
+            ("Both suites", "are currently still available"),
+            ("Each suite", "is still available"),
+            ("Both industrial buildings", "are currently still available"),
+            ("Both brokers' warehouses", "are currently still available"),
+            ("Each of the owners’ facilities", "is still available"),
+            ("Both landlords' units", "are currently still available"),
+            ("Each of the agents’ suites", "is still available"),
+            ("Both tenants' premises", "are currently still available"),
+        )
+
+        for first, second in (
+            (target_address, competitor_address),
+            (competitor_address, target_address),
+        ):
+            for reason in ("leased", "sold", "no_space_available"):
+                event = {"type": "property_unavailable", "reason": reason}
+                for quantified_subject, predicate in quantified_subjects:
+                    for preposition in ("at", "across"):
+                        message_text = (
+                            f"{quantified_subject} {preposition} {first} and "
+                            f"{second} {predicate}."
+                        )
+                        with self.subTest(
+                            first=first,
+                            reason=reason,
+                            quantified_subject=quantified_subject,
+                            preposition=preposition,
+                        ):
+                            self.assertFalse(
+                                processing._property_unavailable_event_applies_to_row(
+                                    event,
+                                    row_anchor=f"{target_address}, Phoenix",
+                                    message_text=message_text,
+                                )
+                            )
+                            self.assertIsNone(
+                                processing._pending_nonviable_followup_patch(
+                                    [event],
+                                    row_anchor=f"{target_address}, Phoenix",
+                                    message_text=message_text,
+                                )
+                            )
+
+    def test_property_vocabulary_does_not_promote_nonproperty_heads(self):
+        target_address = "17 Harbor Pkwy"
+        competitor_address = "8021 Copper Mesa Blvd"
+        quantified_subjects = (
+            "Both warehouse managers",
+            "Each facility contact",
+            "Both premises brokers",
+            "Each unit owner",
+            "Both suite prices",
+            "Both facilities' operators",
+            "Each warehouse’s agent",
+        )
+
+        for first, second in (
+            (target_address, competitor_address),
+            (competitor_address, target_address),
+        ):
+            for reason in ("leased", "sold", "no_space_available"):
+                event = {"type": "property_unavailable", "reason": reason}
+                for quantified_subject in quantified_subjects:
+                    message_text = (
+                        f"{quantified_subject} at {first} and {second} "
+                        "are still available."
+                    )
+                    with self.subTest(
+                        first=first,
+                        reason=reason,
+                        quantified_subject=quantified_subject,
+                    ):
+                        patch = processing._pending_nonviable_followup_patch(
+                            [event],
+                            row_anchor=f"{target_address}, Phoenix",
+                            message_text=message_text,
+                        )
+                        self.assertTrue(
+                            processing._property_unavailable_event_applies_to_row(
+                                event,
+                                row_anchor=f"{target_address}, Phoenix",
+                                message_text=message_text,
+                            )
+                        )
+                        self.assertIsNotNone(patch)
+                        self.assertEqual("stopped", patch["followUpStatus"])
+                        self.assertEqual(reason, patch["pendingTerminalReason"])
+
     def test_near_negated_availability_never_suppresses_target_terminal_event(self):
         address_pairs = (
             ("1 Main St", "2 Oak Ave"),
