@@ -53,12 +53,15 @@ from .outbound_safety import validate_outbound_body
 from .email import (
     OUTBOUND_MODE_LIVE,
     _kill_switch_suppressed,
+    _safe_greeting_first_name,
     resolve_outbound_mode,
 )
 from .column_config import (
     get_column_config_error,
     response_requests_nonrequestable_fields,
 )
+
+_FOLLOWUP_DATETIME_TYPE = datetime
 
 # Claim timeout for follow-up processing (prevent duplicate sends)
 FOLLOWUP_CLAIM_TIMEOUT_SECONDS = 60
@@ -198,13 +201,235 @@ def _canonical_followup_value(value: Any) -> Any:
     return str(value)
 
 
-def _followup_config_fingerprint(followup_config: Dict[str, Any]) -> str:
-    """Fingerprint durable scheduling inputs while excluding runtime claim fields."""
-    durable_config = {
+def _typed_followup_identity_value(value: Any) -> Dict[str, Any]:
+    """Encode a value deterministically without Python's cross-type equality."""
+    if isinstance(value, _FOLLOWUP_DATETIME_TYPE):
+        return {"type": "datetime", "value": value.isoformat()}
+    type_name = f"{type(value).__module__}.{type(value).__qualname__}"
+    if value is None:
+        return {"type": type_name}
+    if isinstance(value, bool):
+        return {"type": type_name, "value": value}
+    if isinstance(value, str):
+        return {"type": type_name, "value": value}
+    if isinstance(value, bytes):
+        return {"type": type_name, "value": value.hex()}
+    if isinstance(value, int):
+        return {"type": type_name, "value": str(value)}
+    if isinstance(value, float):
+        return {"type": type_name, "value": value.hex()}
+    if isinstance(value, dict):
+        items = [
+            {
+                "key": _typed_followup_identity_value(key),
+                "value": _typed_followup_identity_value(item),
+            }
+            for key, item in value.items()
+        ]
+        items.sort(
+            key=lambda entry: json.dumps(
+                entry["key"],
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return {"type": type_name, "items": items}
+    if isinstance(value, (list, tuple)):
+        return {
+            "type": type_name,
+            "items": [_typed_followup_identity_value(item) for item in value],
+        }
+    if isinstance(value, (set, frozenset)):
+        items = [_typed_followup_identity_value(item) for item in value]
+        items.sort(
+            key=lambda item: json.dumps(
+                item,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return {"type": type_name, "items": items}
+    return {
+        "type": type_name,
+        "value": _canonical_followup_value(value),
+    }
+
+
+def _followup_values_exactly_match(left: Any, right: Any) -> bool:
+    """Compare protocol values without Python's bool/int/container coercion."""
+    return (
+        _typed_followup_identity_value(left)
+        == _typed_followup_identity_value(right)
+    )
+
+
+def _followup_index_is_valid(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _followup_indexes_exactly_match(left: Any, right: Any) -> bool:
+    return (
+        _followup_index_is_valid(left)
+        and _followup_index_is_valid(right)
+        and _followup_values_exactly_match(left, right)
+    )
+
+
+_FOLLOWUP_TYPED_VALUE_MISSING = object()
+
+
+def _followup_value_from_typed(value: Any) -> Any:
+    """Decode the typed wire format; callers validate canonical round-tripping."""
+    if not isinstance(value, dict):
+        return _FOLLOWUP_TYPED_VALUE_MISSING
+    value_type = value.get("type")
+    if value_type == "builtins.NoneType":
+        return None
+    if value_type == "builtins.bool":
+        decoded = value.get("value")
+        return decoded if type(decoded) is bool else _FOLLOWUP_TYPED_VALUE_MISSING
+    if value_type == "builtins.str":
+        decoded = value.get("value")
+        return decoded if isinstance(decoded, str) else _FOLLOWUP_TYPED_VALUE_MISSING
+    if value_type == "builtins.bytes":
+        encoded = value.get("value")
+        if not isinstance(encoded, str):
+            return _FOLLOWUP_TYPED_VALUE_MISSING
+        try:
+            return bytes.fromhex(encoded)
+        except ValueError:
+            return _FOLLOWUP_TYPED_VALUE_MISSING
+    if value_type == "builtins.int":
+        encoded = value.get("value")
+        if not isinstance(encoded, str):
+            return _FOLLOWUP_TYPED_VALUE_MISSING
+        try:
+            decoded = int(encoded)
+        except ValueError:
+            return _FOLLOWUP_TYPED_VALUE_MISSING
+        return decoded if str(decoded) == encoded else _FOLLOWUP_TYPED_VALUE_MISSING
+    if value_type == "builtins.float":
+        encoded = value.get("value")
+        if not isinstance(encoded, str):
+            return _FOLLOWUP_TYPED_VALUE_MISSING
+        try:
+            return float.fromhex(encoded)
+        except ValueError:
+            return _FOLLOWUP_TYPED_VALUE_MISSING
+    if value_type == "datetime":
+        encoded = value.get("value")
+        if not isinstance(encoded, str):
+            return _FOLLOWUP_TYPED_VALUE_MISSING
+        try:
+            return _FOLLOWUP_DATETIME_TYPE.fromisoformat(encoded)
+        except ValueError:
+            return _FOLLOWUP_TYPED_VALUE_MISSING
+    if value_type == "builtins.dict":
+        items = value.get("items")
+        if not isinstance(items, list):
+            return _FOLLOWUP_TYPED_VALUE_MISSING
+        decoded_dict = {}
+        for item in items:
+            if not isinstance(item, dict):
+                return _FOLLOWUP_TYPED_VALUE_MISSING
+            decoded_key = _followup_value_from_typed(item.get("key"))
+            decoded_value = _followup_value_from_typed(item.get("value"))
+            if (
+                decoded_key is _FOLLOWUP_TYPED_VALUE_MISSING
+                or decoded_value is _FOLLOWUP_TYPED_VALUE_MISSING
+            ):
+                return _FOLLOWUP_TYPED_VALUE_MISSING
+            try:
+                decoded_dict[decoded_key] = decoded_value
+            except TypeError:
+                return _FOLLOWUP_TYPED_VALUE_MISSING
+        return decoded_dict
+    collection_types = {
+        "builtins.list": list,
+        "builtins.tuple": tuple,
+        "builtins.set": set,
+        "builtins.frozenset": frozenset,
+    }
+    collection_type = collection_types.get(value_type)
+    if collection_type is not None:
+        items = value.get("items")
+        if not isinstance(items, list):
+            return _FOLLOWUP_TYPED_VALUE_MISSING
+        decoded_items = []
+        for item in items:
+            decoded = _followup_value_from_typed(item)
+            if decoded is _FOLLOWUP_TYPED_VALUE_MISSING:
+                return _FOLLOWUP_TYPED_VALUE_MISSING
+            decoded_items.append(decoded)
+        try:
+            return collection_type(decoded_items)
+        except TypeError:
+            return _FOLLOWUP_TYPED_VALUE_MISSING
+    return _FOLLOWUP_TYPED_VALUE_MISSING
+
+
+def _followup_value_from_exact_typed(value: Any) -> Any:
+    """Decode only canonical typed values, rejecting lossy/malformed proofs."""
+    decoded = _followup_value_from_typed(value)
+    if decoded is _FOLLOWUP_TYPED_VALUE_MISSING:
+        return _FOLLOWUP_TYPED_VALUE_MISSING
+    if not _followup_values_exactly_match(
+        _typed_followup_identity_value(decoded),
+        value,
+    ):
+        return _FOLLOWUP_TYPED_VALUE_MISSING
+    return decoded
+
+
+def _decode_followup_field_signature(
+    signature: Any,
+) -> Optional[Tuple[bool, Any]]:
+    """Return ``(present, value)`` for an exact field signature."""
+    if not isinstance(signature, dict) or set(signature) != {"present", "value"}:
+        return None
+    present = signature["present"]
+    if type(present) is not bool:
+        return None
+    if not present:
+        if _followup_values_exactly_match(signature["value"], {"type": "missing"}):
+            return False, _FOLLOWUP_TYPED_VALUE_MISSING
+        return None
+    decoded = _followup_value_from_exact_typed(signature["value"])
+    if decoded is _FOLLOWUP_TYPED_VALUE_MISSING:
+        return None
+    return True, decoded
+
+
+def _followup_field_signature(
+    source: Dict[str, Any],
+    key: str,
+) -> Dict[str, Any]:
+    """Snapshot a field without collapsing absence, ``None``, or value type."""
+    source = source if isinstance(source, dict) else {}
+    present = key in source
+    return {
+        "present": present,
+        "value": (
+            _typed_followup_identity_value(source[key])
+            if present
+            else {"type": "missing"}
+        ),
+    }
+
+
+def _followup_durable_config(
+    followup_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
         key: value
         for key, value in (followup_config or {}).items()
         if key not in _FOLLOWUP_CONFIG_RUNTIME_FIELDS
     }
+
+
+def _followup_config_fingerprint(followup_config: Dict[str, Any]) -> str:
+    """Fingerprint durable scheduling inputs while excluding runtime claim fields."""
+    durable_config = _followup_durable_config(followup_config)
     encoded = json.dumps(
         _canonical_followup_value(durable_config),
         sort_keys=True,
@@ -219,21 +444,74 @@ def _followup_retry_signature(
 ) -> Dict[str, Any]:
     """Return the exact retry fence that a claimed worker observed."""
     return _canonical_followup_value({
-        "lastSendError": (followup_config or {}).get("lastSendError"),
-        "lastSendAttemptAt": (followup_config or {}).get("lastSendAttemptAt"),
-        "lastSendAttemptIndex": (followup_config or {}).get("lastSendAttemptIndex"),
-        "followUpSendAttempt": (thread_data or {}).get("followUpSendAttempt"),
+        "processingBy": _followup_field_signature(
+            followup_config,
+            "processingBy",
+        ),
+        "currentFollowUpIndex": _followup_field_signature(
+            followup_config,
+            "currentFollowUpIndex",
+        ),
+        "lastSendError": _followup_field_signature(
+            followup_config,
+            "lastSendError",
+        ),
+        "lastSendAttemptAt": _followup_field_signature(
+            followup_config,
+            "lastSendAttemptAt",
+        ),
+        "lastSendAttemptIndex": _followup_field_signature(
+            followup_config,
+            "lastSendAttemptIndex",
+        ),
+        "followUpSendAttempt": _followup_field_signature(
+            thread_data,
+            "followUpSendAttempt",
+        ),
     })
 
 
 def _followup_raw_message(followup_config: Dict[str, Any], followup_index: int) -> str:
     followups = (followup_config or {}).get("followUps") or []
+    if not _followup_index_is_valid(followup_index):
+        return ""
     if not isinstance(followups, list) or followup_index >= len(followups):
         return ""
     step = followups[followup_index]
     if not isinstance(step, dict):
         return ""
     return str(step.get("message") or "")
+
+
+def _resolve_followup_message(
+    followup_config: Dict[str, Any],
+    followup_index: int,
+    contact_name: Any,
+) -> str:
+    """Resolve the exact final body from durable follow-up inputs."""
+    message = (
+        _followup_raw_message(followup_config, followup_index)
+        or _get_default_followup_message(followup_index)
+    )
+    safe_contact_name = _safe_followup_contact_name(contact_name)
+    first_name = (
+        _safe_greeting_first_name(safe_contact_name)
+        if safe_contact_name
+        else None
+    )
+    if first_name and "[NAME]" in message:
+        message = message.replace("[NAME]", first_name)
+    return message
+
+
+def _safe_followup_contact_name(contact_name: Any) -> str:
+    """Return a durable contact-name string only when its greeting is safe."""
+    if not isinstance(contact_name, str):
+        return ""
+    candidate = contact_name.strip()
+    if not candidate or not _safe_greeting_first_name(candidate):
+        return ""
+    return candidate
 
 
 def _followup_primary_recipient(thread_data: Dict[str, Any]) -> str:
@@ -263,25 +541,163 @@ def _normalize_followup_recipients(recipients: Any) -> List[str]:
     return normalized
 
 
+_FOLLOWUP_IDENTITY_THREAD_FIELDS = (
+    "clientId",
+    "email",
+    "contactName",
+    "ccEmails",
+    "ccRecipients",
+    "rowNumber",
+)
+_FOLLOWUP_IDENTITY_CONFIG_FIELDS = (
+    "currentFollowUpIndex",
+    "followUps",
+)
+
+
 def _followup_send_identity(
     thread_data: Dict[str, Any],
     followup_config: Dict[str, Any],
     followup_index: int,
 ) -> Dict[str, Any]:
     """Capture Firestore inputs that can change the external send."""
+    thread_data = thread_data or {}
     cc_recipients = (
-        (thread_data or {}).get("ccEmails")
-        or (thread_data or {}).get("ccRecipients")
+        thread_data.get("ccEmails")
+        or thread_data.get("ccRecipients")
         or []
     )
+    contact_name_present = "contactName" in thread_data
+    contact_name = thread_data.get("contactName") if contact_name_present else None
+    contact_name_type = (
+        f"{type(contact_name).__module__}.{type(contact_name).__qualname__}"
+        if contact_name_present
+        else "missing"
+    )
+    input_signatures = {
+        "thread": {
+            key: _followup_field_signature(thread_data, key)
+            for key in _FOLLOWUP_IDENTITY_THREAD_FIELDS
+        },
+        "config": {
+            "currentFollowUpIndex": _followup_field_signature(
+                followup_config,
+                "currentFollowUpIndex",
+            ),
+            "followUps": _followup_field_signature(
+                followup_config,
+                "followUps",
+            ),
+            "durable": {
+                "present": True,
+                "value": _typed_followup_identity_value(
+                    _followup_durable_config(followup_config)
+                ),
+            },
+        },
+        "followupIndex": {
+            "present": True,
+            "value": _typed_followup_identity_value(followup_index),
+        },
+    }
     return _canonical_followup_value({
-        "clientId": (thread_data or {}).get("clientId"),
+        "clientId": thread_data.get("clientId"),
         "recipient": _followup_primary_recipient(thread_data),
         "rawMessage": _followup_raw_message(followup_config, followup_index),
-        "contactName": (thread_data or {}).get("contactName") or "",
+        "contactName": contact_name,
+        "contactNameExact": (
+            _typed_followup_identity_value(contact_name)
+            if contact_name_present
+            else {"type": "missing"}
+        ),
+        "contactNamePresent": contact_name_present,
+        "contactNameType": contact_name_type,
         "ccRecipients": cc_recipients,
         "configFingerprint": _followup_config_fingerprint(followup_config),
+        "inputSignatures": input_signatures,
     })
+
+
+def _followup_inputs_from_send_identity(
+    identity: Any,
+) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], int]]:
+    """Decode a complete identity into its exact thread/config/index inputs."""
+    if not isinstance(identity, dict):
+        return None
+    input_signatures = identity.get("inputSignatures")
+    if not isinstance(input_signatures, dict) or set(input_signatures) != {
+        "thread",
+        "config",
+        "followupIndex",
+    }:
+        return None
+    thread_signatures = input_signatures.get("thread")
+    config_signatures = input_signatures.get("config")
+    index_signature = input_signatures.get("followupIndex")
+    if not isinstance(thread_signatures, dict) or set(thread_signatures) != set(
+        _FOLLOWUP_IDENTITY_THREAD_FIELDS
+    ):
+        return None
+    if not isinstance(config_signatures, dict) or set(config_signatures) != {
+        *_FOLLOWUP_IDENTITY_CONFIG_FIELDS,
+        "durable",
+    }:
+        return None
+
+    thread_data = {}
+    for field in _FOLLOWUP_IDENTITY_THREAD_FIELDS:
+        decoded = _decode_followup_field_signature(thread_signatures[field])
+        if decoded is None:
+            return None
+        present, value = decoded
+        if present:
+            thread_data[field] = value
+    if "email" not in thread_data:
+        return None
+    if "rowNumber" in thread_data and (
+        type(thread_data["rowNumber"]) is not int
+        or thread_data["rowNumber"] <= 0
+    ):
+        return None
+
+    config_values = {}
+    for field in (*_FOLLOWUP_IDENTITY_CONFIG_FIELDS, "durable"):
+        decoded = _decode_followup_field_signature(config_signatures[field])
+        if decoded is None or not decoded[0]:
+            return None
+        config_values[field] = decoded[1]
+    decoded_index = _decode_followup_field_signature(index_signature)
+    if decoded_index is None or not decoded_index[0]:
+        return None
+    followup_index = decoded_index[1]
+    if not _followup_indexes_exactly_match(
+        config_values["currentFollowUpIndex"],
+        followup_index,
+    ):
+        return None
+
+    durable_config = config_values["durable"]
+    if not isinstance(durable_config, dict):
+        return None
+    if not _followup_values_exactly_match(
+        _followup_durable_config(durable_config),
+        durable_config,
+    ):
+        return None
+
+    rebuilt_identity = _followup_send_identity(
+        thread_data,
+        durable_config,
+        followup_index,
+    )
+    if not _followup_values_exactly_match(identity, rebuilt_identity):
+        return None
+    return thread_data, durable_config, followup_index
+
+
+def _followup_send_identity_has_complete_proof(identity: Any) -> bool:
+    """Return whether an identity exactly rebuilds from its typed raw proofs."""
+    return _followup_inputs_from_send_identity(identity) is not None
 
 
 def _followup_send_identity_matches(
@@ -291,11 +707,13 @@ def _followup_send_identity_matches(
     allow_config_fingerprint_change: bool = False,
 ) -> bool:
     """Compare send inputs, optionally tolerating terminal scheduling changes."""
-    if not isinstance(left, dict) or not isinstance(right, dict):
+    if not _followup_send_identity_has_complete_proof(left):
+        return False
+    if not _followup_send_identity_has_complete_proof(right):
         return False
     canonical_left = _canonical_followup_value(left)
     canonical_right = _canonical_followup_value(right)
-    if canonical_left == canonical_right:
+    if _followup_values_exactly_match(canonical_left, canonical_right):
         return True
     if not allow_config_fingerprint_change:
         return False
@@ -303,7 +721,259 @@ def _followup_send_identity_matches(
     canonical_right = dict(canonical_right)
     canonical_left.pop("configFingerprint", None)
     canonical_right.pop("configFingerprint", None)
-    return canonical_left == canonical_right
+    for identity in (canonical_left, canonical_right):
+        input_signatures = identity.get("inputSignatures")
+        if not isinstance(input_signatures, dict):
+            continue
+        input_signatures = dict(input_signatures)
+        config_signatures = input_signatures.get("config")
+        if isinstance(config_signatures, dict):
+            config_signatures = dict(config_signatures)
+            config_signatures.pop("durable", None)
+            input_signatures["config"] = config_signatures
+        identity["inputSignatures"] = input_signatures
+    return _followup_values_exactly_match(
+        canonical_left,
+        canonical_right,
+    )
+
+
+_FOLLOWUP_SEND_ENVELOPE_FIELDS = (
+    "id",
+    "owner",
+    "index",
+    "createdAt",
+    "sendStartedAt",
+    "sendIdentity",
+    "configFingerprint",
+    "clientId",
+    "recipient",
+    "body",
+    "subject",
+    "conversationId",
+    "draftId",
+    "toRecipients",
+    "ccRecipients",
+)
+
+
+def _followup_send_envelope_payload(marker: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(marker, dict) or any(
+        field not in marker for field in _FOLLOWUP_SEND_ENVELOPE_FIELDS
+    ):
+        return None
+    return {
+        field: marker[field]
+        for field in _FOLLOWUP_SEND_ENVELOPE_FIELDS
+    }
+
+
+def _followup_send_envelope_hash(envelope_proof: Any) -> str:
+    encoded = json.dumps(
+        _canonical_followup_value(envelope_proof),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _followup_typed_value_hash(value: Any) -> str:
+    return _followup_send_envelope_hash(_typed_followup_identity_value(value))
+
+
+def _followup_utc_timestamp(value: Any) -> Optional[datetime]:
+    """Normalize only aware datetime, Firestore, or ISO timestamp values."""
+    try:
+        if isinstance(value, str):
+            if not value or value != value.strip():
+                return None
+            encoded = value[:-1] + "+00:00" if value.endswith("Z") else value
+            value = _FOLLOWUP_DATETIME_TYPE.fromisoformat(encoded)
+        elif not isinstance(value, _FOLLOWUP_DATETIME_TYPE):
+            return None
+
+        if (
+            not isinstance(value, _FOLLOWUP_DATETIME_TYPE)
+            or value.tzinfo is None
+            or value.utcoffset() is None
+        ):
+            return None
+        normalized = value.astimezone(timezone.utc)
+        normalized.timestamp()
+        return normalized
+    except (AttributeError, TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _validated_followup_retry_timestamp(
+    followup_config: Any,
+    *,
+    expected_signature: Optional[Dict[str, Any]] = None,
+) -> Optional[Tuple[datetime, Dict[str, Any]]]:
+    """Return a current legacy retry timestamp plus its exact field signature."""
+    config = followup_config if isinstance(followup_config, dict) else {}
+    signature = _followup_field_signature(config, "lastSendAttemptAt")
+    if expected_signature is not None and not _followup_values_exactly_match(
+        signature,
+        expected_signature,
+    ):
+        return None
+    timestamp = _followup_utc_timestamp(config.get("lastSendAttemptAt"))
+    now = _followup_utc_timestamp(datetime.now(timezone.utc))
+    if timestamp is None or now is None:
+        return None
+    if timestamp > now:
+        return None
+    return timestamp, signature
+
+
+def _followup_send_envelope_timestamps_are_valid(
+    marker: Any,
+    payload: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Validate the immutable send timeline and its mutable recovery lease."""
+    payload = payload or _followup_send_envelope_payload(marker)
+    if payload is None:
+        return False
+    created_at = _followup_utc_timestamp(payload["createdAt"])
+    send_started_at = _followup_utc_timestamp(payload["sendStartedAt"])
+    now = _followup_utc_timestamp(datetime.now(timezone.utc))
+    if created_at is None or send_started_at is None or now is None:
+        return False
+    if created_at > send_started_at:
+        return False
+    if send_started_at > now:
+        return False
+    marker_state = str(marker.get("state") or "").strip().lower()
+    if marker_state in {"sending", "uncertain"} and "leaseUntil" not in marker:
+        return False
+    if "leaseUntil" in marker:
+        lease_until = _followup_utc_timestamp(marker["leaseUntil"])
+        if lease_until is None or lease_until < send_started_at:
+            return False
+    return True
+
+
+def _seal_followup_send_envelope(marker: Dict[str, Any]) -> Dict[str, Any]:
+    """Seal immutable send inputs while leaving recovery state mutable."""
+    sealed_marker = dict(marker)
+    payload = _followup_send_envelope_payload(sealed_marker)
+    if payload is None:
+        raise ValueError("follow-up send envelope is incomplete")
+    if not _followup_send_envelope_timestamps_are_valid(sealed_marker, payload):
+        raise ValueError("follow-up send envelope timestamps are invalid")
+    envelope_fields = dict(payload)
+    send_identity = envelope_fields.pop("sendIdentity")
+    envelope_proof = _typed_followup_identity_value({
+        "fields": envelope_fields,
+        "sendIdentityHash": _followup_typed_value_hash(send_identity),
+    })
+    sealed_marker["envelopeProof"] = envelope_proof
+    sealed_marker["inputHash"] = _followup_send_envelope_hash(envelope_proof)
+    return sealed_marker
+
+
+def _followup_send_envelope_is_complete(
+    marker: Any,
+    *,
+    expected_identity: Optional[Dict[str, Any]] = None,
+    allow_config_fingerprint_change: bool = False,
+) -> bool:
+    """Validate the immutable marker and bind it to durable send inputs."""
+    payload = _followup_send_envelope_payload(marker)
+    if payload is None:
+        return False
+    if not _followup_send_envelope_timestamps_are_valid(marker, payload):
+        return False
+    envelope_proof = marker.get("envelopeProof")
+    decoded_proof = _followup_value_from_exact_typed(envelope_proof)
+    if not isinstance(decoded_proof, dict) or set(decoded_proof) != {
+        "fields",
+        "sendIdentityHash",
+    }:
+        return False
+    proved_fields = decoded_proof["fields"]
+    expected_fields = dict(payload)
+    send_identity = expected_fields.pop("sendIdentity")
+    if not _followup_values_exactly_match(proved_fields, expected_fields):
+        return False
+    if not _followup_values_exactly_match(
+        decoded_proof["sendIdentityHash"],
+        _followup_typed_value_hash(send_identity),
+    ):
+        return False
+    if not _followup_values_exactly_match(
+        marker.get("inputHash"),
+        _followup_send_envelope_hash(envelope_proof),
+    ):
+        return False
+
+    identity_inputs = _followup_inputs_from_send_identity(send_identity)
+    if identity_inputs is None:
+        return False
+    identity_thread, identity_config, identity_index = identity_inputs
+    if not _followup_indexes_exactly_match(payload["index"], identity_index):
+        return False
+    if expected_identity is not None and not _followup_send_identity_matches(
+        send_identity,
+        expected_identity,
+        allow_config_fingerprint_change=allow_config_fingerprint_change,
+    ):
+        return False
+    if not _followup_values_exactly_match(
+        payload["configFingerprint"],
+        send_identity.get("configFingerprint"),
+    ):
+        return False
+    if not _followup_values_exactly_match(
+        payload["clientId"],
+        send_identity.get("clientId"),
+    ):
+        return False
+    if not _followup_values_exactly_match(
+        payload["recipient"],
+        send_identity.get("recipient"),
+    ):
+        return False
+
+    expected_body = _resolve_followup_message(
+        identity_config,
+        identity_index,
+        identity_thread.get("contactName"),
+    )
+    if not _followup_values_exactly_match(payload["body"], expected_body):
+        return False
+
+    if not all(
+        isinstance(payload[field], str) and payload[field]
+        for field in ("id", "owner", "recipient", "body", "subject")
+    ):
+        return False
+    if payload["conversationId"] is not None and not isinstance(
+        payload["conversationId"],
+        str,
+    ):
+        return False
+    if payload["draftId"] is not None and not isinstance(payload["draftId"], str):
+        return False
+
+    to_recipients = payload["toRecipients"]
+    cc_recipients = payload["ccRecipients"]
+    if not isinstance(to_recipients, list) or not isinstance(cc_recipients, list):
+        return False
+    if not _followup_values_exactly_match(
+        to_recipients,
+        _normalize_followup_recipients(to_recipients),
+    ):
+        return False
+    if not _followup_values_exactly_match(
+        cc_recipients,
+        _normalize_followup_recipients(cc_recipients),
+    ):
+        return False
+    if payload["recipient"] not in to_recipients:
+        return False
+    return True
 
 
 def _followup_preservation_outcome(
@@ -468,6 +1138,9 @@ def _claim_followup(
     """
     from google.cloud.firestore import transactional
 
+    if not _followup_index_is_valid(current_index):
+        return None
+
     thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
 
     @transactional
@@ -482,6 +1155,9 @@ def _claim_followup(
             return None
 
         actual_index = followup_config.get("currentFollowUpIndex", 0)
+        if not _followup_index_is_valid(actual_index):
+            print(f"   ⏭️ Follow-up index is invalid: {actual_index!r}")
+            return None
         processing_by = followup_config.get("processingBy")
         processing_at = followup_config.get("processingAt")
         send_attempt = data.get("followUpSendAttempt")
@@ -496,7 +1172,10 @@ def _claim_followup(
             return None
         if (
             attempt_state in {"sending", "uncertain"}
-            and send_attempt.get("index") != actual_index
+            and not _followup_indexes_exactly_match(
+                send_attempt.get("index"),
+                actual_index,
+            )
         ):
             attempt_index = send_attempt.get("index")
             reason = (
@@ -544,7 +1223,10 @@ def _claim_followup(
             print(f"   🛑 {reason}")
             return None
         if (
-            send_attempt.get("index") == actual_index
+            _followup_indexes_exactly_match(
+                send_attempt.get("index"),
+                actual_index,
+            )
             and attempt_state == "committed"
         ):
             print(
@@ -553,11 +1235,14 @@ def _claim_followup(
             )
             return None
         reconciliation_required = (
-            send_attempt.get("index") == actual_index
+            _followup_indexes_exactly_match(
+                send_attempt.get("index"),
+                actual_index,
+            )
             and attempt_state in {"sending", "uncertain"}
         )
 
-        if actual_index != expected_index:
+        if not _followup_indexes_exactly_match(actual_index, expected_index):
             print(f"   ⏭️ Follow-up index changed ({expected_index} → {actual_index}), skipping")
             return None
 
@@ -718,7 +1403,13 @@ def _release_followup_claim(
                 return False
 
             actual_index = followup_config.get("currentFollowUpIndex", 0)
-            if current_index is not None and actual_index != current_index:
+            if not _followup_index_is_valid(actual_index):
+                print(f"   ⏭️ Follow-up index is invalid: {actual_index!r}")
+                return False
+            if current_index is not None and not _followup_indexes_exactly_match(
+                actual_index,
+                current_index,
+            ):
                 print(
                     f"   ⏭️ Follow-up index changed from {current_index} "
                     f"to {actual_index}; not releasing"
@@ -824,6 +1515,9 @@ def _terminalize_owned_followup(
     """Apply campaign terminal state only to the exact active claim."""
     from google.cloud.firestore import transactional
 
+    if not _followup_index_is_valid(current_index):
+        return False, f"the claimed follow-up index is invalid: {current_index!r}"
+
     thread_ref = (
         _fs.collection("users")
         .document(user_id)
@@ -839,7 +1533,10 @@ def _terminalize_owned_followup(
 
         data = snapshot.to_dict() or {}
         current_client_id = data.get("clientId")
-        if current_client_id != expected_client_id:
+        if not _followup_values_exactly_match(
+            current_client_id,
+            expected_client_id,
+        ):
             return False, (
                 f"the thread client changed from {expected_client_id} "
                 f"to {current_client_id}"
@@ -853,7 +1550,7 @@ def _terminalize_owned_followup(
                 f"claim ownership changed from {claim_owner} to {current_owner}"
             )
         actual_index = current_config.get("currentFollowUpIndex", 0)
-        if actual_index != current_index:
+        if not _followup_indexes_exactly_match(actual_index, current_index):
             return False, (
                 f"the follow-up index changed from {current_index} to {actual_index}"
             )
@@ -997,6 +1694,8 @@ def _followup_terminal_block_reason(
     followup_index: int,
 ) -> Optional[str]:
     """Return a human-readable reason when a follow-up must not send now."""
+    if not _followup_index_is_valid(followup_index):
+        return f"the requested follow-up index is invalid: {followup_index!r}"
     status = str((thread_data or {}).get("status") or "").strip().lower()
     followup_status = str((thread_data or {}).get("followUpStatus") or "").strip().lower()
     status_reason = str((thread_data or {}).get("statusReason") or "").strip().lower()
@@ -1018,7 +1717,10 @@ def _followup_terminal_block_reason(
         return "follow-up tracking is disabled"
 
     current_index = (followup_config or {}).get("currentFollowUpIndex")
-    if current_index is not None and current_index != followup_index:
+    if current_index is not None and not _followup_indexes_exactly_match(
+        current_index,
+        followup_index,
+    ):
         return f"the follow-up index changed from {followup_index} to {current_index}"
 
     followups = (followup_config or {}).get("followUps") or []
@@ -1084,9 +1786,17 @@ def _persist_followup_send_intent(
     draft_id: str,
     to_recipients: Optional[List[str]] = None,
     cc_recipients: Optional[List[str]] = None,
+    fallback_contact_name: Optional[str] = None,
+    expected_retry_timestamp_signature: Optional[Dict[str, Any]] = None,
 ):
     """Fence an irreversible Graph send with an exact transactional intent."""
     from google.cloud.firestore import transactional
+
+    if not _followup_index_is_valid(followup_index):
+        return None, f"the claimed follow-up index is invalid: {followup_index!r}"
+    expected_index = (expected_followup_config or {}).get("currentFollowUpIndex")
+    if not _followup_indexes_exactly_match(expected_index, followup_index):
+        return None, "the claimed config index differs from the follow-up index"
 
     expected_identity = _followup_send_identity(
         expected_thread_data,
@@ -1105,10 +1815,6 @@ def _persist_followup_send_intent(
         if cc_recipients is not None
         else expected_identity.get("ccRecipients")
     )
-    expected_body = (
-        _followup_raw_message(expected_followup_config, followup_index)
-        or _get_default_followup_message(followup_index)
-    )
     thread_ref = (
         _fs.collection("users")
         .document(user_id)
@@ -1126,6 +1832,15 @@ def _persist_followup_send_intent(
         current_config = data.get("followUpConfig")
         if not isinstance(current_config, dict):
             return None, "the current follow-up config is missing"
+        if (
+            expected_retry_timestamp_signature is not None
+            and _validated_followup_retry_timestamp(
+                current_config,
+                expected_signature=expected_retry_timestamp_signature,
+            )
+            is None
+        ):
+            return None, "the legacy retry timestamp changed or is invalid"
 
         block_reason = _followup_terminal_block_reason(
             data,
@@ -1142,9 +1857,8 @@ def _persist_followup_send_intent(
                 f"follow-up claim ownership changed from {claim_owner} "
                 f"to {current_owner}"
             )
-
         current_index = current_config.get("currentFollowUpIndex", 0)
-        if current_index != followup_index:
+        if not _followup_indexes_exactly_match(current_index, followup_index):
             return None, (
                 f"the follow-up index changed from {followup_index} to {current_index}"
             )
@@ -1154,16 +1868,64 @@ def _persist_followup_send_intent(
             current_config,
             followup_index,
         )
-        if current_identity != expected_identity:
+        if not _followup_values_exactly_match(
+            current_identity,
+            expected_identity,
+        ):
             return None, "recipient, message, client, or follow-up config changed"
-        if _followup_retry_signature(data, current_config) != expected_retry:
+        if not _followup_values_exactly_match(
+            _followup_retry_signature(data, current_config),
+            expected_retry,
+        ):
             return None, "follow-up retry metadata changed"
         if current_identity.get("recipient") != str(recipient or "").strip().lower():
             return None, "the normalized primary recipient changed"
+
+        send_identity = current_identity
+        body_contact_name = data.get("contactName")
+        contact_name_update = {}
+        if fallback_contact_name is not None:
+            current_contact_name = data.get("contactName")
+            current_name_is_missing = (
+                current_contact_name is None
+                or (
+                    isinstance(current_contact_name, str)
+                    and not current_contact_name.strip()
+                )
+            )
+            safe_fallback_name = _safe_followup_contact_name(fallback_contact_name)
+            if not current_name_is_missing:
+                return None, "the thread contact name changed before send"
+            if not safe_fallback_name:
+                return None, "the sheet fallback contact name is not safe"
+
+            body_contact_name = safe_fallback_name
+            resolved_thread_data = dict(data)
+            resolved_thread_data["contactName"] = safe_fallback_name
+            send_identity = _followup_send_identity(
+                resolved_thread_data,
+                current_config,
+                followup_index,
+            )
+            contact_name_update["contactName"] = safe_fallback_name
+
+        expected_body = _resolve_followup_message(
+            current_config,
+            followup_index,
+            body_contact_name,
+        )
         if str(body or "") != expected_body:
             return None, "the final follow-up body differs from the claimed message"
+        body_validation = validate_outbound_body(expected_body)
+        if not body_validation.is_safe:
+            return None, (
+                "the final follow-up body failed outbound safety: "
+                f"{body_validation.reason}"
+            )
         if current_identity.get("recipient") not in normalized_to_recipients:
             return None, "the primary recipient is missing from the final Graph payload"
+        if not _followup_send_identity_has_complete_proof(send_identity):
+            return None, "the follow-up send identity proof is incomplete"
 
         existing_attempt = data.get("followUpSendAttempt")
         if isinstance(existing_attempt, dict):
@@ -1171,7 +1933,10 @@ def _persist_followup_send_intent(
             if (
                 existing_state in {"sending", "uncertain", "needs_review"}
                 or (
-                    existing_attempt.get("index") == followup_index
+                    _followup_indexes_exactly_match(
+                        existing_attempt.get("index"),
+                        followup_index,
+                    )
                     and existing_state == "committed"
                 )
             ):
@@ -1181,26 +1946,10 @@ def _persist_followup_send_intent(
                 )
 
         now = datetime.now(timezone.utc)
-        send_started_at = now - timedelta(seconds=5)
+        send_started_at = now
         lease_until = now + timedelta(seconds=FOLLOWUP_SEND_LEASE_SECONDS)
         attempt_id = f"followup-attempt-{uuid4().hex}"
-        marker_identity = {
-            **expected_identity,
-            "body": body,
-            "subject": subject,
-            "conversationId": conversation_id,
-            "draftId": draft_id,
-            "toRecipients": normalized_to_recipients,
-            "ccRecipients": normalized_cc_recipients,
-        }
-        input_hash = hashlib.sha256(
-            json.dumps(
-                _canonical_followup_value(marker_identity),
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        marker = {
+        marker = _seal_followup_send_envelope({
             "id": attempt_id,
             "state": "sending",
             "owner": claim_owner,
@@ -1208,10 +1957,9 @@ def _persist_followup_send_intent(
             "createdAt": now,
             "sendStartedAt": send_started_at,
             "leaseUntil": lease_until,
-            "inputHash": input_hash,
-            "sendIdentity": expected_identity,
-            "configFingerprint": expected_identity.get("configFingerprint"),
-            "clientId": expected_identity.get("clientId"),
+            "sendIdentity": send_identity,
+            "configFingerprint": send_identity.get("configFingerprint"),
+            "clientId": send_identity.get("clientId"),
             "recipient": recipient,
             "body": body,
             "subject": subject,
@@ -1219,8 +1967,9 @@ def _persist_followup_send_intent(
             "draftId": draft_id,
             "toRecipients": normalized_to_recipients,
             "ccRecipients": normalized_cc_recipients,
-        }
+        })
         transaction.update(thread_ref, {
+            **contact_name_update,
             "followUpSendAttempt": marker,
             "followUpConfig.processingAt": now,
             "followUpConfig.processingLeaseUntil": lease_until,
@@ -1248,6 +1997,9 @@ def _record_reconciled_followup_attempt(
     """CAS a Sent Items match before writing any reconciliation audit state."""
     from google.cloud.firestore import transactional
 
+    if not _followup_index_is_valid(followup_index):
+        return None, f"the reconciliation index is invalid: {followup_index!r}"
+
     thread_ref = (
         _fs.collection("users")
         .document(user_id)
@@ -1273,7 +2025,7 @@ def _record_reconciled_followup_attempt(
             )
 
         current_index = current_config.get("currentFollowUpIndex", 0)
-        if current_index != followup_index:
+        if not _followup_indexes_exactly_match(current_index, followup_index):
             return None, (
                 f"the follow-up index changed from {followup_index} to {current_index}"
             )
@@ -1281,7 +2033,15 @@ def _record_reconciled_followup_attempt(
         current_attempt = data.get("followUpSendAttempt")
         if not isinstance(current_attempt, dict):
             return None, "the durable send attempt is missing"
-        if _canonical_followup_value(current_attempt) != expected_attempt:
+        if not _followup_indexes_exactly_match(
+            current_attempt.get("index"),
+            followup_index,
+        ):
+            return None, "the durable send attempt index changed"
+        if not _followup_values_exactly_match(
+            current_attempt,
+            expected_attempt,
+        ):
             return None, "the durable send attempt changed"
         current_state = str(current_attempt.get("state") or "").strip().lower()
         if current_state not in {"sending", "uncertain"}:
@@ -1300,17 +2060,16 @@ def _record_reconciled_followup_attempt(
             allow_config_fingerprint_change=allow_terminal_config_change,
         ):
             return None, "recipient, message, client, or follow-up config changed"
-        marker_identity = current_attempt.get("sendIdentity")
-        if (
-            isinstance(marker_identity, dict)
-            and not _followup_send_identity_matches(
-                marker_identity,
-                current_identity,
-                allow_config_fingerprint_change=allow_terminal_config_change,
-            )
+        if not _followup_send_envelope_is_complete(
+            current_attempt,
+            expected_identity=current_identity,
+            allow_config_fingerprint_change=allow_terminal_config_change,
         ):
-            return None, "current inputs differ from the accepted send attempt"
-        if _followup_retry_signature(data, current_config) != expected_retry:
+            return None, "the accepted send envelope is missing, changed, or incomplete"
+        if not _followup_values_exactly_match(
+            _followup_retry_signature(data, current_config),
+            expected_retry,
+        ):
             return None, "follow-up retry metadata changed"
 
         reconciled_at = datetime.now(timezone.utc)
@@ -1394,7 +2153,7 @@ def _legacy_followup_review_attempt(
     error: str,
 ) -> Dict[str, Any]:
     """Build a deterministic marker for a legacy ambiguity requiring review."""
-    expected_identity, _expected_retry, legacy_digest, attempt_id = (
+    expected_identity, _expected_retry, _legacy_digest, attempt_id = (
         _legacy_followup_attempt_components(
             user_id,
             thread_id,
@@ -1408,20 +2167,24 @@ def _legacy_followup_review_attempt(
         )
     )
     now = datetime.now(timezone.utc)
-    return {
+    validated_retry_timestamp = _validated_followup_retry_timestamp(
+        expected_followup_config
+    )
+    legacy_started_at = (
+        validated_retry_timestamp[0]
+        if validated_retry_timestamp is not None
+        else now
+    )
+    return _seal_followup_send_envelope({
         "id": attempt_id,
         "state": "needs_review",
         "resolution": "ambiguous",
         "error": error,
         "owner": claim_owner,
         "index": followup_index,
-        "createdAt": now,
+        "createdAt": legacy_started_at,
         "finalizedAt": now,
-        "sendStartedAt": (
-            expected_followup_config.get("lastSendAttemptAt")
-            or now - timedelta(seconds=5)
-        ),
-        "inputHash": legacy_digest,
+        "sendStartedAt": legacy_started_at,
         "sendIdentity": expected_identity,
         "configFingerprint": expected_identity.get("configFingerprint"),
         "clientId": expected_identity.get("clientId"),
@@ -1429,6 +2192,7 @@ def _legacy_followup_review_attempt(
         "body": body,
         "subject": subject,
         "conversationId": conversation_id,
+        "draftId": None,
         "toRecipients": _normalize_followup_recipients([recipient]),
         "ccRecipients": _normalize_followup_recipients(
             expected_identity.get("ccRecipients")
@@ -1436,7 +2200,7 @@ def _legacy_followup_review_attempt(
         "legacyRecovered": True,
         "sentMatchId": sent_match.get("id"),
         "sentMatchDateTime": sent_match.get("sentDateTime"),
-    }
+    })
 
 
 def _migrate_legacy_sent_match(
@@ -1452,11 +2216,31 @@ def _migrate_legacy_sent_match(
     subject: str,
     conversation_id: Optional[str],
     sent_match: Dict[str, Any],
+    expected_retry_timestamp_signature: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str], str]:
     """Migrate a pre-marker Sent Items match into the durable protocol."""
     from google.cloud.firestore import transactional
 
-    expected_identity, expected_retry, legacy_digest, attempt_id = (
+    if not _followup_index_is_valid(followup_index):
+        return (
+            None,
+            f"the legacy reconciliation index is invalid: {followup_index!r}",
+            "followup-legacy-invalid-index",
+        )
+    expected_config_index = (expected_followup_config or {}).get(
+        "currentFollowUpIndex"
+    )
+    if not _followup_indexes_exactly_match(
+        expected_config_index,
+        followup_index,
+    ):
+        return (
+            None,
+            "the claimed config index differs from the reconciliation index",
+            "followup-legacy-index-mismatch",
+        )
+
+    expected_identity, expected_retry, _legacy_digest, attempt_id = (
         _legacy_followup_attempt_components(
             user_id,
             thread_id,
@@ -1468,6 +2252,19 @@ def _migrate_legacy_sent_match(
             subject=subject,
             conversation_id=conversation_id,
         )
+    )
+    validated_retry_timestamp = _validated_followup_retry_timestamp(
+        expected_followup_config,
+        expected_signature=expected_retry_timestamp_signature,
+    )
+    if validated_retry_timestamp is None:
+        return (
+            None,
+            "the legacy lastSendAttemptAt timestamp is missing or invalid",
+            attempt_id,
+        )
+    expected_send_started_at, retry_timestamp_signature = (
+        validated_retry_timestamp
     )
     thread_ref = (
         _fs.collection("users")
@@ -1493,35 +2290,51 @@ def _migrate_legacy_sent_match(
                 f"claim ownership changed from {claim_owner} to {current_owner}"
             )
         current_index = current_config.get("currentFollowUpIndex", 0)
-        if current_index != followup_index:
+        if not _followup_indexes_exactly_match(current_index, followup_index):
             return None, (
                 f"the follow-up index changed from {followup_index} to {current_index}"
             )
-        if _followup_send_identity(
+        current_identity = _followup_send_identity(
             data,
             current_config,
             followup_index,
-        ) != expected_identity:
+        )
+        if not _followup_send_identity_has_complete_proof(expected_identity):
+            return None, "the claimed send identity proof is incomplete"
+        if not _followup_send_identity_has_complete_proof(current_identity):
+            return None, "the current send identity proof is incomplete"
+        if not _followup_values_exactly_match(
+            current_identity,
+            expected_identity,
+        ):
             return None, "recipient, message, client, or follow-up config changed"
-        if _followup_retry_signature(data, current_config) != expected_retry:
+        current_retry_timestamp = _validated_followup_retry_timestamp(
+            current_config,
+            expected_signature=retry_timestamp_signature,
+        )
+        if current_retry_timestamp is None:
+            return None, "the legacy lastSendAttemptAt timestamp changed or is invalid"
+        current_send_started_at, _current_timestamp_signature = (
+            current_retry_timestamp
+        )
+        if current_send_started_at != expected_send_started_at:
+            return None, "the legacy lastSendAttemptAt timestamp changed or is invalid"
+        if not _followup_values_exactly_match(
+            _followup_retry_signature(data, current_config),
+            expected_retry,
+        ):
             return None, "follow-up retry metadata changed"
-
         now = datetime.now(timezone.utc)
         lease_until = now + timedelta(seconds=FOLLOWUP_SEND_LEASE_SECONDS)
-        send_started_at = (
-            expected_followup_config.get("lastSendAttemptAt")
-            or now - timedelta(seconds=5)
-        )
-        marker = {
+        marker = _seal_followup_send_envelope({
             "id": attempt_id,
             "state": "uncertain",
             "owner": claim_owner,
             "reconciliationOwner": claim_owner,
             "index": followup_index,
-            "createdAt": now,
-            "sendStartedAt": send_started_at,
+            "createdAt": current_send_started_at,
+            "sendStartedAt": current_send_started_at,
             "leaseUntil": lease_until,
-            "inputHash": legacy_digest,
             "sendIdentity": expected_identity,
             "configFingerprint": expected_identity.get("configFingerprint"),
             "clientId": expected_identity.get("clientId"),
@@ -1529,6 +2342,7 @@ def _migrate_legacy_sent_match(
             "body": body,
             "subject": subject,
             "conversationId": conversation_id,
+            "draftId": None,
             "toRecipients": _normalize_followup_recipients([recipient]),
             "ccRecipients": _normalize_followup_recipients(
                 expected_identity.get("ccRecipients")
@@ -1537,7 +2351,7 @@ def _migrate_legacy_sent_match(
             "reconciledAt": now,
             "sentMatchId": sent_match.get("id"),
             "sentMatchDateTime": sent_match.get("sentDateTime"),
-        }
+        })
         transaction.update(thread_ref, {
             "followUpSendAttempt": marker,
             "lastOutboundAt": SERVER_TIMESTAMP,
@@ -1564,14 +2378,28 @@ def _reconcile_durable_followup_attempt(
     claim_owner: Optional[str],
 ) -> Optional[bool]:
     """Resolve an uncertain durable attempt without ever blindly resending it."""
+    if not _followup_index_is_valid(followup_index):
+        _set_followup_send_outcome(
+            error=f"Invalid follow-up reconciliation index: {followup_index!r}",
+            guard_failed_closed=True,
+        )
+        return False
     marker = (thread_data or {}).get("followUpSendAttempt")
-    if not isinstance(marker, dict) or marker.get("index") != followup_index:
+    if not isinstance(marker, dict):
         return None
     marker_state = str(marker.get("state") or "").strip().lower()
     if marker_state not in {"sending", "uncertain"}:
         return None
+    if not _followup_indexes_exactly_match(marker.get("index"), followup_index):
+        _set_followup_send_outcome(
+            error="Unresolved follow-up marker has a mismatched or invalid index",
+            attempt_id=marker.get("id"),
+            attempt_marker=marker,
+            guard_failed_closed=True,
+        )
+        return False
 
-    expected_attempt = _canonical_followup_value(marker)
+    expected_attempt = marker
     expected_config = (thread_data or {}).get("followUpConfig") or {}
     expected_identity = _followup_send_identity(
         thread_data,
@@ -1579,6 +2407,27 @@ def _reconcile_durable_followup_attempt(
         followup_index,
     )
     expected_retry = _followup_retry_signature(thread_data, expected_config)
+    allow_terminal_config_change = (
+        _followup_preservation_outcome(thread_data) is not None
+    )
+    if not _followup_send_envelope_is_complete(
+        marker,
+        expected_identity=expected_identity,
+        allow_config_fingerprint_change=allow_terminal_config_change,
+    ):
+        failure_reason = (
+            "Durable follow-up send envelope is missing, changed, or incomplete; "
+            "manual review required"
+        )
+        _set_followup_send_outcome(
+            error=failure_reason,
+            attempt_at=marker.get("sendStartedAt"),
+            attempt_id=marker.get("id"),
+            attempt_marker=marker,
+            guard_failed_closed=True,
+        )
+        print(f"   🛑 {failure_reason}")
+        return False
 
     recipient = str(marker.get("recipient") or "").strip()
     body = str(marker.get("body") or "")
@@ -2028,6 +2877,28 @@ def _send_followup_email(
     import requests
 
     _reset_followup_send_outcome()
+    if not _followup_index_is_valid(followup_index):
+        _set_followup_send_outcome(
+            error=f"Invalid follow-up index: {followup_index!r}",
+            guard_failed_closed=True,
+        )
+        return False
+    config_has_index = (
+        isinstance(followup_config, dict)
+        and "currentFollowUpIndex" in followup_config
+    )
+    config_index = (followup_config or {}).get("currentFollowUpIndex")
+    # Reject supplied type/value mismatches during preflight.  The durable
+    # send-intent transaction below also requires the index to be present.
+    if config_has_index and not _followup_indexes_exactly_match(
+        config_index,
+        followup_index,
+    ):
+        _set_followup_send_outcome(
+            error="Follow-up config index does not exactly match the requested index",
+            guard_failed_closed=True,
+        )
+        return False
     reconciliation_result = _reconcile_durable_followup_attempt(
         user_id,
         thread_id,
@@ -2191,9 +3062,14 @@ def _send_followup_email(
 
         # Personalize the message with contact name if available
         contact_name = thread_data.get("contactName", "")
+        sheet_contact_name = None
 
         # Fallback: fetch contact name from sheet if not on thread
-        if not contact_name and "[NAME]" in followup_message:
+        contact_name_is_missing = (
+            contact_name is None
+            or (isinstance(contact_name, str) and not contact_name.strip())
+        )
+        if contact_name_is_missing and "[NAME]" in followup_message:
             try:
                 from .clients import _get_sheet_id_or_fail, _sheets_client
                 client_id = thread_data.get("clientId")
@@ -2208,14 +3084,23 @@ def _send_followup_email(
                     ).execute()
                     row_values = result.get("values", [[]])[0]
                     if len(row_values) >= 5:
-                        contact_name = row_values[4]  # Leasing Contact column (E)
-                        print(f"   Fetched contact name from sheet: {contact_name}")
+                        sheet_contact_name = _safe_followup_contact_name(
+                            row_values[4]
+                        )
+                        if sheet_contact_name:
+                            contact_name = sheet_contact_name
+                            print(
+                                "   Fetched safe contact name from sheet: "
+                                f"{contact_name}"
+                            )
             except Exception as e:
                 print(f"   Could not fetch contact name from sheet: {e}")
 
-        if contact_name and "[NAME]" in followup_message:
-            first_name = contact_name.split()[0] if contact_name else ""
-            followup_message = followup_message.replace("[NAME]", first_name)
+        followup_message = _resolve_followup_message(
+            followup_config,
+            followup_index,
+            contact_name,
+        )
 
         body_validation = validate_outbound_body(followup_message)
         if not body_validation.is_safe:
@@ -2244,12 +3129,57 @@ def _send_followup_email(
         )
 
         last_attempt_index = followup_config.get("lastSendAttemptIndex")
-        retry_state_matches_current_followup = (
-            last_attempt_index is None or last_attempt_index == followup_index
-        )
-        if retry_state_matches_current_followup and (
-            followup_config.get("lastSendError") or followup_config.get("lastSendAttemptAt")
+        if (
+            last_attempt_index is not None
+            and not _followup_index_is_valid(last_attempt_index)
         ):
+            failure_reason = "Follow-up retry index is malformed; manual review required"
+            _set_followup_send_outcome(
+                error=failure_reason,
+                guard_failed_closed=True,
+            )
+            print(f"   🛑 {failure_reason}")
+            return False
+        legacy_retry_exists = any(
+            followup_config.get(field) is not None
+            for field in (
+                "lastSendError",
+                "lastSendAttemptAt",
+                "lastSendAttemptIndex",
+            )
+        )
+        legacy_retry_timestamp = None
+        legacy_retry_timestamp_signature = None
+        if legacy_retry_exists:
+            validated_retry_timestamp = _validated_followup_retry_timestamp(
+                followup_config
+            )
+            if validated_retry_timestamp is None:
+                failure_reason = (
+                    "Follow-up retry timestamp is missing or invalid; "
+                    "manual review required"
+                )
+                _set_followup_send_outcome(
+                    error=failure_reason,
+                    guard_failed_closed=True,
+                )
+                print(f"   🛑 {failure_reason}")
+                return False
+            (
+                legacy_retry_timestamp,
+                legacy_retry_timestamp_signature,
+            ) = validated_retry_timestamp
+        retry_state_matches_current_followup = (
+            last_attempt_index is None
+            or _followup_indexes_exactly_match(
+                last_attempt_index,
+                followup_index,
+            )
+        )
+        if retry_state_matches_current_followup and legacy_retry_exists:
+            legacy_retry_sent_after = (
+                legacy_retry_timestamp - timedelta(seconds=30)
+            )
             try:
                 sent_match = find_matching_sent_message_for_retry(
                     headers,
@@ -2257,7 +3187,7 @@ def _send_followup_email(
                     body=followup_message,
                     subject=subject,
                     conversation_id=conversation_id,
-                    sent_after=sent_after_from_retry_data(followup_config),
+                    sent_after=legacy_retry_sent_after,
                 )
             except SentMailGuardLookupError as exc:
                 failure_reason = f"Sent Items retry guard failed: {exc}"
@@ -2281,6 +3211,9 @@ def _send_followup_email(
                             subject=subject,
                             conversation_id=conversation_id,
                             sent_match=sent_match,
+                            expected_retry_timestamp_signature=(
+                                legacy_retry_timestamp_signature
+                            ),
                         )
                     )
                 except Exception as exc:
@@ -2343,7 +3276,7 @@ def _send_followup_email(
                 manual_continuation = find_sent_conversation_continuation_for_retry(
                     headers,
                     conversation_id=conversation_id,
-                    sent_after=sent_after_from_retry_data(followup_config),
+                    sent_after=legacy_retry_sent_after,
                 )
             except SentMailGuardLookupError as exc:
                 failure_reason = f"Sent Items manual continuation guard failed: {exc}"
@@ -2640,6 +3573,10 @@ def _send_followup_email(
                 draft_id=reply_draft_id,
                 to_recipients=final_to_recipients,
                 cc_recipients=final_cc_recipients,
+                fallback_contact_name=sheet_contact_name,
+                expected_retry_timestamp_signature=(
+                    legacy_retry_timestamp_signature
+                ),
             )
         except Exception as exc:
             send_attempt = None
@@ -2725,6 +3662,9 @@ def _schedule_next_followup(
     """
     from google.cloud.firestore import transactional
 
+    if not _followup_index_is_valid(just_sent_index):
+        return FollowupScheduleOutcome.AMBIGUOUS
+
     thread_ref = (
         _fs.collection("users")
         .document(user_id)
@@ -2765,7 +3705,10 @@ def _schedule_next_followup(
 
         current_index = current_config.get("currentFollowUpIndex", 0)
         if (
-            current_index == just_sent_index + 1
+            _followup_indexes_exactly_match(
+                current_index,
+                just_sent_index + 1,
+            )
             and send_attempt_id
             and current_attempt_id == send_attempt_id
             and current_attempt.get("state") == "committed"
@@ -2780,7 +3723,7 @@ def _schedule_next_followup(
             )
             return FollowupScheduleOutcome.AMBIGUOUS, None
 
-        if current_index != just_sent_index:
+        if not _followup_indexes_exactly_match(current_index, just_sent_index):
             print(
                 f"   ⏭️ Follow-up index changed from {just_sent_index} "
                 f"to {current_index}; not advancing"
@@ -2794,6 +3737,12 @@ def _schedule_next_followup(
             )
             return FollowupScheduleOutcome.AMBIGUOUS, None
         if send_attempt_id:
+            if not _followup_indexes_exactly_match(
+                current_attempt.get("index"),
+                just_sent_index,
+            ):
+                print("   ⏭️ Durable send attempt index changed")
+                return FollowupScheduleOutcome.AMBIGUOUS, None
             current_attempt_state = str(
                 current_attempt.get("state") or ""
             ).strip().lower()
@@ -2812,25 +3761,26 @@ def _schedule_next_followup(
                 return FollowupScheduleOutcome.AMBIGUOUS, None
             if (
                 send_attempt_marker is not None
-                and _canonical_followup_value(current_attempt)
-                != _canonical_followup_value(send_attempt_marker)
+                and not _followup_values_exactly_match(
+                    current_attempt,
+                    send_attempt_marker,
+                )
             ):
                 print("   ⏭️ Durable send attempt changed after acceptance")
                 return FollowupScheduleOutcome.AMBIGUOUS, None
 
-            sent_identity = current_attempt.get("sendIdentity")
             current_identity = _followup_send_identity(
                 data,
                 current_config,
                 just_sent_index,
             )
             allow_terminal_config_change = preservation_outcome is not None
-            if not _followup_send_identity_matches(
-                sent_identity,
-                current_identity,
+            if not _followup_send_envelope_is_complete(
+                current_attempt,
+                expected_identity=current_identity,
                 allow_config_fingerprint_change=allow_terminal_config_change,
             ):
-                print("   ⏭️ Accepted send inputs differ from current thread state")
+                print("   ⏭️ Accepted send envelope is incomplete or changed")
                 return FollowupScheduleOutcome.AMBIGUOUS, None
 
         config_changed = (

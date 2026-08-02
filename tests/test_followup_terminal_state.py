@@ -1,10 +1,12 @@
 import os
 import unittest
+from copy import deepcopy
 from contextvars import copy_context
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
+from google.api_core.datetime_helpers import DatetimeWithNanoseconds
 
 os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault(
@@ -127,6 +129,64 @@ def _fixed_datetime(value):
             return value.astimezone(tz) if tz else value
 
     return FixedDateTime
+
+
+def _sealed_followup_attempt(
+    thread_data,
+    followup_config,
+    *,
+    attempt_id,
+    owner,
+    state="sending",
+    reconciliation_owner=None,
+    followup_index=0,
+    send_started_at=None,
+    subject="Follow-up",
+    conversation_id=None,
+    draft_id=None,
+    to_recipients=None,
+    cc_recipients=None,
+):
+    """Build a production-shaped active marker for recovery-path tests."""
+    send_started_at = send_started_at or datetime.now(timezone.utc)
+    identity = followup._followup_send_identity(
+        thread_data,
+        followup_config,
+        followup_index,
+    )
+    recipient = identity["recipient"]
+    marker = {
+        "id": attempt_id,
+        "state": state,
+        "owner": owner,
+        "index": followup_index,
+        "createdAt": send_started_at,
+        "sendStartedAt": send_started_at,
+        "leaseUntil": send_started_at + followup.timedelta(minutes=10),
+        "sendIdentity": identity,
+        "configFingerprint": identity["configFingerprint"],
+        "clientId": identity["clientId"],
+        "recipient": recipient,
+        "body": followup._resolve_followup_message(
+            followup_config,
+            followup_index,
+            thread_data.get("contactName"),
+        ),
+        "subject": subject,
+        "conversationId": conversation_id,
+        "draftId": draft_id,
+        "toRecipients": followup._normalize_followup_recipients(
+            to_recipients if to_recipients is not None else [recipient]
+        ),
+        "ccRecipients": followup._normalize_followup_recipients(
+            cc_recipients
+            if cc_recipients is not None
+            else identity.get("ccRecipients")
+        ),
+    }
+    if reconciliation_owner is not None:
+        marker["reconciliationOwner"] = reconciliation_owner
+    return followup._seal_followup_send_envelope(marker)
 
 
 class FakeMessageDoc:
@@ -939,7 +999,10 @@ class FollowupTerminalStateTests(unittest.TestCase):
                 {"Authorization": "Bearer token"},
                 "thread-1",
                 {"clientId": "client-1", "email": ["broker@example.com"]},
-                {"followUps": [{"message": "Is there a flyer available?"}]},
+                {
+                    "currentFollowUpIndex": 0,
+                    "followUps": [{"message": "Is there a flyer available?"}],
+                },
                 0,
             )
 
@@ -964,7 +1027,10 @@ class FollowupTerminalStateTests(unittest.TestCase):
                 {"Authorization": "Bearer token"},
                 "thread-1",
                 {"clientId": "client-1", "email": ["broker@example.com"]},
-                {"followUps": [{"message": "Could you confirm the asking rent?"}]},
+                {
+                    "currentFollowUpIndex": 0,
+                    "followUps": [{"message": "Could you confirm the asking rent?"}],
+                },
                 0,
             )
 
@@ -1174,6 +1240,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
         })
         fake_fs = FakeFollowupFirestore([outbound])
         followup_config = {
+            "currentFollowUpIndex": 0,
             "followUps": [{"message": "Hi Riley,\n\nJust following up."}],
         }
         thread_data = {
@@ -1208,6 +1275,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
         })
         fake_fs = FakeFollowupFirestore([outbound])
         followup_config = {
+            "currentFollowUpIndex": 0,
             "followUps": [{"message": "Hi Riley,\n\nJust following up."}],
         }
         thread_data = {
@@ -1349,6 +1417,232 @@ class FollowupTerminalStateTests(unittest.TestCase):
             ["assistant@example.com"],
             thread_data["followUpSendAttempt"]["ccRecipients"],
         )
+
+    def test_personalized_followup_persists_raw_template_and_sends_resolved_body(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+            "to": ["broker@example.com"],
+        })
+        raw_template = "Hi [NAME],\n\nJust following up."
+        resolved_body = "Hi Ryan,\n\nJust following up."
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "followUps": [{"message": raw_template}],
+        }
+        thread_data = {
+            "clientId": "client-1",
+            "email": ["broker@example.com"],
+            "contactName": "Ryan Broker",
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": followup_config,
+        }
+        fake_fs = FakeFollowupFirestore([outbound], thread_data=thread_data)
+        post_urls = []
+        patched_payloads = []
+
+        def run_request(callback, *args, **kwargs):
+            return callback()
+
+        def fake_get(url, **kwargs):
+            self.assertIn("/me/messages", url)
+            return FakeResponse(200, {
+                "value": [{
+                    "id": "graph-root",
+                    "subject": "Current subject",
+                    "conversationId": "conv-current",
+                }]
+            })
+
+        def fake_post(url, **kwargs):
+            post_urls.append(url)
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "reply-draft-personalized",
+                    "toRecipients": [
+                        {"emailAddress": {"address": "broker@example.com"}},
+                    ],
+                    "ccRecipients": [],
+                })
+            if url.endswith("/send"):
+                marker = thread_data.get("followUpSendAttempt")
+                self.assertIsNotNone(marker)
+                self.assertEqual("sending", marker["state"])
+                self.assertEqual(raw_template, marker["sendIdentity"]["rawMessage"])
+                self.assertEqual(resolved_body, marker["body"])
+                self.assertEqual("broker@example.com", marker["recipient"])
+                return FakeResponse(202, {})
+            raise AssertionError(f"Unexpected POST: {url}")
+
+        def fake_patch(url, **kwargs):
+            patched_payloads.append(kwargs.get("json") or {})
+            return FakeResponse(200, {})
+
+        with patch.object(followup, "_fs", fake_fs), patch.object(
+            followup, "exponential_backoff_request", side_effect=run_request
+        ), patch.object(requests, "get", side_effect=fake_get), patch.object(
+            requests, "post", side_effect=fake_post
+        ), patch.object(
+            requests, "patch", side_effect=fake_patch
+        ), patch.object(
+            followup, "_save_followup_message", return_value=True
+        ), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ), patch(
+            "email_automation.email._delete_graph_reply_draft"
+        ):
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+                claim_owner="claim-owner",
+            )
+
+        self.assertTrue(result)
+        self.assertTrue(any(url.endswith("/send") for url in post_urls))
+        patched_html = patched_payloads[-1]["body"]["content"]
+        self.assertIn("Hi Ryan", patched_html)
+        self.assertNotIn("[NAME]", patched_html)
+
+    def test_followup_name_resolution_rejects_malformed_contact_names(self):
+        followup_config = {
+            "followUps": [{"message": "Hi [NAME],\n\nJust following up."}],
+        }
+
+        for contact_name in (
+            {"first": "Ryan"},
+            ["Ryan", "Broker"],
+            b"Ryan",
+            123,
+            True,
+            "   ",
+        ):
+            with self.subTest(contact_name=contact_name):
+                self.assertEqual(
+                    "Hi [NAME],\n\nJust following up.",
+                    followup._resolve_followup_message(
+                        followup_config,
+                        0,
+                        contact_name,
+                    ),
+                )
+
+    def test_default_followup_durably_captures_sheet_name_before_graph_send(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+            "to": ["broker@example.com"],
+        })
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "followUps": [{"message": ""}],
+        }
+        thread_data = {
+            "clientId": "client-1",
+            "email": ["broker@example.com"],
+            "contactName": "",
+            "rowNumber": 12,
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": followup_config,
+        }
+        fake_fs = FakeFollowupFirestore([outbound], thread_data=thread_data)
+        sheets = Mock()
+        sheets.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+            "values": [["", "", "", "", "Ryan Broker"]],
+        }
+        post_urls = []
+        patched_payloads = []
+
+        def run_request(callback, *args, **kwargs):
+            return callback()
+
+        def fake_get(url, **kwargs):
+            self.assertIn("/me/messages", url)
+            return FakeResponse(200, {
+                "value": [{
+                    "id": "graph-root",
+                    "subject": "Current subject",
+                    "conversationId": "conv-current",
+                }]
+            })
+
+        def fake_post(url, **kwargs):
+            post_urls.append(url)
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "reply-draft-default",
+                    "toRecipients": [
+                        {"emailAddress": {"address": "broker@example.com"}},
+                    ],
+                    "ccRecipients": [],
+                })
+            if url.endswith("/send"):
+                marker = thread_data.get("followUpSendAttempt")
+                self.assertIsNotNone(marker)
+                self.assertEqual("sending", marker["state"])
+                self.assertEqual("", marker["sendIdentity"]["rawMessage"])
+                self.assertEqual("Ryan Broker", marker["sendIdentity"]["contactName"])
+                self.assertTrue(marker["body"].startswith("Hi Ryan,"))
+                self.assertEqual("broker@example.com", marker["recipient"])
+                self.assertEqual("Ryan Broker", thread_data["contactName"])
+                self.assertEqual(
+                    followup._followup_config_fingerprint(followup_config),
+                    marker["configFingerprint"],
+                )
+                return FakeResponse(202, {})
+            raise AssertionError(f"Unexpected POST: {url}")
+
+        def fake_patch(url, **kwargs):
+            patched_payloads.append(kwargs.get("json") or {})
+            return FakeResponse(200, {})
+
+        with patch.object(followup, "_fs", fake_fs), patch.object(
+            followup, "exponential_backoff_request", side_effect=run_request
+        ), patch.object(requests, "get", side_effect=fake_get), patch.object(
+            requests, "post", side_effect=fake_post
+        ), patch.object(
+            requests, "patch", side_effect=fake_patch
+        ), patch.object(
+            followup, "_save_followup_message", return_value=True
+        ), patch(
+            "email_automation.clients._get_sheet_id_or_fail",
+            return_value="sheet-1",
+        ), patch(
+            "email_automation.clients._sheets_client",
+            return_value=sheets,
+        ), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ), patch(
+            "email_automation.email._delete_graph_reply_draft"
+        ):
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+                claim_owner="claim-owner",
+            )
+
+        self.assertTrue(result)
+        self.assertTrue(any(url.endswith("/send") for url in post_urls))
+        patched_html = patched_payloads[-1]["body"]["content"]
+        self.assertIn("Hi Ryan", patched_html)
+        self.assertNotIn("[NAME]", patched_html)
 
     def test_followup_graph_send_requires_claim_owner(self):
         outbound = FakeMessageDoc({
@@ -1622,7 +1916,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
             "lastSendError": None,
             "lastSendAttemptAt": None,
             "lastSendAttemptIndex": None,
-            "followUps": [{"message": "Claimed body"}],
+            "followUps": [{"message": "Hi [NAME], following up."}],
         }
         claimed_thread = {
             "clientId": "client-claimed",
@@ -1639,6 +1933,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
             "retry": {"config": {"lastSendError": "new ambiguous attempt"}},
             "body": {"followups": [{"message": "Changed body"}]},
             "send_body": {"body_arg": "Injected body"},
+            "contact_name": {"thread": {"contactName": "Changed Broker"}},
             "recipient": {"thread": {"email": ["changed@example.com"]}},
             "client": {"thread": {"clientId": "client-changed"}},
         }
@@ -1669,7 +1964,1880 @@ class FollowupTerminalStateTests(unittest.TestCase):
                         expected_thread_data=claimed_thread,
                         expected_followup_config=base_config,
                         recipient="claimed@example.com",
-                        body=mutation.get("body_arg", "Claimed body"),
+                        body=mutation.get("body_arg", "Hi Claimed, following up."),
+                        subject="Claimed subject",
+                        conversation_id="conv-claimed",
+                        draft_id="draft-claimed",
+                    )
+
+                self.assertIsNone(marker)
+                self.assertTrue(reason)
+                self.assertEqual([], thread_ref.updates)
+
+    def test_send_intent_cas_rejects_typed_contact_name_mutations(self):
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "followUps": [{"message": "Plain follow-up body."}],
+        }
+        missing = object()
+        mutations = (
+            (missing, None),
+            (None, missing),
+            (None, {}),
+            (None, []),
+            (None, 0),
+            (None, False),
+            ({}, None),
+            ([], None),
+            (0, None),
+            (False, None),
+            ({}, []),
+            ([], {}),
+            (0, False),
+            (False, 0),
+            ([0], [False]),
+            ([False], [0]),
+            ({"first": 0}, {"first": False}),
+            ({"first": False}, {"first": 0}),
+        )
+
+        for claimed_name, current_name in mutations:
+            with self.subTest(
+                claimed_type=type(claimed_name).__name__,
+                current_type=type(current_name).__name__,
+            ):
+                claimed_thread = {
+                    "clientId": "client-claimed",
+                    "email": ["claimed@example.com"],
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "hasInboundReply": False,
+                    "followUpConfig": followup_config,
+                }
+                if claimed_name is not missing:
+                    claimed_thread["contactName"] = claimed_name
+                current_thread = dict(claimed_thread)
+                if current_name is missing:
+                    current_thread.pop("contactName", None)
+                else:
+                    current_thread["contactName"] = current_name
+                thread_ref = FakeThreadRef(current_thread)
+
+                with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    marker, reason = followup._persist_followup_send_intent(
+                        "uid-1",
+                        "thread-1",
+                        claim_owner="claim-owner",
+                        followup_index=0,
+                        expected_thread_data=claimed_thread,
+                        expected_followup_config=followup_config,
+                        recipient="claimed@example.com",
+                        body="Plain follow-up body.",
+                        subject="Claimed subject",
+                        conversation_id="conv-claimed",
+                        draft_id="draft-claimed",
+                    )
+
+                self.assertIsNone(marker)
+                self.assertTrue(reason)
+                self.assertEqual([], thread_ref.updates)
+
+    def test_send_intent_cas_rejects_full_identity_and_retry_type_mutations(self):
+        base_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "lastSendError": None,
+            "lastSendAttemptAt": None,
+            "lastSendAttemptIndex": None,
+            "followUps": [{"message": "Plain follow-up body."}],
+        }
+        base_thread = {
+            "clientId": "client-claimed",
+            "email": ["claimed@example.com"],
+            "contactName": None,
+            "ccEmails": [],
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+        }
+        cases = (
+            ("client_scalar", {"clientId": 0}, {"clientId": False}, {}, {}),
+            ("client_nested", {"clientId": [0]}, {"clientId": [False]}, {}, {}),
+            ("cc_scalar", {"ccEmails": [0]}, {"ccEmails": [False]}, {}, {}),
+            (
+                "cc_nested",
+                {"ccEmails": [{"address": [0]}]},
+                {"ccEmails": [{"address": [False]}]},
+                {},
+                {},
+            ),
+            (
+                "retry_index",
+                {},
+                {},
+                {"lastSendAttemptIndex": 0},
+                {"lastSendAttemptIndex": False},
+            ),
+            (
+                "retry_error",
+                {},
+                {},
+                {"lastSendError": [0]},
+                {"lastSendError": [False]},
+            ),
+            (
+                "retry_attempt_at",
+                {},
+                {},
+                {"lastSendAttemptAt": [0]},
+                {"lastSendAttemptAt": [False]},
+            ),
+            (
+                "retry_attempt_marker",
+                {"followUpSendAttempt": {"nested": [0]}},
+                {"followUpSendAttempt": {"nested": [False]}},
+                {},
+                {},
+            ),
+            (
+                "raw_message",
+                {},
+                {},
+                {"followUps": [{"message": [0]}]},
+                {"followUps": [{"message": [False]}]},
+            ),
+            (
+                "config_nested",
+                {},
+                {},
+                {
+                    "followUps": [{
+                        "message": "Plain follow-up body.",
+                        "metadata": [0],
+                    }],
+                },
+                {
+                    "followUps": [{
+                        "message": "Plain follow-up body.",
+                        "metadata": [False],
+                    }],
+                },
+            ),
+        )
+
+        for name, claimed_patch, current_patch, claimed_retry, current_retry in cases:
+            with self.subTest(name=name):
+                claimed_config = {**base_config, **claimed_retry}
+                current_config = {**base_config, **current_retry}
+                claimed_thread = {
+                    **base_thread,
+                    **claimed_patch,
+                    "followUpConfig": claimed_config,
+                }
+                current_thread = {
+                    **base_thread,
+                    **current_patch,
+                    "followUpConfig": current_config,
+                }
+                thread_ref = FakeThreadRef(current_thread)
+
+                with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    marker, reason = followup._persist_followup_send_intent(
+                        "uid-1",
+                        "thread-1",
+                        claim_owner="claim-owner",
+                        followup_index=0,
+                        expected_thread_data=claimed_thread,
+                        expected_followup_config=claimed_config,
+                        recipient="claimed@example.com",
+                        body="Plain follow-up body.",
+                        subject="Claimed subject",
+                        conversation_id="conv-claimed",
+                        draft_id="draft-claimed",
+                    )
+
+                self.assertIsNone(marker)
+                self.assertTrue(reason)
+                self.assertEqual([], thread_ref.updates)
+
+    def test_send_cas_rejects_source_presence_and_canonical_type_races(self):
+        base_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "followUps": [{"message": "Plain follow-up body."}],
+        }
+        base_thread = {
+            "clientId": "client-claimed",
+            "email": ["claimed@example.com"],
+            "contactName": None,
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+        }
+        missing = object()
+        attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
+        cases = (
+            ("client_absent_to_none", "thread", "clientId", missing, None),
+            ("client_none_to_absent", "thread", "clientId", None, missing),
+            ("cc_emails_absent_to_none", "thread", "ccEmails", missing, None),
+            ("cc_emails_none_to_absent", "thread", "ccEmails", None, missing),
+            (
+                "cc_recipients_absent_to_none",
+                "thread",
+                "ccRecipients",
+                missing,
+                None,
+            ),
+            (
+                "cc_recipients_none_to_absent",
+                "thread",
+                "ccRecipients",
+                None,
+                missing,
+            ),
+            ("row_absent_to_none", "thread", "rowNumber", missing, None),
+            ("row_none_to_absent", "thread", "rowNumber", None, missing),
+            (
+                "email_string_to_list",
+                "thread",
+                "email",
+                "claimed@example.com",
+                ["claimed@example.com"],
+            ),
+            (
+                "email_list_to_string",
+                "thread",
+                "email",
+                ["claimed@example.com"],
+                "claimed@example.com",
+            ),
+            (
+                "config_datetime_to_iso_string",
+                "config",
+                "auditMetadata",
+                attempted_at,
+                attempted_at.isoformat(),
+            ),
+            (
+                "config_iso_string_to_datetime",
+                "config",
+                "auditMetadata",
+                attempted_at.isoformat(),
+                attempted_at,
+            ),
+            (
+                "index_absent_to_zero",
+                "config",
+                "currentFollowUpIndex",
+                missing,
+                0,
+            ),
+            (
+                "index_zero_to_absent",
+                "config",
+                "currentFollowUpIndex",
+                0,
+                missing,
+            ),
+            (
+                "owner_absent_to_claimed",
+                "config",
+                "processingBy",
+                missing,
+                "claim-owner",
+            ),
+            (
+                "owner_none_to_claimed",
+                "config",
+                "processingBy",
+                None,
+                "claim-owner",
+            ),
+        )
+
+        def apply_value(target, key, value):
+            if value is missing:
+                target.pop(key, None)
+            else:
+                target[key] = value
+
+        for name, scope, key, claimed_value, current_value in cases:
+            with self.subTest(name=name):
+                claimed_config = dict(base_config)
+                current_config = dict(base_config)
+                claimed_thread = dict(base_thread)
+                current_thread = dict(base_thread)
+                if scope == "config":
+                    apply_value(claimed_config, key, claimed_value)
+                    apply_value(current_config, key, current_value)
+                else:
+                    apply_value(claimed_thread, key, claimed_value)
+                    apply_value(current_thread, key, current_value)
+                claimed_thread["followUpConfig"] = claimed_config
+                current_thread["followUpConfig"] = current_config
+
+                send_ref = FakeThreadRef(current_thread)
+                with patch.object(
+                    followup,
+                    "_fs",
+                    FakeFirestore(send_ref),
+                ), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    marker, reason = followup._persist_followup_send_intent(
+                        "uid-1",
+                        "thread-1",
+                        claim_owner="claim-owner",
+                        followup_index=0,
+                        expected_thread_data=claimed_thread,
+                        expected_followup_config=claimed_config,
+                        recipient="claimed@example.com",
+                        body="Plain follow-up body.",
+                        subject="Claimed subject",
+                        conversation_id="conv-claimed",
+                        draft_id="draft-claimed",
+                    )
+
+                self.assertIsNone(marker)
+                self.assertTrue(reason)
+                self.assertEqual([], send_ref.updates)
+
+                migrate_ref = FakeThreadRef(current_thread)
+                with patch.object(
+                    followup,
+                    "_fs",
+                    FakeFirestore(migrate_ref),
+                ), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    migrated, migrate_reason, _attempt_id = (
+                        followup._migrate_legacy_sent_match(
+                            "uid-1",
+                            "thread-1",
+                            claim_owner="claim-owner",
+                            followup_index=0,
+                            expected_thread_data=claimed_thread,
+                            expected_followup_config=claimed_config,
+                            recipient="claimed@example.com",
+                            body="Plain follow-up body.",
+                            subject="Claimed subject",
+                            conversation_id="conv-claimed",
+                            sent_match={
+                                "id": "sent-legacy",
+                                "sentDateTime": "2026-06-26T12:05:02Z",
+                            },
+                        )
+                    )
+
+                self.assertIsNone(migrated)
+                self.assertTrue(migrate_reason)
+                self.assertEqual([], migrate_ref.updates)
+
+    def test_cross_index_type_mismatches_fail_at_every_irreversible_fence(self):
+        cases = (
+            ("bool_config_int_arg", False, 0),
+            ("int_config_bool_arg", 0, False),
+            ("float_config_int_arg", 0.0, 0),
+            ("int_config_float_arg", 0, 0.0),
+            ("string_config_int_arg", "0", 0),
+            ("int_config_string_arg", 0, "0"),
+            ("list_config_int_arg", [0], 0),
+            ("int_config_list_arg", 0, [0]),
+            ("dict_config_int_arg", {"nested": 0}, 0),
+            ("int_config_dict_arg", 0, {"nested": 0}),
+        )
+
+        for name, config_index, argument_index in cases:
+            followup_config = {
+                "enabled": True,
+                "currentFollowUpIndex": config_index,
+                "processingBy": "claim-owner",
+                "followUps": [
+                    {"message": "Plain follow-up body."},
+                    {"message": "Second follow-up body."},
+                ],
+            }
+            thread_data = {
+                "clientId": "client-claimed",
+                "email": ["claimed@example.com"],
+                "contactName": "Claimed Broker",
+                "status": "active",
+                "followUpStatus": "waiting",
+                "hasInboundReply": False,
+                "followUpConfig": followup_config,
+            }
+
+            with self.subTest(name=name, stage="send_intent"):
+                send_ref = FakeThreadRef(thread_data)
+                with patch.object(
+                    followup,
+                    "_fs",
+                    FakeFirestore(send_ref),
+                ), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    marker, reason = followup._persist_followup_send_intent(
+                        "uid-1",
+                        "thread-1",
+                        claim_owner="claim-owner",
+                        followup_index=argument_index,
+                        expected_thread_data=thread_data,
+                        expected_followup_config=followup_config,
+                        recipient="claimed@example.com",
+                        body="Plain follow-up body.",
+                        subject="Claimed subject",
+                        conversation_id="conv-claimed",
+                        draft_id="draft-claimed",
+                    )
+
+                self.assertIsNone(marker)
+                self.assertTrue(reason)
+                self.assertEqual([], send_ref.updates)
+
+            identity_index = (
+                argument_index
+                if type(argument_index) in {int, bool}
+                else 0
+            )
+            accepted_identity = followup._followup_send_identity(
+                thread_data,
+                followup_config,
+                identity_index,
+            )
+            attempt = {
+                "id": f"attempt-{name}",
+                "state": "uncertain",
+                "owner": "claim-owner",
+                "index": argument_index,
+                "sendIdentity": accepted_identity,
+            }
+
+            with self.subTest(name=name, stage="post_accept"):
+                post_thread = {
+                    **thread_data,
+                    "followUpSendAttempt": attempt,
+                }
+                post_ref = FakeThreadRef(post_thread)
+                with patch.object(
+                    followup,
+                    "_fs",
+                    FakeFirestore(post_ref),
+                ), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    outcome = followup._schedule_next_followup(
+                        "uid-1",
+                        "thread-1",
+                        followup_config,
+                        just_sent_index=argument_index,
+                        claim_owner="claim-owner",
+                        send_attempt_id=attempt["id"],
+                    )
+
+                self.assertEqual(
+                    "ambiguous",
+                    getattr(outcome, "value", outcome),
+                )
+                self.assertEqual([], post_ref.updates)
+
+            with self.subTest(name=name, stage="reconciliation"):
+                reconcile_thread = {
+                    **thread_data,
+                    "followUpSendAttempt": attempt,
+                }
+                reconcile_ref = FakeThreadRef(reconcile_thread)
+                with patch.object(
+                    followup,
+                    "_fs",
+                    FakeFirestore(reconcile_ref),
+                ), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    reconciled, reconcile_reason = (
+                        followup._record_reconciled_followup_attempt(
+                            "uid-1",
+                            "thread-1",
+                            claim_owner="claim-owner",
+                            followup_index=argument_index,
+                            expected_attempt=attempt,
+                            expected_identity=accepted_identity,
+                            expected_retry=followup._followup_retry_signature(
+                                reconcile_thread,
+                                followup_config,
+                            ),
+                            sent_match={
+                                "id": "sent-index-mismatch",
+                                "sentDateTime": "2026-06-26T12:05:02Z",
+                            },
+                        )
+                    )
+
+                self.assertIsNone(reconciled)
+                self.assertTrue(reconcile_reason)
+                self.assertEqual([], reconcile_ref.updates)
+
+    def test_complete_identity_proof_rejects_cross_field_inconsistencies(self):
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "followUps": [{"message": "Plain follow-up body."}],
+            "auditMetadata": {"nested": [0, False, "0"]},
+        }
+        thread_data = {
+            "clientId": "client-proof",
+            "email": [" Proof@Example.com "],
+            "contactName": "Proof Broker",
+            "ccEmails": [],
+            "ccRecipients": ["cc@example.com"],
+            "rowNumber": 7,
+        }
+        identity = followup._followup_send_identity(
+            thread_data,
+            followup_config,
+            0,
+        )
+        self.assertTrue(followup._followup_send_identity_has_complete_proof(identity))
+
+        def replace_durable_config(proof, config):
+            proof["inputSignatures"]["config"]["durable"]["value"] = (
+                followup._typed_followup_identity_value(config)
+            )
+
+        cases = {
+            "recipient_vs_raw_email": lambda proof: proof.update(
+                recipient="other@example.com"
+            ),
+            "raw_message_vs_followups": lambda proof: proof.update(
+                rawMessage="Tampered follow-up body."
+            ),
+            "client_vs_raw_client": lambda proof: proof.update(
+                clientId="other-client"
+            ),
+            "contact_type_vs_raw_contact": lambda proof: proof.update(
+                contactNameType="builtins.list"
+            ),
+            "effective_cc_vs_raw_sources": lambda proof: proof.update(
+                ccRecipients=["other@example.com"]
+            ),
+            "fingerprint_vs_durable_config": lambda proof: proof.update(
+                configFingerprint="0" * 64
+            ),
+            "config_index_vs_argument": lambda proof: proof["inputSignatures"][
+                "config"
+            ]["currentFollowUpIndex"].update(
+                value=followup._typed_followup_identity_value(False)
+            ),
+            "durable_index_vs_field": lambda proof: replace_durable_config(
+                proof,
+                {**followup_config, "currentFollowUpIndex": False},
+            ),
+            "durable_followups_vs_field": lambda proof: replace_durable_config(
+                proof,
+                {**followup_config, "followUps": [{"message": "Changed body"}]},
+            ),
+            "row_bool_is_not_positive_int": lambda proof: proof[
+                "inputSignatures"
+            ]["thread"]["rowNumber"].update(
+                value=followup._typed_followup_identity_value(True)
+            ),
+        }
+
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                tampered = deepcopy(identity)
+                mutate(tampered)
+                self.assertFalse(
+                    followup._followup_send_identity_has_complete_proof(tampered)
+                )
+
+    def test_send_envelope_tampering_fails_at_every_recovery_fence(self):
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "followUps": [{"message": "Plain follow-up body."}],
+        }
+        thread_data = {
+            "clientId": "client-envelope",
+            "email": ["claimed@example.com"],
+            "contactName": "Claimed Broker",
+            "ccEmails": ["cc@example.com"],
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": followup_config,
+        }
+        intent_fs = FakeFollowupFirestore([], thread_data=thread_data)
+        with patch.object(followup, "_fs", intent_fs), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ):
+            marker, reason = followup._persist_followup_send_intent(
+                "uid-1",
+                "thread-1",
+                claim_owner="claim-owner",
+                followup_index=0,
+                expected_thread_data=thread_data,
+                expected_followup_config=followup_config,
+                recipient="claimed@example.com",
+                body="Plain follow-up body.",
+                subject="Claimed subject",
+                conversation_id="conv-claimed",
+                draft_id="draft-claimed",
+                to_recipients=["claimed@example.com"],
+                cc_recipients=["cc@example.com"],
+            )
+
+        self.assertIsNone(reason)
+        self.assertIsNotNone(marker)
+        base_thread = deepcopy(thread_data)
+
+        def remove_field(field):
+            return lambda attempt: attempt.pop(field, None)
+
+        def change_all(attempt):
+            attempt.update({
+                "recipient": "other@example.com",
+                "body": "Other body",
+                "subject": "Other subject",
+                "conversationId": "conv-other",
+                "draftId": "draft-other",
+                "toRecipients": ["other@example.com"],
+                "ccRecipients": ["other-cc@example.com"],
+            })
+
+        def forge_self_consistent_envelope(attempt):
+            payload = followup._followup_send_envelope_payload(attempt)
+            proved_fields = dict(payload)
+            send_identity = proved_fields.pop("sendIdentity")
+            proof = followup._typed_followup_identity_value({
+                "fields": proved_fields,
+                "sendIdentityHash": followup._followup_typed_value_hash(
+                    send_identity
+                ),
+            })
+            attempt["envelopeProof"] = proof
+            attempt["inputHash"] = followup._followup_send_envelope_hash(proof)
+
+        validation_now = datetime.now(timezone.utc) + followup.timedelta(seconds=1)
+        ordered_timestamp = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
+        firestore_timestamp = DatetimeWithNanoseconds(
+            2026,
+            6,
+            26,
+            12,
+            5,
+            tzinfo=timezone.utc,
+        )
+
+        cases = (
+            ("exact", None),
+            (
+                "exact_timestamp_now",
+                lambda attempt: attempt.update(
+                    createdAt=validation_now,
+                    sendStartedAt=validation_now,
+                ),
+            ),
+            (
+                "exact_timestamp_iso_z",
+                lambda attempt: attempt.update(
+                    createdAt="2026-06-26T12:05:00Z",
+                    sendStartedAt="2026-06-26T12:05:00Z",
+                ),
+            ),
+            (
+                "exact_timestamp_iso_offset",
+                lambda attempt: attempt.update(
+                    createdAt="2026-06-26T05:05:00-07:00",
+                    sendStartedAt="2026-06-26T05:05:00-07:00",
+                ),
+            ),
+            (
+                "exact_timestamp_firestore",
+                lambda attempt: attempt.update(
+                    createdAt=firestore_timestamp,
+                    sendStartedAt=firestore_timestamp,
+                ),
+            ),
+            ("attempt_id", lambda attempt: attempt.update(id="attempt-other")),
+            ("owner", lambda attempt: attempt.update(owner="other-owner")),
+            (
+                "created_at",
+                lambda attempt: attempt.update(createdAt="2026-06-26T12:00:00Z"),
+            ),
+            (
+                "send_started_at",
+                lambda attempt: attempt.update(
+                    sendStartedAt="2026-06-26T12:00:00Z"
+                ),
+            ),
+            (
+                "config_fingerprint",
+                lambda attempt: attempt.update(configFingerprint="0" * 64),
+            ),
+            (
+                "client_id",
+                lambda attempt: attempt.update(clientId="client-other"),
+            ),
+            (
+                "recipient",
+                lambda attempt: attempt.update(recipient="other@example.com"),
+            ),
+            ("body", lambda attempt: attempt.update(body="Other body")),
+            ("subject", lambda attempt: attempt.update(subject="Other subject")),
+            (
+                "conversation",
+                lambda attempt: attempt.update(conversationId="conv-other"),
+            ),
+            ("draft", lambda attempt: attempt.update(draftId="draft-other")),
+            (
+                "to_recipients",
+                lambda attempt: attempt.update(toRecipients=["other@example.com"]),
+            ),
+            (
+                "cc_recipients",
+                lambda attempt: attempt.update(
+                    ccRecipients=["other-cc@example.com"]
+                ),
+            ),
+            ("combined", change_all),
+            ("missing_envelope_proof", remove_field("envelopeProof")),
+            (
+                "malformed_envelope_proof",
+                lambda attempt: attempt.update(
+                    envelopeProof=followup._typed_followup_identity_value(
+                        {"body": "Other body"}
+                    )
+                ),
+            ),
+            ("missing_input_hash", remove_field("inputHash")),
+            ("changed_input_hash", lambda attempt: attempt.update(inputHash="0" * 64)),
+            (
+                "timestamp_empty_created",
+                lambda attempt: attempt.update(createdAt=""),
+            ),
+            (
+                "timestamp_garbage_started",
+                lambda attempt: attempt.update(sendStartedAt="not-a-timestamp"),
+            ),
+            (
+                "timestamp_bool_created",
+                lambda attempt: attempt.update(createdAt=False),
+            ),
+            (
+                "timestamp_nan_started",
+                lambda attempt: attempt.update(sendStartedAt=float("nan")),
+            ),
+            (
+                "timestamp_naive_datetime",
+                lambda attempt: attempt.update(
+                    createdAt=datetime(2026, 6, 26, 12, 5),
+                ),
+            ),
+            (
+                "timestamp_naive_iso",
+                lambda attempt: attempt.update(
+                    sendStartedAt="2026-06-26T12:05:00",
+                ),
+            ),
+            (
+                "timestamp_invalid_timezone",
+                lambda attempt: attempt.update(
+                    sendStartedAt="2026-06-26T12:05:00+25:00",
+                ),
+            ),
+            (
+                "timestamp_reversed_order",
+                lambda attempt: attempt.update(
+                    createdAt=ordered_timestamp,
+                    sendStartedAt=ordered_timestamp - followup.timedelta(seconds=1),
+                ),
+            ),
+            ("timestamp_missing_lease", remove_field("leaseUntil")),
+            (
+                "timestamp_garbage_lease",
+                lambda attempt: attempt.update(leaseUntil="not-a-timestamp"),
+            ),
+            (
+                "timestamp_lease_before_send",
+                lambda attempt: attempt.update(leaseUntil=ordered_timestamp),
+            ),
+            (
+                "timestamp_future_1_second",
+                lambda attempt: attempt.update(
+                    createdAt=validation_now + followup.timedelta(seconds=1),
+                    sendStartedAt=validation_now + followup.timedelta(seconds=1),
+                ),
+            ),
+            (
+                "timestamp_future_60_seconds",
+                lambda attempt: attempt.update(
+                    createdAt=validation_now + followup.timedelta(seconds=60),
+                    sendStartedAt=validation_now + followup.timedelta(seconds=60),
+                ),
+            ),
+            (
+                "timestamp_future_299_seconds",
+                lambda attempt: attempt.update(
+                    createdAt=validation_now + followup.timedelta(seconds=299),
+                    sendStartedAt=validation_now + followup.timedelta(seconds=299),
+                ),
+            ),
+            (
+                "timestamp_future_1_day",
+                lambda attempt: attempt.update(
+                    createdAt=validation_now + followup.timedelta(days=1),
+                    sendStartedAt=validation_now + followup.timedelta(days=1),
+                ),
+            ),
+        )
+
+        sent_match = {
+            "id": "sent-envelope",
+            "sentDateTime": "2026-06-26T12:05:02Z",
+        }
+        for name, mutate in cases:
+            attempt = deepcopy(marker)
+            if mutate is not None:
+                mutate(attempt)
+            is_timestamp_case = name.startswith("timestamp_")
+            is_exact_case = name.startswith("exact")
+            if is_timestamp_case or name.startswith("exact_timestamp_"):
+                forge_self_consistent_envelope(attempt)
+
+            with self.subTest(name=name, stage="prelookup_reconciliation"):
+                current_thread = deepcopy(base_thread)
+                current_thread["followUpSendAttempt"] = deepcopy(attempt)
+                reconcile_fs = FakeFollowupFirestore(
+                    [],
+                    thread_data=current_thread,
+                )
+                with patch.object(followup, "_fs", reconcile_fs), patch.object(
+                    followup,
+                    "datetime",
+                    _fixed_datetime(validation_now),
+                ), patch.object(
+                    followup,
+                    "find_matching_sent_message_for_retry",
+                    return_value=sent_match,
+                ) as sent_guard, patch.object(
+                    followup,
+                    "_save_followup_message",
+                    return_value=True,
+                ) as save_followup, patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    result = followup._reconcile_durable_followup_attempt(
+                        "uid-1",
+                        "thread-1",
+                        {"Authorization": "Bearer token"},
+                        current_thread,
+                        0,
+                        "claim-owner",
+                    )
+
+                if is_exact_case:
+                    self.assertTrue(result)
+                    sent_guard.assert_called_once()
+                    save_followup.assert_called_once()
+                    self.assertTrue(reconcile_fs.updates)
+                else:
+                    self.assertFalse(result)
+                    sent_guard.assert_not_called()
+                    save_followup.assert_not_called()
+                    self.assertEqual([], reconcile_fs.updates)
+
+            with self.subTest(name=name, stage="transactional_reconciliation"):
+                record_thread = deepcopy(base_thread)
+                record_thread["followUpSendAttempt"] = deepcopy(attempt)
+                record_ref = FakeThreadRef(record_thread)
+                with patch.object(
+                    followup,
+                    "_fs",
+                    FakeFirestore(record_ref),
+                ), patch.object(
+                    followup,
+                    "datetime",
+                    _fixed_datetime(validation_now),
+                ), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    reconciled, record_reason = (
+                        followup._record_reconciled_followup_attempt(
+                            "uid-1",
+                            "thread-1",
+                            claim_owner="claim-owner",
+                            followup_index=0,
+                            expected_attempt=attempt,
+                            expected_identity=followup._followup_send_identity(
+                                record_thread,
+                                record_thread["followUpConfig"],
+                                0,
+                            ),
+                            expected_retry=followup._followup_retry_signature(
+                                record_thread,
+                                record_thread["followUpConfig"],
+                            ),
+                            sent_match=sent_match,
+                        )
+                    )
+
+                if is_exact_case:
+                    self.assertIsNotNone(reconciled)
+                    self.assertIsNone(record_reason)
+                    self.assertTrue(record_ref.updates)
+                else:
+                    self.assertIsNone(reconciled)
+                    self.assertTrue(record_reason)
+                    self.assertEqual([], record_ref.updates)
+
+            with self.subTest(name=name, stage="postaccept"):
+                schedule_thread = deepcopy(base_thread)
+                schedule_thread["followUpSendAttempt"] = deepcopy(attempt)
+                schedule_ref = FakeThreadRef(schedule_thread)
+                with patch.object(
+                    followup,
+                    "_fs",
+                    FakeFirestore(schedule_ref),
+                ), patch.object(
+                    followup,
+                    "datetime",
+                    _fixed_datetime(validation_now),
+                ), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    outcome = followup._schedule_next_followup(
+                        "uid-1",
+                        "thread-1",
+                        schedule_thread["followUpConfig"],
+                        just_sent_index=0,
+                        claim_owner="claim-owner",
+                        send_attempt_id=attempt["id"],
+                        send_attempt_marker=attempt,
+                    )
+
+                if is_exact_case:
+                    self.assertNotEqual(
+                        "ambiguous",
+                        getattr(outcome, "value", outcome),
+                    )
+                    self.assertTrue(schedule_ref.updates)
+                else:
+                    self.assertEqual(
+                        "ambiguous",
+                        getattr(outcome, "value", outcome),
+                    )
+                    self.assertEqual([], schedule_ref.updates)
+
+            if is_timestamp_case:
+                with self.subTest(name=name, stage="sealing"):
+                    unsealed = deepcopy(attempt)
+                    unsealed.pop("envelopeProof", None)
+                    unsealed.pop("inputHash", None)
+                    with patch.object(
+                        followup,
+                        "datetime",
+                        _fixed_datetime(validation_now),
+                    ), self.assertRaises(ValueError):
+                        followup._seal_followup_send_envelope(unsealed)
+
+    def test_legacy_migration_validates_attempt_timestamp_schema(self):
+        missing = object()
+        validation_now = datetime.now(timezone.utc)
+        cases = (
+            ("exact_now", validation_now, True),
+            (
+                "datetime",
+                datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc),
+                True,
+            ),
+            ("iso_z", "2026-06-26T12:05:00Z", True),
+            ("iso_offset", "2026-06-26T05:05:00-07:00", True),
+            (
+                "firestore",
+                DatetimeWithNanoseconds(
+                    2026,
+                    6,
+                    26,
+                    12,
+                    5,
+                    tzinfo=timezone.utc,
+                ),
+                True,
+            ),
+            ("missing", missing, False),
+            ("none", None, False),
+            ("empty", "", False),
+            ("garbage", "not-a-timestamp", False),
+            ("bool", False, False),
+            ("nan", float("nan"), False),
+            ("naive_datetime", datetime(2026, 6, 26, 12, 5), False),
+            ("naive_iso", "2026-06-26T12:05:00", False),
+            (
+                "future_1_second",
+                validation_now + followup.timedelta(seconds=1),
+                False,
+            ),
+            (
+                "future_60_seconds",
+                validation_now + followup.timedelta(seconds=60),
+                False,
+            ),
+            (
+                "future_299_seconds",
+                validation_now + followup.timedelta(seconds=299),
+                False,
+            ),
+            (
+                "future_1_day",
+                validation_now + followup.timedelta(days=1),
+                False,
+            ),
+        )
+
+        for name, attempted_at, is_valid in cases:
+            with self.subTest(name=name):
+                followup_config = {
+                    "enabled": True,
+                    "currentFollowUpIndex": 0,
+                    "processingBy": "claim-owner",
+                    "lastSendError": "ambiguous Graph result",
+                    "lastSendAttemptIndex": 0,
+                    "followUps": [{"message": "Plain follow-up body."}],
+                }
+                if attempted_at is not missing:
+                    followup_config["lastSendAttemptAt"] = attempted_at
+                thread_data = {
+                    "clientId": "client-legacy-time",
+                    "email": ["legacy@example.com"],
+                    "contactName": "Legacy Broker",
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "hasInboundReply": False,
+                    "followUpConfig": followup_config,
+                }
+                thread_ref = FakeThreadRef(thread_data)
+
+                with patch.object(
+                    followup,
+                    "_fs",
+                    FakeFirestore(thread_ref),
+                ), patch.object(
+                    followup,
+                    "datetime",
+                    _fixed_datetime(validation_now),
+                ), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    marker, reason, _attempt_id = (
+                        followup._migrate_legacy_sent_match(
+                            "uid-1",
+                            "thread-1",
+                            claim_owner="claim-owner",
+                            followup_index=0,
+                            expected_thread_data=thread_data,
+                            expected_followup_config=followup_config,
+                            recipient="legacy@example.com",
+                            body="Plain follow-up body.",
+                            subject="Legacy subject",
+                            conversation_id="conv-legacy",
+                            sent_match={
+                                "id": "sent-legacy",
+                                "sentDateTime": "2026-06-26T12:05:02Z",
+                            },
+                        )
+                    )
+
+                if is_valid:
+                    expected_timestamp = followup._followup_utc_timestamp(
+                        attempted_at
+                    )
+                    self.assertIsNotNone(marker)
+                    self.assertIsNone(reason)
+                    self.assertEqual(expected_timestamp, marker["createdAt"])
+                    self.assertEqual(expected_timestamp, marker["sendStartedAt"])
+                    self.assertEqual(1, len(thread_ref.updates))
+                else:
+                    self.assertIsNone(marker)
+                    self.assertTrue(reason)
+                    self.assertEqual([], thread_ref.updates)
+
+    def test_legacy_migration_rejects_full_identity_and_retry_type_mutations(self):
+        attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
+        base_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "lastSendError": None,
+            "lastSendAttemptAt": attempted_at,
+            "lastSendAttemptIndex": None,
+            "followUps": [{"message": "Plain follow-up body."}],
+        }
+        base_thread = {
+            "clientId": "client-claimed",
+            "email": ["claimed@example.com"],
+            "contactName": None,
+            "ccEmails": [],
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+        }
+        cases = (
+            ("client_scalar", {"clientId": 0}, {"clientId": False}, {}, {}),
+            ("client_nested", {"clientId": [0]}, {"clientId": [False]}, {}, {}),
+            ("cc_scalar", {"ccEmails": [0]}, {"ccEmails": [False]}, {}, {}),
+            (
+                "cc_nested",
+                {"ccEmails": [{"address": [0]}]},
+                {"ccEmails": [{"address": [False]}]},
+                {},
+                {},
+            ),
+            (
+                "retry_index",
+                {},
+                {},
+                {"lastSendAttemptIndex": 0},
+                {"lastSendAttemptIndex": False},
+            ),
+            (
+                "retry_error",
+                {},
+                {},
+                {"lastSendError": [0]},
+                {"lastSendError": [False]},
+            ),
+            (
+                "retry_attempt_at",
+                {},
+                {},
+                {"lastSendAttemptAt": [0]},
+                {"lastSendAttemptAt": [False]},
+            ),
+            (
+                "retry_attempt_marker",
+                {"followUpSendAttempt": {"nested": [0]}},
+                {"followUpSendAttempt": {"nested": [False]}},
+                {},
+                {},
+            ),
+            (
+                "raw_message",
+                {},
+                {},
+                {"followUps": [{"message": [0]}]},
+                {"followUps": [{"message": [False]}]},
+            ),
+            (
+                "config_nested",
+                {},
+                {},
+                {
+                    "followUps": [{
+                        "message": "Plain follow-up body.",
+                        "metadata": [0],
+                    }],
+                },
+                {
+                    "followUps": [{
+                        "message": "Plain follow-up body.",
+                        "metadata": [False],
+                    }],
+                },
+            ),
+        )
+
+        for name, claimed_patch, current_patch, claimed_retry, current_retry in cases:
+            with self.subTest(name=name):
+                claimed_config = {**base_config, **claimed_retry}
+                current_config = {**base_config, **current_retry}
+                claimed_thread = {
+                    **base_thread,
+                    **claimed_patch,
+                    "followUpConfig": claimed_config,
+                }
+                current_thread = {
+                    **base_thread,
+                    **current_patch,
+                    "followUpConfig": current_config,
+                }
+                thread_ref = FakeThreadRef(current_thread)
+
+                with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    marker, reason, _attempt_id = followup._migrate_legacy_sent_match(
+                        "uid-1",
+                        "thread-1",
+                        claim_owner="claim-owner",
+                        followup_index=0,
+                        expected_thread_data=claimed_thread,
+                        expected_followup_config=claimed_config,
+                        recipient="claimed@example.com",
+                        body="Plain follow-up body.",
+                        subject="Claimed subject",
+                        conversation_id="conv-claimed",
+                        sent_match={
+                            "id": "sent-legacy",
+                            "sentDateTime": "2026-06-26T12:05:02Z",
+                        },
+                    )
+
+                self.assertIsNone(marker)
+                self.assertTrue(reason)
+                self.assertEqual([], thread_ref.updates)
+
+    def test_full_typed_fences_allow_stable_exact_values(self):
+        attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "lastSendError": [0],
+            "lastSendAttemptAt": attempted_at,
+            "lastSendAttemptIndex": False,
+            "followUps": [{"message": "Plain follow-up body."}],
+        }
+        thread_data = {
+            "clientId": [0],
+            "email": ["claimed@example.com"],
+            "contactName": None,
+            "ccEmails": [{"address": [False]}],
+            "followUpSendAttempt": {"metadata": [0]},
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": followup_config,
+        }
+
+        send_ref = FakeThreadRef(dict(thread_data))
+        with patch.object(followup, "_fs", FakeFirestore(send_ref)), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ):
+            marker, reason = followup._persist_followup_send_intent(
+                "uid-1",
+                "thread-1",
+                claim_owner="claim-owner",
+                followup_index=0,
+                expected_thread_data=thread_data,
+                expected_followup_config=followup_config,
+                recipient="claimed@example.com",
+                body="Plain follow-up body.",
+                subject="Claimed subject",
+                conversation_id="conv-claimed",
+                draft_id="draft-claimed",
+            )
+
+        self.assertIsNotNone(marker)
+        self.assertIsNone(reason)
+        self.assertEqual(1, len(send_ref.updates))
+
+        migrate_ref = FakeThreadRef(dict(thread_data))
+        with patch.object(followup, "_fs", FakeFirestore(migrate_ref)), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ):
+            migrated, migrate_reason, _attempt_id = (
+                followup._migrate_legacy_sent_match(
+                    "uid-1",
+                    "thread-1",
+                    claim_owner="claim-owner",
+                    followup_index=0,
+                    expected_thread_data=thread_data,
+                    expected_followup_config=followup_config,
+                    recipient="claimed@example.com",
+                    body="Plain follow-up body.",
+                    subject="Claimed subject",
+                    conversation_id="conv-claimed",
+                    sent_match={
+                        "id": "sent-legacy",
+                        "sentDateTime": "2026-06-26T12:05:02Z",
+                    },
+                )
+            )
+
+        self.assertIsNotNone(migrated)
+        self.assertIsNone(migrate_reason)
+        self.assertEqual(1, len(migrate_ref.updates))
+
+    def test_retry_signature_rejects_absence_none_races(self):
+        base_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "followUps": [{"message": "Plain follow-up body."}],
+        }
+        base_thread = {
+            "clientId": "client-claimed",
+            "email": ["claimed@example.com"],
+            "contactName": None,
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+        }
+        retry_fields = (
+            "lastSendError",
+            "lastSendAttemptAt",
+            "lastSendAttemptIndex",
+            "followUpSendAttempt",
+        )
+
+        for field in retry_fields:
+            for claimed_present, current_present in ((False, True), (True, False)):
+                with self.subTest(
+                    field=field,
+                    claimed_present=claimed_present,
+                    current_present=current_present,
+                ):
+                    claimed_config = dict(base_config)
+                    current_config = dict(base_config)
+                    claimed_thread = dict(base_thread)
+                    current_thread = dict(base_thread)
+                    if field == "followUpSendAttempt":
+                        if claimed_present:
+                            claimed_thread[field] = None
+                        if current_present:
+                            current_thread[field] = None
+                    else:
+                        if claimed_present:
+                            claimed_config[field] = None
+                        if current_present:
+                            current_config[field] = None
+                    claimed_thread["followUpConfig"] = claimed_config
+                    current_thread["followUpConfig"] = current_config
+
+                    send_ref = FakeThreadRef(current_thread)
+                    with patch.object(
+                        followup,
+                        "_fs",
+                        FakeFirestore(send_ref),
+                    ), patch(
+                        "google.cloud.firestore.transactional", lambda fn: fn
+                    ):
+                        marker, reason = followup._persist_followup_send_intent(
+                            "uid-1",
+                            "thread-1",
+                            claim_owner="claim-owner",
+                            followup_index=0,
+                            expected_thread_data=claimed_thread,
+                            expected_followup_config=claimed_config,
+                            recipient="claimed@example.com",
+                            body="Plain follow-up body.",
+                            subject="Claimed subject",
+                            conversation_id="conv-claimed",
+                            draft_id="draft-claimed",
+                        )
+
+                    self.assertIsNone(marker)
+                    self.assertTrue(reason)
+                    self.assertEqual([], send_ref.updates)
+
+                    migrate_ref = FakeThreadRef(current_thread)
+                    with patch.object(
+                        followup,
+                        "_fs",
+                        FakeFirestore(migrate_ref),
+                    ), patch(
+                        "google.cloud.firestore.transactional", lambda fn: fn
+                    ):
+                        migrated, migrate_reason, _attempt_id = (
+                            followup._migrate_legacy_sent_match(
+                                "uid-1",
+                                "thread-1",
+                                claim_owner="claim-owner",
+                                followup_index=0,
+                                expected_thread_data=claimed_thread,
+                                expected_followup_config=claimed_config,
+                                recipient="claimed@example.com",
+                                body="Plain follow-up body.",
+                                subject="Claimed subject",
+                                conversation_id="conv-claimed",
+                                sent_match={
+                                    "id": "sent-legacy",
+                                    "sentDateTime": "2026-06-26T12:05:02Z",
+                                },
+                            )
+                        )
+
+                    self.assertIsNone(migrated)
+                    self.assertTrue(migrate_reason)
+                    self.assertEqual([], migrate_ref.updates)
+
+    def test_new_intent_allows_stable_absence_but_legacy_migration_requires_time(self):
+        for explicit_none in (False, True):
+            with self.subTest(explicit_none=explicit_none):
+                followup_config = {
+                    "enabled": True,
+                    "currentFollowUpIndex": 0,
+                    "processingBy": "claim-owner",
+                    "followUps": [{"message": "Plain follow-up body."}],
+                }
+                thread_data = {
+                    "clientId": "client-claimed",
+                    "email": ["claimed@example.com"],
+                    "contactName": None,
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "hasInboundReply": False,
+                    "followUpConfig": followup_config,
+                }
+                if explicit_none:
+                    followup_config.update({
+                        "lastSendError": None,
+                        "lastSendAttemptAt": None,
+                        "lastSendAttemptIndex": None,
+                    })
+                    thread_data["followUpSendAttempt"] = None
+
+                send_ref = FakeThreadRef(dict(thread_data))
+                with patch.object(
+                    followup,
+                    "_fs",
+                    FakeFirestore(send_ref),
+                ), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    marker, reason = followup._persist_followup_send_intent(
+                        "uid-1",
+                        "thread-1",
+                        claim_owner="claim-owner",
+                        followup_index=0,
+                        expected_thread_data=thread_data,
+                        expected_followup_config=followup_config,
+                        recipient="claimed@example.com",
+                        body="Plain follow-up body.",
+                        subject="Claimed subject",
+                        conversation_id="conv-claimed",
+                        draft_id="draft-claimed",
+                    )
+
+                self.assertIsNotNone(marker)
+                self.assertIsNone(reason)
+                self.assertEqual(1, len(send_ref.updates))
+
+                migrate_ref = FakeThreadRef(dict(thread_data))
+                with patch.object(
+                    followup,
+                    "_fs",
+                    FakeFirestore(migrate_ref),
+                ), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    migrated, migrate_reason, _attempt_id = (
+                        followup._migrate_legacy_sent_match(
+                            "uid-1",
+                            "thread-1",
+                            claim_owner="claim-owner",
+                            followup_index=0,
+                            expected_thread_data=thread_data,
+                            expected_followup_config=followup_config,
+                            recipient="claimed@example.com",
+                            body="Plain follow-up body.",
+                            subject="Claimed subject",
+                            conversation_id="conv-claimed",
+                            sent_match={
+                                "id": "sent-legacy",
+                                "sentDateTime": "2026-06-26T12:05:02Z",
+                            },
+                        )
+                    )
+
+                self.assertIsNone(migrated)
+                self.assertIn("lastSendAttemptAt", migrate_reason)
+                self.assertEqual([], migrate_ref.updates)
+
+    def test_reconciliation_rejects_inexact_legacy_contact_identities(self):
+        attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "reconcile-owner",
+            "lastSendError": "Graph send outcome pending reconciliation",
+            "lastSendAttemptAt": attempted_at,
+            "lastSendAttemptIndex": 0,
+            "followUps": [{"message": "Plain follow-up body."}],
+        }
+        missing = object()
+        cases = (
+            ([0], [False]),
+            ([False], [0]),
+            ({"nested": [0]}, {"nested": [False]}),
+            ({"nested": {"value": False}}, {"nested": {"value": 0}}),
+            (None, False),
+            (None, 0),
+            (None, {}),
+            (None, missing),
+            (missing, None),
+            (missing, missing),
+        )
+
+        for accepted_name, current_name in cases:
+            with self.subTest(
+                accepted_type=type(accepted_name).__name__,
+                current_type=type(current_name).__name__,
+            ):
+                accepted_thread = {
+                    "clientId": "client-current",
+                    "email": ["current@example.com"],
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "hasInboundReply": False,
+                    "followUpConfig": followup_config,
+                }
+                if accepted_name is not missing:
+                    accepted_thread["contactName"] = accepted_name
+                legacy_identity = followup._followup_send_identity(
+                    accepted_thread,
+                    followup_config,
+                    0,
+                )
+                legacy_identity.pop("contactNameExact")
+                legacy_identity.pop("contactNamePresent")
+                legacy_identity.pop("contactNameType")
+                legacy_identity.pop("inputSignatures")
+                legacy_identity["contactName"] = (
+                    legacy_identity.get("contactName") or ""
+                )
+
+                marker = {
+                    "id": "attempt-legacy",
+                    "state": "uncertain",
+                    "owner": "reconcile-owner",
+                    "index": 0,
+                    "sendIdentity": legacy_identity,
+                }
+                current_thread = {
+                    "clientId": "client-current",
+                    "email": ["current@example.com"],
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "hasInboundReply": False,
+                    "followUpSendAttempt": marker,
+                    "followUpConfig": followup_config,
+                }
+                if current_name is not missing:
+                    current_thread["contactName"] = current_name
+                thread_ref = FakeThreadRef(current_thread)
+
+                with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    reconciled, reason = followup._record_reconciled_followup_attempt(
+                        "uid-1",
+                        "thread-1",
+                        claim_owner="reconcile-owner",
+                        followup_index=0,
+                        expected_attempt=followup._canonical_followup_value(marker),
+                        expected_identity=legacy_identity,
+                        expected_retry=followup._followup_retry_signature(
+                            current_thread,
+                            followup_config,
+                        ),
+                        sent_match={
+                            "id": "sent-legacy",
+                            "sentDateTime": "2026-06-26T12:05:02Z",
+                        },
+                    )
+
+                self.assertIsNone(reconciled)
+                self.assertTrue(reason)
+                self.assertEqual([], thread_ref.updates)
+
+    def test_reconciliation_rejects_attempt_datetime_string_race(self):
+        attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "reconcile-owner",
+            "lastSendError": "Graph send outcome pending reconciliation",
+            "lastSendAttemptAt": attempted_at,
+            "lastSendAttemptIndex": 0,
+            "followUps": [{"message": "Plain follow-up body."}],
+        }
+        claimed_thread = {
+            "clientId": "client-current",
+            "email": ["current@example.com"],
+            "contactName": "Ryan Broker",
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": followup_config,
+        }
+        claimed_attempt = {
+            "id": "attempt-claimed",
+            "state": "uncertain",
+            "owner": "reconcile-owner",
+            "index": 0,
+            "createdAt": attempted_at,
+        }
+        current_attempt = {
+            **claimed_attempt,
+            "createdAt": attempted_at.isoformat(),
+        }
+        current_thread = {
+            **claimed_thread,
+            "followUpSendAttempt": current_attempt,
+        }
+        thread_ref = FakeThreadRef(current_thread)
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ):
+            reconciled, reason = followup._record_reconciled_followup_attempt(
+                "uid-1",
+                "thread-1",
+                claim_owner="reconcile-owner",
+                followup_index=0,
+                expected_attempt=claimed_attempt,
+                expected_identity=followup._followup_send_identity(
+                    claimed_thread,
+                    followup_config,
+                    0,
+                ),
+                expected_retry=followup._followup_retry_signature(
+                    current_thread,
+                    followup_config,
+                ),
+                sent_match={
+                    "id": "sent-claimed",
+                    "sentDateTime": "2026-06-26T12:05:02Z",
+                },
+            )
+
+        self.assertIsNone(reconciled)
+        self.assertTrue(reason)
+        self.assertEqual([], thread_ref.updates)
+
+    def test_reconciliation_rejects_mixed_schema_config_type_drift(self):
+        attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
+        accepted_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "reconcile-owner",
+            "lastSendError": "Graph send outcome pending reconciliation",
+            "lastSendAttemptAt": attempted_at,
+            "lastSendAttemptIndex": 0,
+            "followUps": [{"message": "Plain follow-up body."}],
+            "auditMetadata": attempted_at,
+        }
+        accepted_thread = {
+            "clientId": "client-current",
+            "email": ["current@example.com"],
+            "contactName": "Ryan Broker",
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": accepted_config,
+        }
+        legacy_identity = followup._followup_send_identity(
+            accepted_thread,
+            accepted_config,
+            0,
+        )
+        legacy_identity.pop("inputSignatures")
+        legacy_identity.pop("contactNameExact")
+        legacy_identity.pop("contactNamePresent")
+        legacy_identity.pop("contactNameType")
+
+        current_config = {
+            **accepted_config,
+            "auditMetadata": attempted_at.isoformat(),
+        }
+        marker = {
+            "id": "attempt-legacy-config",
+            "state": "uncertain",
+            "owner": "reconcile-owner",
+            "index": 0,
+            "sendIdentity": legacy_identity,
+        }
+        current_thread = {
+            **accepted_thread,
+            "followUpConfig": current_config,
+            "followUpSendAttempt": marker,
+        }
+        thread_ref = FakeThreadRef(current_thread)
+
+        with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+            "google.cloud.firestore.transactional", lambda fn: fn
+        ):
+            reconciled, reason = followup._record_reconciled_followup_attempt(
+                "uid-1",
+                "thread-1",
+                claim_owner="reconcile-owner",
+                followup_index=0,
+                expected_attempt=marker,
+                expected_identity=legacy_identity,
+                expected_retry=followup._followup_retry_signature(
+                    current_thread,
+                    current_config,
+                ),
+                sent_match={
+                    "id": "sent-legacy-config",
+                    "sentDateTime": "2026-06-26T12:05:02Z",
+                },
+            )
+
+        self.assertIsNone(reconciled)
+        self.assertTrue(reason)
+        self.assertEqual([], thread_ref.updates)
+
+    def test_reconciliation_rejects_legacy_identities_without_raw_input_proofs(self):
+        attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "reconcile-owner",
+            "lastSendError": "Graph send outcome pending reconciliation",
+            "lastSendAttemptAt": attempted_at,
+            "lastSendAttemptIndex": 0,
+            "followUps": [{"message": "Plain follow-up body."}],
+        }
+
+        for contact_name in (
+            "Ryan Broker",
+            "",
+            [0],
+            {"nested": [False]},
+        ):
+            with self.subTest(contact_name=contact_name):
+                thread_data = {
+                    "clientId": "client-current",
+                    "email": ["current@example.com"],
+                    "contactName": contact_name,
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "hasInboundReply": False,
+                    "followUpConfig": followup_config,
+                }
+                legacy_identity = followup._followup_send_identity(
+                    thread_data,
+                    followup_config,
+                    0,
+                )
+                legacy_identity.pop("contactNameExact")
+                legacy_identity.pop("contactNamePresent")
+                legacy_identity.pop("contactNameType")
+                legacy_identity.pop("inputSignatures")
+                legacy_identity["contactName"] = (
+                    legacy_identity.get("contactName") or ""
+                )
+                marker = {
+                    "id": "attempt-legacy-stable",
+                    "state": "uncertain",
+                    "owner": "reconcile-owner",
+                    "index": 0,
+                    "sendIdentity": legacy_identity,
+                }
+                thread_data["followUpSendAttempt"] = marker
+                thread_ref = FakeThreadRef(thread_data)
+
+                with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    reconciled, reason = followup._record_reconciled_followup_attempt(
+                        "uid-1",
+                        "thread-1",
+                        claim_owner="reconcile-owner",
+                        followup_index=0,
+                        expected_attempt=followup._canonical_followup_value(marker),
+                        expected_identity=legacy_identity,
+                        expected_retry=followup._followup_retry_signature(
+                            thread_data,
+                            followup_config,
+                        ),
+                        sent_match={
+                            "id": "sent-legacy",
+                            "sentDateTime": "2026-06-26T12:05:02Z",
+                        },
+                    )
+
+                self.assertIsNone(reconciled)
+                self.assertTrue(reason)
+                self.assertEqual([], thread_ref.updates)
+
+    def test_send_intent_allows_stable_missing_contact_for_plain_body(self):
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "followUps": [{"message": "Plain follow-up body."}],
+        }
+
+        for contact_name_present in (False, True):
+            with self.subTest(contact_name_present=contact_name_present):
+                thread_data = {
+                    "clientId": "client-claimed",
+                    "email": ["claimed@example.com"],
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "hasInboundReply": False,
+                    "followUpConfig": followup_config,
+                }
+                if contact_name_present:
+                    thread_data["contactName"] = None
+                thread_ref = FakeThreadRef(thread_data)
+
+                with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    marker, reason = followup._persist_followup_send_intent(
+                        "uid-1",
+                        "thread-1",
+                        claim_owner="claim-owner",
+                        followup_index=0,
+                        expected_thread_data=thread_data,
+                        expected_followup_config=followup_config,
+                        recipient="claimed@example.com",
+                        body="Plain follow-up body.",
+                        subject="Claimed subject",
+                        conversation_id="conv-claimed",
+                        draft_id="draft-claimed",
+                    )
+
+                self.assertIsNotNone(marker)
+                self.assertIsNone(reason)
+                self.assertEqual(1, len(thread_ref.updates))
+
+    def test_send_intent_rejects_unresolved_name_for_missing_or_malformed_contact(self):
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "followUps": [{"message": "Hi [NAME], following up."}],
+        }
+
+        for contact_name in (None, {}, [], 0, False, "   "):
+            with self.subTest(contact_name=contact_name):
+                thread_data = {
+                    "clientId": "client-claimed",
+                    "email": ["claimed@example.com"],
+                    "contactName": contact_name,
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "hasInboundReply": False,
+                    "followUpConfig": followup_config,
+                }
+                thread_ref = FakeThreadRef(thread_data)
+
+                with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    marker, reason = followup._persist_followup_send_intent(
+                        "uid-1",
+                        "thread-1",
+                        claim_owner="claim-owner",
+                        followup_index=0,
+                        expected_thread_data=thread_data,
+                        expected_followup_config=followup_config,
+                        recipient="claimed@example.com",
+                        body="Hi [NAME], following up.",
                         subject="Claimed subject",
                         conversation_id="conv-claimed",
                         draft_id="draft-claimed",
@@ -1864,19 +4032,17 @@ class FollowupTerminalStateTests(unittest.TestCase):
             "status": "active",
             "followUpStatus": "waiting",
             "hasInboundReply": False,
-            "followUpSendAttempt": {
-                "id": "attempt-crashed",
-                "state": "sending",
-                "owner": "crashed-owner",
-                "index": 0,
-                "recipient": "current@example.com",
-                "body": "Current body",
-                "subject": "Current subject",
-                "conversationId": "conv-current",
-                "sendStartedAt": attempted_at,
-            },
             "followUpConfig": followup_config,
         }
+        thread_data["followUpSendAttempt"] = _sealed_followup_attempt(
+            thread_data,
+            followup_config,
+            attempt_id="attempt-crashed",
+            owner="crashed-owner",
+            send_started_at=attempted_at,
+            subject="Current subject",
+            conversation_id="conv-current",
+        )
         fake_fs = FakeFollowupFirestore([outbound], thread_data=thread_data)
 
         with patch.object(followup, "_fs", fake_fs), patch.object(
@@ -1935,28 +4101,22 @@ class FollowupTerminalStateTests(unittest.TestCase):
             "hasInboundReply": False,
             "followUpConfig": accepted_config,
         }
-        marker = {
-            "id": "attempt-crashed",
-            "state": "uncertain",
-            "owner": "crashed-owner",
-            "reconciliationOwner": "reconcile-owner",
-            "index": 0,
-            "recipient": "original@example.com",
-            "body": "Original body",
-            "subject": "Original subject",
-            "conversationId": "conv-original",
-            "toRecipients": [
+        marker = _sealed_followup_attempt(
+            accepted_thread,
+            accepted_config,
+            attempt_id="attempt-crashed",
+            owner="crashed-owner",
+            state="uncertain",
+            reconciliation_owner="reconcile-owner",
+            send_started_at=attempted_at,
+            subject="Original subject",
+            conversation_id="conv-original",
+            to_recipients=[
                 "original@example.com",
                 "teammate@example.com",
             ],
-            "ccRecipients": ["assistant@example.com"],
-            "sendStartedAt": attempted_at,
-            "sendIdentity": followup._followup_send_identity(
-                accepted_thread,
-                accepted_config,
-                0,
-            ),
-        }
+            cc_recipients=["assistant@example.com"],
+        )
         followup_config = {
             **accepted_config,
             "enabled": False,
@@ -2028,6 +4188,96 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertEqual("attempt-crashed", outcome.attempt_id)
         self.assertFalse(outcome.guard_failed_closed)
 
+    def test_durable_sent_match_rejects_malformed_identity_without_audit_write(self):
+        attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "reconcile-owner",
+            "lastSendError": "Graph send outcome pending reconciliation",
+            "lastSendAttemptAt": attempted_at,
+            "lastSendAttemptIndex": 0,
+            "followUps": [{"message": "Original body"}],
+        }
+        base_thread = {
+            "clientId": "client-current",
+            "email": ["original@example.com"],
+            "contactName": "Original Broker",
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": followup_config,
+        }
+        valid_identity = followup._followup_send_identity(
+            base_thread,
+            followup_config,
+            0,
+        )
+        missing = object()
+        identity_cases = (
+            ("missing", missing),
+            ("none", None),
+            ("string", "not-an-identity"),
+            ("list", []),
+            ("empty_dict", {}),
+            (
+                "partial_dict",
+                {"inputSignatures": valid_identity["inputSignatures"]},
+            ),
+        )
+
+        for name, malformed_identity in identity_cases:
+            with self.subTest(name=name):
+                marker = {
+                    "id": f"attempt-malformed-{name}",
+                    "state": "uncertain",
+                    "owner": "crashed-owner",
+                    "reconciliationOwner": "reconcile-owner",
+                    "index": 0,
+                    "recipient": "original@example.com",
+                    "body": "Original body",
+                    "subject": "Original subject",
+                    "conversationId": "conv-original",
+                    "sendStartedAt": attempted_at,
+                }
+                if malformed_identity is not missing:
+                    marker["sendIdentity"] = malformed_identity
+                thread_data = {
+                    **base_thread,
+                    "followUpSendAttempt": marker,
+                }
+                fake_fs = FakeFollowupFirestore([], thread_data=thread_data)
+
+                with patch.object(followup, "_fs", fake_fs), patch.object(
+                    followup,
+                    "find_matching_sent_message_for_retry",
+                    return_value={
+                        "id": "sent-followup",
+                        "sentDateTime": "2026-06-26T12:05:02Z",
+                    },
+                ), patch.object(
+                    followup,
+                    "_save_followup_message",
+                ) as save_followup, patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    result = followup._send_followup_email(
+                        "uid-1",
+                        {"Authorization": "Bearer token"},
+                        "thread-1",
+                        thread_data,
+                        followup_config,
+                        0,
+                        claim_owner="reconcile-owner",
+                    )
+
+                self.assertFalse(result)
+                self.assertEqual([], fake_fs.updates)
+                save_followup.assert_not_called()
+                outcome = followup._get_followup_send_outcome()
+                self.assertTrue(outcome.guard_failed_closed)
+                self.assertIn("manual review", outcome.error)
+
     def test_sent_match_history_failure_keeps_attempt_recoverable(self):
         attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
         followup_config = {
@@ -2048,23 +4298,17 @@ class FollowupTerminalStateTests(unittest.TestCase):
             "hasInboundReply": False,
             "followUpConfig": followup_config,
         }
-        marker = {
-            "id": "attempt-history-failure",
-            "state": "uncertain",
-            "owner": "crashed-owner",
-            "reconciliationOwner": "reconcile-owner",
-            "index": 0,
-            "recipient": "original@example.com",
-            "body": "Original body",
-            "subject": "Original subject",
-            "conversationId": "conv-original",
-            "sendStartedAt": attempted_at,
-            "sendIdentity": followup._followup_send_identity(
-                thread_data,
-                followup_config,
-                0,
-            ),
-        }
+        marker = _sealed_followup_attempt(
+            thread_data,
+            followup_config,
+            attempt_id="attempt-history-failure",
+            owner="crashed-owner",
+            state="uncertain",
+            reconciliation_owner="reconcile-owner",
+            send_started_at=attempted_at,
+            subject="Original subject",
+            conversation_id="conv-original",
+        )
         thread_data["followUpSendAttempt"] = marker
         fake_fs = FakeFollowupFirestore([], thread_data=thread_data)
 
@@ -2103,18 +4347,6 @@ class FollowupTerminalStateTests(unittest.TestCase):
             "processingBy": "reconcile-owner",
             "followUps": [{"message": "Original body"}],
         }
-        claimed_marker = {
-            "id": "attempt-original",
-            "state": "uncertain",
-            "owner": "original-owner",
-            "reconciliationOwner": "reconcile-owner",
-            "index": 0,
-            "recipient": "original@example.com",
-            "body": "Original body",
-            "subject": "Original subject",
-            "conversationId": "conv-original",
-            "sendStartedAt": attempted_at,
-        }
         claimed_thread = {
             "clientId": "client-1",
             "email": ["original@example.com"],
@@ -2122,9 +4354,20 @@ class FollowupTerminalStateTests(unittest.TestCase):
             "status": "active",
             "followUpStatus": "waiting",
             "hasInboundReply": False,
-            "followUpSendAttempt": claimed_marker,
             "followUpConfig": claimed_config,
         }
+        claimed_marker = _sealed_followup_attempt(
+            claimed_thread,
+            claimed_config,
+            attempt_id="attempt-original",
+            owner="original-owner",
+            state="uncertain",
+            reconciliation_owner="reconcile-owner",
+            send_started_at=attempted_at,
+            subject="Original subject",
+            conversation_id="conv-original",
+        )
+        claimed_thread["followUpSendAttempt"] = claimed_marker
         current_config = dict(claimed_config)
         current_thread = {
             **claimed_thread,
@@ -2198,6 +4441,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
         })
         fake_fs = FakeFollowupFirestore([outbound])
         followup_config = {
+            "currentFollowUpIndex": 0,
             "followUps": [{"message": "Hi Riley,\n\nJust following up."}],
         }
         thread_data = {
@@ -2537,6 +4781,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
         })
         fake_fs = FakeFollowupFirestore([outbound])
         followup_config = {
+            "currentFollowUpIndex": 0,
             "followUps": [{"message": "Hi Riley,\n\nJust following up."}],
         }
         thread_data = {
@@ -2595,6 +4840,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
         })
         fake_fs = FakeFollowupFirestore([outbound])
         followup_config = {
+            "currentFollowUpIndex": 0,
             "followUps": [{"message": "Hi Riley,\n\nJust following up."}],
         }
         thread_data = {
@@ -2652,6 +4898,384 @@ class FollowupTerminalStateTests(unittest.TestCase):
         self.assertIn("Could not attach required signature asset", followup._send_followup_email.last_error)
         self.assertTrue(followup._send_followup_email.guard_failed_closed)
 
+    def test_legacy_retry_invalid_timestamp_blocks_before_guards_or_intent(self):
+        missing = object()
+        validation_now = datetime.now(timezone.utc)
+        cases = (
+            ("missing", missing),
+            ("garbage", "not-a-timestamp"),
+            ("bool", False),
+            (
+                "future_1_second",
+                validation_now + followup.timedelta(seconds=1),
+            ),
+            (
+                "future_60_seconds",
+                validation_now + followup.timedelta(seconds=60),
+            ),
+            (
+                "future_299_seconds",
+                validation_now + followup.timedelta(seconds=299),
+            ),
+            (
+                "future_1_day",
+                validation_now + followup.timedelta(days=1),
+            ),
+        )
+
+        for name, attempted_at in cases:
+            with self.subTest(name=name):
+                outbound = FakeMessageDoc({
+                    "direction": "outbound",
+                    "headers": {"internetMessageId": "<root@example.com>"},
+                    "sentDateTime": "2026-06-26T12:00:00Z",
+                })
+                followup_config = {
+                    "enabled": True,
+                    "currentFollowUpIndex": 0,
+                    "processingBy": "claim-owner",
+                    "lastSendError": "Read timed out after Graph accepted send",
+                    "lastSendAttemptIndex": 0,
+                    "followUps": [{"message": "Retry body"}],
+                }
+                if attempted_at is not missing:
+                    followup_config["lastSendAttemptAt"] = attempted_at
+                thread_data = {
+                    "clientId": "client-1",
+                    "email": ["broker@example.com"],
+                    "contactName": "Ryan Broker",
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "hasInboundReply": False,
+                    "followUpConfig": followup_config,
+                }
+                fake_fs = FakeFollowupFirestore([outbound], thread_data=thread_data)
+
+                def run_request(callback, *_args, **_kwargs):
+                    return callback()
+
+                def fake_get(_url, **_kwargs):
+                    return FakeResponse(200, {
+                        "value": [{
+                            "id": "graph-root",
+                            "subject": "Retry subject",
+                            "conversationId": "conv-retry",
+                        }],
+                    })
+
+                def fake_post(url, **_kwargs):
+                    if url.endswith("/createReplyAll"):
+                        return FakeResponse(201, {
+                            "id": "reply-draft-retry",
+                            "toRecipients": [{
+                                "emailAddress": {"address": "broker@example.com"},
+                            }],
+                            "ccRecipients": [],
+                        })
+                    raise AssertionError(f"Unexpected POST: {url}")
+
+                with patch.object(followup, "_fs", fake_fs), patch.object(
+                    followup,
+                    "datetime",
+                    _fixed_datetime(validation_now),
+                ), patch.object(
+                    followup,
+                    "exponential_backoff_request",
+                    side_effect=run_request,
+                ), patch.object(
+                    requests,
+                    "get",
+                    side_effect=fake_get,
+                ), patch.object(
+                    requests,
+                    "post",
+                    side_effect=fake_post,
+                ) as post, patch.object(
+                    requests,
+                    "patch",
+                    return_value=FakeResponse(200),
+                ), patch.object(
+                    followup,
+                    "find_matching_sent_message_for_retry",
+                    return_value=None,
+                ) as sent_guard, patch.object(
+                    followup,
+                    "find_sent_conversation_continuation_for_retry",
+                    return_value=None,
+                ) as continuation_guard, patch.object(
+                    followup,
+                    "_persist_followup_send_intent",
+                    return_value=(None, "test stop"),
+                ) as persist_intent, patch(
+                    "email_automation.email._delete_graph_reply_draft"
+                ):
+                    result = followup._send_followup_email(
+                        "uid-1",
+                        {"Authorization": "Bearer token"},
+                        "thread-1",
+                        thread_data,
+                        followup_config,
+                        0,
+                        claim_owner="claim-owner",
+                    )
+
+                self.assertFalse(result)
+                sent_guard.assert_not_called()
+                continuation_guard.assert_not_called()
+                persist_intent.assert_not_called()
+                post.assert_not_called()
+                outcome = followup._get_followup_send_outcome()
+                self.assertTrue(outcome.guard_failed_closed)
+                self.assertIn("timestamp", outcome.error)
+
+    def test_legacy_retry_valid_timestamps_reach_guards_with_captured_signature(self):
+        validation_now = datetime.now(timezone.utc)
+        firestore_timestamp = DatetimeWithNanoseconds(
+            2026,
+            6,
+            26,
+            12,
+            5,
+            tzinfo=timezone.utc,
+        )
+        cases = (
+            ("exact_now", validation_now),
+            ("datetime", datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)),
+            ("iso_z", "2026-06-26T12:05:00Z"),
+            ("iso_offset", "2026-06-26T05:05:00-07:00"),
+            ("firestore", firestore_timestamp),
+        )
+
+        for name, attempted_at in cases:
+            with self.subTest(name=name):
+                outbound = FakeMessageDoc({
+                    "direction": "outbound",
+                    "headers": {"internetMessageId": "<root@example.com>"},
+                    "sentDateTime": "2026-06-26T12:00:00Z",
+                })
+                followup_config = {
+                    "enabled": True,
+                    "currentFollowUpIndex": 0,
+                    "processingBy": "claim-owner",
+                    "lastSendError": "Read timed out after Graph accepted send",
+                    "lastSendAttemptAt": attempted_at,
+                    "lastSendAttemptIndex": 0,
+                    "followUps": [{"message": "Retry body"}],
+                }
+                thread_data = {
+                    "clientId": "client-1",
+                    "email": ["broker@example.com"],
+                    "contactName": "Ryan Broker",
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "hasInboundReply": False,
+                    "followUpConfig": followup_config,
+                }
+                fake_fs = FakeFollowupFirestore([outbound], thread_data=thread_data)
+
+                def run_request(callback, *_args, **_kwargs):
+                    return callback()
+
+                def fake_get(_url, **_kwargs):
+                    return FakeResponse(200, {
+                        "value": [{
+                            "id": "graph-root",
+                            "subject": "Retry subject",
+                            "conversationId": "conv-retry",
+                        }],
+                    })
+
+                def fake_post(url, **_kwargs):
+                    if url.endswith("/createReplyAll"):
+                        return FakeResponse(201, {
+                            "id": "reply-draft-retry",
+                            "toRecipients": [{
+                                "emailAddress": {"address": "broker@example.com"},
+                            }],
+                            "ccRecipients": [],
+                        })
+                    raise AssertionError(f"Unexpected POST: {url}")
+
+                with patch.object(followup, "_fs", fake_fs), patch.object(
+                    followup,
+                    "datetime",
+                    _fixed_datetime(validation_now),
+                ), patch.object(
+                    followup,
+                    "exponential_backoff_request",
+                    side_effect=run_request,
+                ), patch.object(
+                    requests,
+                    "get",
+                    side_effect=fake_get,
+                ), patch.object(
+                    requests,
+                    "post",
+                    side_effect=fake_post,
+                ), patch.object(
+                    requests,
+                    "patch",
+                    return_value=FakeResponse(200),
+                ), patch.object(
+                    followup,
+                    "find_matching_sent_message_for_retry",
+                    return_value=None,
+                ) as sent_guard, patch.object(
+                    followup,
+                    "find_sent_conversation_continuation_for_retry",
+                    return_value=None,
+                ) as continuation_guard, patch.object(
+                    followup,
+                    "_persist_followup_send_intent",
+                    return_value=(None, "test stop"),
+                ) as persist_intent, patch(
+                    "email_automation.email._delete_graph_reply_draft"
+                ):
+                    result = followup._send_followup_email(
+                        "uid-1",
+                        {"Authorization": "Bearer token"},
+                        "thread-1",
+                        thread_data,
+                        followup_config,
+                        0,
+                        claim_owner="claim-owner",
+                    )
+
+                self.assertFalse(result)
+                expected_sent_after = (
+                    followup._followup_utc_timestamp(attempted_at)
+                    - followup.timedelta(seconds=30)
+                )
+                self.assertEqual(
+                    expected_sent_after,
+                    sent_guard.call_args.kwargs["sent_after"],
+                )
+                self.assertEqual(
+                    expected_sent_after,
+                    continuation_guard.call_args.kwargs["sent_after"],
+                )
+                self.assertEqual(
+                    followup._followup_field_signature(
+                        followup_config,
+                        "lastSendAttemptAt",
+                    ),
+                    persist_intent.call_args.kwargs[
+                        "expected_retry_timestamp_signature"
+                    ],
+                )
+
+    def test_legacy_retry_timestamp_change_after_guard_blocks_new_send_intent(self):
+        outbound = FakeMessageDoc({
+            "direction": "outbound",
+            "headers": {"internetMessageId": "<root@example.com>"},
+            "sentDateTime": "2026-06-26T12:00:00Z",
+        })
+        original_attempted_at = "2026-06-26T12:05:00Z"
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "lastSendError": "Read timed out after Graph accepted send",
+            "lastSendAttemptAt": original_attempted_at,
+            "lastSendAttemptIndex": 0,
+            "followUps": [{"message": "Retry body"}],
+        }
+        thread_data = {
+            "clientId": "client-1",
+            "email": ["broker@example.com"],
+            "contactName": "Ryan Broker",
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": followup_config,
+        }
+        fake_fs = FakeFollowupFirestore([outbound], thread_data=thread_data)
+        post_urls = []
+
+        def run_request(callback, *_args, **_kwargs):
+            return callback()
+
+        def fake_get(_url, **_kwargs):
+            return FakeResponse(200, {
+                "value": [{
+                    "id": "graph-root",
+                    "subject": "Retry subject",
+                    "conversationId": "conv-retry",
+                }],
+            })
+
+        def change_timestamp_after_lookup(*_args, **_kwargs):
+            followup_config["lastSendAttemptAt"] = "2026-06-26T12:06:00Z"
+            return None
+
+        def fake_post(url, **_kwargs):
+            post_urls.append(url)
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "reply-draft-retry-race",
+                    "toRecipients": [{
+                        "emailAddress": {"address": "broker@example.com"},
+                    }],
+                    "ccRecipients": [],
+                })
+            if url.endswith("/send"):
+                return FakeResponse(202, {})
+            raise AssertionError(f"Unexpected POST: {url}")
+
+        with patch.object(followup, "_fs", fake_fs), patch.object(
+            followup,
+            "exponential_backoff_request",
+            side_effect=run_request,
+        ), patch.object(
+            requests,
+            "get",
+            side_effect=fake_get,
+        ), patch.object(
+            requests,
+            "post",
+            side_effect=fake_post,
+        ), patch.object(
+            requests,
+            "patch",
+            return_value=FakeResponse(200),
+        ), patch.object(
+            followup,
+            "find_matching_sent_message_for_retry",
+            side_effect=change_timestamp_after_lookup,
+        ), patch.object(
+            followup,
+            "find_sent_conversation_continuation_for_retry",
+            return_value=None,
+        ) as continuation_guard, patch.object(
+            followup,
+            "_save_followup_message",
+            return_value=True,
+        ), patch(
+            "google.cloud.firestore.transactional",
+            lambda fn: fn,
+        ), patch(
+            "email_automation.email._delete_graph_reply_draft"
+        ):
+            result = followup._send_followup_email(
+                "uid-1",
+                {"Authorization": "Bearer token"},
+                "thread-1",
+                thread_data,
+                followup_config,
+                0,
+                claim_owner="claim-owner",
+            )
+
+        self.assertFalse(result)
+        self.assertFalse(any(url.endswith("/send") for url in post_urls))
+        self.assertNotIn("followUpSendAttempt", thread_data)
+        self.assertEqual(
+            datetime(2026, 6, 26, 12, 4, 30, tzinfo=timezone.utc),
+            continuation_guard.call_args.kwargs["sent_after"],
+        )
+        self.assertIn("timestamp", followup._send_followup_email.last_error)
+        self.assertTrue(followup._send_followup_email.guard_failed_closed)
+
     def test_failed_followup_retry_uses_sent_items_match_without_resending(self):
         outbound = FakeMessageDoc({
             "direction": "outbound",
@@ -2677,6 +5301,10 @@ class FollowupTerminalStateTests(unittest.TestCase):
             "followUpConfig": followup_config,
         }
         fake_fs = FakeFollowupFirestore([outbound], thread_data=thread_data)
+        expected_retry_timestamp_signature = followup._followup_field_signature(
+            followup_config,
+            "lastSendAttemptAt",
+        )
 
         def assert_durable_attempt_before_history(*_args, **kwargs):
             marker = thread_data.get("followUpSendAttempt")
@@ -2700,6 +5328,11 @@ class FollowupTerminalStateTests(unittest.TestCase):
                  "_save_followup_message",
                  side_effect=assert_durable_attempt_before_history,
              ) as save_followup, \
+             patch.object(
+                 followup,
+                 "_migrate_legacy_sent_match",
+                 wraps=followup._migrate_legacy_sent_match,
+             ) as migrate_legacy, \
              patch.object(requests, "post") as post, \
              patch("google.cloud.firestore.transactional", lambda fn: fn):
             result = followup._send_followup_email(
@@ -2714,6 +5347,12 @@ class FollowupTerminalStateTests(unittest.TestCase):
 
         self.assertTrue(result)
         sent_guard.assert_called_once()
+        self.assertEqual(
+            expected_retry_timestamp_signature,
+            migrate_legacy.call_args.kwargs[
+                "expected_retry_timestamp_signature"
+            ],
+        )
         post.assert_not_called()
         save_followup.assert_called_once()
         self.assertIsNone(fake_fs.updates[-1]["followUpConfig.lastSendError"])
@@ -2933,6 +5572,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
         })
         fake_fs = FakeFollowupFirestore([outbound])
         followup_config = {
+            "currentFollowUpIndex": 0,
             "lastSendError": "Read timed out after Graph accepted send",
             "lastSendAttemptAt": "2026-06-26T12:05:00Z",
             "followUps": [{"message": "Hi [NAME],\n\nJust following up."}],
@@ -2974,6 +5614,7 @@ class FollowupTerminalStateTests(unittest.TestCase):
         })
         fake_fs = FakeFollowupFirestore([outbound])
         followup_config = {
+            "currentFollowUpIndex": 0,
             "lastSendError": "Read timed out after Graph accepted send",
             "lastSendAttemptAt": "2026-06-26T12:05:00Z",
             "followUps": [{"message": "Hi [NAME],\n\nJust following up."}],
@@ -3249,17 +5890,14 @@ class FollowupTerminalStateTests(unittest.TestCase):
                     **state,
                     "followUpConfig": current_config,
                 }
-                current_thread["followUpSendAttempt"] = {
-                    "id": "attempt-sent",
-                    "state": "sending",
-                    "owner": "claim-owner",
-                    "index": 0,
-                    "sendIdentity": followup._followup_send_identity(
-                        current_thread,
-                        current_config,
-                        0,
-                    ),
-                }
+                current_thread["followUpSendAttempt"] = _sealed_followup_attempt(
+                    current_thread,
+                    current_config,
+                    attempt_id="attempt-sent",
+                    owner="claim-owner",
+                    subject="Subject",
+                    conversation_id="conv-current",
+                )
                 thread_ref = FakeThreadRef(current_thread)
 
                 with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
@@ -3315,17 +5953,14 @@ class FollowupTerminalStateTests(unittest.TestCase):
             "hasInboundReply": False,
             "followUpConfig": accepted_config,
         }
-        marker = {
-            "id": "attempt-sent",
-            "state": "sending",
-            "owner": "claim-owner",
-            "index": 0,
-            "sendIdentity": followup._followup_send_identity(
-                accepted_thread,
-                accepted_config,
-                0,
-            ),
-        }
+        marker = _sealed_followup_attempt(
+            accepted_thread,
+            accepted_config,
+            attempt_id="attempt-sent",
+            owner="claim-owner",
+            subject="Subject",
+            conversation_id="conv-current",
+        )
         current_config = {
             **accepted_config,
             "enabled": False,
@@ -3659,6 +6294,188 @@ class FollowupTerminalStateTests(unittest.TestCase):
                 self.assertEqual("ambiguous", getattr(outcome, "value", outcome))
                 self.assertEqual([], thread_ref.updates)
 
+    def test_post_accept_rejects_unprovable_mixed_schema_input_types(self):
+        attempted_at = datetime(2026, 6, 26, 12, 5, tzinfo=timezone.utc)
+        cases = (
+            (
+                "row_int_to_bool",
+                {"rowNumber": 0},
+                {"rowNumber": False},
+                {},
+                {},
+            ),
+            (
+                "email_list_to_string",
+                {"email": ["sent@example.com"]},
+                {"email": "sent@example.com"},
+                {},
+                {},
+            ),
+            (
+                "cc_source_swap",
+                {"ccEmails": ["cc@example.com"]},
+                {"ccRecipients": ["cc@example.com"]},
+                {},
+                {},
+            ),
+            (
+                "config_datetime_to_iso_string",
+                {},
+                {},
+                {"auditMetadata": attempted_at},
+                {"auditMetadata": attempted_at.isoformat()},
+            ),
+        )
+
+        for name, sent_patch, current_patch, sent_config_patch, current_config_patch in cases:
+            with self.subTest(name=name):
+                sent_config = {
+                    "enabled": True,
+                    "currentFollowUpIndex": 0,
+                    "processingBy": "claim-owner",
+                    "followUps": [
+                        {"message": "Sent body"},
+                        {"message": "Second body"},
+                    ],
+                    **sent_config_patch,
+                }
+                current_config = {
+                    **sent_config,
+                    **current_config_patch,
+                }
+                sent_thread = {
+                    "clientId": "client-sent",
+                    "email": ["sent@example.com"],
+                    "contactName": "Sent Broker",
+                    "status": "active",
+                    "followUpStatus": "waiting",
+                    "hasInboundReply": False,
+                    **sent_patch,
+                    "followUpConfig": sent_config,
+                }
+                legacy_identity = followup._followup_send_identity(
+                    sent_thread,
+                    sent_config,
+                    0,
+                )
+                legacy_identity.pop("inputSignatures")
+                legacy_identity.pop("contactNameExact")
+                legacy_identity.pop("contactNamePresent")
+                legacy_identity.pop("contactNameType")
+
+                current_thread = {
+                    **sent_thread,
+                    **current_patch,
+                    "followUpConfig": current_config,
+                    "followUpSendAttempt": {
+                        "id": "attempt-mixed-schema",
+                        "state": "sending",
+                        "owner": "claim-owner",
+                        "index": 0,
+                        "sendIdentity": legacy_identity,
+                    },
+                }
+                if name == "cc_source_swap":
+                    current_thread.pop("ccEmails", None)
+                thread_ref = FakeThreadRef(current_thread)
+
+                with patch.object(
+                    followup,
+                    "_fs",
+                    FakeFirestore(thread_ref),
+                ), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    outcome = followup._schedule_next_followup(
+                        "uid-1",
+                        "thread-1",
+                        sent_config,
+                        just_sent_index=0,
+                        claim_owner="claim-owner",
+                        send_attempt_id="attempt-mixed-schema",
+                    )
+
+                self.assertEqual(
+                    "ambiguous",
+                    getattr(outcome, "value", outcome),
+                )
+                self.assertEqual([], thread_ref.updates)
+
+    def test_post_accept_rejects_missing_or_malformed_send_identity(self):
+        followup_config = {
+            "enabled": True,
+            "currentFollowUpIndex": 0,
+            "processingBy": "claim-owner",
+            "followUps": [
+                {"message": "Sent body"},
+                {"message": "Second body"},
+            ],
+        }
+        thread_data = {
+            "clientId": "client-sent",
+            "email": ["sent@example.com"],
+            "contactName": "Sent Broker",
+            "status": "active",
+            "followUpStatus": "waiting",
+            "hasInboundReply": False,
+            "followUpConfig": followup_config,
+        }
+        valid_identity = followup._followup_send_identity(
+            thread_data,
+            followup_config,
+            0,
+        )
+        missing = object()
+        identity_cases = (
+            ("missing", missing),
+            ("none", None),
+            ("string", "not-an-identity"),
+            ("list", []),
+            ("empty_dict", {}),
+            (
+                "partial_dict",
+                {"inputSignatures": valid_identity["inputSignatures"]},
+            ),
+        )
+
+        for name, malformed_identity in identity_cases:
+            with self.subTest(name=name):
+                attempt = {
+                    "id": f"attempt-malformed-{name}",
+                    "state": "sending",
+                    "owner": "claim-owner",
+                    "index": 0,
+                }
+                if malformed_identity is not missing:
+                    attempt["sendIdentity"] = malformed_identity
+                current_thread = {
+                    **thread_data,
+                    "followUpSendAttempt": attempt,
+                }
+                thread_ref = FakeThreadRef(current_thread)
+
+                with patch.object(
+                    followup,
+                    "_fs",
+                    FakeFirestore(thread_ref),
+                ), patch(
+                    "google.cloud.firestore.transactional", lambda fn: fn
+                ):
+                    outcome = followup._schedule_next_followup(
+                        "uid-1",
+                        "thread-1",
+                        followup_config,
+                        just_sent_index=0,
+                        claim_owner="claim-owner",
+                        send_attempt_id=attempt["id"],
+                    )
+
+                self.assertEqual(
+                    "ambiguous",
+                    getattr(outcome, "value", outcome),
+                )
+                self.assertEqual([], thread_ref.updates)
+
     def test_terminal_state_does_not_hide_accepted_send_conflicts(self):
         sent_config = {
             "enabled": True,
@@ -3765,18 +6582,16 @@ class FollowupTerminalStateTests(unittest.TestCase):
             "hasInboundReply": False,
             "followUpConfig": current_config,
         }
-        current_thread["followUpSendAttempt"] = {
-            "id": "attempt-sent",
-            "state": "uncertain",
-            "owner": "old-owner",
-            "reconciliationOwner": "reconcile-owner",
-            "index": 0,
-            "sendIdentity": followup._followup_send_identity(
-                current_thread,
-                current_config,
-                0,
-            ),
-        }
+        current_thread["followUpSendAttempt"] = _sealed_followup_attempt(
+            current_thread,
+            current_config,
+            attempt_id="attempt-sent",
+            owner="old-owner",
+            state="uncertain",
+            reconciliation_owner="reconcile-owner",
+            subject="Subject",
+            conversation_id="conv-current",
+        )
         thread_ref = FakeThreadRef(current_thread)
 
         with patch.object(followup, "_fs", FakeFirestore(thread_ref)), patch(
