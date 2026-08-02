@@ -2306,7 +2306,7 @@ def _is_bounded_coordinated_viability_link(link_text: str) -> bool:
         return False
     if not re.fullmatch(
         r"[a-z]+(?:[-'’][a-z]+)*"
-        r"(?:[ \t]+[a-z]+(?:[-'’][a-z]+)*){0,5}",
+        r"(?:[ \t]+[a-z]+(?:[-'’][a-z]+)*){0,7}",
         normalized,
         re.IGNORECASE,
     ):

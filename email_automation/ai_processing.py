@@ -543,7 +543,7 @@ _VIABILITY_NEGATOR_PATTERN = (
     r"hasn['’]?t|haven['’]?t|hadn['’]?t|"
     r"cannot|can['’]?t|couldn['’]?t|wouldn['’]?t|shouldn['’]?t)"
 )
-_VIABILITY_NEGATION_MODIFIER_PATTERN = r"(?:all|both|currently|necessarily)"
+_VIABILITY_DIRECT_MODIFIER_PATTERN = r"(?:all|both|currently|necessarily)"
 _VIABILITY_QUALIFIER_WORDS = frozenset({
     "anticipated", "expected", "likely", "projected", "scheduled",
 })
@@ -553,34 +553,46 @@ _VIABILITY_NEGATOR_LINK_WORDS = frozenset({
 _VIABILITY_QUALIFIER_PATTERN = (
     r"(?:expected|likely|anticipated|projected|scheduled)"
 )
-_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN = (
+_VIABILITY_QUALIFIER_AUXILIARY_PATTERN = (
+    r"(?:am|is|are|was|were|be|been|being|"
+    r"do|does|did|have|has|had|"
+    r"can|could|will|would|shall|should|may|might|must|ought|to|"
+    r"appear|appears|appeared|seem|seems|seemed)"
+)
+_VIABILITY_QUALIFIER_BRIDGE_PATTERN = (
+    rf"(?:[a-z]+ly|all|both|{_VIABILITY_QUALIFIER_AUXILIARY_PATTERN})"
+)
+_VIABILITY_QUALIFIED_SCOPE_ATOM_PATTERN = (
+    rf"(?:{_VIABILITY_NEGATOR_PATTERN}|{_VIABILITY_QUALIFIER_BRIDGE_PATTERN})"
+)
+_VIABILITY_DIRECT_SCOPE_ATOM_PATTERN = (
     rf"(?:{_VIABILITY_NEGATOR_PATTERN}|"
-    rf"{_VIABILITY_NEGATION_MODIFIER_PATTERN})"
+    rf"{_VIABILITY_DIRECT_MODIFIER_PATTERN})"
 )
 _VIABILITY_QUALIFIED_NEGATION_SCOPE_RE = re.compile(
     rf"\b(?P<scope>"
-    rf"(?:{_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN}\s+){{0,6}}"
+    rf"(?:{_VIABILITY_QUALIFIED_SCOPE_ATOM_PATTERN}\s+){{0,8}}"
     rf"(?:{_VIABILITY_QUALIFIER_PATTERN}|unlikely)\s+"
-    rf"(?:{_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN}\s+){{0,3}}"
+    rf"(?:{_VIABILITY_QUALIFIED_SCOPE_ATOM_PATTERN}\s+){{0,4}}"
     rf"to\s+)$",
     re.IGNORECASE,
 )
 _VIABILITY_POST_INFINITIVE_NEGATION_SCOPE_RE = re.compile(
     rf"\b(?P<scope>"
-    rf"(?:{_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN}\s+){{0,6}}"
+    rf"(?:{_VIABILITY_QUALIFIED_SCOPE_ATOM_PATTERN}\s+){{0,8}}"
     rf"(?:{_VIABILITY_QUALIFIER_PATTERN}|unlikely)\s+to\s+"
-    rf"(?:{_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN}\s+){{1,3}})$",
+    rf"(?:{_VIABILITY_QUALIFIED_SCOPE_ATOM_PATTERN}\s+){{1,4}})$",
     re.IGNORECASE,
 )
 _VIABILITY_DIRECT_INFINITIVE_NEGATION_SCOPE_RE = re.compile(
     rf"\b(?P<scope>"
-    rf"(?:{_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN}\s+){{1,6}}"
+    rf"(?:{_VIABILITY_DIRECT_SCOPE_ATOM_PATTERN}\s+){{1,6}}"
     rf"to\s+)$",
     re.IGNORECASE,
 )
 _VIABILITY_DIRECT_NEGATION_SCOPE_RE = re.compile(
     rf"\b(?P<scope>"
-    rf"(?:{_VIABILITY_NEGATION_SCOPE_ATOM_PATTERN}\s+){{1,6}})$",
+    rf"(?:{_VIABILITY_DIRECT_SCOPE_ATOM_PATTERN}\s+){{1,6}})$",
     re.IGNORECASE,
 )
 _VIABILITY_NEGATOR_RE = re.compile(
