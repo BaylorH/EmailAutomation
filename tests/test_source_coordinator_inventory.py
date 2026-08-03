@@ -25,6 +25,19 @@ DRAFT_DELETE_MANIFEST_PATH = REPO_ROOT / "tests/fixtures/graph_draft_delete_call
 DRAFT_DELETE_HELPER_NAME = "_delete_graph_reply_draft"
 DRAFT_DELETE_EMAIL_MODULE = "email_automation.email"
 DRAFT_DELETE_EMAIL_PATH = "email_automation/email.py"
+SOURCE_ADMISSION_METHOD = "admit_or_repair_source_identity"
+SOURCE_ADMISSION_PRIVATE_ENVELOPE = "_SourceAdmissionEnvelope"
+SOURCE_ADMISSION_ALLOWED_ADAPTERS = {
+    ("email_automation/processing.py", "process_inbox_message"),
+    ("email_automation/operator_replay.py", "replay_exact_message"),
+}
+SOURCE_ADMISSION_ALLOWED_CALLABLE_SCOPES = {
+    *((path, (function,)) for path, function in SOURCE_ADMISSION_ALLOWED_ADAPTERS),
+    (
+        "email_automation/operator_replay.py",
+        ("replay_exact_message", "_under_lease"),
+    ),
+}
 
 EXPECTED_DRAFT_DELETE_MANIFEST = {
     "schemaVersion": 1,
@@ -161,6 +174,155 @@ def _source_coordinator_forbidden_imports(tree):
                 seen.add(finding)
                 forbidden.append(finding)
     return forbidden
+
+
+class _SourceAdmissionContractVisitor(ast.NodeVisitor):
+    """Reject private-envelope access and non-adapter admission references."""
+
+    def __init__(self, relative_path):
+        self.relative_path = Path(relative_path).as_posix()
+        self.violations = []
+        self._function_scopes = []
+        self._class_depth = 0
+        self._direct_call_references = set()
+
+    def _record(self, node, reason):
+        self.violations.append((getattr(node, "lineno", 0), reason))
+
+    def _inside_reviewed_adapter(self):
+        return (
+            self._class_depth == 0
+            and (self.relative_path, tuple(self._function_scopes))
+            in SOURCE_ADMISSION_ALLOWED_CALLABLE_SCOPES
+        )
+
+    def visit_FunctionDef(self, node):
+        if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and node.name == SOURCE_ADMISSION_PRIVATE_ENVELOPE
+        ):
+            self._record(node, "private admission envelope definition")
+        if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and node.name == SOURCE_ADMISSION_METHOD
+        ):
+            self._record(node, "admission method definition/propagation")
+        _visit_function_metadata(self, node)
+        self._function_scopes.append(node.name)
+        try:
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self._function_scopes.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and node.name == SOURCE_ADMISSION_PRIVATE_ENVELOPE
+        ):
+            self._record(node, "private admission envelope definition")
+        _visit_class_metadata(self, node)
+        self._class_depth += 1
+        try:
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self._class_depth -= 1
+
+    def visit_Lambda(self, node):
+        self.visit(node.args)
+        self._function_scopes.append(
+            f"<lambda@{node.lineno}:{node.col_offset}>"
+        )
+        try:
+            self.visit(node.body)
+        finally:
+            self._function_scopes.pop()
+
+    def visit_GeneratorExp(self, node):
+        self._function_scopes.append(
+            f"<generator@{node.lineno}:{node.col_offset}>"
+        )
+        try:
+            self.generic_visit(node)
+        finally:
+            self._function_scopes.pop()
+
+    def visit_ImportFrom(self, node):
+        for imported in node.names:
+            if imported.name == SOURCE_ADMISSION_PRIVATE_ENVELOPE:
+                self._record(node, "private admission envelope import")
+            if imported.name == SOURCE_ADMISSION_METHOD:
+                self._record(node, "admission method import/propagation")
+
+    def visit_Call(self, node):
+        protected_reference = (
+            isinstance(node.func, ast.Name)
+            and node.func.id == SOURCE_ADMISSION_METHOD
+        ) or (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == SOURCE_ADMISSION_METHOD
+        )
+        if protected_reference:
+            self._direct_call_references.add(id(node.func))
+            if not self._inside_reviewed_adapter():
+                self._record(node, "admission call outside reviewed adapter")
+        self.generic_visit(node)
+
+    def visit_Name(self, node):
+        if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and node.id == SOURCE_ADMISSION_PRIVATE_ENVELOPE
+        ):
+            self._record(node, "private admission envelope reference")
+        if (
+            node.id == SOURCE_ADMISSION_METHOD
+            and id(node) not in self._direct_call_references
+        ):
+            self._record(node, "admission method propagation")
+
+    def visit_Attribute(self, node):
+        if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and node.attr == SOURCE_ADMISSION_PRIVATE_ENVELOPE
+        ):
+            self._record(node, "private admission envelope attribute")
+        if (
+            node.attr == SOURCE_ADMISSION_METHOD
+            and id(node) not in self._direct_call_references
+        ):
+            self._record(node, "admission method propagation")
+        self.visit(node.value)
+
+    def visit_Constant(self, node):
+        if type(node.value) is not str:
+            return
+        if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and node.value == SOURCE_ADMISSION_PRIVATE_ENVELOPE
+        ):
+            self._record(node, "dynamic private admission envelope reference")
+        if node.value == SOURCE_ADMISSION_METHOD:
+            self._record(node, "dynamic admission method reference")
+
+
+def _source_admission_contract_violations(source, relative_path):
+    visitor = _SourceAdmissionContractVisitor(relative_path)
+    visitor.visit(ast.parse(source, filename=str(relative_path)))
+    return visitor.violations
+
+
+def _discover_source_admission_contract_violations():
+    violations = []
+    for relative_path in _application_python_files():
+        source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        for line, reason in _source_admission_contract_violations(
+            source, relative_path
+        ):
+            violations.append((relative_path.as_posix(), line, reason))
+    return violations
 
 
 def _visit_function_metadata(visitor, node):
@@ -806,6 +968,121 @@ class InventoryContractTests(unittest.TestCase):
             filename=str(SOURCE_COORDINATOR_PATH),
         )
         self.assertEqual([], _source_coordinator_forbidden_imports(tree))
+
+    def test_source_admission_private_type_and_call_sites_are_bounded(self):
+        self.assertEqual([], _discover_source_admission_contract_violations())
+
+    def test_source_admission_gate_rejects_private_envelope_mutations(self):
+        mutations = {
+            "direct import": (
+                "from email_automation.source_coordinator import "
+                "_SourceAdmissionEnvelope\n"
+                "value = _SourceAdmissionEnvelope((), 'kind', 'hash')"
+            ),
+            "aliased import": (
+                "from email_automation.source_coordinator import "
+                "_SourceAdmissionEnvelope as Envelope\n"
+                "value = Envelope((), 'kind', 'hash')"
+            ),
+            "module attribute": (
+                "import email_automation.source_coordinator as coordinator\n"
+                "value = coordinator._SourceAdmissionEnvelope"
+            ),
+            "dynamic lookup": (
+                "value = getattr(coordinator, '_SourceAdmissionEnvelope')"
+            ),
+            "spoofed definition": "class _SourceAdmissionEnvelope: pass",
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_admission_contract_violations(
+                        source, "email_automation/unreviewed.py"
+                    )
+                )
+
+    def test_source_admission_gate_rejects_unreviewed_calls_and_propagation(self):
+        mutations = {
+            "module call": "coordinator.admit_or_repair_source_identity()",
+            "wrong function": (
+                "def run():\n"
+                " coordinator.admit_or_repair_source_identity()"
+            ),
+            "propagated method": (
+                "def run():\n"
+                " callback = coordinator.admit_or_repair_source_identity\n"
+                " callback()"
+            ),
+            "dynamic method": (
+                "def run():\n"
+                " callback = getattr(coordinator, "
+                "'admit_or_repair_source_identity')\n"
+                " callback()"
+            ),
+            "same-name class method": (
+                "class Spoof:\n"
+                " def process_inbox_message(self):\n"
+                "  coordinator.admit_or_repair_source_identity()"
+            ),
+            "spoofed admission definition": (
+                "def admit_or_repair_source_identity():\n"
+                " pass"
+            ),
+            "escaping nested class": (
+                "def process_inbox_message():\n"
+                " class Hidden:\n"
+                "  def run(self):\n"
+                "   coordinator.admit_or_repair_source_identity()"
+            ),
+            "escaping lambda": (
+                "def process_inbox_message():\n"
+                " return lambda: "
+                "coordinator.admit_or_repair_source_identity()"
+            ),
+            "unreviewed nested closure": (
+                "def replay_exact_message():\n"
+                " def later():\n"
+                "  coordinator.admit_or_repair_source_identity()\n"
+                " return later"
+            ),
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_admission_contract_violations(
+                        source, "email_automation/processing.py"
+                    )
+                )
+
+    def test_source_admission_gate_allows_only_exact_reviewed_adapters(self):
+        allowed = {
+            "email_automation/processing.py": (
+                "def process_inbox_message():\n"
+                " coordinator.admit_or_repair_source_identity()"
+            ),
+            "email_automation/operator_replay.py": (
+                "def replay_exact_message():\n"
+                " def _under_lease():\n"
+                "  coordinator.admit_or_repair_source_identity()\n"
+                " _under_lease()"
+            ),
+        }
+        for relative_path, source in allowed.items():
+            with self.subTest(relative_path=relative_path):
+                self.assertEqual(
+                    [],
+                    _source_admission_contract_violations(source, relative_path),
+                )
+
+        wrong_path = (
+            "def process_inbox_message():\n"
+            " coordinator.admit_or_repair_source_identity()"
+        )
+        self.assertTrue(
+            _source_admission_contract_violations(
+                wrong_path, "email_automation/unreviewed.py"
+            )
+        )
 
     def test_application_file_exclusions_are_preserved(self):
         self.assertTrue(_is_application_python_file(Path(DRAFT_DELETE_EMAIL_PATH)))
