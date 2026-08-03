@@ -98,16 +98,6 @@ def _resolve_import_from_module(relative_path, node):
     return ".".join(package_parts)
 
 
-def _dotted_expression(node):
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        parent = _dotted_expression(node.value)
-        if parent:
-            return f"{parent}.{node.attr}"
-    return None
-
-
 class _ScopeBindingCollector(ast.NodeVisitor):
     def __init__(self, relative_path, *, module_scope):
         self.relative_path = Path(relative_path).as_posix()
@@ -246,24 +236,6 @@ def _has_helper_provenance(states):
     )
 
 
-def _is_bound_delete_helper_callee(node, scoped_bindings):
-    if isinstance(node, ast.Name):
-        states = _lookup_binding_states(node.id, scoped_bindings)
-        return states == {_HELPER_BINDING}
-    if (
-        isinstance(node, ast.Attribute)
-        and node.attr == DRAFT_DELETE_HELPER_NAME
-    ):
-        receiver = _dotted_expression(node.value)
-        states = (
-            _lookup_binding_states(receiver, scoped_bindings)
-            if receiver
-            else set()
-        )
-        return states == {_EMAIL_MODULE_BINDING}
-    return False
-
-
 def _helper_reference_status(node, scoped_bindings):
     if isinstance(node, ast.Name):
         states = _lookup_binding_states(node.id, scoped_bindings)
@@ -274,15 +246,16 @@ def _helper_reference_status(node, scoped_bindings):
         isinstance(node, ast.Attribute)
         and node.attr == DRAFT_DELETE_HELPER_NAME
     ):
-        receiver = _dotted_expression(node.value)
-        states = (
-            _lookup_binding_states(receiver, scoped_bindings)
-            if receiver
-            else set()
+        receiver_states = _expression_binding_states(
+            node.value,
+            scoped_bindings,
         )
-        if not states:
+        if not receiver_states:
             return None
-        return _EMAIL_MODULE_BINDING in states or _AMBIGUOUS_BINDING in states
+        return bool(
+            receiver_states
+            & {_EMAIL_MODULE_BINDING, _AMBIGUOUS_BINDING}
+        )
     if isinstance(
         node,
         (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
@@ -307,17 +280,15 @@ def _expression_binding_states(node, scoped_bindings):
         isinstance(node, ast.Attribute)
         and node.attr == DRAFT_DELETE_HELPER_NAME
     ):
-        receiver = _dotted_expression(node.value)
-        receiver_states = (
-            _lookup_binding_states(receiver, scoped_bindings)
-            if receiver
-            else set()
+        receiver_states = _expression_binding_states(
+            node.value,
+            scoped_bindings,
         )
         if not receiver_states:
             return set()
         if receiver_states == {_EMAIL_MODULE_BINDING}:
             return {_HELPER_BINDING}
-        if _EMAIL_MODULE_BINDING in receiver_states:
+        if receiver_states & {_EMAIL_MODULE_BINDING, _AMBIGUOUS_BINDING}:
             return {_AMBIGUOUS_BINDING}
         return {_NONHELPER_BINDING}
     if isinstance(node, ast.IfExp):
@@ -737,9 +708,17 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
 
     def visit_Attribute(self, node):
         if self._reference_is_approved(node):
+            self.generic_visit(node)
             return
-        if _is_bound_delete_helper_callee(node, self.binding_stack):
-            self._raise_unsupported_reference(node)
+        if node.attr == DRAFT_DELETE_HELPER_NAME:
+            states = _expression_binding_states(node, self.binding_stack)
+            if states == {_HELPER_BINDING}:
+                self._raise_unsupported_reference(node)
+            if _AMBIGUOUS_BINDING in states:
+                raise DraftDeleteBindingInventoryError(
+                    "unsupported or ambiguous draft delete receiver at "
+                    f"{self.relative_path}:{node.lineno}"
+                )
         self.generic_visit(node)
 
     def visit_Assign(self, node):
@@ -860,6 +839,38 @@ def _in_memory_draft_delete_callers(source, relative_path):
 
 
 class InventoryScannerRegressionTests(unittest.TestCase):
+    def test_named_expression_email_module_receiver_is_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+import email_automation.email as email_module
+
+def cleanup():
+    (alias := email_module)._delete_graph_reply_draft()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/followup.py", "cleanup"): 1}),
+            callers,
+        )
+
+    def test_conditional_email_module_receiver_is_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+import email_automation.email as email_module
+
+def cleanup(flag):
+    (
+        email_module if flag else email_module
+    )._delete_graph_reply_draft()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/followup.py", "cleanup"): 1}),
+            callers,
+        )
+
     def test_named_expression_direct_helper_callee_is_counted(self):
         callers = _in_memory_draft_delete_callers(
             """
