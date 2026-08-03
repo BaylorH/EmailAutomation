@@ -114,6 +114,24 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
         self.relative_path = Path(relative_path).as_posix()
         self.callers = Counter()
         self._scopes = []
+        self._canonical_helper_definition = None
+
+    def _validate_protected_binding(self, name, *, allowed=False):
+        if name == DRAFT_DELETE_HELPER_NAME and not allowed:
+            _fail_inventory("protected helper binding is unsupported")
+
+    def visit_Module(self, node):
+        if self.relative_path == DRAFT_DELETE_EMAIL_PATH:
+            helpers = [
+                statement
+                for statement in node.body
+                if type(statement) is ast.FunctionDef
+                and statement.name == DRAFT_DELETE_HELPER_NAME
+            ]
+            if len(helpers) == 1:
+                self._canonical_helper_definition = helpers[0]
+        for statement in node.body:
+            self.visit(statement)
 
     def _caller_key(self):
         if not self._scopes:
@@ -130,12 +148,16 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
             self._scopes.pop()
 
     def visit_FunctionDef(self, node):
+        self._validate_protected_binding(
+            node.name, allowed=node is self._canonical_helper_definition
+        )
         # Definition-time expressions belong to the enclosing syntactic scope.
         _visit_function_metadata(self, node)
         self._visit_body("function", node.name, node.body)
 
     visit_AsyncFunctionDef = visit_FunctionDef
     def visit_ClassDef(self, node):
+        self._validate_protected_binding(node.name)
         _visit_class_metadata(self, node)
         self._visit_body("class", node.name, node.body)
 
@@ -163,8 +185,7 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
             self.visit(item)
 
     def visit_Name(self, node):
-        if node.id == DRAFT_DELETE_HELPER_NAME:
-            _fail_inventory("protected helper reference is not a direct call")
+        self._validate_protected_binding(node.id)
 
     def visit_Attribute(self, node):
         if node.attr == DRAFT_DELETE_HELPER_NAME:
@@ -172,40 +193,53 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_arg(self, node):
-        if node.arg == DRAFT_DELETE_HELPER_NAME:
-            _fail_inventory("protected helper name is rebound as an argument")
+        self._validate_protected_binding(node.arg)
         if node.annotation:
             self.visit(node.annotation)
 
+    def _visit_type_parameter(self, node):
+        self._validate_protected_binding(node.name)
+        self.generic_visit(node)
+
+    visit_TypeVar = _visit_type_parameter
+    visit_ParamSpec = _visit_type_parameter
+    visit_TypeVarTuple = _visit_type_parameter
+
     def visit_Global(self, node):
-        if DRAFT_DELETE_HELPER_NAME in node.names:
-            _fail_inventory("protected helper global/nonlocal binding is unsupported")
+        for name in node.names:
+            self._validate_protected_binding(name)
 
     visit_Nonlocal = visit_Global
     def _visit_named_binding(self, node):
-        if node.name == DRAFT_DELETE_HELPER_NAME:
-            _fail_inventory("protected helper binding is unsupported")
+        self._validate_protected_binding(node.name)
         self.generic_visit(node)
 
     visit_ExceptHandler = _visit_named_binding
     visit_MatchAs = _visit_named_binding
     visit_MatchStar = _visit_named_binding
     def visit_MatchMapping(self, node):
-        if node.rest == DRAFT_DELETE_HELPER_NAME:
-            _fail_inventory("protected helper pattern binding is unsupported")
+        self._validate_protected_binding(node.rest)
         self.generic_visit(node)
 
+    def visit_Import(self, node):
+        for alias in node.names:
+            bound_name = alias.asname or alias.name.split(".", 1)[0]
+            self._validate_protected_binding(bound_name)
+
     def visit_ImportFrom(self, node):
-        if _resolve_import_from_module(node, self.relative_path) != DRAFT_DELETE_EMAIL_MODULE:
-            return
+        module = _resolve_import_from_module(node, self.relative_path)
         for alias in node.names:
             if alias.name == "*":
-                _fail_inventory("star import from the protected helper module")
-            if (
-                alias.name == DRAFT_DELETE_HELPER_NAME
-                and alias.asname not in (None, DRAFT_DELETE_HELPER_NAME)
-            ):
-                _fail_inventory("renaming the protected helper is unsupported")
+                _fail_inventory("star imports can hide protected helper bindings")
+            bound_name = alias.asname or alias.name
+            allowed = (
+                module == DRAFT_DELETE_EMAIL_MODULE
+                and alias.name == DRAFT_DELETE_HELPER_NAME
+                and bound_name == DRAFT_DELETE_HELPER_NAME
+            )
+            if alias.name == DRAFT_DELETE_HELPER_NAME and not allowed:
+                _fail_inventory("protected helper import source is unsupported")
+            self._validate_protected_binding(bound_name, allowed=allowed)
 
 
 class _RequestsDeleteVisitor(ast.NodeVisitor):
@@ -394,13 +428,33 @@ def _discover_draft_delete_callers(manifest_callers):
     return callers
 
 
+class _LegacyDefinitionVisitor(ast.NodeVisitor):
+    """Find definitions in module-execution flow while pruning lexical scopes."""
+
+    def __init__(self, path, target_names, discovered):
+        self.path = path
+        self.target_names = target_names
+        self.discovered = discovered
+
+    def visit_FunctionDef(self, node):
+        if node.name in self.target_names:
+            self.discovered[(self.path, node.name)] += 1
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        return
+
+    def visit_Lambda(self, node):
+        return
+
+
 def _legacy_symbols_in_modules(modules):
     target_names = {name for _, name in EXPECTED_LEGACY_MARKER_DEFINITIONS}
     discovered = Counter()
     for relative_path, tree in modules:
-        for node in tree.body:  # Topology is part of the legacy authority contract.
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in target_names:
-                discovered[(Path(relative_path).as_posix(), node.name)] += 1
+        path = Path(relative_path).as_posix()
+        _LegacyDefinitionVisitor(path, target_names, discovered).visit(tree)
     return discovered
 
 
@@ -491,6 +545,29 @@ def escaped_module():
         for statement in statements:
             with self.subTest(statement=statement), self.assertRaises(DraftDeleteBindingInventoryError):
                 _in_memory_draft_delete_callers(statement, "email_automation/followup.py")
+
+    def test_protected_name_rebindings_are_rejected(self):
+        helper = DRAFT_DELETE_HELPER_NAME
+        sources = {
+            "foreign function": f"def {helper}(): pass\n{helper}()",
+            "nested function": f"def outer():\n def {helper}(): pass\n {helper}()",
+            "async function": f"async def {helper}(): pass\n{helper}()",
+            "class": f"class {helper}: pass\n{helper}()",
+            "import alias": f"import unrelated as {helper}\n{helper}()",
+            "foreign from alias": f"from unrelated import fake as {helper}\n{helper}()",
+            "exact module fake": f"from email_automation.email import fake as {helper}\n{helper}()",
+            "foreign star": f"from unrelated import *\n{helper}()",
+            "type var": f"def cleanup[{helper}]():\n {helper}()",
+            "param spec": f"def cleanup[**{helper}]():\n {helper}()",
+            "type var tuple": f"def cleanup[*{helper}]():\n {helper}()",
+        }
+        for case, source in sources.items():
+            with self.subTest(case=case), self.assertRaises(
+                DraftDeleteBindingInventoryError
+            ):
+                _in_memory_draft_delete_callers(
+                    source, "email_automation/followup.py"
+                )
 
     def test_scope_keys_are_qualified_and_definition_time_is_enclosing(self):
         source = """
@@ -615,7 +692,11 @@ class InventoryContractTests(unittest.TestCase):
 
     def test_legacy_inventory_only_accepts_top_level_definitions(self):
         sources = {
-            "email_automation/messaging.py": "def has_processed(): pass\nclass Hidden:\n def mark_processed(self): pass",
+            "email_automation/messaging.py": (
+                "def has_processed(): pass\n"
+                "class Hidden:\n def mark_processed(self): pass\n"
+                "def wrapper():\n def mark_processed(): pass"
+            ),
             "scheduler_runner.py": "def has_processed(): pass\ndef mark_processed(): pass",
             "email_automation/operator_replay.py": "def _begin_replay_claim(): pass\ndef _complete_replay_claim(): pass",
         }
@@ -623,6 +704,25 @@ class InventoryContractTests(unittest.TestCase):
         discovered = _legacy_symbols_in_modules(modules)
         self.assertNotEqual(EXPECTED_LEGACY_MARKER_DEFINITIONS, discovered)
         self.assertNotIn(("email_automation/messaging.py", "mark_processed"), discovered)
+
+    def test_legacy_inventory_counts_module_control_flow_definitions(self):
+        blocks = {
+            "if": "if enabled:\n def mark_processed(): pass",
+            "try": "try:\n def mark_processed(): pass\nexcept Exception:\n pass",
+            "match": "match value:\n case _:\n  def mark_processed(): pass",
+            "for": "for item in items:\n def mark_processed(): pass",
+            "with": "with context():\n def mark_processed(): pass",
+        }
+        expected = Counter(
+            {("email_automation/messaging.py", "mark_processed"): 2}
+        )
+        for case, block in blocks.items():
+            with self.subTest(case=case):
+                tree = ast.parse(f"def mark_processed(): pass\n{block}")
+                discovered = _legacy_symbols_in_modules(
+                    [("email_automation/messaging.py", tree)]
+                )
+                self.assertEqual(expected, discovered)
 
 
 if __name__ == "__main__":
