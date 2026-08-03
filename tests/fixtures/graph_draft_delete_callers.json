@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "deferred": [
+    {
+      "path": "email_automation/email.py",
+      "function": "_send_outbox_as_reply",
+      "count": 2
+    },
+    {
+      "path": "email_automation/email.py",
+      "function": "send_and_index_email",
+      "count": 1
+    },
+    {
+      "path": "email_automation/followup.py",
+      "function": "_send_followup_email",
+      "count": 13
+    }
+  ],
+  "m2Owned": [
+    {
+      "path": "email_automation/processing.py",
+      "function": "send_reply_in_thread",
+      "count": 5
+    }
+  ]
+}
