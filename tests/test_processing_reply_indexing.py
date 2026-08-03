@@ -242,6 +242,7 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
             if url.endswith("/createReplyAll"):
                 return FakeResponse(201, {
                     "id": "auto-reply-draft-1",
+                    "subject": "RE: 101 Launch Complete Way",
                     "toRecipients": [
                         {"emailAddress": {"address": "bp21harrison@gmail.com"}},
                     ],
@@ -288,7 +289,7 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
                 patch.object(processing.requests, "post", side_effect=fake_post), \
                 patch.object(processing.requests, "patch", side_effect=fake_patch), \
                 patch.object(processing.time, "sleep", return_value=None), \
-                patch.object(processing, "_find_recent_sent_message_for_conversation", return_value=sent_message), \
+                patch.object(processing, "find_exact_sent_message_by_immutable_id", return_value=sent_message), \
                 patch("email_automation.messaging.index_message_id", return_value=True), \
                 patch("email_automation.messaging.lookup_thread_by_message_id", return_value="thread-1"), \
                 patch("email_automation.messaging.index_conversation_id", return_value=True), \
@@ -344,6 +345,7 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
             if url.endswith("/me/messages/auto-reply-draft-1"):
                 return FakeResponse(200, {
                     "id": "auto-reply-draft-1",
+                    "subject": "RE: 101 Launch Complete Way",
                     "toRecipients": [
                         {"emailAddress": {"address": "bp21harrison@gmail.com"}},
                     ],
@@ -380,7 +382,7 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
                 patch.object(processing.requests, "post", side_effect=fake_post), \
                 patch.object(processing.requests, "patch", side_effect=fake_patch), \
                 patch.object(processing.time, "sleep", return_value=None), \
-                patch.object(processing, "_find_recent_sent_message_for_conversation", return_value=sent_message), \
+                patch.object(processing, "find_exact_sent_message_by_immutable_id", return_value=sent_message), \
                 patch("email_automation.messaging.index_message_id", return_value=True), \
                 patch("email_automation.messaging.lookup_thread_by_message_id", return_value="thread-1"), \
                 patch("email_automation.messaging.index_conversation_id", return_value=True), \
@@ -448,6 +450,7 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
             if url.endswith("/me/messages/auto-reply-draft-1"):
                 return FakeResponse(200, {
                     "id": "auto-reply-draft-1",
+                    "subject": "RE: 101 Launch Complete Way",
                     "toRecipients": [],
                     "ccRecipients": [],
                 })
@@ -482,7 +485,7 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
                 patch.object(processing.requests, "post", side_effect=fake_post), \
                 patch.object(processing.requests, "patch", side_effect=fake_patch), \
                 patch.object(processing.time, "sleep", return_value=None), \
-                patch.object(processing, "_find_recent_sent_message_for_conversation", return_value=sent_message), \
+                patch.object(processing, "find_exact_sent_message_by_immutable_id", return_value=sent_message), \
                 patch("email_automation.messaging.index_message_id", return_value=True), \
                 patch("email_automation.messaging.lookup_thread_by_message_id", return_value="thread-1"), \
                 patch("email_automation.messaging.index_conversation_id", return_value=True), \
@@ -536,6 +539,7 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
             if url.endswith("/me/messages/auto-reply-draft-1"):
                 return FakeResponse(200, {
                     "id": "auto-reply-draft-1",
+                    "subject": "RE: 101 Launch Complete Way",
                     "toRecipients": [],
                     "ccRecipients": [],
                 })
@@ -565,7 +569,7 @@ class ProcessingReplyIndexingTests(unittest.TestCase):
                 patch.object(processing.requests, "post", side_effect=fake_post), \
                 patch.object(processing.requests, "patch", side_effect=fake_patch), \
                 patch.object(processing.time, "sleep", return_value=None), \
-                patch.object(processing, "_find_recent_sent_message_for_conversation", return_value=sent_message), \
+                patch.object(processing, "find_exact_sent_message_by_immutable_id", return_value=sent_message), \
                 patch("email_automation.messaging.index_message_id", return_value=True), \
                 patch("email_automation.messaging.lookup_thread_by_message_id", return_value="thread-1"), \
                 patch("email_automation.messaging.index_conversation_id", return_value=True), \

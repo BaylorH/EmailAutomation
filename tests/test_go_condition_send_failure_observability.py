@@ -148,6 +148,7 @@ class SendOutboxSendFailureObservabilityTests(unittest.TestCase):
         }
 
         with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "resolve_outbound_mode", return_value=email_module.OUTBOUND_MODE_LIVE), \
              patch.object(email_module, "_get_current_outbox_data", return_value={}), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_pause_results_outbox_item_if_needed", return_value=False), \
@@ -188,6 +189,7 @@ class SendOutboxSendFailureObservabilityTests(unittest.TestCase):
         }
 
         with patch.object(email_module, "_claim_outbox_item", return_value=True), \
+             patch.object(email_module, "resolve_outbound_mode", return_value=email_module.OUTBOUND_MODE_LIVE), \
              patch.object(email_module, "_get_current_outbox_data", return_value={}), \
              patch.object(email_module, "_has_existing_thread_for_property", return_value=False), \
              patch.object(email_module, "_pause_results_outbox_item_if_needed", return_value=False), \
@@ -322,6 +324,7 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
             return False
 
         fake_send_reply_in_thread.last_error = "HTTP 500 Graph send failed"
+        graph_capability = object()
 
         with patch.object(
             pending_responses,
@@ -335,6 +338,25 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
         ), patch.dict(sys.modules, {
             "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
         }), patch.object(
+            pending_responses,
+            "_process_pending_completion_obligations",
+            return_value=[],
+        ), patch.object(
+            pending_responses,
+            "_claim_pending_response_for_send",
+            return_value="observability-test-claim",
+        ), patch.object(
+            pending_responses,
+            "_final_pending_response_send_fence",
+            return_value=graph_capability,
+        ), patch.object(
+            pending_responses,
+            "resolve_graph_send_permit",
+        ), patch.object(
+            pending_responses,
+            "_cas_pending_update",
+            return_value=True,
+        ), patch.object(
             processing_module, "send_reply_in_thread", new=fake_send_reply_in_thread
         ), patch.object(
             processing_module, "_reset_reply_send_outcome",
@@ -376,7 +398,29 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
             outcome=None,
             campaign_suppression_kind=None,
             campaign_decision=None,
+            exact_sent_evidence={"id": "sent-message-1"},
         )
+        graph_capability = types.SimpleNamespace(
+            permit_id="graph-send-observability",
+            immutable_hash="a" * 64,
+        )
+        completion_snapshot = types.SimpleNamespace(
+            id="pending-completion-observability",
+        )
+        completion_ref = types.SimpleNamespace(
+            id=completion_snapshot.id,
+            get=lambda: completion_snapshot,
+        )
+
+        def replay_completion(user_id, _snapshot, processing):
+            completed = processing._maybe_mark_client_completed(
+                user_id,
+                "client-1",
+            )
+            return pending_responses._pending_completion_operation_state(
+                "healthy" if completed is True else "error",
+                obligation_id=completion_snapshot.id,
+            )
 
         with patch.object(
             pending_responses,
@@ -390,9 +434,37 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
         ), patch.dict(sys.modules, {
             "email_automation.clients": types.SimpleNamespace(_fs=fake_fs),
         }), patch.object(
+            pending_responses,
+            "_process_pending_completion_obligations",
+            return_value=[],
+        ), patch.object(
+            pending_responses,
+            "_claim_pending_response_for_send",
+            return_value="observability-test-claim",
+        ), patch.object(
+            pending_responses,
+            "_final_pending_response_send_fence",
+            return_value=graph_capability,
+        ), patch.object(
+            pending_responses,
+            "_cas_pending_success",
+            return_value=True,
+        ), patch.object(
+            pending_responses,
+            "_pending_claim_refs",
+            return_value=(fake_fs, fake_fs, fake_fs, active_doc.reference),
+        ), patch.object(
+            pending_responses,
+            "_pending_completion_side_document",
+            return_value=(completion_ref, {}),
+        ), patch.object(
+            pending_responses,
+            "_replay_pending_completion_obligation",
+            side_effect=replay_completion,
+        ), patch.object(
             processing_module, "send_reply_in_thread", new=fake_send_reply_in_thread
         ), patch.object(
-            processing_module, "_maybe_mark_client_completed", return_value=False
+            processing_module, "_maybe_mark_client_completed", return_value=True
         ) as maybe_mark_completed, patch.object(
             processing_module, "_reset_reply_send_outcome", return_value=send_outcome
         ), patch.object(
@@ -403,9 +475,12 @@ class PendingResponseSendFailureObservabilityTests(unittest.TestCase):
             )
 
         maybe_mark_completed.assert_called_once_with("uid-1", "client-1")
-        self.assertEqual(len(states), 1)
-        self.assertEqual(states[0]["status"], "healthy")
-        self.assertEqual(states[0]["operation"], "pending_response_send")
+        self.assertEqual(len(states), 2)
+        self.assertEqual(
+            {state["operation"] for state in states},
+            {"pending_response_send", "pending_response_completion"},
+        )
+        self.assertTrue(all(state["status"] == "healthy" for state in states))
         self.assertEqual(main._combine_graph_operation_states(states)["status"], "healthy")
 
 

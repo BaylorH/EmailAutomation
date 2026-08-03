@@ -7,6 +7,7 @@ import uuid
 import logging
 from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from google.cloud import firestore
 from google.cloud.firestore import SERVER_TIMESTAMP, Increment
 from .utils import (
@@ -59,6 +60,11 @@ from .column_config import (
 
 logger = logging.getLogger(__name__)
 _ORIGINAL_GET_CLIENT_AUTOMATION_PAUSE = get_client_automation_pause
+
+
+def _graph_message_path_segment(message_id: Any) -> str:
+    """Encode one raw Microsoft Graph message ID for one URL path segment."""
+    return quote(str(message_id or ""), safe="")
 
 # Maximum retry attempts before moving to dead-letter queue
 MAX_OUTBOX_ATTEMPTS = 5
@@ -1513,13 +1519,20 @@ def _hydrate_reply_all_draft_recipients(
 ) -> Dict[str, Any]:
     """
     Microsoft Graph may return only the draft id from createReplyAll even though
-    the saved draft has the computed To/CC audience. Fetch the draft before
-    applying SiteSift's safety filter so a sparse response does not strand the
-    outbox item as retrying.
+    the saved draft has its inherited subject and computed To/CC audience.
+    Fetch whichever exact provider fields are missing before SiteSift freezes
+    and filters the draft.
     """
     if not isinstance(draft, dict):
         return {}
-    if draft.get("toRecipients") or draft.get("ccRecipients"):
+    has_recipients = bool(
+        draft.get("toRecipients") or draft.get("ccRecipients")
+    )
+    has_subject = bool(
+        isinstance(draft.get("subject"), str)
+        and draft.get("subject").strip()
+    )
+    if has_recipients and has_subject:
         return draft
 
     draft_id = draft.get("id")
@@ -1529,9 +1542,9 @@ def _hydrate_reply_all_draft_recipients(
     try:
         fetched_resp = exponential_backoff_request(
             lambda: requests.get(
-                f"{base}/me/messages/{draft_id}",
+                f"{base}/me/messages/{_graph_message_path_segment(draft_id)}",
                 headers=headers,
-                params={"$select": "id,toRecipients,ccRecipients"},
+                params={"$select": "id,subject,toRecipients,ccRecipients"},
                 timeout=30,
             ),
             max_retries=GRAPH_SEND_MAX_RETRIES,
@@ -1544,8 +1557,11 @@ def _hydrate_reply_all_draft_recipients(
             return draft
         fetched = fetched_resp.json() or {}
         hydrated = dict(draft)
-        hydrated["toRecipients"] = fetched.get("toRecipients") or []
-        hydrated["ccRecipients"] = fetched.get("ccRecipients") or []
+        if not has_recipients:
+            hydrated["toRecipients"] = fetched.get("toRecipients") or []
+            hydrated["ccRecipients"] = fetched.get("ccRecipients") or []
+        if isinstance(fetched.get("subject"), str):
+            hydrated["subject"] = fetched["subject"]
         return hydrated
     except Exception as exc:
         print(f"   ⚠️ Could not fetch reply-all draft recipients: {exc}")
@@ -1647,7 +1663,7 @@ def _delete_graph_reply_draft(
     try:
         delete_resp = exponential_backoff_request(
             lambda: requests.delete(
-                f"{base}/me/messages/{draft_id}",
+                f"{base}/me/messages/{_graph_message_path_segment(draft_id)}",
                 headers=headers,
                 timeout=30,
             ),

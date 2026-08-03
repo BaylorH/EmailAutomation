@@ -4,6 +4,8 @@ import random
 import errno
 import socket
 import ssl
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Optional, List, Dict, Any
 import httplib2
 from google.auth.exceptions import TransportError
@@ -22,6 +24,40 @@ from .utils import _norm_txt, _normalize_email
 MAX_RETRIES = 5
 BASE_DELAY_SECONDS = 1.0
 MAX_DELAY_SECONDS = 60.0
+TERMINAL_SHEETS_REQUEST_TIMEOUT_SECONDS = 10.0
+_terminal_sheets_deadline_monotonic = ContextVar(
+    "terminal_sheets_deadline_monotonic",
+    default=None,
+)
+
+
+@contextmanager
+def terminal_sheets_provider_window(seconds: float):
+    """Bound every Google request in one terminal mutation/readback window.
+
+    Terminal saga writes must finish before their Firestore lease can expire.
+    Within this context, each request receives a concrete transport timeout and
+    generic 429 replay/backoff is disabled so the total call cannot silently
+    outlive the persisted provider deadline.
+    """
+    duration = float(seconds)
+    if duration <= 0:
+        raise TimeoutError("terminal Sheets provider deadline already expired")
+    token = _terminal_sheets_deadline_monotonic.set(time.monotonic() + duration)
+    try:
+        yield
+    finally:
+        _terminal_sheets_deadline_monotonic.reset(token)
+
+
+def _terminal_request_timeout_target(request):
+    authorized_http = getattr(request, "http", None)
+    nested_http = getattr(authorized_http, "http", None)
+    if nested_http is not None and hasattr(nested_http, "timeout"):
+        return nested_http
+    if authorized_http is not None and hasattr(authorized_http, "timeout"):
+        return authorized_http
+    return None
 
 
 def is_retryable_sheets_error(error: Exception) -> bool:
@@ -84,26 +120,52 @@ def _execute_with_retry(request, operation_name: str = "Sheets API"):
     Raises:
         HttpError: If all retries are exhausted or non-retryable error occurs
     """
-    for attempt in range(MAX_RETRIES):
+    provider_deadline = _terminal_sheets_deadline_monotonic.get()
+    max_attempts = 1 if provider_deadline is not None else MAX_RETRIES
+    for attempt in range(max_attempts):
+        timeout_target = None
+        previous_timeout = None
+        if provider_deadline is not None:
+            remaining = provider_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"terminal Sheets provider deadline expired before {operation_name}"
+                )
+            timeout_target = _terminal_request_timeout_target(request)
+            if timeout_target is None:
+                raise RuntimeError(
+                    "terminal Sheets request has no timeout-capable transport"
+                )
+            previous_timeout = timeout_target.timeout
+            timeout_target.timeout = min(
+                TERMINAL_SHEETS_REQUEST_TIMEOUT_SECONDS,
+                remaining,
+            )
         try:
-            return request.execute()
+            try:
+                return request.execute()
+            finally:
+                if timeout_target is not None:
+                    timeout_target.timeout = previous_timeout
         except HttpError as e:
             if getattr(e.resp, "status", None) == 429:
+                if provider_deadline is not None:
+                    raise
                 delay = min(BASE_DELAY_SECONDS * (2 ** attempt), MAX_DELAY_SECONDS)
                 jitter = random.uniform(0, delay * 0.25)
                 total_delay = delay + jitter
 
-                if attempt < MAX_RETRIES - 1:
+                if attempt < max_attempts - 1:
                     print(
                         f"⏳ Sheets rate limit on {operation_name}, "
                         f"retrying in {total_delay:.1f}s "
-                        f"(attempt {attempt + 1}/{MAX_RETRIES})"
+                        f"(attempt {attempt + 1}/{max_attempts})"
                     )
                     time.sleep(total_delay)
                 else:
                     print(
                         f"❌ Sheets rate limit persisted for "
-                        f"{operation_name} after {MAX_RETRIES} attempts"
+                        f"{operation_name} after {max_attempts} attempts"
                     )
                     raise
             else:

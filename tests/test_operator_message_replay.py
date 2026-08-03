@@ -19,7 +19,7 @@ os.environ.setdefault(
     ),
 )
 
-from email_automation import operator_replay
+from email_automation import operator_replay, processing
 from email_automation.utils import b64url_id, normalize_message_id
 
 
@@ -354,6 +354,73 @@ class OperatorReplayContractTests(unittest.TestCase):
         _seed_valid_state(self.fs)
         self.fs.data[failure_path]["graphMessageId"] = "wrong-graph"
         self.assert_refused(message="failure")
+
+    def test_failure_ref_resolves_v2_hash_without_unsafe_graph_id_probe(self):
+        request = _request(graph_message_id="graph/resource/with/slash")
+        self.fs.data.pop(
+            (
+                "users",
+                BAYLOR_UID,
+                "processingFailures",
+                _failure_id(),
+            )
+        )
+        failure_id = processing._processing_failure_document_id(
+            request.thread_id,
+            request.internet_message_id,
+            graph_message_id=request.graph_message_id,
+            internet_message_id=request.internet_message_id,
+            source_message_key=request.internet_message_id,
+        )
+        failure_path = (
+            "users",
+            BAYLOR_UID,
+            "processingFailures",
+            failure_id,
+        )
+        self.fs.data[failure_path] = {
+            "threadId": request.thread_id,
+            "sourceMessageKey": request.internet_message_id,
+            "graphMessageId": request.graph_message_id,
+            "internetMessageId": request.internet_message_id,
+            "processingFailureIdentityKind": "graph",
+            "processingFailureIdentityKey": request.graph_message_id,
+        }
+
+        resolved = operator_replay._failure_ref(self.fs, request)
+
+        self.assertEqual(failure_id, resolved.id)
+        self.assertIn(("get", failure_path), self.fs.events)
+        probed_ids = [event[1][-1] for event in self.fs.events]
+        self.assertTrue(all("graph/resource" not in doc_id for doc_id in probed_ids))
+
+    def test_failure_ref_fails_closed_on_v2_legacy_collision(self):
+        request = _request()
+        failure_id = processing._processing_failure_document_id(
+            request.thread_id,
+            request.internet_message_id,
+            graph_message_id=request.graph_message_id,
+            internet_message_id=request.internet_message_id,
+            source_message_key=request.internet_message_id,
+        )
+        self.fs.data[
+            (
+                "users",
+                BAYLOR_UID,
+                "processingFailures",
+                failure_id,
+            )
+        ] = {
+            "threadId": request.thread_id,
+            "sourceMessageKey": request.internet_message_id,
+            "graphMessageId": request.graph_message_id,
+            "internetMessageId": request.internet_message_id,
+        }
+
+        with self.assertRaisesRegex(
+            operator_replay.ReplayRefused, "Multiple processing failures"
+        ):
+            operator_replay._failure_ref(self.fs, request)
 
     def test_legacy_asset_failure_without_graph_id_is_verified_then_backfilled_on_apply(self):
         failure_path = (

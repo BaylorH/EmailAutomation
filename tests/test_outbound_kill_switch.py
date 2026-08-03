@@ -429,6 +429,7 @@ class DirectAutoReplyKillSwitchTests(unittest.TestCase):
                     if url.endswith("/createReplyAll"):
                         return _GraphResponse(201, {
                             "id": "reply-draft-1",
+                            "subject": "RE: 100 Safety Way",
                             "toRecipients": [{
                                 "emailAddress": {"address": "broker@example.com"}
                             }],

@@ -168,12 +168,65 @@ def _processed_ref(fs_client, uid: str, message_id: str):
 
 
 def _failure_ref(fs_client, request: ReplayRequest):
-    failure_id = f"{request.thread_id}__{request.internet_message_id}"
-    return (
-        _user_ref(fs_client, request.uid)
-        .collection("processingFailures")
-        .document(failure_id)
+    # Runtime import avoids a module import cycle while sharing the canonical
+    # processing-failure identity rules with scanner/retry writers.
+    from .processing import (
+        _processing_failure_document_ids,
+        _safe_legacy_processing_failure_document_ids,
+        _validate_existing_processing_failure_identity,
     )
+
+    failures_ref = _user_ref(fs_client, request.uid).collection(
+        "processingFailures"
+    )
+    hashed_refs = [
+        failures_ref.document(doc_id)
+        for doc_id in _processing_failure_document_ids(
+            request.thread_id,
+            request.internet_message_id,
+            graph_message_id=request.graph_message_id,
+            internet_message_id=request.internet_message_id,
+            source_message_key=request.internet_message_id,
+        )
+    ]
+
+    legacy_refs = [
+        failures_ref.document(doc_id)
+        for doc_id in _safe_legacy_processing_failure_document_ids(
+            request.thread_id,
+            request.internet_message_id,
+            graph_message_id=request.graph_message_id,
+            internet_message_id=request.internet_message_id,
+            source_message_key=request.internet_message_id,
+        )
+    ]
+    existing = []
+    for ref in [*hashed_refs, *legacy_refs]:
+        snapshot = ref.get()
+        if snapshot.exists is True:
+            existing.append((ref, snapshot))
+    if len(existing) > 1:
+        raise ReplayRefused(
+            "Multiple processing failures match the exact replay identity"
+        )
+    if existing:
+        ref, snapshot = existing[0]
+        try:
+            _validate_existing_processing_failure_identity(
+                ref,
+                snapshot.to_dict() or {},
+                request.thread_id,
+                request.internet_message_id,
+                graph_message_id=request.graph_message_id,
+                internet_message_id=request.internet_message_id,
+                source_message_key=request.internet_message_id,
+            )
+        except ValueError as exc:
+            raise ReplayRefused(
+                f"Exact processing failure identity is invalid: {exc}"
+            ) from exc
+        return ref
+    return hashed_refs[0]
 
 
 def _read_required(ref, label: str) -> Dict[str, Any]:
@@ -634,7 +687,7 @@ def replay_exact_message(
                 "Sent Items shows a newer recipient continuation outside the exact thread"
             )
 
-        failure_id = f"{request.thread_id}__{request.internet_message_id}"
+        failure_id = failure_ref.id
         if apply:
             attempt_id, attempt_started_at = _begin_replay_claim(
                 fs_client,

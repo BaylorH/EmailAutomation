@@ -502,6 +502,165 @@ def move_row_below_divider(
         print(f"❌ Failed to move row below divider: {e}")
         raise
 
+
+def move_row_below_new_divider_atomic(
+    sheets,
+    spreadsheet_id: str,
+    tab_title: str,
+    src_row: int,
+    divider_row: int,
+    *,
+    notes_column_index: int,
+    notes_value: str,
+) -> int:
+    """Create the missing divider and move/note/delete in one Sheets batch.
+
+    A missing divider used to be created by a separate provider request.  If
+    that request succeeded and the later move returned 429, the enclosing
+    attempt could falsely claim that nothing applied.  Google Sheets
+    ``batchUpdate`` is atomic, so this single request is the only safe provider
+    boundary for the combined terminal effect.
+    """
+    sheet_id = _first_sheet_props(sheets, spreadsheet_id)[0]
+    header = _read_header_row2(sheets, spreadsheet_id, tab_title)
+    num_cols = max(1, len(header))
+    if (
+        isinstance(src_row, bool)
+        or not isinstance(src_row, int)
+        or isinstance(divider_row, bool)
+        or not isinstance(divider_row, int)
+        or src_row < 1
+        or divider_row <= src_row
+    ):
+        raise ValueError("source row must precede the planned missing divider")
+    if (
+        isinstance(notes_column_index, bool)
+        or not isinstance(notes_column_index, int)
+        or not 1 <= notes_column_index <= num_cols
+        or not str(notes_value or "").strip()
+    ):
+        raise ValueError("an exact Notes column and durable note are required")
+
+    notes_zero_based = notes_column_index - 1
+    requests = [
+        {
+            "updateCells": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": divider_row - 1,
+                    "endRowIndex": divider_row,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 1,
+                },
+                "rows": [{
+                    "values": [{
+                        "userEnteredValue": {"stringValue": "NON-VIABLE"}
+                    }]
+                }],
+                "fields": "userEnteredValue",
+            }
+        },
+        {
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": sheet_id,
+                        "startRowIndex": 2,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": max(26, num_cols),
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": '=$A3="NON-VIABLE"'}],
+                        },
+                        "format": {
+                            "backgroundColor": {
+                                "red": 0.8,
+                                "green": 0.0,
+                                "blue": 0.0,
+                            },
+                            "textFormat": {
+                                "bold": True,
+                                "foregroundColor": {
+                                    "red": 1.0,
+                                    "green": 1.0,
+                                    "blue": 1.0,
+                                },
+                            },
+                        },
+                    },
+                },
+                "index": 0,
+            }
+        },
+        {
+            "insertDimension": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": divider_row,
+                    "endIndex": divider_row + 1,
+                },
+                "inheritFromBefore": False,
+            }
+        },
+        {
+            "copyPaste": {
+                "source": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": src_row - 1,
+                    "endRowIndex": src_row,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols,
+                },
+                "destination": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": divider_row,
+                    "endRowIndex": divider_row + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols,
+                },
+                "pasteType": "PASTE_NORMAL",
+            }
+        },
+        {
+            "updateCells": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": divider_row,
+                    "endRowIndex": divider_row + 1,
+                    "startColumnIndex": notes_zero_based,
+                    "endColumnIndex": notes_zero_based + 1,
+                },
+                "rows": [{
+                    "values": [{
+                        "userEnteredValue": {"stringValue": str(notes_value)}
+                    }]
+                }],
+                "fields": "userEnteredValue",
+            }
+        },
+        {
+            "deleteDimension": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": src_row - 1,
+                    "endIndex": src_row,
+                }
+            }
+        },
+    ]
+    _execute_with_retry(
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
+        ),
+        "move_row_below_new_divider_atomic",
+    )
+    return divider_row
+
 def insert_property_row_above_divider(sheets, sheet_id: str, tab_title: str, values_by_header: dict) -> int:
     """
     Insert a new property row one row above the divider (or at end if no divider).

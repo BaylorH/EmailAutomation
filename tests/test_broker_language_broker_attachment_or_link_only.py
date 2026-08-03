@@ -883,6 +883,10 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
 
     def test_warning_fallback_record_uses_distinct_cleanup_key(self):
         fs = mock.MagicMock()
+        nested_document = (
+            fs.collection.return_value.document.return_value.collection.return_value.document
+        )
+        nested_document.return_value.get.return_value.exists = False
         with mock.patch.object(proc, "_fs", fs):
             self.assertTrue(
                 proc._record_ai_processing_failure(
@@ -899,16 +903,13 @@ class TestBrokenAssetGracefulDegradation(unittest.TestCase):
             )
             proc._clear_ai_processing_failure("user-1", "thread-1", "message-1")
 
-        nested_document = (
-            fs.collection.return_value.document.return_value.collection.return_value.document
-        )
         document_calls = [call.args[0] for call in nested_document.call_args_list]
         self.assertIn("thread-1__message-1__asset_warning_persistence", document_calls)
         self.assertIn("thread-1__message-1", document_calls)
-        fallback_set = nested_document.return_value.set.call_args_list[0]
+        fallback_set = fs.transaction.return_value.set.call_args_list[0]
         self.assertEqual(
             {"assetWarnings": [{"name": "dead.pdf", "error": "404"}]},
-            fallback_set.args[0]["metadata"],
+            fallback_set.args[1]["metadata"],
         )
 
     def test_asset_column_classifier_uses_default_and_custom_mappings(self):

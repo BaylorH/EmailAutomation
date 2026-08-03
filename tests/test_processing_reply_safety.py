@@ -175,6 +175,7 @@ class ProcessingReplySafetyTests(unittest.TestCase):
             if url.endswith("/createReplyAll"):
                 return FakeResponse(201, {
                     "id": "draft-1",
+                    "subject": "RE: 100 Signature Way",
                     "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
                     "ccRecipients": [],
                 })
@@ -223,7 +224,7 @@ class ProcessingReplySafetyTests(unittest.TestCase):
                      "ccRecipients": [],
                  }
              }), \
-             patch("email_automation.processing._find_recent_sent_message_for_conversation", return_value=sent_message), \
+             patch("email_automation.processing.find_exact_sent_message_by_immutable_id", return_value=sent_message), \
              patch("email_automation.messaging.index_message_id", return_value=True), \
              patch("email_automation.messaging.lookup_thread_by_message_id", return_value="thread-1"), \
              patch("email_automation.messaging.save_message"), \
@@ -252,6 +253,7 @@ class ProcessingReplySafetyTests(unittest.TestCase):
             if url.endswith("/createReplyAll"):
                 return FakeResponse(201, {
                     "id": "draft-1",
+                    "subject": "RE: 100 Optout Way",
                     "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
                     "ccRecipients": [],
                 })
@@ -302,6 +304,165 @@ class ProcessingReplySafetyTests(unittest.TestCase):
             processing.send_reply_in_thread.last_outcome,
         )
         self.assertIn("opted out", processing.send_reply_in_thread.last_error.lower())
+        delete_draft.assert_called_once()
+        self.assertEqual("draft-1", delete_draft.call_args.args[1])
+
+    def test_send_reply_without_capability_deletes_draft_when_no_safe_recipients_remain(self):
+        post_urls = []
+
+        def fake_post(url, **_kwargs):
+            post_urls.append(url)
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "draft-1",
+                    "subject": "RE: 100 No Safe Recipient Way",
+                    "toRecipients": [{
+                        "emailAddress": {
+                            "address": "bp21harrison@gmail.com",
+                        },
+                    }],
+                    "ccRecipients": [],
+                })
+            raise AssertionError(f"Unexpected POST {url}")
+
+        current_meta = {
+            "conversationId": "conversation-1",
+            "subject": "RE: 100 No Safe Recipient Way",
+        }
+        recipient_result = {
+            "payload": {"toRecipients": [], "ccRecipients": []},
+            "skipped": {},
+        }
+
+        with patch.dict(os.environ, {"SITESIFT_AUTO_REPLY_ALLOWLIST": "uid-1"}), \
+             patch.object(processing, "get_client_automation_decision", return_value=CampaignAutomationDecision(
+                 state="allow", reason="", client_data={"status": "live"},
+                 metadata={"terminal": False, "stopKind": "none"},
+             )), \
+             patch("email_automation.clients._fs", FakeFirestore({
+                 "email": "baylor.freelance@outlook.com",
+             })), \
+             patch("requests.get", return_value=FakeResponse(200, current_meta)), \
+             patch("requests.post", side_effect=fake_post), \
+             patch("requests.patch", side_effect=AssertionError("Unsafe reply must not be patched")), \
+             patch("email_automation.email._hydrate_reply_all_draft_recipients", side_effect=lambda _headers, draft, base=None: draft), \
+             patch("email_automation.email._source_message_reply_all_fallback", side_effect=lambda draft, _current_meta: draft), \
+             patch("email_automation.email._reviewed_recipient_reply_all_fallback", side_effect=lambda draft, to_emails=None: draft), \
+             patch("email_automation.email._filter_reply_all_draft_recipients", return_value=recipient_result), \
+             patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
+            sent = processing.send_reply_in_thread(
+                user_id="uid-1",
+                headers={"Authorization": "Bearer token"},
+                body="Hi Avery,\n\nThanks for the update.",
+                current_msg_id="message-1",
+                recipient="bp21harrison@gmail.com",
+                thread_id="thread-1",
+            )
+
+        self.assertFalse(sent)
+        self.assertEqual("send_failed", processing.send_reply_in_thread.last_outcome)
+        self.assertIn("no safe", processing.send_reply_in_thread.last_error.lower())
+        self.assertEqual(1, len(post_urls))
+        self.assertTrue(post_urls[0].endswith("/createReplyAll"))
+        self.assertFalse(any(url.endswith("/send") for url in post_urls))
+        delete_draft.assert_called_once()
+        self.assertEqual("draft-1", delete_draft.call_args.args[1])
+
+    def test_send_reply_without_capability_deletes_draft_at_final_campaign_gate(self):
+        post_urls = []
+        patch_urls = []
+        decision_calls = 0
+        allow = CampaignAutomationDecision(
+            state="allow",
+            reason="",
+            client_data={"status": "live"},
+            metadata={"terminal": False, "stopKind": "none"},
+        )
+        deny = CampaignAutomationDecision(
+            state="blocked",
+            reason="campaign_stopped_after_draft",
+            client_data={"status": "stopped"},
+            metadata={"terminal": True, "stopKind": "terminal_stop"},
+        )
+
+        def campaign_decision(*_args, **_kwargs):
+            nonlocal decision_calls
+            decision_calls += 1
+            return deny if decision_calls > 1 else allow
+
+        def fake_post(url, **_kwargs):
+            post_urls.append(url)
+            if url.endswith("/createReplyAll"):
+                return FakeResponse(201, {
+                    "id": "draft-1",
+                    "subject": "RE: 100 Final Campaign Gate Way",
+                    "toRecipients": [{
+                        "emailAddress": {
+                            "address": "bp21harrison@gmail.com",
+                        },
+                    }],
+                    "ccRecipients": [],
+                })
+            raise AssertionError(f"Unexpected POST {url}")
+
+        def fake_patch(url, **_kwargs):
+            patch_urls.append(url)
+            return FakeResponse(204, {})
+
+        current_meta = {
+            "conversationId": "conversation-1",
+            "subject": "RE: 100 Final Campaign Gate Way",
+        }
+        recipient_result = {
+            "payload": {
+                "toRecipients": [{
+                    "emailAddress": {
+                        "address": "bp21harrison@gmail.com",
+                    },
+                }],
+                "ccRecipients": [],
+            },
+            "skipped": {},
+        }
+
+        with patch.dict(os.environ, {"SITESIFT_AUTO_REPLY_ALLOWLIST": "uid-1"}), \
+             patch.object(processing, "get_client_automation_decision", side_effect=campaign_decision), \
+             patch.object(processing, "resolve_outbound_mode", return_value="live"), \
+             patch("email_automation.clients._fs", FakeFirestore({
+                 "email": "baylor.freelance@outlook.com",
+             })), \
+             patch("requests.get", return_value=FakeResponse(200, current_meta)), \
+             patch("requests.post", side_effect=fake_post), \
+             patch("requests.patch", side_effect=fake_patch), \
+             patch("email_automation.email._hydrate_reply_all_draft_recipients", side_effect=lambda _headers, draft, base=None: draft), \
+             patch("email_automation.email._source_message_reply_all_fallback", side_effect=lambda draft, _current_meta: draft), \
+             patch("email_automation.email._reviewed_recipient_reply_all_fallback", side_effect=lambda draft, to_emails=None: draft), \
+             patch("email_automation.email._filter_reply_all_draft_recipients", return_value=recipient_result), \
+             patch("email_automation.email._delete_graph_reply_draft") as delete_draft:
+            sent = processing.send_reply_in_thread(
+                user_id="uid-1",
+                headers={"Authorization": "Bearer token"},
+                body="Hi Avery,\n\nThanks for the update.",
+                current_msg_id="message-1",
+                recipient="bp21harrison@gmail.com",
+                thread_id="thread-1",
+            )
+
+        self.assertFalse(sent)
+        self.assertEqual(
+            "blocked_campaign_terminal",
+            processing.send_reply_in_thread.last_outcome,
+        )
+        self.assertIn(
+            "campaign_stopped_after_draft",
+            processing.send_reply_in_thread.last_error,
+        )
+        self.assertEqual(2, decision_calls)
+        self.assertEqual(1, len(patch_urls))
+        self.assertTrue(patch_urls[0].endswith("/me/messages/draft-1"))
+        self.assertEqual(1, len(post_urls))
+        self.assertTrue(post_urls[0].endswith("/createReplyAll"))
+        self.assertFalse(any(url.endswith("/send") for url in post_urls))
         delete_draft.assert_called_once()
         self.assertEqual("draft-1", delete_draft.call_args.args[1])
 

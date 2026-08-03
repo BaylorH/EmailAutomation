@@ -655,6 +655,7 @@ class InboxAutoReplyWrongRecipientTests(unittest.TestCase):
                 # recipient and a legitimate one.
                 return _FakeResponse(201, {
                     "id": "reply-draft-w",
+                    "subject": "RE: 200 Market St",
                     "toRecipients": [
                         {"emailAddress": {"address": wrong_recipient}},
                         {"emailAddress": {"address": good_recipient}},
@@ -697,7 +698,7 @@ class InboxAutoReplyWrongRecipientTests(unittest.TestCase):
                 patch.object(processing.requests, "patch", side_effect=fake_patch), \
                 patch.object(processing.requests, "delete", side_effect=fake_delete), \
                 patch.object(processing.time, "sleep", return_value=None), \
-                patch.object(processing, "_find_recent_sent_message_for_conversation", return_value=sent_message), \
+                patch.object(processing, "find_exact_sent_message_by_immutable_id", return_value=sent_message), \
                 patch("email_automation.messaging.index_message_id", return_value=True), \
                 patch("email_automation.messaging.lookup_thread_by_message_id", return_value="thread-w"), \
                 patch("email_automation.messaging.index_conversation_id", return_value=True), \
@@ -758,6 +759,7 @@ class InboxAutoReplyWrongRecipientTests(unittest.TestCase):
             if url.endswith("/createReplyAll"):
                 return _FakeResponse(201, {
                     "id": "reply-draft-stop",
+                    "subject": "RE: 200 Market St",
                     "toRecipients": [{"emailAddress": {"address": "bp21harrison@gmail.com"}}],
                     "ccRecipients": [],
                 })

@@ -1,11 +1,65 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from email_automation import ai_processing, processing
 from email_automation.column_config import get_default_column_config
 
 
 class ProcessingCompletionGuardTests(unittest.TestCase):
+    def test_terminal_ambiguous_send_review_is_tri_state_server_protocol_work(self):
+        firestore = MagicMock()
+        user_ref = MagicMock()
+        reviews_ref = MagicMock()
+        review_ref = MagicMock()
+        firestore.collection.return_value.document.return_value = user_ref
+        user_ref.collection.return_value = reviews_ref
+        reviews_ref.document.return_value = review_ref
+        saga = {
+            "sagaKey": "saga-1",
+            "sourceGraphMessageId": "graph-source-1",
+            "sourceConversationId": "conversation-1",
+            "replyRecipient": "broker@example.test",
+            "responseBody": "Thanks for the update.",
+            "clientId": "client-1",
+        }
+        permit = {
+            "permitId": "permit-1",
+            "immutableHash": "permit-hash-1",
+            "sendPreparedEnvelopeHash": "envelope-hash-1",
+        }
+
+        with patch.object(processing, "_fs", firestore):
+            actual_ref, payload = processing._terminal_reply_reconciliation_document(
+                "uid-1",
+                "thread-1",
+                saga,
+                permit,
+                kind="send_needs_reconciliation",
+                already_sent=None,
+                provider_send_started=True,
+                reason="Graph /send outcome was not authoritative",
+            )
+
+            with self.assertRaises(processing.RetryableProcessingError):
+                processing._terminal_reply_reconciliation_document(
+                    "uid-1",
+                    "thread-1",
+                    saga,
+                    permit,
+                    kind="send_needs_reconciliation",
+                    already_sent=False,
+                    provider_send_started=True,
+                    reason="must stay unknown",
+                )
+
+        self.assertIs(review_ref, actual_ref)
+        user_ref.collection.assert_called_with("terminalGraphSendReviews")
+        self.assertEqual("terminalGraphSendProtocol", payload["source"])
+        self.assertTrue(payload["authoritative"])
+        self.assertIsNone(payload["alreadySent"])
+        self.assertTrue(payload["sendOutcomeUnknown"])
+        self.assertFalse(payload["retryAllowed"])
+
     def test_close_event_defers_campaign_completion_for_pending_closing_reply(self):
         proposal = {
             "response_email": "Hi,\n\nThanks for the details.",
@@ -773,6 +827,8 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             outbox_ref=outbox_ref,
             pending_responses_ref=FakeQuery([]),
             dead_letter_ref=FakeQuery([]),
+            terminal_graph_reviews_ref=FakeQuery([]),
+            pending_draft_reviews_ref=FakeQuery([]),
         )
 
         self.assertTrue(completed)
@@ -784,6 +840,9 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
                 "pendingOutbox": 0,
                 "pendingResponses": 0,
                 "unresolvedDeadLetters": 0,
+                "unresolvedTerminalProtocolThreads": 0,
+                "unresolvedTerminalGraphReviews": 0,
+                "unresolvedPendingDraftReviews": 0,
                 "currentActions": 0,
             },
             client_ref._data["completionSummary"],
@@ -843,10 +902,94 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             outbox_ref=FakeQuery([]),
             pending_responses_ref=FakeQuery([]),
             dead_letter_ref=FakeQuery([]),
+            terminal_graph_reviews_ref=FakeQuery([]),
+            pending_draft_reviews_ref=FakeQuery([]),
         )
 
         self.assertFalse(completed)
         self.assertEqual([], client_ref.set_calls)
+
+    def test_resolved_pending_pointer_does_not_block_no_reply_terminal_completion(self):
+        class FakeDoc:
+            def __init__(self, doc_id, data=None):
+                self.id = doc_id
+                self._data = dict(data or {})
+                self.reference = object()
+                self.set_calls = []
+
+            def to_dict(self):
+                return dict(self._data)
+
+            def get(self):
+                data = dict(self._data)
+
+                class Snapshot:
+                    exists = True
+
+                    def to_dict(inner_self):
+                        return dict(data)
+
+                return Snapshot()
+
+            def set(self, payload, merge=False):
+                self.set_calls.append((payload, merge))
+                self._data.update(payload)
+
+        class FakeQuery:
+            def __init__(self, docs):
+                self.docs = list(docs)
+                self.filters = []
+
+            def where(self, *, filter):
+                self.filters.append(filter)
+                return self
+
+            def stream(self):
+                docs = self.docs
+                for field_filter in self.filters:
+                    docs = [
+                        doc for doc in docs
+                        if doc.to_dict().get(field_filter.field_path)
+                        == field_filter.value
+                    ]
+                return docs
+
+        client_ref = FakeDoc("client-1", {"status": "live"})
+        thread_doc = FakeDoc("thread-1", {
+            "clientId": "client-1",
+            "status": "completed",
+            "responseScenario": "none",
+            "activeGraphSendPermit": {
+                "version": 1,
+                "permitId": "prior-pending-permit",
+                "permitImmutableHash": "prior-pending-hash",
+            },
+        })
+
+        with patch.object(
+            processing,
+            "read_active_graph_send_permit",
+            return_value={
+                "status": "settled_sent",
+                "issuerKind": "pending_response",
+            },
+        ) as read_permit:
+            completed = processing._maybe_mark_client_completed(
+                "uid-1",
+                "client-1",
+                client_ref=client_ref,
+                threads_ref=FakeQuery([thread_doc]),
+                notifications_ref=FakeQuery([]),
+                outbox_ref=FakeQuery([]),
+                pending_responses_ref=FakeQuery([]),
+                dead_letter_ref=FakeQuery([]),
+                terminal_graph_reviews_ref=FakeQuery([]),
+                pending_draft_reviews_ref=FakeQuery([]),
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual("completed", client_ref._data["status"])
+        read_permit.assert_called_once_with(thread_doc.reference, thread_doc.to_dict())
 
     def test_does_not_overwrite_stopped_client_as_completed(self):
         class FakeDoc:
@@ -900,6 +1043,8 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             outbox_ref=FakeQuery([]),
             pending_responses_ref=FakeQuery([]),
             dead_letter_ref=FakeQuery([]),
+            terminal_graph_reviews_ref=FakeQuery([]),
+            pending_draft_reviews_ref=FakeQuery([]),
         )
 
         self.assertFalse(completed)
@@ -962,6 +1107,8 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             outbox_ref=FakeQuery([]),
             pending_responses_ref=FakeQuery([]),
             dead_letter_ref=FakeQuery([]),
+            terminal_graph_reviews_ref=FakeQuery([]),
+            pending_draft_reviews_ref=FakeQuery([]),
         ))
         self.assertEqual([], with_action.set_calls)
 
@@ -977,6 +1124,8 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
             ]),
             pending_responses_ref=FakeQuery([]),
             dead_letter_ref=FakeQuery([]),
+            terminal_graph_reviews_ref=FakeQuery([]),
+            pending_draft_reviews_ref=FakeQuery([]),
         ))
         self.assertEqual([], with_outbox.set_calls)
 
@@ -992,6 +1141,8 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
                 FakeDoc("pending-1", {"clientId": "client-1", "status": "queued"}),
             ]),
             dead_letter_ref=FakeQuery([]),
+            terminal_graph_reviews_ref=FakeQuery([]),
+            pending_draft_reviews_ref=FakeQuery([]),
         ))
         self.assertEqual([], with_pending_reply.set_calls)
 
@@ -1011,6 +1162,8 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
                     "alreadySent": True,
                 }),
             ]),
+            terminal_graph_reviews_ref=FakeQuery([]),
+            pending_draft_reviews_ref=FakeQuery([]),
         ))
         self.assertEqual([], with_reconciliation.set_calls)
 
@@ -1030,8 +1183,44 @@ class ProcessingCompletionGuardTests(unittest.TestCase):
                     "alreadySent": True,
                 }),
             ]),
+            terminal_graph_reviews_ref=FakeQuery([]),
+            pending_draft_reviews_ref=FakeQuery([]),
         ))
         self.assertEqual("completed", with_resolved_reconciliation._data["status"])
+
+        terminal_protocol_thread = FakeQuery([
+            FakeDoc("thread-1", {
+                "clientId": "client-1",
+                "status": "stopped",
+                "terminalReplyOwed": True,
+                "terminalSagaKey": "saga-1",
+            }),
+        ])
+        with_terminal_protocol_review = FakeDoc("client-1", {"status": "live"})
+        self.assertFalse(processing._maybe_mark_client_completed(
+            "uid-1",
+            "client-1",
+            client_ref=with_terminal_protocol_review,
+            threads_ref=terminal_protocol_thread,
+            notifications_ref=FakeQuery([]),
+            outbox_ref=FakeQuery([]),
+            pending_responses_ref=FakeQuery([]),
+            dead_letter_ref=FakeQuery([
+                FakeDoc("generic-dead-1", {
+                    "clientId": "client-1",
+                    "status": "discarded",
+                }),
+            ]),
+            terminal_graph_reviews_ref=FakeQuery([
+                FakeDoc("terminal-review-1", {
+                    "clientId": "client-1",
+                    "status": "needs_reconciliation",
+                    "source": "terminalGraphSendProtocol",
+                }),
+            ]),
+            pending_draft_reviews_ref=FakeQuery([]),
+        ))
+        self.assertEqual([], with_terminal_protocol_review.set_calls)
 
     def test_deterministic_rent_fallback_extracts_asking_rent_not_nnn(self):
         value = ai_processing._extract_rent_sf_yr_from_text(

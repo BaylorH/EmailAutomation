@@ -4,17 +4,20 @@ import hashlib
 import json
 import time
 import logging
+import copy
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 import os
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
-from urllib.parse import quote
+from uuid import uuid4
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter
+from googleapiclient.errors import HttpError
 
 from .clients import _fs, _get_sheet_id_or_fail, _get_client_config, _sheets_client
 from .sheets import AssetLinkWriteError, format_sheet_columns_autosize_with_exceptions, _get_first_tab_title, _read_header_row2, append_links_to_flyer_link_column, append_links_to_floorplan_column, write_property_image_columns, is_floorplan_filename, _header_index_map, _find_row_by_email, clear_row_highlight, highlight_row, ROW_HIGHLIGHT_BLUE, _execute_with_retry, _col_letter
-from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move, stop_threads_for_row, complete_threads_for_row
+from .sheets import terminal_sheets_provider_window
+from .sheet_operations import _find_row_by_anchor, ensure_nonviable_divider, move_row_below_divider, move_row_below_new_divider_atomic, insert_property_row_above_divider, _is_row_below_nonviable, sync_thread_row_numbers_after_move, stop_threads_for_row, complete_threads_for_row
 from .messaging import (save_message, save_thread_root, index_message_id, index_conversation_id,
                        dump_thread_from_firestore, has_processed, mark_processed, set_last_scan_iso,
                        lookup_thread_by_message_id, lookup_thread_by_conversation_id,
@@ -64,6 +67,7 @@ from .tour_scheduling import (
 from .outbound_safety import validate_outbound_body
 from .email import (
     OUTBOUND_MODE_LIVE,
+    _graph_message_path_segment,
     _kill_switch_suppressed,
     resolve_outbound_mode,
 )
@@ -72,9 +76,40 @@ from .utils import (exponential_backoff_request, strip_html_tags, safe_preview,
                    format_email_body_with_footer, strip_email_quotes, strip_outbound_body_signoff,
                    b64url_id)
 from .pending_responses import queue_pending_response, record_sent_unindexed_response
+from .send_permits import (
+    GRAPH_SEND_RESOLVED_STATUSES,
+    RESOLVED_PENDING_DRAFT_REVIEW_STATUSES,
+    RESOLVED_TERMINAL_GRAPH_REVIEW_STATUSES,
+    GraphSendPermitBlocked,
+    GraphSendPermitLocalRetryable,
+    assert_terminal_reply_permit_settled,
+    assert_terminal_staging_allowed,
+    begin_graph_draft_attachment,
+    begin_graph_draft_creation,
+    begin_graph_draft_patch,
+    cas_terminal_reply_transition as _cas_graph_terminal_reply_transition,
+    complete_graph_draft_attachment,
+    complete_graph_draft_creation,
+    complete_graph_draft_patch,
+    consume_graph_send_capability,
+    finalize_graph_draft_preparation,
+    graph_send_permit_blocks_new_send,
+    expired_graph_send_pre_send_recovery_kind,
+    issue_terminal_graph_send_permit,
+    read_active_graph_send_permit,
+    read_active_terminal_reply_permit,
+    read_permit,
+    resolve_graph_send_permit,
+    validate_unissued_terminal_reply_attempt,
+    validate_graph_draft_attachment_plan,
+)
 from .sent_mail_guard import (
     SentMailGuardLookupError,
+    find_exact_sent_message_by_immutable_id,
+    find_matching_sent_message_for_retry,
     find_sent_conversation_continuation_for_retry,
+    graph_headers_with_immutable_id,
+    sent_after_from_retry_data,
 )
 from .app_config import INBOX_SCAN_WINDOW_HOURS
 from .column_config import (
@@ -100,6 +135,7 @@ from .system_health import RESOLVED_DEAD_LETTER_STATUSES
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass(frozen=True)
 class ReplySendOutcome:
     error: Optional[str] = None
@@ -110,6 +146,7 @@ class ReplySendOutcome:
     send_attempt_at: Optional[datetime] = None
     campaign_decision: Optional[Any] = None
     campaign_suppression_kind: Optional[str] = None
+    exact_sent_evidence: Optional[Dict[str, Any]] = None
 
 
 _REPLY_SEND_OUTCOME = ContextVar("reply_send_outcome", default=ReplySendOutcome())
@@ -152,6 +189,7 @@ def _mirror_reply_send_outcome(outcome: ReplySendOutcome) -> None:
     send_reply_in_thread.last_conversation_id = outcome.conversation_id
     send_reply_in_thread.last_send_attempt_at = outcome.send_attempt_at
     send_reply_in_thread.last_campaign_decision = outcome.campaign_decision
+    send_reply_in_thread.last_exact_sent_evidence = outcome.exact_sent_evidence
 
 
 def _set_reply_send_outcome(**changes) -> ReplySendOutcome:
@@ -544,6 +582,361 @@ def _find_recent_sent_message_for_conversation(
     return None
 
 
+PROCESSING_FAILURE_SCHEMA_VERSION = 2
+PROCESSING_FAILURE_DOC_PREFIX = "processing-failure-v2-"
+FIRESTORE_DOCUMENT_ID_MAX_BYTES = 1500
+
+
+def _clean_processing_failure_identity_value(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _processing_failure_identity(
+    thread_id: str,
+    message_id: Optional[str] = None,
+    *,
+    graph_message_id: Optional[str] = None,
+    internet_message_id: Optional[str] = None,
+    source_message_key: Optional[str] = None,
+    processing_failure_identity_key: Optional[str] = None,
+    processing_failure_identity_kind: Optional[str] = None,
+) -> Dict[str, Any]:
+    clean_thread_id = _clean_processing_failure_identity_value(thread_id)
+    clean_message_id = _clean_processing_failure_identity_value(message_id)
+    clean_graph_message_id = _clean_processing_failure_identity_value(
+        graph_message_id
+    )
+    clean_internet_message_id = _clean_processing_failure_identity_value(
+        internet_message_id
+    )
+    clean_source_message_key = _clean_processing_failure_identity_value(
+        source_message_key
+    )
+    clean_identity_key = _clean_processing_failure_identity_value(
+        processing_failure_identity_key
+    )
+    clean_identity_kind = _clean_processing_failure_identity_value(
+        processing_failure_identity_kind
+    ).lower()
+    if not clean_source_message_key:
+        clean_source_message_key = (
+            clean_message_id
+            or clean_internet_message_id
+            or clean_graph_message_id
+        )
+    if not clean_thread_id or not clean_source_message_key:
+        raise ValueError(
+            "Processing failure identity requires threadId and sourceMessageKey"
+        )
+    if not clean_internet_message_id and (
+        clean_message_id.startswith("<") and clean_message_id.endswith(">")
+    ):
+        clean_internet_message_id = clean_message_id
+    if not clean_identity_key:
+        if clean_graph_message_id:
+            clean_identity_kind = "graph"
+            clean_identity_key = clean_graph_message_id
+        elif clean_internet_message_id:
+            clean_identity_kind = "internet"
+            clean_identity_key = clean_internet_message_id
+        else:
+            clean_identity_kind = "source"
+            clean_identity_key = clean_source_message_key
+    if clean_identity_kind not in {"graph", "internet", "source"}:
+        raise ValueError("Processing failure identity kind is invalid")
+    return {
+        "processingFailureSchemaVersion": PROCESSING_FAILURE_SCHEMA_VERSION,
+        "threadId": clean_thread_id,
+        "sourceMessageKey": clean_source_message_key,
+        "graphMessageId": clean_graph_message_id or None,
+        "internetMessageId": clean_internet_message_id or None,
+        "processingFailureIdentityKind": clean_identity_kind,
+        "processingFailureIdentityKey": clean_identity_key,
+    }
+
+
+def _processing_failure_document_id(
+    thread_id: str,
+    message_id: Optional[str] = None,
+    *,
+    graph_message_id: Optional[str] = None,
+    internet_message_id: Optional[str] = None,
+    source_message_key: Optional[str] = None,
+    record_key_suffix: Optional[str] = None,
+    processing_failure_identity_key: Optional[str] = None,
+    processing_failure_identity_kind: Optional[str] = None,
+) -> str:
+    identity = _processing_failure_identity(
+        thread_id,
+        message_id,
+        graph_message_id=graph_message_id,
+        internet_message_id=internet_message_id,
+        source_message_key=source_message_key,
+        processing_failure_identity_key=processing_failure_identity_key,
+        processing_failure_identity_kind=processing_failure_identity_kind,
+    )
+    digest_payload = {
+        "processingFailureSchemaVersion": PROCESSING_FAILURE_SCHEMA_VERSION,
+        "threadId": identity["threadId"],
+        "processingFailureIdentityKind": identity[
+            "processingFailureIdentityKind"
+        ],
+        "processingFailureIdentityKey": identity["processingFailureIdentityKey"],
+        "recordKeySuffix": (
+            _clean_processing_failure_identity_value(record_key_suffix) or None
+        ),
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            digest_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"{PROCESSING_FAILURE_DOC_PREFIX}{digest}"
+
+
+def _processing_failure_document_ids(
+    thread_id: str,
+    message_id: Optional[str] = None,
+    *,
+    graph_message_id: Optional[str] = None,
+    internet_message_id: Optional[str] = None,
+    source_message_key: Optional[str] = None,
+    record_key_suffix: Optional[str] = None,
+    processing_failure_identity_key: Optional[str] = None,
+    processing_failure_identity_kind: Optional[str] = None,
+) -> List[str]:
+    """Return primary then compatibility v2 IDs for all exact typed aliases."""
+    identity = _processing_failure_identity(
+        thread_id,
+        message_id,
+        graph_message_id=graph_message_id,
+        internet_message_id=internet_message_id,
+        source_message_key=source_message_key,
+        processing_failure_identity_key=processing_failure_identity_key,
+        processing_failure_identity_kind=processing_failure_identity_kind,
+    )
+    pairs = []
+
+    def add(kind: str, value: Any) -> None:
+        clean_value = _clean_processing_failure_identity_value(value)
+        pair = (kind, clean_value)
+        if clean_value and pair not in pairs:
+            pairs.append(pair)
+
+    add(
+        identity["processingFailureIdentityKind"],
+        identity["processingFailureIdentityKey"],
+    )
+    add("graph", identity.get("graphMessageId"))
+    add("internet", identity.get("internetMessageId"))
+    add("source", identity.get("sourceMessageKey"))
+    # Compatibility for early v2 records created before typed aliases were
+    # known: their resource/RFC value may have been classified as `source`.
+    add("source", graph_message_id)
+    add("source", internet_message_id)
+    add("source", message_id)
+    return [
+        _processing_failure_document_id(
+            thread_id,
+            message_id,
+            graph_message_id=graph_message_id,
+            internet_message_id=internet_message_id,
+            source_message_key=source_message_key,
+            record_key_suffix=record_key_suffix,
+            processing_failure_identity_key=value,
+            processing_failure_identity_kind=kind,
+        )
+        for kind, value in pairs
+    ]
+
+
+def _safe_legacy_processing_failure_document_ids(
+    thread_id: str,
+    message_id: Optional[str] = None,
+    *,
+    graph_message_id: Optional[str] = None,
+    internet_message_id: Optional[str] = None,
+    source_message_key: Optional[str] = None,
+    record_key_suffix: Optional[str] = None,
+) -> List[str]:
+    """Return only legacy IDs that are safe to hand to Firestore.document()."""
+    clean_thread_id = _clean_processing_failure_identity_value(thread_id)
+    if not clean_thread_id:
+        return []
+    safe_suffix = re.sub(
+        r"[^A-Za-z0-9_-]+",
+        "_",
+        _clean_processing_failure_identity_value(record_key_suffix),
+    ).strip("_")
+    candidates = []
+    for value in (
+        source_message_key,
+        message_id,
+        internet_message_id,
+        graph_message_id,
+    ):
+        clean_value = _clean_processing_failure_identity_value(value)
+        if clean_value and clean_value not in candidates:
+            candidates.append(clean_value)
+
+    safe_ids = []
+    for candidate in candidates:
+        doc_id = f"{clean_thread_id}__{candidate}"
+        if safe_suffix:
+            doc_id = f"{doc_id}__{safe_suffix}"
+        if (
+            doc_id in {".", ".."}
+            or "/" in doc_id
+            or len(doc_id.encode("utf-8")) > FIRESTORE_DOCUMENT_ID_MAX_BYTES
+        ):
+            continue
+        if doc_id not in safe_ids:
+            safe_ids.append(doc_id)
+    return safe_ids
+
+
+def _validate_existing_processing_failure_identity(
+    ref: Any,
+    data: Dict[str, Any],
+    thread_id: str,
+    message_id: Optional[str] = None,
+    *,
+    graph_message_id: Optional[str] = None,
+    internet_message_id: Optional[str] = None,
+    source_message_key: Optional[str] = None,
+    record_key_suffix: Optional[str] = None,
+) -> None:
+    """Reject a candidate whose stored identity does not match its path/request."""
+    if not isinstance(data, dict):
+        raise ValueError("Processing failure record is malformed")
+    requested = _processing_failure_identity(
+        thread_id,
+        message_id,
+        graph_message_id=graph_message_id,
+        internet_message_id=internet_message_id,
+        source_message_key=source_message_key,
+    )
+    stored_thread_id = _clean_processing_failure_identity_value(
+        data.get("threadId")
+    )
+    if stored_thread_id != requested["threadId"]:
+        raise ValueError("Processing failure record threadId does not match its path")
+
+    stored_source_message_key = _clean_processing_failure_identity_value(
+        data.get("sourceMessageKey") or data.get("messageId")
+    )
+    requested_aliases = {
+        _clean_processing_failure_identity_value(value)
+        for value in (
+            requested.get("sourceMessageKey"),
+            requested.get("graphMessageId"),
+            requested.get("internetMessageId"),
+            message_id,
+        )
+        if _clean_processing_failure_identity_value(value)
+    }
+    if (
+        not stored_source_message_key
+        or stored_source_message_key not in requested_aliases
+    ):
+        raise ValueError(
+            "Processing failure record source identity does not match the request"
+        )
+
+    stored_graph_message_id = _clean_processing_failure_identity_value(
+        data.get("graphMessageId")
+    )
+    stored_internet_message_id = _clean_processing_failure_identity_value(
+        data.get("internetMessageId")
+    )
+    if (
+        stored_graph_message_id
+        and requested.get("graphMessageId")
+        and stored_graph_message_id != requested["graphMessageId"]
+    ):
+        raise ValueError(
+            "Processing failure Graph message identity is contradictory"
+        )
+    if (
+        stored_internet_message_id
+        and requested.get("internetMessageId")
+        and stored_internet_message_id != requested["internetMessageId"]
+    ):
+        raise ValueError("Processing failure internet identity is contradictory")
+
+    ref_id = _clean_processing_failure_identity_value(getattr(ref, "id", None))
+    is_v2 = bool(
+        re.fullmatch(rf"{re.escape(PROCESSING_FAILURE_DOC_PREFIX)}[0-9a-f]{{64}}", ref_id)
+    )
+    if is_v2:
+        stored_identity_kind = _clean_processing_failure_identity_value(
+            data.get("processingFailureIdentityKind")
+        ).lower()
+        stored_identity_key = _clean_processing_failure_identity_value(
+            data.get("processingFailureIdentityKey")
+        )
+        if (
+            stored_identity_kind not in {"graph", "internet", "source"}
+            or not stored_identity_key
+        ):
+            raise ValueError("Processing failure v2 identity metadata is malformed")
+        if (
+            stored_identity_kind == "graph"
+            and stored_identity_key != stored_graph_message_id
+        ):
+            raise ValueError(
+                "Processing failure v2 Graph key does not match its stored Graph alias"
+            )
+        if (
+            stored_identity_kind == "internet"
+            and stored_identity_key != stored_internet_message_id
+        ):
+            raise ValueError(
+                "Processing failure v2 internet key does not match its stored internet alias"
+            )
+        if stored_identity_kind == "source" and stored_identity_key not in {
+            value
+            for value in (
+                stored_source_message_key,
+                stored_graph_message_id,
+                stored_internet_message_id,
+            )
+            if value
+        }:
+            raise ValueError(
+                "Processing failure v2 source key does not match a stored source alias"
+            )
+        expected_ref_id = _processing_failure_document_id(
+            stored_thread_id,
+            stored_source_message_key,
+            graph_message_id=stored_graph_message_id,
+            internet_message_id=stored_internet_message_id,
+            source_message_key=stored_source_message_key,
+            record_key_suffix=record_key_suffix,
+            processing_failure_identity_key=stored_identity_key,
+            processing_failure_identity_kind=stored_identity_kind,
+        )
+        if ref_id != expected_ref_id:
+            raise ValueError(
+                "Processing failure v2 identity metadata does not match its path"
+            )
+        return
+
+    expected_legacy_ids = _safe_legacy_processing_failure_document_ids(
+        stored_thread_id,
+        stored_source_message_key,
+        graph_message_id=stored_graph_message_id,
+        internet_message_id=stored_internet_message_id,
+        source_message_key=stored_source_message_key,
+        record_key_suffix=record_key_suffix,
+    )
+    if ref_id not in expected_legacy_ids:
+        raise ValueError("Legacy processing failure identity does not match its path")
+
+
 def _record_ai_processing_failure(
     user_id: str,
     client_id: str,
@@ -555,43 +948,179 @@ def _record_ai_processing_failure(
     recovery_status: Optional[str] = None,
     record_key_suffix: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    graph_message_id: Optional[str] = None,
+    internet_message_id: Optional[str] = None,
+    source_message_key: Optional[str] = None,
+    extra_fields: Optional[Dict[str, Any]] = None,
 ) -> bool:
     try:
-        doc_id = f"{thread_id}__{message_id or int(time.time())}"
-        if record_key_suffix:
-            safe_suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", record_key_suffix).strip("_")
-            if safe_suffix:
-                doc_id = f"{doc_id}__{safe_suffix}"
+        identity = _processing_failure_identity(
+            thread_id,
+            message_id,
+            graph_message_id=graph_message_id,
+            internet_message_id=internet_message_id,
+            source_message_key=source_message_key,
+        )
+        hashed_doc_ids = _processing_failure_document_ids(
+            thread_id,
+            message_id,
+            graph_message_id=graph_message_id,
+            internet_message_id=internet_message_id,
+            source_message_key=source_message_key,
+            record_key_suffix=record_key_suffix,
+        )
+        legacy_doc_ids = _safe_legacy_processing_failure_document_ids(
+            thread_id,
+            message_id,
+            graph_message_id=graph_message_id,
+            internet_message_id=internet_message_id,
+            source_message_key=source_message_key,
+            record_key_suffix=record_key_suffix,
+        )
+        failures_ref = (
+            _fs.collection("users")
+            .document(user_id)
+            .collection("processingFailures")
+        )
+        hashed_refs = [
+            failures_ref.document(doc_id) for doc_id in hashed_doc_ids
+        ]
+        legacy_refs = [failures_ref.document(doc_id) for doc_id in legacy_doc_ids]
+        transaction = _fs.transaction()
+        hashed_snapshots = [
+            ref.get(transaction=transaction) for ref in hashed_refs
+        ]
+        legacy_snapshots = [
+            ref.get(transaction=transaction) for ref in legacy_refs
+        ]
+        existing_hashed = [
+            (ref, snapshot)
+            for ref, snapshot in zip(hashed_refs, hashed_snapshots)
+            if getattr(snapshot, "exists", False)
+        ]
+        existing_legacy = [
+            (ref, snapshot)
+            for ref, snapshot in zip(legacy_refs, legacy_snapshots)
+            if getattr(snapshot, "exists", False)
+        ]
+        existing_matches = [*existing_hashed, *existing_legacy]
+        if len(existing_matches) > 1:
+            raise ValueError(
+                "Multiple processing failure records match the exact identity"
+            )
+        if existing_matches:
+            target_ref, target_snapshot = existing_matches[0]
+        else:
+            target_ref = hashed_refs[0]
+            target_snapshot = hashed_snapshots[0]
+
+        existing = (
+            target_snapshot.to_dict() or {}
+            if getattr(target_snapshot, "exists", False)
+            else {}
+        )
+        if getattr(target_snapshot, "exists", False):
+            _validate_existing_processing_failure_identity(
+                target_ref,
+                existing,
+                thread_id,
+                message_id,
+                graph_message_id=graph_message_id,
+                internet_message_id=internet_message_id,
+                source_message_key=source_message_key,
+                record_key_suffix=record_key_suffix,
+            )
+        occurrences = existing.get("failureOccurrences")
+        if isinstance(occurrences, bool) or not isinstance(occurrences, int):
+            occurrences = 0
+        occurrences = max(0, occurrences)
+        existing_nonretryable = existing.get("retryable") is False
+        existing_identity_key = _clean_processing_failure_identity_value(
+            existing.get("processingFailureIdentityKey")
+        )
+        existing_identity_kind = _clean_processing_failure_identity_value(
+            existing.get("processingFailureIdentityKind")
+        ).lower()
+        if (
+            existing_identity_key
+            and existing_identity_kind in {"graph", "internet", "source"}
+        ):
+            # Enrichment must never mutate the stable key used by this v2 doc.
+            identity["processingFailureIdentityKey"] = existing_identity_key
+            identity["processingFailureIdentityKind"] = existing_identity_kind
         payload = {
             "clientId": client_id,
-            "threadId": thread_id,
-            "messageId": message_id,
+            **identity,
+            # Preserve the legacy field for readers that have not migrated yet.
+            "messageId": identity["sourceMessageKey"],
             "reason": reason,
-            "retryable": retryable,
-            "createdAt": SERVER_TIMESTAMP,
+            "retryable": False if existing_nonretryable else bool(retryable),
+            "failureOccurrences": occurrences + 1,
             "updatedAt": SERVER_TIMESTAMP,
+            "lastFailedAt": SERVER_TIMESTAMP,
         }
+        if record_key_suffix:
+            payload["processingFailureRecordKeySuffix"] = (
+                _clean_processing_failure_identity_value(record_key_suffix)
+            )
+        if "createdAt" not in existing:
+            payload["createdAt"] = SERVER_TIMESTAMP
         if recovery_status:
-            payload["recoveryStatus"] = recovery_status
+            if not (
+                existing_nonretryable
+                and bool(retryable)
+                and existing.get("recoveryStatus")
+            ):
+                payload["recoveryStatus"] = recovery_status
         if isinstance(metadata, dict) and metadata:
             payload["metadata"] = metadata
-        _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).set(
-            payload,
-            merge=True,
-        )
+        if isinstance(extra_fields, dict) and extra_fields:
+            payload.update(extra_fields)
+        transaction.set(target_ref, payload, merge=True)
+        transaction.commit()
         return True
     except Exception as e:
         print(f"⚠️ Could not record AI processing failure: {e}")
         return False
 
 
-def _has_processing_failure_record(user_id: str, thread_id: str, message_id: str) -> bool:
-    if not thread_id or not message_id:
+def _has_processing_failure_record(
+    user_id: str,
+    thread_id: str,
+    message_id: str,
+    *,
+    graph_message_id: Optional[str] = None,
+    internet_message_id: Optional[str] = None,
+    source_message_key: Optional[str] = None,
+) -> bool:
+    if not thread_id or not (message_id or source_message_key):
         return False
     try:
-        doc_id = f"{thread_id}__{message_id}"
-        doc = _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).get()
-        return bool(getattr(doc, "exists", False))
+        failures_ref = (
+            _fs.collection("users")
+            .document(user_id)
+            .collection("processingFailures")
+        )
+        doc_ids = [
+            *_processing_failure_document_ids(
+                thread_id,
+                message_id,
+                graph_message_id=graph_message_id,
+                internet_message_id=internet_message_id,
+                source_message_key=source_message_key,
+            ),
+            *_safe_legacy_processing_failure_document_ids(
+                thread_id,
+                message_id,
+                graph_message_id=graph_message_id,
+                internet_message_id=internet_message_id,
+                source_message_key=source_message_key,
+            ),
+        ]
+        return any(
+            bool(getattr(failures_ref.document(doc_id).get(), "exists", False))
+            for doc_id in dict.fromkeys(doc_ids)
+        )
     except Exception as e:
         print(f"⚠️ Could not check processing failure retry state: {e}")
         return False
@@ -603,32 +1132,40 @@ def _record_processing_failure_blocked_by_manual_continuation(
     thread_id: str,
     message_id: str,
     sent_artifact: Dict[str, Any],
-):
-    try:
-        doc_id = f"{thread_id}__{message_id or int(time.time())}"
-        guard_unreadable = bool(sent_artifact.get("guardUnreadable"))
-        recovery_status = (
-            "blocked_manual_retry_guard_unreadable"
-            if guard_unreadable
-            else "blocked_manual_conversation_continued"
+    *,
+    graph_message_id: Optional[str] = None,
+    internet_message_id: Optional[str] = None,
+    source_message_key: Optional[str] = None,
+) -> bool:
+    guard_unreadable = bool(sent_artifact.get("guardUnreadable"))
+    recovery_status = (
+        "blocked_manual_retry_guard_unreadable"
+        if guard_unreadable
+        else "blocked_manual_conversation_continued"
+    )
+    last_retry_error = (
+        "Could not verify whether the user manually continued this conversation "
+        f"after the processing failure ({sent_artifact.get('guardError') or 'Sent Items unreadable'}); "
+        "leaving visible for manual review before retry."
+        if guard_unreadable
+        else (
+            "Inbox retry skipped because Sent Items shows this conversation was "
+            "continued after the failure; leaving visible for manual review to "
+            "avoid stale or duplicate handling."
         )
-        last_retry_error = (
-            "Could not verify whether the user manually continued this conversation "
-            f"after the processing failure ({sent_artifact.get('guardError') or 'Sent Items unreadable'}); "
-            "leaving visible for manual review before retry."
-            if guard_unreadable
-            else (
-                "Inbox retry skipped because Sent Items shows this conversation was "
-                "continued after the failure; leaving visible for manual review to "
-                "avoid stale or duplicate handling."
-            )
-        )
-        _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).set({
-            "clientId": client_id,
-            "threadId": thread_id,
-            "messageId": message_id,
-            "retryable": False,
-            "recoveryStatus": recovery_status,
+    )
+    return _record_ai_processing_failure(
+        user_id,
+        client_id,
+        thread_id,
+        message_id,
+        last_retry_error,
+        retryable=False,
+        recovery_status=recovery_status,
+        graph_message_id=graph_message_id,
+        internet_message_id=internet_message_id,
+        source_message_key=source_message_key,
+        extra_fields={
             "recoveryArtifactCollection": sent_artifact.get("collection") or "SentItems/manualContinuation",
             "recoverySentMessageId": sent_artifact.get("id") or sent_artifact.get("sentMessageId"),
             "recoverySentInternetMessageId": sent_artifact.get("internetMessageId"),
@@ -637,10 +1174,8 @@ def _record_processing_failure_blocked_by_manual_continuation(
             "recoveryGuardError": sent_artifact.get("guardError"),
             "lastRetryAt": SERVER_TIMESTAMP,
             "lastRetryError": last_retry_error,
-            "updatedAt": SERVER_TIMESTAMP,
-        }, merge=True)
-    except Exception as e:
-        print(f"⚠️ Could not record manual-continuation processing failure block: {e}")
+        },
+    )
 
 
 def _client_id_for_processing_failure(user_id: str, thread_id: str) -> str:
@@ -655,12 +1190,41 @@ def _client_id_for_processing_failure(user_id: str, thread_id: str) -> str:
         return "unknown"
 
 
-def _clear_ai_processing_failure(user_id: str, thread_id: str, message_id: str):
-    if not message_id:
+def _clear_ai_processing_failure(
+    user_id: str,
+    thread_id: str,
+    message_id: str,
+    *,
+    graph_message_id: Optional[str] = None,
+    internet_message_id: Optional[str] = None,
+    source_message_key: Optional[str] = None,
+):
+    if not (message_id or source_message_key):
         return
     try:
-        doc_id = f"{thread_id}__{message_id}"
-        _fs.collection("users").document(user_id).collection("processingFailures").document(doc_id).delete()
+        failures_ref = (
+            _fs.collection("users")
+            .document(user_id)
+            .collection("processingFailures")
+        )
+        doc_ids = [
+            *_processing_failure_document_ids(
+                thread_id,
+                message_id,
+                graph_message_id=graph_message_id,
+                internet_message_id=internet_message_id,
+                source_message_key=source_message_key,
+            ),
+            *_safe_legacy_processing_failure_document_ids(
+                thread_id,
+                message_id,
+                graph_message_id=graph_message_id,
+                internet_message_id=internet_message_id,
+                source_message_key=source_message_key,
+            ),
+        ]
+        for doc_id in dict.fromkeys(doc_ids):
+            failures_ref.document(doc_id).delete()
     except Exception as e:
         print(f"⚠️ Could not clear AI processing failure: {e}")
 
@@ -730,25 +1294,60 @@ def _value_matches_message_candidates(value: Any, candidates: set) -> bool:
     return bool(_message_identity_candidates(value) & candidates)
 
 
+_SOURCE_MESSAGE_IDENTITY_KEYS = (
+    "msgId",
+    "replyToMessageId",
+    "sourceMessageId",
+    "sourceGraphMessageId",
+    "sourceInternetMessageId",
+    "originalMessageId",
+    "currentMsgId",
+    "detectedInMessageId",
+)
+_SOURCE_MESSAGE_IDENTITY_CONTAINERS = (
+    "meta",
+    "tourInvite",
+    "sourceMessage",
+    "source",
+)
+
+
+def _source_identity_value_is_present(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(
+            _source_identity_value_is_present(item)
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple, set)):
+        return any(_source_identity_value_is_present(item) for item in value)
+    return False
+
+
+def _source_message_identity_is_present(data: Dict[str, Any]) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if any(
+        _source_identity_value_is_present(data.get(key))
+        for key in _SOURCE_MESSAGE_IDENTITY_KEYS
+    ):
+        return True
+    return any(
+        _source_message_identity_is_present(data.get(key))
+        for key in _SOURCE_MESSAGE_IDENTITY_CONTAINERS
+    )
+
+
 def _source_message_match(data: Dict[str, Any], candidates: set) -> bool:
     if not candidates:
         return False
 
-    direct_keys = (
-        "msgId",
-        "replyToMessageId",
-        "sourceMessageId",
-        "sourceGraphMessageId",
-        "sourceInternetMessageId",
-        "originalMessageId",
-        "currentMsgId",
-        "detectedInMessageId",
-    )
-    for key in direct_keys:
+    for key in _SOURCE_MESSAGE_IDENTITY_KEYS:
         if _value_matches_message_candidates((data or {}).get(key), candidates):
             return True
 
-    for nested_key in ("meta", "tourInvite", "sourceMessage", "source"):
+    for nested_key in _SOURCE_MESSAGE_IDENTITY_CONTAINERS:
         nested = (data or {}).get(nested_key)
         if isinstance(nested, dict) and _source_message_match(nested, candidates):
             return True
@@ -1259,10 +1858,10 @@ def reconcile_stale_processing_failures(user_id: str, limit: int = 100) -> Dict[
 
 
 def _fetch_graph_message_by_id(headers: Dict[str, str], message_id: str) -> Dict[str, Any]:
-    encoded_id = quote(str(message_id or ""), safe="")
     response = exponential_backoff_request(
         lambda: requests.get(
-            f"https://graph.microsoft.com/v1.0/me/messages/{encoded_id}",
+            "https://graph.microsoft.com/v1.0/me/messages/"
+            f"{_graph_message_path_segment(message_id)}",
             headers=headers,
             params={
                 "$select": (
@@ -1275,6 +1874,129 @@ def _fetch_graph_message_by_id(headers: Dict[str, str], message_id: str) -> Dict
         )
     )
     return response.json() or {}
+
+
+def _looks_like_internet_message_id(value: Any) -> bool:
+    clean_value = _clean_processing_failure_identity_value(value)
+    return clean_value.startswith("<") and clean_value.endswith(">")
+
+
+def _fetch_graph_message_by_internet_message_id(
+    headers: Dict[str, str], internet_message_id: str
+) -> Dict[str, Any]:
+    exact_id = _clean_processing_failure_identity_value(internet_message_id)
+    if not exact_id:
+        raise RetryableProcessingError(
+            "Processing failure has no RFC internet message id to resolve"
+        )
+    escaped_id = exact_id.replace("'", "''")
+    response = exponential_backoff_request(
+        lambda: requests.get(
+            "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages",
+            headers=headers,
+            params={
+                "$filter": f"internetMessageId eq '{escaped_id}'",
+                "$top": 2,
+                "$select": (
+                    "id,subject,from,sender,replyTo,toRecipients,ccRecipients,"
+                    "receivedDateTime,sentDateTime,conversationId,internetMessageId,"
+                    "internetMessageHeaders,bodyPreview,hasAttachments"
+                ),
+            },
+            timeout=30,
+        )
+    )
+    payload = response.json() or {}
+    values = payload.get("value", []) if isinstance(payload, dict) else []
+    exact_matches = [
+        message
+        for message in values
+        if isinstance(message, dict)
+        and message.get("internetMessageId") == exact_id
+    ]
+    if not exact_matches:
+        raise RetryableProcessingError(
+            "Graph internetMessageId lookup returned no exact message"
+        )
+    if len(exact_matches) > 1:
+        raise RetryableProcessingError(
+            "Graph internetMessageId lookup returned multiple exact messages"
+        )
+    return exact_matches[0]
+
+
+def _fetch_graph_message_for_processing_failure(
+    headers: Dict[str, str], data: Dict[str, Any]
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    stored_graph_message_id = _clean_processing_failure_identity_value(
+        data.get("graphMessageId")
+    )
+    stored_internet_message_id = _clean_processing_failure_identity_value(
+        data.get("internetMessageId")
+    )
+    legacy_message_id = _clean_processing_failure_identity_value(
+        data.get("messageId")
+    )
+    source_message_key = _clean_processing_failure_identity_value(
+        data.get("sourceMessageKey")
+    ) or legacy_message_id
+
+    expected_graph_message_id = stored_graph_message_id
+    expected_internet_message_id = stored_internet_message_id
+    if stored_graph_message_id:
+        message = _fetch_graph_message_by_id(headers, stored_graph_message_id)
+    elif stored_internet_message_id:
+        message = _fetch_graph_message_by_internet_message_id(
+            headers, stored_internet_message_id
+        )
+    elif _looks_like_internet_message_id(source_message_key):
+        expected_internet_message_id = source_message_key
+        message = _fetch_graph_message_by_internet_message_id(
+            headers, source_message_key
+        )
+    elif source_message_key:
+        # Legacy records sometimes stored the Graph resource ID in messageId.
+        expected_graph_message_id = source_message_key
+        message = _fetch_graph_message_by_id(headers, source_message_key)
+    else:
+        raise RetryableProcessingError(
+            "Processing failure has no resolvable Graph or RFC message identity"
+        )
+
+    if not isinstance(message, dict) or not message.get("id"):
+        raise RetryableProcessingError("Graph message fetch returned no message id")
+    if (
+        expected_graph_message_id
+        and message.get("id") != expected_graph_message_id
+    ):
+        raise RetryableProcessingError(
+            "Graph message fetch returned a different resource id"
+        )
+    if (
+        expected_internet_message_id
+        and message.get("internetMessageId") != expected_internet_message_id
+    ):
+        raise RetryableProcessingError(
+            "Graph message fetch returned a different internetMessageId"
+        )
+
+    resolved_graph_message_id = _clean_processing_failure_identity_value(
+        message.get("id")
+    )
+    resolved_internet_message_id = _clean_processing_failure_identity_value(
+        message.get("internetMessageId")
+    )
+    if not source_message_key:
+        source_message_key = (
+            resolved_internet_message_id or resolved_graph_message_id
+        )
+    identity = {
+        "processingFailureSchemaVersion": PROCESSING_FAILURE_SCHEMA_VERSION,
+        "sourceMessageKey": source_message_key,
+        "graphMessageId": resolved_graph_message_id,
+        "internetMessageId": resolved_internet_message_id or None,
+    }
+    return message, identity
 
 
 def retry_processing_failures(
@@ -1298,22 +2020,97 @@ def retry_processing_failures(
     for doc in docs:
         result["checked"] += 1
         data = doc.to_dict() or {}
-        message_id = data.get("messageId")
+        message_id = (
+            data.get("sourceMessageKey")
+            or data.get("messageId")
+            or data.get("internetMessageId")
+            or data.get("graphMessageId")
+        )
         thread_id = data.get("threadId")
         client_id = data.get("clientId")
         attempts = int(data.get("processingAttempts") or 0)
-
-        if _is_operator_replay_recovery_status(data.get("recoveryStatus")):
+        terminal_disposition = _terminal_retry_disposition(
+            user_id,
+            thread_id,
+            message_id,
+            graph_message_id=data.get("graphMessageId"),
+            internet_message_id=data.get("internetMessageId"),
+        )
+        terminal_kind = terminal_disposition.get("kind")
+        terminal_source_exact = (
+            terminal_disposition.get("exactSourceConfirmed") is True
+        )
+        terminal_retry_reserved = terminal_source_exact and terminal_kind in {
+            "active",
+            "settled",
+        }
+        exact_terminal_saga = (
+            terminal_disposition.get("saga")
+            if terminal_retry_reserved and terminal_kind == "active"
+            else None
+        )
+        if (
+            terminal_kind == "settled"
+            and terminal_source_exact
+        ):
+            # The authoritative snapshot proved this exact source completed.
+            # Clear only its stale retry record; do not evaluate campaign,
+            # artifacts, manual continuation, Graph, or generic processing.
+            try:
+                doc.reference.delete()
+            except Exception as cleanup_error:
+                print(
+                    "⚠️ Could not clear exact settled processing failure: "
+                    f"{cleanup_error}"
+                )
             result["skipped"] += 1
             continue
 
-        if data.get("recoveryStatus") == "asset_warning_persistence_failed":
+        if terminal_kind in {"active", "settled"} and not terminal_source_exact:
+            try:
+                doc.reference.set({
+                    "retryable": False,
+                    "recoveryStatus": "terminal_source_identity_unconfirmed",
+                    "lastRetryAt": SERVER_TIMESTAMP,
+                    "lastRetryError": (
+                        "Terminal retry source matched only an untyped alias; "
+                        "leaving visible for manual identity review."
+                    ),
+                    "updatedAt": SERVER_TIMESTAMP,
+                }, merge=True)
+            except Exception as update_error:
+                print(
+                    "⚠️ Could not preserve provisional terminal retry: "
+                    f"{update_error}"
+                )
             result["skipped"] += 1
             continue
 
-        decision = get_client_automation_decision(user_id, client_id)
-        suppression_kind = classify_campaign_suppression(decision)
-        if suppression_kind:
+        if (
+            not terminal_retry_reserved
+            and _is_operator_replay_recovery_status(data.get("recoveryStatus"))
+        ):
+            result["skipped"] += 1
+            continue
+
+        if (
+            not terminal_retry_reserved
+            and data.get("recoveryStatus") == "asset_warning_persistence_failed"
+        ):
+            result["skipped"] += 1
+            continue
+
+        decision = (
+            get_client_automation_decision(user_id, client_id)
+            if not terminal_retry_reserved
+            else None
+        )
+        suppression_kind = (
+            classify_campaign_suppression(decision)
+            if decision is not None
+            else None
+        )
+        if suppression_kind and not terminal_retry_reserved:
             terminal = suppression_kind == "terminal"
             try:
                 doc.reference.set({
@@ -1334,27 +2131,31 @@ def retry_processing_failures(
             result["skipped"] += 1
             continue
 
-        if not data.get("retryable", True) or not message_id or attempts >= max_attempts:
+        if not message_id or (
+            not terminal_retry_reserved
+            and (not data.get("retryable", True) or attempts >= max_attempts)
+        ):
             result["skipped"] += 1
             continue
 
-        if has_processed(user_id, message_id):
+        if not terminal_retry_reserved and has_processed(user_id, message_id):
             doc.reference.delete()
             result["skipped"] += 1
             continue
 
-        existing_artifact = _find_existing_retry_artifact_for_message(
-            user_id,
-            thread_id,
-            message_id,
-            client_id,
-        )
-        if existing_artifact:
-            result["skipped"] += 1
-            _mark_processing_failure_blocked_by_existing_artifact(doc, existing_artifact)
-            continue
+        if not terminal_retry_reserved:
+            existing_artifact = _find_existing_retry_artifact_for_message(
+                user_id,
+                thread_id,
+                message_id,
+                client_id,
+            )
+            if existing_artifact:
+                result["skipped"] += 1
+                _mark_processing_failure_blocked_by_existing_artifact(doc, existing_artifact)
+                continue
 
-        if max_failure_age_hours and max_failure_age_hours > 0:
+        if not terminal_retry_reserved and max_failure_age_hours and max_failure_age_hours > 0:
             failure_time = _timestamp_to_utc(data.get("createdAt") or data.get("updatedAt"))
             if failure_time and datetime.now(timezone.utc) - failure_time > timedelta(hours=max_failure_age_hours):
                 result["skipped"] += 1
@@ -1364,38 +2165,88 @@ def retry_processing_failures(
         processing_error = None
         msg = None
         try:
-            msg = _fetch_graph_message_by_id(headers, message_id)
-            if not msg.get("id"):
-                raise RetryableProcessingError("Graph message fetch returned no message id")
-            expanded_existing_artifact = _find_existing_retry_artifact_for_message(
+            msg, resolved_identity = _fetch_graph_message_for_processing_failure(
+                headers, data
+            )
+            identity_update = {
+                **resolved_identity,
+                "messageId": resolved_identity["sourceMessageKey"],
+                "updatedAt": SERVER_TIMESTAMP,
+            }
+            identity_needs_update = any(
+                data.get(field) != value
+                for field, value in resolved_identity.items()
+            ) or data.get("messageId") != resolved_identity["sourceMessageKey"]
+            terminal_disposition = _terminal_retry_disposition(
                 user_id,
                 thread_id,
-                message_id,
-                client_id,
-                additional_message_ids=[
-                    msg.get("id"),
-                    msg.get("internetMessageId"),
+                resolved_identity["sourceMessageKey"],
+                graph_message_id=resolved_identity["graphMessageId"],
+                internet_message_id=resolved_identity["internetMessageId"],
+            )
+            terminal_kind = terminal_disposition.get("kind")
+            terminal_source_exact = (
+                terminal_disposition.get("exactSourceConfirmed") is True
+            )
+            terminal_retry_reserved = terminal_source_exact and terminal_kind in {
+                "active",
+                "settled",
+            }
+            exact_terminal_saga = (
+                terminal_disposition.get("saga")
+                if terminal_retry_reserved and terminal_kind == "active"
+                else None
+            )
+            if terminal_kind in {"active", "settled"} and not terminal_source_exact:
+                raise RetryableProcessingError(
+                    "terminal retry source was not exactly confirmed"
+                )
+            if terminal_kind == "settled":
+                try:
+                    doc.reference.delete()
+                except Exception as cleanup_error:
+                    print(
+                        "⚠️ Could not clear exact settled processing failure: "
+                        f"{cleanup_error}"
+                    )
+                result["skipped"] += 1
+                continue
+            if identity_needs_update:
+                doc.reference.set(identity_update, merge=True)
+            if not exact_terminal_saga:
+                expanded_existing_artifact = _find_existing_retry_artifact_for_message(
+                    user_id,
+                    thread_id,
+                    message_id,
+                    client_id,
+                    additional_message_ids=[
+                        msg.get("id"),
+                        msg.get("internetMessageId"),
+                        msg.get("conversationId"),
+                    ],
+                )
+                if expanded_existing_artifact:
+                    result["skipped"] += 1
+                    _mark_processing_failure_blocked_by_existing_artifact(doc, expanded_existing_artifact)
+                    continue
+                manual_continuation = _find_sent_item_continuing_conversation(
+                    headers,
                     msg.get("conversationId"),
-                ],
-            )
-            if expanded_existing_artifact:
-                result["skipped"] += 1
-                _mark_processing_failure_blocked_by_existing_artifact(doc, expanded_existing_artifact)
-                continue
-            manual_continuation = _find_sent_item_continuing_conversation(
-                headers,
-                msg.get("conversationId"),
-                data.get("createdAt") or data.get("updatedAt"),
-            )
-            if manual_continuation:
-                result["skipped"] += 1
-                _mark_processing_failure_blocked_by_manual_continuation(doc, manual_continuation)
-                continue
+                    data.get("createdAt") or data.get("updatedAt"),
+                )
+                if manual_continuation:
+                    result["skipped"] += 1
+                    _mark_processing_failure_blocked_by_manual_continuation(doc, manual_continuation)
+                    continue
             result["retried"] += 1
             process_inbox_message(user_id, headers, msg)
             processed_keys = [
                 key
-                for key in [message_id, msg.get("id"), msg.get("internetMessageId")]
+                for key in [
+                    resolved_identity["sourceMessageKey"],
+                    resolved_identity["graphMessageId"],
+                    resolved_identity["internetMessageId"],
+                ]
                 if key
             ]
             for processed_key in dict.fromkeys(processed_keys):
@@ -1436,7 +2287,14 @@ def _find_manual_continuation_for_inbox_retry(
     msg: Dict[str, Any],
     processed_key: str,
 ) -> Optional[Dict[str, Any]]:
-    if not _has_processing_failure_record(user_id, thread_id, processed_key):
+    if not _has_processing_failure_record(
+        user_id,
+        thread_id,
+        processed_key,
+        graph_message_id=msg.get("id"),
+        internet_message_id=msg.get("internetMessageId"),
+        source_message_key=processed_key,
+    ):
         return None
     try:
         return find_sent_conversation_continuation_for_retry(
@@ -1455,6 +2313,31 @@ def _skip_inbox_retry_after_manual_continuation(
     msg: Dict[str, Any],
     processed_key: str,
 ) -> bool:
+    if not _has_processing_failure_record(
+        user_id,
+        thread_id,
+        processed_key,
+        graph_message_id=msg.get("id"),
+        internet_message_id=msg.get("internetMessageId"),
+        source_message_key=processed_key,
+    ):
+        return False
+    disposition = _terminal_retry_disposition(
+        user_id,
+        thread_id,
+        processed_key,
+        graph_message_id=msg.get("id"),
+        internet_message_id=msg.get("internetMessageId"),
+    )
+    if (
+        disposition.get("kind") in {"active", "settled"}
+        and disposition.get("exactSourceConfirmed") is not True
+    ):
+        return False
+    if disposition.get("kind") == "settled":
+        return True
+    if disposition.get("kind") == "active":
+        return False
     manual_continuation = _find_manual_continuation_for_inbox_retry(
         user_id,
         headers,
@@ -1471,6 +2354,9 @@ def _skip_inbox_retry_after_manual_continuation(
         thread_id,
         processed_key,
         manual_continuation,
+        graph_message_id=msg.get("id"),
+        internet_message_id=msg.get("internetMessageId"),
+        source_message_key=processed_key,
     )
     mark_processed(user_id, processed_key)
     return True
@@ -1920,6 +2806,32 @@ NON_PENDING_OUTBOX_STATUSES = {
     "dead_lettered",
 }
 
+def _terminal_thread_blocks_client_completion(doc, data: Dict[str, Any]) -> bool:
+    """Fail closed while terminal-protocol work or its permit is unresolved."""
+    attempt = data.get("terminalReplyAttempt")
+    if (
+        data.get("terminalReplyOwed")
+        or data.get("terminalNotificationOwed")
+        or _has_pending_terminal_saga(data)
+        or (
+            isinstance(attempt, dict)
+            and str(attempt.get("status") or "").strip().lower()
+            == "needs_reconciliation"
+        )
+    ):
+        return True
+
+    pointer = data.get("activeGraphSendPermit")
+    if pointer is None:
+        return False
+    if not hasattr(doc, "reference"):
+        return True
+    try:
+        permit = read_active_graph_send_permit(doc.reference, data)
+    except Exception:
+        return True
+    return graph_send_permit_blocks_new_send(permit)
+
 
 def _maybe_mark_client_completed(
     user_id: str,
@@ -1931,13 +2843,25 @@ def _maybe_mark_client_completed(
     outbox_ref=None,
     pending_responses_ref=None,
     dead_letter_ref=None,
+    terminal_graph_reviews_ref=None,
+    pending_draft_reviews_ref=None,
 ) -> bool:
     """Mark a campaign completed once every thread is terminal and no current work remains."""
     if not client_id:
         return False
 
     try:
-        user_ref = _fs.collection("users").document(user_id)
+        user_ref = None
+        if any(ref is None for ref in (
+            client_ref,
+            threads_ref,
+            outbox_ref,
+            pending_responses_ref,
+            dead_letter_ref,
+            terminal_graph_reviews_ref,
+            pending_draft_reviews_ref,
+        )):
+            user_ref = _fs.collection("users").document(user_id)
         if client_ref is None:
             client_ref = user_ref.collection("clients").document(client_id)
         if threads_ref is None:
@@ -1950,6 +2874,14 @@ def _maybe_mark_client_completed(
             pending_responses_ref = user_ref.collection("pendingResponses")
         if dead_letter_ref is None:
             dead_letter_ref = user_ref.collection("deadLetterQueue")
+        if terminal_graph_reviews_ref is None:
+            terminal_graph_reviews_ref = user_ref.collection(
+                "terminalGraphSendReviews"
+            )
+        if pending_draft_reviews_ref is None:
+            pending_draft_reviews_ref = user_ref.collection(
+                "graphSendDraftReviews"
+            )
 
         client_snapshot = client_ref.get()
         client_data = client_snapshot.to_dict() if getattr(client_snapshot, "exists", False) else {}
@@ -1967,6 +2899,7 @@ def _maybe_mark_client_completed(
 
         active_threads = []
         terminal_threads = []
+        unresolved_terminal_protocol_threads = []
         for doc in thread_docs:
             data = doc.to_dict() or {}
             thread_status = str(data.get("status") or THREAD_STATUS["active"]).strip().lower()
@@ -1974,6 +2907,8 @@ def _maybe_mark_client_completed(
                 terminal_threads.append(doc)
             else:
                 active_threads.append(doc)
+            if _terminal_thread_blocks_client_completion(doc, data):
+                unresolved_terminal_protocol_threads.append(doc)
 
         action_docs = list(
             notifications_ref
@@ -2011,12 +2946,37 @@ def _maybe_mark_client_completed(
             ):
                 unresolved_dead_letter_docs.append(doc)
 
+        unresolved_terminal_graph_reviews = []
+        for doc in (
+            terminal_graph_reviews_ref
+            .where(filter=FieldFilter("clientId", "==", client_id))
+            .stream()
+        ):
+            data = doc.to_dict() or {}
+            review_status = str(data.get("status") or "").strip().lower()
+            if review_status not in RESOLVED_TERMINAL_GRAPH_REVIEW_STATUSES:
+                unresolved_terminal_graph_reviews.append(doc)
+
+        unresolved_pending_draft_reviews = []
+        for doc in (
+            pending_draft_reviews_ref
+            .where(filter=FieldFilter("clientId", "==", client_id))
+            .stream()
+        ):
+            data = doc.to_dict() or {}
+            review_status = str(data.get("status") or "").strip().lower()
+            if review_status not in RESOLVED_PENDING_DRAFT_REVIEW_STATUSES:
+                unresolved_pending_draft_reviews.append(doc)
+
         if (
             active_threads
             or action_docs
             or outbox_docs
             or pending_response_docs
             or unresolved_dead_letter_docs
+            or unresolved_terminal_protocol_threads
+            or unresolved_terminal_graph_reviews
+            or unresolved_pending_draft_reviews
         ):
             return False
 
@@ -2031,6 +2991,15 @@ def _maybe_mark_client_completed(
                 "pendingOutbox": len(outbox_docs),
                 "pendingResponses": len(pending_response_docs),
                 "unresolvedDeadLetters": len(unresolved_dead_letter_docs),
+                "unresolvedTerminalProtocolThreads": len(
+                    unresolved_terminal_protocol_threads
+                ),
+                "unresolvedTerminalGraphReviews": len(
+                    unresolved_terminal_graph_reviews
+                ),
+                "unresolvedPendingDraftReviews": len(
+                    unresolved_pending_draft_reviews
+                ),
                 "currentActions": len(action_docs),
             },
         }, merge=True)
@@ -3859,12 +4828,61 @@ def _terminal_note_range(tab_title: str, notes_column_index: int, row_number: in
     return f"'{safe_title}'!{_col_letter(notes_column_index)}{row_number}"
 
 
+def _terminal_sheet_header_fingerprint(header: List[str]) -> str:
+    projection = [str(value or "").strip() for value in (header or [])]
+    return hashlib.sha256(
+        json.dumps(projection, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_terminal_saga_sheet_layout(
+    saga: Dict[str, Any],
+    header: List[str],
+) -> int:
+    notes_index, expected_name, expected_fingerprint = (
+        _validate_terminal_saga_sheet_layout_binding(saga)
+    )
+    if (
+        notes_index > len(header or [])
+        or str((header or [])[notes_index - 1] or "").strip() != expected_name
+        or _terminal_sheet_header_fingerprint(header) != expected_fingerprint
+    ):
+        raise RetryableProcessingError(
+            "terminal saga Sheet header/Notes coordinate drifted"
+        )
+    return notes_index
+
+
+def _validate_terminal_saga_sheet_layout_binding(
+    saga: Dict[str, Any],
+) -> tuple[int, str, str]:
+    notes_index = saga.get("notesColumnIndex")
+    expected_name = saga.get("notesColumnHeader")
+    expected_fingerprint = saga.get("sheetHeaderFingerprint")
+    if notes_index is None:
+        raise RetryableProcessingError(
+            "terminal saga persisted no Notes/Comments column; "
+            "automatic coordinate rebinding is forbidden"
+        )
+    if (
+        isinstance(notes_index, bool)
+        or not isinstance(notes_index, int)
+        or notes_index < 1
+        or not str(expected_name or "").strip()
+        or not str(expected_fingerprint or "").strip()
+    ):
+        raise RetryableProcessingError(
+            "terminal saga Sheet layout binding is missing or malformed"
+        )
+    return notes_index, str(expected_name).strip(), str(expected_fingerprint).strip()
+
+
 def _read_terminal_note(
     sheets,
     spreadsheet_id: str,
     tab_title: str,
     row_number: int,
-    notes_column_index: int,
+    notes_column_index: Optional[int],
 ) -> str:
     note_range = _terminal_note_range(tab_title, notes_column_index, row_number)
     response = _execute_with_retry(
@@ -3940,8 +4958,12 @@ def _pending_nonviable_followup_patch(
     row_anchor: str,
     message_text: str,
 ) -> Optional[Dict[str, Any]]:
-    """Stop follow-up eligibility before retryable sheet work begins."""
-    for event in (events or []):
+    """Build the legacy fail-closed follow-up patch for terminal intent.
+
+    The immutable saga owns persistence in the full pipeline; this pure helper
+    remains the shared semantic contract for follow-up guards and regressions.
+    """
+    for event in events or []:
         if (event or {}).get("type") != "property_unavailable":
             continue
         if not _property_unavailable_event_applies_to_row(
@@ -3963,161 +4985,4846 @@ def _pending_nonviable_followup_patch(
     return None
 
 
-def _stage_row_thread_roots_for_terminal_transition(
+TERMINAL_SAGA_VERSION = 2
+FIRESTORE_BATCH_WRITE_LIMIT = 500
+TERMINAL_SAGA_EXECUTION_LEASE_SECONDS = 300
+TERMINAL_SHEET_MUTATION_VERSION = 2
+TERMINAL_SHEET_PROVIDER_DEADLINE_SECONDS = 60
+TERMINAL_SHEET_READBACK_DEADLINE_SECONDS = 30
+TERMINAL_SHEET_MUTATION_ATTEMPT_LIMIT = 8
+TERMINAL_SHEET_MUTATION_HISTORY_LIMIT = TERMINAL_SHEET_MUTATION_ATTEMPT_LIMIT - 1
+
+
+@dataclass(frozen=True)
+class TerminalSagaExecution:
+    owner: str
+    fencing_token: int
+
+
+def _terminal_source_message_key(message_id: str, internet_message_id: str) -> str:
+    source_key = str(internet_message_id or message_id or "").strip()
+    if not source_key:
+        raise ValueError("terminal saga requires an exact source message identity")
+    return source_key
+
+
+def _terminal_event_key_for_source(
+    event_type: str,
+    message_id: str,
+    internet_message_id: str,
+) -> str:
+    """Bind terminal event admission to one immutable inbound source."""
+    source_key = _terminal_source_message_key(message_id, internet_message_id)
+    source_hash = hashlib.sha256(source_key.encode("utf-8")).hexdigest()
+    return f"{event_type}:source:{source_hash}"
+
+
+def _thread_handled_event_record(
+    thread_data: Dict[str, Any],
+    event_key: str,
+) -> Any:
+    """Read both native Firestore maps and flattened local-test projections."""
+    nested = (thread_data or {}).get("handledEvents")
+    if isinstance(nested, dict) and event_key in nested:
+        return nested.get(event_key)
+    return (thread_data or {}).get(f"handledEvents.{event_key}")
+
+
+def _is_explicit_same_contact_replacement_reactivation(
+    thread_data: Dict[str, Any],
+) -> bool:
+    data = thread_data or {}
+    replacement = _active_replacement_context(data)
+    return bool(
+        data.get("status") == THREAD_STATUS["active"]
+        and data.get("statusReason") == "same_contact_replacement_reply"
+        and replacement is not None
+        and data.get("rowNumber") == replacement.get("rowNumber")
+    )
+
+
+def _terminal_event_is_handled_for_source(
+    thread_data: Dict[str, Any],
+    event_type: str,
+    event_key: str,
+    message_id: str,
+    internet_message_id: str,
+) -> bool:
+    """Honor exact v2 markers and narrowly scoped legacy terminal markers.
+
+    Legacy thread-wide markers remain effective for their recorded source, and
+    unsourced evidence remains fail-closed while any terminal evidence remains.
+    Only an explicitly sourced mismatch can be scoped away after an exact
+    same-contact replacement reactivation/rebind.
+    """
+    if _thread_handled_event_record(thread_data, event_key) is not None:
+        return True
+
+    legacy = _thread_handled_event_record(thread_data, event_type)
+    if legacy is None:
+        return False
+    candidates = _message_identity_candidates(message_id, internet_message_id)
+    if isinstance(legacy, dict) and _source_message_match(legacy, candidates):
+        return True
+    if (
+        isinstance(legacy, dict)
+        and _source_message_identity_is_present(legacy)
+        and _is_explicit_same_contact_replacement_reactivation(thread_data)
+    ):
+        # The active row is a new property generation. Historical terminal
+        # timestamps from the prior row cannot broaden an explicitly sourced
+        # legacy marker to this different inbound message. Unsourced legacy
+        # evidence remains fail-closed below.
+        return False
+
+    still_terminal = (
+        (thread_data or {}).get("status") == THREAD_STATUS["stopped"]
+        or bool((thread_data or {}).get("nonViableAt"))
+        or bool((thread_data or {}).get("nonViableReason"))
+    )
+    return still_terminal
+
+
+def _validate_terminal_saga_immutable_hash(saga: Dict[str, Any]) -> None:
+    expected_hash = str((saga or {}).get("immutableHash") or "").strip()
+    immutable_payload = {
+        key: value
+        for key, value in (saga or {}).items()
+        if key not in {"immutableHash", "phase", "finalRow"}
+    }
+    actual_hash = hashlib.sha256(
+        json.dumps(immutable_payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    if not expected_hash or actual_hash != expected_hash:
+        raise RetryableProcessingError(
+            "immutable terminal saga hash does not match persisted payload"
+        )
+
+
+def _terminal_saga_for_source(
+    thread_data: Dict[str, Any],
+    message_id: str,
+    internet_message_id: str,
+) -> Optional[Dict[str, Any]]:
+    saga = (thread_data or {}).get("terminalSaga")
+    if not isinstance(saga, dict):
+        return None
+    expected_key = _terminal_source_message_key(message_id, internet_message_id)
+    if saga.get("sourceMessageKey") != expected_key:
+        return None
+    if saga.get("sourceGraphMessageId") and saga.get("sourceGraphMessageId") != message_id:
+        return None
+    if (
+        saga.get("sourceInternetMessageId")
+        and saga.get("sourceInternetMessageId") != internet_message_id
+    ):
+        return None
+    _validate_terminal_saga_immutable_hash(saga)
+    return dict(saga)
+
+
+def _has_pending_terminal_saga(thread_data: Optional[Dict[str, Any]]) -> bool:
+    """Fail closed while another exact source owns a staged/finalized saga."""
+    data = thread_data or {}
+    return bool(
+        data.get("terminalSagaKey")
+        or data.get("pendingTerminalReason")
+        or isinstance(data.get("terminalSaga"), dict)
+        or isinstance(data.get("terminalSagaClaim"), dict)
+    )
+
+
+def _terminal_saga_for_retry_source(
+    user_id: str,
+    thread_id: str,
+    *message_ids: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Compatibility wrapper over the authoritative retry disposition."""
+    disposition = _terminal_retry_disposition(
+        user_id,
+        thread_id,
+        *message_ids,
+    )
+    return (
+        disposition.get("saga")
+        if disposition.get("kind") == "active"
+        else None
+    )
+
+
+def _terminal_retry_disposition(
+    user_id: str,
+    thread_id: str,
+    *message_ids: Optional[str],
+    graph_message_id: Optional[str] = None,
+    internet_message_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Classify one source from one authoritative thread snapshot.
+
+    ``active`` must resume the frozen saga, ``settled`` must perform no generic
+    retry/batch work, and ``ordinary`` may enter the normal pipeline.  Every
+    retained settlement is fully self-validated even when it does not match.
+    """
+    if not user_id or not thread_id:
+        return {"kind": "ordinary", "saga": None, "settlement": None}
+    candidates = {
+        str(value).strip()
+        for value in message_ids
+        if str(value or "").strip()
+    }
+    graph_source = str(graph_message_id or "").strip()
+    internet_source = str(internet_message_id or "").strip()
+    if not candidates and not graph_source and not internet_source:
+        return {"kind": "ordinary", "saga": None, "settlement": None}
+    try:
+        snapshot = (
+            _fs.collection("users").document(user_id).collection("threads")
+            .document(thread_id).get()
+        )
+    except Exception as exc:
+        raise RetryableProcessingError(
+            f"terminal retry disposition lookup failed: {exc}"
+        ) from exc
+    if snapshot.exists is not True:
+        raise RetryableProcessingError(
+            "authoritative terminal thread is missing during retry disposition"
+        )
+    data = snapshot.to_dict() or {}
+    records = []
+    saga = (data or {}).get("terminalSaga")
+    if isinstance(saga, dict):
+        _validate_terminal_saga_immutable_hash(saga)
+        records.append(("active", dict(saga)))
+    elif _has_pending_terminal_saga(data):
+        raise RetryableProcessingError(
+            "terminal retry disposition found partial active-saga markers"
+        )
+
+    for settlement in _validate_terminal_settlement_history(
+        (data or {}).get("terminalSettlements")
+    ):
+        records.append(("settled", dict(settlement)))
+
+    def aliases(record):
+        return {
+            str(value).strip()
+            for value in (
+                record.get("sourceMessageKey"),
+                record.get("sourceGraphMessageId"),
+                record.get("sourceInternetMessageId"),
+            )
+            if str(value or "").strip()
+        }
+
+    untyped_matches = {
+        index
+        for index, (_kind, record) in enumerate(records)
+        if candidates.intersection(aliases(record))
+    }
+    graph_matches = {
+        index
+        for index, (_kind, record) in enumerate(records)
+        if graph_source
+        and str(record.get("sourceGraphMessageId") or "").strip()
+        == graph_source
+    }
+    internet_matches = {
+        index
+        for index, (_kind, record) in enumerate(records)
+        if internet_source
+        and str(record.get("sourceInternetMessageId") or "").strip()
+        == internet_source
+    }
+    typed_source_provided = bool(graph_source or internet_source)
+    matches = (
+        graph_matches | internet_matches | untyped_matches
+        if typed_source_provided
+        else untyped_matches
+    )
+    if len(matches) > 1:
+        raise RetryableProcessingError(
+            "terminal retry disposition received contradictory source aliases"
+        )
+    if not matches:
+        return {
+            "kind": "ordinary",
+            "saga": None,
+            "settlement": None,
+            "exactSourceConfirmed": False,
+        }
+
+    matched_index = next(iter(matches))
+    matched_kind, matched_record = records[matched_index]
+    matched_aliases = aliases(matched_record)
+    persisted_graph = str(
+        matched_record.get("sourceGraphMessageId") or ""
+    ).strip()
+    persisted_internet = str(
+        matched_record.get("sourceInternetMessageId") or ""
+    ).strip()
+    exact_source_confirmed = False
+    if typed_source_provided:
+        if (
+            (graph_source and persisted_graph and graph_source != persisted_graph)
+            or (
+                internet_source
+                and persisted_internet
+                and internet_source != persisted_internet
+            )
+            or any(candidate not in matched_aliases for candidate in candidates)
+        ):
+            raise RetryableProcessingError(
+                "terminal retry disposition received contradictory source aliases"
+            )
+        graph_exact = bool(graph_source) and persisted_graph == graph_source
+        internet_exact = (
+            bool(internet_source) and persisted_internet == internet_source
+        )
+        every_supplied_type_exact = (
+            (not graph_source or graph_exact)
+            and (not internet_source or internet_exact)
+        )
+        exact_source_confirmed = bool(
+            (graph_exact or internet_exact) and every_supplied_type_exact
+        )
+
+    return {
+        "kind": matched_kind,
+        "saga": dict(matched_record) if matched_kind == "active" else None,
+        "settlement": (
+            dict(matched_record) if matched_kind == "settled" else None
+        ),
+        "exactSourceConfirmed": exact_source_confirmed,
+    }
+
+
+def _preview_nonviable_divider(
+    sheets,
+    spreadsheet_id: str,
+    tab_title: str,
+) -> Dict[str, Any]:
+    """Read the existing or would-be divider row without mutating the Sheet."""
+    safe_title = str(tab_title or "").replace("'", "''")
+    response = _execute_with_retry(
+        sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{safe_title}'!A:A",
+        ),
+        "preview_nonviable_divider",
+    )
+    rows = response.get("values", []) if isinstance(response, dict) else []
+    for row_number, row in enumerate(rows, start=1):
+        if row and str(row[0]).strip().upper() == "NON-VIABLE":
+            return {"dividerRow": row_number, "exists": True}
+    return {"dividerRow": (len(rows) + 1) if rows else 1, "exists": False}
+
+
+def _terminal_plan_members(
+    snapshots,
+    *,
+    client_id: str,
+    source_row: int,
+    divider_row: int,
+) -> tuple[List[str], List[Dict[str, Any]]]:
+    terminal_ids = []
+    row_shifts = []
+    for snapshot in snapshots:
+        data = snapshot.to_dict() or {}
+        if data.get("clientId") != client_id:
+            continue
+        current_row = data.get("rowNumber")
+        if current_row == source_row:
+            terminal_ids.append(snapshot.id)
+        elif (
+            isinstance(current_row, int)
+            and source_row < current_row <= divider_row
+        ):
+            row_shifts.append({
+                "threadId": snapshot.id,
+                "fromRow": current_row,
+                "toRow": current_row - 1,
+            })
+    terminal_ids.sort()
+    row_shifts.sort(key=lambda item: item["threadId"])
+    return terminal_ids, row_shifts
+
+
+def _build_terminal_finalization_plan(
     user_id: str,
     client_id: str,
-    row_number: int,
-    pending_patch: Dict[str, Any],
-    *,
     current_thread_id: str,
-) -> List[str]:
-    """Make every thread root for a row non-sendable before Sheet mutation."""
-    try:
-        if not client_id or row_number is None or not current_thread_id:
-            raise ValueError("clientId, rowNumber, and current thread are required")
-
-        threads_ref = (
-            _fs.collection("users")
-            .document(user_id)
-            .collection("threads")
+    *,
+    source_row: int,
+    divider_row: int,
+) -> Dict[str, Any]:
+    threads_ref = (
+        _fs.collection("users").document(user_id).collection("threads")
+    )
+    terminal_ids, row_shifts = _terminal_plan_members(
+        list(threads_ref.stream()),
+        client_id=client_id,
+        source_row=source_row,
+        divider_row=divider_row,
+    )
+    if not terminal_ids or current_thread_id not in terminal_ids:
+        raise RetryableProcessingError(
+            "terminal preflight could not identify the exact current row roots"
         )
-        terminal_reason = pending_patch.get("pendingTerminalReason")
-        matching_thread_ids = []
-        for thread in threads_ref.stream():
-            thread_data = thread.to_dict() or {}
-            is_source_row = thread_data.get("rowNumber") == row_number
-            is_recovering_source_row = (
-                thread_data.get("pendingTerminalSourceRow") == row_number
-                and thread_data.get("pendingTerminalReason") == terminal_reason
-            )
-            if (
-                thread_data.get("clientId") == client_id
-                and (is_source_row or is_recovering_source_row)
-            ):
-                matching_thread_ids.append(thread.id)
-        if not matching_thread_ids:
-            raise ValueError("no Firestore thread roots matched the terminal row")
-        if current_thread_id not in matching_thread_ids:
-            raise ValueError("current Firestore thread root did not match the terminal row")
+    write_count = len(terminal_ids) + len(row_shifts)
+    if write_count > FIRESTORE_BATCH_WRITE_LIMIT:
+        raise RetryableProcessingError(
+            "terminal finalization preflight exceeds Firestore 500-write limit: "
+            f"{write_count} writes"
+        )
+    return {
+        "dividerRow": divider_row,
+        "finalRow": source_row if source_row > divider_row else divider_row,
+        "claimThreadId": terminal_ids[0],
+        "terminalThreadIds": terminal_ids,
+        "rowShifts": row_shifts,
+        "writeCount": write_count,
+    }
 
-        batch = _fs.batch()
-        staged_patch = {
-            **pending_patch,
-            "pendingTerminalSourceRow": row_number,
+
+def _verify_terminal_finalization_plan(
+    user_id: str,
+    client_id: str,
+    saga: Dict[str, Any],
+) -> None:
+    plan = saga.get("finalizationPlan") or {}
+    threads_ref = (
+        _fs.collection("users").document(user_id).collection("threads")
+    )
+    actual_ids, actual_shifts = _terminal_plan_members(
+        list(threads_ref.stream()),
+        client_id=client_id,
+        source_row=saga.get("sourceRow"),
+        divider_row=plan.get("dividerRow"),
+    )
+    if actual_ids != plan.get("terminalThreadIds") or actual_shifts != plan.get("rowShifts"):
+        raise RetryableProcessingError(
+            "terminal finalization plan drifted after immutable preflight"
+        )
+    if plan.get("writeCount") != len(actual_ids) + len(actual_shifts):
+        raise RetryableProcessingError("terminal finalization plan write count drifted")
+
+
+def _terminal_saga_claim_ref(user_id: str, saga: Dict[str, Any]):
+    claim_thread_id = (saga.get("finalizationPlan") or {}).get("claimThreadId")
+    if not claim_thread_id:
+        raise RetryableProcessingError("terminal saga has no canonical claim root")
+    return (
+        _fs.collection("users").document(user_id).collection("threads")
+        .document(claim_thread_id)
+    )
+
+
+def _validate_terminal_saga_execution_claim(
+    claim: Any,
+    saga: Dict[str, Any],
+    terminal_saga_owner: TerminalSagaExecution,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    _validate_terminal_saga_immutable_hash(saga)
+    if not isinstance(terminal_saga_owner, TerminalSagaExecution):
+        raise RetryableProcessingError("terminal saga execution owner is missing")
+    if not isinstance(claim, dict):
+        raise RetryableProcessingError("terminal saga canonical claim is missing")
+    if (
+        claim.get("sagaKey") != saga.get("sagaKey")
+        or claim.get("immutableHash") != saga.get("immutableHash")
+    ):
+        raise RetryableProcessingError("terminal saga canonical claim drifted")
+    claim_token = claim.get("fencingToken")
+    if (
+        claim.get("owner") != terminal_saga_owner.owner
+        or isinstance(claim_token, bool)
+        or claim_token != terminal_saga_owner.fencing_token
+    ):
+        raise RetryableProcessingError("terminal saga execution ownership changed")
+    if (
+        not terminal_saga_owner.owner
+        or isinstance(terminal_saga_owner.fencing_token, bool)
+        or terminal_saga_owner.fencing_token < 1
+    ):
+        raise RetryableProcessingError("terminal saga execution owner is malformed")
+    lease_until = _timestamp_to_utc(claim.get("leaseUntil"))
+    now = now or datetime.now(timezone.utc)
+    if lease_until is None or lease_until <= now:
+        raise RetryableProcessingError(
+            "terminal saga execution lease is missing, malformed, or expired"
+        )
+    return claim
+
+
+def _renew_terminal_saga_execution(
+    user_id: str,
+    saga: Dict[str, Any],
+    terminal_saga_owner: TerminalSagaExecution,
+) -> datetime:
+    """Transactionally assert the canonical fence and renew before an effect."""
+    claim_ref = _terminal_saga_claim_ref(user_id, saga)
+    now = datetime.now(timezone.utc)
+    transaction = _fs.transaction()
+    snapshot = claim_ref.get(transaction=transaction)
+    data = snapshot.to_dict() if snapshot.exists else {}
+    claim = _validate_terminal_saga_execution_claim(
+        (data or {}).get("terminalSagaClaim"),
+        saga,
+        terminal_saga_owner,
+        now=now,
+    )
+    renewed_until = now + timedelta(seconds=TERMINAL_SAGA_EXECUTION_LEASE_SECONDS)
+    transaction.update(claim_ref, {
+        "terminalSagaClaim": {
+            **claim,
+            "leaseUntil": renewed_until,
+            "renewedAt": now,
+        },
+        "updatedAt": SERVER_TIMESTAMP,
+    })
+    try:
+        transaction.commit()
+    except Exception as exc:
+        raise RetryableProcessingError(
+            f"terminal saga execution lease renewal failed: {exc}"
+        ) from exc
+    return renewed_until
+
+
+def _fenced_terminal_thread_update(
+    user_id: str,
+    current_thread_id: str,
+    saga: Dict[str, Any],
+    terminal_saga_owner: TerminalSagaExecution,
+    patch: Dict[str, Any],
+    *,
+    renew_lease: bool = False,
+    failure_label: str,
+) -> None:
+    """Apply an intent/outcome only while the caller owns the canonical fence."""
+    claim_ref = _terminal_saga_claim_ref(user_id, saga)
+    current_ref = (
+        _fs.collection("users").document(user_id).collection("threads")
+        .document(current_thread_id)
+    )
+    now = datetime.now(timezone.utc)
+    transaction = _fs.transaction()
+    snapshot = claim_ref.get(transaction=transaction)
+    data = snapshot.to_dict() if snapshot.exists else {}
+    claim = _validate_terminal_saga_execution_claim(
+        (data or {}).get("terminalSagaClaim"),
+        saga,
+        terminal_saga_owner,
+        now=now,
+    )
+    if renew_lease:
+        renewed_claim = {
+            **claim,
+            "leaseUntil": now + timedelta(
+                seconds=TERMINAL_SAGA_EXECUTION_LEASE_SECONDS
+            ),
+            "renewedAt": now,
         }
-        for matching_thread_id in matching_thread_ids:
-            batch.update(
-                threads_ref.document(matching_thread_id),
-                dict(staged_patch),
+        claim_thread_id = (saga.get("finalizationPlan") or {}).get("claimThreadId")
+        if current_thread_id == claim_thread_id:
+            transaction.update(current_ref, {
+                **patch,
+                "terminalSagaClaim": renewed_claim,
+            })
+        else:
+            transaction.update(claim_ref, {
+                "terminalSagaClaim": renewed_claim,
+                "updatedAt": SERVER_TIMESTAMP,
+            })
+            transaction.update(current_ref, patch)
+    else:
+        transaction.update(current_ref, patch)
+    try:
+        transaction.commit()
+    except Exception as exc:
+        raise RetryableProcessingError(f"{failure_label}: {exc}") from exc
+
+
+def _read_validated_terminal_staging_plan(
+    transaction,
+    threads_ref,
+    *,
+    client_id: str,
+    current_thread_id: str,
+    saga: Dict[str, Any],
+) -> tuple[List[str], str, Dict[str, Any]]:
+    """Read and validate every frozen staging target in one transaction."""
+    _validate_terminal_saga_immutable_hash(saga)
+    plan = saga.get("finalizationPlan")
+    source_row = saga.get("sourceRow")
+    if (
+        saga.get("phase") != "staged"
+        or saga.get("clientId") != client_id
+        or not isinstance(plan, dict)
+        or type(source_row) is not int
+        or source_row < 1
+    ):
+        raise RetryableProcessingError(
+            "terminal staging plan identity or source geometry is malformed"
+        )
+
+    divider_row = plan.get("dividerRow")
+    final_row = plan.get("finalRow")
+    write_count = plan.get("writeCount")
+    terminal_ids = plan.get("terminalThreadIds")
+    row_shifts = plan.get("rowShifts")
+    claim_thread_id = plan.get("claimThreadId")
+    if (
+        type(divider_row) is not int
+        or divider_row < 1
+        or type(final_row) is not int
+        or final_row != (
+            source_row if source_row > divider_row else divider_row
+        )
+        or type(write_count) is not int
+        or not isinstance(terminal_ids, list)
+        or not isinstance(row_shifts, list)
+    ):
+        raise RetryableProcessingError(
+            "terminal staging plan geometry is malformed"
+        )
+
+    if (
+        not terminal_ids
+        or any(
+            not isinstance(thread_id, str) or not thread_id.strip()
+            for thread_id in terminal_ids
+        )
+        or terminal_ids != sorted(set(terminal_ids))
+        or current_thread_id not in terminal_ids
+        or claim_thread_id != terminal_ids[0]
+    ):
+        raise RetryableProcessingError(
+            "terminal staging plan membership is malformed"
+        )
+
+    validated_shifts = []
+    shift_ids = []
+    for shift in row_shifts:
+        if not isinstance(shift, dict) or set(shift) != {
+            "threadId",
+            "fromRow",
+            "toRow",
+        }:
+            raise RetryableProcessingError(
+                "terminal staging row-shift entry is malformed"
             )
-        batch.commit()
-        return matching_thread_ids
+        shift_id = shift.get("threadId")
+        from_row = shift.get("fromRow")
+        to_row = shift.get("toRow")
+        if (
+            not isinstance(shift_id, str)
+            or not shift_id.strip()
+            or type(from_row) is not int
+            or type(to_row) is not int
+            or not (source_row < from_row <= divider_row)
+            or to_row != from_row - 1
+        ):
+            raise RetryableProcessingError(
+                "terminal staging row-shift geometry is malformed"
+            )
+        shift_ids.append(shift_id)
+        validated_shifts.append(shift)
+    if (
+        shift_ids != sorted(set(shift_ids))
+        or set(terminal_ids) & set(shift_ids)
+        or write_count != len(terminal_ids) + len(validated_shifts)
+        or write_count > FIRESTORE_BATCH_WRITE_LIMIT
+    ):
+        raise RetryableProcessingError(
+            "terminal staging plan target membership drifted"
+        )
+
+    expected_rows = {
+        **{thread_id: source_row for thread_id in terminal_ids},
+        **{
+            shift["threadId"]: shift["fromRow"]
+            for shift in validated_shifts
+        },
+    }
+    target_snapshots = {}
+    for target_id, expected_row in expected_rows.items():
+        target_ref = threads_ref.document(target_id)
+        if getattr(target_ref, "id", None) != target_id:
+            raise RetryableProcessingError(
+                f"terminal staging root identity drifted: {target_id}"
+            )
+        snapshot = target_ref.get(transaction=transaction)
+        data = snapshot.to_dict() if snapshot.exists else {}
+        live_row = (data or {}).get("rowNumber")
+        if (
+            not snapshot.exists
+            or (data or {}).get("clientId") != client_id
+            or type(live_row) is not int
+            or live_row != expected_row
+        ):
+            raise RetryableProcessingError(
+                f"terminal staging root drifted: {target_id}"
+            )
+        target_snapshots[target_id] = snapshot
+
+    return list(terminal_ids), claim_thread_id, target_snapshots
+
+
+def _stage_terminal_saga(
+    user_id: str,
+    client_id: str,
+    current_thread_id: str,
+    saga: Dict[str, Any],
+) -> tuple[Dict[str, Any], TerminalSagaExecution]:
+    """Atomically claim the row and persist one immutable source-message saga."""
+    try:
+        threads_ref = (
+            _fs.collection("users").document(user_id).collection("threads")
+        )
+        owner = f"terminal-saga-{uuid4().hex}"
+        now = datetime.now(timezone.utc)
+        common_patch = {
+            "followUpStatus": "stopped",
+            "followUpConfig.nextFollowUpAt": None,
+            "followUpConfig.processingBy": None,
+            "followUpConfig.processingAt": None,
+            "pendingTerminalReason": saga.get("reason"),
+            "pendingTerminalAt": SERVER_TIMESTAMP,
+            "pendingTerminalSourceRow": saga.get("sourceRow"),
+            "terminalSagaKey": saga.get("sagaKey"),
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+        transaction = _fs.transaction()
+        terminal_ids, claim_thread_id, target_snapshots = (
+            _read_validated_terminal_staging_plan(
+                transaction,
+                threads_ref,
+                client_id=client_id,
+                current_thread_id=current_thread_id,
+                saga=saga,
+            )
+        )
+        claim_ref = threads_ref.document(claim_thread_id)
+        claim_snapshot = target_snapshots[claim_thread_id]
+        claim_data = claim_snapshot.to_dict() if claim_snapshot.exists else {}
+        current_ref = threads_ref.document(current_thread_id)
+        current_snapshot = target_snapshots[current_thread_id]
+        current_data = current_snapshot.to_dict() if current_snapshot.exists else {}
+        # Every frozen alias/root is about to receive terminal ownership
+        # markers.  Linearize against a pending/reply send permit on each one,
+        # not only the source root, before staging any write.
+        for terminal_id in terminal_ids:
+            try:
+                assert_terminal_staging_allowed(
+                    transaction,
+                    threads_ref.document(terminal_id),
+                )
+            except GraphSendPermitBlocked as exc:
+                raise RetryableProcessingError(
+                    "terminal saga staging blocked by Graph send permit on "
+                    f"root {terminal_id}: {exc}"
+                ) from exc
+        settlements = _validate_terminal_settlement_history(
+            (current_data or {}).get("terminalSettlements")
+        )
+        if len(settlements) >= TERMINAL_SETTLEMENT_HISTORY_LIMIT:
+            raise RetryableProcessingError(
+                "terminal settlement retention limit reached before staging; "
+                "operator review is required"
+            )
+        expected_settlement_ordinal = len(settlements) + 1
+        if saga.get("settlementOrdinal") != expected_settlement_ordinal:
+            raise RetryableProcessingError(
+                "terminal saga settlement ordinal drifted before staging"
+            )
+        if (current_data or {}).get("terminalReplyAttempt") is not None:
+            raise RetryableProcessingError(
+                "terminal saga cannot replace an uncleared prior reply attempt"
+            )
+        existing_claim = (claim_data or {}).get("terminalSagaClaim")
+        if isinstance(existing_claim, dict) and existing_claim.get("sagaKey"):
+            raise RetryableProcessingError(
+                "terminal saga row claim conflict; losing source remains retryable"
+            )
+        prior_fence = (claim_data or {}).get("terminalSagaFence", 0)
+        if isinstance(prior_fence, bool) or not isinstance(prior_fence, int) or prior_fence < 0:
+            raise RetryableProcessingError("terminal saga fencing counter is malformed")
+        fencing_token = prior_fence + 1
+        terminal_saga_owner = TerminalSagaExecution(owner, fencing_token)
+        claim = {
+            "sagaKey": saga.get("sagaKey"),
+            "immutableHash": saga.get("immutableHash"),
+            "sourceMessageKey": saga.get("sourceMessageKey"),
+            "currentThreadId": current_thread_id,
+            "owner": owner,
+            "fencingToken": fencing_token,
+            "claimedAt": now,
+            "leaseUntil": now + timedelta(
+                seconds=TERMINAL_SAGA_EXECUTION_LEASE_SECONDS
+            ),
+            "status": "processing",
+        }
+        for terminal_id in terminal_ids:
+            root_patch = dict(common_patch)
+            if terminal_id == current_thread_id:
+                root_patch["terminalSaga"] = dict(saga)
+            if terminal_id == claim_thread_id:
+                root_patch["terminalSagaClaim"] = claim
+                root_patch["terminalSagaFence"] = fencing_token
+            transaction.update(threads_ref.document(terminal_id), root_patch)
+        try:
+            transaction.commit()
+        except Exception as exc:
+            committed_snapshot = claim_ref.get()
+            committed_data = (
+                committed_snapshot.to_dict() if committed_snapshot.exists else {}
+            )
+            committed_claim = committed_data.get("terminalSagaClaim")
+            if not (
+                isinstance(committed_claim, dict)
+                and committed_claim.get("owner") == owner
+                and committed_claim.get("fencingToken") == fencing_token
+                and committed_claim.get("immutableHash") == saga.get("immutableHash")
+            ):
+                if isinstance(committed_claim, dict) and committed_claim.get("sagaKey"):
+                    raise RetryableProcessingError(
+                        "terminal saga row claim conflict; losing source remains retryable"
+                    ) from exc
+                raise
+        return dict(saga), terminal_saga_owner
+    except RetryableProcessingError:
+        raise
     except Exception as exc:
         raise RetryableProcessingError(
             f"Row thread terminal staging failed: {exc}"
         ) from exc
 
 
+def _release_terminal_saga_execution_claim(
+    user_id: str,
+    saga: Dict[str, Any],
+    terminal_saga_owner: TerminalSagaExecution,
+) -> None:
+    if not terminal_saga_owner:
+        return
+    plan = saga.get("finalizationPlan") or {}
+    claim_thread_id = plan.get("claimThreadId")
+    if not claim_thread_id:
+        return
+    claim_ref = (
+        _fs.collection("users").document(user_id).collection("threads")
+        .document(claim_thread_id)
+    )
+    try:
+        transaction = _fs.transaction()
+        snapshot = claim_ref.get(transaction=transaction)
+        data = snapshot.to_dict() if snapshot.exists else {}
+        claim = (data or {}).get("terminalSagaClaim")
+        _validate_terminal_saga_execution_claim(
+            claim,
+            saga,
+            terminal_saga_owner,
+        )
+        transaction.update(claim_ref, {
+            "terminalSagaClaim": {
+                **claim,
+                "owner": None,
+                "leaseUntil": None,
+                "status": "retryable",
+                "releasedAt": SERVER_TIMESTAMP,
+            },
+            "updatedAt": SERVER_TIMESTAMP,
+        })
+        transaction.commit()
+    except Exception as exc:
+        print(f"⚠️ Could not release terminal saga execution claim: {exc}")
+
+
+def _claim_existing_terminal_saga_execution(
+    user_id: str,
+    current_thread_id: str,
+    thread_data: Dict[str, Any],
+    saga: Dict[str, Any],
+) -> TerminalSagaExecution:
+    """Serialize exact-source recovery against the original row winner."""
+    plan = saga.get("finalizationPlan") or {}
+    claim_thread_id = plan.get("claimThreadId")
+    if not claim_thread_id:
+        raise RetryableProcessingError("terminal saga has no canonical claim root")
+    claim_ref = (
+        _fs.collection("users").document(user_id).collection("threads")
+        .document(claim_thread_id)
+    )
+    owner = f"terminal-saga-recovery-{uuid4().hex}"
+    now = datetime.now(timezone.utc)
+    transaction = _fs.transaction()
+    snapshot = claim_ref.get(transaction=transaction)
+    data = snapshot.to_dict() if snapshot.exists else {}
+    claim = (data or {}).get("terminalSagaClaim")
+    if not isinstance(claim, dict):
+        raise RetryableProcessingError("terminal saga canonical claim is missing")
+    if (
+        claim.get("sagaKey") != saga.get("sagaKey")
+        or claim.get("immutableHash") != saga.get("immutableHash")
+    ):
+        raise RetryableProcessingError("terminal saga canonical claim drifted")
+
+    existing_owner = claim.get("owner")
+    lease_until = _timestamp_to_utc(claim.get("leaseUntil"))
+    if existing_owner:
+        if lease_until is None:
+            raise RetryableProcessingError(
+                "terminal saga execution lease is missing, malformed, or expired"
+            )
+        if lease_until > now:
+            raise RetryableProcessingError(
+                "terminal saga is already owned by another active worker"
+            )
+    fence_values = (
+        claim.get("fencingToken", 0),
+        (data or {}).get("terminalSagaFence", 0),
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in fence_values
+    ):
+        raise RetryableProcessingError("terminal saga fencing counter is malformed")
+    prior_fence = max(fence_values)
+    fencing_token = prior_fence + 1
+    terminal_saga_owner = TerminalSagaExecution(owner, fencing_token)
+
+    transaction.update(claim_ref, {
+        "terminalSagaClaim": {
+            **claim,
+            "owner": owner,
+            "fencingToken": fencing_token,
+            "claimedAt": now,
+            "leaseUntil": now + timedelta(
+                seconds=TERMINAL_SAGA_EXECUTION_LEASE_SECONDS
+            ),
+            "status": "recovering",
+        },
+        "terminalSagaFence": fencing_token,
+        "updatedAt": SERVER_TIMESTAMP,
+    })
+    try:
+        transaction.commit()
+    except Exception as exc:
+        raise RetryableProcessingError(
+            f"terminal saga recovery claim failed: {exc}"
+        ) from exc
+    return terminal_saga_owner
+
+
+_TERMINAL_SHEET_ATTEMPT_IMMUTABLE_FIELDS = (
+    "version",
+    "sagaKey",
+    "sagaImmutableHash",
+    "attemptId",
+    "ordinal",
+    "previousAttemptId",
+    "previousAttemptHash",
+    "mutationKind",
+    "sourceRow",
+    "finalRow",
+    "rowAnchor",
+    "noteHash",
+    "owner",
+    "fencingToken",
+    "requestStartedAt",
+    "providerDeadline",
+)
+_TERMINAL_SHEET_APPLIED_STATUSES = {"applied", "reconciled_applied"}
+_TERMINAL_SHEET_ATTEMPT_COMMON_FIELDS = frozenset({
+    *_TERMINAL_SHEET_ATTEMPT_IMMUTABLE_FIELDS,
+    "attemptImmutableHash",
+    "attemptHash",
+    "status",
+})
+_TERMINAL_SHEET_ATTEMPT_STATUS_FIELDS = {
+    "request_started": frozenset(),
+    "applied": frozenset({
+        "appliedByOwner",
+        "appliedByFencingToken",
+        "providerCompletedAt",
+        "operatorReviewRequired",
+    }),
+    "reconciled_applied": frozenset({
+        "reconciledByOwner",
+        "reconciledByFencingToken",
+        "reconciledAt",
+        "reconciliationEvidence",
+        "operatorReviewRequired",
+    }),
+    "needs_operator_review": frozenset({
+        "operatorReviewRequired",
+        "reviewReason",
+        "reviewEvidence",
+        "providerError",
+        "reviewedByOwner",
+        "reviewedByFencingToken",
+        "reviewedAt",
+    }),
+    "definitely_not_applied": frozenset({
+        "providerStatusCode",
+        "providerError",
+        "definitelyNotAppliedAt",
+        "operatorReviewRequired",
+    }),
+}
+_TERMINAL_SHEET_ATTEMPT_LEGAL_TRANSITIONS = {
+    "request_started": frozenset({
+        "applied",
+        "reconciled_applied",
+        "needs_operator_review",
+        "definitely_not_applied",
+    }),
+    "needs_operator_review": frozenset({"reconciled_applied"}),
+    "applied": frozenset(),
+    "reconciled_applied": frozenset(),
+    "definitely_not_applied": frozenset(),
+}
+_TERMINAL_SHEET_MUTATION_REVIEW_FIELDS = frozenset({
+    "sagaKey",
+    "attemptId",
+    "attemptHash",
+    "reason",
+    "observedByOwner",
+    "observedByFencingToken",
+    "requestedAt",
+})
+
+
+def _terminal_sheet_attempt_immutable_hash(attempt: Dict[str, Any]) -> str:
+    immutable = {
+        field: attempt.get(field)
+        for field in _TERMINAL_SHEET_ATTEMPT_IMMUTABLE_FIELDS
+    }
+    return hashlib.sha256(
+        json.dumps(immutable, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _terminal_sheet_attempt_full_hash(attempt: Dict[str, Any]) -> str:
+    state = {
+        field: value
+        for field, value in attempt.items()
+        if field != "attemptHash"
+    }
+    return hashlib.sha256(
+        json.dumps(state, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _terminal_sheet_attempt_observer_is_valid(
+    attempt: Dict[str, Any],
+    *,
+    owner_field: str,
+    fencing_field: str,
+) -> bool:
+    observer_owner = attempt.get(owner_field)
+    observer_fence = attempt.get(fencing_field)
+    attempt_fence = attempt.get("fencingToken")
+    if (
+        not isinstance(observer_owner, str)
+        or not observer_owner.strip()
+        or type(observer_fence) is not int
+        or observer_fence < attempt_fence
+    ):
+        return False
+    return not (
+        observer_fence == attempt_fence
+        and observer_owner != attempt.get("owner")
+    )
+
+
+def _terminal_sheet_attempt_datetime_is_valid(value: Any) -> bool:
+    if not isinstance(value, datetime):
+        return False
+    try:
+        return value.tzinfo is not None and value.utcoffset() is not None
+    except Exception:
+        return False
+
+
+def _terminal_sheet_attempt_timestamp_is_valid(
+    attempt: Dict[str, Any],
+    field: str,
+) -> bool:
+    raw_value = attempt.get(field)
+    raw_started_at = attempt.get("requestStartedAt")
+    if (
+        not _terminal_sheet_attempt_datetime_is_valid(raw_value)
+        or not _terminal_sheet_attempt_datetime_is_valid(raw_started_at)
+    ):
+        return False
+    value = _timestamp_to_utc(raw_value)
+    started_at = _timestamp_to_utc(raw_started_at)
+    return value is not None and started_at is not None and value >= started_at
+
+
+def _terminal_sheet_attempt_with_status(
+    current: Dict[str, Any],
+    status: str,
+    outcome_fields: Dict[str, Any],
+) -> Dict[str, Any]:
+    updated = {
+        field: current[field]
+        for field in _TERMINAL_SHEET_ATTEMPT_IMMUTABLE_FIELDS
+    }
+    updated["attemptImmutableHash"] = current["attemptImmutableHash"]
+    updated["status"] = status
+    updated.update(outcome_fields)
+    updated["attemptHash"] = _terminal_sheet_attempt_full_hash(updated)
+    return updated
+
+
+def _terminal_sheet_mutation_geometry_from_saga(
+    saga: Dict[str, Any],
+) -> tuple[int, int, str]:
+    plan = saga.get("finalizationPlan")
+    source_row = saga.get("sourceRow")
+    final_row = plan.get("finalRow") if isinstance(plan, dict) else None
+    if (
+        type(source_row) is not int
+        or source_row < 1
+        or type(final_row) is not int
+        or final_row < 1
+    ):
+        raise RetryableProcessingError(
+            "terminal Sheet mutation saga geometry is malformed"
+        )
+    phase = saga.get("phase")
+    if phase == "staged":
+        if "finalRow" in saga:
+            raise RetryableProcessingError(
+                "staged terminal Sheet mutation saga contains mutable finalRow"
+            )
+    elif phase == "finalized":
+        if (
+            type(saga.get("finalRow")) is not int
+            or saga.get("finalRow") != final_row
+        ):
+            raise RetryableProcessingError(
+                "finalized terminal Sheet mutation saga finalRow drifted from plan"
+            )
+    else:
+        raise RetryableProcessingError(
+            "terminal Sheet mutation saga phase is malformed"
+        )
+    mutation_kind = (
+        "ensure_note"
+        if source_row == final_row
+        else "move_with_note"
+    )
+    return source_row, final_row, mutation_kind
+
+
+def _terminal_sheet_mutation_kind_from_saga(
+    saga: Dict[str, Any],
+) -> str:
+    return _terminal_sheet_mutation_geometry_from_saga(saga)[2]
+
+
+def _validate_terminal_sheet_mutation_attempt(
+    attempt: Any,
+    saga: Dict[str, Any],
+    *,
+    mutation_kind: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not isinstance(attempt, dict):
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt is missing or malformed"
+        )
+    status = attempt.get("status")
+    status_fields = _TERMINAL_SHEET_ATTEMPT_STATUS_FIELDS.get(status)
+    if status_fields is None:
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt status is malformed"
+        )
+    expected_fields = _TERMINAL_SHEET_ATTEMPT_COMMON_FIELDS | status_fields
+    if set(attempt) != expected_fields:
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt status schema has missing, extra, "
+            "or cross-status fields"
+        )
+    immutable = {
+        field: attempt.get(field)
+        for field in _TERMINAL_SHEET_ATTEMPT_IMMUTABLE_FIELDS
+    }
+    actual_immutable_hash = _terminal_sheet_attempt_immutable_hash(attempt)
+    actual_full_hash = _terminal_sheet_attempt_full_hash(attempt)
+    plan = saga.get("finalizationPlan") or {}
+    expected = {
+        "version": TERMINAL_SHEET_MUTATION_VERSION,
+        "sagaKey": saga.get("sagaKey"),
+        "sagaImmutableHash": saga.get("immutableHash"),
+        "sourceRow": saga.get("sourceRow"),
+        "finalRow": plan.get("finalRow"),
+        "rowAnchor": saga.get("rowAnchor"),
+        "noteHash": hashlib.sha256(
+            str(saga.get("note") or "").encode("utf-8")
+        ).hexdigest(),
+    }
+    if any(immutable.get(field) != value for field, value in expected.items()):
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt drifted from immutable saga"
+        )
+    expected_mutation_kind = _terminal_sheet_mutation_kind_from_saga(saga)
+    if immutable.get("mutationKind") != expected_mutation_kind:
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt kind drifted from immutable "
+            "saga geometry"
+        )
+    if mutation_kind and immutable.get("mutationKind") != mutation_kind:
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt kind drifted"
+        )
+    if immutable.get("mutationKind") not in {"move_with_note", "ensure_note"}:
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt kind is malformed"
+        )
+    if (
+        type(immutable.get("version")) is not int
+        or type(immutable.get("sourceRow")) is not int
+        or immutable.get("sourceRow") < 1
+        or type(immutable.get("finalRow")) is not int
+        or immutable.get("finalRow") < 1
+        or not isinstance(immutable.get("attemptId"), str)
+        or not immutable.get("attemptId").strip()
+        or type(immutable.get("ordinal")) is not int
+        or immutable.get("ordinal") < 1
+        or not isinstance(immutable.get("owner"), str)
+        or not immutable.get("owner").strip()
+        or type(immutable.get("fencingToken")) is not int
+        or immutable.get("fencingToken") < 1
+        or attempt.get("attemptImmutableHash") != actual_immutable_hash
+    ):
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt immutable hash is malformed"
+        )
+    if attempt.get("attemptHash") != actual_full_hash:
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt full hash is malformed"
+        )
+    if immutable.get("ordinal") == 1 and (
+        immutable.get("previousAttemptId") is not None
+        or immutable.get("previousAttemptHash") is not None
+    ):
+        raise RetryableProcessingError(
+            "first terminal Sheet mutation attempt has malformed lineage"
+    )
+    if immutable.get("ordinal") > 1 and (
+        not isinstance(immutable.get("previousAttemptId"), str)
+        or not immutable.get("previousAttemptId").strip()
+        or not isinstance(immutable.get("previousAttemptHash"), str)
+        or not immutable.get("previousAttemptHash").strip()
+    ):
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt lineage is malformed"
+        )
+    started_at = _timestamp_to_utc(immutable.get("requestStartedAt"))
+    provider_deadline = _timestamp_to_utc(immutable.get("providerDeadline"))
+    if (
+        not _terminal_sheet_attempt_datetime_is_valid(
+            immutable.get("requestStartedAt")
+        )
+        or not _terminal_sheet_attempt_datetime_is_valid(
+            immutable.get("providerDeadline")
+        )
+        or started_at is None
+        or provider_deadline is None
+        or provider_deadline <= started_at
+    ):
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt provider deadline is malformed"
+        )
+    if status == "applied" and (
+        attempt.get("appliedByOwner") != immutable.get("owner")
+        or type(attempt.get("appliedByFencingToken")) is not int
+        or attempt.get("appliedByFencingToken")
+        != immutable.get("fencingToken")
+        or not _terminal_sheet_attempt_timestamp_is_valid(
+            attempt,
+            "providerCompletedAt",
+        )
+        or attempt.get("operatorReviewRequired") is not False
+    ):
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt applied outcome is malformed"
+        )
+    if status == "reconciled_applied" and (
+        not _terminal_sheet_attempt_observer_is_valid(
+            attempt,
+            owner_field="reconciledByOwner",
+            fencing_field="reconciledByFencingToken",
+        )
+        or not _terminal_sheet_attempt_timestamp_is_valid(
+            attempt,
+            "reconciledAt",
+        )
+        or not isinstance(attempt.get("reconciliationEvidence"), str)
+        or not attempt.get("reconciliationEvidence").strip()
+        or attempt.get("operatorReviewRequired") is not False
+    ):
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt reconciled outcome is malformed"
+        )
+    if status == "needs_operator_review" and (
+        attempt.get("operatorReviewRequired") is not True
+        or not isinstance(attempt.get("reviewReason"), str)
+        or not attempt.get("reviewReason").strip()
+        or attempt.get("reviewEvidence")
+        not in {"absent", "partial", "unreadable"}
+        or (
+            attempt.get("providerError") is not None
+            and (
+                not isinstance(attempt.get("providerError"), str)
+                or not attempt.get("providerError").strip()
+            )
+        )
+        or not _terminal_sheet_attempt_observer_is_valid(
+            attempt,
+            owner_field="reviewedByOwner",
+            fencing_field="reviewedByFencingToken",
+        )
+        or not _terminal_sheet_attempt_timestamp_is_valid(
+            attempt,
+            "reviewedAt",
+        )
+    ):
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt operator-review outcome is malformed"
+        )
+    if status == "definitely_not_applied" and (
+        type(attempt.get("providerStatusCode")) is not int
+        or attempt.get("providerStatusCode") != 429
+        or not isinstance(attempt.get("providerError"), str)
+        or not attempt.get("providerError").strip()
+        or not _terminal_sheet_attempt_timestamp_is_valid(
+            attempt,
+            "definitelyNotAppliedAt",
+        )
+        or attempt.get("operatorReviewRequired") is not False
+    ):
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt definite-429 outcome is malformed"
+        )
+    return dict(attempt)
+
+
+def _validate_terminal_sheet_mutation_review(
+    review: Any,
+    saga: Dict[str, Any],
+    attempt: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if attempt.get("status") != "needs_operator_review":
+        if review is not None:
+            raise RetryableProcessingError(
+                "terminal Sheet mutation review exists for a non-review attempt"
+            )
+        return None
+    if not isinstance(review, dict) or set(review) != _TERMINAL_SHEET_MUTATION_REVIEW_FIELDS:
+        raise RetryableProcessingError(
+            "terminal Sheet mutation review is missing or malformed"
+        )
+    expected = {
+        "sagaKey": saga.get("sagaKey"),
+        "attemptId": attempt.get("attemptId"),
+        "attemptHash": attempt.get("attemptHash"),
+        "reason": attempt.get("reviewReason"),
+        "observedByOwner": attempt.get("reviewedByOwner"),
+        "observedByFencingToken": attempt.get("reviewedByFencingToken"),
+        "requestedAt": attempt.get("reviewedAt"),
+    }
+    if review != expected:
+        raise RetryableProcessingError(
+            "terminal Sheet mutation review drifted from the exact attempt hash"
+        )
+    return dict(review)
+
+
+def _validate_terminal_sheet_mutation_history(
+    history: Any,
+    saga: Dict[str, Any],
+    *,
+    mutation_kind: str,
+    active_attempt: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    if history is None:
+        history = []
+    if not isinstance(history, list) or len(history) > TERMINAL_SHEET_MUTATION_HISTORY_LIMIT:
+        raise RetryableProcessingError(
+            "terminal Sheet mutation attempt history is malformed or over limit"
+        )
+    validated: List[Dict[str, Any]] = []
+    previous = None
+    seen_attempt_ids = set()
+    for index, raw_attempt in enumerate(history, start=1):
+        attempt = _validate_terminal_sheet_mutation_attempt(
+            raw_attempt,
+            saga,
+            mutation_kind=mutation_kind,
+        )
+        if attempt.get("ordinal") != index:
+            raise RetryableProcessingError(
+                "terminal Sheet mutation attempt history ordinal drifted"
+            )
+        if attempt.get("attemptId") in seen_attempt_ids:
+            raise RetryableProcessingError(
+                "terminal Sheet mutation attempt history contains a duplicate ID"
+            )
+        if previous is not None and (
+            attempt.get("previousAttemptId") != previous.get("attemptId")
+            or attempt.get("previousAttemptHash") != previous.get("attemptHash")
+        ):
+            raise RetryableProcessingError(
+                "terminal Sheet mutation attempt history lineage drifted"
+            )
+        if previous is not None and (
+            attempt.get("owner") == previous.get("owner")
+            or attempt.get("fencingToken") <= previous.get("fencingToken")
+        ):
+            raise RetryableProcessingError(
+                "terminal Sheet mutation history owner/fence did not advance"
+            )
+        if attempt.get("status") != "definitely_not_applied":
+            raise RetryableProcessingError(
+                "terminal Sheet mutation history contains an ambiguous attempt"
+            )
+        validated.append(attempt)
+        seen_attempt_ids.add(attempt.get("attemptId"))
+        previous = attempt
+
+    if active_attempt is not None:
+        if active_attempt.get("ordinal") != len(validated) + 1:
+            raise RetryableProcessingError(
+                "active terminal Sheet mutation attempt ordinal drifted"
+            )
+        expected_previous_id = previous.get("attemptId") if previous else None
+        expected_previous_hash = previous.get("attemptHash") if previous else None
+        if (
+            active_attempt.get("previousAttemptId") != expected_previous_id
+            or active_attempt.get("previousAttemptHash") != expected_previous_hash
+        ):
+            raise RetryableProcessingError(
+                "active terminal Sheet mutation attempt lineage drifted"
+            )
+        if active_attempt.get("attemptId") in seen_attempt_ids:
+            raise RetryableProcessingError(
+                "active terminal Sheet mutation attempt ID is duplicated"
+            )
+        if previous is not None and (
+            active_attempt.get("owner") == previous.get("owner")
+            or active_attempt.get("fencingToken")
+            <= previous.get("fencingToken")
+        ):
+            raise RetryableProcessingError(
+                "active terminal Sheet mutation owner/fence did not advance"
+            )
+    return validated
+
+
+def _begin_terminal_sheet_mutation_attempt(
+    user_id: str,
+    saga: Dict[str, Any],
+    terminal_saga_owner: TerminalSagaExecution,
+    mutation_kind: str,
+    *,
+    allow_create: bool = True,
+) -> tuple[Dict[str, Any], bool]:
+    """Persist request_started under the current fence before any Sheet write."""
+    _source_row, expected_final_row, derived_mutation_kind = (
+        _terminal_sheet_mutation_geometry_from_saga(saga)
+    )
+    if mutation_kind != derived_mutation_kind:
+        raise RetryableProcessingError(
+            "terminal Sheet mutation caller kind disagrees with immutable "
+            "saga geometry"
+        )
+    mutation_kind = derived_mutation_kind
+    claim_ref = _terminal_saga_claim_ref(user_id, saga)
+    transaction = _fs.transaction()
+    now = datetime.now(timezone.utc)
+    commit_attempted = False
+    attempt_id = f"terminal-sheet-{uuid4().hex}"
+    expected_history = None
+    expected_review = None
+    expected_claim = None
+    try:
+        snapshot = claim_ref.get(transaction=transaction)
+        data = snapshot.to_dict() if snapshot.exists else {}
+        claim = _validate_terminal_saga_execution_claim(
+            (data or {}).get("terminalSagaClaim"),
+            saga,
+            terminal_saga_owner,
+            now=now,
+        )
+        existing = (data or {}).get("terminalSheetMutationAttempt")
+        if existing is not None:
+            existing = _validate_terminal_sheet_mutation_attempt(
+                existing,
+                saga,
+                mutation_kind=mutation_kind,
+            )
+            _validate_terminal_sheet_mutation_review(
+                (data or {}).get("terminalSheetMutationReview"),
+                saga,
+                existing,
+            )
+            history = _validate_terminal_sheet_mutation_history(
+                (data or {}).get("terminalSheetMutationHistory"),
+                saga,
+                mutation_kind=mutation_kind,
+                active_attempt=existing,
+            )
+            if existing.get("status") != "definitely_not_applied":
+                return existing, False
+            if not allow_create:
+                raise RetryableProcessingError(
+                    "terminal Sheet mutation attempt creation is disabled "
+                    "during read-only recovery"
+                )
+            if (
+                terminal_saga_owner.owner == existing.get("owner")
+                or terminal_saga_owner.fencing_token
+                <= existing.get("fencingToken", 0)
+            ):
+                raise RetryableProcessingError(
+                    "a definitely-not-applied Sheet mutation requires a new fenced "
+                    "owner with a strictly higher fencing token"
+                )
+            if existing.get("ordinal") >= TERMINAL_SHEET_MUTATION_ATTEMPT_LIMIT:
+                raise RetryableProcessingError(
+                    "terminal Sheet mutation definite-retry limit was reached"
+                )
+            previous_attempt = existing
+            next_ordinal = existing.get("ordinal") + 1
+        else:
+            if not allow_create:
+                raise RetryableProcessingError(
+                    "finalized terminal Sheet recovery is missing its durable "
+                    "mutation attempt; reconstruction is forbidden"
+                )
+            if (data or {}).get("terminalSheetMutationReview") is not None:
+                raise RetryableProcessingError(
+                    "terminal Sheet mutation review exists without an active attempt"
+                )
+            history = _validate_terminal_sheet_mutation_history(
+                (data or {}).get("terminalSheetMutationHistory"),
+                saga,
+                mutation_kind=mutation_kind,
+            )
+            if history:
+                raise RetryableProcessingError(
+                    "terminal Sheet mutation history exists without an active attempt"
+                )
+            previous_attempt = None
+            next_ordinal = 1
+
+        renewed_until = now + timedelta(
+            seconds=TERMINAL_SAGA_EXECUTION_LEASE_SECONDS
+        )
+        provider_deadline = now + timedelta(
+            seconds=TERMINAL_SHEET_PROVIDER_DEADLINE_SECONDS
+        )
+        if provider_deadline >= renewed_until:
+            raise RetryableProcessingError(
+                "terminal Sheet provider deadline must be shorter than its lease"
+            )
+        immutable = {
+            "version": TERMINAL_SHEET_MUTATION_VERSION,
+            "sagaKey": saga.get("sagaKey"),
+            "sagaImmutableHash": saga.get("immutableHash"),
+            "attemptId": attempt_id,
+            "ordinal": next_ordinal,
+            "previousAttemptId": (
+                previous_attempt.get("attemptId") if previous_attempt else None
+            ),
+            "previousAttemptHash": (
+                previous_attempt.get("attemptHash") if previous_attempt else None
+            ),
+            "mutationKind": derived_mutation_kind,
+            "sourceRow": saga.get("sourceRow"),
+            "finalRow": expected_final_row,
+            "rowAnchor": saga.get("rowAnchor"),
+            "noteHash": hashlib.sha256(
+                str(saga.get("note") or "").encode("utf-8")
+            ).hexdigest(),
+            "owner": terminal_saga_owner.owner,
+            "fencingToken": terminal_saga_owner.fencing_token,
+            "requestStartedAt": now,
+            "providerDeadline": provider_deadline,
+        }
+        attempt = {
+            **immutable,
+            "attemptImmutableHash": _terminal_sheet_attempt_immutable_hash(
+                immutable
+            ),
+            "status": "request_started",
+        }
+        attempt["attemptHash"] = _terminal_sheet_attempt_full_hash(attempt)
+        patch = {
+            "terminalSheetMutationAttempt": attempt,
+            "terminalSagaClaim": {
+                **claim,
+                "leaseUntil": renewed_until,
+                "renewedAt": now,
+            },
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+        expected_history = copy.deepcopy(
+            (data or {}).get("terminalSheetMutationHistory")
+        )
+        expected_review = copy.deepcopy(
+            (data or {}).get("terminalSheetMutationReview")
+        )
+        if previous_attempt is not None:
+            patch["terminalSheetMutationHistory"] = [
+                *history,
+                previous_attempt,
+            ]
+            patch["terminalSheetMutationReview"] = None
+            expected_history = copy.deepcopy(
+                patch["terminalSheetMutationHistory"]
+            )
+            expected_review = None
+        expected_claim = copy.deepcopy(patch["terminalSagaClaim"])
+        transaction.update(claim_ref, patch)
+        commit_attempted = True
+        transaction.commit()
+        return attempt, True
+    except Exception as exc:
+        if commit_attempted:
+            try:
+                readback = claim_ref.get()
+                readback_data = readback.to_dict() if readback.exists else {}
+                readback_claim = _validate_terminal_saga_execution_claim(
+                    readback_data.get("terminalSagaClaim"),
+                    saga,
+                    terminal_saga_owner,
+                )
+                committed = _validate_terminal_sheet_mutation_attempt(
+                    readback_data.get("terminalSheetMutationAttempt"),
+                    saga,
+                    mutation_kind=mutation_kind,
+                )
+                _validate_terminal_sheet_mutation_history(
+                    readback_data.get("terminalSheetMutationHistory"),
+                    saga,
+                    mutation_kind=mutation_kind,
+                    active_attempt=committed,
+                )
+                _validate_terminal_sheet_mutation_review(
+                    readback_data.get("terminalSheetMutationReview"),
+                    saga,
+                    committed,
+                )
+                if (
+                    committed == attempt
+                    and readback_claim == expected_claim
+                    and readback_data.get("terminalSheetMutationHistory")
+                    == expected_history
+                    and readback_data.get("terminalSheetMutationReview")
+                    == expected_review
+                ):
+                    return attempt, True
+            except Exception:
+                pass
+        if isinstance(exc, RetryableProcessingError):
+            raise
+        raise RetryableProcessingError(
+            f"terminal Sheet mutation intent persistence failed: {exc}"
+        ) from exc
+
+
+def _record_terminal_sheet_mutation_state(
+    user_id: str,
+    saga: Dict[str, Any],
+    terminal_saga_owner: TerminalSagaExecution,
+    attempt: Dict[str, Any],
+    status: str,
+    **outcome_fields,
+) -> Dict[str, Any]:
+    claim_ref = _terminal_saga_claim_ref(user_id, saga)
+    transaction = _fs.transaction()
+    now = datetime.now(timezone.utc)
+    commit_attempted = False
+    updated_attempt = None
+    expected_review = None
+    expected_history = None
+    expected_claim = None
+    try:
+        snapshot = claim_ref.get(transaction=transaction)
+        data = snapshot.to_dict() if snapshot.exists else {}
+        claim = _validate_terminal_saga_execution_claim(
+            (data or {}).get("terminalSagaClaim"),
+            saga,
+            terminal_saga_owner,
+            now=now,
+        )
+        current = _validate_terminal_sheet_mutation_attempt(
+            (data or {}).get("terminalSheetMutationAttempt"),
+            saga,
+            mutation_kind=attempt.get("mutationKind"),
+        )
+        _validate_terminal_sheet_mutation_review(
+            (data or {}).get("terminalSheetMutationReview"),
+            saga,
+            current,
+        )
+        expected_history = copy.deepcopy(
+            (data or {}).get("terminalSheetMutationHistory")
+        )
+        history = _validate_terminal_sheet_mutation_history(
+            expected_history,
+            saga,
+            mutation_kind=current.get("mutationKind"),
+            active_attempt=current,
+        )
+        if (
+            current.get("attemptId") != attempt.get("attemptId")
+            or current.get("attemptHash") != attempt.get("attemptHash")
+        ):
+            raise RetryableProcessingError(
+                "terminal Sheet mutation attempt changed before outcome persistence"
+            )
+        updated_attempt = _terminal_sheet_attempt_with_status(
+            current,
+            status,
+            outcome_fields,
+        )
+        updated_attempt = _validate_terminal_sheet_mutation_attempt(
+            updated_attempt,
+            saga,
+            mutation_kind=current.get("mutationKind"),
+        )
+        current_status = current.get("status")
+        if current_status == status:
+            if updated_attempt != current:
+                raise RetryableProcessingError(
+                    "terminal Sheet mutation same-state outcome rewrite is forbidden"
+                )
+            return current
+        if status not in _TERMINAL_SHEET_ATTEMPT_LEGAL_TRANSITIONS.get(
+            current_status,
+            frozenset(),
+        ):
+            raise RetryableProcessingError(
+                "terminal Sheet mutation status transition is forbidden"
+            )
+        if status in {"applied", "definitely_not_applied"} and (
+            terminal_saga_owner.owner != current.get("owner")
+            or terminal_saga_owner.fencing_token
+            != current.get("fencingToken")
+        ):
+            raise RetryableProcessingError(
+                "terminal Sheet provider outcome fence identity is malformed"
+            )
+        if status == "reconciled_applied" and (
+            outcome_fields.get("reconciledByOwner")
+            != terminal_saga_owner.owner
+            or outcome_fields.get("reconciledByFencingToken")
+            != terminal_saga_owner.fencing_token
+        ):
+            raise RetryableProcessingError(
+                "terminal Sheet reconciliation fence identity is malformed"
+            )
+        if status == "needs_operator_review" and (
+            outcome_fields.get("reviewedByOwner")
+            != terminal_saga_owner.owner
+            or outcome_fields.get("reviewedByFencingToken")
+            != terminal_saga_owner.fencing_token
+        ):
+            raise RetryableProcessingError(
+                "terminal Sheet review fence identity is malformed"
+            )
+        patch = {
+            "terminalSheetMutationAttempt": updated_attempt,
+            "terminalSagaClaim": {
+                **claim,
+                "leaseUntil": now + timedelta(
+                    seconds=TERMINAL_SAGA_EXECUTION_LEASE_SECONDS
+                ),
+                "renewedAt": now,
+            },
+            "updatedAt": SERVER_TIMESTAMP,
+        }
+        expected_claim = copy.deepcopy(patch["terminalSagaClaim"])
+        if status == "needs_operator_review":
+            expected_review = {
+                "sagaKey": saga.get("sagaKey"),
+                "attemptId": updated_attempt.get("attemptId"),
+                "attemptHash": updated_attempt.get("attemptHash"),
+                "reason": updated_attempt.get("reviewReason"),
+                "observedByOwner": updated_attempt.get("reviewedByOwner"),
+                "observedByFencingToken": updated_attempt.get(
+                    "reviewedByFencingToken"
+                ),
+                "requestedAt": updated_attempt.get("reviewedAt"),
+            }
+        patch["terminalSheetMutationReview"] = expected_review
+        transaction.update(claim_ref, patch)
+        commit_attempted = True
+        transaction.commit()
+        return updated_attempt
+    except Exception as exc:
+        if commit_attempted and updated_attempt is not None:
+            try:
+                readback = claim_ref.get()
+                data = readback.to_dict() if readback.exists else {}
+                readback_claim = _validate_terminal_saga_execution_claim(
+                    data.get("terminalSagaClaim"),
+                    saga,
+                    terminal_saga_owner,
+                )
+                committed = _validate_terminal_sheet_mutation_attempt(
+                    data.get("terminalSheetMutationAttempt"),
+                    saga,
+                    mutation_kind=attempt.get("mutationKind"),
+                )
+                committed_history = _validate_terminal_sheet_mutation_history(
+                    data.get("terminalSheetMutationHistory"),
+                    saga,
+                    mutation_kind=attempt.get("mutationKind"),
+                    active_attempt=committed,
+                )
+                _validate_terminal_sheet_mutation_review(
+                    data.get("terminalSheetMutationReview"),
+                    saga,
+                    committed,
+                )
+                if (
+                    committed == updated_attempt
+                    and readback_claim == expected_claim
+                    and data.get("terminalSheetMutationHistory")
+                    == expected_history
+                    and committed_history == history
+                    and data.get("terminalSheetMutationReview")
+                    == expected_review
+                ):
+                    return updated_attempt
+            except Exception:
+                pass
+        if isinstance(exc, RetryableProcessingError):
+            raise
+        raise RetryableProcessingError(
+            f"terminal Sheet mutation outcome persistence failed: {exc}"
+        ) from exc
+
+
+def _record_terminal_sheet_mutation_review(
+    user_id: str,
+    saga: Dict[str, Any],
+    terminal_saga_owner: TerminalSagaExecution,
+    reason: str,
+) -> None:
+    """Make malformed/non-reconcilable attempts visible without rewriting them."""
+    claim_ref = _terminal_saga_claim_ref(user_id, saga)
+    transaction = _fs.transaction()
+    now = datetime.now(timezone.utc)
+    try:
+        snapshot = claim_ref.get(transaction=transaction)
+        data = snapshot.to_dict() if snapshot.exists else {}
+        claim = _validate_terminal_saga_execution_claim(
+            (data or {}).get("terminalSagaClaim"),
+            saga,
+            terminal_saga_owner,
+            now=now,
+        )
+        attempt = (data or {}).get("terminalSheetMutationAttempt")
+        transaction.update(claim_ref, {
+            "terminalSheetMutationReview": {
+                "sagaKey": saga.get("sagaKey"),
+                "attemptId": (
+                    attempt.get("attemptId") if isinstance(attempt, dict) else None
+                ),
+                "attemptHash": (
+                    attempt.get("attemptHash") if isinstance(attempt, dict) else None
+                ),
+                "reason": reason,
+                "observedByOwner": terminal_saga_owner.owner,
+                "observedByFencingToken": terminal_saga_owner.fencing_token,
+                "requestedAt": now,
+            },
+            "terminalSagaClaim": {
+                **claim,
+                "leaseUntil": now + timedelta(
+                    seconds=TERMINAL_SAGA_EXECUTION_LEASE_SECONDS
+                ),
+                "renewedAt": now,
+            },
+            "updatedAt": SERVER_TIMESTAMP,
+        })
+        transaction.commit()
+    except Exception as exc:
+        if isinstance(exc, RetryableProcessingError):
+            raise
+        raise RetryableProcessingError(
+            f"terminal Sheet operator-review persistence failed: {exc}"
+        ) from exc
+
+
+def _terminal_sheet_persisted_state_requires_operator_review(
+    user_id: str,
+    saga: Dict[str, Any],
+) -> bool:
+    """Classify only malformed persisted Sheet state as operator-visible."""
+    try:
+        snapshot = _terminal_saga_claim_ref(user_id, saga).get()
+        data = snapshot.to_dict() if snapshot.exists else {}
+    except Exception:
+        return False
+    attempt = (data or {}).get("terminalSheetMutationAttempt")
+    history = (data or {}).get("terminalSheetMutationHistory")
+    review = (data or {}).get("terminalSheetMutationReview")
+    if attempt is None:
+        return review is not None or history not in (None, [])
+    try:
+        mutation_kind = _terminal_sheet_mutation_kind_from_saga(saga)
+        validated_attempt = _validate_terminal_sheet_mutation_attempt(
+            attempt,
+            saga,
+            mutation_kind=mutation_kind,
+        )
+        _validate_terminal_sheet_mutation_history(
+            history,
+            saga,
+            mutation_kind=mutation_kind,
+            active_attempt=validated_attempt,
+        )
+        _validate_terminal_sheet_mutation_review(
+            review,
+            saga,
+            validated_attempt,
+        )
+    except RetryableProcessingError:
+        return True
+    return False
+
+
+def _read_terminal_sheet_mutation_effect(
+    user_id: str,
+    current_thread_id: str,
+    sheets,
+    sheet_id: str,
+    tab_title: str,
+    header: List[str],
+    notes_column_index: int,
+    saga: Dict[str, Any],
+) -> tuple[str, str]:
+    """Read exact row-plus-note evidence without issuing a Sheet mutation."""
+    try:
+        with terminal_sheets_provider_window(
+            TERMINAL_SHEET_READBACK_DEADLINE_SECONDS
+        ):
+            rownum, rowvals = _find_row_by_anchor(
+                user_id,
+                current_thread_id,
+                sheets,
+                sheet_id,
+                tab_title,
+                header,
+                saga.get("replyRecipient") or "",
+            )
+            if rownum is None:
+                return "absent", "persisted row anchor was not found"
+            live_anchor = get_row_anchor(rowvals or [], header)
+            if (
+                saga.get("rowAnchor")
+                and live_anchor
+                and _normalize_replacement_match_text(live_anchor)
+                != _normalize_replacement_match_text(saga.get("rowAnchor"))
+            ):
+                return "partial", "row anchor drifted"
+            expected_final_row = (saga.get("finalizationPlan") or {}).get("finalRow")
+            if rownum != expected_final_row:
+                return (
+                    "absent" if rownum == saga.get("sourceRow") else "partial",
+                    f"row is {rownum}; expected exact final row {expected_final_row}",
+                )
+            if not _is_row_below_nonviable(
+                sheets,
+                sheet_id,
+                tab_title,
+                rownum,
+            ):
+                return "partial", "row is not below the NON-VIABLE divider"
+            note = _read_terminal_note(
+                sheets,
+                sheet_id,
+                tab_title,
+                rownum,
+                notes_column_index,
+            )
+            stable_note = str(saga.get("note") or "").strip()
+            if not stable_note or stable_note not in note:
+                return "partial", "exact terminal note is not present"
+            return "applied", "exact final row and terminal note are present"
+    except Exception as exc:
+        return "unreadable", f"Sheet effect readback failed: {exc}"
+
+
+def _execute_or_reconcile_terminal_sheet_mutation(
+    user_id: str,
+    current_thread_id: str,
+    sheets,
+    sheet_id: str,
+    tab_title: str,
+    header: List[str],
+    notes_column_index: int,
+    saga: Dict[str, Any],
+    terminal_saga_owner: TerminalSagaExecution,
+    mutation_kind: str,
+    *,
+    allow_provider_mutation: bool = True,
+) -> int:
+    _source_row, expected_final_row, derived_mutation_kind = (
+        _terminal_sheet_mutation_geometry_from_saga(saga)
+    )
+    if mutation_kind != derived_mutation_kind:
+        raise RetryableProcessingError(
+            "terminal Sheet mutation caller kind disagrees with immutable "
+            "saga geometry"
+        )
+    mutation_kind = derived_mutation_kind
+    try:
+        attempt, created = _begin_terminal_sheet_mutation_attempt(
+            user_id,
+            saga,
+            terminal_saga_owner,
+            mutation_kind,
+            allow_create=allow_provider_mutation,
+        )
+    except Exception as exc:
+        malformed_state = (
+            _terminal_sheet_persisted_state_requires_operator_review(
+                user_id,
+                saga,
+            )
+        )
+        reason = (
+            f"malformed terminal Sheet mutation attempt: {exc}"
+            if malformed_state
+            else f"terminal Sheet mutation attempt preparation failed: {exc}"
+        )
+        if malformed_state:
+            _record_terminal_sheet_mutation_review(
+                user_id,
+                saga,
+                terminal_saga_owner,
+                reason,
+            )
+        raise RetryableProcessingError(reason) from exc
+
+    if attempt.get("status") in _TERMINAL_SHEET_APPLIED_STATUSES:
+        return expected_final_row
+    if not created or not allow_provider_mutation:
+        evidence, evidence_reason = _read_terminal_sheet_mutation_effect(
+            user_id,
+            current_thread_id,
+            sheets,
+            sheet_id,
+            tab_title,
+            header,
+            notes_column_index,
+            saga,
+        )
+        if evidence == "applied":
+            _record_terminal_sheet_mutation_state(
+                user_id,
+                saga,
+                terminal_saga_owner,
+                attempt,
+                "reconciled_applied",
+                reconciledByOwner=terminal_saga_owner.owner,
+                reconciledByFencingToken=terminal_saga_owner.fencing_token,
+                reconciledAt=datetime.now(timezone.utc),
+                reconciliationEvidence=evidence_reason,
+                operatorReviewRequired=False,
+            )
+            return expected_final_row
+        if attempt.get("status") == "needs_operator_review":
+            raise RetryableProcessingError(
+                "terminal Sheet mutation requires operator review: "
+                f"{evidence_reason}; no second mutation was authorized"
+            )
+        _record_terminal_sheet_mutation_state(
+            user_id,
+            saga,
+            terminal_saga_owner,
+            attempt,
+            "needs_operator_review",
+            operatorReviewRequired=True,
+            reviewReason=evidence_reason,
+            reviewEvidence=evidence,
+            providerError=None,
+            reviewedByOwner=terminal_saga_owner.owner,
+            reviewedByFencingToken=terminal_saga_owner.fencing_token,
+            reviewedAt=datetime.now(timezone.utc),
+        )
+        raise RetryableProcessingError(
+            "terminal Sheet mutation requires operator review: "
+            f"{evidence_reason}; no second mutation was authorized"
+        )
+
+    provider_deadline = _timestamp_to_utc(attempt.get("providerDeadline"))
+    remaining_seconds = (
+        (provider_deadline - datetime.now(timezone.utc)).total_seconds()
+        if provider_deadline is not None
+        else 0
+    )
+    try:
+        with terminal_sheets_provider_window(remaining_seconds):
+            live_header = _read_header_row2(sheets, sheet_id, tab_title)
+            _validate_terminal_saga_sheet_layout(saga, live_header)
+            if derived_mutation_kind == "ensure_note":
+                _ensure_terminal_note(
+                    sheets,
+                    sheet_id,
+                    tab_title,
+                    expected_final_row,
+                    notes_column_index,
+                    saga.get("note"),
+                )
+                final_row = expected_final_row
+            else:
+                plan = saga.get("finalizationPlan") or {}
+                planned_divider = plan.get("dividerRow")
+                if saga.get("dividerExists", True):
+                    live_divider = _preview_nonviable_divider(
+                        sheets,
+                        sheet_id,
+                        tab_title,
+                    )
+                    if (
+                        not live_divider.get("exists")
+                        or live_divider.get("dividerRow") != planned_divider
+                    ):
+                        raise RetryableProcessingError(
+                            "existing NON-VIABLE divider drifted after preflight"
+                        )
+                    divider_row = planned_divider
+                else:
+                    live_divider = _preview_nonviable_divider(
+                        sheets,
+                        sheet_id,
+                        tab_title,
+                    )
+                    if (
+                        live_divider.get("exists")
+                        or live_divider.get("dividerRow") != planned_divider
+                    ):
+                        raise RetryableProcessingError(
+                            "missing NON-VIABLE divider plan drifted after preflight"
+                        )
+                    final_row = move_row_below_new_divider_atomic(
+                        sheets,
+                        sheet_id,
+                        tab_title,
+                        saga.get("sourceRow"),
+                        planned_divider,
+                        notes_column_index=notes_column_index,
+                        notes_value=saga.get("note"),
+                    )
+                    if final_row != expected_final_row:
+                        raise RetryableProcessingError(
+                            "atomic missing-divider Sheet mutation returned an "
+                            "unexpected final row"
+                        )
+                if saga.get("dividerExists", True):
+                    final_row = move_row_below_divider(
+                        sheets,
+                        sheet_id,
+                        tab_title,
+                        saga.get("sourceRow"),
+                        divider_row,
+                        notes_column_index=notes_column_index,
+                        notes_value=saga.get("note"),
+                    )
+                if final_row != expected_final_row:
+                    raise RetryableProcessingError(
+                        "Sheet mutation returned an unexpected final row"
+                    )
+        _record_terminal_sheet_mutation_state(
+            user_id,
+            saga,
+            terminal_saga_owner,
+            attempt,
+            "applied",
+            appliedByOwner=terminal_saga_owner.owner,
+            appliedByFencingToken=terminal_saga_owner.fencing_token,
+            providerCompletedAt=datetime.now(timezone.utc),
+            operatorReviewRequired=False,
+        )
+        return final_row
+    except Exception as provider_exc:
+        provider_status = (
+            getattr(getattr(provider_exc, "resp", None), "status", None)
+            if isinstance(provider_exc, HttpError)
+            else None
+        )
+        if type(provider_status) is int and provider_status == 429:
+            _record_terminal_sheet_mutation_state(
+                user_id,
+                saga,
+                terminal_saga_owner,
+                attempt,
+                "definitely_not_applied",
+                providerStatusCode=429,
+                providerError=str(provider_exc)[:1500],
+                definitelyNotAppliedAt=datetime.now(timezone.utc),
+                operatorReviewRequired=False,
+            )
+            raise RetryableProcessingError(
+                "terminal Sheet provider rejected the mutation with 429 before "
+                "acceptance; a new fenced owner may issue one linked attempt"
+            ) from provider_exc
+        evidence, evidence_reason = _read_terminal_sheet_mutation_effect(
+            user_id,
+            current_thread_id,
+            sheets,
+            sheet_id,
+            tab_title,
+            header,
+            notes_column_index,
+            saga,
+        )
+        if evidence == "applied":
+            _record_terminal_sheet_mutation_state(
+                user_id,
+                saga,
+                terminal_saga_owner,
+                attempt,
+                "reconciled_applied",
+                reconciledByOwner=terminal_saga_owner.owner,
+                reconciledByFencingToken=terminal_saga_owner.fencing_token,
+                reconciledAt=datetime.now(timezone.utc),
+                reconciliationEvidence=evidence_reason,
+                operatorReviewRequired=False,
+            )
+            return expected_final_row
+        _record_terminal_sheet_mutation_state(
+            user_id,
+            saga,
+            terminal_saga_owner,
+            attempt,
+            "needs_operator_review",
+            operatorReviewRequired=True,
+            reviewReason=evidence_reason,
+            reviewEvidence=evidence,
+            providerError=str(provider_exc)[:1500],
+            reviewedByOwner=terminal_saga_owner.owner,
+            reviewedByFencingToken=terminal_saga_owner.fencing_token,
+            reviewedAt=datetime.now(timezone.utc),
+        )
+        raise RetryableProcessingError(
+            "terminal Sheet mutation requires operator review after an ambiguous "
+            f"provider outcome: {evidence_reason}"
+        ) from provider_exc
+
+
 def _finalize_terminal_thread_roots(
     user_id: str,
     client_id: str,
-    staged_thread_ids: List[str],
-    *,
     current_thread_id: str,
-    source_row: int,
+    saga: Dict[str, Any],
+    *,
     final_row: int,
-    divider_row: Optional[int],
-    terminal_reason: str,
-    event_key: str,
-    message_id: str,
-    notification_id: Optional[str],
-) -> int:
-    """Atomically reconcile exact staged roots and record terminal event evidence.
-
-    Keeping the stopped status and handled-event marker in one Firestore batch
-    prevents a retry from being hidden behind the terminal-thread early exit.
-    """
+    terminal_saga_owner: TerminalSagaExecution,
+) -> Dict[str, Any]:
+    """Use only the persisted bounded plan to atomically terminalize row roots."""
     try:
-        exact_ids = list(dict.fromkeys(staged_thread_ids or []))
+        _validate_terminal_saga_immutable_hash(saga)
+        plan = saga.get("finalizationPlan") or {}
+        exact_ids = list(plan.get("terminalThreadIds") or [])
+        row_shifts = list(plan.get("rowShifts") or [])
         if not exact_ids or current_thread_id not in exact_ids:
             raise ValueError("exact staged thread roots are required for finalization")
-        if source_row is None or final_row is None:
-            raise ValueError("source and final row numbers are required")
+        if final_row != plan.get("finalRow"):
+            raise ValueError("Sheet move result does not match immutable final row")
+        if len(exact_ids) + len(row_shifts) != plan.get("writeCount"):
+            raise ValueError("immutable finalization write count is inconsistent")
+        if plan.get("writeCount") > FIRESTORE_BATCH_WRITE_LIMIT:
+            raise ValueError("immutable finalization plan exceeds Firestore batch limit")
 
         threads_ref = (
-            _fs.collection("users")
-            .document(user_id)
-            .collection("threads")
+            _fs.collection("users").document(user_id).collection("threads")
         )
-        snapshots = list(threads_ref.stream())
-        snapshots_by_id = {snapshot.id: snapshot for snapshot in snapshots}
-        missing_ids = [thread_id for thread_id in exact_ids if thread_id not in snapshots_by_id]
-        if missing_ids:
-            raise ValueError(f"staged thread roots disappeared: {missing_ids}")
+        claim_thread_id = plan.get("claimThreadId")
+        if claim_thread_id not in exact_ids:
+            raise ValueError("canonical claim root is outside the terminal plan")
+        claim_ref = threads_ref.document(claim_thread_id)
+        now = datetime.now(timezone.utc)
+        transaction = _fs.transaction()
+        claim_snapshot = claim_ref.get(transaction=transaction)
+        claim_data = claim_snapshot.to_dict() if claim_snapshot.exists else {}
+        claim = _validate_terminal_saga_execution_claim(
+            (claim_data or {}).get("terminalSagaClaim"),
+            saga,
+            terminal_saga_owner,
+            now=now,
+        )
+        sheet_attempt = _validate_terminal_sheet_mutation_attempt(
+            (claim_data or {}).get("terminalSheetMutationAttempt"),
+            saga,
+        )
+        _validate_terminal_sheet_mutation_history(
+            (claim_data or {}).get("terminalSheetMutationHistory"),
+            saga,
+            mutation_kind=sheet_attempt.get("mutationKind"),
+            active_attempt=sheet_attempt,
+        )
+        _validate_terminal_sheet_mutation_review(
+            (claim_data or {}).get("terminalSheetMutationReview"),
+            saga,
+            sheet_attempt,
+        )
+        if sheet_attempt.get("status") not in _TERMINAL_SHEET_APPLIED_STATUSES:
+            raise RetryableProcessingError(
+                "terminal Sheet mutation is not durably applied or reconciled"
+            )
 
-        batch = _fs.batch()
-        staged_id_set = set(exact_ids)
-        finalized_ids = set()
+        # Read every planned target in this transaction before any writes. A
+        # concurrent sibling row change then creates a transaction conflict
+        # instead of being blindly overwritten after an outside stream check.
+        target_snapshots = {claim_thread_id: claim_snapshot}
+        for target_id in [
+            *exact_ids,
+            *(shift.get("threadId") for shift in row_shifts),
+        ]:
+            if target_id not in target_snapshots:
+                target_snapshots[target_id] = threads_ref.document(target_id).get(
+                    transaction=transaction
+                )
+        for terminal_id in exact_ids:
+            snapshot = target_snapshots[terminal_id]
+            data = snapshot.to_dict() if snapshot.exists else {}
+            if (
+                not snapshot.exists
+                or data.get("clientId") != client_id
+                or data.get("rowNumber") != saga.get("sourceRow")
+                or data.get("terminalSagaKey") != saga.get("sagaKey")
+            ):
+                raise RetryableProcessingError(
+                    f"terminal finalization root drifted: {terminal_id}"
+                )
+            if terminal_id == current_thread_id and (
+                (data.get("terminalSaga") or {}).get("immutableHash")
+                != saga.get("immutableHash")
+            ):
+                raise RetryableProcessingError(
+                    "terminal current-root saga drifted before finalization"
+                )
+        for shift in row_shifts:
+            snapshot = target_snapshots[shift["threadId"]]
+            data = snapshot.to_dict() if snapshot.exists else {}
+            if (
+                not snapshot.exists
+                or data.get("clientId") != client_id
+                or data.get("rowNumber") != shift.get("fromRow")
+            ):
+                raise RetryableProcessingError(
+                    f"terminal row-shift root drifted: {shift['threadId']}"
+                )
+        finalized_saga = {
+            **saga,
+            "phase": "finalized",
+            "finalRow": final_row,
+        }
         terminal_patch = {
             "rowNumber": final_row,
             "status": THREAD_STATUS["stopped"],
-            "statusReason": terminal_reason,
+            "statusReason": saga.get("reason"),
             "statusUpdatedAt": SERVER_TIMESTAMP,
             "nonViableAt": SERVER_TIMESTAMP,
-            "nonViableReason": terminal_reason,
+            "nonViableReason": saga.get("reason"),
             "followUpStatus": "stopped",
             "followUpConfig.nextFollowUpAt": None,
             "followUpConfig.processingBy": None,
             "followUpConfig.processingAt": None,
-            "pendingTerminalReason": None,
-            "pendingTerminalAt": None,
-            "pendingTerminalSourceRow": None,
             "updatedAt": SERVER_TIMESTAMP,
         }
-
-        for snapshot in snapshots:
-            thread_data = snapshot.to_dict() or {}
-            if thread_data.get("clientId") != client_id:
-                continue
-
-            if snapshot.id in staged_id_set:
-                current_row = thread_data.get("rowNumber")
-                pending_source_row = thread_data.get("pendingTerminalSourceRow")
-                if current_row not in {source_row, final_row} and pending_source_row != source_row:
-                    raise ValueError(
-                        f"staged thread root {snapshot.id} no longer matches terminal rows"
-                    )
-                root_patch = dict(terminal_patch)
-                if snapshot.id == current_thread_id:
-                    root_patch[f"handledEvents.{event_key}"] = {
-                        "detectedAt": SERVER_TIMESTAMP,
-                        "detectedInMessageId": message_id,
-                        "notificationId": notification_id,
-                    }
-                batch.update(threads_ref.document(snapshot.id), root_patch)
-                finalized_ids.add(snapshot.id)
-                continue
-
-            current_row = thread_data.get("rowNumber")
-            if (
-                divider_row is not None
-                and source_row < final_row
-                and isinstance(current_row, int)
-                and source_row < current_row <= divider_row
-            ):
-                batch.update(
-                    threads_ref.document(snapshot.id),
-                    {"rowNumber": current_row - 1, "updatedAt": SERVER_TIMESTAMP},
-                )
-
-        if finalized_ids != staged_id_set:
-            raise ValueError("not every staged thread root was included in finalization")
-        batch.commit()
-        return len(finalized_ids)
+        root_patches: Dict[str, Dict[str, Any]] = {}
+        for terminal_id in exact_ids:
+            root_patch = dict(terminal_patch)
+            if terminal_id == current_thread_id:
+                root_patch.update({
+                    "terminalSaga": finalized_saga,
+                    "terminalNotificationOwed": bool(
+                        saga.get("notificationRequired", True)
+                    ),
+                    "terminalNotificationOutcome": None,
+                    "terminalReplyOwed": saga.get("responseScenario") != "none",
+                    "terminalReplyOutcome": None,
+                })
+            root_patches[terminal_id] = root_patch
+        for shift in row_shifts:
+            root_patches[shift["threadId"]] = {
+                "rowNumber": shift["toRow"],
+                "updatedAt": SERVER_TIMESTAMP,
+            }
+        root_patches[claim_thread_id]["terminalSagaClaim"] = {
+            **claim,
+            "leaseUntil": now + timedelta(
+                seconds=TERMINAL_SAGA_EXECUTION_LEASE_SECONDS
+            ),
+            "renewedAt": now,
+        }
+        for root_id, root_patch in root_patches.items():
+            transaction.update(threads_ref.document(root_id), root_patch)
+        transaction.commit()
+        return finalized_saga
     except Exception as exc:
+        if isinstance(exc, RetryableProcessingError):
+            raise
         raise RetryableProcessingError(
             f"terminal Firestore finalization failed: {exc}"
         ) from exc
+
+
+def _settle_terminal_notification_obligation(
+    user_id: str,
+    client_id: str,
+    current_thread_id: str,
+    recipient: str,
+    saga: Dict[str, Any],
+    *,
+    terminal_saga_owner: TerminalSagaExecution,
+) -> None:
+    """Create the idempotent notification only after terminal state commits."""
+    thread_ref = (
+        _fs.collection("users").document(user_id).collection("threads")
+        .document(current_thread_id)
+    )
+    snapshot = thread_ref.get()
+    data = snapshot.to_dict() if snapshot.exists else {}
+    if not data or (data.get("terminalSaga") or {}).get("sagaKey") != saga.get("sagaKey"):
+        raise RetryableProcessingError("terminal notification saga state is unavailable")
+    if not data.get("terminalNotificationOwed"):
+        if saga.get("notificationRequired", True):
+            return
+        try:
+            _fenced_terminal_thread_update(
+                user_id,
+                current_thread_id,
+                saga,
+                terminal_saga_owner,
+                {
+                f"handledEvents.{saga['eventKey']}": {
+                    "detectedAt": SERVER_TIMESTAMP,
+                    "detectedInMessageId": saga.get("sourceGraphMessageId"),
+                    "notificationId": None,
+                },
+                "terminalNotificationOutcome": "not_required_already_nonviable",
+                "updatedAt": SERVER_TIMESTAMP,
+                },
+                failure_label="terminal handled-marker persistence failed",
+            )
+            return
+        except Exception as exc:
+            raise RetryableProcessingError(
+                f"terminal handled-marker persistence failed: {exc}"
+            ) from exc
+
+    try:
+        _renew_terminal_saga_execution(user_id, saga, terminal_saga_owner)
+        _source_row, terminal_final_row, _mutation_kind = (
+            _terminal_sheet_mutation_geometry_from_saga(saga)
+        )
+        notification_id = write_notification(
+            user_id,
+            client_id,
+            kind="property_unavailable",
+            priority="important",
+            email=recipient,
+            thread_id=current_thread_id,
+            row_number=terminal_final_row,
+            row_anchor=saga.get("rowAnchor"),
+            meta={
+                "address": saga.get("eventAddress", ""),
+                "city": saga.get("eventCity", ""),
+                "reason": saga.get("reason"),
+                "sourceMessageKey": saga.get("sourceMessageKey"),
+            },
+            dedupe_key=f"property_unavailable:{current_thread_id}:{saga.get('sagaKey')}",
+        )
+        if not notification_id:
+            raise ValueError("notification write returned no durable identifier")
+        _fenced_terminal_thread_update(
+            user_id,
+            current_thread_id,
+            saga,
+            terminal_saga_owner,
+            {
+            f"handledEvents.{saga['eventKey']}": {
+                "detectedAt": SERVER_TIMESTAMP,
+                "detectedInMessageId": saga.get("sourceGraphMessageId"),
+                "notificationId": notification_id,
+            },
+            "terminalNotificationOwed": False,
+            "terminalNotificationId": notification_id,
+            "terminalNotificationOutcome": "created",
+            "updatedAt": SERVER_TIMESTAMP,
+            },
+            failure_label="terminal notification outcome persistence failed",
+        )
+    except Exception as exc:
+        raise RetryableProcessingError(
+            f"terminal notification persistence failed: {exc}"
+        ) from exc
+
+
+TERMINAL_SETTLEMENT_VERSION = 2
+TERMINAL_SETTLEMENT_HISTORY_LIMIT = 8
+
+
+def _terminal_reply_attempt_archive_hash(attempt: Any) -> Optional[str]:
+    if attempt is None:
+        return None
+    if not isinstance(attempt, dict):
+        raise RetryableProcessingError(
+            "terminal settlement reply attempt is malformed"
+        )
+    return hashlib.sha256(
+        json.dumps(attempt, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_terminal_settlement_projection(
+    projection: Any,
+    *,
+    saga: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not isinstance(projection, dict):
+        raise RetryableProcessingError(
+            "terminal settlement projection is missing or malformed"
+        )
+    expected_hash = str(projection.get("projectionHash") or "").strip()
+    immutable = {
+        key: value
+        for key, value in projection.items()
+        if key != "projectionHash"
+    }
+    actual_hash = hashlib.sha256(
+        json.dumps(immutable, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    if (
+        projection.get("version") != TERMINAL_SETTLEMENT_VERSION
+        or isinstance(projection.get("settlementOrdinal"), bool)
+        or not isinstance(projection.get("settlementOrdinal"), int)
+        or projection.get("settlementOrdinal") < 1
+        or not str(projection.get("sagaKey") or "").strip()
+        or not str(projection.get("sourceMessageKey") or "").strip()
+        or not expected_hash
+        or actual_hash != expected_hash
+    ):
+        raise RetryableProcessingError(
+            "terminal settlement projection immutable hash does not match"
+        )
+    archived_saga = projection.get("sagaSnapshot")
+    if not isinstance(archived_saga, dict):
+        raise RetryableProcessingError(
+            "terminal settlement is missing its immutable saga snapshot"
+        )
+    _validate_terminal_saga_immutable_hash(archived_saga)
+    archived_final_row = (archived_saga.get("finalizationPlan") or {}).get(
+        "finalRow"
+    )
+    if (
+        archived_saga.get("phase") != "finalized"
+        or archived_saga.get("finalRow") != archived_final_row
+    ):
+        raise RetryableProcessingError(
+            "terminal settlement saga snapshot is not durably finalized"
+        )
+    if saga is not None and (
+        archived_saga.get("sagaKey") != saga.get("sagaKey")
+        or archived_saga.get("immutableHash") != saga.get("immutableHash")
+    ):
+        raise RetryableProcessingError(
+            "terminal settlement archived saga does not match active saga"
+        )
+    validation_saga = archived_saga
+    expected = {
+        "sagaKey": validation_saga.get("sagaKey"),
+        "sagaImmutableHash": validation_saga.get("immutableHash"),
+        "sourceMessageKey": validation_saga.get("sourceMessageKey"),
+        "sourceGraphMessageId": validation_saga.get("sourceGraphMessageId"),
+        "sourceInternetMessageId": validation_saga.get(
+            "sourceInternetMessageId"
+        ),
+        "finalRow": archived_final_row,
+    }
+    if validation_saga.get("settlementOrdinal") is not None:
+        expected["settlementOrdinal"] = validation_saga.get(
+            "settlementOrdinal"
+        )
+    actual = {key: projection.get(key) for key in expected}
+    if actual != expected:
+        raise RetryableProcessingError(
+            "terminal settlement projection does not match immutable saga"
+        )
+    attempt = _validate_terminal_sheet_mutation_attempt(
+        projection.get("sheetMutationAttempt"),
+        validation_saga,
+    )
+    if attempt.get("status") not in _TERMINAL_SHEET_APPLIED_STATUSES:
+        raise RetryableProcessingError(
+            "terminal settlement does not archive an applied Sheet attempt"
+        )
+    _validate_terminal_sheet_mutation_history(
+        projection.get("sheetMutationHistory"),
+        validation_saga,
+        mutation_kind=attempt.get("mutationKind"),
+        active_attempt=attempt,
+    )
+    if projection.get("sheetMutationReview") is not None:
+        raise RetryableProcessingError(
+            "applied terminal settlement unexpectedly archives active Sheet review"
+        )
+
+    notification_outcome = projection.get("notificationOutcome")
+    if validation_saga.get("notificationRequired"):
+        if notification_outcome != "created":
+            raise RetryableProcessingError(
+                "terminal settlement notification outcome is not durable"
+            )
+    elif notification_outcome not in {
+        "not_required",
+        "not_required_already_nonviable",
+    }:
+        raise RetryableProcessingError(
+            "terminal settlement no-notification outcome is malformed"
+        )
+
+    archived_reply_attempt = projection.get("terminalReplyAttempt")
+    archived_reply_attempt_hash = projection.get("terminalReplyAttemptHash")
+    if archived_reply_attempt is None:
+        if archived_reply_attempt_hash is not None:
+            raise RetryableProcessingError(
+                "terminal settlement no-attempt reply hash is malformed"
+            )
+    else:
+        if (
+            archived_reply_attempt_hash
+            != _terminal_reply_attempt_archive_hash(archived_reply_attempt)
+            or archived_reply_attempt.get("sourceMessageKey")
+            != validation_saga.get("sourceMessageKey")
+            or archived_reply_attempt.get("sourceGraphMessageId")
+            != validation_saga.get("sourceGraphMessageId")
+            or archived_reply_attempt.get("conversationId")
+            != validation_saga.get("sourceConversationId")
+            or str(archived_reply_attempt.get("recipient") or "").strip().lower()
+            != str(validation_saga.get("replyRecipient") or "").strip().lower()
+        ):
+            raise RetryableProcessingError(
+                "terminal settlement reply attempt hash or source binding drifted"
+            )
+    reply_outcome = projection.get("replyOutcome")
+    if validation_saga.get("responseScenario") != "none":
+        if reply_outcome == "campaign_stopped":
+            if archived_reply_attempt is not None:
+                raise RetryableProcessingError(
+                    "campaign-stopped terminal settlement unexpectedly archives "
+                    "a provider reply attempt"
+                )
+        elif (
+            not isinstance(archived_reply_attempt, dict)
+            or archived_reply_attempt.get("sagaKey")
+            != validation_saga.get("sagaKey")
+            or archived_reply_attempt.get("status")
+            not in {"committed", "reconciled"}
+            or archived_reply_attempt.get("outcome") != reply_outcome
+            or reply_outcome
+            not in {
+                "sent_indexed",
+                "sent_unindexed",
+                "sent_reconciled",
+                "queued_retry",
+                "recipient_suppressed",
+                "draft_needs_review",
+            }
+        ):
+            raise RetryableProcessingError(
+                "terminal settlement does not archive the exact resolved reply attempt"
+            )
+        else:
+            _validate_terminal_reply_attempt_body(
+                validation_saga,
+                archived_reply_attempt,
+            )
+    elif archived_reply_attempt is not None or reply_outcome != "not_required":
+        raise RetryableProcessingError(
+            "no-reply terminal settlement archives a malformed reply outcome"
+        )
+    return dict(projection)
+
+
+def _validate_terminal_settlement_history(
+    settlements: Any,
+) -> List[Dict[str, Any]]:
+    if settlements is None:
+        return []
+    if (
+        not isinstance(settlements, list)
+        or len(settlements) > TERMINAL_SETTLEMENT_HISTORY_LIMIT
+    ):
+        raise RetryableProcessingError(
+            "terminal settlement history is malformed or over its retention limit"
+        )
+    validated: List[Dict[str, Any]] = []
+    saga_keys = set()
+    source_keys = set()
+    for ordinal, raw_projection in enumerate(settlements, start=1):
+        projection = _validate_terminal_settlement_projection(raw_projection)
+        if projection.get("settlementOrdinal") != ordinal:
+            raise RetryableProcessingError(
+                "terminal settlement history ordinal drifted"
+            )
+        saga_key = projection.get("sagaKey")
+        source_key = projection.get("sourceMessageKey")
+        if saga_key in saga_keys or source_key in source_keys:
+            raise RetryableProcessingError(
+                "terminal settlement history contains a duplicate generation"
+            )
+        saga_keys.add(saga_key)
+        source_keys.add(source_key)
+        validated.append(projection)
+    return validated
+
+
+def _terminal_settlement_for_source(
+    thread_data: Dict[str, Any],
+    message_id: str,
+    internet_message_id: str,
+) -> Optional[Dict[str, Any]]:
+    settlements = _validate_terminal_settlement_history(
+        (thread_data or {}).get("terminalSettlements")
+    )
+    if not settlements:
+        return None
+    expected_key = _terminal_source_message_key(message_id, internet_message_id)
+    matches = []
+    for projection in settlements:
+        persisted_sources = {
+            str(value).strip()
+            for value in (
+                projection.get("sourceMessageKey"),
+                projection.get("sourceGraphMessageId"),
+                projection.get("sourceInternetMessageId"),
+            )
+            if str(value or "").strip()
+        }
+        if expected_key not in persisted_sources:
+            continue
+        if (
+            projection.get("sourceGraphMessageId")
+            and projection.get("sourceGraphMessageId") != message_id
+        ):
+            continue
+        if (
+            projection.get("sourceInternetMessageId")
+            and projection.get("sourceInternetMessageId") != internet_message_id
+        ):
+            continue
+        matches.append(projection)
+    if len(matches) > 1:
+        raise RetryableProcessingError(
+            "multiple terminal settlements match the same exact source"
+        )
+    return matches[0] if matches else None
+
+
+_CLIENT_COMPLETION_INELIGIBLE_STATUSES = frozenset({
+    "stopping",
+    "stopped",
+    "archived",
+    "deleted",
+})
+
+
+def _client_status_for_terminal_completion_replay(client_ref) -> str:
+    try:
+        snapshot = client_ref.get()
+        if getattr(snapshot, "exists", False) is not True:
+            raise RetryableProcessingError(
+                "terminal completion replay client is missing"
+            )
+        data = snapshot.to_dict() or {}
+        return str(data.get("status") or "").strip().lower()
+    except RetryableProcessingError:
+        raise
+    except Exception as exc:
+        raise RetryableProcessingError(
+            f"terminal completion replay client read failed: {exc}"
+        ) from exc
+
+
+def _require_terminal_client_completion(
+    user_id: str,
+    client_id: str,
+) -> None:
+    """Fail retryably until a post-terminal local completion is durable."""
+    normalized_client_id = str(client_id or "").strip()
+    if not normalized_client_id:
+        raise RetryableProcessingError(
+            "terminal completion client binding is missing"
+        )
+    client_ref = (
+        _fs.collection("users").document(user_id)
+        .collection("clients").document(normalized_client_id)
+    )
+    status = _client_status_for_terminal_completion_replay(client_ref)
+    if status == "completed" or status in _CLIENT_COMPLETION_INELIGIBLE_STATUSES:
+        return
+    try:
+        completed = _maybe_mark_client_completed(
+            user_id,
+            normalized_client_id,
+            client_ref=client_ref,
+        )
+    except Exception:
+        completed = False
+    if completed is True:
+        return
+    status = _client_status_for_terminal_completion_replay(client_ref)
+    if status == "completed" or status in _CLIENT_COMPLETION_INELIGIBLE_STATUSES:
+        return
+    raise RetryableProcessingError(
+        "terminal settlement client completion obligation remains unresolved"
+    )
+
+
+def _replay_terminal_completion_obligation(
+    user_id: str,
+    thread_data: Dict[str, Any],
+    settlement: Dict[str, Any],
+    message_id: str,
+    internet_message_id: str,
+) -> None:
+    """Replay only the local client-completion intent from an exact tombstone."""
+    projection = _validate_terminal_settlement_projection(settlement)
+    expected_source_key = _terminal_source_message_key(
+        message_id,
+        internet_message_id,
+    )
+    persisted_sources = {
+        str(value).strip()
+        for value in (
+            projection.get("sourceMessageKey"),
+            projection.get("sourceGraphMessageId"),
+            projection.get("sourceInternetMessageId"),
+        )
+        if str(value or "").strip()
+    }
+    if (
+        expected_source_key not in persisted_sources
+        or (
+            projection.get("sourceGraphMessageId")
+            and projection.get("sourceGraphMessageId") != message_id
+        )
+        or (
+            projection.get("sourceInternetMessageId")
+            and projection.get("sourceInternetMessageId")
+            != internet_message_id
+        )
+    ):
+        raise RetryableProcessingError(
+            "terminal completion replay settlement source drifted"
+        )
+
+    saga_snapshot = projection.get("sagaSnapshot")
+    completion_required = saga_snapshot.get("completeClientAfterReply")
+    if type(completion_required) is not bool:
+        raise RetryableProcessingError(
+            "terminal completion replay obligation is malformed"
+        )
+    if not completion_required:
+        return
+
+    client_id = str(saga_snapshot.get("clientId") or "").strip()
+    thread_client_id = str((thread_data or {}).get("clientId") or "").strip()
+    if not client_id or (
+        thread_client_id and thread_client_id != client_id
+    ):
+        raise RetryableProcessingError(
+            "terminal completion replay client binding drifted"
+        )
+
+    client_ref = (
+        _fs.collection("users").document(user_id)
+        .collection("clients").document(client_id)
+    )
+    status = _client_status_for_terminal_completion_replay(client_ref)
+    if status == "completed" or status in _CLIENT_COMPLETION_INELIGIBLE_STATUSES:
+        return
+
+    try:
+        completed = _maybe_mark_client_completed(
+            user_id,
+            client_id,
+            client_ref=client_ref,
+        )
+    except Exception:
+        completed = False
+    if completed is True:
+        return
+
+    status = _client_status_for_terminal_completion_replay(client_ref)
+    if status == "completed" or status in _CLIENT_COMPLETION_INELIGIBLE_STATUSES:
+        return
+    raise RetryableProcessingError(
+        "terminal settlement client completion obligation remains unresolved"
+    )
+
+
+def _persist_terminal_settlement_projection(
+    user_id: str,
+    current_thread_id: str,
+    saga: Dict[str, Any],
+    terminal_saga_owner: TerminalSagaExecution,
+) -> Dict[str, Any]:
+    """Persist immutable exact-source settlement before active pointers clear."""
+    _validate_terminal_saga_immutable_hash(saga)
+    threads_ref = (
+        _fs.collection("users").document(user_id).collection("threads")
+    )
+    claim_thread_id = (saga.get("finalizationPlan") or {}).get("claimThreadId")
+    claim_ref = threads_ref.document(claim_thread_id)
+    current_ref = threads_ref.document(current_thread_id)
+    transaction = _fs.transaction()
+    now = datetime.now(timezone.utc)
+    commit_attempted = False
+    try:
+        claim_snapshot = claim_ref.get(transaction=transaction)
+        claim_data = claim_snapshot.to_dict() if claim_snapshot.exists else {}
+        claim = _validate_terminal_saga_execution_claim(
+            (claim_data or {}).get("terminalSagaClaim"),
+            saga,
+            terminal_saga_owner,
+            now=now,
+        )
+        current_snapshot = current_ref.get(transaction=transaction)
+        current_data = current_snapshot.to_dict() if current_snapshot.exists else {}
+        if (
+            not current_snapshot.exists
+            or (current_data.get("terminalSaga") or {}).get("sagaKey")
+            != saga.get("sagaKey")
+            or current_data.get("terminalNotificationOwed")
+            or current_data.get("terminalReplyOwed")
+        ):
+            raise RetryableProcessingError(
+                "terminal settlement requires the exact resolved current saga"
+            )
+        try:
+            assert_terminal_reply_permit_settled(
+                transaction,
+                current_ref,
+                thread_data=current_data,
+            )
+        except GraphSendPermitBlocked as exc:
+            raise RetryableProcessingError(
+                f"terminal settlement blocked by Graph send permit: {exc}"
+            ) from exc
+
+        settlements = _validate_terminal_settlement_history(
+            current_data.get("terminalSettlements")
+        )
+        for existing in settlements:
+            if existing.get("sagaKey") == saga.get("sagaKey"):
+                return _validate_terminal_settlement_projection(
+                    existing,
+                    saga=saga,
+                )
+        new_source_values = {
+            str(value).strip()
+            for value in (
+                saga.get("sourceMessageKey"),
+                saga.get("sourceGraphMessageId"),
+                saga.get("sourceInternetMessageId"),
+            )
+            if str(value or "").strip()
+        }
+        for existing in settlements:
+            existing_source_values = {
+                str(value).strip()
+                for value in (
+                    existing.get("sourceMessageKey"),
+                    existing.get("sourceGraphMessageId"),
+                    existing.get("sourceInternetMessageId"),
+                )
+                if str(value or "").strip()
+            }
+            if new_source_values & existing_source_values:
+                raise RetryableProcessingError(
+                    "terminal settlement source already belongs to another generation"
+                )
+        if len(settlements) >= TERMINAL_SETTLEMENT_HISTORY_LIMIT:
+            raise RetryableProcessingError(
+                "terminal settlement retention limit reached; operator review is required"
+            )
+        reserved_settlement_ordinal = saga.get("settlementOrdinal")
+        if (
+            reserved_settlement_ordinal is None
+            and saga.get("version") == 1
+        ):
+            reserved_settlement_ordinal = len(settlements) + 1
+        if reserved_settlement_ordinal != len(settlements) + 1:
+            raise RetryableProcessingError(
+                "terminal settlement ordinal no longer matches its staged reservation"
+            )
+
+        sheet_attempt = _validate_terminal_sheet_mutation_attempt(
+            (claim_data or {}).get("terminalSheetMutationAttempt"),
+            saga,
+        )
+        if sheet_attempt.get("status") not in _TERMINAL_SHEET_APPLIED_STATUSES:
+            raise RetryableProcessingError(
+                "terminal settlement requires an applied Sheet mutation attempt"
+            )
+        sheet_history = _validate_terminal_sheet_mutation_history(
+            (claim_data or {}).get("terminalSheetMutationHistory"),
+            saga,
+            mutation_kind=sheet_attempt.get("mutationKind"),
+            active_attempt=sheet_attempt,
+        )
+        _source_row, terminal_final_row, _mutation_kind = (
+            _terminal_sheet_mutation_geometry_from_saga(saga)
+        )
+
+        immutable = {
+            "version": TERMINAL_SETTLEMENT_VERSION,
+            "settlementOrdinal": reserved_settlement_ordinal,
+            "sagaKey": saga.get("sagaKey"),
+            "sagaImmutableHash": saga.get("immutableHash"),
+            "sourceMessageKey": saga.get("sourceMessageKey"),
+            "sourceGraphMessageId": saga.get("sourceGraphMessageId"),
+            "sourceInternetMessageId": saga.get("sourceInternetMessageId"),
+            "finalRow": terminal_final_row,
+            "notificationOutcome": (
+                current_data.get("terminalNotificationOutcome")
+                or "not_required"
+            ),
+            "replyOutcome": (
+                current_data.get("terminalReplyOutcome") or "not_required"
+            ),
+            "sagaSnapshot": copy.deepcopy(saga),
+            "terminalReplyAttempt": current_data.get("terminalReplyAttempt"),
+            "terminalReplyAttemptHash": _terminal_reply_attempt_archive_hash(
+                current_data.get("terminalReplyAttempt")
+            ),
+            "sheetMutationAttempt": sheet_attempt,
+            "sheetMutationHistory": sheet_history,
+            "sheetMutationReview": (claim_data or {}).get(
+                "terminalSheetMutationReview"
+            ),
+            "settledAt": now,
+        }
+        projection = {
+            **immutable,
+            "projectionHash": hashlib.sha256(
+                json.dumps(immutable, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest(),
+        }
+        projection = _validate_terminal_settlement_projection(
+            projection,
+            saga=saga,
+        )
+        renewed_claim = {
+            **claim,
+            "leaseUntil": now + timedelta(
+                seconds=TERMINAL_SAGA_EXECUTION_LEASE_SECONDS
+            ),
+            "renewedAt": now,
+        }
+        updated_settlements = [*settlements, projection]
+        if claim_thread_id == current_thread_id:
+            transaction.update(current_ref, {
+                "terminalSettlements": updated_settlements,
+                "terminalSettlement": None,
+                "terminalSagaClaim": renewed_claim,
+                "updatedAt": SERVER_TIMESTAMP,
+            })
+        else:
+            transaction.update(claim_ref, {
+                "terminalSagaClaim": renewed_claim,
+                "updatedAt": SERVER_TIMESTAMP,
+            })
+            transaction.update(current_ref, {
+                "terminalSettlements": updated_settlements,
+                "terminalSettlement": None,
+                "updatedAt": SERVER_TIMESTAMP,
+            })
+        commit_attempted = True
+        transaction.commit()
+        return projection
+    except Exception as exc:
+        if not commit_attempted:
+            if isinstance(exc, RetryableProcessingError):
+                raise
+            raise RetryableProcessingError(
+                f"terminal settlement projection persistence failed: {exc}"
+            ) from exc
+        try:
+            readback = current_ref.get()
+            readback_data = readback.to_dict() if readback.exists else {}
+            committed = _terminal_settlement_for_source(
+                readback_data,
+                saga.get("sourceGraphMessageId"),
+                saga.get("sourceInternetMessageId"),
+            )
+            if committed is None:
+                raise RetryableProcessingError(
+                    "terminal settlement commit readback did not find exact source"
+                )
+            return _validate_terminal_settlement_projection(committed, saga=saga)
+        except Exception:
+            if isinstance(exc, RetryableProcessingError):
+                raise
+            raise RetryableProcessingError(
+                f"terminal settlement projection persistence failed: {exc}"
+            ) from exc
+
+
+def _terminal_cleanup_readback_is_exact(
+    threads_ref,
+    current_thread_id: str,
+    saga: Dict[str, Any],
+) -> bool:
+    plan = saga.get("finalizationPlan") or {}
+    exact_ids = list(plan.get("terminalThreadIds") or [])
+    claim_thread_id = plan.get("claimThreadId")
+    for terminal_id in exact_ids:
+        snapshot = threads_ref.document(terminal_id).get()
+        if not snapshot.exists:
+            return False
+        data = snapshot.to_dict() or {}
+        if any(
+            data.get(field) is not None
+            for field in (
+                "terminalSagaKey",
+                "pendingTerminalReason",
+                "pendingTerminalAt",
+                "pendingTerminalSourceRow",
+            )
+        ):
+            return False
+        if terminal_id == claim_thread_id:
+            if data.get("terminalSagaClaim") is not None:
+                return False
+            if any(
+                data.get(field) is not None
+                for field in (
+                    "terminalSheetMutationAttempt",
+                    "terminalSheetMutationHistory",
+                    "terminalSheetMutationReview",
+                )
+            ):
+                return False
+        if terminal_id == current_thread_id:
+            if (
+                data.get("terminalSaga") is not None
+                or data.get("terminalNotificationOwed")
+                or data.get("terminalReplyOwed")
+                or data.get("terminalReplyAttempt") is not None
+            ):
+                return False
+            try:
+                settlement = _terminal_settlement_for_source(
+                    data,
+                    saga.get("sourceGraphMessageId"),
+                    saga.get("sourceInternetMessageId"),
+                )
+                if settlement is None:
+                    return False
+                _validate_terminal_settlement_projection(settlement, saga=saga)
+            except RetryableProcessingError:
+                return False
+    return True
+
+
+def _clear_resolved_terminal_saga(
+    user_id: str,
+    current_thread_id: str,
+    saga: Dict[str, Any],
+    *,
+    terminal_saga_owner: TerminalSagaExecution,
+) -> None:
+    threads_ref = (
+        _fs.collection("users").document(user_id).collection("threads")
+    )
+    plan = saga.get("finalizationPlan") or {}
+    exact_ids = list(plan.get("terminalThreadIds") or [])
+    claim_thread_id = plan.get("claimThreadId")
+    if not exact_ids or len(exact_ids) > FIRESTORE_BATCH_WRITE_LIMIT:
+        raise RetryableProcessingError("terminal saga cleanup plan is invalid")
+    if current_thread_id not in exact_ids or claim_thread_id not in exact_ids:
+        raise RetryableProcessingError("terminal saga cleanup roots are invalid")
+    _persist_terminal_settlement_projection(
+        user_id,
+        current_thread_id,
+        saga,
+        terminal_saga_owner,
+    )
+    try:
+        claim_ref = threads_ref.document(claim_thread_id)
+        current_ref = threads_ref.document(current_thread_id)
+        transaction = _fs.transaction()
+        claim_snapshot = claim_ref.get(transaction=transaction)
+        claim_data = claim_snapshot.to_dict() if claim_snapshot.exists else {}
+        _validate_terminal_saga_execution_claim(
+            (claim_data or {}).get("terminalSagaClaim"),
+            saga,
+            terminal_saga_owner,
+        )
+        current_snapshot = current_ref.get(transaction=transaction)
+        current_data = current_snapshot.to_dict() if current_snapshot.exists else {}
+        if (
+            not current_snapshot.exists
+            or (current_data.get("terminalSaga") or {}).get("sagaKey")
+            != saga.get("sagaKey")
+            or current_data.get("terminalNotificationOwed")
+            or current_data.get("terminalReplyOwed")
+        ):
+            raise RetryableProcessingError(
+                "terminal saga still has unresolved obligations"
+            )
+        try:
+            assert_terminal_reply_permit_settled(
+                transaction,
+                current_ref,
+                thread_data=current_data,
+            )
+        except GraphSendPermitBlocked as exc:
+            raise RetryableProcessingError(
+                f"terminal saga cleanup blocked by Graph send permit: {exc}"
+            ) from exc
+        settlement = _terminal_settlement_for_source(
+            current_data,
+            saga.get("sourceGraphMessageId"),
+            saga.get("sourceInternetMessageId"),
+        )
+        if settlement is None:
+            raise RetryableProcessingError(
+                "terminal settlement projection disappeared before cleanup"
+            )
+        _validate_terminal_settlement_projection(settlement, saga=saga)
+        exact_snapshots = {}
+        for terminal_id in exact_ids:
+            if terminal_id == current_thread_id:
+                exact_snapshots[terminal_id] = current_snapshot
+                continue
+            if terminal_id == claim_thread_id:
+                exact_snapshots[terminal_id] = claim_snapshot
+                continue
+            exact_snapshots[terminal_id] = threads_ref.document(terminal_id).get(
+                transaction=transaction
+            )
+        for terminal_id, snapshot in exact_snapshots.items():
+            data = snapshot.to_dict() if snapshot.exists else {}
+            if (
+                not snapshot.exists
+                or data.get("terminalSagaKey") != saga.get("sagaKey")
+            ):
+                raise RetryableProcessingError(
+                    f"terminal saga cleanup root drifted: {terminal_id}"
+                )
+        for terminal_id in exact_ids:
+            patch = {
+                "terminalSagaKey": None,
+                "pendingTerminalReason": None,
+                "pendingTerminalAt": None,
+                "pendingTerminalSourceRow": None,
+                "updatedAt": SERVER_TIMESTAMP,
+            }
+            if terminal_id == current_thread_id:
+                patch["terminalSaga"] = None
+                patch["terminalReplyAttempt"] = None
+            if terminal_id == claim_thread_id:
+                patch["terminalSagaClaim"] = None
+                patch["terminalSheetMutationAttempt"] = None
+                patch["terminalSheetMutationHistory"] = None
+                patch["terminalSheetMutationReview"] = None
+            transaction.update(threads_ref.document(terminal_id), patch)
+        try:
+            transaction.commit()
+        except Exception:
+            if _terminal_cleanup_readback_is_exact(
+                threads_ref,
+                current_thread_id,
+                saga,
+            ):
+                return
+            raise
+    except Exception as exc:
+        raise RetryableProcessingError(
+            f"terminal saga cleanup failed: {exc}"
+        ) from exc
+
+
+def _terminal_reply_will_queue_after_definite_send_failure(
+    send_outcome: ReplySendOutcome,
+) -> bool:
+    """Mirror the generic retry helper's branches that create pending work."""
+    if (
+        send_outcome.sent_but_unindexed
+        or send_outcome.outcome == "sent_but_unindexed"
+        or send_outcome.campaign_suppression_kind == "terminal"
+        or send_outcome.outcome == "blocked_campaign_terminal"
+        or send_outcome.outcome == "suppressed_recipient_optout"
+    ):
+        return False
+    return True
+
+
+def _terminal_reply_body_hash(saga: Dict[str, Any]) -> str:
+    """Hash the immutable, validated saga body that is actually sent or queued."""
+    response_body = str((saga or {}).get("responseBody") or "").strip()
+    if not response_body:
+        raise RetryableProcessingError("terminal reply obligation has no persisted body")
+    return hashlib.sha256(response_body.encode("utf-8")).hexdigest()
+
+
+def _validate_terminal_reply_attempt_body(
+    saga: Dict[str, Any],
+    attempt: Dict[str, Any],
+) -> str:
+    expected_body_hash = _terminal_reply_body_hash(saga)
+    if str((attempt or {}).get("responseBodyHash") or "") != expected_body_hash:
+        raise RetryableProcessingError(
+            "terminal reply attempt body hash does not match immutable saga response body"
+        )
+    return expected_body_hash
+
+
+def _terminal_pending_response_ref(user_id: str, current_thread_id: str):
+    return (
+        _fs.collection("users").document(user_id)
+        .collection("pendingResponses").document(current_thread_id)
+    )
+
+
+def _validate_exact_terminal_pending_response_data(
+    pending: Dict[str, Any],
+    current_thread_id: str,
+    client_id: str,
+    recipient: str,
+    saga: Dict[str, Any],
+    attempt: Dict[str, Any],
+) -> Dict[str, Any]:
+    expected_body_hash = _validate_terminal_reply_attempt_body(saga, attempt)
+    body_hash = hashlib.sha256(
+        str((pending or {}).get("responseBody") or "").encode("utf-8")
+    ).hexdigest()
+    expected = {
+        "threadId": current_thread_id,
+        "msgId": saga.get("sourceGraphMessageId"),
+        "recipient": str(recipient or "").strip().lower(),
+        "clientId": client_id,
+        "conversationId": (
+            attempt.get("conversationId") or saga.get("sourceConversationId")
+        ),
+        "responseBodyHash": expected_body_hash,
+    }
+    actual = {
+        "threadId": (pending or {}).get("threadId"),
+        "msgId": (pending or {}).get("msgId"),
+        "recipient": str((pending or {}).get("recipient") or "").strip().lower(),
+        "clientId": (pending or {}).get("clientId"),
+        "conversationId": (pending or {}).get("conversationId"),
+        "responseBodyHash": body_hash,
+    }
+    if actual != expected:
+        raise RetryableProcessingError(
+            "terminal pending response evidence does not match immutable reply intent"
+        )
+    return pending
+
+
+def _exact_terminal_pending_response(
+    user_id: str,
+    current_thread_id: str,
+    client_id: str,
+    recipient: str,
+    saga: Dict[str, Any],
+    attempt: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return only the deterministic pending doc for this immutable reply intent."""
+    _validate_terminal_reply_attempt_body(saga, attempt)
+    try:
+        snapshot = _terminal_pending_response_ref(user_id, current_thread_id).get()
+    except Exception as exc:
+        raise RetryableProcessingError(
+            f"terminal pending response lookup failed: {exc}"
+        ) from exc
+    if not snapshot.exists:
+        return None
+    return _validate_exact_terminal_pending_response_data(
+        snapshot.to_dict() or {},
+        current_thread_id,
+        client_id,
+        recipient,
+        saga,
+        attempt,
+    )
+
+
+def _terminal_pending_response_payload(
+    current_thread_id: str,
+    client_id: str,
+    recipient: str,
+    response_body: str,
+    saga: Dict[str, Any],
+    *,
+    error: str,
+    subject: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    last_send_attempt_at: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Build the deterministic pending projection used by the terminal CAS."""
+    payload = {
+        "threadId": current_thread_id,
+        "msgId": saga.get("sourceGraphMessageId"),
+        "recipient": recipient,
+        "responseBody": response_body,
+        "clientId": client_id,
+        "attempts": 1,
+        "lastError": error,
+        "createdAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+    }
+    resolved_conversation_id = (
+        conversation_id or saga.get("sourceConversationId")
+    )
+    if resolved_conversation_id:
+        payload["conversationId"] = resolved_conversation_id
+    if subject:
+        payload["subject"] = subject
+    if last_send_attempt_at:
+        payload["lastSendAttemptAt"] = last_send_attempt_at
+    return payload
+
+
+def _terminal_reply_reconciliation_document(
+    user_id: str,
+    current_thread_id: str,
+    saga: Dict[str, Any],
+    permit: Dict[str, Any],
+    *,
+    kind: str,
+    already_sent: Optional[bool],
+    provider_send_started: bool,
+    reason: str,
+) -> tuple[Any, Dict[str, Any]]:
+    identity = hashlib.sha256(
+        f"{saga.get('sagaKey')}:{permit.get('permitId')}:{kind}".encode("utf-8")
+    ).hexdigest()
+    ref = (
+        _fs.collection("users").document(user_id)
+        .collection("terminalGraphSendReviews")
+        .document(f"terminal-reply-{identity}")
+    )
+    if kind == "send_needs_reconciliation" and already_sent is not None:
+        raise RetryableProcessingError(
+            "ambiguous terminal send review must preserve tri-state Sent evidence"
+        )
+    payload = {
+        "threadId": current_thread_id,
+        "msgId": saga.get("sourceGraphMessageId"),
+        "recipient": saga.get("replyRecipient"),
+        "responseBody": saga.get("responseBody"),
+        "clientId": saga.get("clientId"),
+        "conversationId": saga.get("sourceConversationId"),
+        "source": "terminalGraphSendProtocol",
+        "authoritative": True,
+        "status": (
+            "needs_reconciliation" if provider_send_started
+            else "manual_review"
+        ),
+        "alreadySent": already_sent,
+        "providerSendStarted": bool(provider_send_started),
+        "sendOutcomeUnknown": bool(
+            provider_send_started and already_sent is None
+        ),
+        "retryAllowed": False,
+        "failureReason": reason,
+        "graphSendPermitId": permit.get("permitId"),
+        "graphSendPermitHash": permit.get("immutableHash"),
+        "preparedEnvelopeHash": (
+            permit.get("sendPreparedEnvelopeHash")
+            or (permit.get("preparedEnvelope") or {}).get(
+                "preparedEnvelopeHash"
+            )
+        ),
+        "createdAt": SERVER_TIMESTAMP,
+        "updatedAt": SERVER_TIMESTAMP,
+        "movedAt": SERVER_TIMESTAMP,
+        "deadLetteredAt": SERVER_TIMESTAMP,
+    }
+    if kind == "draft_needs_review":
+        preparation = dict(permit.get("draftPreparation") or {})
+        resolution_evidence = dict(permit.get("resolutionEvidence") or {})
+        payload.update({
+            "draftId": preparation.get("draftId"),
+            "draftMutationState": preparation.get("state"),
+            "draftResolutionEvidenceHash": permit.get(
+                "resolutionEvidenceHash"
+            ),
+            "automaticDeleteAttempted": resolution_evidence.get(
+                "automaticDeleteAttempted",
+                False,
+            ),
+        })
+    return ref, payload
+
+
+def _cas_terminal_reply_transition(*args, **kwargs) -> bool:
+    try:
+        return _cas_graph_terminal_reply_transition(*args, **kwargs)
+    except GraphSendPermitBlocked as exc:
+        raise RetryableProcessingError(
+            f"terminal reply Graph permit CAS failed: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise RetryableProcessingError(
+            f"terminal reply outcome persistence failed: {exc}"
+        ) from exc
+
+
+def _fenced_reconcile_terminal_reply_sent(
+    user_id: str,
+    client_id: str,
+    current_thread_id: str,
+    recipient: str,
+    saga: Dict[str, Any],
+    attempt: Dict[str, Any],
+    sent_match: Dict[str, Any],
+    terminal_saga_owner: TerminalSagaExecution,
+) -> None:
+    """Settle retained send evidence and the terminal outcome in one CAS."""
+    claim_ref = _terminal_saga_claim_ref(user_id, saga)
+    current_ref = (
+        _fs.collection("users").document(user_id).collection("threads")
+        .document(current_thread_id)
+    )
+    pending_ref = _terminal_pending_response_ref(user_id, current_thread_id)
+    try:
+        current_attempt = dict(attempt or {})
+        _validate_terminal_reply_attempt_body(saga, current_attempt)
+        body_hash = current_attempt.get("responseBodyHash")
+        retained_permit = read_active_terminal_reply_permit(
+            _fs,
+            current_ref,
+            current_attempt,
+            saga,
+        )
+        prepared_envelope_hash = (
+            retained_permit.get("sendPreparedEnvelopeHash")
+            or (retained_permit.get("preparedEnvelope") or {}).get(
+                "preparedEnvelopeHash"
+            )
+        )
+        reconciled_attempt = {
+            **current_attempt,
+            "status": "reconciled",
+            "outcome": "sent_reconciled",
+            "reconciledAt": SERVER_TIMESTAMP,
+            "sentMessageId": (
+                sent_match.get("sentMessageId") or sent_match.get("id")
+            ),
+            "sentInternetMessageId": sent_match.get("internetMessageId"),
+            "sentConversationId": sent_match.get("conversationId"),
+            "sentDateTime": sent_match.get("sentDateTime"),
+        }
+        _cas_terminal_reply_transition(
+            _fs,
+            current_ref,
+            claim_ref,
+            saga,
+            terminal_saga_owner.owner,
+            terminal_saga_owner.fencing_token,
+            expected_attempt_status=current_attempt.get("status"),
+            thread_patch={
+                "terminalReplyOwed": False,
+                "terminalReplyOutcome": "sent_reconciled",
+                "terminalReplyResolvedAt": SERVER_TIMESTAMP,
+                "terminalReplyAttempt": reconciled_attempt,
+                "updatedAt": SERVER_TIMESTAMP,
+            },
+            permit_settlement="settled_sent",
+            sent_evidence={
+                **dict(sent_match or {}),
+                "sentMessageId": (
+                    sent_match.get("sentMessageId") or sent_match.get("id")
+                ),
+                "recipient": recipient,
+                "bodyHash": body_hash,
+                "conversationId": (
+                    sent_match.get("conversationId")
+                    or saga.get("sourceConversationId")
+                ),
+                "permitId": retained_permit.get("permitId"),
+                "sourceGraphMessageId": retained_permit.get(
+                    "sourceGraphMessageId"
+                ),
+                "preparedEnvelopeHash": prepared_envelope_hash,
+            },
+            pending_delete_ref=pending_ref,
+        )
+    except Exception as exc:
+        if isinstance(exc, RetryableProcessingError):
+            raise
+        raise RetryableProcessingError(
+            f"terminal reply Sent reconciliation persistence failed: {exc}"
+        ) from exc
+
+
+def _ensure_terminal_reply_queue(
+    user_id: str,
+    client_id: str,
+    current_thread_id: str,
+    recipient: str,
+    response_body: str,
+    saga: Dict[str, Any],
+    attempt: Dict[str, Any],
+    terminal_saga_owner: TerminalSagaExecution,
+    *,
+    error: str,
+    subject: Optional[str] = None,
+    last_send_attempt_at: Optional[Any] = None,
+    intent_already_renewed: bool = False,
+) -> Dict[str, Any]:
+    """Create the deterministic pending item at most once after a fenced intent."""
+    pending = _exact_terminal_pending_response(
+        user_id,
+        current_thread_id,
+        client_id,
+        recipient,
+        saga,
+        attempt,
+    )
+    if pending is not None:
+        return attempt
+
+    renewed_attempt = attempt
+    if not intent_already_renewed:
+        renewed_attempt = {
+            **attempt,
+            "queueIntentRenewedAt": SERVER_TIMESTAMP,
+        }
+        _fenced_terminal_thread_update(
+            user_id,
+            current_thread_id,
+            saga,
+            terminal_saga_owner,
+            {
+                "terminalReplyAttempt": renewed_attempt,
+                "updatedAt": SERVER_TIMESTAMP,
+            },
+            renew_lease=True,
+            failure_label="terminal reply queue-intent renewal failed",
+        )
+
+    queue_pending_response(
+        user_id,
+        current_thread_id,
+        saga.get("sourceGraphMessageId"),
+        recipient,
+        response_body,
+        client_id,
+        error=error,
+        subject=subject,
+        conversation_id=(
+            renewed_attempt.get("conversationId")
+            or saga.get("sourceConversationId")
+        ),
+        last_send_attempt_at=last_send_attempt_at,
+    )
+    if _exact_terminal_pending_response(
+        user_id,
+        current_thread_id,
+        client_id,
+        recipient,
+        saga,
+        renewed_attempt,
+    ) is None:
+        raise RetryableProcessingError(
+            "terminal reply queue did not create durable exact pending evidence"
+        )
+    return renewed_attempt
+
+
+def _settle_terminal_reply_obligation(
+    user_id: str,
+    client_id: str,
+    current_thread_id: str,
+    headers: Dict[str, str],
+    recipient: str,
+    saga: Dict[str, Any],
+    *,
+    terminal_saga_owner: TerminalSagaExecution,
+) -> str:
+    """Require a durable sent, pending, reconciliation, or suppression outcome."""
+    thread_ref = (
+        _fs.collection("users").document(user_id).collection("threads")
+        .document(current_thread_id)
+    )
+    snapshot = thread_ref.get()
+    data = snapshot.to_dict() if snapshot.exists else {}
+    unissued_terminal_attempt = None
+    if data.get("terminalReplyOwed"):
+        durable_attempt = data.get("terminalReplyAttempt")
+        if durable_attempt is not None and not isinstance(durable_attempt, dict):
+            raise RetryableProcessingError(
+                "terminal reply attempt is malformed before saga renewal"
+            )
+        if isinstance(durable_attempt, dict):
+            has_permit_id = bool(durable_attempt.get("graphSendPermitId"))
+            has_permit_hash = bool(
+                durable_attempt.get("graphSendPermitHash")
+            )
+            if has_permit_id != has_permit_hash:
+                raise RetryableProcessingError(
+                    "terminal reply attempt has partial retained permit proof"
+                )
+            has_complete_permit_link = has_permit_id and has_permit_hash
+            if (
+                durable_attempt.get("status")
+                != "queueing_campaign_suppression"
+                and not has_complete_permit_link
+            ):
+                try:
+                    validated_unissued_attempt = (
+                        validate_unissued_terminal_reply_attempt(
+                            saga,
+                            durable_attempt,
+                        )
+                    )
+                except GraphSendPermitBlocked as exc:
+                    raise RetryableProcessingError(
+                        f"terminal unissued reply attempt is not exact: {exc}"
+                    ) from exc
+                try:
+                    active_permit = read_active_graph_send_permit(
+                        thread_ref,
+                        data,
+                    )
+                except GraphSendPermitBlocked as exc:
+                    raise RetryableProcessingError(
+                        "terminal unissued reply attempt has malformed retained "
+                        f"Graph permit state: {exc}"
+                    ) from exc
+                if active_permit is None:
+                    # The issuance transaction re-proves this exact source and
+                    # the absence of a newly concurrent active permit.
+                    unissued_terminal_attempt = validated_unissued_attempt
+    _renew_terminal_saga_execution(user_id, saga, terminal_saga_owner)
+    if data.get("terminalReplyOwed"):
+        response_body = str(saga.get("responseBody") or "").strip()
+        body_hash = _terminal_reply_body_hash(saga)
+        attempt = data.get("terminalReplyAttempt")
+        if unissued_terminal_attempt is not None:
+            # A crash may leave the durable send intent immediately before
+            # permit issuance. Preserve it rather than constructing a new one.
+            attempt = None
+
+        if attempt is not None:
+            if not isinstance(attempt, dict) or attempt.get("sagaKey") != saga.get(
+                "sagaKey"
+            ):
+                raise RetryableProcessingError(
+                    "terminal reply attempt does not belong to the immutable saga"
+                )
+            status = attempt.get("status")
+            if status not in {
+                "sending",
+                "needs_reconciliation",
+                "queueing_response_retry",
+                "queueing_campaign_suppression",
+            }:
+                raise RetryableProcessingError(
+                    f"terminal reply attempt has unsupported owed status: {status}"
+                )
+            _validate_terminal_reply_attempt_body(saga, attempt)
+            retained_permit = None
+            permit_id = attempt.get("graphSendPermitId")
+            permit_hash = attempt.get("graphSendPermitHash")
+            if bool(permit_id) != bool(permit_hash):
+                raise RetryableProcessingError(
+                    "terminal reply attempt has partial retained permit proof"
+                )
+            if permit_id:
+                try:
+                    retained_permit = read_active_terminal_reply_permit(
+                        _fs,
+                        thread_ref,
+                        attempt,
+                        saga,
+                    )
+                except GraphSendPermitBlocked as exc:
+                    raise RetryableProcessingError(
+                        "terminal reply retained permit validation failed before "
+                        f"Sent lookup: {exc}"
+                    ) from exc
+            sent_match = None
+            permit_status = (retained_permit or {}).get("status")
+            pre_send_recovery_kind = (
+                expired_graph_send_pre_send_recovery_kind(
+                    retained_permit
+                )
+                if status == "sending" and retained_permit is not None
+                else None
+            )
+            if (
+                status == "sending"
+                and retained_permit is not None
+                and (
+                    pre_send_recovery_kind == "draft_needs_review"
+                    or (
+                        permit_status == "needs_reconciliation"
+                        and retained_permit.get("requestStartedAt") is None
+                    )
+                )
+            ):
+                outcome = "draft_needs_review"
+                resolution_evidence = dict(
+                    retained_permit.get("resolutionEvidence") or {}
+                )
+                evidence_document = _terminal_reply_reconciliation_document(
+                    user_id,
+                    current_thread_id,
+                    saga,
+                    retained_permit,
+                    kind="draft_needs_review",
+                    already_sent=False,
+                    provider_send_started=False,
+                    reason=(
+                        resolution_evidence.get("reason")
+                        or "Expired retained Graph draft requires authoritative manual review"
+                    ),
+                )
+                committed_attempt = {
+                    **attempt,
+                    "status": "committed",
+                    "outcome": outcome,
+                    "committedAt": SERVER_TIMESTAMP,
+                }
+                _cas_terminal_reply_transition(
+                    _fs,
+                    thread_ref,
+                    _terminal_saga_claim_ref(user_id, saga),
+                    saga,
+                    terminal_saga_owner.owner,
+                    terminal_saga_owner.fencing_token,
+                    expected_attempt_status="sending",
+                    thread_patch={
+                        "terminalReplyOwed": False,
+                        "terminalReplyOutcome": outcome,
+                        "terminalReplyResolvedAt": SERVER_TIMESTAMP,
+                        "terminalReplyAttempt": committed_attempt,
+                        "updatedAt": SERVER_TIMESTAMP,
+                    },
+                    permit_settlement="settled_draft_needs_review",
+                    side_documents=(evidence_document,),
+                )
+                _clear_resolved_terminal_saga(
+                    user_id,
+                    current_thread_id,
+                    saga,
+                    terminal_saga_owner=terminal_saga_owner,
+                )
+                return outcome
+            if (
+                status == "sending"
+                and retained_permit is not None
+                and pre_send_recovery_kind == "definitely_not_started"
+            ):
+                error = (
+                    "Recovering an expired Graph permit that never started "
+                    "provider work before deterministic queue creation"
+                )
+                attempt = {
+                    **attempt,
+                    "status": "queueing_response_retry",
+                    "queueDocumentId": current_thread_id,
+                    "conversationId": (
+                        attempt.get("conversationId")
+                        or saga.get("sourceConversationId")
+                    ),
+                    "sendFailure": error,
+                    "definiteUnsentAt": datetime.now(timezone.utc),
+                }
+                _cas_terminal_reply_transition(
+                    _fs,
+                    thread_ref,
+                    _terminal_saga_claim_ref(user_id, saga),
+                    saga,
+                    terminal_saga_owner.owner,
+                    terminal_saga_owner.fencing_token,
+                    expected_attempt_status="sending",
+                    thread_patch={
+                        "terminalReplyAttempt": attempt,
+                        "updatedAt": SERVER_TIMESTAMP,
+                    },
+                    permit_settlement="settled_definitely_not_sent",
+                    pending_upsert=(
+                        _terminal_pending_response_ref(
+                            user_id,
+                            current_thread_id,
+                        ),
+                        _terminal_pending_response_payload(
+                            current_thread_id,
+                            client_id,
+                            recipient,
+                            response_body,
+                            saga,
+                            error=error,
+                            conversation_id=attempt.get("conversationId"),
+                        ),
+                    ),
+                )
+                status = "queueing_response_retry"
+                permit_status = "settled_definitely_not_sent"
+            if status == "queueing_response_retry" and (
+                retained_permit is None
+                or permit_status != "settled_definitely_not_sent"
+            ):
+                raise RetryableProcessingError(
+                    "terminal queueing_response_retry lacks retained "
+                    "definitely-not-sent permit proof"
+                )
+            if status == "queueing_campaign_suppression":
+                if retained_permit is not None:
+                    raise RetryableProcessingError(
+                        "terminal pre-send campaign queue unexpectedly carries a permit"
+                    )
+                try:
+                    active_permit = read_active_graph_send_permit(thread_ref, data)
+                except GraphSendPermitBlocked as exc:
+                    raise RetryableProcessingError(
+                        "terminal pre-send campaign queue permit state is malformed: "
+                        f"{exc}"
+                    ) from exc
+                if active_permit is not None:
+                    raise RetryableProcessingError(
+                        "terminal pre-send campaign queue has retained Graph activity"
+                    )
+            if retained_permit is not None and permit_status in {
+                "request_started",
+                "needs_reconciliation",
+                "accepted",
+                "reconciled_sent",
+            }:
+                sent_after = (
+                    retained_permit.get("requestStartedAt")
+                    if retained_permit is not None
+                    else sent_after_from_retry_data(attempt)
+                )
+                if retained_permit is not None and not sent_after:
+                    raise RetryableProcessingError(
+                        "terminal send reconciliation is missing requestStartedAt"
+                    )
+                try:
+                    prepared_envelope = (
+                        retained_permit.get("preparedEnvelope") or {}
+                    )
+                    sent_match = find_exact_sent_message_by_immutable_id(
+                        headers,
+                        prepared_envelope.get("draftId"),
+                        recipient=recipient,
+                        to_recipients=prepared_envelope.get("toRecipients"),
+                        cc_recipients=prepared_envelope.get("ccRecipients"),
+                        require_no_bcc=True,
+                        require_attachment_proof=True,
+                        canonical_body_hash=prepared_envelope.get("htmlBodyHash"),
+                        subject=prepared_envelope.get("subject"),
+                        conversation_id=saga.get("sourceConversationId"),
+                        attempts=2,
+                    )
+                except Exception as exc:
+                    raise RetryableProcessingError(
+                        "terminal reply Sent Items reconciliation failed closed: "
+                        f"{exc}"
+                    ) from exc
+            if sent_match:
+                _fenced_reconcile_terminal_reply_sent(
+                    user_id,
+                    client_id,
+                    current_thread_id,
+                    recipient,
+                    saga,
+                    attempt,
+                    sent_match,
+                    terminal_saga_owner,
+                )
+                outcome = "sent_reconciled"
+                _clear_resolved_terminal_saga(
+                    user_id,
+                    current_thread_id,
+                    saga,
+                    terminal_saga_owner=terminal_saga_owner,
+                )
+                return outcome
+
+            if status == "sending":
+                try:
+                    retained_permit = read_active_terminal_reply_permit(
+                        _fs,
+                        thread_ref,
+                        attempt,
+                        saga,
+                    )
+                except GraphSendPermitBlocked as exc:
+                    raise RetryableProcessingError(
+                        "terminal reply has a send intent without exact retained "
+                        f"permit evidence: {exc}"
+                    ) from exc
+                if retained_permit.get("status") == "definitely_not_sent":
+                    error = (
+                        "Recovering retained definitely-unsent terminal reply "
+                        "before deterministic queue creation"
+                    )
+                    attempt = {
+                        **attempt,
+                        "status": "queueing_response_retry",
+                        "queueDocumentId": current_thread_id,
+                        "conversationId": (
+                            attempt.get("conversationId")
+                            or saga.get("sourceConversationId")
+                        ),
+                        "sendFailure": error,
+                        "definiteUnsentAt": SERVER_TIMESTAMP,
+                    }
+                    _cas_terminal_reply_transition(
+                        _fs,
+                        thread_ref,
+                        _terminal_saga_claim_ref(user_id, saga),
+                        saga,
+                        terminal_saga_owner.owner,
+                        terminal_saga_owner.fencing_token,
+                        expected_attempt_status="sending",
+                        thread_patch={
+                            "terminalReplyAttempt": attempt,
+                            "updatedAt": SERVER_TIMESTAMP,
+                        },
+                        permit_settlement="settled_definitely_not_sent",
+                        pending_upsert=(
+                            _terminal_pending_response_ref(
+                                user_id,
+                                current_thread_id,
+                            ),
+                            _terminal_pending_response_payload(
+                                current_thread_id,
+                                client_id,
+                                recipient,
+                                response_body,
+                                saga,
+                                error=error,
+                                conversation_id=attempt.get("conversationId"),
+                            ),
+                        ),
+                    )
+                    status = "queueing_response_retry"
+                else:
+                    raise RetryableProcessingError(
+                        "terminal reply has a durable send intent but no confirmed "
+                        "Sent Items match; retained permit remains unresolved and "
+                        "duplicate send is refused"
+                    )
+
+            if status == "needs_reconciliation":
+                raise RetryableProcessingError(
+                    "terminal reply remains reconciliation-only without an exact "
+                    "Sent Items match; duplicate send is refused"
+                )
+
+            error = (
+                "Recovering durable definite-unsent terminal reply queue intent"
+                if status == "queueing_response_retry"
+                else "Recovering durable terminal reply campaign queue intent"
+            )
+            attempt = _ensure_terminal_reply_queue(
+                user_id,
+                client_id,
+                current_thread_id,
+                recipient,
+                response_body,
+                saga,
+                attempt,
+                terminal_saga_owner,
+                error=error,
+            )
+            outcome = "queued_retry"
+            _fenced_terminal_thread_update(
+                user_id,
+                current_thread_id,
+                saga,
+                terminal_saga_owner,
+                {
+                    "terminalReplyOwed": False,
+                    "terminalReplyOutcome": outcome,
+                    "terminalReplyResolvedAt": SERVER_TIMESTAMP,
+                    "terminalReplyAttempt": {
+                        **attempt,
+                        "status": "committed",
+                        "outcome": outcome,
+                        "committedAt": SERVER_TIMESTAMP,
+                    },
+                    "updatedAt": SERVER_TIMESTAMP,
+                },
+                failure_label=(
+                    "terminal reply queued outcome persistence failed"
+                    if status == "queueing_response_retry"
+                    else "terminal reply suppression outcome persistence failed"
+                ),
+            )
+            _clear_resolved_terminal_saga(
+                user_id,
+                current_thread_id,
+                saga,
+                terminal_saga_owner=terminal_saga_owner,
+            )
+            return outcome
+
+        campaign_decision = get_client_automation_decision(user_id, client_id)
+        campaign_suppression_kind = classify_campaign_suppression(campaign_decision)
+        if campaign_suppression_kind:
+            if campaign_suppression_kind == "terminal":
+                outcome = "campaign_stopped"
+                committed_attempt = None
+            else:
+                attempt = {
+                    "sagaKey": saga.get("sagaKey"),
+                    "sourceMessageKey": saga.get("sourceMessageKey"),
+                    "sourceGraphMessageId": saga.get("sourceGraphMessageId"),
+                    "conversationId": saga.get("sourceConversationId"),
+                    "recipient": recipient,
+                    "responseBodyHash": body_hash,
+                    "status": "queueing_campaign_suppression",
+                    "startedAt": SERVER_TIMESTAMP,
+                }
+                _fenced_terminal_thread_update(
+                    user_id,
+                    current_thread_id,
+                    saga,
+                    terminal_saga_owner,
+                    {
+                        "terminalReplyAttempt": attempt,
+                        "updatedAt": SERVER_TIMESTAMP,
+                    },
+                    renew_lease=True,
+                    failure_label="terminal reply queue-intent persistence failed",
+                )
+                attempt = _ensure_terminal_reply_queue(
+                    user_id,
+                    client_id,
+                    current_thread_id,
+                    recipient,
+                    response_body,
+                    saga,
+                    attempt,
+                    terminal_saga_owner,
+                    error=(
+                        "Terminal reply queued while campaign automation is "
+                        f"{campaign_suppression_kind}: {campaign_decision.reason}"
+                    ),
+                    intent_already_renewed=True,
+                )
+                outcome = "queued_retry"
+                committed_attempt = {
+                    **attempt,
+                    "status": "committed",
+                    "outcome": outcome,
+                    "committedAt": SERVER_TIMESTAMP,
+                }
+            _fenced_terminal_thread_update(
+                user_id,
+                current_thread_id,
+                saga,
+                terminal_saga_owner,
+                {
+                    "terminalReplyOwed": False,
+                    "terminalReplyOutcome": outcome,
+                    "terminalReplyResolvedAt": SERVER_TIMESTAMP,
+                    "terminalReplyAttempt": committed_attempt,
+                    "updatedAt": SERVER_TIMESTAMP,
+                },
+                failure_label="terminal reply suppression outcome persistence failed",
+            )
+            _clear_resolved_terminal_saga(
+                user_id,
+                current_thread_id,
+                saga,
+                terminal_saga_owner=terminal_saga_owner,
+            )
+            return outcome
+
+        if unissued_terminal_attempt is None:
+            attempt = {
+                "sagaKey": saga.get("sagaKey"),
+                "sourceMessageKey": saga.get("sourceMessageKey"),
+                "sourceGraphMessageId": saga.get("sourceGraphMessageId"),
+                "conversationId": saga.get("sourceConversationId"),
+                "recipient": str(recipient or "").strip().lower(),
+                "responseBodyHash": body_hash,
+                "status": "sending",
+                "startedAt": datetime.now(timezone.utc),
+            }
+            _fenced_terminal_thread_update(
+                user_id,
+                current_thread_id,
+                saga,
+                terminal_saga_owner,
+                {
+                    "terminalReplyAttempt": attempt,
+                    "updatedAt": SERVER_TIMESTAMP,
+                },
+                renew_lease=True,
+                failure_label="terminal reply send-intent persistence failed",
+            )
+        else:
+            attempt = unissued_terminal_attempt
+        graph_send_capability = issue_terminal_graph_send_permit(
+            _fs,
+            thread_ref,
+            _terminal_saga_claim_ref(user_id, saga),
+            saga,
+            terminal_saga_owner.owner,
+            terminal_saga_owner.fencing_token,
+        )
+        attempt = {
+            **attempt,
+            "graphSendPermitId": graph_send_capability.permit_id,
+            "graphSendPermitHash": graph_send_capability.immutable_hash,
+        }
+        sent = send_reply_in_thread(
+            user_id,
+            headers,
+            response_body,
+            saga.get("sourceGraphMessageId"),
+            recipient,
+            current_thread_id,
+            graph_send_capability=graph_send_capability,
+        )
+        send_outcome = _get_reply_send_outcome()
+        outcome_committed_with_permit = False
+        if sent:
+            if not isinstance(send_outcome.exact_sent_evidence, dict):
+                raise RetryableProcessingError(
+                    "terminal indexed reply lacks exact immutable Sent evidence"
+                )
+            outcome = "sent_indexed"
+            committed_attempt = {
+                **attempt,
+                "status": "committed",
+                "outcome": outcome,
+                "committedAt": SERVER_TIMESTAMP,
+            }
+            _cas_terminal_reply_transition(
+                _fs,
+                thread_ref,
+                _terminal_saga_claim_ref(user_id, saga),
+                saga,
+                terminal_saga_owner.owner,
+                terminal_saga_owner.fencing_token,
+                expected_attempt_status="sending",
+                thread_patch={
+                    "terminalReplyOwed": False,
+                    "terminalReplyOutcome": outcome,
+                    "terminalReplyResolvedAt": SERVER_TIMESTAMP,
+                    "terminalReplyAttempt": committed_attempt,
+                    "updatedAt": SERVER_TIMESTAMP,
+                },
+                permit_settlement="settled_sent",
+                capability=graph_send_capability,
+                sent_evidence=send_outcome.exact_sent_evidence,
+            )
+            attempt = committed_attempt
+            outcome_committed_with_permit = True
+        else:
+            retained_permit = read_permit(graph_send_capability)
+            permit_status = retained_permit.get("status")
+            if (
+                permit_status == "definitely_not_sent"
+                and _terminal_reply_will_queue_after_definite_send_failure(
+                    send_outcome
+                )
+            ):
+                failure_reason = (
+                    send_outcome.error or "send_reply_in_thread returned False"
+                )
+                attempt = {
+                    **attempt,
+                    "status": "queueing_response_retry",
+                    "queueDocumentId": current_thread_id,
+                    "conversationId": (
+                        send_outcome.conversation_id
+                        or saga.get("sourceConversationId")
+                    ),
+                    "sendFailure": send_outcome.error,
+                    "definiteUnsentAt": SERVER_TIMESTAMP,
+                }
+                _cas_terminal_reply_transition(
+                    _fs,
+                    thread_ref,
+                    _terminal_saga_claim_ref(user_id, saga),
+                    saga,
+                    terminal_saga_owner.owner,
+                    terminal_saga_owner.fencing_token,
+                    expected_attempt_status="sending",
+                    thread_patch={
+                        "terminalReplyAttempt": attempt,
+                        "updatedAt": SERVER_TIMESTAMP,
+                    },
+                    permit_settlement="settled_definitely_not_sent",
+                    capability=graph_send_capability,
+                    pending_upsert=(
+                        _terminal_pending_response_ref(
+                            user_id,
+                            current_thread_id,
+                        ),
+                        _terminal_pending_response_payload(
+                            current_thread_id,
+                            client_id,
+                            recipient,
+                            response_body,
+                            saga,
+                            error=failure_reason,
+                            subject=send_outcome.subject,
+                            conversation_id=attempt.get("conversationId"),
+                            last_send_attempt_at=send_outcome.send_attempt_at,
+                        ),
+                    ),
+                )
+                if _exact_terminal_pending_response(
+                    user_id,
+                    current_thread_id,
+                    client_id,
+                    recipient,
+                    saga,
+                    attempt,
+                ) is None:
+                    raise RetryableProcessingError(
+                        "terminal definite-unsent CAS did not retain exact pending work"
+                    )
+                outcome = "queued_retry"
+            else:
+                if (
+                    permit_status == "accepted"
+                    and isinstance(send_outcome.exact_sent_evidence, dict)
+                ):
+                    outcome = "sent_unindexed"
+                    committed_attempt = {
+                        **attempt,
+                        "status": "committed",
+                        "outcome": outcome,
+                        "committedAt": SERVER_TIMESTAMP,
+                    }
+                    _cas_terminal_reply_transition(
+                        _fs,
+                        thread_ref,
+                        _terminal_saga_claim_ref(user_id, saga),
+                        saga,
+                        terminal_saga_owner.owner,
+                        terminal_saga_owner.fencing_token,
+                        expected_attempt_status="sending",
+                        thread_patch={
+                            "terminalReplyOwed": False,
+                            "terminalReplyOutcome": outcome,
+                            "terminalReplyResolvedAt": SERVER_TIMESTAMP,
+                            "terminalReplyAttempt": committed_attempt,
+                            "updatedAt": SERVER_TIMESTAMP,
+                        },
+                        permit_settlement="settled_sent",
+                        capability=graph_send_capability,
+                        sent_evidence=send_outcome.exact_sent_evidence,
+                    )
+                    attempt = committed_attempt
+                    outcome_committed_with_permit = True
+                elif permit_status == "definitely_not_sent":
+                    outcome = _queue_response_retry_or_reconciliation(
+                        user_id,
+                        current_thread_id,
+                        saga.get("sourceGraphMessageId"),
+                        recipient,
+                        response_body,
+                        client_id,
+                        source_context="terminalSaga",
+                    )
+                    committed_attempt = {
+                        **attempt,
+                        "status": "committed",
+                        "outcome": outcome,
+                        "committedAt": SERVER_TIMESTAMP,
+                    }
+                    _cas_terminal_reply_transition(
+                        _fs,
+                        thread_ref,
+                        _terminal_saga_claim_ref(user_id, saga),
+                        saga,
+                        terminal_saga_owner.owner,
+                        terminal_saga_owner.fencing_token,
+                        expected_attempt_status="sending",
+                        thread_patch={
+                            "terminalReplyOwed": False,
+                            "terminalReplyOutcome": outcome,
+                            "terminalReplyResolvedAt": SERVER_TIMESTAMP,
+                            "terminalReplyAttempt": committed_attempt,
+                            "updatedAt": SERVER_TIMESTAMP,
+                        },
+                        permit_settlement="settled_definitely_not_sent",
+                        capability=graph_send_capability,
+                    )
+                    attempt = committed_attempt
+                    outcome_committed_with_permit = True
+                elif (
+                    send_outcome.outcome
+                    == "draft_mutation_needs_reconciliation"
+                    and permit_status == "needs_reconciliation"
+                    and retained_permit.get("requestStartedAt") is None
+                ):
+                    outcome = "draft_needs_review"
+                    evidence_document = _terminal_reply_reconciliation_document(
+                        user_id,
+                        current_thread_id,
+                        saga,
+                        retained_permit,
+                        kind="draft_needs_review",
+                        already_sent=False,
+                        provider_send_started=False,
+                        reason=(
+                            send_outcome.error
+                            or "Graph draft mutation became ambiguous before /send"
+                        ),
+                    )
+                    committed_attempt = {
+                        **attempt,
+                        "status": "committed",
+                        "outcome": outcome,
+                        "committedAt": SERVER_TIMESTAMP,
+                    }
+                    _cas_terminal_reply_transition(
+                        _fs,
+                        thread_ref,
+                        _terminal_saga_claim_ref(user_id, saga),
+                        saga,
+                        terminal_saga_owner.owner,
+                        terminal_saga_owner.fencing_token,
+                        expected_attempt_status="sending",
+                        thread_patch={
+                            "terminalReplyOwed": False,
+                            "terminalReplyOutcome": outcome,
+                            "terminalReplyResolvedAt": SERVER_TIMESTAMP,
+                            "terminalReplyAttempt": committed_attempt,
+                            "updatedAt": SERVER_TIMESTAMP,
+                        },
+                        permit_settlement="settled_draft_needs_review",
+                        capability=graph_send_capability,
+                        side_documents=(evidence_document,),
+                    )
+                    attempt = committed_attempt
+                    outcome_committed_with_permit = True
+                elif permit_status in {
+                    "accepted",
+                    "request_started",
+                    "needs_reconciliation",
+                }:
+                    outcome = "needs_reconciliation"
+                    evidence_document = _terminal_reply_reconciliation_document(
+                        user_id,
+                        current_thread_id,
+                        saga,
+                        retained_permit,
+                        kind="send_needs_reconciliation",
+                        already_sent=None,
+                        provider_send_started=True,
+                        reason=(
+                            send_outcome.error
+                            or "Graph send outcome is ambiguous"
+                        ),
+                    )
+                    reconciliation_attempt = {
+                        **attempt,
+                        "status": "needs_reconciliation",
+                        "outcome": outcome,
+                        "reconciliationRecordedAt": SERVER_TIMESTAMP,
+                    }
+                    _cas_terminal_reply_transition(
+                        _fs,
+                        thread_ref,
+                        _terminal_saga_claim_ref(user_id, saga),
+                        saga,
+                        terminal_saga_owner.owner,
+                        terminal_saga_owner.fencing_token,
+                        expected_attempt_status="sending",
+                        thread_patch={
+                            "terminalReplyAttempt": reconciliation_attempt,
+                            "updatedAt": SERVER_TIMESTAMP,
+                        },
+                        permit_settlement="reconciliation_recorded",
+                        capability=graph_send_capability,
+                        side_documents=(evidence_document,),
+                    )
+                    raise RetryableProcessingError(
+                        "terminal Graph send remains reconciliation-only; duplicate "
+                        "send is refused"
+                    )
+                else:
+                    raise RetryableProcessingError(
+                        "terminal Graph permit has unsupported reply outcome: "
+                        f"{permit_status}"
+                    )
+        if outcome not in {
+            "sent_indexed",
+            "sent_unindexed",
+            "queued_retry",
+            "recipient_suppressed",
+            "campaign_stopped",
+            "draft_needs_review",
+        }:
+            raise RetryableProcessingError(
+                f"terminal reply has no durable outcome: {outcome}"
+            )
+        if not outcome_committed_with_permit:
+            _fenced_terminal_thread_update(
+                user_id,
+                current_thread_id,
+                saga,
+                terminal_saga_owner,
+                {
+                    "terminalReplyOwed": False,
+                    "terminalReplyOutcome": outcome,
+                    "terminalReplyResolvedAt": SERVER_TIMESTAMP,
+                    "terminalReplyAttempt": {
+                        **attempt,
+                        "status": "committed",
+                        "outcome": outcome,
+                        "committedAt": SERVER_TIMESTAMP,
+                    },
+                    "updatedAt": SERVER_TIMESTAMP,
+                },
+                failure_label="terminal reply outcome persistence failed",
+            )
+    else:
+        outcome = data.get("terminalReplyOutcome") or "not_required"
+
+    _clear_resolved_terminal_saga(
+        user_id,
+        current_thread_id,
+        saga,
+        terminal_saga_owner=terminal_saga_owner,
+    )
+    return outcome
+
+
+def _build_terminal_saga(
+    user_id: str,
+    client_id: str,
+    current_thread_id: str,
+    *,
+    message: Dict[str, Any],
+    internet_message_id: str,
+    conversation_id: str,
+    sheet_id: str,
+    tab_title: str,
+    source_row: int,
+    row_anchor: str,
+    notes_column_index: int,
+    sheet_header: List[str],
+    terminal_reason: str,
+    terminal_note: str,
+    event_key: str,
+    event: Dict[str, Any],
+    divider_row: int,
+    divider_exists: bool,
+    row_already_nonviable: bool,
+    has_alternative_path: bool,
+    llm_response_email: Optional[str],
+    column_config: Optional[Dict[str, Any]],
+    contact_name: Optional[str],
+    reply_recipient: str,
+) -> Dict[str, Any]:
+    source_graph_message_id = str(message.get("id") or "").strip()
+    if (
+        isinstance(notes_column_index, bool)
+        or not isinstance(notes_column_index, int)
+        or notes_column_index < 1
+        or notes_column_index > len(sheet_header or [])
+    ):
+        raise RetryableProcessingError(
+            "terminal saga requires an exact Notes/Comments coordinate"
+        )
+    notes_column_header = str(
+        (sheet_header or [])[notes_column_index - 1] or ""
+    ).strip()
+    if not notes_column_header:
+        raise RetryableProcessingError(
+            "terminal saga Notes/Comments header is blank"
+        )
+    source_message_key = _terminal_source_message_key(
+        source_graph_message_id,
+        internet_message_id,
+    )
+    current_snapshot = (
+        _fs.collection("users").document(user_id).collection("threads")
+        .document(current_thread_id).get()
+    )
+    if not current_snapshot.exists:
+        raise RetryableProcessingError(
+            "terminal saga current root disappeared before settlement preflight"
+        )
+    prior_settlements = _validate_terminal_settlement_history(
+        (current_snapshot.to_dict() or {}).get("terminalSettlements")
+    )
+    if len(prior_settlements) >= TERMINAL_SETTLEMENT_HISTORY_LIMIT:
+        raise RetryableProcessingError(
+            "terminal settlement retention limit reached before staging; "
+            "operator review is required"
+        )
+    settlement_ordinal = len(prior_settlements) + 1
+    saga_key = hashlib.sha256(
+        f"{current_thread_id}\0{source_message_key}\0property_unavailable".encode("utf-8")
+    ).hexdigest()
+    plan = _build_terminal_finalization_plan(
+        user_id,
+        client_id,
+        current_thread_id,
+        source_row=source_row,
+        divider_row=divider_row,
+    )
+    if row_already_nonviable:
+        response_scenario = "none"
+        response_body = None
+    else:
+        if terminal_reason == "requirements_mismatch":
+            response_scenario = (
+                "requirements_mismatch_with_alternative"
+                if has_alternative_path
+                else "requirements_mismatch"
+            )
+        else:
+            response_scenario = (
+                "nonviable_with_alternative"
+                if has_alternative_path
+                else "nonviable"
+            )
+        response_body = _select_automatic_response_body(
+            response_scenario,
+            _align_response_greeting(llm_response_email, contact_name),
+            column_config,
+            contact_name,
+        )
+
+    immutable = {
+        "version": TERMINAL_SAGA_VERSION,
+        "settlementOrdinal": settlement_ordinal,
+        "sagaKey": saga_key,
+        "sourceMessageKey": source_message_key,
+        "sourceGraphMessageId": source_graph_message_id,
+        "sourceInternetMessageId": internet_message_id,
+        "sourceConversationId": conversation_id,
+        "sourceReceivedAt": message.get("receivedDateTime"),
+        "reason": terminal_reason,
+        "note": terminal_note,
+        "eventKey": event_key,
+        "sourceRow": source_row,
+        "rowAnchor": row_anchor,
+        "responseScenario": response_scenario,
+        "responseBody": response_body,
+        "completeClientAfterReply": (
+            response_scenario in {"nonviable", "requirements_mismatch"}
+            or (response_scenario == "none" and not has_alternative_path)
+        ),
+        "replyRecipient": reply_recipient,
+        "notificationRequired": not row_already_nonviable,
+        "eventAddress": _event_text(event, "address"),
+        "eventCity": _event_text(event, "city"),
+        "clientId": client_id,
+        "sheetId": sheet_id,
+        "tabTitle": tab_title,
+        "notesColumnIndex": notes_column_index,
+        "notesColumnHeader": notes_column_header,
+        "sheetHeaderFingerprint": _terminal_sheet_header_fingerprint(
+            sheet_header
+        ),
+        "dividerExists": bool(divider_exists),
+        "finalizationPlan": plan,
+    }
+    immutable_hash = hashlib.sha256(
+        json.dumps(immutable, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return {
+        **immutable,
+        "immutableHash": immutable_hash,
+        "phase": "staged",
+    }
+
+
+def _resume_exact_terminal_saga(
+    user_id: str,
+    headers: Dict[str, str],
+    thread_id: str,
+    thread_data: Dict[str, Any],
+    saga: Dict[str, Any],
+) -> None:
+    """Advance only persisted terminal evidence; skip the generic inbox pipeline."""
+    _validate_terminal_saga_immutable_hash(saga)
+    source_row, expected_final_row, mutation_kind = (
+        _terminal_sheet_mutation_geometry_from_saga(saga)
+    )
+    # Validate the immutable coordinate commitment before claim/fence churn or
+    # any Sheets client/read.  Legacy missing bindings are operator-repair only.
+    _validate_terminal_saga_sheet_layout_binding(saga)
+    client_id = saga.get("clientId") or (thread_data or {}).get("clientId")
+    if not client_id or (
+        saga.get("clientId")
+        and (thread_data or {}).get("clientId")
+        and saga.get("clientId") != (thread_data or {}).get("clientId")
+    ):
+        raise RetryableProcessingError("terminal saga client context drift")
+    sheet_id = saga.get("sheetId")
+    tab_title = saga.get("tabTitle")
+    if not sheet_id or not tab_title:
+        raise RetryableProcessingError("terminal saga Sheet context is incomplete")
+
+    owner = _claim_existing_terminal_saga_execution(
+        user_id,
+        thread_id,
+        thread_data,
+        saga,
+    )
+    try:
+        sheets = _sheets_client()
+        live_tab_title = _get_first_tab_title(sheets, sheet_id)
+        if live_tab_title != tab_title:
+            raise RetryableProcessingError(
+                "terminal saga tab context drift: "
+                f"expected {tab_title!r}, found {live_tab_title!r}"
+            )
+        header = _read_header_row2(sheets, sheet_id, tab_title)
+        live_notes_column_index = find_notes_comment_column_index(header)
+        persisted_notes_column_index = saga.get("notesColumnIndex")
+        if live_notes_column_index != persisted_notes_column_index:
+            raise RetryableProcessingError(
+                "terminal saga notes-column context drift: "
+                f"expected {persisted_notes_column_index}, "
+                f"found {live_notes_column_index}"
+            )
+        notes_column_index = _validate_terminal_saga_sheet_layout(saga, header)
+
+        rownum, rowvals = _find_row_by_anchor(
+            user_id,
+            thread_id,
+            sheets,
+            sheet_id,
+            tab_title,
+            header,
+            saga.get("replyRecipient") or "",
+        )
+        if rownum is None:
+            raise RetryableProcessingError(
+                "terminal saga could not locate its persisted Sheet row"
+            )
+        live_anchor = get_row_anchor(rowvals or [], header)
+        if (
+            saga.get("rowAnchor")
+            and live_anchor
+            and _normalize_replacement_match_text(live_anchor)
+            != _normalize_replacement_match_text(saga.get("rowAnchor"))
+        ):
+            raise RetryableProcessingError("terminal saga row-anchor context drift")
+
+        if rownum not in {source_row, expected_final_row}:
+            raise RetryableProcessingError(
+                "terminal saga row context drift: "
+                f"expected {source_row} or {expected_final_row}, found {rownum}"
+            )
+
+        phase = saga.get("phase")
+        if phase == "staged":
+            allow_provider_mutation = rownum == source_row
+            if mutation_kind == "move_with_note" and allow_provider_mutation:
+                _verify_terminal_finalization_plan(user_id, client_id, saga)
+            final_row = _execute_or_reconcile_terminal_sheet_mutation(
+                user_id,
+                thread_id,
+                sheets,
+                sheet_id,
+                tab_title,
+                header,
+                notes_column_index,
+                saga,
+                owner,
+                mutation_kind,
+                allow_provider_mutation=allow_provider_mutation,
+            )
+            saga = _finalize_terminal_thread_roots(
+                user_id,
+                client_id,
+                thread_id,
+                saga,
+                final_row=final_row,
+                terminal_saga_owner=owner,
+            )
+        elif phase == "finalized":
+            final_row = expected_final_row
+            _execute_or_reconcile_terminal_sheet_mutation(
+                user_id,
+                thread_id,
+                sheets,
+                sheet_id,
+                tab_title,
+                header,
+                notes_column_index,
+                saga,
+                owner,
+                mutation_kind,
+                allow_provider_mutation=False,
+            )
+        else:
+            raise RetryableProcessingError(
+                f"unsupported terminal saga phase: {phase}"
+            )
+
+        recipient = saga.get("replyRecipient") or ""
+        _settle_terminal_notification_obligation(
+            user_id,
+            client_id,
+            thread_id,
+            recipient,
+            saga,
+            terminal_saga_owner=owner,
+        )
+        reply_outcome = _settle_terminal_reply_obligation(
+            user_id,
+            client_id,
+            thread_id,
+            headers,
+            recipient,
+            saga,
+            terminal_saga_owner=owner,
+        )
+        print(f"📧 Terminal saga recovery reached durable outcome: {reply_outcome}")
+        if saga.get("completeClientAfterReply"):
+            _require_terminal_client_completion(user_id, client_id)
+    except Exception:
+        current_ref = (
+            _fs.collection("users").document(user_id).collection("threads")
+            .document(thread_id)
+        )
+        current_snapshot = current_ref.get()
+        current_data = current_snapshot.to_dict() if current_snapshot.exists else {}
+        attempt = current_data.get("terminalReplyAttempt")
+        if not (
+            isinstance(attempt, dict)
+            and attempt.get("sagaKey") == saga.get("sagaKey")
+        ):
+            _release_terminal_saga_execution_claim(user_id, saga, owner)
+        raise
 
 
 _PROPERTY_ANCHOR_STOPWORDS = {
@@ -4607,6 +10314,67 @@ def _mark_reply_sent_but_unindexed(reason: str) -> bool:
     return False
 
 
+def _mark_reply_accepted_unconfirmed(reason: str) -> bool:
+    _set_reply_send_outcome(
+        error=reason,
+        sent_but_unindexed=False,
+        outcome="accepted_needs_reconciliation",
+        exact_sent_evidence=None,
+    )
+    print(f"   ⚠️ ACCEPTED-BUT-UNCONFIRMED: {reason}")
+    return False
+
+
+def _mark_draft_mutation_needs_reconciliation(reason: str) -> bool:
+    _set_reply_send_outcome(
+        error=reason,
+        sent_but_unindexed=False,
+        outcome="draft_mutation_needs_reconciliation",
+    )
+    print(f"   ⚠️ DRAFT-RECONCILIATION: {reason}")
+    return False
+
+
+def _persist_exact_graph_completion(completer, *args, **kwargs):
+    """Retry only the same local evidence write after an ambiguous commit."""
+    try:
+        return completer(*args, **kwargs)
+    except Exception as first_error:
+        try:
+            return completer(*args, **kwargs)
+        except Exception as readback_error:
+            raise readback_error from first_error
+
+
+def _retain_graph_reply_draft_for_review(
+    graph_send_capability,
+    draft_id: str,
+    *,
+    reason: str,
+    phase: str,
+) -> bool:
+    """Retain one capability-owned draft; Graph DELETE has no CAS precondition."""
+    normalized_draft_id = str(draft_id or "").strip()
+    if not normalized_draft_id:
+        raise GraphSendPermitBlocked(
+            "capability-owned Graph draft review is missing its draft id"
+        )
+    evidence = {
+        "reason": str(reason or "").strip(),
+        "phase": str(phase or "").strip(),
+        "draftId": normalized_draft_id,
+        "providerSendStarted": False,
+        "automaticDeleteAttempted": False,
+    }
+    _persist_exact_graph_completion(
+        resolve_graph_send_permit,
+        graph_send_capability,
+        "needs_reconciliation",
+        evidence=evidence,
+    )
+    return _mark_draft_mutation_needs_reconciliation(evidence["reason"])
+
+
 def _automatic_inbox_replies_allowed(user_id: str) -> bool:
     raw_allowlist = os.environ.get("SITESIFT_AUTO_REPLY_ALLOWLIST")
     if raw_allowlist is None:
@@ -4639,7 +10407,16 @@ def _tour_actions_allowed(user_id: str) -> bool:
     return str(user_id or "").strip() in allowed
 
 
-def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id: str, recipient: str, thread_id: str) -> bool:
+def send_reply_in_thread(
+    user_id: str,
+    headers: dict,
+    body: str,
+    current_msg_id: str,
+    recipient: str,
+    thread_id: str,
+    *,
+    graph_send_capability=None,
+) -> bool:
     """Send a reply to the current message being processed and index it for future replies"""
     _reset_reply_send_outcome()
     outbound_mode = resolve_outbound_mode()
@@ -4656,6 +10433,12 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             outbound_mode,
             context=f"send_reply_in_thread thread {thread_id}",
         )
+        if graph_send_capability is not None:
+            resolve_graph_send_permit(
+                graph_send_capability,
+                "definitely_not_sent",
+                evidence={"reason": reason, "phase": "preflight"},
+            )
         return False
     body_validation = validate_outbound_body(body)
     if not body_validation.is_safe:
@@ -4664,6 +10447,15 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             outcome="blocked_unsafe_body",
         )
         print(f"   🛑 Blocked unsafe auto-reply body: {body_validation.reason}")
+        if graph_send_capability is not None:
+            resolve_graph_send_permit(
+                graph_send_capability,
+                "definitely_not_sent",
+                evidence={
+                    "reason": body_validation.reason,
+                    "phase": "body_validation",
+                },
+            )
         return False
     if not _automatic_inbox_replies_allowed(user_id):
         _set_reply_send_outcome(
@@ -4674,7 +10466,14 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             outcome="blocked_auto_reply_policy",
         )
         print(f"   🛑 Blocked automatic inbox reply for non-allowlisted user {user_id}")
+        if graph_send_capability is not None:
+            resolve_graph_send_permit(
+                graph_send_capability,
+                "definitely_not_sent",
+                evidence={"reason": "user_not_allowlisted", "phase": "preflight"},
+            )
         return False
+    provider_mutation_phase = None
     try:
         from .utils import (
             GRAPH_SEND_MAX_RETRIES,
@@ -4710,16 +10509,23 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         if decision.denies_autonomous_work:
             _set_reply_campaign_suppression(decision)
             print(f"   🛑 {_get_reply_send_outcome().error}")
+            if graph_send_capability is not None:
+                resolve_graph_send_permit(
+                    graph_send_capability,
+                    "definitely_not_sent",
+                    evidence={"reason": decision.reason, "phase": "campaign_gate"},
+                )
             return False
 
         base = "https://graph.microsoft.com/v1.0"
+        graph_headers = graph_headers_with_immutable_id(headers)
         current_meta = {}
 
         try:
             current_meta_resp = exponential_backoff_request(
                 lambda: requests.get(
-                    f"{base}/me/messages/{current_msg_id}",
-                    headers=headers,
+                    f"{base}/me/messages/{_graph_message_path_segment(current_msg_id)}",
+                    headers=graph_headers,
                     params={
                         "$select": (
                             "conversationId,subject,from,sender,replyTo,"
@@ -4758,17 +10564,71 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             user_email=user_email,
         )
 
+        # Freeze and validate the complete attachment plan before the first
+        # provider mutation. Its size determines the retained permit history
+        # budget, and the same list is reused through PATCH, attachment POSTs,
+        # /send, and exact Sent reconciliation.
+        signature_attachments = []
+        if needs_signature_attachments(
+            signature_mode,
+            user_signature,
+            user_email=user_email,
+        ):
+            signature_attachments = get_signature_attachments(
+                user_signature,
+                signature_mode,
+                user_email=user_email,
+            )
+        planned_attachment_count = validate_graph_draft_attachment_plan(
+            signature_attachments
+        )
+
         # Track if reply was sent successfully
         reply_sent_successfully = False
         reply_sent_after = None
 
-        create_reply_resp = exponential_backoff_request(
-            lambda: requests.post(f"{base}/me/messages/{current_msg_id}/createReplyAll", headers=headers, timeout=30),
-            max_retries=GRAPH_SEND_MAX_RETRIES,
-        )
+        if graph_send_capability is not None:
+            create_timeout = begin_graph_draft_creation(
+                graph_send_capability,
+                current_msg_id,
+                planned_attachment_count=planned_attachment_count,
+            )
+            provider_mutation_phase = "create_reply"
+            try:
+                create_reply_resp = requests.post(
+                    f"{base}/me/messages/{_graph_message_path_segment(current_msg_id)}/createReplyAll",
+                    headers=graph_headers,
+                    timeout=create_timeout,
+                )
+            except Exception as exc:
+                _persist_exact_graph_completion(
+                    complete_graph_draft_creation,
+                    graph_send_capability,
+                    outcome="needs_reconciliation",
+                    evidence={"reason": str(exc)[:1500], "phase": "create_reply"},
+                )
+                return _mark_draft_mutation_needs_reconciliation(str(exc))
+        else:
+            provider_mutation_phase = "create_reply"
+            create_reply_resp = exponential_backoff_request(
+                lambda: requests.post(
+                    f"{base}/me/messages/{_graph_message_path_segment(current_msg_id)}/createReplyAll",
+                    headers=graph_headers,
+                    timeout=30,
+                ),
+                max_retries=GRAPH_SEND_MAX_RETRIES,
+            )
         if not create_reply_resp or create_reply_resp.status_code not in [200, 201]:
             failure_reason = f"createReplyAll failed: {create_reply_resp.status_code if create_reply_resp else 'no response'}"
             _set_reply_send_outcome(error=failure_reason, outcome="send_failed")
+            if graph_send_capability is not None:
+                _persist_exact_graph_completion(
+                    complete_graph_draft_creation,
+                    graph_send_capability,
+                    outcome="needs_reconciliation",
+                    evidence={"reason": failure_reason, "phase": "create_reply"},
+                )
+                return _mark_draft_mutation_needs_reconciliation(failure_reason)
             print(f"   ❌ {failure_reason}")
             return False
 
@@ -4779,11 +10639,36 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                 error="createReplyAll returned no draft id",
                 outcome="send_failed",
             )
+            if graph_send_capability is not None:
+                _persist_exact_graph_completion(
+                    complete_graph_draft_creation,
+                    graph_send_capability,
+                    outcome="needs_reconciliation",
+                    evidence={
+                        "reason": "createReplyAll returned no draft id",
+                        "phase": "create_reply",
+                    },
+                )
+                return _mark_draft_mutation_needs_reconciliation(
+                    "createReplyAll returned no draft id"
+                )
             print("   ❌ createReplyAll returned no draft id")
             return False
+        if graph_send_capability is not None:
+            _persist_exact_graph_completion(
+                complete_graph_draft_creation,
+                graph_send_capability,
+                draft_id=reply_draft_id,
+                outcome="created",
+                evidence={
+                    "httpStatus": getattr(create_reply_resp, "status_code", None),
+                    "phase": "create_reply",
+                    "draftId": reply_draft_id,
+                },
+            )
 
         reply_draft = _hydrate_reply_all_draft_recipients(
-            headers,
+            graph_headers,
             reply_draft,
             base=base,
         )
@@ -4795,6 +10680,29 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
             reply_draft,
             to_emails=[recipient],
         )
+        reply_subject = reply_draft.get("subject")
+        if not isinstance(reply_subject, str) or not reply_subject.strip():
+            failure_reason = (
+                "createReplyAll draft has no exact provider-inherited subject"
+            )
+            _set_reply_send_outcome(
+                error=failure_reason,
+                outcome="send_failed",
+            )
+            if graph_send_capability is not None:
+                return _retain_graph_reply_draft_for_review(
+                    graph_send_capability,
+                    reply_draft_id,
+                    reason=failure_reason,
+                    phase="draft_subject",
+                )
+            _delete_graph_reply_draft(
+                graph_headers,
+                reply_draft_id,
+                base=base,
+            )
+            return False
+        _set_reply_send_outcome(subject=reply_subject)
 
         recipient_result = _filter_reply_all_draft_recipients(
             user_id,
@@ -4810,60 +10718,262 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                     outcome="suppressed_recipient_optout",
                 )
                 print("   ⏭️ Reply suppressed because all safe recipients opted out")
-                _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+                if graph_send_capability is not None:
+                    return _retain_graph_reply_draft_for_review(
+                        graph_send_capability,
+                        reply_draft_id,
+                        reason="recipient_optout",
+                        phase="draft",
+                    )
+                _delete_graph_reply_draft(
+                    graph_headers, reply_draft_id, base=base
+                )
                 return False
             _set_reply_send_outcome(
                 error="No safe reply-all recipients remained after filtering",
                 outcome="send_failed",
             )
             print("   ❌ No safe reply-all recipients remained after filtering")
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            if graph_send_capability is not None:
+                return _retain_graph_reply_draft_for_review(
+                    graph_send_capability,
+                    reply_draft_id,
+                    reason="no_safe_recipients",
+                    phase="draft",
+                )
+            _delete_graph_reply_draft(graph_headers, reply_draft_id, base=base)
             return False
 
         patch_payload = {
+            "subject": reply_subject,
             "body": {"contentType": "HTML", "content": html_body},
             "toRecipients": recipient_payload["toRecipients"],
             "ccRecipients": recipient_payload["ccRecipients"],
         }
-        patch_resp = exponential_backoff_request(
-            lambda: requests.patch(
-                f"{base}/me/messages/{reply_draft_id}",
-                headers=headers,
-                json=patch_payload,
-                timeout=30
-            ),
-            max_retries=GRAPH_SEND_MAX_RETRIES,
-        )
+        prepared_graph_envelope = None
+        if graph_send_capability is not None:
+            prepared_graph_envelope = begin_graph_draft_patch(
+                graph_send_capability,
+                source_graph_message_id=current_msg_id,
+                draft_id=reply_draft_id,
+                subject=reply_subject,
+                html_body=html_body,
+                to_recipients=recipient_payload["toRecipients"],
+                cc_recipients=recipient_payload["ccRecipients"],
+                attachments=signature_attachments,
+            )
+            provider_mutation_phase = "patch_draft"
+            try:
+                patch_resp = requests.patch(
+                    f"{base}/me/messages/{_graph_message_path_segment(reply_draft_id)}",
+                    headers=graph_headers,
+                    json=patch_payload,
+                    timeout=prepared_graph_envelope["timeoutSeconds"],
+                )
+            except Exception as exc:
+                _persist_exact_graph_completion(
+                    complete_graph_draft_patch,
+                    graph_send_capability,
+                    prepared_envelope_hash=prepared_graph_envelope[
+                        "preparedEnvelopeHash"
+                    ],
+                    outcome="needs_reconciliation",
+                    evidence={"reason": str(exc)[:1500], "phase": "patch_draft"},
+                )
+                return _mark_draft_mutation_needs_reconciliation(str(exc))
+        else:
+            provider_mutation_phase = "patch_draft"
+            patch_resp = exponential_backoff_request(
+                lambda: requests.patch(
+                    f"{base}/me/messages/{_graph_message_path_segment(reply_draft_id)}",
+                    headers=graph_headers,
+                    json=patch_payload,
+                    timeout=30
+                ),
+                max_retries=GRAPH_SEND_MAX_RETRIES,
+            )
         if not patch_resp or patch_resp.status_code not in [200, 202, 204]:
             failure_reason = f"Reply-all draft patch failed: {patch_resp.status_code if patch_resp else 'no response'}"
             _set_reply_send_outcome(error=failure_reason, outcome="send_failed")
+            if graph_send_capability is not None:
+                _persist_exact_graph_completion(
+                    complete_graph_draft_patch,
+                    graph_send_capability,
+                    prepared_envelope_hash=prepared_graph_envelope[
+                        "preparedEnvelopeHash"
+                    ],
+                    outcome="needs_reconciliation",
+                    evidence={"reason": failure_reason, "phase": "patch_draft"},
+                )
+                return _mark_draft_mutation_needs_reconciliation(failure_reason)
             print(f"   ❌ {failure_reason}")
             return False
+        if graph_send_capability is not None:
+            _persist_exact_graph_completion(
+                complete_graph_draft_patch,
+                graph_send_capability,
+                prepared_envelope_hash=prepared_graph_envelope[
+                    "preparedEnvelopeHash"
+                ],
+                outcome="applied",
+                evidence={
+                    "httpStatus": getattr(patch_resp, "status_code", None),
+                    "phase": "patch_draft",
+                    "draftId": reply_draft_id,
+                    "preparedEnvelopeHash": prepared_graph_envelope[
+                        "preparedEnvelopeHash"
+                    ],
+                },
+            )
 
-        signature_attachments = []
-        if needs_signature_attachments(signature_mode, user_signature, user_email=user_email):
-            signature_attachments = get_signature_attachments(user_signature, signature_mode, user_email=user_email)
-
-        for attachment in signature_attachments:
+        for attachment_index, attachment in enumerate(signature_attachments):
             try:
-                att_resp = exponential_backoff_request(
-                    lambda att=attachment: requests.post(
-                        f"{base}/me/messages/{reply_draft_id}/attachments",
-                        headers=headers,
-                        json=att,
-                        timeout=30
-                    ),
-                    max_retries=GRAPH_SEND_MAX_RETRIES,
-                )
+                if graph_send_capability is not None:
+                    attachment_operation = begin_graph_draft_attachment(
+                        graph_send_capability,
+                        prepared_envelope_hash=prepared_graph_envelope[
+                            "preparedEnvelopeHash"
+                        ],
+                        attachment_index=attachment_index,
+                        attachment=attachment,
+                    )
+                    provider_mutation_phase = "attach_draft"
+                    att_resp = requests.post(
+                        f"{base}/me/messages/{_graph_message_path_segment(reply_draft_id)}/attachments",
+                        headers=graph_headers,
+                        json=attachment,
+                        timeout=attachment_operation["timeoutSeconds"],
+                    )
+                else:
+                    provider_mutation_phase = "attach_draft"
+                    att_resp = exponential_backoff_request(
+                        lambda att=attachment: requests.post(
+                            f"{base}/me/messages/{_graph_message_path_segment(reply_draft_id)}/attachments",
+                            headers=graph_headers,
+                            json=att,
+                            timeout=30
+                        ),
+                        max_retries=GRAPH_SEND_MAX_RETRIES,
+                    )
                 if att_resp.status_code in [200, 201]:
+                    if graph_send_capability is not None:
+                        attachment_response = att_resp.json() or {}
+                        provider_attachment_id = str(
+                            attachment_response.get("id") or ""
+                        ).strip()
+                        if not provider_attachment_id:
+                            failure_reason = (
+                                "Reply-all attachment success returned no "
+                                "provider attachment id"
+                            )
+                            _persist_exact_graph_completion(
+                                complete_graph_draft_attachment,
+                                graph_send_capability,
+                                prepared_envelope_hash=prepared_graph_envelope[
+                                    "preparedEnvelopeHash"
+                                ],
+                                attachment_index=attachment_index,
+                                outcome="needs_reconciliation",
+                                evidence={
+                                    "reason": failure_reason,
+                                    "phase": "attach_draft",
+                                },
+                            )
+                            return _mark_draft_mutation_needs_reconciliation(
+                                failure_reason
+                            )
+                        _persist_exact_graph_completion(
+                            complete_graph_draft_attachment,
+                            graph_send_capability,
+                            prepared_envelope_hash=prepared_graph_envelope[
+                                "preparedEnvelopeHash"
+                            ],
+                            attachment_index=attachment_index,
+                            outcome="applied",
+                            evidence={
+                                "httpStatus": att_resp.status_code,
+                                "phase": "attach_draft",
+                                "draftId": attachment_operation["draftId"],
+                                "attachmentIndex": attachment_operation[
+                                    "attachmentIndex"
+                                ],
+                                "attachmentHash": attachment_operation[
+                                    "attachmentHash"
+                                ],
+                                "providerAttachmentId": provider_attachment_id,
+                            },
+                        )
                     print(f"   📎 Attached {attachment['name']}")
+                elif graph_send_capability is not None:
+                    failure_reason = (
+                        "Reply-all attachment failed: "
+                        f"{getattr(att_resp, 'status_code', None)}"
+                    )
+                    _persist_exact_graph_completion(
+                        complete_graph_draft_attachment,
+                        graph_send_capability,
+                        prepared_envelope_hash=prepared_graph_envelope[
+                            "preparedEnvelopeHash"
+                        ],
+                        attachment_index=attachment_index,
+                        outcome="needs_reconciliation",
+                        evidence={
+                            "reason": failure_reason,
+                            "phase": "attach_draft",
+                        },
+                    )
+                    return _mark_draft_mutation_needs_reconciliation(
+                        failure_reason
+                    )
+            except GraphSendPermitLocalRetryable:
+                # The attachment request has not started when begin_* reports
+                # an exact local commit failure.  Preserve that distinction
+                # for the outer permit resolver instead of recording an
+                # unknown provider mutation.
+                raise
             except Exception as e:
+                if graph_send_capability is not None:
+                    try:
+                        _persist_exact_graph_completion(
+                            complete_graph_draft_attachment,
+                            graph_send_capability,
+                            prepared_envelope_hash=prepared_graph_envelope[
+                                "preparedEnvelopeHash"
+                            ],
+                            attachment_index=attachment_index,
+                            outcome="needs_reconciliation",
+                            evidence={
+                                "reason": str(e)[:1500],
+                                "phase": "attach_draft",
+                            },
+                        )
+                    except Exception:
+                        # Propagate to the outer exact-permit resolver.  Returning
+                        # here could strand an issued parent after begin_* failed.
+                        raise
+                    return _mark_draft_mutation_needs_reconciliation(str(e))
                 print(f"   ⚠️ Error attaching {attachment['name']}: {e}")
+
+        if graph_send_capability is not None:
+            finalize_graph_draft_preparation(
+                graph_send_capability,
+                prepared_envelope_hash=prepared_graph_envelope[
+                    "preparedEnvelopeHash"
+                ],
+            )
 
         decision = get_client_automation_decision(user_id, client_id)
         if decision.denies_autonomous_work:
             _set_reply_campaign_suppression(decision)
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            if graph_send_capability is not None:
+                print(f"   🛑 {_get_reply_send_outcome().error}")
+                return _retain_graph_reply_draft_for_review(
+                    graph_send_capability,
+                    reply_draft_id,
+                    reason=decision.reason,
+                    phase="final_campaign_gate",
+                )
+            _delete_graph_reply_draft(graph_headers, reply_draft_id, base=base)
             print(f"   🛑 {_get_reply_send_outcome().error}")
             return False
 
@@ -4881,16 +10991,71 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
                 outbound_mode,
                 context=f"send_reply_in_thread thread {thread_id} at Graph send",
             )
-            _delete_graph_reply_draft(headers, reply_draft_id, base=base)
+            if graph_send_capability is not None:
+                return _retain_graph_reply_draft_for_review(
+                    graph_send_capability,
+                    reply_draft_id,
+                    reason=reason,
+                    phase="final_kill_switch",
+                )
+            _delete_graph_reply_draft(graph_headers, reply_draft_id, base=base)
             return False
 
         reply_sent_after = datetime.now(timezone.utc) - timedelta(seconds=3)
         _set_reply_send_outcome(send_attempt_at=reply_sent_after)
-        resp = exponential_backoff_request(
-            lambda: requests.post(f"{base}/me/messages/{reply_draft_id}/send", headers=headers, timeout=30),
-            max_retries=1,
-            operation="graph_send",
-        )
+        if graph_send_capability is not None:
+            send_timeout = consume_graph_send_capability(
+                graph_send_capability,
+                source_graph_message_id=current_msg_id,
+                draft_id=reply_draft_id,
+                subject=reply_subject,
+                html_body=html_body,
+                to_recipients=recipient_payload["toRecipients"],
+                cc_recipients=recipient_payload["ccRecipients"],
+                attachments=signature_attachments,
+            )
+            provider_mutation_phase = "send"
+            try:
+                resp = requests.post(
+                    f"{base}/me/messages/{_graph_message_path_segment(reply_draft_id)}/send",
+                    headers=graph_headers,
+                    timeout=send_timeout,
+                )
+            except Exception as exc:
+                resolve_graph_send_permit(
+                    graph_send_capability,
+                    "needs_reconciliation",
+                    evidence={"reason": str(exc)[:1500], "phase": "send"},
+                )
+                _set_reply_send_outcome(
+                    error=str(exc),
+                    outcome="graph_permit_needs_reconciliation",
+                    sent_but_unindexed=True,
+                )
+                raise
+            permit_status = (
+                "accepted"
+                if resp and resp.status_code in [200, 202]
+                else "needs_reconciliation"
+            )
+            resolve_graph_send_permit(
+                graph_send_capability,
+                permit_status,
+                evidence={
+                    "httpStatus": getattr(resp, "status_code", None),
+                    "phase": "send",
+                },
+            )
+        else:
+            resp = exponential_backoff_request(
+                lambda: requests.post(
+                    f"{base}/me/messages/{_graph_message_path_segment(reply_draft_id)}/send",
+                    headers=graph_headers,
+                    timeout=30,
+                ),
+                max_retries=1,
+                operation="graph_send",
+            )
         reply_sent_successfully = resp and resp.status_code in [200, 202]
         if reply_sent_successfully:
             print(f"   ✅ Sent reply via createReplyAll draft")
@@ -4898,115 +11063,274 @@ def send_reply_in_thread(user_id: str, headers: dict, body: str, current_msg_id:
         if not reply_sent_successfully:
             failure_reason = f"Reply-all draft send failed: {resp.status_code if resp else 'no response'}"
             _set_reply_send_outcome(error=failure_reason, outcome="send_failed")
+            if graph_send_capability is not None:
+                _set_reply_send_outcome(
+                    error=failure_reason,
+                    outcome="graph_permit_needs_reconciliation",
+                    sent_but_unindexed=True,
+                )
             print(f"   ❌ {failure_reason}")
             return False
 
-        # Reply was sent successfully - now index it
-        # CRITICAL: Index the sent message so future replies can find the thread
-        # Graph draft sends do not return the sent message ID, so fetch it from SentItems.
+        # Reply was accepted.  The immutable draft ID names the same provider
+        # object after Graph moves it to Sent Items, so only that exact object
+        # may be indexed or used as successful-send evidence.
         try:
-            # Wait a moment for the message to appear in SentItems
             time.sleep(1)
-
-            # Fetch the most recent message from SentItems for this conversation
-            # Get conversationId from the current message
-            current_msg_resp = exponential_backoff_request(
-                lambda: requests.get(
-                    f"{base}/me/messages/{current_msg_id}",
-                    headers=headers,
-                    params={"$select": "conversationId"},
-                    timeout=30
-                )
+            expected_conversation_id = current_meta.get("conversationId")
+            sent_msg = find_exact_sent_message_by_immutable_id(
+                graph_headers,
+                reply_draft_id,
+                recipient=recipient,
+                to_recipients=recipient_payload["toRecipients"],
+                cc_recipients=recipient_payload["ccRecipients"],
+                require_no_bcc=True,
+                require_attachment_proof=True,
+                canonical_body_hash=(prepared_graph_envelope or {}).get(
+                    "htmlBodyHash"
+                ),
+                subject=(
+                    (prepared_graph_envelope or {}).get("subject")
+                    or reply_subject
+                ),
+                conversation_id=expected_conversation_id,
+                base=base,
+                attempts=4,
             )
-            conversation_id = current_msg_resp.json().get("conversationId") if current_msg_resp.status_code == 200 else None
+            if not sent_msg:
+                return _mark_reply_accepted_unconfirmed(
+                    "Exact immutable Sent message is not yet readable; "
+                    "provider acceptance remains reconciliation-only"
+                )
+            exact_sent_evidence = {
+                **dict(sent_msg),
+                "sentMessageId": sent_msg.get("id"),
+                "recipient": str(recipient or "").strip().lower(),
+                "bodyHash": hashlib.sha256(
+                    str(body or "").encode("utf-8")
+                ).hexdigest(),
+                "conversationId": sent_msg.get("conversationId"),
+                "permitId": (
+                    graph_send_capability.permit_id
+                    if graph_send_capability is not None
+                    else None
+                ),
+                "sourceGraphMessageId": current_msg_id,
+                "preparedEnvelopeHash": (
+                    (prepared_graph_envelope or {}).get(
+                        "preparedEnvelopeHash"
+                    )
+                ),
+            }
+            _set_reply_send_outcome(
+                exact_sent_evidence=exact_sent_evidence,
+            )
+            conversation_id = (
+                sent_msg.get("conversationId") or expected_conversation_id
+            )
             if conversation_id:
                 _set_reply_send_outcome(conversation_id=conversation_id)
-
-            if conversation_id:
-                sent_msg = _find_recent_sent_message_for_conversation(
-                    headers,
-                    base,
-                    conversation_id,
-                    reply_sent_after or (datetime.now(timezone.utc) - timedelta(minutes=5)),
-                )
-
-                if sent_msg:
-                    sent_internet_msg_id = sent_msg.get("internetMessageId")
-
-                    if sent_internet_msg_id:
-                        # Index this sent message with retry logic
-                        normalized_id = normalize_message_id(sent_internet_msg_id)
-
-                        # Retry indexing up to 3 times
-                        MAX_RETRIES = 3
-                        msg_indexed = False
-                        for attempt in range(MAX_RETRIES):
-                            if index_message_id(user_id, sent_internet_msg_id, thread_id):
-                                # Verify the index was written
-                                time.sleep(0.2)
-                                if lookup_thread_by_message_id(user_id, sent_internet_msg_id) == thread_id:
-                                    msg_indexed = True
-                                    break
-                            print(f"   ⚠️ Reply index attempt {attempt + 1}/{MAX_RETRIES} failed, retrying...")
-                            time.sleep(0.5 * (attempt + 1))
-
-                        if not msg_indexed:
-                            error_msg = f"Failed to index reply after {MAX_RETRIES} attempts"
-                            print(f"   ⚠️ CRITICAL: {error_msg} - future replies may be orphaned")
-                            return _mark_reply_sent_but_unindexed(error_msg)
-
-                        # Also save the message record
-                        to_recipients = [r.get("emailAddress", {}).get("address", "") for r in sent_msg.get("toRecipients", [])]
-                        cc_recipients = [r.get("emailAddress", {}).get("address", "") for r in sent_msg.get("ccRecipients", [])]
-                        body_obj = sent_msg.get("body", {}) or {}
-                        body_content = body_obj.get("content", "")
-
-                        message_record = {
-                            "direction": "outbound",
-                            "subject": sent_msg.get("subject", ""),
-                            "from": "me",
-                            "to": to_recipients,
-                            "cc": cc_recipients,
-                            "sentDateTime": sent_msg.get("sentDateTime"),
-                            "receivedDateTime": None,
-                            "headers": {
-                                "internetMessageId": sent_internet_msg_id,
-                                "inReplyTo": None,  # Would need to extract from headers
-                                "references": []
-                            },
-                            "body": {
-                                "contentType": body_obj.get("contentType", "HTML"),
-                                "content": body_content,
-                                "preview": sent_msg.get("bodyPreview", "")[:200] or safe_preview(body_content)
-                            }
-                        }
-                        save_message(user_id, thread_id, normalized_id, message_record)
-
-                        # Index conversation ID with retry
-                        if conversation_id:
-                            for attempt in range(MAX_RETRIES):
-                                if index_conversation_id(user_id, conversation_id, thread_id):
-                                    break
-                                time.sleep(0.5 * (attempt + 1))
-
-                        print(f"   📝 Indexed sent reply message: {sent_internet_msg_id[:50]}...")
-                    else:
-                        return _mark_reply_sent_but_unindexed("Sent message has no internetMessageId, cannot index")
-                else:
-                    return _mark_reply_sent_but_unindexed("Could not find new sent message in SentItems to index")
             else:
                 return _mark_reply_sent_but_unindexed("Could not get conversationId to index sent message")
+
+            sent_internet_msg_id = sent_msg.get("internetMessageId")
+            if not sent_internet_msg_id:
+                return _mark_reply_sent_but_unindexed(
+                    "Exact Sent message has no internetMessageId, cannot index"
+                )
+            normalized_id = normalize_message_id(sent_internet_msg_id)
+            max_index_retries = 3
+            msg_indexed = False
+            for attempt in range(max_index_retries):
+                if index_message_id(user_id, sent_internet_msg_id, thread_id):
+                    time.sleep(0.2)
+                    if (
+                        lookup_thread_by_message_id(
+                            user_id, sent_internet_msg_id
+                        )
+                        == thread_id
+                    ):
+                        msg_indexed = True
+                        break
+                print(
+                    "   ⚠️ Reply index attempt "
+                    f"{attempt + 1}/{max_index_retries} failed, retrying..."
+                )
+                time.sleep(0.5 * (attempt + 1))
+            if not msg_indexed:
+                error_msg = (
+                    f"Failed to index reply after {max_index_retries} attempts"
+                )
+                print(
+                    f"   ⚠️ CRITICAL: {error_msg} - future replies may be orphaned"
+                )
+                return _mark_reply_sent_but_unindexed(error_msg)
+
+            to_recipients = [
+                item.get("emailAddress", {}).get("address", "")
+                for item in sent_msg.get("toRecipients", [])
+            ]
+            cc_recipients = [
+                item.get("emailAddress", {}).get("address", "")
+                for item in sent_msg.get("ccRecipients", [])
+            ]
+            body_obj = sent_msg.get("body", {}) or {}
+            body_content = body_obj.get("content", "")
+            message_record = {
+                "direction": "outbound",
+                "subject": sent_msg.get("subject", ""),
+                "from": "me",
+                "to": to_recipients,
+                "cc": cc_recipients,
+                "sentDateTime": sent_msg.get("sentDateTime"),
+                "receivedDateTime": None,
+                "headers": {
+                    "internetMessageId": sent_internet_msg_id,
+                    "inReplyTo": None,
+                    "references": [],
+                },
+                "body": {
+                    "contentType": body_obj.get("contentType", "HTML"),
+                    "content": body_content,
+                    "preview": (
+                        sent_msg.get("bodyPreview", "")[:200]
+                        or safe_preview(body_content)
+                    ),
+                },
+            }
+            save_message(user_id, thread_id, normalized_id, message_record)
+            for attempt in range(max_index_retries):
+                if index_conversation_id(user_id, conversation_id, thread_id):
+                    break
+                time.sleep(0.5 * (attempt + 1))
+            print(
+                "   📝 Indexed exact immutable sent reply message: "
+                f"{sent_internet_msg_id[:50]}..."
+            )
         except Exception as e:
-            return _mark_reply_sent_but_unindexed(f"Failed to index sent reply: {e}")
+            if _get_reply_send_outcome().exact_sent_evidence:
+                return _mark_reply_sent_but_unindexed(
+                    f"Failed to index exact sent reply: {e}"
+                )
+            return _mark_reply_accepted_unconfirmed(
+                f"Exact immutable Sent confirmation failed closed: {e}"
+            )
 
         _set_reply_send_outcome(outcome="sent_indexed")
         return True
 
+    except GraphSendPermitLocalRetryable as e:
+        if graph_send_capability is None:
+            raise
+        retained_permit = read_permit(graph_send_capability)
+        preparation = dict(retained_permit.get("draftPreparation") or {})
+        preparation_state = preparation.get("state")
+        failure_reason = str(e)[:1500]
+        if preparation_state is None:
+            _persist_exact_graph_completion(
+                resolve_graph_send_permit,
+                graph_send_capability,
+                "definitely_not_sent",
+                evidence={
+                    "reason": failure_reason,
+                    "phase": "local_transition_commit",
+                },
+            )
+            _set_reply_send_outcome(
+                error=failure_reason,
+                sent_but_unindexed=False,
+                outcome="local_transition_definitely_not_started",
+            )
+            print(f"   ❌ Failed before any Graph provider mutation: {e}")
+            return False
+        if preparation_state in {
+            "draft_created",
+            "patch_applied",
+            "attachment_applied",
+            "prepared",
+        }:
+            evidence = {
+                "reason": failure_reason,
+                "phase": "local_transition_commit",
+                "draftId": preparation.get("draftId"),
+                "providerSendStarted": False,
+                "automaticDeleteAttempted": False,
+            }
+            _persist_exact_graph_completion(
+                resolve_graph_send_permit,
+                graph_send_capability,
+                "needs_reconciliation",
+                evidence=evidence,
+            )
+            return _mark_draft_mutation_needs_reconciliation(
+                evidence["reason"]
+            )
+        raise
     except Exception as e:
+        send_request_may_have_started = provider_mutation_phase == "send"
+        draft_mutation_may_have_started = provider_mutation_phase in {
+            "create_reply",
+            "patch_draft",
+            "attach_draft",
+        }
+        if graph_send_capability is not None and not send_request_may_have_started:
+            retained_permit = read_permit(graph_send_capability)
+            preparation = dict(retained_permit.get("draftPreparation") or {})
+            if (
+                retained_permit.get("requestStartedAt") is None
+                and preparation.get("state") in {
+                    "draft_created",
+                    "patch_applied",
+                    "attachment_applied",
+                    "prepared",
+                }
+            ):
+                failure_reason = str(e)[:1500]
+                evidence = {
+                    "reason": failure_reason,
+                    "phase": "pre_send_permit",
+                    "draftId": preparation.get("draftId"),
+                    "providerSendStarted": False,
+                    "automaticDeleteAttempted": False,
+                }
+                _persist_exact_graph_completion(
+                    resolve_graph_send_permit,
+                    graph_send_capability,
+                    "needs_reconciliation",
+                    evidence=evidence,
+                )
+                return _mark_draft_mutation_needs_reconciliation(
+                    failure_reason
+                )
+        if graph_send_capability is not None:
+            try:
+                resolve_graph_send_permit(
+                    graph_send_capability,
+                    (
+                        "needs_reconciliation"
+                        if send_request_may_have_started
+                        or draft_mutation_may_have_started
+                        else "definitely_not_sent"
+                    ),
+                    evidence={
+                        "reason": str(e)[:1500],
+                        "phase": provider_mutation_phase or "preflight_exception",
+                    },
+                )
+            except Exception:
+                pass
         _set_reply_send_outcome(
             error=str(e),
-            sent_but_unindexed=False,
-            outcome="send_failed",
+            sent_but_unindexed=bool(
+                graph_send_capability and send_request_may_have_started
+            ),
+            outcome=(
+                "graph_permit_needs_reconciliation"
+                if graph_send_capability and send_request_may_have_started
+                else "draft_mutation_needs_reconciliation"
+                if graph_send_capability and draft_mutation_may_have_started
+                else "send_failed"
+            ),
         )
         print(f"   ❌ Failed to send reply: {e}")
         return False
@@ -5019,7 +11343,7 @@ def _find_client_id_by_email(uid: str, email: str) -> Optional[str]:
     """
     if not email:
         return None
-    
+
     email_lower = email.lower().strip()
     
     try:
@@ -5253,6 +11577,111 @@ def _validate_operator_replay_claims(
             )
 
 
+def _persist_inbound_message_history(
+    user_id: str,
+    thread_id: str,
+    graph_message_id: str,
+    internet_message_id: str,
+    message_record: Dict[str, Any],
+    thread_ref,
+    source_envelope: Dict[str, Any],
+    *,
+    strict: bool,
+) -> None:
+    """Persist the exact inbound history/index/envelope without downstream effects."""
+    max_retries = 3
+    durable_message_id = internet_message_id or graph_message_id
+    message_saved = False
+    if durable_message_id:
+        for attempt_number in range(max_retries):
+            try:
+                message_saved = bool(
+                    save_message(
+                        user_id,
+                        thread_id,
+                        durable_message_id,
+                        message_record,
+                    )
+                )
+            except Exception as exc:
+                message_saved = False
+                print(f"⚠️ Inbound message save raised: {exc}")
+            if message_saved:
+                break
+            print(
+                "⚠️ Inbound message save attempt "
+                f"{attempt_number + 1}/{max_retries} failed, retrying..."
+            )
+            time.sleep(0.5 * (attempt_number + 1))
+    if strict and not message_saved:
+        raise RetryableProcessingError(
+            "different-source inbound history save could not be verified"
+        )
+
+    if internet_message_id:
+        message_indexed = False
+        for attempt_number in range(max_retries):
+            try:
+                if index_message_id(
+                    user_id,
+                    internet_message_id,
+                    thread_id,
+                ):
+                    time.sleep(0.2)
+                    message_indexed = (
+                        lookup_thread_by_message_id(
+                            user_id,
+                            internet_message_id,
+                        )
+                        == thread_id
+                    )
+                    if message_indexed:
+                        break
+            except Exception as exc:
+                print(f"⚠️ Inbound message index verification raised: {exc}")
+            print(
+                "⚠️ Inbound message index attempt "
+                f"{attempt_number + 1}/{max_retries} failed, retrying..."
+            )
+            time.sleep(0.5 * (attempt_number + 1))
+        if not message_indexed:
+            print(
+                f"⚠️ Failed to index inbound message after {max_retries} attempts"
+            )
+            if strict:
+                raise RetryableProcessingError(
+                    "different-source inbound message index could not be verified"
+                )
+
+    try:
+        update_payload = {"updatedAt": SERVER_TIMESTAMP}
+        if source_envelope:
+            update_payload["lastInboundEnvelope"] = source_envelope
+        thread_ref.set(update_payload, merge=True)
+        if strict:
+            verification_snapshot = thread_ref.get()
+            verification_data = (
+                verification_snapshot.to_dict()
+                if verification_snapshot.exists
+                else {}
+            )
+            if "updatedAt" not in verification_data or (
+                source_envelope
+                and verification_data.get("lastInboundEnvelope") != source_envelope
+            ):
+                raise RetryableProcessingError(
+                    "different-source inbound timestamp/envelope could not be verified"
+                )
+    except Exception as exc:
+        if strict:
+            if isinstance(exc, RetryableProcessingError):
+                raise
+            raise RetryableProcessingError(
+                f"different-source inbound timestamp/envelope persistence failed: {exc}"
+            ) from exc
+        print(f"⚠️ Failed to update thread timestamp: {exc}")
+
+
 def process_inbox_message(
     user_id: str,
     headers: Dict[str, str],
@@ -5293,7 +11722,8 @@ def process_inbox_message(
     try:
         full_msg = exponential_backoff_request(
             lambda: requests.get(
-                f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}",
+                "https://graph.microsoft.com/v1.0/me/messages/"
+                f"{_graph_message_path_segment(msg_id)}",
                 headers=headers,
                 params={"$select": "body,hasAttachments,sender,replyTo,ccRecipients"},
                 timeout=30
@@ -5325,7 +11755,8 @@ def process_inbox_message(
         try:
             response = exponential_backoff_request(
                 lambda: requests.get(
-                    f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}",
+                    "https://graph.microsoft.com/v1.0/me/messages/"
+                    f"{_graph_message_path_segment(msg_id)}",
                     headers=headers,
                     params={"$select": "internetMessageHeaders"},
                     timeout=30
@@ -5450,17 +11881,119 @@ def process_inbox_message(
         print(f"   Subject: {subject}")
         print(f"   ConversationId: {conversation_id} (not in our index)")
         return
-    
+
     print(f"🎯 Matched via {matched_header} -> thread {thread_id}")
 
     thread_ref = _fs.collection("users").document(user_id).collection("threads").document(thread_id)
     thread_data = {}
     try:
         thread_doc = thread_ref.get()
-        if thread_doc.exists:
-            thread_data = thread_doc.to_dict() or {}
+        if thread_doc.exists is not True:
+            raise RetryableProcessingError(
+                "matched authoritative thread root is missing"
+            )
+        thread_data = thread_doc.to_dict() or {}
     except Exception as e:
-        print(f"⚠️ Could not fetch thread status data: {e}")
+        if isinstance(e, RetryableProcessingError):
+            raise
+        raise RetryableProcessingError(
+            f"authoritative terminal thread read failed: {e}"
+        ) from e
+
+    exact_terminal_saga = _terminal_saga_for_source(
+        thread_data,
+        msg_id,
+        internet_message_id,
+    )
+    if exact_terminal_saga:
+        print(
+            "🔁 Resuming exact immutable terminal saga before the generic inbox pipeline"
+        )
+        return _resume_exact_terminal_saga(
+            user_id,
+            headers,
+            thread_id,
+            thread_data,
+            exact_terminal_saga,
+        )
+
+    exact_terminal_settlement = _terminal_settlement_for_source(
+        thread_data,
+        msg_id,
+        internet_message_id,
+    )
+    if exact_terminal_settlement:
+        _replay_terminal_completion_obligation(
+            user_id,
+            thread_data,
+            exact_terminal_settlement,
+            msg_id,
+            internet_message_id,
+        )
+        print(
+            "✅ Exact terminal source already has an immutable settlement; "
+            "skipping replacement and generic processing"
+        )
+        return
+
+    retained_terminal_settlements = _validate_terminal_settlement_history(
+        (thread_data or {}).get("terminalSettlements")
+    )
+    if len(retained_terminal_settlements) >= TERMINAL_SETTLEMENT_HISTORY_LIMIT:
+        # This source is not one of the eight exact retained generations.  Stop
+        # before history writes, follow-up mutation, attachment reads, Sheets,
+        # model/proposal work, notifications, or any Graph send.
+        raise RetryableProcessingError(
+            "terminal settlement retention limit reached before generic source "
+            "admission; operator review is required"
+        )
+
+    pending_terminal_other_source = _has_pending_terminal_saga(thread_data)
+    if pending_terminal_other_source:
+        print(
+            "⏸️ A different exact source owns the pending terminal saga; "
+            "saving this message for history only and leaving it retryable"
+        )
+
+    message_record = {
+        "direction": "inbound",
+        "subject": subject,
+        "from": from_addr,
+        "sender": sender_addr,
+        "to": to_recipients,
+        "cc": cc_recipients,
+        "replyTo": reply_to_recipients,
+        "sentDateTime": sent_dt,
+        "receivedDateTime": received_dt,
+        "headers": {
+            "internetMessageId": internet_message_id,
+            "inReplyTo": in_reply_to,
+            "references": references,
+        },
+        "body": {
+            "contentType": "Text",
+            "content": _full_text,
+            "preview": safe_preview(_full_text),
+        },
+        "hasAttachments": has_attachments,
+        "sourceMessage": source_envelope,
+    }
+
+    if pending_terminal_other_source:
+        _persist_inbound_message_history(
+            user_id,
+            thread_id,
+            msg_id,
+            internet_message_id,
+            message_record,
+            thread_ref,
+            source_envelope,
+            strict=True,
+        )
+        raise RetryableProcessingError(
+            "terminal saga transition is pending for a different source message; "
+            "history was saved but downstream processing remains blocked"
+        )
 
     thread_status = thread_data.get("status") or get_thread_status(user_id, thread_id)
     client_id_for_gate = thread_data.get("clientId")
@@ -5510,7 +12043,11 @@ def process_inbox_message(
     # Outlook (out-of-band Sent-Items continuation) instead of using the dashboard,
     # clear the stale open action_needed notification and resume the thread so
     # processing continues normally rather than staying paused forever.
-    if thread_status == THREAD_STATUS["paused"] and not client_denied:
+    if (
+        thread_status == THREAD_STATUS["paused"]
+        and not client_denied
+        and not pending_terminal_other_source
+    ):
         if _resume_paused_thread_after_manual_continuation(
             user_id, headers, thread_id, thread_data, msg
         ):
@@ -5523,7 +12060,12 @@ def process_inbox_message(
         message_text=_text_for_ai,
         has_attachments=has_attachments,
     )
-    if late_reply_patch and not client_denied:
+    if (
+        late_reply_patch
+        and not client_denied
+        and not exact_terminal_saga
+        and not pending_terminal_other_source
+    ):
         thread_ref.set(late_reply_patch, merge=True)
         thread_data.update(late_reply_patch)
         thread_status = THREAD_STATUS["active"]
@@ -5535,7 +12077,13 @@ def process_inbox_message(
     # Terminal threads keep late replies for history but must not generate new AI work or auto-replies,
     # except when the user approved a same-contact replacement property in this email thread.
     replacement_context = _active_replacement_context(thread_data, _full_text)
-    if replacement_context and thread_status == THREAD_STATUS["stopped"] and not client_denied:
+    if (
+        replacement_context
+        and thread_status == THREAD_STATUS["stopped"]
+        and not client_denied
+        and not exact_terminal_saga
+        and not pending_terminal_other_source
+    ):
         replacement_subject = replacement_context["address"]
         if replacement_context.get("city"):
             replacement_subject = f"{replacement_subject}, {replacement_context['city']}"
@@ -5557,11 +12105,24 @@ def process_inbox_message(
             f"{replacement_subject} row {replacement_context['rowNumber']}"
         )
 
-    if client_denied or _should_skip_processing_for_terminal_thread(thread_status, thread_data, _full_text):
+    terminal_thread_skip = _should_skip_processing_for_terminal_thread(
+        thread_status,
+        thread_data,
+        _full_text,
+    )
+    if (
+        client_denied
+        or pending_terminal_other_source
+        or (terminal_thread_skip and not exact_terminal_saga)
+    ):
         reason_label = (
             f"campaign automation is {campaign_suppression_kind}"
             if client_denied
-            else f"thread is {thread_status}"
+            else (
+                "another source owns a pending terminal saga"
+                if pending_terminal_other_source
+                else f"thread is {thread_status}"
+            )
         )
         print(
             f"⏹️ {reason_label} for {thread_id[:20]}... - "
@@ -5573,68 +12134,16 @@ def process_inbox_message(
     else:
         skip_processing_for_terminal = False
 
-    # Create message record
-    message_record = {
-        "direction": "inbound",
-        "subject": subject,
-        "from": from_addr,
-        "sender": sender_addr,
-        "to": to_recipients,
-        "cc": cc_recipients,
-        "replyTo": reply_to_recipients,
-        "sentDateTime": sent_dt,
-        "receivedDateTime": received_dt,
-        "headers": {
-            "internetMessageId": internet_message_id,
-            "inReplyTo": in_reply_to,
-            "references": references
-        },
-        "body": {
-            "contentType": "Text",
-            "content": _full_text,
-            "preview": safe_preview(_full_text)
-        },
-        "hasAttachments": has_attachments,
-        "sourceMessage": source_envelope,
-    }
-    
-    # Save to Firestore with retry logic for reliability
-    import time
-    MAX_RETRIES = 3
-
-    if internet_message_id:
-        # Save message with retry
-        for attempt in range(MAX_RETRIES):
-            if save_message(user_id, thread_id, internet_message_id, message_record):
-                break
-            print(f"⚠️ Inbound message save attempt {attempt + 1}/{MAX_RETRIES} failed, retrying...")
-            time.sleep(0.5 * (attempt + 1))
-
-        # Index with retry and verification
-        msg_indexed = False
-        for attempt in range(MAX_RETRIES):
-            if index_message_id(user_id, internet_message_id, thread_id):
-                time.sleep(0.2)
-                if lookup_thread_by_message_id(user_id, internet_message_id) == thread_id:
-                    msg_indexed = True
-                    break
-            print(f"⚠️ Inbound message index attempt {attempt + 1}/{MAX_RETRIES} failed, retrying...")
-            time.sleep(0.5 * (attempt + 1))
-
-        if not msg_indexed:
-            print(f"⚠️ Failed to index inbound message after {MAX_RETRIES} attempts")
-    else:
-        # Use Graph message ID as fallback
-        save_message(user_id, thread_id, msg_id, message_record)
-    
-    # Update thread timestamp
-    try:
-        update_payload = {"updatedAt": SERVER_TIMESTAMP}
-        if source_envelope:
-            update_payload["lastInboundEnvelope"] = source_envelope
-        thread_ref.set(update_payload, merge=True)
-    except Exception as e:
-        print(f"⚠️ Failed to update thread timestamp: {e}")
+    _persist_inbound_message_history(
+        user_id,
+        thread_id,
+        msg_id,
+        internet_message_id,
+        message_record,
+        thread_ref,
+        source_envelope,
+        strict=False,
+    )
 
     if _is_no_new_reply_text(_text_for_ai) and not has_attachments:
         print(
@@ -5656,6 +12165,13 @@ def process_inbox_message(
     # If thread is terminal, skip further processing (AI, sheet updates, auto-replies)
     if skip_processing_for_terminal:
         print("⏹️ Skipping suppressed processing - message saved for history only")
+        if exact_terminal_saga and (
+            thread_data.get("terminalNotificationOwed")
+            or thread_data.get("terminalReplyOwed")
+        ):
+            raise RetryableProcessingError(
+                "exact terminal source still has unresolved obligations"
+            )
         if client_denied and not client_terminal:
             raise RetryableProcessingError(
                 "Campaign automation is temporarily unavailable; inbound evidence was saved "
@@ -5734,6 +12250,7 @@ def process_inbox_message(
         new_property_pending_created = False
         new_row_number = None              # track the newly created row number
         defer_client_completion_for_closing_reply = False
+        active_terminal_saga = dict(exact_terminal_saga) if exact_terminal_saga else None
 
         # NEW: Handle PDF attachments with enhanced extraction for current message only
         pdf_manifest = fetch_and_process_pdfs(headers, msg_id)
@@ -5797,11 +12314,26 @@ def process_inbox_message(
 
         # Step 3: get proposal using Responses API with URL content and PDF data
         # Pass column_config and extraction_fields for per-client AI configuration
-        proposal = propose_sheet_updates(
-            user_id, client_id, to_addr_lower, sheet_id, header, rownum, rowvals,
-            thread_id, pdf_manifest=usable_pdf_manifest, url_texts=url_texts, contact_name=contact_name,
-            headers=headers, column_config=column_config, extraction_fields=extraction_fields
-        )
+        if active_terminal_saga:
+            proposal = {
+                "updates": [],
+                "events": [{
+                    "type": "property_unavailable",
+                    "reason": active_terminal_saga.get("reason"),
+                    "_terminalSagaResume": True,
+                }],
+                "response_email": active_terminal_saga.get("responseBody"),
+            }
+            print(
+                "🔁 Resuming immutable terminal saga for the exact source message "
+                "without requesting fresh model output"
+            )
+        else:
+            proposal = propose_sheet_updates(
+                user_id, client_id, to_addr_lower, sheet_id, header, rownum, rowvals,
+                thread_id, pdf_manifest=usable_pdf_manifest, url_texts=url_texts, contact_name=contact_name,
+                headers=headers, column_config=column_config, extraction_fields=extraction_fields
+            )
 
         if proposal:
             # Process updates
@@ -5886,6 +12418,8 @@ def process_inbox_message(
             # Process events from the proposal
             sheets = _sheets_client()
             row_anchor = get_row_anchor(rowvals, header)
+            if active_terminal_saga:
+                row_anchor = active_terminal_saga.get("rowAnchor") or row_anchor
 
             events = _order_events_for_processing(_proposal_events(proposal))
             current_pdf_manifest, new_property_pdf_groups = _partition_property_attachments(
@@ -5915,32 +12449,6 @@ def process_inbox_message(
                 )
                 for e in events
             )
-            pending_nonviable_patch = _pending_nonviable_followup_patch(
-                events,
-                row_anchor=row_anchor,
-                message_text=_full_text,
-            )
-            staged_terminal_thread_ids = []
-            terminal_source_row = rownum
-            if pending_nonviable_patch:
-                pending_source_row = thread_data.get("pendingTerminalSourceRow")
-                if isinstance(pending_source_row, int) and pending_source_row > 0:
-                    terminal_source_row = pending_source_row
-                staged_terminal_thread_ids = _stage_row_thread_roots_for_terminal_transition(
-                    user_id,
-                    client_id,
-                    terminal_source_row,
-                    pending_nonviable_patch,
-                    current_thread_id=thread_id,
-                )
-                thread_data.update({
-                    **pending_nonviable_patch,
-                    "pendingTerminalSourceRow": terminal_source_row,
-                })
-                print(
-                    "🛑 Follow-up eligibility stopped before non-viable sheet work "
-                    f"for {len(staged_terminal_thread_ids)} row thread root(s)"
-                )
             print(f"\n{'='*60}")
             print(f"📋 EVENT PROCESSING: {len(events)} event(s) detected by AI")
             print(f"{'='*60}")
@@ -5955,11 +12463,31 @@ def process_inbox_message(
 
                 # Build event key for deduplication
                 event_key = build_event_key(event_type, event, thread_id)
+                if event_type == "property_unavailable":
+                    event_key = _terminal_event_key_for_source(
+                        event_type,
+                        msg_id,
+                        internet_message_id,
+                    )
                 print(f"   Event key: {event_key}")
 
                 # Check if this event was already handled - prevents duplicate notifications
                 # when AI re-detects the same event from conversation history
-                if is_event_handled(user_id, thread_id, event_key):
+                event_already_handled = (
+                    _terminal_event_is_handled_for_source(
+                        thread_data,
+                        event_type,
+                        event_key,
+                        msg_id,
+                        internet_message_id,
+                    )
+                    if event_type == "property_unavailable"
+                    else is_event_handled(user_id, thread_id, event_key)
+                )
+                if (
+                    event_already_handled
+                    and not active_terminal_saga
+                ):
                     print(f"   ✅ Already handled, skipping")
                     continue
 
@@ -6253,7 +12781,7 @@ def process_inbox_message(
                         print(f"❌ Failed to write needs_user_input notification: {e}")
 
                 elif event_type == "property_unavailable":
-                    if not _property_unavailable_event_applies_to_row(
+                    if not active_terminal_saga and not _property_unavailable_event_applies_to_row(
                         event,
                         row_anchor=row_anchor,
                         message_text=_full_text,
@@ -6266,169 +12794,191 @@ def process_inbox_message(
                         mark_event_handled(user_id, thread_id, event_key, msg_id, None)
                         continue
 
-                    terminal_reason = _nonviable_status_reason(event)
-                    message_content = _full_text.lower()
-                    found_keyword = next((kw for kw in PROPERTY_UNAVAILABLE_KEYWORDS if kw in message_content), "AI-detected unavailability")
-                    comment_reason = (
-                        terminal_reason
-                        if terminal_reason == "requirements_mismatch"
-                        else found_keyword
-                    )
-                    print(f"🔍 Processing property_unavailable event (trigger: '{found_keyword}')")
-
+                    terminal_saga_owner = None
                     try:
                         tab_title = _get_first_tab_title(sheets, sheet_id)
                         comments_col_idx = find_notes_comment_column_index(header)
-                        if comments_col_idx is None:
-                            raise ValueError(
-                                "Notes/Comments column is required for a terminal transition"
-                            )
-
-                        unavailable_comment = _build_property_unavailable_comment(
-                            _terminal_note_date(msg),
-                            comment_reason,
-                            events,
-                        )
                         row_already_nonviable = _is_row_below_nonviable(
                             sheets,
                             sheet_id,
                             tab_title,
                             rownum,
                         )
-
-                        if row_already_nonviable:
+                        if active_terminal_saga:
+                            saga = dict(active_terminal_saga)
+                            _validate_terminal_saga_sheet_layout(saga, header)
+                            terminal_reason = saga.get("reason")
+                            terminal_note = saga.get("note")
+                            event_key = saga.get("eventKey")
+                            comments_col_idx = saga.get("notesColumnIndex")
                             print(
-                                f"ℹ️ Row {rownum} already below NON-VIABLE divider; "
-                                "repairing terminal evidence before finalizing thread state"
+                                "🔁 Processing persisted property_unavailable saga "
+                                f"({saga.get('sagaKey', '')[:12]})"
                             )
-                            _ensure_terminal_note(
+                        else:
+                            terminal_reason = _nonviable_status_reason(event)
+                            message_content = _full_text.lower()
+                            found_keyword = next(
+                                (
+                                    keyword
+                                    for keyword in PROPERTY_UNAVAILABLE_KEYWORDS
+                                    if keyword in message_content
+                                ),
+                                "AI-detected unavailability",
+                            )
+                            comment_reason = (
+                                terminal_reason
+                                if terminal_reason == "requirements_mismatch"
+                                else found_keyword
+                            )
+                            print(
+                                "🔍 Processing property_unavailable event "
+                                f"(trigger: '{found_keyword}')"
+                            )
+                            unavailable_comment = _build_property_unavailable_comment(
+                                _terminal_note_date(msg),
+                                comment_reason,
+                                events,
+                            )
+                            if comments_col_idx is None:
+                                # Refuse before staging any immutable saga or
+                                # stopping row roots.  A later-added column may
+                                # never retroactively become this source's
+                                # coordinate.
+                                raise ValueError(
+                                    "Notes/Comments column is required for a "
+                                    "terminal transition"
+                                )
+                            existing_comment = _read_terminal_note(
                                 sheets,
                                 sheet_id,
                                 tab_title,
                                 rownum,
                                 comments_col_idx,
+                            )
+                            terminal_note = _merge_terminal_note(
+                                existing_comment,
                                 unavailable_comment,
                             )
-
-                            # A retry after a committed Sheet move reuses the same
-                            # deterministic notification before atomically stopping
-                            # the exact staged roots and recording the handled event.
-                            recovery_notif_id = None
-                            if terminal_source_row != rownum:
-                                recovery_notif_id = write_notification(
-                                    user_id,
-                                    client_id,
-                                    kind="property_unavailable",
-                                    priority="important",
-                                    email=to_addr_lower,
-                                    thread_id=thread_id,
-                                    row_number=rownum,
-                                    row_anchor=row_anchor,
-                                    meta={
-                                        "address": event.get("address", ""),
-                                        "city": event.get("city", ""),
-                                        "reason": terminal_reason,
-                                    },
-                                    dedupe_key=(
-                                        f"property_unavailable:{thread_id}:{rownum}:moved"
-                                    ),
+                            if row_already_nonviable:
+                                divider_preview = {
+                                    "dividerRow": max(1, rownum - 1),
+                                    "exists": True,
+                                }
+                            else:
+                                divider_preview = _preview_nonviable_divider(
+                                    sheets,
+                                    sheet_id,
+                                    tab_title,
                                 )
-
-                            finalized_thread_count = _finalize_terminal_thread_roots(
+                            saga = _build_terminal_saga(
                                 user_id,
                                 client_id,
-                                staged_terminal_thread_ids,
-                                current_thread_id=thread_id,
-                                source_row=terminal_source_row,
-                                final_row=rownum,
-                                divider_row=(
-                                    rownum if terminal_source_row < rownum else None
-                                ),
+                                thread_id,
+                                message=msg,
+                                internet_message_id=internet_message_id,
+                                conversation_id=conversation_id,
+                                sheet_id=sheet_id,
+                                tab_title=tab_title,
+                                source_row=rownum,
+                                row_anchor=row_anchor,
+                                notes_column_index=comments_col_idx,
+                                sheet_header=header,
                                 terminal_reason=terminal_reason,
+                                terminal_note=terminal_note,
                                 event_key=event_key,
-                                message_id=msg_id,
-                                notification_id=recovery_notif_id,
+                                event=event,
+                                divider_row=divider_preview["dividerRow"],
+                                divider_exists=divider_preview["exists"],
+                                row_already_nonviable=row_already_nonviable,
+                                has_alternative_path=_has_new_property_path(
+                                    events,
+                                    new_row_created=new_row_created,
+                                    new_property_pending_created=(
+                                        new_property_pending_created
+                                    ),
+                                ),
+                                llm_response_email=proposal.get("response_email"),
+                                column_config=column_config,
+                                contact_name=contact_name,
+                                reply_recipient=to_addr_lower,
                             )
-                            old_row_became_nonviable = True
-                            # A recovered partial transition still owes the
-                            # terminal acknowledgement. A legacy row that was
-                            # already non-viable before this message does not.
-                            proposal["skip_response"] = terminal_source_row == rownum
+                            saga, terminal_saga_owner = _stage_terminal_saga(
+                                user_id,
+                                client_id,
+                                thread_id,
+                                saga,
+                            )
+                            active_terminal_saga = dict(saga)
                             print(
-                                "🛑 Finalized already non-viable row evidence for "
-                                f"{finalized_thread_count} exact thread root(s)"
+                                "🛑 Persisted immutable terminal saga and stopped "
+                                f"{len(saga['finalizationPlan']['terminalThreadIds'])} "
+                                "exact row root(s)"
                             )
-                            if (
-                                terminal_source_row == rownum
-                                and not any(
-                                    (evt or {}).get("type") == "new_property"
-                                    for evt in events
-                                )
-                            ):
-                                _maybe_mark_client_completed(user_id, client_id)
-                            continue
-
-                        if terminal_source_row != rownum:
+                        (
+                            terminal_source_row,
+                            expected_final_row,
+                            mutation_kind,
+                        ) = _terminal_sheet_mutation_geometry_from_saga(saga)
+                        if rownum not in {terminal_source_row, expected_final_row}:
                             raise ValueError(
-                                "pending terminal source row does not match the live source row"
+                                "live terminal row does not match the immutable saga"
                             )
+                        saga_phase = saga.get("phase")
+                        if saga_phase == "staged":
+                            if mutation_kind == "move_with_note":
+                                _verify_terminal_finalization_plan(
+                                    user_id,
+                                    client_id,
+                                    saga,
+                                )
+                            final_row = _execute_or_reconcile_terminal_sheet_mutation(
+                                user_id,
+                                thread_id,
+                                sheets,
+                                sheet_id,
+                                tab_title,
+                                header,
+                                comments_col_idx,
+                                saga,
+                                terminal_saga_owner,
+                                mutation_kind,
+                                allow_provider_mutation=True,
+                            )
+                            saga = _finalize_terminal_thread_roots(
+                                user_id,
+                                client_id,
+                                thread_id,
+                                saga,
+                                final_row=final_row,
+                                terminal_saga_owner=terminal_saga_owner,
+                            )
+                            active_terminal_saga = dict(saga)
+                        elif saga_phase == "finalized":
+                            final_row = expected_final_row
+                            _execute_or_reconcile_terminal_sheet_mutation(
+                                user_id,
+                                thread_id,
+                                sheets,
+                                sheet_id,
+                                tab_title,
+                                header,
+                                comments_col_idx,
+                                saga,
+                                terminal_saga_owner,
+                                mutation_kind,
+                                allow_provider_mutation=False,
+                            )
+                        else:
+                            raise ValueError(f"unsupported terminal saga phase: {saga_phase}")
 
-                        existing_comment = _read_terminal_note(
-                            sheets,
-                            sheet_id,
-                            tab_title,
-                            rownum,
-                            comments_col_idx,
-                        )
-                        final_comment = _merge_terminal_note(
-                            existing_comment,
-                            unavailable_comment,
-                        )
-                        divider_row = ensure_nonviable_divider(
-                            sheets,
-                            sheet_id,
-                            tab_title,
-                        )
-                        new_rownum = move_row_below_divider(
-                            sheets,
-                            sheet_id,
-                            tab_title,
-                            rownum,
-                            divider_row,
-                            notes_column_index=comments_col_idx,
-                            notes_value=final_comment,
-                        )
-
-                        # The stable notification is written before the terminal
-                        # Firestore batch so an ambiguous commit can never leave a
-                        # stopped thread without its handled-event evidence.
-                        notif_id = write_notification(
-                            user_id, client_id,
-                            kind="property_unavailable",
-                            priority="important",
-                            email=to_addr_lower,
-                            thread_id=thread_id,
-                            row_number=new_rownum,
-                            row_anchor=row_anchor,
-                            meta={
-                                "address": event.get("address", ""),
-                                "city": event.get("city", ""),
-                                "reason": terminal_reason,
-                            },
-                            dedupe_key=f"property_unavailable:{thread_id}:{new_rownum}:moved"
-                        )
-                        finalized_thread_count = _finalize_terminal_thread_roots(
+                        _settle_terminal_notification_obligation(
                             user_id,
                             client_id,
-                            staged_terminal_thread_ids,
-                            current_thread_id=thread_id,
-                            source_row=terminal_source_row,
-                            final_row=new_rownum,
-                            divider_row=divider_row,
-                            terminal_reason=terminal_reason,
-                            event_key=event_key,
-                            message_id=msg_id,
-                            notification_id=notif_id,
+                            thread_id,
+                            to_addr_lower,
+                            saga,
+                            terminal_saga_owner=terminal_saga_owner,
                         )
 
                         # Reformatting is cosmetic and must not turn a committed
@@ -6439,16 +12989,22 @@ def process_inbox_message(
                             print(f"⚠️ Could not reformat terminal row: {format_error}")
 
                         old_row_became_nonviable = True
-                        rownum = new_rownum
+                        rownum = final_row
                         try:
-                            clear_row_highlight(sheet_id, new_rownum)
+                            clear_row_highlight(sheet_id, final_row)
                         except Exception as e:
                             print(f"⚠️ Could not clear row highlight: {e}")
                         print(
-                            "🚫 Moved property with durable terminal note and finalized "
-                            f"{finalized_thread_count} exact thread root(s)"
+                            "🚫 Terminal Sheet/state evidence committed; notification "
+                            "obligation settled"
                         )
                     except Exception as e:
+                        if terminal_saga_owner and "saga" in locals():
+                            _release_terminal_saga_execution_claim(
+                                user_id,
+                                saga,
+                                terminal_saga_owner,
+                            )
                         print(f"❌ Failed to handle property_unavailable: {e}")
                         import traceback
                         traceback.print_exc()
@@ -7155,6 +13711,25 @@ def process_inbox_message(
             if not allow_outbound_reply:
                 _set_reply_send_outcome(outcome="suppressed_operator_replay_no_send")
                 print("⏭️ Operator replay extraction-only mode: outbound reply suppressed")
+                if active_terminal_saga:
+                    raise RetryableProcessingError(
+                        "terminal saga reply remains owed in extraction-only replay"
+                    )
+                return
+
+            if active_terminal_saga:
+                reply_outcome = _settle_terminal_reply_obligation(
+                    user_id,
+                    client_id,
+                    thread_id,
+                    headers,
+                    active_terminal_saga.get("replyRecipient") or to_addr_lower,
+                    active_terminal_saga,
+                    terminal_saga_owner=terminal_saga_owner,
+                )
+                print(f"📧 Terminal saga reply reached durable outcome: {reply_outcome}")
+                if active_terminal_saga.get("completeClientAfterReply"):
+                    _require_terminal_client_completion(user_id, client_id)
                 return
 
             try:
@@ -7461,7 +14036,9 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     # PHASE 1: Collect all unprocessed messages and group by thread
     from collections import defaultdict
     thread_messages = defaultdict(list)  # thread_id -> [messages in order]
+    thread_message_dispositions = {}
     orphan_messages = []  # Messages we couldn't match to a thread
+    provisional_terminal_messages = []
 
     scanned_count = 0
     skipped_count = 0
@@ -7501,15 +14078,44 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
                     print(f"⚠️ Message has no internetMessageId or id, skipping")
                     continue
 
-                # Check if already processed
-                if has_processed(user_id, processed_key):
+                # Resolve active/settled/ordinary from one authoritative thread
+                # snapshot before generic processed/manual/batch behavior.
+                thread_id = _match_message_to_thread(user_id, msg, headers)
+                disposition = {"kind": "ordinary"}
+                if thread_id:
+                    disposition = _terminal_retry_disposition(
+                        user_id,
+                        thread_id,
+                        processed_key,
+                        graph_message_id=msg.get("id"),
+                        internet_message_id=msg.get("internetMessageId"),
+                    )
+                    if (
+                        disposition.get("kind") in {"active", "settled"}
+                        and disposition.get("exactSourceConfirmed") is not True
+                    ):
+                        print(
+                            "⏸️ Terminal source matched only an untyped alias; "
+                            "leaving the inbox message unprocessed for identity review"
+                        )
+                        provisional_terminal_messages.append(
+                            (thread_id, msg, processed_key, disposition.get("kind"))
+                        )
+                        skipped_count += 1
+                        continue
+                    if disposition.get("kind") == "settled":
+                        skipped_count += 1
+                        continue
+
+                already_processed = has_processed(user_id, processed_key)
+                if already_processed and disposition.get("kind") != "active":
                     skipped_count += 1
                     continue
 
-                # Try to match to a thread
-                thread_id = _match_message_to_thread(user_id, msg, headers)
-
                 if thread_id:
+                    thread_message_dispositions[
+                        (thread_id, processed_key)
+                    ] = disposition.get("kind")
                     thread_messages[thread_id].append(msg)
                 else:
                     orphan_messages.append(msg)
@@ -7527,6 +14133,26 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
     # PHASE 2: Process messages - batched by thread
     processed_count = 0
     batched_count = 0
+    failure_visibility_lost = 0
+
+    for thread_id, msg, processed_key, terminal_kind in provisional_terminal_messages:
+        failure_recorded = _record_ai_processing_failure(
+            user_id,
+            _client_id_for_processing_failure(user_id, thread_id),
+            thread_id,
+            processed_key,
+            (
+                f"{terminal_kind} terminal source matched only an untyped alias; "
+                "manual identity review is required"
+            ),
+            retryable=False,
+            recovery_status="terminal_source_identity_unconfirmed",
+            graph_message_id=msg.get("id"),
+            internet_message_id=msg.get("internetMessageId"),
+            source_message_key=processed_key,
+        )
+        if failure_recorded is not True:
+            failure_visibility_lost += 1
 
     # Process thread batches (multiple messages in same thread)
     # Add delay between processing to avoid Google Sheets rate limits (60 reads/min)
@@ -7534,6 +14160,77 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
 
     thread_list = list(thread_messages.items())
     for idx, (thread_id, messages) in enumerate(thread_list):
+        exact_recovery_messages = []
+        remaining_messages = list(messages)
+        if len(messages) > 1:
+            remaining_messages = []
+            for candidate in messages:
+                candidate_key = (
+                    candidate.get("internetMessageId") or candidate.get("id")
+                )
+                if thread_message_dispositions.get(
+                    (thread_id, candidate_key)
+                ) == "active":
+                    exact_recovery_messages.append(candidate)
+                else:
+                    remaining_messages.append(candidate)
+
+        exact_recovery_failed = False
+        for recovery_msg in exact_recovery_messages:
+            processing_error = None
+            recovery_key = (
+                recovery_msg.get("internetMessageId") or recovery_msg.get("id")
+            )
+            try:
+                process_inbox_message(user_id, headers, recovery_msg)
+                processed_count += 1
+                _clear_ai_processing_failure(
+                    user_id,
+                    thread_id,
+                    recovery_key,
+                    graph_message_id=recovery_msg.get("id"),
+                    internet_message_id=recovery_msg.get("internetMessageId"),
+                    source_message_key=recovery_key,
+                )
+            except Exception as exc:
+                processing_error = exc
+                exact_recovery_failed = True
+                print(f"❌ Failed to recover exact terminal saga message: {exc}")
+                failure_recorded = _record_ai_processing_failure(
+                    user_id,
+                    _client_id_for_processing_failure(user_id, thread_id),
+                    thread_id,
+                    recovery_key,
+                    str(exc),
+                    graph_message_id=recovery_msg.get("id"),
+                    internet_message_id=recovery_msg.get("internetMessageId"),
+                    source_message_key=recovery_key,
+                )
+                if failure_recorded is not True:
+                    failure_visibility_lost += 1
+            finally:
+                if _should_mark_processed_after_error(processing_error):
+                    mark_processed(user_id, recovery_key)
+                else:
+                    print(f"🔁 Leaving exact terminal source retryable: {recovery_key}")
+            if exact_recovery_failed:
+                break
+
+        if exact_recovery_failed:
+            print(
+                "⏸️ Exact terminal recovery failed; leaving every later message "
+                "in this thread unprocessed until the saga resolves"
+            )
+            if idx < len(thread_list) - 1:
+                time.sleep(RATE_LIMIT_DELAY)
+            continue
+
+        messages = remaining_messages
+        if not messages:
+            if idx < len(thread_list) - 1:
+                time.sleep(RATE_LIMIT_DELAY)
+            continue
+
         if len(messages) > 1:
             # BATCH PROCESSING: Multiple messages in same thread
             print(f"📦 Batching {len(messages)} messages for thread {thread_id[:20]}...")
@@ -7542,6 +14239,7 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             # Process only the LAST message (most recent), but include all message content
             # in the conversation history (which is already handled by build_conversation_payload)
             # First, save all the messages to Firestore so they appear in conversation
+            batch_prerequisite_failed = False
             for msg in messages[:-1]:  # All but the last
                 try:
                     _save_message_to_thread(user_id, thread_id, msg, headers)
@@ -7549,6 +14247,30 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
                     mark_processed(user_id, processed_key)
                 except Exception as e:
                     print(f"⚠️ Failed to save batched message: {e}")
+                    failed_key = msg.get("internetMessageId") or msg.get("id")
+                    failure_recorded = _record_ai_processing_failure(
+                        user_id,
+                        _client_id_for_processing_failure(user_id, thread_id),
+                        thread_id,
+                        failed_key,
+                        f"Conversation history persistence failed: {e}",
+                        graph_message_id=msg.get("id"),
+                        internet_message_id=msg.get("internetMessageId"),
+                        source_message_key=failed_key,
+                    )
+                    if failure_recorded is not True:
+                        failure_visibility_lost += 1
+                    batch_prerequisite_failed = True
+                    break
+
+            if batch_prerequisite_failed:
+                print(
+                    "⏸️ Earlier batched message was not durably saved; "
+                    "leaving the latest message unprocessed to preserve ordering"
+                )
+                if idx < len(thread_list) - 1:
+                    time.sleep(RATE_LIMIT_DELAY)
+                continue
 
             # Process the last message (which will see all previous in conversation)
             last_msg = messages[-1]
@@ -7560,17 +14282,29 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             try:
                 process_inbox_message(user_id, headers, last_msg)
                 processed_count += 1
-                _clear_ai_processing_failure(user_id, thread_id, last_msg.get("internetMessageId") or last_msg.get("id"))
+                _clear_ai_processing_failure(
+                    user_id,
+                    thread_id,
+                    processed_key,
+                    graph_message_id=last_msg.get("id"),
+                    internet_message_id=last_msg.get("internetMessageId"),
+                    source_message_key=processed_key,
+                )
             except Exception as e:
                 processing_error = e
                 print(f"❌ Failed to process batched message: {e}")
-                _record_ai_processing_failure(
+                failure_recorded = _record_ai_processing_failure(
                     user_id,
                     _client_id_for_processing_failure(user_id, thread_id),
                     thread_id,
                     processed_key,
                     str(e),
+                    graph_message_id=last_msg.get("id"),
+                    internet_message_id=last_msg.get("internetMessageId"),
+                    source_message_key=processed_key,
                 )
+                if failure_recorded is not True:
+                    failure_visibility_lost += 1
             finally:
                 if _should_mark_processed_after_error(processing_error):
                     mark_processed(user_id, processed_key)
@@ -7587,17 +14321,29 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
             try:
                 process_inbox_message(user_id, headers, msg)
                 processed_count += 1
-                _clear_ai_processing_failure(user_id, thread_id, msg.get("internetMessageId") or msg.get("id"))
+                _clear_ai_processing_failure(
+                    user_id,
+                    thread_id,
+                    processed_key,
+                    graph_message_id=msg.get("id"),
+                    internet_message_id=msg.get("internetMessageId"),
+                    source_message_key=processed_key,
+                )
             except Exception as e:
                 processing_error = e
                 print(f"❌ Failed to process message {msg.get('id', 'unknown')}: {e}")
-                _record_ai_processing_failure(
+                failure_recorded = _record_ai_processing_failure(
                     user_id,
                     _client_id_for_processing_failure(user_id, thread_id),
                     thread_id,
                     processed_key,
                     str(e),
+                    graph_message_id=msg.get("id"),
+                    internet_message_id=msg.get("internetMessageId"),
+                    source_message_key=processed_key,
                 )
+                if failure_recorded is not True:
+                    failure_visibility_lost += 1
             finally:
                 if _should_mark_processed_after_error(processing_error):
                     mark_processed(user_id, processed_key)
@@ -7617,13 +14363,18 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
         except Exception as e:
             processing_error = e
             print(f"❌ Failed to process orphan message: {e}")
-            _record_ai_processing_failure(
+            failure_recorded = _record_ai_processing_failure(
                 user_id,
                 "unknown",
                 "orphan",
                 processed_key,
                 str(e),
+                graph_message_id=msg.get("id"),
+                internet_message_id=msg.get("internetMessageId"),
+                source_message_key=processed_key,
             )
+            if failure_recorded is not True:
+                failure_visibility_lost += 1
         finally:
             if _should_mark_processed_after_error(processing_error):
                 mark_processed(user_id, processed_key)
@@ -7633,6 +14384,21 @@ def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread:
         # Rate limit delay between orphan messages (skip delay after last one)
         if idx < len(orphan_messages) - 1:
             time.sleep(RATE_LIMIT_DELAY)
+
+    if failure_visibility_lost:
+        return {
+            "status": "error",
+            "operation": "inbox_scan",
+            "error": (
+                "One or more processing failures could not be durably recorded"
+            ),
+            "failureVisibilityLost": failure_visibility_lost,
+            "scanned": scanned_count,
+            "processed": processed_count,
+            "batched": batched_count,
+            "skipped": skipped_count,
+            "orphaned": len(orphan_messages),
+        }
 
     # Set last scan timestamp
     set_last_scan_iso(user_id, now_utc.isoformat().replace("+00:00", "Z"))
@@ -7665,7 +14431,8 @@ def _match_message_to_thread(user_id: str, msg: dict, headers: dict) -> Optional
         try:
             response = exponential_backoff_request(
                 lambda: requests.get(
-                    f"https://graph.microsoft.com/v1.0/me/messages/{msg.get('id')}",
+                    "https://graph.microsoft.com/v1.0/me/messages/"
+                    f"{_graph_message_path_segment(msg.get('id'))}",
                     headers=headers,
                     params={"$select": "internetMessageHeaders"},
                     timeout=30
@@ -7735,7 +14502,8 @@ def _save_message_to_thread(user_id: str, thread_id: str, msg: dict, headers: di
     try:
         full_msg = exponential_backoff_request(
             lambda: requests.get(
-                f"https://graph.microsoft.com/v1.0/me/messages/{msg.get('id')}",
+                "https://graph.microsoft.com/v1.0/me/messages/"
+                f"{_graph_message_path_segment(msg.get('id'))}",
                 headers=headers,
                 params={"$select": "body,hasAttachments,sender,replyTo,ccRecipients"},
                 timeout=30

@@ -281,6 +281,46 @@ def check_token_status():
     except Exception as e:
         return {"status": "error", "message": f"Error checking token: {str(e)}"}
 
+
+def _graph_headers_for_user(user_id: str) -> dict:
+    """Load a server-owned mailbox token for one authenticated UID."""
+    import tempfile
+    from firebase_helpers import download_token
+
+    temp_handle = tempfile.NamedTemporaryFile(
+        prefix="sitesift-operator-graph-",
+        suffix=".bin",
+        delete=False,
+    )
+    temp_path = temp_handle.name
+    temp_handle.close()
+    try:
+        download_token(FIREBASE_API_KEY, output_file=temp_path, user_id=user_id)
+        cache = SerializableTokenCache()
+        with open(temp_path, "r") as token_file:
+            cache.deserialize(token_file.read())
+        client = ConfidentialClientApplication(
+            CLIENT_ID,
+            client_credential=CLIENT_SECRET,
+            authority=AUTHORITY,
+            token_cache=cache,
+        )
+        accounts = client.get_accounts()
+        if not accounts:
+            raise RuntimeError("authenticated mailbox account is unavailable")
+        result = client.acquire_token_silent(SCOPES, account=accounts[0])
+        if not result or "access_token" not in result:
+            raise RuntimeError("authenticated mailbox token is unavailable")
+        return {
+            "Authorization": f"Bearer {result['access_token']}",
+            "Content-Type": "application/json",
+        }
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
 def auto_upload_token():
     """Automatically upload token to Firebase if valid"""
     try:
@@ -2978,6 +3018,175 @@ def api_firestore_inspect():
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/pending-send-reconciliation/acknowledge", methods=["POST"])
+@verify_firebase_token(check_revoked=True)
+def api_acknowledge_pending_send_reconciliation():
+    """Retire one exact ambiguous Graph send without asserting sent/unsent.
+
+    This is intentionally separate from generic dead-letter actions.  It keeps
+    authentication, the retained permit, the latest server-owned review
+    evidence, pending deletion, and the immutable operator audit in one exact
+    CAS.  It cannot requeue or send mail.
+    """
+    if not SCHEDULER_AVAILABLE:
+        return jsonify({"success": False, "error": "Scheduler not available"}), 503
+    data, err = _require_json_object()
+    if err:
+        return err
+    user_id = _safe_uid(g.get("firebase_uid"))
+    if user_id is None:
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
+    required = {
+        "pendingDocumentId": data.get("pendingDocumentId"),
+        "expectedPermitId": data.get("expectedPermitId"),
+        "expectedPermitHash": data.get("expectedPermitHash"),
+        "expectedReconciliationEvidenceHash": data.get(
+            "expectedReconciliationEvidenceHash"
+        ),
+        "operatorReason": data.get("operatorReason"),
+        "settlementId": data.get("settlementId"),
+    }
+    if data.get("action") != "acknowledge_ambiguous_no_retry" or not all(
+        _is_nonempty_str(value) for value in required.values()
+    ):
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
+    if (
+        any(
+            "/" in required[name] or len(required[name]) > 200
+            for name in ("pendingDocumentId", "settlementId")
+        )
+        or len(required["operatorReason"]) > 1500
+        or not required["expectedPermitId"].startswith("graph-send-")
+        or len(required["expectedPermitHash"]) != 64
+        or len(required["expectedReconciliationEvidenceHash"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in (
+                required["expectedPermitHash"]
+                + required["expectedReconciliationEvidenceHash"]
+            ).lower()
+        )
+    ):
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
+
+    try:
+        from email_automation.pending_responses import (
+            acknowledge_pending_graph_send_ambiguity,
+        )
+
+        settlement_status = acknowledge_pending_graph_send_ambiguity(
+            user_id,
+            required["pendingDocumentId"],
+            headers_factory=lambda: _graph_headers_for_user(user_id),
+            expected_permit_id=required["expectedPermitId"],
+            expected_permit_hash=required["expectedPermitHash"].lower(),
+            expected_reconciliation_evidence_hash=required[
+                "expectedReconciliationEvidenceHash"
+            ].lower(),
+            operator_id=user_id,
+            operator_reason=required["operatorReason"],
+            settlement_id=required["settlementId"],
+        )
+        return jsonify({
+            "success": True,
+            "status": settlement_status,
+            "retryAllowed": False,
+        })
+    except Exception as exc:
+        # Exact-CAS mismatches are conflicts, and raw protocol details are kept
+        # out of the response.  The server log retains the exception class for
+        # diagnosis without leaking mailbox metadata.
+        print(
+            "⚠️ Pending send operator settlement refused: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+        return jsonify({
+            "success": False,
+            "error": "Exact pending-send reconciliation was refused",
+        }), 409
+
+
+@app.route("/api/pending-draft-review/resolve", methods=["POST"])
+@verify_firebase_token(check_revoked=True)
+def api_resolve_pending_draft_review():
+    """Record an exact local retained-draft resolution; never call Graph."""
+    if not SCHEDULER_AVAILABLE:
+        return jsonify({"success": False, "error": "Scheduler not available"}), 503
+    data, err = _require_json_object()
+    if err:
+        return err
+    user_id = _safe_uid(g.get("firebase_uid"))
+    if user_id is None:
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
+    required = {
+        "threadId": data.get("threadId"),
+        "expectedPermitId": data.get("expectedPermitId"),
+        "expectedPermitHash": data.get("expectedPermitHash"),
+        "expectedReviewEvidenceHash": data.get(
+            "expectedReviewEvidenceHash"
+        ),
+        "operatorReason": data.get("operatorReason"),
+        "settlementId": data.get("settlementId"),
+    }
+    if (
+        data.get("action") != "confirm_retained_draft_not_actionable"
+        or not all(_is_nonempty_str(value) for value in required.values())
+    ):
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
+    if (
+        any(
+            "/" in required[name] or len(required[name]) > 200
+            for name in ("threadId", "settlementId")
+        )
+        or len(required["operatorReason"]) > 1500
+        or not required["expectedPermitId"].startswith("graph-send-")
+        or len(required["expectedPermitHash"]) != 64
+        or len(required["expectedReviewEvidenceHash"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in (
+                required["expectedPermitHash"]
+                + required["expectedReviewEvidenceHash"]
+            ).lower()
+        )
+    ):
+        return jsonify({"success": False, "error": _GENERIC_BAD_REQUEST}), 400
+
+    try:
+        from email_automation.pending_responses import (
+            resolve_pending_graph_draft_review,
+        )
+
+        settlement_status = resolve_pending_graph_draft_review(
+            user_id,
+            required["threadId"],
+            expected_permit_id=required["expectedPermitId"],
+            expected_permit_hash=required["expectedPermitHash"].lower(),
+            expected_review_evidence_hash=required[
+                "expectedReviewEvidenceHash"
+            ].lower(),
+            operator_id=user_id,
+            operator_reason=required["operatorReason"],
+            settlement_id=required["settlementId"],
+        )
+        return jsonify({
+            "success": True,
+            "status": settlement_status,
+            "retryAllowed": True,
+        })
+    except Exception as exc:
+        print(
+            "⚠️ Pending draft-review operator resolution refused: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+        return jsonify({
+            "success": False,
+            "error": "Exact pending draft-review resolution was refused",
+        }), 409
 
 
 @app.route("/api/firestore-cleanup", methods=["POST"])

@@ -530,6 +530,7 @@ class BackendActionAuditTests(unittest.TestCase):
             if url.endswith("/createReplyAll"):
                 return FakeResponse(201, {
                     "id": "reply-draft-1",
+                    "subject": "RE: 910 Confidential Ct",
                     "toRecipients": [
                         {"emailAddress": {"address": "bp21harrison@gmail.com"}},
                     ],
