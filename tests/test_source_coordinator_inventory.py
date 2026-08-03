@@ -330,6 +330,8 @@ def _expression_binding_states(node, scoped_bindings):
         if not true_states or not false_states:
             return set()
         return {_NONHELPER_BINDING}
+    if isinstance(node, ast.NamedExpr):
+        return _expression_binding_states(node.value, scoped_bindings)
     if isinstance(
         node,
         (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
@@ -424,6 +426,35 @@ def _approved_assignment_reference_nodes(target, value, scoped_bindings):
             )
         )
     return approved_nodes
+
+
+def _approved_call_target_reference_nodes(node, scoped_bindings):
+    if _expression_binding_states(node, scoped_bindings) != {_HELPER_BINDING}:
+        return set()
+
+    if isinstance(node, ast.NamedExpr):
+        value_nodes = _approved_call_target_reference_nodes(
+            node.value,
+            scoped_bindings,
+        )
+        if value_nodes:
+            return {id(node.target)} | value_nodes
+        return set()
+    if isinstance(node, ast.IfExp):
+        true_nodes = _approved_call_target_reference_nodes(
+            node.body,
+            scoped_bindings,
+        )
+        false_nodes = _approved_call_target_reference_nodes(
+            node.orelse,
+            scoped_bindings,
+        )
+        if true_nodes and false_nodes:
+            return true_nodes | false_nodes
+        return set()
+
+    source_nodes = _supported_binding_source_nodes(node, scoped_bindings)
+    return source_nodes if source_nodes is not None else set()
 
 
 def _assignment_binding_updates(target, value, scoped_bindings):
@@ -719,13 +750,28 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
         self._visit_assignment([node.target], node.value)
 
     def visit_NamedExpr(self, node):
-        self._visit_assignment([node.target], node.value)
+        self.visit(node.value)
+        self.visit(node.target)
 
     def visit_Call(self, node):
-        is_delete_helper_call = _is_bound_delete_helper_callee(
+        call_target_states = _expression_binding_states(
             node.func,
             self.binding_stack,
         )
+        is_delete_helper_call = call_target_states == {_HELPER_BINDING}
+        is_ambiguous_helper_call = (
+            _AMBIGUOUS_BINDING in call_target_states
+            or (
+                _HELPER_BINDING in call_target_states
+                and not is_delete_helper_call
+            )
+        )
+        if is_ambiguous_helper_call:
+            raise DraftDeleteBindingInventoryError(
+                "unsupported or ambiguous draft delete call target at "
+                f"{self.relative_path}:{node.lineno}"
+            )
+
         if is_delete_helper_call:
             self.callers[(self.relative_path, self._caller_scope())] += 1
 
@@ -739,6 +785,17 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
             self.requests_delete_implementations += 1
 
         if is_delete_helper_call:
+            approved_nodes = _approved_call_target_reference_nodes(
+                node.func,
+                self.binding_stack,
+            )
+            if not approved_nodes:
+                self._raise_unsupported_reference(node.func)
+            self.approved_reference_stack.append(approved_nodes)
+            try:
+                self.visit(node.func)
+            finally:
+                self.approved_reference_stack.pop()
             for argument in node.args:
                 self.visit(argument)
             for keyword in node.keywords:
@@ -803,6 +860,38 @@ def _in_memory_draft_delete_callers(source, relative_path):
 
 
 class InventoryScannerRegressionTests(unittest.TestCase):
+    def test_named_expression_direct_helper_callee_is_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+from .email import _delete_graph_reply_draft as helper
+
+def cleanup():
+    (alias := helper)()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/followup.py", "cleanup"): 1}),
+            callers,
+        )
+
+    def test_named_expression_helper_alias_outside_callee_fails_closed(self):
+        source = """
+from .email import _delete_graph_reply_draft as helper
+
+def cleanup():
+    (alias := helper)
+    alias()
+"""
+        with self.assertRaisesRegex(
+            DraftDeleteBindingInventoryError,
+            "unsupported draft delete helper propagation",
+        ):
+            _in_memory_draft_delete_callers(
+                source,
+                "email_automation/followup.py",
+            )
+
     def test_returned_helper_reference_fails_closed(self):
         source = """
 from .email import _delete_graph_reply_draft as helper
