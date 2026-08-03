@@ -36,7 +36,19 @@ EXPECTED_LEGACY_MARKER_DEFINITIONS = Counter(
 
 _HELPER_BINDING = "helper"
 _EMAIL_MODULE_BINDING = "email_module"
-_OTHER_BINDING = "other"
+_NONHELPER_BINDING = "nonhelper"
+_AMBIGUOUS_BINDING = "ambiguous"
+
+# Bounded binding contract: assignment results are helper, nonhelper, or
+# ambiguous. The email-module marker is provenance used only to resolve the
+# exact helper attribute. Unsupported helper-derived expressions and
+# destructuring become ambiguous and fail the inventory deterministically;
+# this scanner does not attempt general runtime inference.
+
+
+class DraftDeleteBindingInventoryError(AssertionError):
+    """A helper-derived binding cannot be classified safely by the inventory."""
+
 
 _EXCLUDED_APPLICATION_PARTS = {
     ".git",
@@ -108,7 +120,7 @@ class _ScopeBindingCollector(ast.NodeVisitor):
 
     def _add_nonhelper_target(self, target):
         if isinstance(target, ast.Name):
-            self._add_binding(target.id, _OTHER_BINDING)
+            self._add_binding(target.id, _NONHELPER_BINDING)
         elif isinstance(target, (ast.List, ast.Tuple)):
             for element in target.elts:
                 self._add_nonhelper_target(element)
@@ -116,10 +128,8 @@ class _ScopeBindingCollector(ast.NodeVisitor):
             self._add_nonhelper_target(target.value)
 
     def _add_assignment(self, target, value):
-        if isinstance(target, ast.Name):
-            self.assignments.append((target.id, value))
-        else:
-            self._add_nonhelper_target(target)
+        if isinstance(target, (ast.Name, ast.List, ast.Tuple, ast.Starred)):
+            self.assignments.append((target, value))
 
     def visit_FunctionDef(self, node):
         if (
@@ -129,13 +139,13 @@ class _ScopeBindingCollector(ast.NodeVisitor):
         ):
             self._add_binding(node.name, _HELPER_BINDING)
         else:
-            self._add_binding(node.name, _OTHER_BINDING)
+            self._add_binding(node.name, _NONHELPER_BINDING)
 
     def visit_AsyncFunctionDef(self, node):
         self.visit_FunctionDef(node)
 
     def visit_ClassDef(self, node):
-        self._add_binding(node.name, _OTHER_BINDING)
+        self._add_binding(node.name, _NONHELPER_BINDING)
 
     def visit_Lambda(self, node):
         return
@@ -154,7 +164,7 @@ class _ScopeBindingCollector(ast.NodeVisitor):
             elif imported_module == "email_automation" and alias.name == "email":
                 self._add_binding(bound_name, _EMAIL_MODULE_BINDING)
             else:
-                self._add_binding(bound_name, _OTHER_BINDING)
+                self._add_binding(bound_name, _NONHELPER_BINDING)
 
     def visit_Import(self, node):
         for alias in node.names:
@@ -163,7 +173,7 @@ class _ScopeBindingCollector(ast.NodeVisitor):
                 self._add_binding(bound_name, _EMAIL_MODULE_BINDING)
             else:
                 bound_name = alias.asname or alias.name.split(".", 1)[0]
-                self._add_binding(bound_name, _OTHER_BINDING)
+                self._add_binding(bound_name, _NONHELPER_BINDING)
 
     def visit_Assign(self, node):
         for target in node.targets:
@@ -203,7 +213,7 @@ class _ScopeBindingCollector(ast.NodeVisitor):
 
     def visit_ExceptHandler(self, node):
         if node.name:
-            self._add_binding(node.name, _OTHER_BINDING)
+            self._add_binding(node.name, _NONHELPER_BINDING)
         self.generic_visit(node)
 
 
@@ -229,6 +239,49 @@ def _lookup_binding_states(name, scoped_bindings):
     return set()
 
 
+def _has_helper_provenance(states):
+    return bool(
+        states
+        & {_HELPER_BINDING, _EMAIL_MODULE_BINDING, _AMBIGUOUS_BINDING}
+    )
+
+
+def _helper_reference_status(node, scoped_bindings):
+    if isinstance(node, ast.Name):
+        states = _lookup_binding_states(node.id, scoped_bindings)
+        if not states:
+            return None
+        return _has_helper_provenance(states)
+    if (
+        isinstance(node, ast.Attribute)
+        and node.attr == DRAFT_DELETE_HELPER_NAME
+    ):
+        receiver = _dotted_expression(node.value)
+        states = (
+            _lookup_binding_states(receiver, scoped_bindings)
+            if receiver
+            else set()
+        )
+        if not states:
+            return None
+        return _EMAIL_MODULE_BINDING in states or _AMBIGUOUS_BINDING in states
+    if isinstance(
+        node,
+        (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+    ):
+        return False
+
+    statuses = [
+        _helper_reference_status(child, scoped_bindings)
+        for child in ast.iter_child_nodes(node)
+    ]
+    if any(status is True for status in statuses):
+        return True
+    if any(status is None for status in statuses):
+        return None
+    return False
+
+
 def _expression_binding_states(node, scoped_bindings):
     if isinstance(node, ast.Name):
         return _lookup_binding_states(node.id, scoped_bindings)
@@ -242,13 +295,89 @@ def _expression_binding_states(node, scoped_bindings):
             if receiver
             else set()
         )
-        result = set()
+        if not receiver_states:
+            return set()
+        if receiver_states == {_EMAIL_MODULE_BINDING}:
+            return {_HELPER_BINDING}
         if _EMAIL_MODULE_BINDING in receiver_states:
-            result.add(_HELPER_BINDING)
-        if receiver_states - {_EMAIL_MODULE_BINDING}:
-            result.add(_OTHER_BINDING)
-        return result
-    return {_OTHER_BINDING}
+            return {_AMBIGUOUS_BINDING}
+        return {_NONHELPER_BINDING}
+    if isinstance(node, ast.IfExp):
+        true_states = _expression_binding_states(node.body, scoped_bindings)
+        false_states = _expression_binding_states(node.orelse, scoped_bindings)
+        if true_states and true_states == false_states:
+            return true_states
+        if _has_helper_provenance(true_states | false_states):
+            return {_AMBIGUOUS_BINDING}
+        if not true_states or not false_states:
+            return set()
+        return {_NONHELPER_BINDING}
+    if isinstance(
+        node,
+        (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+    ):
+        return {_NONHELPER_BINDING}
+
+    helper_reference = _helper_reference_status(node, scoped_bindings)
+    if helper_reference is True:
+        return {_AMBIGUOUS_BINDING}
+    if helper_reference is None:
+        return set()
+    return {_NONHELPER_BINDING}
+
+
+def _target_names(target):
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return [
+            name
+            for element in target.elts
+            for name in _target_names(element)
+        ]
+    return []
+
+
+def _assignment_binding_updates(target, value, scoped_bindings):
+    if isinstance(target, ast.Name):
+        value_states = _expression_binding_states(value, scoped_bindings)
+        if not value_states:
+            return None
+        return [(target.id, value_states)]
+
+    if isinstance(target, (ast.List, ast.Tuple)):
+        is_bounded_pairing = (
+            isinstance(value, (ast.List, ast.Tuple))
+            and len(target.elts) == len(value.elts)
+            and not any(
+                isinstance(element, ast.Starred) for element in target.elts
+            )
+        )
+        if is_bounded_pairing:
+            updates = []
+            for target_element, value_element in zip(target.elts, value.elts):
+                element_updates = _assignment_binding_updates(
+                    target_element,
+                    value_element,
+                    scoped_bindings,
+                )
+                if element_updates is None:
+                    return None
+                updates.extend(element_updates)
+            return updates
+
+    target_names = _target_names(target)
+    if not target_names:
+        return []
+    helper_reference = _helper_reference_status(value, scoped_bindings)
+    if helper_reference is None:
+        return None
+    binding_kind = (
+        _AMBIGUOUS_BINDING if helper_reference else _NONHELPER_BINDING
+    )
+    return [(name, {binding_kind}) for name in target_names]
 
 
 def _analyze_scope_bindings(node, relative_path, scope_kind, outer_bindings):
@@ -258,7 +387,7 @@ def _analyze_scope_bindings(node, relative_path, scope_kind, outer_bindings):
     )
     if scope_kind == "function":
         for argument_name in _function_argument_names(node.args):
-            collector._add_binding(argument_name, _OTHER_BINDING)
+            collector._add_binding(argument_name, _NONHELPER_BINDING)
     for statement in node.body:
         collector.visit(statement)
 
@@ -268,28 +397,33 @@ def _analyze_scope_bindings(node, relative_path, scope_kind, outer_bindings):
         unresolved = []
         changed = False
         scoped_bindings = outer_bindings + [(scope_kind, bindings)]
-        for target_name, value in pending_assignments:
-            value_states = _expression_binding_states(value, scoped_bindings)
-            if not value_states:
-                unresolved.append((target_name, value))
+        for target, value in pending_assignments:
+            updates = _assignment_binding_updates(target, value, scoped_bindings)
+            if updates is None:
+                unresolved.append((target, value))
                 continue
-            target_states = bindings.setdefault(target_name, set())
-            previous_states = set(target_states)
-            target_states.update(value_states)
-            changed = changed or target_states != previous_states
+            for target_name, value_states in updates:
+                target_states = bindings.setdefault(target_name, set())
+                previous_states = set(target_states)
+                target_states.update(value_states)
+                changed = changed or target_states != previous_states
         if not unresolved:
             break
         if not changed:
-            for target_name, _ in unresolved:
-                bindings.setdefault(target_name, set()).add(_OTHER_BINDING)
+            for target, _ in unresolved:
+                for target_name in _target_names(target):
+                    bindings.setdefault(target_name, set()).add(
+                        _NONHELPER_BINDING
+                    )
             break
         pending_assignments = unresolved
 
     for name, states in bindings.items():
         helper_related = states & {_HELPER_BINDING, _EMAIL_MODULE_BINDING}
-        if helper_related and len(states) > 1:
-            raise AssertionError(
-                f"ambiguous draft delete alias {name!r} in "
+        if _AMBIGUOUS_BINDING in states or (helper_related and len(states) > 1):
+            raise DraftDeleteBindingInventoryError(
+                "unsupported or ambiguous draft delete binding "
+                f"(ambiguous draft delete alias) {name!r} in "
                 f"{Path(relative_path).as_posix()}"
             )
     return bindings
@@ -371,6 +505,53 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
     def visit_ClassDef(self, node):
         self._visit_scope(node, "class")
 
+    def visit_Lambda(self, node):
+        defaults = list(node.args.defaults) + [
+            default for default in node.args.kw_defaults if default is not None
+        ]
+        for default in defaults:
+            self.visit(default)
+
+        bindings = {
+            name: {_NONHELPER_BINDING}
+            for name in _function_argument_names(node.args)
+        }
+        self.binding_stack.append(("function", bindings))
+        self.visit(node.body)
+        self.binding_stack.pop()
+
+    def _visit_comprehension(self, node, result_nodes):
+        if not node.generators:
+            for result_node in result_nodes:
+                self.visit(result_node)
+            return
+
+        self.visit(node.generators[0].iter)
+        bindings = {}
+        self.binding_stack.append(("function", bindings))
+        for index, generator in enumerate(node.generators):
+            if index:
+                self.visit(generator.iter)
+            for name in _target_names(generator.target):
+                bindings[name] = {_NONHELPER_BINDING}
+            for condition in generator.ifs:
+                self.visit(condition)
+        for result_node in result_nodes:
+            self.visit(result_node)
+        self.binding_stack.pop()
+
+    def visit_ListComp(self, node):
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_SetComp(self, node):
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_GeneratorExp(self, node):
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_DictComp(self, node):
+        self._visit_comprehension(node, [node.key, node.value])
+
     def visit_Call(self, node):
         if self._is_bound_delete_helper_call(node):
             self.callers[(self.relative_path, self._caller_scope())] += 1
@@ -442,6 +623,64 @@ def _in_memory_draft_delete_callers(source, relative_path):
 
 
 class InventoryScannerRegressionTests(unittest.TestCase):
+    def test_conditional_helper_alias_fails_closed(self):
+        source = """
+from .email import _delete_graph_reply_draft as helper
+
+def cleanup(flag, fallback):
+    alias = helper if flag else fallback
+    alias()
+"""
+        with self.assertRaisesRegex(
+            DraftDeleteBindingInventoryError,
+            "unsupported or ambiguous draft delete binding",
+        ):
+            _in_memory_draft_delete_callers(
+                source,
+                "email_automation/followup.py",
+            )
+
+    def test_single_item_destructured_helper_alias_is_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+from .email import _delete_graph_reply_draft as helper
+
+def cleanup():
+    (alias,) = (helper,)
+    alias()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/followup.py", "cleanup"): 1}),
+            callers,
+        )
+
+    def test_lambda_parameter_shadowing_helper_name_is_not_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+from .email import _delete_graph_reply_draft
+
+cleanup = lambda _delete_graph_reply_draft: _delete_graph_reply_draft()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(Counter(), callers)
+
+    def test_comprehension_target_shadowing_helper_name_is_not_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+from .email import _delete_graph_reply_draft
+
+results = [
+    _delete_graph_reply_draft()
+    for _delete_graph_reply_draft in callbacks
+]
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(Counter(), callers)
+
     def test_simple_assignment_alias_is_counted(self):
         callers = _in_memory_draft_delete_callers(
             """
