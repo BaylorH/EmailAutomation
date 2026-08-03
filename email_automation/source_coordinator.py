@@ -49,6 +49,11 @@ _SOURCE_IDENTITY_FIELDS = {
 _CLASSIFICATION_SCHEMA_VERSION = 1
 _CLASSIFICATION_INPUT_SCHEMA_VERSION = 1
 _CLASSIFICATION_SNAPSHOT_SCHEMA_VERSION = 1
+_COMPLETE_PROPOSAL_FIELDS = {
+    "schemaVersion",
+    "transitionCandidates",
+    "ordinaryObligations",
+}
 _CLASSIFICATION_REQUEST_KEY_KIND = "source-model-request-v1"
 _CLASSIFICATION_SNAPSHOT_HASH_KIND = "source-classification-snapshot-v1"
 _CLASSIFICATION_SELECTION_HASH_KIND = "source-selection-v1"
@@ -112,6 +117,7 @@ _ORDINARY_CANDIDATE_TYPES = {
     "informational",
 }
 _MODEL_REQUEST_KEY_MAX_BYTES = 1024
+_VERIFIED_HARD_OPTOUT_EVIDENCE_CAPABILITY = object()
 
 
 class CoordinatorMode(str, Enum):
@@ -340,13 +346,27 @@ def _thaw_json(value: Any) -> Any:
 class _VerifiedHardOptoutEvidence:
     evidence: Mapping[str, Any]
 
-    def __init__(self, *, evidence: Mapping[str, Any]):
+    def __init__(self, *, evidence: Mapping[str, Any], capability=None):
+        if capability is not _VERIFIED_HARD_OPTOUT_EVIDENCE_CAPABILITY:
+            raise SourceCoordinatorConfigError(
+                "verified hard opt-out evidence requires coordinator capability"
+            )
         if type(evidence) is not dict:
             raise SourceCoordinatorConfigError(
                 "verified hard opt-out evidence must be an exact mapping"
             )
         _validate_exact_json(evidence, active_containers=set())
         object.__setattr__(self, "evidence", _freeze_json(deepcopy(evidence)))
+
+
+def _mint_verified_hard_optout_evidence(
+    *,
+    evidence: Mapping[str, Any],
+) -> _VerifiedHardOptoutEvidence:
+    return _VerifiedHardOptoutEvidence(
+        evidence=evidence,
+        capability=_VERIFIED_HARD_OPTOUT_EVIDENCE_CAPABILITY,
+    )
 
 
 @dataclass(frozen=True)
@@ -649,14 +669,39 @@ def _normalize_complete_proposal(
         complete_proposal,
         field_name="complete proposal",
     )
+    if (
+        set(normalized) != _COMPLETE_PROPOSAL_FIELDS
+        or type(normalized.get("schemaVersion")) is not int
+        or normalized.get("schemaVersion") != _CLASSIFICATION_SNAPSHOT_SCHEMA_VERSION
+        or type(normalized.get("transitionCandidates")) is not list
+        or type(normalized.get("ordinaryObligations")) is not list
+    ):
+        raise SourceCoordinatorConfigError(
+            "complete proposal schema is unsupported"
+        )
     normalized["transitionCandidates"] = _sorted_semantic_items(
-        normalized.get("transitionCandidates", []),
+        normalized["transitionCandidates"],
         field_name="transition candidates",
     )
     normalized["ordinaryObligations"] = _sorted_semantic_items(
-        normalized.get("ordinaryObligations", []),
+        normalized["ordinaryObligations"],
         field_name="ordinary obligations",
     )
+    legal_transition_types = {
+        "contact_optout",
+        *_TERMINAL_CANDIDATE_TYPES,
+        *_HUMAN_CANDIDATE_TYPES,
+    }
+    for candidate in normalized["transitionCandidates"]:
+        if _candidate_type(candidate) not in legal_transition_types:
+            raise SourceCoordinatorConfigError(
+                "classification candidate is stored in an illegal lane"
+            )
+    for obligation in normalized["ordinaryObligations"]:
+        if _candidate_type(obligation) not in _ORDINARY_CANDIDATE_TYPES:
+            raise SourceCoordinatorConfigError(
+                "classification obligation is stored in an illegal lane"
+            )
     return normalized
 
 
@@ -1772,41 +1817,47 @@ class SourceCoordinator:
             classification_input,
             field_name="classification input",
         )
-        if self._hard_optout_verifier is None:
-            return None
-        try:
-            verified = self._hard_optout_verifier(
-                _freeze_json(deepcopy(input_copy))
-            )
-        except SourceCoordinatorError:
-            raise
-        except Exception as verifier_error:
-            raise SourceCoordinatorAmbiguous(
-                "hard opt-out verifier failed"
-            ) from verifier_error
-        if verified is None:
-            return None
-        if type(verified) is not _VerifiedHardOptoutEvidence:
-            raise SourceCoordinatorConfigError(
-                "hard opt-out verifier returned an untrusted result"
-            )
-        deterministic_evidence = _thaw_json(verified.evidence)
         classification_input_hash = canonical_json_hash(input_copy)
-        complete_proposal = _deterministic_hard_optout_proposal(
-            deterministic_evidence
-        )
-        material = _build_classification_snapshot_material(
-            canonical_source_id=canonical_source_id,
-            classification_input_hash=classification_input_hash,
-            model_request_key=None,
-            complete_proposal=complete_proposal,
-            proposal_evidence=None,
-            deterministic_evidence=deterministic_evidence,
-        )
         identity_ref, classification_ref = self._classification_refs(
             user_id=user_id,
             canonical_source_id=canonical_source_id,
         )
+
+        def invoke_verifier():
+            if self._hard_optout_verifier is None:
+                return None
+            try:
+                verified_result = self._hard_optout_verifier(
+                    _freeze_json(deepcopy(input_copy))
+                )
+            except SourceCoordinatorError:
+                raise
+            except Exception as verifier_error:
+                raise SourceCoordinatorAmbiguous(
+                    "hard opt-out verifier failed"
+                ) from verifier_error
+            if (
+                verified_result is not None
+                and type(verified_result) is not _VerifiedHardOptoutEvidence
+            ):
+                raise SourceCoordinatorConfigError(
+                    "hard opt-out verifier returned an untrusted result"
+                )
+            return verified_result
+
+        def material_from_verified(verified_result):
+            deterministic_evidence = _thaw_json(verified_result.evidence)
+            complete_proposal = _deterministic_hard_optout_proposal(
+                deterministic_evidence
+            )
+            return _build_classification_snapshot_material(
+                canonical_source_id=canonical_source_id,
+                classification_input_hash=classification_input_hash,
+                model_request_key=None,
+                complete_proposal=complete_proposal,
+                proposal_evidence=None,
+                deterministic_evidence=deterministic_evidence,
+            )
 
         def prepare(transaction):
             identity_before = self._require_source_identity_snapshot(
@@ -1831,14 +1882,28 @@ class SourceCoordinator:
                 raise ClassificationClaimConflict(
                     "classification claim coordinates do not match"
                 )
+            now = self._current_time()
             if before["classificationState"] == "snapshot_ready":
                 if (
                     before["classificationInputHash"] != classification_input_hash
                     or before["modelRequestState"] != "not_applicable"
-                    or any(
-                        before.get(field) != value
-                        for field, value in material.items()
+                ):
+                    raise ClassificationSnapshotConflict(
+                        "deterministic snapshot retry differs from authority"
                     )
+                if self._hard_optout_verifier is None:
+                    raise ClassificationSnapshotConflict(
+                        "deterministic evidence verifier is unavailable on retry"
+                    )
+                verified = invoke_verifier()
+                if verified is None:
+                    raise ClassificationSnapshotConflict(
+                        "deterministic evidence disappeared on retry"
+                    )
+                material = material_from_verified(verified)
+                if any(
+                    before.get(field) != value
+                    for field, value in material.items()
                 ):
                     raise ClassificationSnapshotConflict(
                         "deterministic snapshot retry differs from authority"
@@ -1855,11 +1920,21 @@ class SourceCoordinator:
                 raise ClassificationRequestAmbiguous(
                     "model request state blocks deterministic classification"
                 )
-            now = self._current_time()
             if before["leaseExpiresAt"] <= now:
                 raise ClassificationClaimExpired(
                     "classification claim expired before deterministic capture"
                 )
+            verified = invoke_verifier()
+            if verified is None:
+                return _ClassificationTransactionPlan(
+                    result=None,
+                    identity_ref=identity_ref,
+                    identity_data=identity_before,
+                    classification_ref=classification_ref,
+                    before_data=before,
+                    expected_data=before,
+                )
+            material = material_from_verified(verified)
             expected = deepcopy(before)
             expected.update(
                 {
@@ -1931,6 +2006,90 @@ class SourceCoordinator:
             "classification snapshot is not ready"
         )
 
+    def _recover_expired_classification_request(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        classification_input_hash: str,
+    ) -> ClassificationSnapshot:
+        identity_ref, classification_ref = self._classification_refs(
+            user_id=user_id,
+            canonical_source_id=canonical_source_id,
+        )
+
+        def prepare(transaction):
+            identity_before = self._require_source_identity_snapshot(
+                identity_ref.get(transaction=transaction),
+                canonical_source_id=canonical_source_id,
+            )
+            before = _snapshot_data(
+                classification_ref.get(transaction=transaction)
+            )
+            if before is None:
+                raise ClassificationSnapshotNotReady(
+                    "classification authority disappeared during recovery"
+                )
+            _validate_classification_document(
+                before,
+                canonical_source_id=canonical_source_id,
+            )
+            if (
+                before.get("classificationInputHash") is not None
+                and before["classificationInputHash"] != classification_input_hash
+            ):
+                raise ClassificationInputConflict(
+                    "classification input conflicts with request authority"
+                )
+            state = before["classificationState"]
+            if state == "snapshot_ready":
+                return _ClassificationTransactionPlan(
+                    result=_classification_snapshot_from_data(before),
+                    identity_ref=identity_ref,
+                    identity_data=identity_before,
+                    classification_ref=classification_ref,
+                    before_data=before,
+                    expected_data=before,
+                    ambiguous_error_type=ClassificationRequestAmbiguous,
+                )
+            if state == "classification_request_ambiguous":
+                raise ClassificationRequestAmbiguous(
+                    "classification request requires operator resolution"
+                )
+            if state != "request_started":
+                raise ClassificationSnapshotNotReady(
+                    "classification request is no longer started"
+                )
+            now = self._current_time()
+            if before["leaseExpiresAt"] > now:
+                raise ClassificationRequestAmbiguous(
+                    "classification request is still active"
+                )
+            expected = deepcopy(before)
+            expected.update(
+                {
+                    "classificationState": "classification_request_ambiguous",
+                    "modelRequestState": "ambiguous",
+                    "updatedAt": now,
+                }
+            )
+            transaction.update(classification_ref, expected)
+            return _ClassificationTransactionPlan(
+                result=_DeferredClassificationError(
+                    ClassificationRequestAmbiguous(
+                        "expired classification request requires operator resolution"
+                    )
+                ),
+                identity_ref=identity_ref,
+                identity_data=identity_before,
+                classification_ref=classification_ref,
+                before_data=before,
+                expected_data=expected,
+                ambiguous_error_type=ClassificationRequestAmbiguous,
+            )
+
+        return self._run_classification_transaction(prepare)
+
     def require_authoritative_classification_snapshot(
         self,
         *,
@@ -1978,6 +2137,12 @@ class SourceCoordinator:
                 user_id=user_id,
                 canonical_source_id=canonical_source_id,
                 expected_classification_input_hash=classification_input_hash,
+            )
+        except ClassificationRequestAmbiguous:
+            return self._recover_expired_classification_request(
+                user_id=user_id,
+                canonical_source_id=canonical_source_id,
+                classification_input_hash=classification_input_hash,
             )
         except ClassificationSnapshotNotReady:
             pass

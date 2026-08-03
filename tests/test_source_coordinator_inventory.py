@@ -28,6 +28,15 @@ DRAFT_DELETE_EMAIL_PATH = "email_automation/email.py"
 SOURCE_ADMISSION_METHOD = "admit_or_repair_source_identity"
 SOURCE_ADMISSION_PRIVATE_ENVELOPE = "_SourceAdmissionEnvelope"
 SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE = "_VerifiedHardOptoutEvidence"
+SOURCE_CLASSIFICATION_PRIVATE_MINT = "_mint_verified_hard_optout_evidence"
+SOURCE_CLASSIFICATION_PRIVATE_CAPABILITY = (
+    "_VERIFIED_HARD_OPTOUT_EVIDENCE_CAPABILITY"
+)
+SOURCE_CLASSIFICATION_PRIVATE_NAMES = {
+    SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE,
+    SOURCE_CLASSIFICATION_PRIVATE_MINT,
+    SOURCE_CLASSIFICATION_PRIVATE_CAPABILITY,
+}
 SOURCE_CLASSIFICATION_ORCHESTRATOR = "classify_source_once"
 SOURCE_ADMISSION_ALLOWED_ADAPTERS = {
     ("email_automation/processing.py", "process_inbox_message"),
@@ -181,13 +190,15 @@ def _source_coordinator_forbidden_imports(tree):
 _REFLECTIVE_ACCESS_NAMES = {
     "getattr",
     "__getattribute__",
+    "__dict__",
     "attrgetter",
     "methodcaller",
+    "vars",
 }
 _PROTECTED_REFLECTION_NAMES = {
     SOURCE_ADMISSION_METHOD,
     SOURCE_ADMISSION_PRIVATE_ENVELOPE,
-    SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE,
+    *SOURCE_CLASSIFICATION_PRIVATE_NAMES,
 }
 
 
@@ -283,17 +294,17 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
         ):
             self._record(node, "dynamic private admission envelope reference")
             self._recorded_reflection_names.add(SOURCE_ADMISSION_PRIVATE_ENVELOPE)
-        if (
-            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
-            and SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
-            in self._reflectively_assembled_names
-            and SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
-            not in self._recorded_reflection_names
-        ):
-            self._record(node, "dynamic private classification evidence reference")
-            self._recorded_reflection_names.add(
-                SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
-            )
+        if self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix():
+            for private_name in sorted(SOURCE_CLASSIFICATION_PRIVATE_NAMES):
+                if (
+                    private_name in self._reflectively_assembled_names
+                    and private_name not in self._recorded_reflection_names
+                ):
+                    self._record(
+                        node,
+                        "dynamic private classification authority reference",
+                    )
+                    self._recorded_reflection_names.add(private_name)
 
     def visit_FunctionDef(self, node):
         if (
@@ -306,6 +317,11 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
             and node.name == SOURCE_ADMISSION_METHOD
         ):
             self._record(node, "admission method definition/propagation")
+        if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and node.name in SOURCE_CLASSIFICATION_PRIVATE_NAMES
+        ):
+            self._record(node, "private classification authority definition")
         _visit_function_metadata(self, node)
         self._function_scopes.append(node.name)
         try:
@@ -324,9 +340,9 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
             self._record(node, "private admission envelope definition")
         if (
             self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
-            and node.name == SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
+            and node.name in SOURCE_CLASSIFICATION_PRIVATE_NAMES
         ):
-            self._record(node, "private classification evidence definition")
+            self._record(node, "private classification authority definition")
         _visit_class_metadata(self, node)
         self._class_depth += 1
         try:
@@ -374,8 +390,8 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
                 self._record(node, "private admission envelope import")
             if imported.name == SOURCE_ADMISSION_METHOD:
                 self._record(node, "admission method import/propagation")
-            if imported.name == SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE:
-                self._record(node, "private classification evidence import")
+            if imported.name in SOURCE_CLASSIFICATION_PRIVATE_NAMES:
+                self._record(node, "private classification authority import")
 
     def visit_Call(self, node):
         protected_reference = (
@@ -401,9 +417,9 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
             self._record(node, "private admission envelope reference")
         if (
             self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
-            and node.id == SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
+            and node.id in SOURCE_CLASSIFICATION_PRIVATE_NAMES
         ):
-            self._record(node, "private classification evidence reference")
+            self._record(node, "private classification authority reference")
         if (
             node.id == SOURCE_ADMISSION_METHOD
             and id(node) not in self._direct_call_references
@@ -420,9 +436,9 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
             self._record(node, "private admission envelope attribute")
         if (
             self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
-            and node.attr == SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
+            and node.attr in SOURCE_CLASSIFICATION_PRIVATE_NAMES
         ):
-            self._record(node, "private classification evidence attribute")
+            self._record(node, "private classification authority attribute")
         if (
             node.attr == SOURCE_ADMISSION_METHOD
             and id(node) not in self._direct_call_references
@@ -440,9 +456,9 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
             self._record(node, "dynamic private admission envelope reference")
         if (
             self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
-            and node.value == SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
+            and node.value in SOURCE_CLASSIFICATION_PRIVATE_NAMES
         ):
-            self._record(node, "dynamic private classification evidence reference")
+            self._record(node, "dynamic private classification authority reference")
         if node.value == SOURCE_ADMISSION_METHOD:
             self._record(node, "dynamic admission method reference")
 
@@ -1203,6 +1219,33 @@ class InventoryContractTests(unittest.TestCase):
                 "value = getattr(coordinator, name)"
             ),
             "spoofed definition": "class _VerifiedHardOptoutEvidence: pass",
+            "module dictionary fragmented lookup": (
+                "prefix = '_VerifiedHard'\n"
+                "suffix = 'OptoutEvidence'\n"
+                "value = coordinator.__dict__[prefix + suffix]"
+            ),
+            "vars fragmented lookup": (
+                "prefix = '_VerifiedHard'\n"
+                "namespace = vars(coordinator)\n"
+                "value = namespace[prefix + 'OptoutEvidence']"
+            ),
+            "dictionary propagation": (
+                "namespace = coordinator.__dict__\n"
+                "prefix = '_VerifiedHard'\n"
+                "constructor = namespace[prefix + 'OptoutEvidence']\n"
+                "value = constructor({})"
+            ),
+            "private mint": (
+                "value = coordinator._mint_verified_hard_optout_evidence"
+            ),
+            "fragmented private mint": (
+                "prefix = '_mint_verified_'\n"
+                "name = prefix + 'hard_optout_evidence'\n"
+                "value = vars(coordinator)[name]"
+            ),
+            "private capability": (
+                "value = coordinator._VERIFIED_HARD_OPTOUT_EVIDENCE_CAPABILITY"
+            ),
         }
         for case, source in mutations.items():
             with self.subTest(case=case):

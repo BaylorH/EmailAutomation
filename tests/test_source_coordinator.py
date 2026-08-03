@@ -1328,9 +1328,39 @@ class ClassificationTests(unittest.TestCase):
             lambda: self.classify(classifier),
         )
         self.assertEqual(0, calls)
-        self.assertIn(
+        self.assertEqual(
+            "classification_request_ambiguous",
             self.classification_data()["classificationState"],
-            {"request_started", "classification_request_ambiguous"},
+        )
+        self.assertEqual("ambiguous", self.classification_data()["modelRequestState"])
+
+    def test_expired_started_request_apply_then_raise_uses_exact_readback(self):
+        claim = self.claim()
+        self.start(claim)
+        self.clock.advance(seconds=61)
+        self.fake.apply_then_raise_next_commit = RuntimeError("unknown commit")
+        calls = 0
+
+        def classifier():
+            nonlocal calls
+            calls += 1
+            raise AssertionError("expired request recovery called classifier")
+
+        self.assertErrorCode(
+            "classification_request_ambiguous",
+            lambda: self.classify(classifier),
+        )
+
+        self.assertEqual(0, calls)
+        stored = self.classification_data()
+        self.assertEqual(
+            "classification_request_ambiguous",
+            stored["classificationState"],
+        )
+        self.assertEqual("ambiguous", stored["modelRequestState"])
+        self.assertEqual(
+            1,
+            sum(event[0] == "commit_raised_after_apply" for event in self.fake.events),
         )
 
     def test_snapshot_apply_then_raise_is_accepted_by_exact_readback(self):
@@ -1390,6 +1420,111 @@ class ClassificationTests(unittest.TestCase):
         )
         self.assertEqual(before_data, self.fake.data)
         self.assertEqual(before_writes, self.write_events())
+
+    def test_complete_proposal_requires_exact_versioned_shape_and_legal_lanes(self):
+        invalid_proposals = {
+            "empty": {},
+            "missing transition list": {
+                "schemaVersion": 1,
+                "ordinaryObligations": [],
+            },
+            "missing ordinary list": {
+                "schemaVersion": 1,
+                "transitionCandidates": [],
+            },
+            "wrong schema": {
+                "schemaVersion": 2,
+                "transitionCandidates": [],
+                "ordinaryObligations": [],
+            },
+            "bool schema": {
+                "schemaVersion": True,
+                "transitionCandidates": [],
+                "ordinaryObligations": [],
+            },
+            "extra top-level field": {
+                "schemaVersion": 1,
+                "transitionCandidates": [],
+                "ordinaryObligations": [],
+                "winner": "none",
+            },
+            "ordinary item in transition lane": {
+                "schemaVersion": 1,
+                "transitionCandidates": [{"type": "field_update"}],
+                "ordinaryObligations": [],
+            },
+            "human item in ordinary lane": {
+                "schemaVersion": 1,
+                "transitionCandidates": [],
+                "ordinaryObligations": [{"type": "call_requested"}],
+            },
+            "hard item in ordinary lane": {
+                "schemaVersion": 1,
+                "transitionCandidates": [],
+                "ordinaryObligations": [{"type": "contact_optout"}],
+            },
+            "unknown ordinary item": {
+                "schemaVersion": 1,
+                "transitionCandidates": [],
+                "ordinaryObligations": [{"type": "unknown_work"}],
+            },
+        }
+
+        for case, proposal in invalid_proposals.items():
+            with self.subTest(case=case):
+                fake = FakeFirestore()
+                clock = MutableClock(FROZEN_NOW)
+                uuids = SequentialUUIDs()
+                coordinator = self.module.SourceCoordinator(
+                    fake,
+                    uuid_factory=uuids,
+                    now_factory=clock,
+                )
+                source = coordinator.admit_or_repair_source_identity(
+                    user_id="user-1",
+                    hydrated_message={"id": "graph-A"},
+                    evidence_kind="graph_hydration",
+                    thread_id="thread-1",
+                )
+                claim = coordinator.claim_source_classification(
+                    user_id="user-1",
+                    canonical_source_id=source.canonical_source_id,
+                    lease_seconds=60,
+                )
+                coordinator.record_classification_request_started(
+                    user_id="user-1",
+                    canonical_source_id=source.canonical_source_id,
+                    classification_epoch=claim.classification_epoch,
+                    classification_claim_id=claim.classification_claim_id,
+                    model_request_key="model-request-1",
+                    classification_input=CLASSIFICATION_INPUT,
+                )
+                before_data = deepcopy(fake.data)
+                before_writes = [
+                    event
+                    for event in fake.events
+                    if event[0] in {"create", "set", "update", "delete"}
+                ]
+
+                with self.assertRaises(self.module.SourceCoordinatorConfigError):
+                    coordinator.persist_complete_classification_snapshot(
+                        user_id="user-1",
+                        canonical_source_id=source.canonical_source_id,
+                        classification_epoch=claim.classification_epoch,
+                        classification_claim_id=claim.classification_claim_id,
+                        complete_proposal=proposal,
+                        proposal_evidence=MODEL_PROPOSAL_EVIDENCE,
+                    )
+
+                self.assertEqual(before_data, fake.data)
+                self.assertEqual(
+                    before_writes,
+                    [
+                        event
+                        for event in fake.events
+                        if event[0] in {"create", "set", "update", "delete"}
+                    ],
+                )
 
     def test_snapshot_ready_recovery_calls_classifier_zero_times(self):
         first = self.classify(
@@ -1538,7 +1673,7 @@ class ClassificationTests(unittest.TestCase):
             nonlocal verifier_calls
             verifier_calls += 1
             self.assertEqual(CLASSIFICATION_INPUT, classification_input)
-            return self.module._VerifiedHardOptoutEvidence(
+            return self.module._mint_verified_hard_optout_evidence(
                 evidence={
                     "schemaVersion": 1,
                     "evidenceKind": "header_list_unsubscribe",
@@ -1574,6 +1709,245 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(
             "contact_optout",
             snapshot.complete_proposal["transitionCandidates"][0]["type"],
+        )
+
+    def test_verified_evidence_requires_module_private_mint_capability(self):
+        evidence = {
+            "schemaVersion": 1,
+            "evidenceKind": "header_list_unsubscribe",
+            "evidenceHash": "b" * 64,
+        }
+        with self.assertRaises(self.module.SourceCoordinatorConfigError):
+            self.module._VerifiedHardOptoutEvidence(evidence=evidence)
+        self.assertTrue(
+            hasattr(self.module, "_mint_verified_hard_optout_evidence"),
+            "reviewed verified-evidence mint is absent",
+        )
+        verified = self.module._mint_verified_hard_optout_evidence(
+            evidence=evidence
+        )
+        self.assertIs(type(verified), self.module._VerifiedHardOptoutEvidence)
+
+    def test_deterministic_no_match_validates_authority_inside_one_transaction(self):
+        observations = []
+
+        def verifier(classification_input):
+            observations.append(tuple(self.fake.events))
+            return None
+
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            hard_optout_verifier=verifier,
+        )
+        claim = self.claim()
+        self.fake.events.clear()
+
+        result = self.coordinator.persist_deterministic_classification_snapshot(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            classification_epoch=claim.classification_epoch,
+            classification_claim_id=claim.classification_claim_id,
+            classification_input=CLASSIFICATION_INPUT,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(1, len(observations))
+        observed_events = observations[0]
+        self.assertEqual(1, sum(event[0] == "transaction_began" for event in observed_events))
+        self.assertEqual(
+            [
+                f"users/user-1/sourceIdentities/{self.source_id}",
+                self.classification_path,
+            ],
+            [event[1] for event in observed_events if event[0] == "get"],
+        )
+        self.assertEqual([], self.write_events())
+        self.assertEqual("claimed", self.classification_data()["classificationState"])
+
+    def test_invalid_deterministic_claims_never_invoke_verifier(self):
+        verifier_calls = 0
+
+        def verifier(classification_input):
+            nonlocal verifier_calls
+            verifier_calls += 1
+            return self.module._mint_verified_hard_optout_evidence(
+                evidence={
+                    "schemaVersion": 1,
+                    "evidenceKind": "header_list_unsubscribe",
+                    "evidenceHash": "b" * 64,
+                }
+            )
+
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            hard_optout_verifier=verifier,
+        )
+        expired = self.claim()
+        self.clock.advance(seconds=61)
+        self.assertErrorCode(
+            "classification_claim_expired",
+            lambda: self.coordinator.persist_deterministic_classification_snapshot(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+                classification_epoch=expired.classification_epoch,
+                classification_claim_id=expired.classification_claim_id,
+                classification_input=CLASSIFICATION_INPUT,
+            ),
+        )
+        self.assertEqual(0, verifier_calls)
+
+        current = self.claim()
+        self.assertErrorCode(
+            "classification_claim_conflict",
+            lambda: self.coordinator.persist_deterministic_classification_snapshot(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+                classification_epoch=expired.classification_epoch,
+                classification_claim_id=expired.classification_claim_id,
+                classification_input=CLASSIFICATION_INPUT,
+            ),
+        )
+        self.assertEqual(0, verifier_calls)
+        self.assertEqual(2, current.classification_epoch)
+
+        missing_identity_fake = FakeFirestore()
+        missing_identity_coordinator = self.module.SourceCoordinator(
+            missing_identity_fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            hard_optout_verifier=verifier,
+        )
+        self.assertErrorCode(
+            "source_identity_missing",
+            lambda: missing_identity_coordinator.persist_deterministic_classification_snapshot(
+                user_id="user-1",
+                canonical_source_id="missing-source",
+                classification_epoch=1,
+                classification_claim_id="missing-claim",
+                classification_input=CLASSIFICATION_INPUT,
+            ),
+        )
+        self.assertEqual(0, verifier_calls)
+
+    def test_deterministic_snapshot_retry_verifies_exact_evidence_after_input_gate(self):
+        verifier_calls = 0
+
+        def verifier(classification_input):
+            nonlocal verifier_calls
+            verifier_calls += 1
+            return self.module._mint_verified_hard_optout_evidence(
+                evidence={
+                    "schemaVersion": 1,
+                    "evidenceKind": "header_list_unsubscribe",
+                    "evidenceHash": "b" * 64,
+                }
+            )
+
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            hard_optout_verifier=verifier,
+        )
+        claim = self.claim()
+        first = self.coordinator.persist_deterministic_classification_snapshot(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            classification_epoch=claim.classification_epoch,
+            classification_claim_id=claim.classification_claim_id,
+            classification_input=CLASSIFICATION_INPUT,
+        )
+        writes_after_first = list(self.write_events())
+
+        exact_retry = self.coordinator.persist_deterministic_classification_snapshot(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            classification_epoch=claim.classification_epoch,
+            classification_claim_id=claim.classification_claim_id,
+            classification_input=CLASSIFICATION_INPUT,
+        )
+
+        self.assertEqual(first, exact_retry)
+        self.assertEqual(2, verifier_calls)
+        self.assertEqual(writes_after_first, self.write_events())
+
+        self.assertErrorCode(
+            "classification_snapshot_conflict",
+            lambda: self.coordinator.persist_deterministic_classification_snapshot(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+                classification_epoch=claim.classification_epoch,
+                classification_claim_id=claim.classification_claim_id,
+                classification_input={**CLASSIFICATION_INPUT, "drift": True},
+            ),
+        )
+        self.assertEqual(2, verifier_calls)
+        self.assertEqual(writes_after_first, self.write_events())
+
+    def test_expired_deterministic_snapshot_retry_still_verifies_evidence(self):
+        evidence_hash = "b" * 64
+        verifier_calls = 0
+
+        def verifier(classification_input):
+            nonlocal verifier_calls
+            verifier_calls += 1
+            return self.module._mint_verified_hard_optout_evidence(
+                evidence={
+                    "schemaVersion": 1,
+                    "evidenceKind": "header_list_unsubscribe",
+                    "evidenceHash": evidence_hash,
+                }
+            )
+
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            hard_optout_verifier=verifier,
+        )
+        claim = self.claim()
+        self.coordinator.persist_deterministic_classification_snapshot(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            classification_epoch=claim.classification_epoch,
+            classification_claim_id=claim.classification_claim_id,
+            classification_input=CLASSIFICATION_INPUT,
+        )
+        self.clock.advance(seconds=61)
+        evidence_hash = "c" * 64
+        before_writes = list(self.write_events())
+
+        self.assertErrorCode(
+            "classification_snapshot_conflict",
+            lambda: self.coordinator.persist_deterministic_classification_snapshot(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+                classification_epoch=claim.classification_epoch,
+                classification_claim_id=claim.classification_claim_id,
+                classification_input=CLASSIFICATION_INPUT,
+            ),
+        )
+        self.assertEqual(2, verifier_calls)
+        self.assertEqual(before_writes, self.write_events())
+
+        coordinator_without_verifier = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+        )
+        self.assertErrorCode(
+            "classification_snapshot_conflict",
+            lambda: coordinator_without_verifier.persist_deterministic_classification_snapshot(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+                classification_epoch=claim.classification_epoch,
+                classification_claim_id=claim.classification_claim_id,
+                classification_input=CLASSIFICATION_INPUT,
+            ),
         )
 
     def test_model_evidence_cannot_assert_deterministic_hard_optout(self):
@@ -1631,7 +2005,6 @@ class ClassificationTests(unittest.TestCase):
                 {"type": "field_update", "field": "stage", "value": "warm"},
                 {"type": "informational", "message": "retained"},
             ],
-            "orderSensitiveNestedData": {"steps": ["first", "second"]},
         }
 
         def freeze(candidate):
