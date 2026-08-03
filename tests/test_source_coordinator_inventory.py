@@ -11,7 +11,9 @@ DRAFT_DELETE_MANIFEST_PATH = (
     REPO_ROOT / "tests" / "fixtures" / "graph_draft_delete_callers.json"
 )
 DRAFT_DELETE_HELPER_NAME = "_delete_graph_reply_draft"
+DRAFT_DELETE_EMAIL_PACKAGE = "email_automation"
 DRAFT_DELETE_EMAIL_MODULE = "email_automation.email"
+DRAFT_DELETE_EMAIL_MODULE_NAME = "email"
 DRAFT_DELETE_EMAIL_PATH = Path("email_automation/email.py").as_posix()
 
 EXPECTED_DRAFT_DELETE_CALLERS = Counter(
@@ -35,15 +37,17 @@ EXPECTED_LEGACY_MARKER_DEFINITIONS = Counter(
 )
 
 _HELPER_BINDING = "helper"
+_EMAIL_PACKAGE_BINDING = "email_package"
 _EMAIL_MODULE_BINDING = "email_module"
 _NONHELPER_BINDING = "nonhelper"
 _AMBIGUOUS_BINDING = "ambiguous"
 
 # Bounded binding contract: assignment results are helper, nonhelper, or
-# ambiguous. The email-module marker is provenance used only to resolve the
-# exact helper attribute. Unsupported helper-derived expressions and
-# destructuring become ambiguous and fail the inventory deterministically;
-# this scanner does not attempt general runtime inference.
+# ambiguous. The email-package and email-module markers are provenance used
+# only to resolve the exact module and helper attributes. Unsupported
+# helper-derived expressions and destructuring become ambiguous and fail the
+# inventory deterministically; this scanner does not attempt general runtime
+# inference.
 
 
 class DraftDeleteBindingInventoryError(AssertionError):
@@ -151,7 +155,10 @@ class _ScopeBindingCollector(ast.NodeVisitor):
                 and alias.name == DRAFT_DELETE_HELPER_NAME
             ):
                 self._add_binding(bound_name, _HELPER_BINDING)
-            elif imported_module == "email_automation" and alias.name == "email":
+            elif (
+                imported_module == DRAFT_DELETE_EMAIL_PACKAGE
+                and alias.name == DRAFT_DELETE_EMAIL_MODULE_NAME
+            ):
                 self._add_binding(bound_name, _EMAIL_MODULE_BINDING)
             else:
                 self._add_binding(bound_name, _NONHELPER_BINDING)
@@ -159,8 +166,13 @@ class _ScopeBindingCollector(ast.NodeVisitor):
     def visit_Import(self, node):
         for alias in node.names:
             if alias.name == DRAFT_DELETE_EMAIL_MODULE:
-                bound_name = alias.asname or alias.name
-                self._add_binding(bound_name, _EMAIL_MODULE_BINDING)
+                if alias.asname:
+                    self._add_binding(alias.asname, _EMAIL_MODULE_BINDING)
+                else:
+                    self._add_binding(
+                        DRAFT_DELETE_EMAIL_PACKAGE,
+                        _EMAIL_PACKAGE_BINDING,
+                    )
             else:
                 bound_name = alias.asname or alias.name.split(".", 1)[0]
                 self._add_binding(bound_name, _NONHELPER_BINDING)
@@ -232,7 +244,12 @@ def _lookup_binding_states(name, scoped_bindings):
 def _has_helper_provenance(states):
     return bool(
         states
-        & {_HELPER_BINDING, _EMAIL_MODULE_BINDING, _AMBIGUOUS_BINDING}
+        & {
+            _HELPER_BINDING,
+            _EMAIL_PACKAGE_BINDING,
+            _EMAIL_MODULE_BINDING,
+            _AMBIGUOUS_BINDING,
+        }
     )
 
 
@@ -276,6 +293,21 @@ def _helper_reference_status(node, scoped_bindings):
 def _expression_binding_states(node, scoped_bindings):
     if isinstance(node, ast.Name):
         return _lookup_binding_states(node.id, scoped_bindings)
+    if (
+        isinstance(node, ast.Attribute)
+        and node.attr == DRAFT_DELETE_EMAIL_MODULE_NAME
+    ):
+        receiver_states = _expression_binding_states(
+            node.value,
+            scoped_bindings,
+        )
+        if not receiver_states:
+            return set()
+        if receiver_states == {_EMAIL_PACKAGE_BINDING}:
+            return {_EMAIL_MODULE_BINDING}
+        if receiver_states & {_EMAIL_PACKAGE_BINDING, _AMBIGUOUS_BINDING}:
+            return {_AMBIGUOUS_BINDING}
+        return {_NONHELPER_BINDING}
     if (
         isinstance(node, ast.Attribute)
         and node.attr == DRAFT_DELETE_HELPER_NAME
@@ -347,7 +379,11 @@ def _supported_binding_source_nodes(node, scoped_bindings):
     if node is None:
         return None
     states = _expression_binding_states(node, scoped_bindings)
-    if states not in ({_HELPER_BINDING}, {_EMAIL_MODULE_BINDING}):
+    if states not in (
+        {_HELPER_BINDING},
+        {_EMAIL_PACKAGE_BINDING},
+        {_EMAIL_MODULE_BINDING},
+    ):
         return None
 
     if isinstance(node, ast.Name):
@@ -507,7 +543,11 @@ def _analyze_scope_bindings(node, relative_path, scope_kind, outer_bindings):
         pending_assignments = unresolved
 
     for name, states in bindings.items():
-        helper_related = states & {_HELPER_BINDING, _EMAIL_MODULE_BINDING}
+        helper_related = states & {
+            _HELPER_BINDING,
+            _EMAIL_PACKAGE_BINDING,
+            _EMAIL_MODULE_BINDING,
+        }
         if _AMBIGUOUS_BINDING in states or (helper_related and len(states) > 1):
             raise DraftDeleteBindingInventoryError(
                 "unsupported or ambiguous draft delete binding "
@@ -839,6 +879,21 @@ def _in_memory_draft_delete_callers(source, relative_path):
 
 
 class InventoryScannerRegressionTests(unittest.TestCase):
+    def test_unaliased_email_module_import_call_is_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+import email_automation.email
+
+def cleanup():
+    email_automation.email._delete_graph_reply_draft()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/followup.py", "cleanup"): 1}),
+            callers,
+        )
+
     def test_named_expression_email_module_receiver_is_counted(self):
         callers = _in_memory_draft_delete_callers(
             """
