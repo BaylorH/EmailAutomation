@@ -349,6 +349,39 @@ def _expression_binding_states(node, scoped_bindings):
     return {_NONHELPER_BINDING}
 
 
+def _default_parameter_binding_states(default, outer_bindings):
+    states = _expression_binding_states(default, outer_bindings)
+    if states in ({_EMAIL_PACKAGE_BINDING}, {_EMAIL_MODULE_BINDING}):
+        return states
+    if _has_helper_provenance(states):
+        return {_AMBIGUOUS_BINDING}
+    return {_NONHELPER_BINDING}
+
+
+def _function_argument_bindings(arguments, outer_bindings):
+    bindings = {
+        name: {_NONHELPER_BINDING}
+        for name in _function_argument_names(arguments)
+    }
+
+    positional = list(arguments.posonlyargs) + list(arguments.args)
+    default_start = len(positional) - len(arguments.defaults)
+    defaulted_positional = positional[default_start:]
+    for argument, default in zip(defaulted_positional, arguments.defaults):
+        bindings[argument.arg] = _default_parameter_binding_states(
+            default,
+            outer_bindings,
+        )
+
+    for argument, default in zip(arguments.kwonlyargs, arguments.kw_defaults):
+        if default is not None:
+            bindings[argument.arg] = _default_parameter_binding_states(
+                default,
+                outer_bindings,
+            )
+    return bindings
+
+
 def _target_names(target):
     if isinstance(target, ast.Name):
         return [target.id]
@@ -510,8 +543,12 @@ def _analyze_scope_bindings(node, relative_path, scope_kind, outer_bindings):
         module_scope=scope_kind == "module",
     )
     if scope_kind == "function":
-        for argument_name in _function_argument_names(node.args):
-            collector._add_binding(argument_name, _NONHELPER_BINDING)
+        for argument_name, states in _function_argument_bindings(
+            node.args,
+            outer_bindings,
+        ).items():
+            for state in states:
+                collector._add_binding(argument_name, state)
     for statement in node.body:
         collector.visit(statement)
 
@@ -665,10 +702,7 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
         for default in defaults:
             self.visit(default)
 
-        bindings = {
-            name: {_NONHELPER_BINDING}
-            for name in _function_argument_names(node.args)
-        }
+        bindings = _function_argument_bindings(node.args, self.binding_stack)
         self.binding_stack.append(("function", bindings))
         self.visit(node.body)
         self.binding_stack.pop()
@@ -879,6 +913,36 @@ def _in_memory_draft_delete_callers(source, relative_path):
 
 
 class InventoryScannerRegressionTests(unittest.TestCase):
+    def test_email_module_default_parameter_call_is_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+import email_automation.email as email_module
+
+def cleanup(module=email_module):
+    module._delete_graph_reply_draft()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/followup.py", "cleanup"): 1}),
+            callers,
+        )
+
+    def test_email_package_default_parameter_call_is_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+import email_automation.email
+
+def cleanup(package=email_automation):
+    package.email._delete_graph_reply_draft()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/followup.py", "cleanup"): 1}),
+            callers,
+        )
+
     def test_unaliased_email_module_import_call_is_counted(self):
         callers = _in_memory_draft_delete_callers(
             """
