@@ -52,6 +52,14 @@ class HostileString(str):
     __hash__ = str.__hash__
 
 
+class JsonMappingSubclass(dict):
+    pass
+
+
+class JsonListSubclass(list):
+    pass
+
+
 class SequentialUUIDs:
     def __init__(self):
         self.calls = 0
@@ -180,6 +188,23 @@ class SourceCoordinatorContractTests(unittest.TestCase):
             ):
                 coordinator.canonical_json_hash(value)
 
+    def test_canonical_json_hash_rejects_non_exact_json_collision_shapes(self):
+        coordinator = self.coordinator
+        invalid_values = (
+            {1: "x"},
+            (1, 2),
+            {"nested": (1, 2)},
+            {"nested": JsonMappingSubclass({"key": "value"})},
+            {"nested": JsonListSubclass([1, 2])},
+            {"\ud800": "invalid surrogate key"},
+            {"value": "\ud800"},
+        )
+        for value in invalid_values:
+            with self.subTest(value=repr(value)), self.assertRaises(
+                coordinator.SourceCoordinatorConfigError
+            ):
+                coordinator.canonical_json_hash(value)
+
     def test_alias_normalization_preserves_opaque_case(self):
         coordinator = self.coordinator
         graph = coordinator.normalize_source_alias("graph", "  AbC+/=  ")
@@ -278,6 +303,19 @@ class SourceCoordinatorContractTests(unittest.TestCase):
 
 
 class SourceCoordinatorFakeTests(unittest.TestCase):
+    def test_document_references_reject_only_firestore_reserved_ids(self):
+        fake = FakeFirestore()
+        collection = fake.collection("items")
+        for document_id in ("__reserved__", "____"):
+            with self.subTest(document_id=document_id), self.assertRaises(
+                ValueError
+            ):
+                collection.document(document_id)
+
+        for document_id in ("___", "__partial_", "_partial__"):
+            with self.subTest(document_id=document_id):
+                self.assertEqual(document_id, collection.document(document_id).id)
+
     def test_create_preconditions_are_atomic(self):
         fake = FakeFirestore()
         existing = fake.collection("items").document("existing")
@@ -511,6 +549,54 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertEqual(before_data, self.fake.data)
         self.assertEqual(before_writes, self.write_events())
 
+    def test_same_owner_projection_absent_from_identity_is_explicitly_ambiguous(self):
+        source = self.admit({"id": "graph-A"})
+        rfc_alias = self.module.normalize_source_alias(
+            "internet_message_id",
+            "rfc-A@example.test",
+        )
+        rfc_key = self.module.source_alias_key("user-1", rfc_alias)
+        rfc_ref = (
+            self.fake.collection("users")
+            .document("user-1")
+            .collection("sourceAliases")
+            .document(rfc_key)
+        )
+        rfc_ref.create(
+            {
+                "schemaVersion": 1,
+                "sourceAliasKey": rfc_key,
+                "aliasType": "internet_message_id",
+                "normalizedValueHash": self.module.canonical_json_hash(
+                    {
+                        "schemaVersion": 1,
+                        "hashKind": "source-alias-normalized-value-v1",
+                        "aliasType": "internet_message_id",
+                        "normalizedValue": "rfc-A@example.test",
+                    }
+                ),
+                "canonicalSourceId": source.canonical_source_id,
+                "createdAt": FROZEN_NOW,
+            }
+        )
+        before_data = deepcopy(self.fake.data)
+        before_writes = list(self.write_events())
+
+        with self.assertRaisesRegex(
+            self.module.SourceCoordinatorAmbiguous,
+            "projection is absent from identity authority",
+        ) as raised:
+            self.admit(
+                {
+                    "id": "graph-A",
+                    "internetMessageId": "<rfc-A@example.test>",
+                }
+            )
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(before_data, self.fake.data)
+        self.assertEqual(before_writes, self.write_events())
+
     def test_conversation_and_internal_thread_ids_are_never_aliases(self):
         first = self.admit(
             {"id": "graph-A", "conversationId": "shared-routing-id"},
@@ -614,6 +700,101 @@ class SourceIdentityTests(unittest.TestCase):
             )
 
         self.assertEqual("source_coordinator_ambiguous", raised.exception.code)
+
+    def test_transaction_factory_failures_are_typed_without_starting_writes(self):
+        class RaisingTransactionFactory:
+            def __init__(self, error):
+                self.error = error
+                self.calls = []
+
+            def transaction(self, max_attempts=5):
+                self.calls.append(max_attempts)
+                raise self.error
+
+        cases = (
+            (
+                "provider failure",
+                RuntimeError("transaction factory unavailable"),
+                self.module.SourceCoordinatorRetryable,
+            ),
+            (
+                "typed failure",
+                self.module.SourceCoordinatorConfigError("typed factory error"),
+                self.module.SourceCoordinatorConfigError,
+            ),
+        )
+        for case, factory_error, expected_type in cases:
+            with self.subTest(case=case):
+                uuids = SequentialUUIDs()
+                firestore = RaisingTransactionFactory(factory_error)
+                coordinator = self.module.SourceCoordinator(
+                    firestore,
+                    uuid_factory=uuids,
+                    now_factory=lambda: FROZEN_NOW,
+                )
+                caught = None
+                try:
+                    coordinator.admit_or_repair_source_identity(
+                        user_id="user-1",
+                        hydrated_message={"id": "graph-A"},
+                        evidence_kind="graph_hydration",
+                        thread_id="thread-1",
+                    )
+                except Exception as exc:  # Assert taxonomy below without a raw error.
+                    caught = exc
+
+                self.assertIsInstance(caught, expected_type)
+                if isinstance(factory_error, self.module.SourceCoordinatorError):
+                    self.assertIs(factory_error, caught)
+                else:
+                    self.assertIs(factory_error, caught.__cause__)
+                self.assertEqual([1], firestore.calls)
+                self.assertEqual(0, uuids.calls)
+
+    def test_firestore_reserved_authority_ids_fail_before_writes(self):
+        cases = (
+            ("reserved user", "__user__", "source-0001", "thread-1"),
+            ("reserved source", "user-1", "__source__", "thread-1"),
+            ("reserved thread", "user-1", "source-0001", "__thread__"),
+        )
+        for case, user_id, source_id, thread_id in cases:
+            with self.subTest(case=case):
+                fake = FakeFirestore()
+                coordinator = self.module.SourceCoordinator(
+                    fake,
+                    uuid_factory=lambda: source_id,
+                    now_factory=lambda: FROZEN_NOW,
+                )
+                with self.assertRaises(self.module.SourceCoordinatorConfigError):
+                    coordinator.admit_or_repair_source_identity(
+                        user_id=user_id,
+                        hydrated_message={"id": "graph-A"},
+                        evidence_kind="graph_hydration",
+                        thread_id=thread_id,
+                    )
+                self.assertEqual({}, fake.data)
+                self.assertEqual(
+                    [],
+                    [
+                        event
+                        for event in fake.events
+                        if event[0] in {"create", "set", "update", "delete"}
+                    ],
+                )
+
+        opaque_fake = FakeFirestore()
+        opaque_coordinator = self.module.SourceCoordinator(
+            opaque_fake,
+            uuid_factory=lambda: "___",
+            now_factory=lambda: FROZEN_NOW,
+        )
+        opaque_result = opaque_coordinator.admit_or_repair_source_identity(
+            user_id="___",
+            hydrated_message={"id": "graph-A"},
+            evidence_kind="graph_hydration",
+            thread_id="___",
+        )
+        self.assertEqual("___", opaque_result.canonical_source_id)
 
     def test_disjoint_sources_are_never_guessed_together(self):
         graph = self.admit(

@@ -176,15 +176,83 @@ def _source_coordinator_forbidden_imports(tree):
     return forbidden
 
 
+_REFLECTIVE_ACCESS_NAMES = {
+    "getattr",
+    "__getattribute__",
+    "attrgetter",
+    "methodcaller",
+}
+_PROTECTED_REFLECTION_NAMES = {
+    SOURCE_ADMISSION_METHOD,
+    SOURCE_ADMISSION_PRIVATE_ENVELOPE,
+}
+
+
+def _is_reflective_attribute_reference(node):
+    return (
+        isinstance(node, ast.Name)
+        and node.id in _REFLECTIVE_ACCESS_NAMES
+    ) or (
+        isinstance(node, ast.Attribute)
+        and node.attr in _REFLECTIVE_ACCESS_NAMES
+    ) or (
+        isinstance(node, ast.ImportFrom)
+        and any(
+            imported.name in _REFLECTIVE_ACCESS_NAMES
+            for imported in node.names
+        )
+    )
+
+
+def _literal_fragments(tree):
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and type(node.value) is str
+        and node.value
+        and any(
+            node.value in protected_name
+            for protected_name in _PROTECTED_REFLECTION_NAMES
+        )
+    }
+
+
+def _can_segment_static_name(name, fragments):
+    reachable = {0}
+    for start in range(len(name)):
+        if start not in reachable:
+            continue
+        for fragment in fragments:
+            if name.startswith(fragment, start):
+                reachable.add(start + len(fragment))
+    return len(name) in reachable
+
+
+def _reflectively_assembled_protected_names(tree):
+    if not any(
+        _is_reflective_attribute_reference(node) for node in ast.walk(tree)
+    ):
+        return set()
+    fragments = _literal_fragments(tree)
+    return {
+        name
+        for name in _PROTECTED_REFLECTION_NAMES
+        if _can_segment_static_name(name, fragments)
+    }
+
+
 class _SourceAdmissionContractVisitor(ast.NodeVisitor):
     """Reject private-envelope access and non-adapter admission references."""
 
-    def __init__(self, relative_path):
+    def __init__(self, relative_path, reflectively_assembled_names):
         self.relative_path = Path(relative_path).as_posix()
         self.violations = []
         self._function_scopes = []
         self._class_depth = 0
         self._direct_call_references = set()
+        self._reflectively_assembled_names = reflectively_assembled_names
+        self._recorded_reflection_names = set()
 
     def _record(self, node, reason):
         self.violations.append((getattr(node, "lineno", 0), reason))
@@ -195,6 +263,23 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
             and (self.relative_path, tuple(self._function_scopes))
             in SOURCE_ADMISSION_ALLOWED_CALLABLE_SCOPES
         )
+
+    def _record_reflective_fragment_assembly(self, node):
+        if (
+            SOURCE_ADMISSION_METHOD in self._reflectively_assembled_names
+            and SOURCE_ADMISSION_METHOD not in self._recorded_reflection_names
+        ):
+            self._record(node, "dynamic admission method reference")
+            self._recorded_reflection_names.add(SOURCE_ADMISSION_METHOD)
+        if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and SOURCE_ADMISSION_PRIVATE_ENVELOPE
+            in self._reflectively_assembled_names
+            and SOURCE_ADMISSION_PRIVATE_ENVELOPE
+            not in self._recorded_reflection_names
+        ):
+            self._record(node, "dynamic private admission envelope reference")
+            self._recorded_reflection_names.add(SOURCE_ADMISSION_PRIVATE_ENVELOPE)
 
     def visit_FunctionDef(self, node):
         if (
@@ -241,16 +326,30 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
         finally:
             self._function_scopes.pop()
 
-    def visit_GeneratorExp(self, node):
+    def _visit_comprehension_scope(self, node):
         self._function_scopes.append(
-            f"<generator@{node.lineno}:{node.col_offset}>"
+            f"<{type(node).__name__.lower()}@{node.lineno}:{node.col_offset}>"
         )
         try:
             self.generic_visit(node)
         finally:
             self._function_scopes.pop()
 
+    def visit_GeneratorExp(self, node):
+        self._visit_comprehension_scope(node)
+
+    def visit_ListComp(self, node):
+        self._visit_comprehension_scope(node)
+
+    def visit_SetComp(self, node):
+        self._visit_comprehension_scope(node)
+
+    def visit_DictComp(self, node):
+        self._visit_comprehension_scope(node)
+
     def visit_ImportFrom(self, node):
+        if _is_reflective_attribute_reference(node):
+            self._record_reflective_fragment_assembly(node)
         for imported in node.names:
             if imported.name == SOURCE_ADMISSION_PRIVATE_ENVELOPE:
                 self._record(node, "private admission envelope import")
@@ -272,6 +371,8 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Name(self, node):
+        if _is_reflective_attribute_reference(node):
+            self._record_reflective_fragment_assembly(node)
         if (
             self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
             and node.id == SOURCE_ADMISSION_PRIVATE_ENVELOPE
@@ -284,6 +385,8 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
             self._record(node, "admission method propagation")
 
     def visit_Attribute(self, node):
+        if _is_reflective_attribute_reference(node):
+            self._record_reflective_fragment_assembly(node)
         if (
             self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
             and node.attr == SOURCE_ADMISSION_PRIVATE_ENVELOPE
@@ -309,8 +412,12 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
 
 
 def _source_admission_contract_violations(source, relative_path):
-    visitor = _SourceAdmissionContractVisitor(relative_path)
-    visitor.visit(ast.parse(source, filename=str(relative_path)))
+    tree = ast.parse(source, filename=str(relative_path))
+    visitor = _SourceAdmissionContractVisitor(
+        relative_path,
+        _reflectively_assembled_protected_names(tree),
+    )
+    visitor.visit(tree)
     return visitor.violations
 
 
@@ -1053,6 +1160,183 @@ class InventoryContractTests(unittest.TestCase):
                         source, "email_automation/processing.py"
                     )
                 )
+
+    def test_source_admission_gate_rejects_bounded_reflection_strings(self):
+        mutations = {
+            "concatenated admission": (
+                'name = "admit_or_repair_" + "source_identity"\n'
+                "getattr(coordinator, name)()"
+            ),
+            "propagated concatenation": (
+                'prefix = "admit_or_repair_"\n'
+                'suffix = "source_identity"\n'
+                "name = prefix + suffix\n"
+                "getattr(coordinator, name)()"
+            ),
+            "constant-only admission f-string": (
+                'name = f"{\'admit_or_repair_\'}{\'source_identity\'}"\n'
+                "getattr(coordinator, name)()"
+            ),
+            "formatted constant name": (
+                'suffix = "source_identity"\n'
+                'name = f"admit_or_repair_{suffix}"\n'
+                "builtins.getattr(coordinator, name)()"
+            ),
+            "concatenated private envelope": (
+                'name = "_SourceAdmission" + "Envelope"\n'
+                "Envelope = getattr(coordinator_module, name)"
+            ),
+            "ambiguous protected reassignment": (
+                'name = "admit_or_repair_" + "source_identity"\n'
+                "name = runtime_name\n"
+                "getattr(coordinator, name)()"
+            ),
+            "tuple destructured admission": (
+                'prefix, suffix = ("admit_or_repair_", "source_identity")\n'
+                "getattr(coordinator, prefix + suffix)()"
+            ),
+            "list destructured private envelope": (
+                '[prefix, suffix] = ["_SourceAdmission", "Envelope"]\n'
+                "getattr(coordinator_module, prefix + suffix)"
+            ),
+            "for-bound admission": (
+                'for prefix in ("admit_or_repair_",):\n'
+                ' getattr(coordinator, prefix + "source_identity")()'
+            ),
+            "comprehension-bound admission": (
+                '[getattr(coordinator, prefix + "source_identity")() '
+                'for prefix in ("admit_or_repair_",)]'
+            ),
+            "bounded conditional admission": (
+                'prefix = "admit_or_repair_" if enabled else "ordinary_"\n'
+                'getattr(coordinator, prefix + "source_identity")()'
+            ),
+            "candidate pressure preserves protected prefix": (
+                "\n".join(
+                    [*(f'name = "a{index:02d}"' for index in range(16)),
+                     'name = "admit_or_repair_"',
+                     'getattr(coordinator, name + "source_identity")()']
+                )
+            ),
+            "comprehension walrus binds containing scope": (
+                'name = "ordinary_"\n'
+                '[(name := "admit_or_repair_") for _ in (0,)]\n'
+                'getattr(coordinator, name + "source_identity")()'
+            ),
+            "class first iterable list comprehension": (
+                "class Hidden:\n"
+                ' prefix = "admit_or_repair_"\n'
+                ' values = [getattr(coordinator, name)() '
+                'for name in (prefix + "source_identity",)]'
+            ),
+            "class first iterable set comprehension": (
+                "class Hidden:\n"
+                ' prefix = "admit_or_repair_"\n'
+                ' values = {getattr(coordinator, name)() '
+                'for name in (prefix + "source_identity",)}'
+            ),
+            "class first iterable dict comprehension": (
+                "class Hidden:\n"
+                ' prefix = "admit_or_repair_"\n'
+                ' values = {name: getattr(coordinator, name)() '
+                'for name in (prefix + "source_identity",)}'
+            ),
+            "class first iterable private generator": (
+                "class Hidden:\n"
+                ' prefix = "_SourceAdmission"\n'
+                ' values = tuple(getattr(coordinator_module, name) '
+                'for name in (prefix + "Envelope",))'
+            ),
+            "conditional tuple destructuring": (
+                'prefix, suffix = (("admit_or_repair_", "source_identity") '
+                'if enabled else ("ordinary_", "callback"))\n'
+                'getattr(coordinator, prefix + suffix)()'
+            ),
+            "conditional for binding": (
+                'for prefix in (("admit_or_repair_",) '
+                'if enabled else ("ordinary_",)):\n'
+                ' getattr(coordinator, prefix + "source_identity")()'
+            ),
+            "conditional comprehension binding": (
+                '[getattr(coordinator, prefix + "source_identity")() '
+                'for prefix in (("admit_or_repair_",) '
+                'if enabled else ("ordinary_",))]'
+            ),
+            "imported getattr alias": (
+                "from builtins import getattr as read_attr\n"
+                'prefix = "admit_or_repair_"\n'
+                'read_attr(coordinator, prefix + "source_identity")()'
+            ),
+            "propagated getattr alias": (
+                "read_attr = getattr\n"
+                'prefix = "admit_or_repair_"\n'
+                'read_attr(coordinator, prefix + "source_identity")()'
+            ),
+            "imported attrgetter alias": (
+                "from operator import attrgetter as pick\n"
+                'prefix = "_SourceAdmission"\n'
+                'pick(prefix + "Envelope")(coordinator_module)'
+            ),
+            "imported methodcaller alias": (
+                "from operator import methodcaller as invoke\n"
+                'prefix = "admit_or_repair_"\n'
+                'invoke(prefix + "source_identity")(coordinator)'
+            ),
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_admission_contract_violations(
+                        source, "email_automation/unreviewed.py"
+                    )
+                )
+
+        benign = (
+            'prefix = "ordinary_"\n'
+            'suffix = "callback"\n'
+            "name = prefix + suffix\n"
+            "callback = getattr(coordinator, name)"
+        )
+        self.assertEqual(
+            [],
+            _source_admission_contract_violations(
+                benign, "email_automation/unreviewed.py"
+            ),
+        )
+        lexical_shadow = (
+            'prefix = "admit_or_repair_"\n'
+            "def run():\n"
+            ' prefix = "ordinary_"\n'
+            ' return getattr(coordinator, prefix + "source_identity")'
+        )
+        self.assertTrue(
+            _source_admission_contract_violations(
+                lexical_shadow, "email_automation/unreviewed.py"
+            )
+        )
+        nested_class_shadow = (
+            'name = "ordinary_"\n'
+            "class Outer:\n"
+            ' name = "admit_or_repair_"\n'
+            " class Inner:\n"
+            '  value = getattr(coordinator, name + "source_identity")'
+        )
+        self.assertTrue(
+            _source_admission_contract_violations(
+                nested_class_shadow, "email_automation/unreviewed.py"
+            )
+        )
+
+        reviewed_reflection = (
+            "def process_inbox_message():\n"
+            ' name = "admit_or_repair_" + "source_identity"\n'
+            " getattr(coordinator, name)()"
+        )
+        self.assertTrue(
+            _source_admission_contract_violations(
+                reviewed_reflection, "email_automation/processing.py"
+            )
+        )
 
     def test_source_admission_gate_allows_only_exact_reviewed_adapters(self):
         allowed = {

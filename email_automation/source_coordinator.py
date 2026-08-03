@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
@@ -131,6 +132,7 @@ def resolve_source_coordinator_mode(environ: Mapping[str, str]) -> CoordinatorMo
 
 
 def canonical_json_hash(value: Any) -> str:
+    _validate_exact_json(value, active_containers=set())
     try:
         encoded = json.dumps(
             value,
@@ -275,7 +277,12 @@ def _validate_document_id(value: str, *, field_name: str) -> None:
         raise SourceCoordinatorConfigError(
             f"{field_name} must be a non-empty string"
         )
-    if value in {".", ".."} or "/" in value or _contains_control_character(value):
+    if (
+        value in {".", ".."}
+        or "/" in value
+        or _contains_control_character(value)
+        or (len(value) >= 4 and value.startswith("__") and value.endswith("__"))
+    ):
         raise SourceCoordinatorConfigError(f"{field_name} is not a safe document id")
     try:
         encoded = value.encode("utf-8")
@@ -299,7 +306,13 @@ def _validate_thread_id(thread_id: str | None) -> str | None:
 
 
 def _validate_exact_json(value: Any, *, active_containers: set[int]) -> None:
-    if value is None or type(value) in {bool, int, float}:
+    if value is None or type(value) in {bool, int}:
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise SourceCoordinatorConfigError(
+                "hydrated message contains a non-finite number"
+            )
         return
     if type(value) is str:
         try:
@@ -355,8 +368,6 @@ def _build_source_admission_envelope(
         raise SourceCoordinatorConfigError(
             "source admission evidence kind is unsupported"
         )
-    _validate_exact_json(hydrated_message, active_containers=set())
-
     evidence_hash = canonical_json_hash(
         {
             "schemaVersion": _SOURCE_IDENTITY_SCHEMA_VERSION,
@@ -614,6 +625,14 @@ class SourceCoordinator:
                 retained_alias_data[key] = data
 
             supplied_by_key = {alias.key: alias for alias in envelope.aliases}
+            if any(
+                supplied_alias_data[key] is not None
+                and key not in descriptors_by_key
+                for key in supplied_by_key
+            ):
+                raise SourceCoordinatorAmbiguous(
+                    "source alias projection is absent from identity authority"
+                )
             overlapping_keys = set(supplied_by_key) & set(descriptors_by_key)
             if not overlapping_keys:
                 raise SourceAliasConflict(
@@ -761,7 +780,14 @@ class SourceCoordinator:
         if not envelope.aliases:
             raise SourceIdentityMissing("source identity requires a typed alias")
 
-        transaction = self._firestore.transaction(max_attempts=1)
+        try:
+            transaction = self._firestore.transaction(max_attempts=1)
+        except SourceCoordinatorError:
+            raise
+        except Exception as transaction_error:
+            raise SourceCoordinatorRetryable(
+                "source identity transaction is unavailable"
+            ) from transaction_error
         prepared_plan = None
 
         @transactional

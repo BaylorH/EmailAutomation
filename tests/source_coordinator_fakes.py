@@ -61,6 +61,11 @@ class FakeCollectionReference:
             type(document_id) is not str
             or not document_id
             or "/" in document_id
+            or (
+                len(document_id) >= 4
+                and document_id.startswith("__")
+                and document_id.endswith("__")
+            )
         ):
             raise ValueError("fake document id must be a non-empty string")
         return FakeDocumentReference(self._store, (*self._parts, document_id))
