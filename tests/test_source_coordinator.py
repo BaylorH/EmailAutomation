@@ -11,11 +11,34 @@ from datetime import datetime, timezone
 from tests.source_coordinator_fakes import (
     FakeDocumentSnapshot,
     FakeFirestore,
+    MutableClock,
 )
 
 
 MODULE_NAME = "email_automation.source_coordinator"
 FROZEN_NOW = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
+CLASSIFICATION_INPUT = {
+    "schemaVersion": 1,
+    "message": {
+        "from": "sender@example.test",
+        "subject": "Availability question",
+        "body": "Is the property still available?",
+    },
+}
+COMPLETE_PROPOSAL = {
+    "schemaVersion": 1,
+    "transitionCandidates": [
+        {"type": "needs_user_input", "reason": "availability_review"}
+    ],
+    "ordinaryObligations": [
+        {"type": "field_update", "field": "last_contacted"}
+    ],
+}
+MODEL_PROPOSAL_EVIDENCE = {
+    "schemaVersion": 1,
+    "evidenceKind": "model_capture",
+    "responseHash": "a" * 64,
+}
 
 
 def _load_source_coordinator(test_case):
@@ -1077,6 +1100,622 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertNotIn(second_only_key, retained_keys)
         self.assertEqual(writes_after_first, len(self.write_events()))
         self.assertEqual(2, len(self.alias_paths()))
+
+
+class ClassificationTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _load_source_coordinator(self)
+        required_types = (
+            "ClassificationClaim",
+            "ClassificationSnapshot",
+        )
+        required_methods = (
+            "claim_source_classification",
+            "record_classification_request_started",
+            "persist_complete_classification_snapshot",
+            "persist_deterministic_classification_snapshot",
+            "require_authoritative_classification_snapshot",
+            "classify_source_once",
+        )
+        for name in required_types:
+            self.assertTrue(
+                hasattr(self.module, name),
+                f"{name} is absent",
+            )
+        self.assertTrue(
+            hasattr(self.module, "SourceCoordinator"),
+            "SourceCoordinator is absent",
+        )
+        for name in required_methods:
+            self.assertTrue(
+                hasattr(self.module.SourceCoordinator, name),
+                f"SourceCoordinator.{name} is absent",
+            )
+
+        self.fake = FakeFirestore()
+        self.clock = MutableClock(FROZEN_NOW)
+        self.uuids = SequentialUUIDs()
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+        )
+        identity = self.coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={"id": "graph-A"},
+            evidence_kind="graph_hydration",
+            thread_id="thread-1",
+        )
+        self.source_id = identity.canonical_source_id
+        self.fake.events.clear()
+
+    @property
+    def classification_path(self):
+        return f"users/user-1/sourceClassifications/{self.source_id}"
+
+    def classification_data(self):
+        return self.fake.data[self.classification_path]
+
+    def write_events(self):
+        return [
+            event
+            for event in self.fake.events
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+
+    def assertErrorCode(self, expected_code, callable_):
+        with self.assertRaises(self.module.SourceCoordinatorError) as raised:
+            callable_()
+        self.assertEqual(expected_code, raised.exception.code)
+        return raised.exception
+
+    def claim(self, *, lease_seconds=60):
+        return self.coordinator.claim_source_classification(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            lease_seconds=lease_seconds,
+        )
+
+    def start(self, claim, *, classification_input=CLASSIFICATION_INPUT):
+        return self.coordinator.record_classification_request_started(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            classification_epoch=claim.classification_epoch,
+            classification_claim_id=claim.classification_claim_id,
+            model_request_key="model-request-1",
+            classification_input=classification_input,
+        )
+
+    def persist(self, claim, *, complete_proposal=COMPLETE_PROPOSAL):
+        return self.coordinator.persist_complete_classification_snapshot(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            classification_epoch=claim.classification_epoch,
+            classification_claim_id=claim.classification_claim_id,
+            complete_proposal=complete_proposal,
+            proposal_evidence=MODEL_PROPOSAL_EVIDENCE,
+        )
+
+    def classify(self, classifier, *, classification_input=CLASSIFICATION_INPUT):
+        return self.coordinator.classify_source_once(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            lease_seconds=60,
+            classification_input=classification_input,
+            classifier=classifier,
+        )
+
+    def test_first_claim_is_epoch_one_unique_and_does_not_start_model(self):
+        claim = self.claim()
+
+        self.assertIsInstance(claim, self.module.ClassificationClaim)
+        self.assertEqual(self.source_id, claim.canonical_source_id)
+        self.assertEqual(1, claim.classification_epoch)
+        self.assertNotEqual(self.source_id, claim.classification_claim_id)
+        self.assertGreater(claim.lease_expires_at, self.clock.current)
+        with self.assertRaises(FrozenInstanceError):
+            claim.classification_epoch = 2
+        stored = self.classification_data()
+        self.assertEqual("claimed", stored["classificationState"])
+        self.assertEqual("not_started", stored["modelRequestState"])
+        self.assertIsNone(stored["classificationInputHash"])
+        self.assertIsNone(stored["modelRequestKey"])
+
+    def test_expired_claim_before_request_start_gets_higher_epoch(self):
+        first = self.claim()
+        self.clock.advance(seconds=61)
+        second = self.claim()
+
+        self.assertEqual(2, second.classification_epoch)
+        self.assertNotEqual(
+            first.classification_claim_id,
+            second.classification_claim_id,
+        )
+        started = self.start(second)
+        self.assertTrue(started.newly_started)
+        self.assertErrorCode(
+            "classification_claim_conflict",
+            lambda: self.start(first),
+        )
+
+    def test_request_intent_is_committed_before_classifier_callback(self):
+        observations = []
+
+        def classifier():
+            stored = deepcopy(self.classification_data())
+            observations.append(stored)
+            return deepcopy(COMPLETE_PROPOSAL), deepcopy(MODEL_PROPOSAL_EVIDENCE)
+
+        snapshot = self.classify(classifier)
+
+        self.assertEqual(1, len(observations))
+        self.assertEqual("request_started", observations[0]["classificationState"])
+        self.assertEqual("started", observations[0]["modelRequestState"])
+        self.assertEqual(
+            self.module.canonical_json_hash(CLASSIFICATION_INPUT),
+            observations[0]["classificationInputHash"],
+        )
+        self.assertTrue(observations[0]["modelRequestKey"])
+        self.assertEqual(
+            self.module.canonical_json_hash(COMPLETE_PROPOSAL),
+            snapshot.complete_proposal_hash,
+        )
+
+    def test_request_start_exact_replay_is_not_fresh_and_input_drift_blocks(self):
+        claim = self.claim()
+        first = self.start(claim)
+        replay = self.start(claim)
+        writes_before_drift = list(self.write_events())
+
+        self.assertTrue(first.newly_started)
+        self.assertFalse(replay.newly_started)
+        self.assertErrorCode(
+            "classification_input_conflict",
+            lambda: self.start(
+                claim,
+                classification_input={**CLASSIFICATION_INPUT, "drift": True},
+            ),
+        )
+        self.assertEqual(writes_before_drift, self.write_events())
+
+    def test_concurrent_identical_start_stale_loser_is_not_authorized(self):
+        claim = self.claim()
+        winner_results = []
+
+        self.fake.before_next_commit_hook = lambda: winner_results.append(
+            self.start(claim)
+        )
+
+        self.assertErrorCode(
+            "classification_request_ambiguous",
+            lambda: self.start(claim),
+        )
+        self.assertEqual(1, len(winner_results))
+        self.assertTrue(winner_results[0].newly_started)
+        self.assertEqual("request_started", self.classification_data()["classificationState"])
+        self.assertEqual(
+            1,
+            sum(event[0] == "update" for event in self.write_events()),
+        )
+
+    def test_expired_claim_cannot_start_but_owned_started_request_can_capture(self):
+        expired_claim = self.claim()
+        self.clock.advance(seconds=61)
+        self.assertErrorCode(
+            "classification_claim_expired",
+            lambda: self.start(expired_claim),
+        )
+
+        takeover = self.claim()
+        self.start(takeover)
+        self.clock.advance(seconds=61)
+        snapshot = self.persist(takeover)
+        self.assertEqual(self.source_id, snapshot.canonical_source_id)
+
+    def test_expired_started_request_authorizes_zero_second_callbacks(self):
+        claim = self.claim()
+        self.start(claim)
+        self.clock.advance(seconds=61)
+        calls = 0
+
+        def classifier():
+            nonlocal calls
+            calls += 1
+            return deepcopy(COMPLETE_PROPOSAL), deepcopy(MODEL_PROPOSAL_EVIDENCE)
+
+        self.assertErrorCode(
+            "classification_request_ambiguous",
+            lambda: self.classify(classifier),
+        )
+        self.assertEqual(0, calls)
+        self.assertIn(
+            self.classification_data()["classificationState"],
+            {"request_started", "classification_request_ambiguous"},
+        )
+
+    def test_snapshot_apply_then_raise_is_accepted_by_exact_readback(self):
+        claim = self.claim()
+        self.start(claim)
+        self.fake.apply_then_raise_next_commit = RuntimeError("unknown commit")
+
+        snapshot = self.persist(claim)
+
+        self.assertIsInstance(snapshot, self.module.ClassificationSnapshot)
+        self.assertEqual(self.source_id, snapshot.canonical_source_id)
+        self.assertEqual(COMPLETE_PROPOSAL, snapshot.complete_proposal)
+        self.assertEqual("snapshot_ready", self.classification_data()["classificationState"])
+        self.assertEqual("captured", self.classification_data()["modelRequestState"])
+
+    def test_different_snapshot_retry_conflicts_without_writes(self):
+        claim = self.claim()
+        self.start(claim)
+        original = self.persist(claim)
+        before_data = deepcopy(self.fake.data)
+        before_writes = list(self.write_events())
+
+        different = deepcopy(COMPLETE_PROPOSAL)
+        different["ordinaryObligations"].append(
+            {"type": "informational", "message": "new"}
+        )
+        self.assertErrorCode(
+            "classification_snapshot_conflict",
+            lambda: self.persist(claim, complete_proposal=different),
+        )
+        self.assertEqual(before_data, self.fake.data)
+        self.assertEqual(before_writes, self.write_events())
+        self.assertEqual(
+            original,
+            self.coordinator.require_authoritative_classification_snapshot(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+            ),
+        )
+
+    def test_oversize_snapshot_fails_before_mutation(self):
+        claim = self.claim()
+        self.start(claim)
+        before_data = deepcopy(self.fake.data)
+        before_writes = list(self.write_events())
+        oversized = {
+            "schemaVersion": 1,
+            "transitionCandidates": [],
+            "ordinaryObligations": [
+                {"type": "informational", "payload": "x" * 614401}
+            ],
+        }
+
+        self.assertErrorCode(
+            "classification_snapshot_too_large",
+            lambda: self.persist(claim, complete_proposal=oversized),
+        )
+        self.assertEqual(before_data, self.fake.data)
+        self.assertEqual(before_writes, self.write_events())
+
+    def test_snapshot_ready_recovery_calls_classifier_zero_times(self):
+        first = self.classify(
+            lambda: (deepcopy(COMPLETE_PROPOSAL), deepcopy(MODEL_PROPOSAL_EVIDENCE))
+        )
+        calls = 0
+
+        def classifier():
+            nonlocal calls
+            calls += 1
+            raise AssertionError("snapshot recovery called classifier")
+
+        second = self.classify(classifier)
+
+        self.assertEqual(0, calls)
+        self.assertEqual(first, second)
+
+    def test_snapshot_ready_recovery_rejects_input_drift_without_callback(self):
+        self.classify(
+            lambda: (deepcopy(COMPLETE_PROPOSAL), deepcopy(MODEL_PROPOSAL_EVIDENCE))
+        )
+        calls = 0
+
+        def classifier():
+            nonlocal calls
+            calls += 1
+            return deepcopy(COMPLETE_PROPOSAL), deepcopy(MODEL_PROPOSAL_EVIDENCE)
+
+        self.assertErrorCode(
+            "classification_input_conflict",
+            lambda: self.classify(
+                classifier,
+                classification_input={**CLASSIFICATION_INPUT, "drift": True},
+            ),
+        )
+        self.assertEqual(0, calls)
+
+    def test_snapshot_result_and_persisted_payload_are_detached_and_immutable(self):
+        proposal = deepcopy(COMPLETE_PROPOSAL)
+        evidence = deepcopy(MODEL_PROPOSAL_EVIDENCE)
+        snapshot = self.classify(lambda: (proposal, evidence))
+
+        proposal["schemaVersion"] = 99
+        evidence["schemaVersion"] = 99
+        self.assertEqual(1, self.classification_data()["completeProposalSnapshot"]["schemaVersion"])
+        self.assertEqual(1, self.classification_data()["proposalEvidence"]["schemaVersion"])
+        self.assertNotIsInstance(snapshot.complete_proposal, dict)
+        with self.assertRaises(TypeError):
+            snapshot.complete_proposal["schemaVersion"] = 99
+        with self.assertRaises(TypeError):
+            dict.__setitem__(snapshot.complete_proposal, "schemaVersion", 99)
+
+    def test_classifier_failure_durably_marks_owned_request_ambiguous(self):
+        def classifier():
+            raise RuntimeError("model transport failed after request start")
+
+        self.assertErrorCode(
+            "classification_request_ambiguous",
+            lambda: self.classify(classifier),
+        )
+        stored = self.classification_data()
+        self.assertEqual(
+            "classification_request_ambiguous",
+            stored["classificationState"],
+        )
+        self.assertEqual("ambiguous", stored["modelRequestState"])
+
+        second_calls = 0
+
+        def second_classifier():
+            nonlocal second_calls
+            second_calls += 1
+            return deepcopy(COMPLETE_PROPOSAL), deepcopy(MODEL_PROPOSAL_EVIDENCE)
+
+        self.assertErrorCode(
+            "classification_request_ambiguous",
+            lambda: self.classify(second_classifier),
+        )
+        self.assertEqual(0, second_calls)
+
+    def test_malformed_classifier_capture_is_fenced_as_ambiguous(self):
+        malformed = {
+            "schemaVersion": 1,
+            "transitionCandidates": [{"type": "unknown_transition_shape"}],
+            "ordinaryObligations": [],
+        }
+
+        self.assertErrorCode(
+            "classification_request_ambiguous",
+            lambda: self.classify(
+                lambda: (malformed, deepcopy(MODEL_PROPOSAL_EVIDENCE))
+            ),
+        )
+        self.assertEqual(
+            "classification_request_ambiguous",
+            self.classification_data()["classificationState"],
+        )
+
+    def test_snapshot_apply_then_raise_requires_identity_readback(self):
+        fake = CorruptingReadbackFirestore()
+        clock = MutableClock(FROZEN_NOW)
+        uuids = SequentialUUIDs()
+        coordinator = self.module.SourceCoordinator(
+            fake,
+            uuid_factory=uuids,
+            now_factory=clock,
+        )
+        source = coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={"id": "graph-A"},
+            evidence_kind="graph_hydration",
+            thread_id="thread-1",
+        )
+        claim = coordinator.claim_source_classification(
+            user_id="user-1",
+            canonical_source_id=source.canonical_source_id,
+            lease_seconds=60,
+        )
+        coordinator.record_classification_request_started(
+            user_id="user-1",
+            canonical_source_id=source.canonical_source_id,
+            classification_epoch=claim.classification_epoch,
+            classification_claim_id=claim.classification_claim_id,
+            model_request_key="model-request-1",
+            classification_input=CLASSIFICATION_INPUT,
+        )
+        fake.hidden_readback_path = (
+            f"users/user-1/sourceIdentities/{source.canonical_source_id}"
+        )
+        fake.apply_then_raise_next_commit = RuntimeError("unknown commit")
+
+        with self.assertRaises(self.module.SourceCoordinatorAmbiguous):
+            coordinator.persist_complete_classification_snapshot(
+                user_id="user-1",
+                canonical_source_id=source.canonical_source_id,
+                classification_epoch=claim.classification_epoch,
+                classification_claim_id=claim.classification_claim_id,
+                complete_proposal=COMPLETE_PROPOSAL,
+                proposal_evidence=MODEL_PROPOSAL_EVIDENCE,
+            )
+
+    def test_verified_deterministic_hard_optout_skips_model_and_freezes(self):
+        verifier_calls = 0
+
+        def verifier(classification_input):
+            nonlocal verifier_calls
+            verifier_calls += 1
+            self.assertEqual(CLASSIFICATION_INPUT, classification_input)
+            return self.module._VerifiedHardOptoutEvidence(
+                evidence={
+                    "schemaVersion": 1,
+                    "evidenceKind": "header_list_unsubscribe",
+                    "evidenceHash": "b" * 64,
+                }
+            )
+
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            hard_optout_verifier=verifier,
+        )
+        classifier_calls = 0
+
+        def classifier():
+            nonlocal classifier_calls
+            classifier_calls += 1
+            raise AssertionError("verified hard opt-out called model")
+
+        snapshot = self.classify(classifier)
+
+        self.assertEqual(1, verifier_calls)
+        self.assertEqual(0, classifier_calls)
+        stored = self.classification_data()
+        self.assertEqual("snapshot_ready", stored["classificationState"])
+        self.assertEqual("not_applicable", stored["modelRequestState"])
+        self.assertIsNone(stored["modelRequestKey"])
+        self.assertEqual(
+            self.module.canonical_json_hash(CLASSIFICATION_INPUT),
+            stored["classificationInputHash"],
+        )
+        self.assertEqual(
+            "contact_optout",
+            snapshot.complete_proposal["transitionCandidates"][0]["type"],
+        )
+
+    def test_model_evidence_cannot_assert_deterministic_hard_optout(self):
+        model_calls = 0
+        proposal = {
+            "schemaVersion": 1,
+            "transitionCandidates": [
+                {"type": "contact_optout", "verified": True}
+            ],
+            "ordinaryObligations": [],
+        }
+        evidence = {
+            "schemaVersion": 1,
+            "evidenceKind": "model_claimed_hard_optout",
+            "verified": True,
+        }
+
+        def classifier():
+            nonlocal model_calls
+            model_calls += 1
+            return proposal, evidence
+
+        self.classify(classifier)
+
+        self.assertEqual(1, model_calls)
+        stored = self.classification_data()
+        self.assertEqual("captured", stored["modelRequestState"])
+        self.assertIsNone(stored["deterministicEvidence"])
+        self.assertEqual(
+            [
+                {
+                    "type": "needs_user_input",
+                    "reason": "unverified_optout_review",
+                    "sourceCandidateHash": self.module.canonical_json_hash(
+                        proposal["transitionCandidates"][0]
+                    ),
+                }
+            ],
+            stored["transitionCandidates"],
+        )
+        self.assertEqual(
+            "human_decision",
+            stored["selectionSnapshot"]["ownerKind"],
+        )
+        self.assertNotIn("contact_optout", json.dumps(stored["selectionSnapshot"]))
+
+    def test_semantic_work_permutations_freeze_identical_hashes(self):
+        proposal = {
+            "schemaVersion": 1,
+            "transitionCandidates": [
+                {"type": "call_requested", "phone": "555-0100"},
+                {"type": "property_unavailable", "property": "A"},
+            ],
+            "ordinaryObligations": [
+                {"type": "field_update", "field": "stage", "value": "warm"},
+                {"type": "informational", "message": "retained"},
+            ],
+            "orderSensitiveNestedData": {"steps": ["first", "second"]},
+        }
+
+        def freeze(candidate):
+            fake = FakeFirestore()
+            clock = MutableClock(FROZEN_NOW)
+            uuids = SequentialUUIDs()
+            coordinator = self.module.SourceCoordinator(
+                fake,
+                uuid_factory=uuids,
+                now_factory=clock,
+            )
+            source = coordinator.admit_or_repair_source_identity(
+                user_id="user-1",
+                hydrated_message={"id": "graph-A"},
+                evidence_kind="graph_hydration",
+                thread_id="thread-1",
+            )
+            snapshot = coordinator.classify_source_once(
+                user_id="user-1",
+                canonical_source_id=source.canonical_source_id,
+                lease_seconds=60,
+                classification_input=CLASSIFICATION_INPUT,
+                classifier=lambda: (
+                    deepcopy(candidate),
+                    deepcopy(MODEL_PROPOSAL_EVIDENCE),
+                ),
+            )
+            return snapshot
+
+        permuted = deepcopy(proposal)
+        permuted["transitionCandidates"].reverse()
+        permuted["ordinaryObligations"].reverse()
+        first = freeze(proposal)
+        second = freeze(permuted)
+
+        self.assertEqual(first.complete_proposal_hash, second.complete_proposal_hash)
+        self.assertEqual(first.selection_hash, second.selection_hash)
+        self.assertEqual(first.snapshot_immutable_hash, second.snapshot_immutable_hash)
+
+    def test_snapshot_commit_writes_only_classification_authority(self):
+        self.classify(
+            lambda: (deepcopy(COMPLETE_PROPOSAL), deepcopy(MODEL_PROPOSAL_EVIDENCE))
+        )
+
+        self.assertTrue(self.write_events())
+        for event in self.write_events():
+            self.assertEqual(self.classification_path, event[1])
+            self.assertNotRegex(
+                event[1],
+                r"owner|ledger|marker|thread|queue|draft|reply|provider",
+            )
+
+    def test_two_workers_call_classifier_once(self):
+        outer_calls = 0
+        inner_calls = 0
+        inner_error = None
+
+        def inner_classifier():
+            nonlocal inner_calls
+            inner_calls += 1
+            return deepcopy(COMPLETE_PROPOSAL), deepcopy(MODEL_PROPOSAL_EVIDENCE)
+
+        def outer_classifier():
+            nonlocal outer_calls, inner_error
+            outer_calls += 1
+            try:
+                self.classify(inner_classifier)
+            except self.module.SourceCoordinatorError as exc:
+                inner_error = exc
+            return deepcopy(COMPLETE_PROPOSAL), deepcopy(MODEL_PROPOSAL_EVIDENCE)
+
+        snapshot = self.classify(outer_classifier)
+
+        self.assertEqual(1, outer_calls)
+        self.assertEqual(0, inner_calls)
+        self.assertIsNotNone(inner_error)
+        self.assertEqual("classification_request_ambiguous", inner_error.code)
+        self.assertEqual(
+            snapshot,
+            self.coordinator.require_authoritative_classification_snapshot(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+            ),
+        )
 
 
 if __name__ == "__main__":

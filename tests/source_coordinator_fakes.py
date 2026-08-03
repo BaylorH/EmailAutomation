@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import timedelta
 from threading import RLock
 
 from google.api_core.exceptions import Aborted
@@ -11,6 +12,20 @@ from google.api_core.exceptions import Aborted
 
 class FakeTransactionAborted(Aborted, RuntimeError):
     """Firestore-shaped conflict raised for a stale transaction snapshot."""
+
+
+class MutableClock:
+    """Small aware-datetime clock for lease and takeover tests."""
+
+    def __init__(self, current):
+        self.current = current
+
+    def __call__(self):
+        return self.current
+
+    def advance(self, *, seconds):
+        self.current += timedelta(seconds=seconds)
+        return self.current
 
 
 def _raise_configured_failure(value):
@@ -245,6 +260,12 @@ class FakeTransaction:
                 self._store.events.append(("commit_failed_before_apply",))
                 _raise_configured_failure(failure)
 
+            if self._store.before_next_commit_hook is not None:
+                hook = self._store.before_next_commit_hook
+                self._store.before_next_commit_hook = None
+                self._store.events.append(("before_commit_hook",))
+                hook()
+
             self._validate_read_versions()
             staged = deepcopy(self._store.data)
             staged_events = []
@@ -318,6 +339,7 @@ class FakeFirestore:
         self.events = []
         self.fail_next_commit = None
         self.apply_then_raise_next_commit = None
+        self.before_next_commit_hook = None
         self._lock = RLock()
         self._versions = {}
         self._version_clock = 0

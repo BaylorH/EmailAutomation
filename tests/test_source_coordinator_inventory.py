@@ -27,6 +27,8 @@ DRAFT_DELETE_EMAIL_MODULE = "email_automation.email"
 DRAFT_DELETE_EMAIL_PATH = "email_automation/email.py"
 SOURCE_ADMISSION_METHOD = "admit_or_repair_source_identity"
 SOURCE_ADMISSION_PRIVATE_ENVELOPE = "_SourceAdmissionEnvelope"
+SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE = "_VerifiedHardOptoutEvidence"
+SOURCE_CLASSIFICATION_ORCHESTRATOR = "classify_source_once"
 SOURCE_ADMISSION_ALLOWED_ADAPTERS = {
     ("email_automation/processing.py", "process_inbox_message"),
     ("email_automation/operator_replay.py", "replay_exact_message"),
@@ -185,6 +187,7 @@ _REFLECTIVE_ACCESS_NAMES = {
 _PROTECTED_REFLECTION_NAMES = {
     SOURCE_ADMISSION_METHOD,
     SOURCE_ADMISSION_PRIVATE_ENVELOPE,
+    SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE,
 }
 
 
@@ -280,6 +283,17 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
         ):
             self._record(node, "dynamic private admission envelope reference")
             self._recorded_reflection_names.add(SOURCE_ADMISSION_PRIVATE_ENVELOPE)
+        if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
+            in self._reflectively_assembled_names
+            and SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
+            not in self._recorded_reflection_names
+        ):
+            self._record(node, "dynamic private classification evidence reference")
+            self._recorded_reflection_names.add(
+                SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
+            )
 
     def visit_FunctionDef(self, node):
         if (
@@ -308,6 +322,11 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
             and node.name == SOURCE_ADMISSION_PRIVATE_ENVELOPE
         ):
             self._record(node, "private admission envelope definition")
+        if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and node.name == SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
+        ):
+            self._record(node, "private classification evidence definition")
         _visit_class_metadata(self, node)
         self._class_depth += 1
         try:
@@ -355,6 +374,8 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
                 self._record(node, "private admission envelope import")
             if imported.name == SOURCE_ADMISSION_METHOD:
                 self._record(node, "admission method import/propagation")
+            if imported.name == SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE:
+                self._record(node, "private classification evidence import")
 
     def visit_Call(self, node):
         protected_reference = (
@@ -379,6 +400,11 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
         ):
             self._record(node, "private admission envelope reference")
         if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and node.id == SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
+        ):
+            self._record(node, "private classification evidence reference")
+        if (
             node.id == SOURCE_ADMISSION_METHOD
             and id(node) not in self._direct_call_references
         ):
@@ -392,6 +418,11 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
             and node.attr == SOURCE_ADMISSION_PRIVATE_ENVELOPE
         ):
             self._record(node, "private admission envelope attribute")
+        if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and node.attr == SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
+        ):
+            self._record(node, "private classification evidence attribute")
         if (
             node.attr == SOURCE_ADMISSION_METHOD
             and id(node) not in self._direct_call_references
@@ -407,6 +438,11 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
             and node.value == SOURCE_ADMISSION_PRIVATE_ENVELOPE
         ):
             self._record(node, "dynamic private admission envelope reference")
+        if (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+            and node.value == SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE
+        ):
+            self._record(node, "dynamic private classification evidence reference")
         if node.value == SOURCE_ADMISSION_METHOD:
             self._record(node, "dynamic admission method reference")
 
@@ -1078,6 +1114,103 @@ class InventoryContractTests(unittest.TestCase):
 
     def test_source_admission_private_type_and_call_sites_are_bounded(self):
         self.assertEqual([], _discover_source_admission_contract_violations())
+
+    def test_classification_private_evidence_and_orchestrator_signature_are_bounded(self):
+        self.assertTrue(SOURCE_COORDINATOR_PATH.exists())
+        tree = ast.parse(
+            SOURCE_COORDINATOR_PATH.read_text(encoding="utf-8"),
+            filename=str(SOURCE_COORDINATOR_PATH),
+        )
+        definitions = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == SOURCE_CLASSIFICATION_ORCHESTRATOR
+        ]
+        self.assertEqual(1, len(definitions))
+        self.assertIsNone(definitions[0].args.vararg)
+        self.assertIsNone(definitions[0].args.kwarg)
+        parameters = tuple(argument.arg for argument in definitions[0].args.args)
+        keyword_only = tuple(
+            argument.arg for argument in definitions[0].args.kwonlyargs
+        )
+        all_parameters = parameters + keyword_only
+        self.assertEqual(
+            (
+                "self",
+                "user_id",
+                "canonical_source_id",
+                "lease_seconds",
+                "classification_input",
+                "classifier",
+            ),
+            all_parameters,
+        )
+        for forbidden in ("deterministic_evidence", "owner_kind", "winner"):
+            self.assertNotIn(forbidden, all_parameters)
+
+        deterministic_definitions = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "persist_deterministic_classification_snapshot"
+        ]
+        self.assertEqual(1, len(deterministic_definitions))
+        self.assertIsNone(deterministic_definitions[0].args.vararg)
+        self.assertIsNone(deterministic_definitions[0].args.kwarg)
+        deterministic_parameters = tuple(
+            argument.arg
+            for argument in (
+                deterministic_definitions[0].args.args
+                + deterministic_definitions[0].args.kwonlyargs
+            )
+        )
+        self.assertEqual(
+            (
+                "self",
+                "user_id",
+                "canonical_source_id",
+                "classification_epoch",
+                "classification_claim_id",
+                "classification_input",
+            ),
+            deterministic_parameters,
+        )
+        for forbidden in (
+            "deterministic_evidence",
+            "proposal_evidence",
+            "owner_kind",
+            "winner",
+        ):
+            self.assertNotIn(forbidden, deterministic_parameters)
+
+    def test_classification_gate_rejects_private_verified_evidence_access(self):
+        mutations = {
+            "direct import": (
+                "from email_automation.source_coordinator import "
+                "_VerifiedHardOptoutEvidence\n"
+                "value = _VerifiedHardOptoutEvidence({})"
+            ),
+            "module attribute": (
+                "import email_automation.source_coordinator as coordinator\n"
+                "value = coordinator._VerifiedHardOptoutEvidence"
+            ),
+            "dynamic lookup": (
+                "value = getattr(coordinator, '_VerifiedHardOptoutEvidence')"
+            ),
+            "fragmented lookup": (
+                "name = '_VerifiedHard' + 'OptoutEvidence'\n"
+                "value = getattr(coordinator, name)"
+            ),
+            "spoofed definition": "class _VerifiedHardOptoutEvidence: pass",
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_admission_contract_violations(
+                        source, "email_automation/unreviewed.py"
+                    )
+                )
 
     def test_source_admission_gate_rejects_private_envelope_mutations(self):
         mutations = {
