@@ -7,13 +7,14 @@ from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SOURCE_COORDINATOR_PATH = REPO_ROOT / "email_automation/source_coordinator.py"
+SOURCE_COORDINATOR_RELATIVE_PATH = Path("email_automation/source_coordinator.py")
+SOURCE_COORDINATOR_PATH = REPO_ROOT / SOURCE_COORDINATOR_RELATIVE_PATH
 FORBIDDEN_SOURCE_COORDINATOR_IMPORT_ROOTS = {
     "googleapiclient",
     "openai",
     "requests",
 }
-FORBIDDEN_SOURCE_COORDINATOR_RELATIVE_IMPORTS = {
+FORBIDDEN_SOURCE_COORDINATOR_APPLICATION_MODULES = {
     "ai_processing",
     "email",
     "file_handling",
@@ -100,6 +101,66 @@ def _resolve_import_from_module(node, relative_path):
     if node.module:
         package_parts.extend(node.module.split("."))
     return ".".join(package_parts)
+
+
+def _source_coordinator_import_paths(node):
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            yield alias.name, False
+        return
+    if not isinstance(node, ast.ImportFrom):
+        return
+
+    module = _resolve_import_from_module(node, SOURCE_COORDINATOR_RELATIVE_PATH)
+    if module:
+        yield module, False
+    for alias in node.names:
+        imported_path = f"{module}.{alias.name}" if module else alias.name
+        yield imported_path, False
+
+    if node.level:
+        relative_module = node.module or ""
+        if relative_module:
+            yield relative_module, True
+        for alias in node.names:
+            relative_path = (
+                f"{relative_module}.{alias.name}"
+                if relative_module
+                else alias.name
+            )
+            yield relative_path, True
+
+
+def _source_coordinator_import_path_is_forbidden(path, *, relative):
+    parts = path.split(".")
+    if not parts:
+        return False
+    if parts[0] in FORBIDDEN_SOURCE_COORDINATOR_IMPORT_ROOTS:
+        return True
+    if relative and parts[0] in FORBIDDEN_SOURCE_COORDINATOR_APPLICATION_MODULES:
+        return True
+    return (
+        len(parts) > 1
+        and parts[0] == "email_automation"
+        and parts[1] in FORBIDDEN_SOURCE_COORDINATOR_APPLICATION_MODULES
+    )
+
+
+def _source_coordinator_forbidden_imports(tree):
+    forbidden = []
+    seen = set()
+    for node in ast.walk(tree):
+        for path, relative in _source_coordinator_import_paths(node):
+            finding = (node.lineno, path)
+            if (
+                finding not in seen
+                and _source_coordinator_import_path_is_forbidden(
+                    path, relative=relative
+                )
+            ):
+                seen.add(finding)
+                forbidden.append(finding)
+    return forbidden
 
 
 def _visit_function_metadata(visitor, node):
@@ -671,6 +732,67 @@ class ProviderDeleteValidatorTests(unittest.TestCase):
 
 
 class InventoryContractTests(unittest.TestCase):
+    def assertSourceCoordinatorImportsRejected(self, source):
+        in_memory_module = mock.Mock()
+        in_memory_module.exists.return_value = True
+        in_memory_module.read_text.return_value = source
+        with mock.patch(
+            f"{__name__}.SOURCE_COORDINATOR_PATH", in_memory_module
+        ), self.assertRaises(AssertionError):
+            self.test_source_coordinator_has_no_provider_or_effect_imports()
+
+    def assertSourceCoordinatorImportsAllowed(self, source):
+        in_memory_module = mock.Mock()
+        in_memory_module.exists.return_value = True
+        in_memory_module.read_text.return_value = source
+        with mock.patch(f"{__name__}.SOURCE_COORDINATOR_PATH", in_memory_module):
+            self.test_source_coordinator_has_no_provider_or_effect_imports()
+
+    def test_absolute_application_effect_imports_are_rejected(self):
+        sources = {
+            "direct import": "import email_automation.email",
+            "aliased import": "import email_automation.sheets as sheets",
+            "package from import": "from email_automation import sheets",
+            "effect from import": (
+                "from email_automation.ai_processing "
+                "import propose_sheet_updates"
+            ),
+            "deep direct import": "import email_automation.email.graph.client",
+            "deep from import": (
+                "from email_automation.sheet_operations.internal "
+                "import update"
+            ),
+        }
+        for case, source in sources.items():
+            with self.subTest(case=case):
+                self.assertSourceCoordinatorImportsRejected(source)
+
+    def test_benign_absolute_application_imports_remain_allowed(self):
+        sources = (
+            "import email_automation",
+            "import email_automation.scheduler_scope",
+            "from email_automation import scheduler_scope",
+            "from email_automation.scheduler_scope import SchedulerScopeError",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertSourceCoordinatorImportsAllowed(source)
+
+    def test_provider_and_relative_effect_imports_remain_rejected(self):
+        sources = (
+            "import requests.adapters",
+            "from openai import OpenAI",
+            "import googleapiclient.discovery",
+            "from .requests import delete",
+            "from .openai.client import OpenAI",
+            "from .email import send_message",
+            "from . import sheets",
+            "from .file_handling.internal import load_file",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertSourceCoordinatorImportsRejected(source)
+
     def test_source_coordinator_has_no_provider_or_effect_imports(self):
         self.assertTrue(
             SOURCE_COORDINATOR_PATH.exists(),
@@ -683,27 +805,7 @@ class InventoryContractTests(unittest.TestCase):
             SOURCE_COORDINATOR_PATH.read_text(encoding="utf-8"),
             filename=str(SOURCE_COORDINATOR_PATH),
         )
-        forbidden = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    root = alias.name.split(".", 1)[0]
-                    if root in FORBIDDEN_SOURCE_COORDINATOR_IMPORT_ROOTS:
-                        forbidden.append((node.lineno, alias.name))
-            elif isinstance(node, ast.ImportFrom):
-                module = node.module or ""
-                root = module.split(".", 1)[0]
-                if root in FORBIDDEN_SOURCE_COORDINATOR_IMPORT_ROOTS:
-                    forbidden.append((node.lineno, module))
-                if node.level:
-                    relative_roots = {root} if root else {
-                        alias.name.split(".", 1)[0] for alias in node.names
-                    }
-                    for relative_root in sorted(relative_roots):
-                        if relative_root in FORBIDDEN_SOURCE_COORDINATOR_RELATIVE_IMPORTS:
-                            forbidden.append((node.lineno, f"relative:{relative_root}"))
-
-        self.assertEqual([], forbidden)
+        self.assertEqual([], _source_coordinator_forbidden_imports(tree))
 
     def test_application_file_exclusions_are_preserved(self):
         self.assertTrue(_is_application_python_file(Path(DRAFT_DELETE_EMAIL_PATH)))
