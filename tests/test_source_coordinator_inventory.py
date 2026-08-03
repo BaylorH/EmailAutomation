@@ -246,6 +246,90 @@ def _has_helper_provenance(states):
     )
 
 
+def _is_bound_delete_helper_callee(node, scoped_bindings):
+    if isinstance(node, ast.Name):
+        states = _lookup_binding_states(node.id, scoped_bindings)
+        return states == {_HELPER_BINDING}
+    if (
+        isinstance(node, ast.Attribute)
+        and node.attr == DRAFT_DELETE_HELPER_NAME
+    ):
+        receiver = _dotted_expression(node.value)
+        states = (
+            _lookup_binding_states(receiver, scoped_bindings)
+            if receiver
+            else set()
+        )
+        return states == {_EMAIL_MODULE_BINDING}
+    return False
+
+
+def _validate_no_unsupported_helper_propagation(
+    node,
+    scoped_bindings,
+    relative_path,
+):
+    """Reject helper values outside the bounded alias/call model."""
+    if node is None:
+        return
+
+    if isinstance(
+        node,
+        (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+    ):
+        # These introduce bindings with evaluation-order rules. Their visitor
+        # methods invoke this validator after installing the correct scope.
+        return
+
+    if isinstance(node, ast.Call):
+        if _is_bound_delete_helper_callee(node.func, scoped_bindings):
+            for argument in node.args:
+                _validate_no_unsupported_helper_propagation(
+                    argument,
+                    scoped_bindings,
+                    relative_path,
+                )
+            for keyword in node.keywords:
+                _validate_no_unsupported_helper_propagation(
+                    keyword.value,
+                    scoped_bindings,
+                    relative_path,
+                )
+            return
+
+    if isinstance(node, ast.Name):
+        states = _lookup_binding_states(node.id, scoped_bindings)
+        if _has_helper_provenance(states):
+            raise DraftDeleteBindingInventoryError(
+                "unsupported draft delete helper propagation at "
+                f"{Path(relative_path).as_posix()}:{node.lineno}"
+            )
+        return
+
+    if (
+        isinstance(node, ast.Attribute)
+        and node.attr == DRAFT_DELETE_HELPER_NAME
+    ):
+        receiver = _dotted_expression(node.value)
+        states = (
+            _lookup_binding_states(receiver, scoped_bindings)
+            if receiver
+            else set()
+        )
+        if _has_helper_provenance(states):
+            raise DraftDeleteBindingInventoryError(
+                "unsupported draft delete helper propagation at "
+                f"{Path(relative_path).as_posix()}:{node.lineno}"
+            )
+
+    for child in ast.iter_child_nodes(node):
+        _validate_no_unsupported_helper_propagation(
+            child,
+            scoped_bindings,
+            relative_path,
+        )
+
+
 def _helper_reference_status(node, scoped_bindings):
     if isinstance(node, ast.Name):
         states = _lookup_binding_states(node.id, scoped_bindings)
@@ -338,6 +422,18 @@ def _target_names(target):
             for name in _target_names(element)
         ]
     return []
+
+
+def _is_bounded_assignment_target(target):
+    if isinstance(target, ast.Name):
+        return True
+    if isinstance(target, ast.Starred):
+        return _is_bounded_assignment_target(target.value)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return all(
+            _is_bounded_assignment_target(element) for element in target.elts
+        )
+    return False
 
 
 def _assignment_binding_updates(target, value, scoped_bindings):
@@ -457,26 +553,54 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
         )
         self.scope_stack.append((scope_kind, node.name))
         self.binding_stack.append((scope_kind, bindings))
-        self.generic_visit(node)
+        for statement in node.body:
+            self.visit(statement)
         self.binding_stack.pop()
         self.scope_stack.pop()
 
-    def _is_bound_delete_helper_call(self, node):
-        if isinstance(node.func, ast.Name):
-            states = _lookup_binding_states(node.func.id, self.binding_stack)
-            return states == {_HELPER_BINDING}
-        if (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == DRAFT_DELETE_HELPER_NAME
-        ):
-            receiver = _dotted_expression(node.func.value)
-            states = (
-                _lookup_binding_states(receiver, self.binding_stack)
-                if receiver
-                else set()
-            )
-            return states == {_EMAIL_MODULE_BINDING}
-        return False
+    def _validate_propagation(self, node):
+        _validate_no_unsupported_helper_propagation(
+            node,
+            self.binding_stack,
+            self.relative_path,
+        )
+
+    def _validate_and_visit(self, node):
+        if node is not None:
+            self._validate_propagation(node)
+            self.visit(node)
+
+    def _visit_function_scope(self, node):
+        for decorator in node.decorator_list:
+            self._validate_and_visit(decorator)
+        for default in node.args.defaults:
+            self._validate_and_visit(default)
+        for default in node.args.kw_defaults:
+            self._validate_and_visit(default)
+
+        arguments = (
+            list(node.args.posonlyargs)
+            + list(node.args.args)
+            + list(node.args.kwonlyargs)
+        )
+        if node.args.vararg is not None:
+            arguments.append(node.args.vararg)
+        if node.args.kwarg is not None:
+            arguments.append(node.args.kwarg)
+        for argument in arguments:
+            self._validate_and_visit(argument.annotation)
+        self._validate_and_visit(node.returns)
+
+        self._visit_scope(node, "function")
+
+    def _visit_class_scope(self, node):
+        for decorator in node.decorator_list:
+            self._validate_and_visit(decorator)
+        for base in node.bases:
+            self._validate_and_visit(base)
+        for keyword in node.keywords:
+            self._validate_and_visit(keyword.value)
+        self._visit_scope(node, "class")
 
     def _caller_scope(self):
         if not self.scope_stack:
@@ -497,20 +621,20 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
         )
 
     def visit_FunctionDef(self, node):
-        self._visit_scope(node, "function")
+        self._visit_function_scope(node)
 
     def visit_AsyncFunctionDef(self, node):
-        self._visit_scope(node, "function")
+        self._visit_function_scope(node)
 
     def visit_ClassDef(self, node):
-        self._visit_scope(node, "class")
+        self._visit_class_scope(node)
 
     def visit_Lambda(self, node):
         defaults = list(node.args.defaults) + [
             default for default in node.args.kw_defaults if default is not None
         ]
         for default in defaults:
-            self.visit(default)
+            self._validate_and_visit(default)
 
         bindings = {
             name: {_NONHELPER_BINDING}
@@ -523,21 +647,21 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
     def _visit_comprehension(self, node, result_nodes):
         if not node.generators:
             for result_node in result_nodes:
-                self.visit(result_node)
+                self._validate_and_visit(result_node)
             return
 
-        self.visit(node.generators[0].iter)
+        self._validate_and_visit(node.generators[0].iter)
         bindings = {}
         self.binding_stack.append(("function", bindings))
         for index, generator in enumerate(node.generators):
             if index:
-                self.visit(generator.iter)
+                self._validate_and_visit(generator.iter)
             for name in _target_names(generator.target):
                 bindings[name] = {_NONHELPER_BINDING}
             for condition in generator.ifs:
-                self.visit(condition)
+                self._validate_and_visit(condition)
         for result_node in result_nodes:
-            self.visit(result_node)
+            self._validate_and_visit(result_node)
         self.binding_stack.pop()
 
     def visit_ListComp(self, node):
@@ -552,9 +676,34 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
     def visit_DictComp(self, node):
         self._visit_comprehension(node, [node.key, node.value])
 
+    def visit_Assign(self, node):
+        unsupported_targets = [
+            target
+            for target in node.targets
+            if not _is_bounded_assignment_target(target)
+        ]
+        if unsupported_targets:
+            for target in unsupported_targets:
+                self._validate_propagation(target)
+            self._validate_propagation(node.value)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node):
+        if not _is_bounded_assignment_target(node.target):
+            self._validate_propagation(node.target)
+            self._validate_propagation(node.value)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node):
+        self._validate_propagation(node.target)
+        self._validate_propagation(node.value)
+        self.generic_visit(node)
+
     def visit_Call(self, node):
-        if self._is_bound_delete_helper_call(node):
+        if _is_bound_delete_helper_callee(node.func, self.binding_stack):
             self.callers[(self.relative_path, self._caller_scope())] += 1
+
+        self._validate_propagation(node)
 
         if (
             self._inside_email_delete_helper()
@@ -623,6 +772,68 @@ def _in_memory_draft_delete_callers(source, relative_path):
 
 
 class InventoryScannerRegressionTests(unittest.TestCase):
+    def test_function_default_helper_propagation_fails_closed(self):
+        source = """
+from .email import _delete_graph_reply_draft as helper
+
+def cleanup(callback=helper):
+    callback()
+"""
+        with self.assertRaisesRegex(
+            DraftDeleteBindingInventoryError,
+            "unsupported draft delete helper propagation",
+        ):
+            _in_memory_draft_delete_callers(
+                source,
+                "email_automation/followup.py",
+            )
+
+    def test_lambda_default_helper_propagation_fails_closed(self):
+        source = """
+from .email import _delete_graph_reply_draft as helper
+
+cleanup = lambda callback=helper: callback()
+"""
+        with self.assertRaisesRegex(
+            DraftDeleteBindingInventoryError,
+            "unsupported draft delete helper propagation",
+        ):
+            _in_memory_draft_delete_callers(
+                source,
+                "email_automation/followup.py",
+            )
+
+    def test_comprehension_helper_propagation_fails_closed(self):
+        source = """
+from .email import _delete_graph_reply_draft as helper
+
+results = [callback() for callback in [helper]]
+"""
+        with self.assertRaisesRegex(
+            DraftDeleteBindingInventoryError,
+            "unsupported draft delete helper propagation",
+        ):
+            _in_memory_draft_delete_callers(
+                source,
+                "email_automation/followup.py",
+            )
+
+    def test_attribute_assignment_helper_propagation_fails_closed(self):
+        source = """
+from .email import _delete_graph_reply_draft as helper
+
+box.callback = helper
+box.callback()
+"""
+        with self.assertRaisesRegex(
+            DraftDeleteBindingInventoryError,
+            "unsupported draft delete helper propagation",
+        ):
+            _in_memory_draft_delete_callers(
+                source,
+                "email_automation/followup.py",
+            )
+
     def test_conditional_helper_alias_fails_closed(self):
         source = """
 from .email import _delete_graph_reply_draft as helper
