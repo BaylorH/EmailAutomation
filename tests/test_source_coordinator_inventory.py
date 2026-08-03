@@ -184,7 +184,11 @@ def _source_coordinator_forbidden_imports(tree):
 
 _REFLECTIVE_ACCESS_NAMES = {
     "getattr",
+    "setattr",
+    "delattr",
     "__getattribute__",
+    "__setattr__",
+    "__delattr__",
     "__dict__",
     "attrgetter",
     "methodcaller",
@@ -473,37 +477,22 @@ def _leading_import_ids(tree):
     return leading
 
 
-def _annotation_node_ids(tree):
-    annotation_ids = set()
-    for node in ast.walk(tree):
-        annotations = []
-        if isinstance(node, ast.arg) and node.annotation is not None:
-            annotations.append(node.annotation)
-        elif isinstance(node, ast.AnnAssign):
-            annotations.append(node.annotation)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.returns is not None:
-                annotations.append(node.returns)
-        for annotation in annotations:
-            annotation_ids.update(id(item) for item in ast.walk(annotation))
-    return annotation_ids
-
-
 class _TrustScope:
     def __init__(self, kind, name, local_names=()):
         self.kind = kind
         self.name = name
         self.instances = {local_name: False for local_name in local_names}
+        self.static_strings = {}
         self.constructor_shadowed = "SourceCoordinator" in local_names
 
 
 class _SourceClassificationTrustVisitor(ast.NodeVisitor):
-    """Enforce the narrow reviewed grammar for classification authority."""
+    """Inventory explicit production wiring; runtime code enforces authority.
 
-    _ALLOWED_INSTANCE_METHODS = {
-        SOURCE_ADMISSION_METHOD,
-        SOURCE_CLASSIFICATION_ORCHESTRATOR,
-    }
+    This is intentionally a bounded AST contract, not a sandbox or a general
+    Python data-flow proof. It rejects reviewed import/construction shapes and
+    explicit verifier names, keywords, and direct reflective attribute access.
+    """
 
     def __init__(self, relative_path, *, tree):
         self.relative_path = Path(relative_path).as_posix()
@@ -516,7 +505,6 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
             for parent in ast.walk(tree)
             for child in ast.iter_child_nodes(parent)
         }
-        self._annotation_ids = _annotation_node_ids(tree)
         self._leading_import_ids = _leading_import_ids(tree)
         self._reviewed_paths = {
             path for path, _ in SOURCE_ADMISSION_ALLOWED_ADAPTERS
@@ -560,6 +548,49 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
             f"_{SOURCE_CLASSIFICATION_VERIFIER_NAME}",
         }:
             self._record(node, "hard opt-out verifier propagation is unreviewed")
+
+    def _lookup_static_string(self, name):
+        for scope in reversed(self._scopes):
+            if name in scope.static_strings:
+                return scope.static_strings[name]
+            if name in scope.instances:
+                return None
+        return None
+
+    def _static_string(self, node):
+        if isinstance(node, ast.Constant) and type(node.value) is str:
+            return node.value
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Add)
+        ):
+            left = self._static_string(node.left)
+            right = self._static_string(node.right)
+            if left is not None and right is not None:
+                return left + right
+            return None
+        if isinstance(node, ast.JoinedStr):
+            parts = []
+            for value in node.values:
+                candidate = (
+                    self._static_string(value.value)
+                    if isinstance(value, ast.FormattedValue)
+                    else self._static_string(value)
+                )
+                if candidate is None:
+                    return None
+                parts.append(candidate)
+            return "".join(parts)
+        if isinstance(node, ast.Name):
+            return self._lookup_static_string(node.id)
+        return None
+
+    def _set_static_string(self, target, value):
+        if isinstance(target, ast.Name):
+            if value is None:
+                self._scopes[-1].static_strings.pop(target.id, None)
+            else:
+                self._scopes[-1].static_strings[target.id] = value
 
     def _current_callable_scope(self):
         if any(scope.kind in {"class", "lambda"} for scope in self._scopes):
@@ -640,32 +671,20 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
 
     def _safe_namespace_membership(self, call):
         parent = self._parents.get(id(call))
-        if not isinstance(parent, ast.Compare):
-            return False
-        operands = (parent.left, *parent.comparators)
-        protected = {
-            "SourceCoordinator",
-            "source_coordinator",
-            "email_automation.source_coordinator",
-            SOURCE_ADMISSION_METHOD,
-            SOURCE_ADMISSION_PRIVATE_ENVELOPE,
-            SOURCE_CLASSIFICATION_VERIFIER_NAME,
-            f"_{SOURCE_CLASSIFICATION_VERIFIER_NAME}",
-            *SOURCE_CLASSIFICATION_PRIVATE_NAMES,
-        }
-        for index, operator in enumerate(parent.ops):
-            if not isinstance(operator, (ast.In, ast.NotIn)):
-                continue
-            if operands[index + 1] is not call:
-                continue
-            member = operands[index]
-            return (
-                isinstance(member, ast.Constant)
-                and type(member.value) is str
-                and member.value
-                and member.value not in protected
-            )
-        return False
+        return (
+            isinstance(parent, ast.Compare)
+            and len(parent.ops) == 1
+            and len(parent.comparators) == 1
+            and isinstance(parent.ops[0], ast.In)
+            and parent.comparators[0] is call
+            and isinstance(parent.left, ast.Constant)
+            and type(parent.left.value) is str
+            and parent.left.value == "saga"
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "locals"
+            and not call.args
+            and not call.keywords
+        )
 
     def _namespace_call_name(self, func):
         if isinstance(func, ast.Name) and func.id in {
@@ -715,13 +734,17 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
             self._check_verifier_name(node, bound)
             if imported.name == "email_automation.source_coordinator":
                 self._record(node, "source coordinator module import is unreviewed")
-            if bound == "SourceCoordinator" and self._constructor_active:
+            if bound == "SourceCoordinator":
                 self._record(node, "SourceCoordinator rebinding is unreviewed")
                 self._constructor_active = False
 
     def visit_ImportFrom(self, node):
         module = _resolve_import_from_module(node, self.relative_path)
         if module == "email_automation.source_coordinator":
+            exact_absolute_source = (
+                node.level == 0
+                and node.module == "email_automation.source_coordinator"
+            )
             for imported in node.names:
                 self._check_verifier_name(node, imported.name)
                 if imported.asname:
@@ -731,17 +754,31 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
                 if imported.name != "SourceCoordinator":
                     continue
                 if (
-                    imported.asname is not None
+                    not exact_absolute_source
+                    or len(node.names) != 1
+                    or imported.asname is not None
                     or id(node) not in self._leading_import_ids
                     or self.relative_path not in self._reviewed_paths
                 ):
                     self._record(node, "SourceCoordinator import is outside the reviewed grammar")
+                if self._constructor_active:
+                    self._record(node, "SourceCoordinator rebinding is unreviewed")
                 self._constructor_active = True
             return
         for imported in node.names:
             self._check_verifier_name(node, imported.name)
             if imported.asname:
                 self._check_verifier_name(node, imported.asname)
+            bound = imported.asname or imported.name
+            if bound == "SourceCoordinator":
+                self._record(node, "SourceCoordinator import is outside the reviewed grammar")
+            if (
+                module == "email_automation"
+                and imported.name == "source_coordinator"
+            ):
+                self._record(node, "source coordinator module import is unreviewed")
+            if imported.name == "*" and self._has_constructor_import:
+                self._record(node, "star import can rebind SourceCoordinator")
             if (
                 (module == "importlib" and imported.name == "import_module")
                 or (module == "builtins" and imported.name == "__import__")
@@ -751,6 +788,8 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node):
         self._check_verifier_name(node, node.name)
+        if node.name == "SourceCoordinator" and self._constructor_active:
+            self._record(node, "SourceCoordinator rebinding is unreviewed")
         _visit_function_metadata(self, node)
         arguments = (
             *node.args.posonlyargs,
@@ -792,6 +831,8 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
 
     def visit_ClassDef(self, node):
         self._check_verifier_name(node, node.name)
+        if node.name == "SourceCoordinator" and self._constructor_active:
+            self._record(node, "SourceCoordinator rebinding is unreviewed")
         _visit_class_metadata(self, node)
         self._scopes.append(_TrustScope("class", node.name))
         try:
@@ -808,6 +849,7 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
 
     def visit_Assign(self, node):
         constructor_value = self._constructor_call(node.value)
+        static_string = self._static_string(node.value)
         self.visit(node.value)
         for target in node.targets:
             self.visit(target)
@@ -821,10 +863,14 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
                 target,
                 protected_instance=bool(simple_target),
             )
+            self._set_static_string(target, static_string)
 
     def visit_AnnAssign(self, node):
         constructor_value = (
             node.value is not None and self._constructor_call(node.value)
+        )
+        static_string = (
+            self._static_string(node.value) if node.value is not None else None
         )
         if node.value:
             self.visit(node.value)
@@ -836,13 +882,56 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
                 constructor_value and isinstance(node.target, ast.Name)
             ),
         )
+        self._set_static_string(node.target, static_string)
 
     def visit_NamedExpr(self, node):
+        static_string = self._static_string(node.value)
         self.visit(node.value)
         self.visit(node.target)
         self._bind_assignment_target(node.target)
+        self._set_static_string(node.target, static_string)
 
     def visit_Call(self, node):
+        if any(
+            keyword.arg
+            in {
+                SOURCE_CLASSIFICATION_VERIFIER_NAME,
+                f"_{SOURCE_CLASSIFICATION_VERIFIER_NAME}",
+            }
+            for keyword in node.keywords
+        ):
+            self._record(node, "hard opt-out verifier injection is unreviewed")
+
+        reflective_name = None
+        if isinstance(node.func, ast.Name):
+            reflective_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            reflective_name = node.func.attr
+        if (
+            reflective_name
+            in {
+                "getattr",
+                "setattr",
+                "delattr",
+                "__getattribute__",
+                "__setattr__",
+                "__delattr__",
+            }
+            and len(node.args) >= 2
+            and self._static_string(node.args[1])
+            in {
+                SOURCE_CLASSIFICATION_VERIFIER_NAME,
+                f"_{SOURCE_CLASSIFICATION_VERIFIER_NAME}",
+            }
+        ):
+            self._record(node, "dynamic hard opt-out verifier reference")
+
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "SourceCoordinator"
+        ):
+            self._record(node, "SourceCoordinator attribute construction is unreviewed")
+
         if self._constructor_name_is_protected(node.func):
             self._allowed_constructor_refs.add(id(node.func))
             if not self._reviewed_callable():
@@ -851,24 +940,13 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
                 self._record(node, "SourceCoordinator result propagation is unreviewed")
             if any(keyword.arg is None for keyword in node.keywords):
                 self._record(node, "SourceCoordinator constructor expansion is unreviewed")
-            if any(
-                keyword.arg
-                in {
-                    SOURCE_CLASSIFICATION_VERIFIER_NAME,
-                    f"_{SOURCE_CLASSIFICATION_VERIFIER_NAME}",
-                }
-                for keyword in node.keywords
-            ):
-                self._record(node, "hard opt-out verifier injection is unreviewed")
-
         if (
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and self._instance_is_protected(node.func.value.id)
         ):
             if (
-                node.func.attr in self._ALLOWED_INSTANCE_METHODS
-                and self._reviewed_callable()
+                self._reviewed_callable()
                 and not node.func.attr.startswith("_")
             ):
                 self._allowed_instance_refs.add(id(node.func.value))
@@ -912,16 +990,12 @@ class _SourceClassificationTrustVisitor(ast.NodeVisitor):
         ):
             self._record(node, "namespace primitive propagation is unreviewed")
         if self._constructor_name_is_protected(node):
-            if (
-                id(node) not in self._allowed_constructor_refs
-                and id(node) not in self._annotation_ids
-            ):
+            if id(node) not in self._allowed_constructor_refs:
                 self._record(node, "SourceCoordinator class propagation is unreviewed")
             return
         if (
             self._instance_is_protected(node.id)
             and id(node) not in self._allowed_instance_refs
-            and id(node) not in self._annotation_ids
         ):
             self._record(node, "source coordinator instance propagation is unreviewed")
 
@@ -2003,7 +2077,7 @@ class InventoryContractTests(unittest.TestCase):
 
         annotation_only = (
             "from email_automation.source_coordinator import SourceCoordinator\n"
-            "def accept(value: SourceCoordinator) -> SourceCoordinator:\n"
+            "def accept(value: 'SourceCoordinator') -> 'SourceCoordinator':\n"
             "    return value"
         )
         self.assertEqual(
@@ -2041,6 +2115,81 @@ class InventoryContractTests(unittest.TestCase):
                 "email_automation/processing.py",
             ),
         )
+
+    def test_classification_gate_rejects_production_verifier_wiring_globally(self):
+        mutations = {
+            "aliased constructor keyword": (
+                "factory = recover_constructor()\n"
+                "value = factory(client, hard_optout_verifier=verify)"
+            ),
+            "ordinary call keyword": "register(hard_optout_verifier=verify)",
+            "private attribute fragments": (
+                "name = '_hard_' + 'optout_verifier'\n"
+                "setattr(value, name, verify)"
+            ),
+            "public verifier fragments": (
+                "name = 'hard_' + 'optout_verifier'\n"
+                "getattr(value, name)"
+            ),
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_admission_contract_violations(
+                        source,
+                        "email_automation/processing.py",
+                    )
+                )
+
+    def test_classification_gate_rejects_executable_annotations(self):
+        source = (
+            "from email_automation.source_coordinator import SourceCoordinator\n"
+            "def process_inbox_message("
+            "value: register(SourceCoordinator)):\n"
+            "    pass"
+        )
+        self.assertTrue(
+            _source_admission_contract_violations(
+                source,
+                "email_automation/processing.py",
+            )
+        )
+
+    def test_classification_gate_requires_exact_constructor_import(self):
+        constructor_call = (
+            ".SourceCoordinator(client, uuid_factory=make_id, "
+            "now_factory=now, hard_optout_verifier=verify)"
+        )
+        mutations = {
+            "package from import": (
+                "from email_automation import source_coordinator as sc\n"
+                "value = sc" + constructor_call
+            ),
+            "relative package import": (
+                "from . import source_coordinator as sc\n"
+                "value = sc" + constructor_call
+            ),
+            "direct module import": (
+                "import email_automation.source_coordinator as sc\n"
+                "value = sc" + constructor_call
+            ),
+            "relative direct class import": (
+                "from .source_coordinator import SourceCoordinator\n"
+                "value = SourceCoordinator(client)"
+            ),
+            "foreign constructor rebinding": (
+                "from email_automation.source_coordinator import SourceCoordinator\n"
+                "from evil import Factory as SourceCoordinator"
+            ),
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_admission_contract_violations(
+                        source,
+                        "email_automation/processing.py",
+                    )
+                )
 
     def test_classification_gate_allows_lexically_shadowed_coordinator_names(self):
         constructor_shadow = (
@@ -2099,6 +2248,28 @@ class InventoryContractTests(unittest.TestCase):
                         "email_automation/unreviewed.py",
                     )
                 )
+
+        exact_safe_membership = (
+            "from email_automation.source_coordinator import SourceCoordinator\n"
+            "value = 'saga' in locals()"
+        )
+        self.assertEqual(
+            [],
+            _source_admission_contract_violations(
+                exact_safe_membership,
+                "email_automation/processing.py",
+            ),
+        )
+        chained_membership = (
+            "from email_automation.source_coordinator import SourceCoordinator\n"
+            "value = 'saga' in locals() == sink"
+        )
+        self.assertTrue(
+            _source_admission_contract_violations(
+                chained_membership,
+                "email_automation/processing.py",
+            )
+        )
 
     def test_classification_gate_rejects_statically_named_dynamic_acquisition(self):
         mutations = {
@@ -2194,8 +2365,10 @@ class InventoryContractTests(unittest.TestCase):
             "user_id, source)\n"
             "    result = coordinator.classify_source_once("
             "user_id, source_id, lease_seconds, classification_input, classifier)\n"
+            "    snapshot = coordinator."
+            "require_authoritative_classification_snapshot(user_id, source_id)\n"
             "    setattr(record, 'status', 'ready')\n"
-            "    return admitted, result"
+            "    return admitted, result, snapshot"
         )
         self.assertEqual(
             [],
