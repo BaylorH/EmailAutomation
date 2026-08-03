@@ -1984,23 +1984,29 @@ class SourceCoordinator:
             data,
             canonical_source_id=canonical_source_id,
         )
+        state = data["classificationState"]
         stored_input_hash = data.get("classificationInputHash")
-        if (
+        input_conflicts = (
             expected_classification_input_hash is not None
             and stored_input_hash is not None
             and stored_input_hash != expected_classification_input_hash
-        ):
-            raise ClassificationInputConflict(
-                "classification input conflicts with retained authority"
-            )
-        if data["classificationState"] == "snapshot_ready":
+        )
+        if state == "snapshot_ready":
+            if input_conflicts:
+                raise ClassificationInputConflict(
+                    "classification input conflicts with retained authority"
+                )
             return _classification_snapshot_from_data(data)
-        if data["classificationState"] in {
+        if state in {
             "request_started",
             "classification_request_ambiguous",
         }:
             raise ClassificationRequestAmbiguous(
                 "classification request is already started or ambiguous"
+            )
+        if input_conflicts:
+            raise ClassificationInputConflict(
+                "classification input conflicts with retained authority"
             )
         raise ClassificationSnapshotNotReady(
             "classification snapshot is not ready"
@@ -2034,15 +2040,16 @@ class SourceCoordinator:
                 before,
                 canonical_source_id=canonical_source_id,
             )
-            if (
+            state = before["classificationState"]
+            input_conflicts = (
                 before.get("classificationInputHash") is not None
                 and before["classificationInputHash"] != classification_input_hash
-            ):
-                raise ClassificationInputConflict(
-                    "classification input conflicts with request authority"
-                )
-            state = before["classificationState"]
+            )
             if state == "snapshot_ready":
+                if input_conflicts:
+                    raise ClassificationInputConflict(
+                        "classification input conflicts with retained authority"
+                    )
                 return _ClassificationTransactionPlan(
                     result=_classification_snapshot_from_data(before),
                     identity_ref=identity_ref,
@@ -2062,6 +2069,10 @@ class SourceCoordinator:
                 )
             now = self._current_time()
             if before["leaseExpiresAt"] > now:
+                if input_conflicts:
+                    raise ClassificationInputConflict(
+                        "classification input conflicts with request authority"
+                    )
                 raise ClassificationRequestAmbiguous(
                     "classification request is still active"
                 )

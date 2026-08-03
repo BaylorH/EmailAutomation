@@ -1334,10 +1334,69 @@ class ClassificationTests(unittest.TestCase):
         )
         self.assertEqual("ambiguous", self.classification_data()["modelRequestState"])
 
-    def test_expired_started_request_apply_then_raise_uses_exact_readback(self):
+    def test_expired_started_request_drift_cannot_suppress_ambiguity_fence(self):
         claim = self.claim()
         self.start(claim)
         self.clock.advance(seconds=61)
+        writes_before_recovery = list(self.write_events())
+        calls = 0
+
+        def classifier():
+            nonlocal calls
+            calls += 1
+            raise AssertionError("expired drift recovery called classifier")
+
+        self.assertErrorCode(
+            "classification_request_ambiguous",
+            lambda: self.classify(
+                classifier,
+                classification_input={**CLASSIFICATION_INPUT, "drift": True},
+            ),
+        )
+
+        self.assertEqual(0, calls)
+        stored = self.classification_data()
+        self.assertEqual(
+            "classification_request_ambiguous",
+            stored["classificationState"],
+        )
+        self.assertEqual("ambiguous", stored["modelRequestState"])
+        recovery_writes = self.write_events()[len(writes_before_recovery) :]
+        self.assertEqual(1, len(recovery_writes))
+        self.assertEqual("update", recovery_writes[0][0])
+        self.assertEqual(self.classification_path, recovery_writes[0][1])
+
+    def test_active_started_request_drift_remains_input_conflict(self):
+        claim = self.claim()
+        self.start(claim)
+        writes_before_retry = list(self.write_events())
+        calls = 0
+
+        def classifier():
+            nonlocal calls
+            calls += 1
+            raise AssertionError("active drift retry called classifier")
+
+        self.assertErrorCode(
+            "classification_input_conflict",
+            lambda: self.classify(
+                classifier,
+                classification_input={**CLASSIFICATION_INPUT, "drift": True},
+            ),
+        )
+
+        self.assertEqual(0, calls)
+        self.assertEqual(
+            "request_started",
+            self.classification_data()["classificationState"],
+        )
+        self.assertEqual(writes_before_retry, self.write_events())
+
+    def test_expired_started_request_drift_apply_then_raise_uses_exact_readback(self):
+        claim = self.claim()
+        self.start(claim)
+        self.clock.advance(seconds=61)
+        writes_before_recovery = list(self.write_events())
         self.fake.apply_then_raise_next_commit = RuntimeError("unknown commit")
         calls = 0
 
@@ -1348,7 +1407,10 @@ class ClassificationTests(unittest.TestCase):
 
         self.assertErrorCode(
             "classification_request_ambiguous",
-            lambda: self.classify(classifier),
+            lambda: self.classify(
+                classifier,
+                classification_input={**CLASSIFICATION_INPUT, "drift": True},
+            ),
         )
 
         self.assertEqual(0, calls)
@@ -1362,6 +1424,10 @@ class ClassificationTests(unittest.TestCase):
             1,
             sum(event[0] == "commit_raised_after_apply" for event in self.fake.events),
         )
+        recovery_writes = self.write_events()[len(writes_before_recovery) :]
+        self.assertEqual(1, len(recovery_writes))
+        self.assertEqual("update", recovery_writes[0][0])
+        self.assertEqual(self.classification_path, recovery_writes[0][1])
 
     def test_snapshot_apply_then_raise_is_accepted_by_exact_readback(self):
         claim = self.claim()
