@@ -141,10 +141,6 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
 
     def visit_Lambda(self, node):
         self.visit(node.args)
-
-    def visit_arg(self, node):
-        if node.annotation:
-            self.visit(node.annotation)
         self._scopes.append(("lambda", f"<lambda@{node.lineno}:{node.col_offset}>"))
         try:
             self.visit(node.body)
@@ -440,6 +436,27 @@ def escaped_module():
                 ("email_automation/unrelated.py", "escaped_module"): 1,
             }),
             _in_memory_draft_delete_callers(source, "email_automation/unrelated.py"),
+        )
+
+    def test_lambda_body_call_uses_qualified_lambda_scope(self):
+        source = "def outer():\n    callback = lambda: _delete_graph_reply_draft()\n"
+        expected = Counter(
+            {("email_automation/followup.py", "outer.<lambda@2:15>"): 1}
+        )
+        self.assertEqual(
+            expected,
+            _in_memory_draft_delete_callers(source, "email_automation/followup.py"),
+        )
+
+    def test_lambda_default_call_stays_in_enclosing_scope(self):
+        source = (
+            "def outer():\n"
+            "    callback = lambda value=_delete_graph_reply_draft(): value\n"
+        )
+        expected = Counter({("email_automation/followup.py", "outer"): 1})
+        self.assertEqual(
+            expected,
+            _in_memory_draft_delete_callers(source, "email_automation/followup.py"),
         )
 
     def test_protected_reference_propagation_is_rejected(self):
