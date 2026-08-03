@@ -102,6 +102,44 @@ def _resolve_import_from_module(relative_path, node):
     return ".".join(package_parts)
 
 
+def _function_definition_expressions(node):
+    yield from node.decorator_list
+    yield from getattr(node, "type_params", ())
+    yield from node.args.defaults
+    yield from (
+        default for default in node.args.kw_defaults if default is not None
+    )
+
+    arguments = (
+        list(node.args.posonlyargs)
+        + list(node.args.args)
+        + list(node.args.kwonlyargs)
+    )
+    if node.args.vararg is not None:
+        arguments.append(node.args.vararg)
+    if node.args.kwarg is not None:
+        arguments.append(node.args.kwarg)
+    for argument in arguments:
+        if argument.annotation is not None:
+            yield argument.annotation
+    if node.returns is not None:
+        yield node.returns
+
+
+def _lambda_definition_expressions(node):
+    yield from node.args.defaults
+    yield from (
+        default for default in node.args.kw_defaults if default is not None
+    )
+
+
+def _class_definition_expressions(node):
+    yield from node.decorator_list
+    yield from getattr(node, "type_params", ())
+    yield from node.bases
+    yield from (keyword.value for keyword in node.keywords)
+
+
 class _ScopeBindingCollector(ast.NodeVisitor):
     def __init__(self, relative_path, *, module_scope):
         self.relative_path = Path(relative_path).as_posix()
@@ -134,15 +172,20 @@ class _ScopeBindingCollector(ast.NodeVisitor):
             self._add_binding(node.name, _HELPER_BINDING)
         else:
             self._add_binding(node.name, _NONHELPER_BINDING)
+        for expression in _function_definition_expressions(node):
+            self.visit(expression)
 
     def visit_AsyncFunctionDef(self, node):
         self.visit_FunctionDef(node)
 
     def visit_ClassDef(self, node):
         self._add_binding(node.name, _NONHELPER_BINDING)
+        for expression in _class_definition_expressions(node):
+            self.visit(expression)
 
     def visit_Lambda(self, node):
-        return
+        for expression in _lambda_definition_expressions(node):
+            self.visit(expression)
 
     def visit_ImportFrom(self, node):
         imported_module = _resolve_import_from_module(self.relative_path, node)
@@ -633,39 +676,13 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
             self.visit(node)
 
     def _visit_function_scope(self, node):
-        for decorator in node.decorator_list:
-            self.visit(decorator)
-        for type_parameter in getattr(node, "type_params", ()):
-            self.visit(type_parameter)
-        for default in node.args.defaults:
-            self.visit(default)
-        for default in node.args.kw_defaults:
-            self._visit_if_present(default)
-
-        arguments = (
-            list(node.args.posonlyargs)
-            + list(node.args.args)
-            + list(node.args.kwonlyargs)
-        )
-        if node.args.vararg is not None:
-            arguments.append(node.args.vararg)
-        if node.args.kwarg is not None:
-            arguments.append(node.args.kwarg)
-        for argument in arguments:
-            self._visit_if_present(argument.annotation)
-        self._visit_if_present(node.returns)
-
+        for expression in _function_definition_expressions(node):
+            self.visit(expression)
         self._visit_scope(node, "function")
 
     def _visit_class_scope(self, node):
-        for decorator in node.decorator_list:
-            self.visit(decorator)
-        for type_parameter in getattr(node, "type_params", ()):
-            self.visit(type_parameter)
-        for base in node.bases:
-            self.visit(base)
-        for keyword in node.keywords:
-            self.visit(keyword.value)
+        for expression in _class_definition_expressions(node):
+            self.visit(expression)
         self._visit_scope(node, "class")
 
     def _caller_scope(self):
@@ -696,11 +713,8 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
         self._visit_class_scope(node)
 
     def visit_Lambda(self, node):
-        defaults = list(node.args.defaults) + [
-            default for default in node.args.kw_defaults if default is not None
-        ]
-        for default in defaults:
-            self.visit(default)
+        for expression in _lambda_definition_expressions(node):
+            self.visit(expression)
 
         bindings = _function_argument_bindings(node.args, self.binding_stack)
         self.binding_stack.append(("function", bindings))
@@ -913,6 +927,59 @@ def _in_memory_draft_delete_callers(source, relative_path):
 
 
 class InventoryScannerRegressionTests(unittest.TestCase):
+    def test_module_walrus_default_binds_in_defining_scope(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+import email_automation.email as em
+
+def setup(module=(alias := em)):
+    pass
+
+def cleanup():
+    alias._delete_graph_reply_draft()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/followup.py", "cleanup"): 1}),
+            callers,
+        )
+
+    def test_package_walrus_default_binds_in_defining_scope(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+import email_automation.email
+
+def setup(package=(alias := email_automation)):
+    pass
+
+def cleanup():
+    alias.email._delete_graph_reply_draft()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/followup.py", "cleanup"): 1}),
+            callers,
+        )
+
+    def test_lambda_walrus_default_binds_in_defining_scope(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+import email_automation.email as em
+
+setup = lambda module=(alias := em): None
+
+def cleanup():
+    alias._delete_graph_reply_draft()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/followup.py", "cleanup"): 1}),
+            callers,
+        )
+
     def test_email_module_default_parameter_call_is_counted(self):
         callers = _in_memory_draft_delete_callers(
             """
