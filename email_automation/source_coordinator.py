@@ -51,6 +51,8 @@ class SourceAlias:
 
 def resolve_source_coordinator_mode(environ: Mapping[str, str]) -> CoordinatorMode:
     value = environ.get(SOURCE_COORDINATOR_MODE_ENV)
+    if type(value) is not str:
+        return CoordinatorMode.DISABLED
     if value == CoordinatorMode.SHADOW.value:
         return CoordinatorMode.SHADOW
     if value == CoordinatorMode.ENFORCED.value:
@@ -78,9 +80,9 @@ def _contains_control_character(value: str) -> bool:
 
 
 def normalize_source_alias(alias_type: str, value: str) -> SourceAlias:
-    if not isinstance(alias_type, str) or alias_type not in _SOURCE_ALIAS_TYPES:
+    if type(alias_type) is not str or alias_type not in _SOURCE_ALIAS_TYPES:
         raise SourceCoordinatorConfigError("source alias type is unsupported")
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise SourceCoordinatorConfigError("source alias value must be a string")
     if _contains_control_character(value):
         raise SourceCoordinatorConfigError("source alias contains a control character")
@@ -104,7 +106,7 @@ def normalize_source_alias(alias_type: str, value: str) -> SourceAlias:
 
 
 def source_alias_key(user_id: str, alias: SourceAlias) -> str:
-    if not isinstance(user_id, str) or not user_id:
+    if type(user_id) is not str or not user_id:
         raise SourceCoordinatorConfigError("user id must be a non-empty string")
     if not isinstance(alias, SourceAlias):
         raise SourceCoordinatorConfigError("source alias is invalid")
@@ -116,7 +118,12 @@ def source_alias_key(user_id: str, alias: SourceAlias) -> str:
     ):
         raise SourceCoordinatorConfigError("source alias is not canonical")
 
-    encoded = "\0".join(
-        (_SOURCE_ALIAS_KEY_DOMAIN, user_id, alias.alias_type, alias.value)
-    ).encode("utf-8")
+    try:
+        encoded = "\0".join(
+            (_SOURCE_ALIAS_KEY_DOMAIN, user_id, alias.alias_type, alias.value)
+        ).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SourceCoordinatorConfigError(
+            "source alias key input is not valid UTF-8"
+        ) from exc
     return hashlib.sha256(encoded).hexdigest()

@@ -17,6 +17,32 @@ def _load_source_coordinator(test_case):
     return importlib.import_module(MODULE_NAME)
 
 
+class MalformedMode(str):
+    def __new__(cls, value):
+        instance = super().__new__(cls, value)
+        instance.equality_calls = 0
+        return instance
+
+    def __eq__(self, other):
+        self.equality_calls += 1
+        return other == "enforced"
+
+    __hash__ = str.__hash__
+
+
+class HostileString(str):
+    def __eq__(self, other):
+        return True
+
+    def strip(self, *args, **kwargs):
+        raise AssertionError("hostile strip executed")
+
+    def encode(self, *args, **kwargs):
+        raise AssertionError("hostile encode executed")
+
+    __hash__ = str.__hash__
+
+
 class SourceCoordinatorContractTests(unittest.TestCase):
     def setUp(self):
         self.coordinator = _load_source_coordinator(self)
@@ -69,6 +95,15 @@ class SourceCoordinatorContractTests(unittest.TestCase):
                         {"SITESIFT_SOURCE_COORDINATOR_MODE": invalid}
                     ),
                 )
+
+        malformed = MalformedMode("garbage")
+        self.assertIs(
+            mode.DISABLED,
+            coordinator.resolve_source_coordinator_mode(
+                {"SITESIFT_SOURCE_COORDINATOR_MODE": malformed}
+            ),
+        )
+        self.assertEqual(0, malformed.equality_calls)
 
     def test_source_alias_is_frozen_and_limit_is_exact(self):
         coordinator = self.coordinator
@@ -130,8 +165,10 @@ class SourceCoordinatorContractTests(unittest.TestCase):
         invalid_aliases = (
             ("unknown", "value"),
             (None, "value"),
+            (HostileString("graph"), "value"),
             ("graph", None),
             ("graph", 123),
+            ("graph", HostileString("value")),
             ("graph", ""),
             ("graph", "   "),
             ("graph", "abc\x00def"),
@@ -184,7 +221,17 @@ class SourceCoordinatorContractTests(unittest.TestCase):
             ("", canonical),
             (None, canonical),
             (123, canonical),
+            (HostileString("user-1"), canonical),
+            ("\ud800", canonical),
             ("user-1", coordinator.SourceAlias("graph", " opaque ")),
+            (
+                "user-1",
+                coordinator.SourceAlias(HostileString("graph"), "opaque"),
+            ),
+            (
+                "user-1",
+                coordinator.SourceAlias("graph", HostileString("opaque")),
+            ),
             ("user-1", coordinator.SourceAlias("unknown", "opaque")),
             ("user-1", object()),
         )
