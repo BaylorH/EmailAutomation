@@ -23,14 +23,20 @@ EXPECTED_DRAFT_DELETE_CALLERS = Counter(
     }
 )
 
-EXPECTED_LEGACY_MARKER_SYMBOLS = {
-    "email_automation/messaging.py": {"has_processed", "mark_processed"},
-    "scheduler_runner.py": {"has_processed", "mark_processed"},
-    "email_automation/operator_replay.py": {
-        "_begin_replay_claim",
-        "_complete_replay_claim",
-    },
-}
+EXPECTED_LEGACY_MARKER_DEFINITIONS = Counter(
+    {
+        ("email_automation/messaging.py", "has_processed"): 1,
+        ("email_automation/messaging.py", "mark_processed"): 1,
+        ("scheduler_runner.py", "has_processed"): 1,
+        ("scheduler_runner.py", "mark_processed"): 1,
+        ("email_automation/operator_replay.py", "_begin_replay_claim"): 1,
+        ("email_automation/operator_replay.py", "_complete_replay_claim"): 1,
+    }
+)
+
+_HELPER_BINDING = "helper"
+_EMAIL_MODULE_BINDING = "email_module"
+_OTHER_BINDING = "other"
 
 _EXCLUDED_APPLICATION_PARTS = {
     ".git",
@@ -90,49 +96,252 @@ def _dotted_expression(node):
     return None
 
 
+class _ScopeBindingCollector(ast.NodeVisitor):
+    def __init__(self, relative_path, *, module_scope):
+        self.relative_path = Path(relative_path).as_posix()
+        self.module_scope = module_scope
+        self.bindings = {}
+        self.assignments = []
+
+    def _add_binding(self, name, binding_kind):
+        self.bindings.setdefault(name, set()).add(binding_kind)
+
+    def _add_nonhelper_target(self, target):
+        if isinstance(target, ast.Name):
+            self._add_binding(target.id, _OTHER_BINDING)
+        elif isinstance(target, (ast.List, ast.Tuple)):
+            for element in target.elts:
+                self._add_nonhelper_target(element)
+        elif isinstance(target, ast.Starred):
+            self._add_nonhelper_target(target.value)
+
+    def _add_assignment(self, target, value):
+        if isinstance(target, ast.Name):
+            self.assignments.append((target.id, value))
+        else:
+            self._add_nonhelper_target(target)
+
+    def visit_FunctionDef(self, node):
+        if (
+            self.module_scope
+            and self.relative_path == DRAFT_DELETE_EMAIL_PATH
+            and node.name == DRAFT_DELETE_HELPER_NAME
+        ):
+            self._add_binding(node.name, _HELPER_BINDING)
+        else:
+            self._add_binding(node.name, _OTHER_BINDING)
+
+    def visit_AsyncFunctionDef(self, node):
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node):
+        self._add_binding(node.name, _OTHER_BINDING)
+
+    def visit_Lambda(self, node):
+        return
+
+    def visit_ImportFrom(self, node):
+        imported_module = _resolve_import_from_module(self.relative_path, node)
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            bound_name = alias.asname or alias.name
+            if (
+                imported_module == DRAFT_DELETE_EMAIL_MODULE
+                and alias.name == DRAFT_DELETE_HELPER_NAME
+            ):
+                self._add_binding(bound_name, _HELPER_BINDING)
+            elif imported_module == "email_automation" and alias.name == "email":
+                self._add_binding(bound_name, _EMAIL_MODULE_BINDING)
+            else:
+                self._add_binding(bound_name, _OTHER_BINDING)
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            if alias.name == DRAFT_DELETE_EMAIL_MODULE:
+                bound_name = alias.asname or alias.name
+                self._add_binding(bound_name, _EMAIL_MODULE_BINDING)
+            else:
+                bound_name = alias.asname or alias.name.split(".", 1)[0]
+                self._add_binding(bound_name, _OTHER_BINDING)
+
+    def visit_Assign(self, node):
+        for target in node.targets:
+            self._add_assignment(target, node.value)
+        self.visit(node.value)
+
+    def visit_AnnAssign(self, node):
+        if node.value is None:
+            self._add_nonhelper_target(node.target)
+        else:
+            self._add_assignment(node.target, node.value)
+            self.visit(node.value)
+
+    def visit_NamedExpr(self, node):
+        self._add_assignment(node.target, node.value)
+        self.visit(node.value)
+
+    def visit_AugAssign(self, node):
+        self._add_nonhelper_target(node.target)
+        self.visit(node.value)
+
+    def visit_For(self, node):
+        self._add_nonhelper_target(node.target)
+        self.generic_visit(node)
+
+    def visit_AsyncFor(self, node):
+        self.visit_For(node)
+
+    def visit_With(self, node):
+        for item in node.items:
+            if item.optional_vars is not None:
+                self._add_nonhelper_target(item.optional_vars)
+        self.generic_visit(node)
+
+    def visit_AsyncWith(self, node):
+        self.visit_With(node)
+
+    def visit_ExceptHandler(self, node):
+        if node.name:
+            self._add_binding(node.name, _OTHER_BINDING)
+        self.generic_visit(node)
+
+
+def _function_argument_names(arguments):
+    positional = list(arguments.posonlyargs) + list(arguments.args)
+    names = [argument.arg for argument in positional + list(arguments.kwonlyargs)]
+    if arguments.vararg is not None:
+        names.append(arguments.vararg.arg)
+    if arguments.kwarg is not None:
+        names.append(arguments.kwarg.arg)
+    return names
+
+
+def _lookup_binding_states(name, scoped_bindings):
+    crossed_function = False
+    for scope_kind, bindings in reversed(scoped_bindings):
+        if scope_kind == "class" and crossed_function:
+            continue
+        if name in bindings:
+            return set(bindings[name])
+        if scope_kind == "function":
+            crossed_function = True
+    return set()
+
+
+def _expression_binding_states(node, scoped_bindings):
+    if isinstance(node, ast.Name):
+        return _lookup_binding_states(node.id, scoped_bindings)
+    if (
+        isinstance(node, ast.Attribute)
+        and node.attr == DRAFT_DELETE_HELPER_NAME
+    ):
+        receiver = _dotted_expression(node.value)
+        receiver_states = (
+            _lookup_binding_states(receiver, scoped_bindings)
+            if receiver
+            else set()
+        )
+        result = set()
+        if _EMAIL_MODULE_BINDING in receiver_states:
+            result.add(_HELPER_BINDING)
+        if receiver_states - {_EMAIL_MODULE_BINDING}:
+            result.add(_OTHER_BINDING)
+        return result
+    return {_OTHER_BINDING}
+
+
+def _analyze_scope_bindings(node, relative_path, scope_kind, outer_bindings):
+    collector = _ScopeBindingCollector(
+        relative_path,
+        module_scope=scope_kind == "module",
+    )
+    if scope_kind == "function":
+        for argument_name in _function_argument_names(node.args):
+            collector._add_binding(argument_name, _OTHER_BINDING)
+    for statement in node.body:
+        collector.visit(statement)
+
+    bindings = collector.bindings
+    pending_assignments = list(collector.assignments)
+    while pending_assignments:
+        unresolved = []
+        changed = False
+        scoped_bindings = outer_bindings + [(scope_kind, bindings)]
+        for target_name, value in pending_assignments:
+            value_states = _expression_binding_states(value, scoped_bindings)
+            if not value_states:
+                unresolved.append((target_name, value))
+                continue
+            target_states = bindings.setdefault(target_name, set())
+            previous_states = set(target_states)
+            target_states.update(value_states)
+            changed = changed or target_states != previous_states
+        if not unresolved:
+            break
+        if not changed:
+            for target_name, _ in unresolved:
+                bindings.setdefault(target_name, set()).add(_OTHER_BINDING)
+            break
+        pending_assignments = unresolved
+
+    for name, states in bindings.items():
+        helper_related = states & {_HELPER_BINDING, _EMAIL_MODULE_BINDING}
+        if helper_related and len(states) > 1:
+            raise AssertionError(
+                f"ambiguous draft delete alias {name!r} in "
+                f"{Path(relative_path).as_posix()}"
+            )
+    return bindings
+
+
 class _DraftDeleteCallVisitor(ast.NodeVisitor):
     def __init__(self, relative_path):
         self.relative_path = Path(relative_path).as_posix()
         self.scope_stack = []
-        self.binding_stack = [
-            {"helper_names": set(), "email_module_names": set()}
-        ]
+        self.binding_stack = []
         self.callers = Counter()
         self.requests_delete_implementations = 0
 
-    def _visit_scope(self, node, scope_kind):
-        self.scope_stack.append((scope_kind, node.name))
-        self.binding_stack.append(
-            {"helper_names": set(), "email_module_names": set()}
+    def visit_Module(self, node):
+        bindings = _analyze_scope_bindings(
+            node,
+            self.relative_path,
+            "module",
+            [],
         )
+        self.binding_stack.append(("module", bindings))
+        self.generic_visit(node)
+        self.binding_stack.pop()
+
+    def _visit_scope(self, node, scope_kind):
+        bindings = _analyze_scope_bindings(
+            node,
+            self.relative_path,
+            scope_kind,
+            self.binding_stack,
+        )
+        self.scope_stack.append((scope_kind, node.name))
+        self.binding_stack.append((scope_kind, bindings))
         self.generic_visit(node)
         self.binding_stack.pop()
         self.scope_stack.pop()
 
-    def _bind_helper_name(self, name):
-        self.binding_stack[-1]["helper_names"].add(name)
-
-    def _bind_email_module_name(self, name):
-        self.binding_stack[-1]["email_module_names"].add(name)
-
-    def _is_bound(self, binding_kind, name):
-        return any(
-            name in bindings[binding_kind]
-            for bindings in reversed(self.binding_stack)
-        )
-
     def _is_bound_delete_helper_call(self, node):
         if isinstance(node.func, ast.Name):
-            return self._is_bound("helper_names", node.func.id)
+            states = _lookup_binding_states(node.func.id, self.binding_stack)
+            return states == {_HELPER_BINDING}
         if (
             isinstance(node.func, ast.Attribute)
             and node.func.attr == DRAFT_DELETE_HELPER_NAME
         ):
             receiver = _dotted_expression(node.func.value)
-            return bool(
-                receiver
-                and self._is_bound("email_module_names", receiver)
+            states = (
+                _lookup_binding_states(receiver, self.binding_stack)
+                if receiver
+                else set()
             )
+            return states == {_EMAIL_MODULE_BINDING}
         return False
 
     def _caller_scope(self):
@@ -154,44 +363,13 @@ class _DraftDeleteCallVisitor(ast.NodeVisitor):
         )
 
     def visit_FunctionDef(self, node):
-        if (
-            self.relative_path == DRAFT_DELETE_EMAIL_PATH
-            and not self.scope_stack
-            and node.name == DRAFT_DELETE_HELPER_NAME
-        ):
-            self._bind_helper_name(node.name)
         self._visit_scope(node, "function")
 
     def visit_AsyncFunctionDef(self, node):
-        if (
-            self.relative_path == DRAFT_DELETE_EMAIL_PATH
-            and not self.scope_stack
-            and node.name == DRAFT_DELETE_HELPER_NAME
-        ):
-            self._bind_helper_name(node.name)
         self._visit_scope(node, "function")
 
     def visit_ClassDef(self, node):
         self._visit_scope(node, "class")
-
-    def visit_ImportFrom(self, node):
-        imported_module = _resolve_import_from_module(self.relative_path, node)
-        if imported_module == DRAFT_DELETE_EMAIL_MODULE:
-            for alias in node.names:
-                if alias.name == DRAFT_DELETE_HELPER_NAME:
-                    self._bind_helper_name(alias.asname or alias.name)
-        elif imported_module == "email_automation":
-            for alias in node.names:
-                if alias.name == "email":
-                    self._bind_email_module_name(alias.asname or alias.name)
-        self.generic_visit(node)
-
-    def visit_Import(self, node):
-        for alias in node.names:
-            if alias.name != DRAFT_DELETE_EMAIL_MODULE:
-                continue
-            self._bind_email_module_name(alias.asname or alias.name)
-        self.generic_visit(node)
 
     def visit_Call(self, node):
         if self._is_bound_delete_helper_call(node):
@@ -242,17 +420,18 @@ def _discover_draft_delete_callers(manifest_callers):
 
 
 def _discover_legacy_authority_symbols():
-    target_names = set().union(*EXPECTED_LEGACY_MARKER_SYMBOLS.values())
-    discovered = {}
+    target_names = {
+        name for _, name in EXPECTED_LEGACY_MARKER_DEFINITIONS
+    }
+    discovered = Counter()
     for relative_path in _application_python_files():
-        names = {
-            node.name
-            for node in ast.walk(_parse_module(relative_path))
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name in target_names
-        }
-        if names:
-            discovered[relative_path.as_posix()] = names
+        path = relative_path.as_posix()
+        for node in ast.walk(_parse_module(relative_path)):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in target_names
+            ):
+                discovered[(path, node.name)] += 1
     return discovered
 
 
@@ -263,6 +442,97 @@ def _in_memory_draft_delete_callers(source, relative_path):
 
 
 class InventoryScannerRegressionTests(unittest.TestCase):
+    def test_simple_assignment_alias_is_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+from .email import _delete_graph_reply_draft
+
+def cleanup():
+    alias = _delete_graph_reply_draft
+    alias()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/followup.py", "cleanup"): 1}),
+            callers,
+        )
+
+    def test_forward_global_helper_definition_is_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+def cleanup():
+    _delete_graph_reply_draft()
+
+def _delete_graph_reply_draft():
+    pass
+""",
+            "email_automation/email.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/email.py", "cleanup"): 1}),
+            callers,
+        )
+
+    def test_import_after_function_definition_is_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+def cleanup():
+    discard_reply()
+
+from .email import _delete_graph_reply_draft as discard_reply
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(
+            Counter({("email_automation/followup.py", "cleanup"): 1}),
+            callers,
+        )
+
+    def test_parameter_shadowing_helper_name_is_not_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+from .email import _delete_graph_reply_draft
+
+def cleanup(_delete_graph_reply_draft):
+    _delete_graph_reply_draft()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(Counter(), callers)
+
+    def test_local_nonhelper_shadowing_helper_name_is_not_counted(self):
+        callers = _in_memory_draft_delete_callers(
+            """
+from .email import _delete_graph_reply_draft
+
+def cleanup():
+    _delete_graph_reply_draft = client.cleanup
+    _delete_graph_reply_draft()
+""",
+            "email_automation/followup.py",
+        )
+        self.assertEqual(Counter(), callers)
+
+    def test_ambiguous_assignment_alias_fails_closed(self):
+        source = """
+from .email import _delete_graph_reply_draft as delete_draft
+
+def cleanup(flag):
+    alias = delete_draft
+    if flag:
+        alias = client.cleanup
+    alias()
+"""
+        with self.assertRaisesRegex(
+            AssertionError,
+            "ambiguous draft delete alias",
+        ):
+            _in_memory_draft_delete_callers(
+                source,
+                "email_automation/followup.py",
+            )
+
     def test_module_scope_delete_call_is_surfaced(self):
         callers = _in_memory_draft_delete_callers(
             """
@@ -376,6 +646,48 @@ def cleanup():
             with self.assertRaises(AssertionError):
                 inventory_case.test_pre_b1_legacy_authority_symbols_are_inventoried()
 
+    def test_duplicate_legacy_definition_in_expected_file_fails_inventory(self):
+        duplicate_sources = {
+            "top_level": "def mark_processed(): pass\n",
+            "method": "class Duplicate:\n    def mark_processed(self): pass\n",
+            "nested": (
+                "def wrapper():\n"
+                "    def mark_processed(): pass\n"
+                "    return mark_processed\n"
+            ),
+        }
+
+        for duplicate_kind, duplicate_source in duplicate_sources.items():
+            with self.subTest(duplicate_kind=duplicate_kind):
+                modules = {
+                    "email_automation/messaging.py": ast.parse(
+                        "def has_processed(): pass\n"
+                        "def mark_processed(): pass\n"
+                        + duplicate_source
+                    ),
+                    "scheduler_runner.py": ast.parse(
+                        "def has_processed(): pass\n"
+                        "def mark_processed(): pass\n"
+                    ),
+                    "email_automation/operator_replay.py": ast.parse(
+                        "def _begin_replay_claim(): pass\n"
+                        "def _complete_replay_claim(): pass\n"
+                    ),
+                }
+
+                with mock.patch(
+                    f"{__name__}._application_python_files",
+                    return_value=[Path(path) for path in modules],
+                ), mock.patch(
+                    f"{__name__}._parse_module",
+                    side_effect=lambda path: modules[Path(path).as_posix()],
+                ):
+                    inventory_case = LegacyMarkerInventoryTests(
+                        "test_pre_b1_legacy_authority_symbols_are_inventoried"
+                    )
+                    with self.assertRaises(AssertionError):
+                        inventory_case.test_pre_b1_legacy_authority_symbols_are_inventoried()
+
 
 class GraphDraftDeleteInventoryTests(unittest.TestCase):
     def test_graph_draft_delete_callers_match_manifest_and_source(self):
@@ -439,7 +751,7 @@ class GraphDraftDeleteInventoryTests(unittest.TestCase):
 class LegacyMarkerInventoryTests(unittest.TestCase):
     def test_pre_b1_legacy_authority_symbols_are_inventoried(self):
         self.assertEqual(
-            EXPECTED_LEGACY_MARKER_SYMBOLS,
+            EXPECTED_LEGACY_MARKER_DEFINITIONS,
             _discover_legacy_authority_symbols(),
         )
 
