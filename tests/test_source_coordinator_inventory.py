@@ -28,15 +28,10 @@ DRAFT_DELETE_EMAIL_PATH = "email_automation/email.py"
 SOURCE_ADMISSION_METHOD = "admit_or_repair_source_identity"
 SOURCE_ADMISSION_PRIVATE_ENVELOPE = "_SourceAdmissionEnvelope"
 SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE = "_VerifiedHardOptoutEvidence"
-SOURCE_CLASSIFICATION_PRIVATE_MINT = "_mint_verified_hard_optout_evidence"
-SOURCE_CLASSIFICATION_PRIVATE_CAPABILITY = (
-    "_VERIFIED_HARD_OPTOUT_EVIDENCE_CAPABILITY"
-)
 SOURCE_CLASSIFICATION_PRIVATE_NAMES = {
     SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE,
-    SOURCE_CLASSIFICATION_PRIVATE_MINT,
-    SOURCE_CLASSIFICATION_PRIVATE_CAPABILITY,
 }
+SOURCE_CLASSIFICATION_VERIFIER_NAME = "hard_optout_verifier"
 SOURCE_CLASSIFICATION_ORCHESTRATOR = "classify_source_once"
 SOURCE_ADMISSION_ALLOWED_ADAPTERS = {
     ("email_automation/processing.py", "process_inbox_message"),
@@ -200,8 +195,6 @@ _PROTECTED_REFLECTION_NAMES = {
     SOURCE_ADMISSION_PRIVATE_ENVELOPE,
     *SOURCE_CLASSIFICATION_PRIVATE_NAMES,
 }
-
-
 def _is_reflective_attribute_reference(node):
     return (
         isinstance(node, ast.Name)
@@ -463,6 +456,482 @@ class _SourceAdmissionContractVisitor(ast.NodeVisitor):
             self._record(node, "dynamic admission method reference")
 
 
+def _leading_import_ids(tree):
+    leading = set()
+    for index, statement in enumerate(tree.body):
+        if (
+            index == 0
+            and isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and type(statement.value.value) is str
+        ):
+            continue
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            leading.add(id(statement))
+            continue
+        break
+    return leading
+
+
+def _annotation_node_ids(tree):
+    annotation_ids = set()
+    for node in ast.walk(tree):
+        annotations = []
+        if isinstance(node, ast.arg) and node.annotation is not None:
+            annotations.append(node.annotation)
+        elif isinstance(node, ast.AnnAssign):
+            annotations.append(node.annotation)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.returns is not None:
+                annotations.append(node.returns)
+        for annotation in annotations:
+            annotation_ids.update(id(item) for item in ast.walk(annotation))
+    return annotation_ids
+
+
+class _TrustScope:
+    def __init__(self, kind, name, local_names=()):
+        self.kind = kind
+        self.name = name
+        self.instances = {local_name: False for local_name in local_names}
+        self.constructor_shadowed = "SourceCoordinator" in local_names
+
+
+class _SourceClassificationTrustVisitor(ast.NodeVisitor):
+    """Enforce the narrow reviewed grammar for classification authority."""
+
+    _ALLOWED_INSTANCE_METHODS = {
+        SOURCE_ADMISSION_METHOD,
+        SOURCE_CLASSIFICATION_ORCHESTRATOR,
+    }
+
+    def __init__(self, relative_path, *, tree):
+        self.relative_path = Path(relative_path).as_posix()
+        self.violations = []
+        self._enabled = (
+            self.relative_path != SOURCE_COORDINATOR_RELATIVE_PATH.as_posix()
+        )
+        self._parents = {
+            id(child): parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        self._annotation_ids = _annotation_node_ids(tree)
+        self._leading_import_ids = _leading_import_ids(tree)
+        self._reviewed_paths = {
+            path for path, _ in SOURCE_ADMISSION_ALLOWED_ADAPTERS
+        }
+        self._has_constructor_import = any(
+            isinstance(node, ast.ImportFrom)
+            and _resolve_import_from_module(node, self.relative_path)
+            == "email_automation.source_coordinator"
+            and any(
+                imported.name == "SourceCoordinator"
+                for imported in node.names
+            )
+            for node in ast.walk(tree)
+        )
+        self._importlib_aliases = {"importlib"}
+        self._sys_aliases = {"sys"}
+        self._builtins_aliases = {"builtins"}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Import):
+                continue
+            for imported in node.names:
+                bound = imported.asname or imported.name.split(".", 1)[0]
+                if imported.name == "importlib":
+                    self._importlib_aliases.add(bound)
+                elif imported.name == "sys":
+                    self._sys_aliases.add(bound)
+                elif imported.name == "builtins":
+                    self._builtins_aliases.add(bound)
+        self._constructor_active = False
+        self._allowed_constructor_refs = set()
+        self._allowed_instance_refs = set()
+        self._allowed_namespace_refs = set()
+        self._scopes = [_TrustScope("module", "<module>")]
+
+    def _record(self, node, reason):
+        self.violations.append((getattr(node, "lineno", 0), reason))
+
+    def _check_verifier_name(self, node, name):
+        if name in {
+            SOURCE_CLASSIFICATION_VERIFIER_NAME,
+            f"_{SOURCE_CLASSIFICATION_VERIFIER_NAME}",
+        }:
+            self._record(node, "hard opt-out verifier propagation is unreviewed")
+
+    def _current_callable_scope(self):
+        if any(scope.kind in {"class", "lambda"} for scope in self._scopes):
+            return None
+        return tuple(
+            scope.name
+            for scope in self._scopes
+            if scope.kind == "function"
+        )
+
+    def _reviewed_callable(self):
+        callable_scope = self._current_callable_scope()
+        return (
+            callable_scope is not None
+            and (self.relative_path, callable_scope)
+            in SOURCE_ADMISSION_ALLOWED_CALLABLE_SCOPES
+        )
+
+    def _instance_is_protected(self, name):
+        for scope in reversed(self._scopes):
+            if name in scope.instances:
+                return bool(scope.instances.get(name))
+        return False
+
+    def _set_instance_binding(self, name, protected):
+        self._scopes[-1].instances[name] = bool(protected)
+
+    def _constructor_name_is_protected(self, node):
+        if not (
+            isinstance(node, ast.Name)
+            and node.id == "SourceCoordinator"
+            and self._constructor_active
+        ):
+            return False
+        return not any(
+            scope.constructor_shadowed for scope in self._scopes[1:]
+        )
+
+    def _constructor_call(self, node):
+        return (
+            isinstance(node, ast.Call)
+            and self._constructor_name_is_protected(node.func)
+        )
+
+    def _simple_constructor_assignment(self, node):
+        parent = self._parents.get(id(node))
+        if (
+            isinstance(parent, ast.Assign)
+            and parent.value is node
+            and len(parent.targets) == 1
+            and isinstance(parent.targets[0], ast.Name)
+        ):
+            return True
+        return (
+            isinstance(parent, ast.AnnAssign)
+            and parent.value is node
+            and isinstance(parent.target, ast.Name)
+        )
+
+    def _bind_assignment_target(self, target, *, protected_instance=False):
+        if isinstance(target, ast.Name):
+            if (
+                target.id == "SourceCoordinator"
+                and self._constructor_active
+            ):
+                if self._scopes[-1].kind == "module":
+                    self._record(target, "SourceCoordinator rebinding is unreviewed")
+                    self._constructor_active = False
+                else:
+                    self._scopes[-1].constructor_shadowed = True
+            self._set_instance_binding(target.id, protected_instance)
+            return
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for item in target.elts:
+                self._bind_assignment_target(item)
+        elif isinstance(target, ast.Starred):
+            self._bind_assignment_target(target.value)
+
+    def _safe_namespace_membership(self, call):
+        parent = self._parents.get(id(call))
+        if not isinstance(parent, ast.Compare):
+            return False
+        operands = (parent.left, *parent.comparators)
+        protected = {
+            "SourceCoordinator",
+            "source_coordinator",
+            "email_automation.source_coordinator",
+            SOURCE_ADMISSION_METHOD,
+            SOURCE_ADMISSION_PRIVATE_ENVELOPE,
+            SOURCE_CLASSIFICATION_VERIFIER_NAME,
+            f"_{SOURCE_CLASSIFICATION_VERIFIER_NAME}",
+            *SOURCE_CLASSIFICATION_PRIVATE_NAMES,
+        }
+        for index, operator in enumerate(parent.ops):
+            if not isinstance(operator, (ast.In, ast.NotIn)):
+                continue
+            if operands[index + 1] is not call:
+                continue
+            member = operands[index]
+            return (
+                isinstance(member, ast.Constant)
+                and type(member.value) is str
+                and member.value
+                and member.value not in protected
+            )
+        return False
+
+    def _namespace_call_name(self, func):
+        if isinstance(func, ast.Name) and func.id in {
+            "globals",
+            "locals",
+            "eval",
+            "exec",
+        }:
+            return func.id
+        if (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id in self._builtins_aliases
+            and func.attr in {"globals", "locals", "eval", "exec"}
+        ):
+            return func.attr
+        return None
+
+    def _dynamic_import_attribute(self, node):
+        return (
+            isinstance(node.value, ast.Name)
+            and (
+                (
+                    node.value.id in self._importlib_aliases
+                    and node.attr == "import_module"
+                )
+                or (
+                    node.value.id in self._builtins_aliases
+                    and node.attr == "__import__"
+                )
+                or (
+                    node.value.id in self._sys_aliases
+                    and node.attr == "modules"
+                )
+            )
+        )
+
+    def visit_Module(self, node):
+        if not self._enabled:
+            return
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_Import(self, node):
+        for imported in node.names:
+            bound = imported.asname or imported.name.split(".", 1)[0]
+            self._check_verifier_name(node, bound)
+            if imported.name == "email_automation.source_coordinator":
+                self._record(node, "source coordinator module import is unreviewed")
+            if bound == "SourceCoordinator" and self._constructor_active:
+                self._record(node, "SourceCoordinator rebinding is unreviewed")
+                self._constructor_active = False
+
+    def visit_ImportFrom(self, node):
+        module = _resolve_import_from_module(node, self.relative_path)
+        if module == "email_automation.source_coordinator":
+            for imported in node.names:
+                self._check_verifier_name(node, imported.name)
+                if imported.asname:
+                    self._check_verifier_name(node, imported.asname)
+                if imported.name == "*":
+                    self._record(node, "source coordinator star import is unreviewed")
+                if imported.name != "SourceCoordinator":
+                    continue
+                if (
+                    imported.asname is not None
+                    or id(node) not in self._leading_import_ids
+                    or self.relative_path not in self._reviewed_paths
+                ):
+                    self._record(node, "SourceCoordinator import is outside the reviewed grammar")
+                self._constructor_active = True
+            return
+        for imported in node.names:
+            self._check_verifier_name(node, imported.name)
+            if imported.asname:
+                self._check_verifier_name(node, imported.asname)
+            if (
+                (module == "importlib" and imported.name == "import_module")
+                or (module == "builtins" and imported.name == "__import__")
+                or (module == "sys" and imported.name == "modules")
+            ):
+                self._record(node, "dynamic module acquisition primitive is unreviewed")
+
+    def visit_FunctionDef(self, node):
+        self._check_verifier_name(node, node.name)
+        _visit_function_metadata(self, node)
+        arguments = (
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        )
+        local_names = {argument.arg for argument in arguments}
+        if node.args.vararg:
+            local_names.add(node.args.vararg.arg)
+        if node.args.kwarg:
+            local_names.add(node.args.kwarg.arg)
+        self._scopes.append(_TrustScope("function", node.name, local_names))
+        try:
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self._scopes.pop()
+        self._set_instance_binding(node.name, False)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Lambda(self, node):
+        arguments = (
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        )
+        local_names = {argument.arg for argument in arguments}
+        if node.args.vararg:
+            local_names.add(node.args.vararg.arg)
+        if node.args.kwarg:
+            local_names.add(node.args.kwarg.arg)
+        self.visit(node.args)
+        self._scopes.append(_TrustScope("lambda", "<lambda>", local_names))
+        try:
+            self.visit(node.body)
+        finally:
+            self._scopes.pop()
+
+    def visit_ClassDef(self, node):
+        self._check_verifier_name(node, node.name)
+        _visit_class_metadata(self, node)
+        self._scopes.append(_TrustScope("class", node.name))
+        try:
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self._scopes.pop()
+        self._set_instance_binding(node.name, False)
+
+    def visit_arg(self, node):
+        self._check_verifier_name(node, node.arg)
+        if node.annotation:
+            self.visit(node.annotation)
+
+    def visit_Assign(self, node):
+        constructor_value = self._constructor_call(node.value)
+        self.visit(node.value)
+        for target in node.targets:
+            self.visit(target)
+        simple_target = (
+            constructor_value
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        )
+        for target in node.targets:
+            self._bind_assignment_target(
+                target,
+                protected_instance=bool(simple_target),
+            )
+
+    def visit_AnnAssign(self, node):
+        constructor_value = (
+            node.value is not None and self._constructor_call(node.value)
+        )
+        if node.value:
+            self.visit(node.value)
+        self.visit(node.target)
+        self.visit(node.annotation)
+        self._bind_assignment_target(
+            node.target,
+            protected_instance=bool(
+                constructor_value and isinstance(node.target, ast.Name)
+            ),
+        )
+
+    def visit_NamedExpr(self, node):
+        self.visit(node.value)
+        self.visit(node.target)
+        self._bind_assignment_target(node.target)
+
+    def visit_Call(self, node):
+        if self._constructor_name_is_protected(node.func):
+            self._allowed_constructor_refs.add(id(node.func))
+            if not self._reviewed_callable():
+                self._record(node, "SourceCoordinator construction is outside a reviewed adapter")
+            if not self._simple_constructor_assignment(node):
+                self._record(node, "SourceCoordinator result propagation is unreviewed")
+            if any(keyword.arg is None for keyword in node.keywords):
+                self._record(node, "SourceCoordinator constructor expansion is unreviewed")
+            if any(
+                keyword.arg
+                in {
+                    SOURCE_CLASSIFICATION_VERIFIER_NAME,
+                    f"_{SOURCE_CLASSIFICATION_VERIFIER_NAME}",
+                }
+                for keyword in node.keywords
+            ):
+                self._record(node, "hard opt-out verifier injection is unreviewed")
+
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and self._instance_is_protected(node.func.value.id)
+        ):
+            if (
+                node.func.attr in self._ALLOWED_INSTANCE_METHODS
+                and self._reviewed_callable()
+                and not node.func.attr.startswith("_")
+            ):
+                self._allowed_instance_refs.add(id(node.func.value))
+            else:
+                self._record(node, "source coordinator method call is outside the reviewed grammar")
+
+        namespace_name = self._namespace_call_name(node.func)
+        if isinstance(node.func, ast.Name) and namespace_name:
+            self._allowed_namespace_refs.add(id(node.func))
+        if namespace_name in {"eval", "exec"}:
+            self._record(node, "dynamic execution primitive is unreviewed")
+        elif (
+            namespace_name in {"globals", "locals"}
+            and self._has_constructor_import
+            and not self._safe_namespace_membership(node)
+        ):
+            self._record(node, "source coordinator namespace recovery is unreviewed")
+
+        if isinstance(node.func, ast.Name) and node.func.id == "__import__":
+            self._record(node, "dynamic module acquisition primitive is unreviewed")
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node):
+        self._check_verifier_name(node, node.attr)
+        if self._dynamic_import_attribute(node):
+            self._record(node, "dynamic module acquisition primitive is unreviewed")
+        self.generic_visit(node)
+
+    def visit_Name(self, node):
+        self._check_verifier_name(node, node.id)
+        if not isinstance(node.ctx, ast.Load):
+            return
+        if node.id in {"eval", "exec", "__import__"}:
+            parent = self._parents.get(id(node))
+            if not (isinstance(parent, ast.Call) and parent.func is node):
+                self._record(node, "dynamic execution or import propagation is unreviewed")
+        if (
+            node.id in {"globals", "locals"}
+            and self._has_constructor_import
+            and id(node) not in self._allowed_namespace_refs
+        ):
+            self._record(node, "namespace primitive propagation is unreviewed")
+        if self._constructor_name_is_protected(node):
+            if (
+                id(node) not in self._allowed_constructor_refs
+                and id(node) not in self._annotation_ids
+            ):
+                self._record(node, "SourceCoordinator class propagation is unreviewed")
+            return
+        if (
+            self._instance_is_protected(node.id)
+            and id(node) not in self._allowed_instance_refs
+            and id(node) not in self._annotation_ids
+        ):
+            self._record(node, "source coordinator instance propagation is unreviewed")
+
+    def visit_Constant(self, node):
+        if node.value in {
+            SOURCE_CLASSIFICATION_VERIFIER_NAME,
+            f"_{SOURCE_CLASSIFICATION_VERIFIER_NAME}",
+        }:
+            self._record(node, "hard opt-out verifier name construction is unreviewed")
+
 def _source_admission_contract_violations(source, relative_path):
     tree = ast.parse(source, filename=str(relative_path))
     visitor = _SourceAdmissionContractVisitor(
@@ -470,7 +939,12 @@ def _source_admission_contract_violations(source, relative_path):
         _reflectively_assembled_protected_names(tree),
     )
     visitor.visit(tree)
-    return visitor.violations
+    trust_visitor = _SourceClassificationTrustVisitor(
+        relative_path,
+        tree=tree,
+    )
+    trust_visitor.visit(tree)
+    return visitor.violations + trust_visitor.violations
 
 
 def _discover_source_admission_contract_violations():
@@ -1200,6 +1674,26 @@ class InventoryContractTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, deterministic_parameters)
 
+        module_bindings = {
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        module_bindings.update(
+            target.id
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else (node.target,)
+            )
+            if isinstance(target, ast.Name)
+        )
+        self.assertNotIn("_mint_verified_hard_optout_evidence", module_bindings)
+        self.assertNotIn(
+            "_VERIFIED_HARD_OPTOUT_EVIDENCE_CAPABILITY",
+            module_bindings,
+        )
+
     def test_classification_gate_rejects_private_verified_evidence_access(self):
         mutations = {
             "direct import": (
@@ -1235,17 +1729,6 @@ class InventoryContractTests(unittest.TestCase):
                 "constructor = namespace[prefix + 'OptoutEvidence']\n"
                 "value = constructor({})"
             ),
-            "private mint": (
-                "value = coordinator._mint_verified_hard_optout_evidence"
-            ),
-            "fragmented private mint": (
-                "prefix = '_mint_verified_'\n"
-                "name = prefix + 'hard_optout_evidence'\n"
-                "value = vars(coordinator)[name]"
-            ),
-            "private capability": (
-                "value = coordinator._VERIFIED_HARD_OPTOUT_EVIDENCE_CAPABILITY"
-            ),
         }
         for case, source in mutations.items():
             with self.subTest(case=case):
@@ -1254,6 +1737,488 @@ class InventoryContractTests(unittest.TestCase):
                         source, "email_automation/unreviewed.py"
                     )
                 )
+
+    def test_classification_gate_rejects_reflection_and_verifier_injection(self):
+        coordinator_import = (
+            "import email_automation.source_coordinator as coordinator\n"
+        )
+        mutations = {
+            "vars suffix iteration": (
+                coordinator_import
+                + "namespace = vars(coordinator)\n"
+                "value = next(v for name, v in namespace.items() "
+                "if name.endswith('Evidence'))"
+            ),
+            "dir introspection": coordinator_import + "names = dir(coordinator)",
+            "hex decoded getattr": (
+                coordinator_import
+                + "name = bytes.fromhex("
+                "'5f5665726966696564486172644f70746f757445766964656e6365'"
+                ").decode()\n"
+                "value = getattr(coordinator, name)"
+            ),
+            "propagated alias getattribute": (
+                coordinator_import
+                + "alias = coordinator\n"
+                "name = '_VerifiedHard' + 'OptoutEvidence'\n"
+                "value = alias.__getattribute__(name)"
+            ),
+            "object getattribute": (
+                coordinator_import
+                + "name = bytes.fromhex("
+                "'5f5665726966696564486172644f70746f757445766964656e6365'"
+                ").decode()\n"
+                "value = object.__getattribute__(coordinator, name)"
+            ),
+            "bound getattribute": (
+                coordinator_import
+                + "reader = coordinator.__getattribute__\n"
+                "name = bytes.fromhex("
+                "'5f5665726966696564486172644f70746f757445766964656e6365'"
+                ").decode()\n"
+                "value = reader(name)"
+            ),
+            "aliased attrgetter": (
+                "from operator import attrgetter as lookup\n"
+                + coordinator_import
+                + "name = bytes.fromhex("
+                "'5f5665726966696564486172644f70746f757445766964656e6365'"
+                ").decode()\n"
+                "value = lookup(name)(coordinator)"
+            ),
+            "aliased methodcaller": (
+                "from operator import methodcaller as invoke\n"
+                + coordinator_import
+                + "name = bytes.fromhex("
+                "'5f5665726966696564486172644f70746f757445766964656e6365'"
+                ").decode()\n"
+                "value = invoke('__getattribute__', name)(coordinator)"
+            ),
+            "base64 decoded dictionary lookup": (
+                "import base64\n"
+                + coordinator_import
+                + "name = base64.b64decode("
+                "'X1ZlcmlmaWVkSGFyZE9wdG91dEV2aWRlbmNl'"
+                ").decode()\n"
+                "value = coordinator.__dict__[name]"
+            ),
+            "method globals": (
+                coordinator_import
+                + "value = coordinator.SourceCoordinator."
+                "persist_deterministic_classification_snapshot.__globals__"
+            ),
+            "verifier keyword": (
+                coordinator_import
+                + "value = coordinator.SourceCoordinator("
+                "client, uuid_factory=make_id, now_factory=now, "
+                "hard_optout_verifier=verify)"
+            ),
+            "verifier attribute propagation": (
+                coordinator_import
+                + "value = instance._hard_optout_verifier"
+            ),
+            "fragmented setattr injection": (
+                coordinator_import
+                + "instance = coordinator.SourceCoordinator("
+                "client, uuid_factory=make_id, now_factory=now)\n"
+                "name = '_hard_' + 'optout_verifier'\n"
+                "setattr(instance, name, verify)"
+            ),
+            "object setattr injection": (
+                coordinator_import
+                + "instance = coordinator.SourceCoordinator("
+                "client, uuid_factory=make_id, now_factory=now)\n"
+                "name = '_hard_' + 'optout_verifier'\n"
+                "object.__setattr__(instance, name, verify)"
+            ),
+            "aliased object setattr injection": (
+                coordinator_import
+                + "instance = coordinator.SourceCoordinator("
+                "client, uuid_factory=make_id, now_factory=now)\n"
+                "setter = object.__setattr__\n"
+                "name = '_hard_' + 'optout_verifier'\n"
+                "setter(instance, name, verify)"
+            ),
+            "verifier rebinding": "hard_optout_verifier = verify",
+            "hidden constructor injection": (
+                coordinator_import
+                + "options = {'hard_optout_verifier': verify}\n"
+                "value = coordinator.SourceCoordinator("
+                "client, uuid_factory=make_id, now_factory=now, **options)"
+            ),
+            "aliased hidden constructor injection": (
+                "from email_automation.source_coordinator import "
+                "SourceCoordinator as SC\n"
+                "options = build_options()\n"
+                "value = SC(client, uuid_factory=make_id, "
+                "now_factory=now, **options)"
+            ),
+            "unbound init injection": (
+                "from email_automation.source_coordinator import "
+                "SourceCoordinator as SC\n"
+                "SC.__init__(instance, client, uuid_factory=make_id, "
+                "now_factory=now, **options)"
+            ),
+            "subclass injection": (
+                "from email_automation.source_coordinator import "
+                "SourceCoordinator as SC\n"
+                "class UnsafeCoordinator(SC):\n"
+                "    def __init__(self, client, **options):\n"
+                "        super().__init__(client, uuid_factory=make_id, "
+                "now_factory=now, **options)"
+            ),
+            "alias assigned after function": (
+                coordinator_import
+                + "def recover():\n"
+                "    return vars(alias)\n"
+                "alias = coordinator"
+            ),
+            "dynamic importlib acquisition": (
+                "import importlib\n"
+                "module = importlib.import_module("
+                "'email_automation.source_coordinator')\n"
+                "value = vars(module)"
+            ),
+            "dynamic sys modules acquisition": (
+                "import sys\n"
+                "module = sys.modules['email_automation.source_coordinator']\n"
+                "value = vars(module)"
+            ),
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_admission_contract_violations(
+                        source,
+                        "email_automation/unreviewed.py",
+                    )
+                )
+
+    def test_classification_gate_does_not_ban_unrelated_getattr(self):
+        self.assertEqual(
+            [],
+            _source_admission_contract_violations(
+                "value = getattr(record, 'id', None)",
+                "email_automation/unrelated.py",
+            ),
+        )
+
+    def test_classification_gate_allows_unrelated_operations_after_constructor_import(self):
+        source = (
+            "from email_automation.source_coordinator import SourceCoordinator\n"
+            "from operator import attrgetter\n"
+            "def process_inbox_message():\n"
+            "    identifier = getattr(record, 'id', None)\n"
+            "    pairs = list(mapping.items())\n"
+            "    matched = filename.endswith('.json')\n"
+            "    reader = attrgetter('id')(record)\n"
+            "    result = other(**options)\n"
+            "    coordinator = SourceCoordinator("
+            "client, uuid_factory=make_id, now_factory=now)"
+        )
+        self.assertEqual(
+            [],
+            _source_admission_contract_violations(
+                source,
+                "email_automation/processing.py",
+            ),
+        )
+
+    def test_classification_gate_allows_unrelated_setattr_and_public_enum_reflection(self):
+        source = (
+            "from email_automation.source_coordinator import "
+            "CoordinatorMode\n"
+            "prefix = '_hard_'\n"
+            "suffix = 'optout_verifier'\n"
+            "setattr(record, 'status', prefix + suffix)\n"
+            "value = getattr(CoordinatorMode, 'value', None)"
+        )
+        self.assertEqual(
+            [],
+            _source_admission_contract_violations(
+                source,
+                "email_automation/reviewed_adapter.py",
+            ),
+        )
+
+    def test_classification_gate_rejects_constructor_escape_and_nested_imports(self):
+        direct_import = (
+            "from email_automation.source_coordinator import "
+            "SourceCoordinator as SC\n"
+        )
+        mutations = {
+            "assignment": direct_import + "factory = SC",
+            "container": direct_import + "factories = [SC]",
+            "argument": direct_import + "register(SC)",
+            "return": direct_import + "def factory():\n    return SC",
+            "unbound init": direct_import + "SC.__init__(instance, client)",
+            "nested direct import": (
+                "def build(options):\n"
+                "    from email_automation.source_coordinator import "
+                "SourceCoordinator as SC\n"
+                "    return SC(client, **options)"
+            ),
+            "nested module import": (
+                "def build(options):\n"
+                "    import email_automation.source_coordinator as coordinator\n"
+                "    return coordinator.SourceCoordinator(client, **options)"
+            ),
+            "star import": (
+                "from email_automation.source_coordinator import *\n"
+                "value = SourceCoordinator(client, **options)"
+            ),
+            "definition before import": (
+                "def build(options):\n"
+                "    return SC(client, **options)\n"
+                "from email_automation.source_coordinator import "
+                "SourceCoordinator as SC"
+            ),
+            "returned constructor result": (
+                direct_import
+                + "def build():\n"
+                "    return SC(client, uuid_factory=make_id, now_factory=now)"
+            ),
+            "passed constructor result": (
+                direct_import
+                + "mutate(SC(client, uuid_factory=make_id, now_factory=now))"
+            ),
+            "contained constructor result": (
+                direct_import
+                + "values = [SC(client, uuid_factory=make_id, now_factory=now)]"
+            ),
+            "attribute assigned constructor result": (
+                direct_import
+                + "holder.coordinator = SC("
+                "client, uuid_factory=make_id, now_factory=now)"
+            ),
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_admission_contract_violations(
+                        source,
+                        "email_automation/unreviewed.py",
+                    )
+                )
+
+        annotation_only = (
+            "from email_automation.source_coordinator import SourceCoordinator\n"
+            "def accept(value: SourceCoordinator) -> SourceCoordinator:\n"
+            "    return value"
+        )
+        self.assertEqual(
+            [],
+            _source_admission_contract_violations(
+                annotation_only,
+                "email_automation/processing.py",
+            ),
+        )
+
+    def test_classification_gate_rejects_import_rebinding_before_or_after_use(self):
+        before_shadow = (
+            "from email_automation.source_coordinator import "
+            "SourceCoordinator\n"
+            "SourceCoordinator(client, **options)\n"
+            "SourceCoordinator = unrelated"
+        )
+        self.assertTrue(
+            _source_admission_contract_violations(
+                before_shadow,
+                "email_automation/processing.py",
+            )
+        )
+
+        after_shadow = (
+            "from email_automation.source_coordinator import "
+            "SourceCoordinator\n"
+            "SourceCoordinator = unrelated\n"
+            "value = getattr(SourceCoordinator, 'ordinary', None)\n"
+            "result = SourceCoordinator(**options)"
+        )
+        self.assertTrue(
+            _source_admission_contract_violations(
+                after_shadow,
+                "email_automation/processing.py",
+            ),
+        )
+
+    def test_classification_gate_allows_lexically_shadowed_coordinator_names(self):
+        constructor_shadow = (
+            "from email_automation.source_coordinator import "
+            "SourceCoordinator\n"
+            "def unrelated(SourceCoordinator):\n"
+            "    return getattr(SourceCoordinator, 'ordinary', None)"
+        )
+        self.assertEqual(
+            [],
+            _source_admission_contract_violations(
+                constructor_shadow,
+                "email_automation/processing.py",
+            ),
+        )
+
+        instance_shadow = (
+            "from email_automation.source_coordinator import SourceCoordinator\n"
+            "def process_inbox_message():\n"
+            "    coordinator = SourceCoordinator("
+            "client, uuid_factory=make_id, now_factory=now)\n"
+            "    return coordinator.classify_source_once("
+            "user_id, source_id, lease_seconds, classification_input, classifier)\n"
+            "def unrelated(coordinator):\n"
+            "    setattr(coordinator, 'status', 'ready')"
+        )
+        self.assertEqual(
+            [],
+            _source_admission_contract_violations(
+                instance_shadow,
+                "email_automation/processing.py",
+            ),
+        )
+
+    def test_classification_gate_rejects_receiverless_namespace_access(self):
+        constructor_import = (
+            "from email_automation.source_coordinator import SourceCoordinator\n"
+        )
+        mutations = {
+            "globals": constructor_import + "namespace = globals()",
+            "locals": constructor_import + "namespace = locals()",
+            "eval": constructor_import + "value = eval(expression)",
+            "exec": constructor_import + "exec(source)",
+            "propagated globals": (
+                constructor_import
+                + "namespace = globals()\n"
+                "name = bytes.fromhex('536f75726365436f6f7264696e61746f72').decode()\n"
+                "factory = namespace[name]"
+            ),
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_admission_contract_violations(
+                        source,
+                        "email_automation/unreviewed.py",
+                    )
+                )
+
+    def test_classification_gate_rejects_statically_named_dynamic_acquisition(self):
+        mutations = {
+            "importlib name binding": (
+                "import importlib\n"
+                "name = 'email_automation.' + 'source_coordinator'\n"
+                "module = importlib.import_module(name)"
+            ),
+            "sys modules name binding": (
+                "import sys\n"
+                "name = 'email_automation.' + 'source_coordinator'\n"
+                "module = sys.modules[name]"
+            ),
+            "propagated importlib loader": (
+                "import importlib\n"
+                "name = 'email_automation.' + 'source_coordinator'\n"
+                "loader = importlib.import_module\n"
+                "module = loader(name)"
+            ),
+            "propagated sys modules": (
+                "import sys\n"
+                "name = 'email_automation.' + 'source_coordinator'\n"
+                "modules = sys.modules\n"
+                "module = modules[name]"
+            ),
+            "builtins import": (
+                "import builtins\n"
+                "name = 'email_automation.' + 'source_coordinator'\n"
+                "module = builtins.__import__(name)"
+            ),
+            "imported builtins loader": (
+                "from builtins import __import__ as loader\n"
+                "name = 'email_automation.' + 'source_coordinator'\n"
+                "module = loader(name)"
+            ),
+            "sys modules get": (
+                "import sys\n"
+                "name = 'email_automation.' + 'source_coordinator'\n"
+                "module = sys.modules.get(name)"
+            ),
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_admission_contract_violations(
+                        source,
+                        "email_automation/unreviewed.py",
+                    )
+                )
+
+    def test_classification_gate_rejects_coordinator_instance_escape(self):
+        prefix = (
+            "from email_automation.source_coordinator import SourceCoordinator\n"
+            "coordinator = SourceCoordinator("
+            "client, uuid_factory=make_id, now_factory=now)\n"
+        )
+        mutations = {
+            "helper argument": prefix + "mutate(coordinator)",
+            "return": prefix + "def leak():\n    return coordinator",
+            "container": prefix + "values = [coordinator]",
+            "alias": prefix + "alias = coordinator",
+            "conditional taint": (
+                "from email_automation.source_coordinator import SourceCoordinator\n"
+                "coordinator = (SourceCoordinator("
+                "client, uuid_factory=make_id, now_factory=now) "
+                "if enabled else fallback)\n"
+                "name = '_hard_' + 'optout_verifier'\n"
+                "setattr(coordinator, name, verify)"
+            ),
+            "bound public method": (
+                prefix + "callback = coordinator.classify_source_once"
+            ),
+            "type getattribute": prefix + "type.__getattribute__(coordinator, name)",
+            "type setattr": prefix + "type.__setattr__(coordinator, name, verify)",
+            "type delattr": prefix + "type.__delattr__(coordinator, name)",
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_admission_contract_violations(
+                        source,
+                        "email_automation/unreviewed.py",
+                    )
+                )
+
+    def test_classification_gate_allows_task7_public_coordinator_calls(self):
+        source = (
+            "from email_automation.source_coordinator import SourceCoordinator\n"
+            "def process_inbox_message():\n"
+            "    coordinator = SourceCoordinator("
+            "client, uuid_factory=make_id, now_factory=now)\n"
+            "    admitted = coordinator.admit_or_repair_source_identity("
+            "user_id, source)\n"
+            "    result = coordinator.classify_source_once("
+            "user_id, source_id, lease_seconds, classification_input, classifier)\n"
+            "    setattr(record, 'status', 'ready')\n"
+            "    return admitted, result"
+        )
+        self.assertEqual(
+            [],
+            _source_admission_contract_violations(
+                source,
+                "email_automation/processing.py",
+            ),
+        )
+
+    def test_classification_gate_allows_current_processing_with_future_import(self):
+        source = (
+            "from email_automation.source_coordinator import SourceCoordinator\n"
+            + (REPO_ROOT / "email_automation/processing.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            [],
+            _source_admission_contract_violations(
+                source,
+                "email_automation/processing.py",
+            ),
+        )
 
     def test_source_admission_gate_rejects_private_envelope_mutations(self):
         mutations = {

@@ -39,6 +39,11 @@ MODEL_PROPOSAL_EVIDENCE = {
     "evidenceKind": "model_capture",
     "responseHash": "a" * 64,
 }
+HARD_OPTOUT_EVIDENCE = {
+    "schemaVersion": 1,
+    "evidenceKind": "header_list_unsubscribe",
+    "evidenceHash": "b" * 64,
+}
 
 
 def _load_source_coordinator(test_case):
@@ -966,6 +971,27 @@ class SourceIdentityTests(unittest.TestCase):
                 projection["normalizedValueHash"],
             )
 
+    def test_bool_alias_projection_version_blocks_enrichment_without_writes(self):
+        source = self.admit({"id": "graph-A"})
+        alias_path = self.alias_paths()[0]
+        self.fake.data[alias_path]["schemaVersion"] = True
+        before_data = deepcopy(self.fake.data)
+        before_writes = list(self.write_events())
+
+        self.assertErrorCode(
+            "source_alias_conflict",
+            lambda: self.admit(
+                {
+                    "id": "graph-A",
+                    "internetMessageId": "<rfc-A@example.test>",
+                }
+            ),
+        )
+
+        self.assertEqual("source-0001", source.canonical_source_id)
+        self.assertEqual(before_data, self.fake.data)
+        self.assertEqual(before_writes, self.write_events())
+
     def test_hydrated_evidence_requires_exact_utf8_json(self):
         invalid_messages = (
             {"id": "graph-A", "nested": {1: "coerced-key"}},
@@ -1220,6 +1246,150 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual("not_started", stored["modelRequestState"])
         self.assertIsNone(stored["classificationInputHash"])
         self.assertIsNone(stored["modelRequestKey"])
+
+    def test_bool_identity_version_blocks_claim_without_writes(self):
+        identity_path = f"users/user-1/sourceIdentities/{self.source_id}"
+        self.fake.data[identity_path]["schemaVersion"] = True
+        before_data = deepcopy(self.fake.data)
+        before_writes = list(self.write_events())
+
+        self.assertErrorCode(
+            "source_coordinator_ambiguous",
+            self.claim,
+        )
+
+        self.assertEqual(before_data, self.fake.data)
+        self.assertEqual(before_writes, self.write_events())
+
+    def test_bool_classification_versions_block_request_start_without_writes(self):
+        for field_name in ("schemaVersion", "classificationInputSchemaVersion"):
+            with self.subTest(field_name=field_name):
+                fake = FakeFirestore()
+                clock = MutableClock(FROZEN_NOW)
+                coordinator = self.module.SourceCoordinator(
+                    fake,
+                    uuid_factory=SequentialUUIDs(),
+                    now_factory=clock,
+                )
+                source = coordinator.admit_or_repair_source_identity(
+                    user_id="user-1",
+                    hydrated_message={"id": "graph-A"},
+                    evidence_kind="graph_hydration",
+                    thread_id="thread-1",
+                )
+                claim = coordinator.claim_source_classification(
+                    user_id="user-1",
+                    canonical_source_id=source.canonical_source_id,
+                    lease_seconds=60,
+                )
+                classification_path = (
+                    "users/user-1/sourceClassifications/"
+                    f"{source.canonical_source_id}"
+                )
+                fake.data[classification_path][field_name] = True
+                before_data = deepcopy(fake.data)
+                before_writes = [
+                    event
+                    for event in fake.events
+                    if event[0] in {"create", "set", "update", "delete"}
+                ]
+
+                self.assertErrorCode(
+                    "source_coordinator_ambiguous",
+                    lambda: coordinator.record_classification_request_started(
+                        user_id="user-1",
+                        canonical_source_id=source.canonical_source_id,
+                        classification_epoch=claim.classification_epoch,
+                        classification_claim_id=claim.classification_claim_id,
+                        model_request_key="model-request-1",
+                        classification_input=CLASSIFICATION_INPUT,
+                    ),
+                )
+
+                self.assertEqual(before_data, fake.data)
+                self.assertEqual(
+                    before_writes,
+                    [
+                        event
+                        for event in fake.events
+                        if event[0] in {"create", "set", "update", "delete"}
+                    ],
+                )
+
+    def test_bool_classification_versions_block_snapshot_require_and_retry(self):
+        for field_name in ("schemaVersion", "classificationInputSchemaVersion"):
+            with self.subTest(field_name=field_name):
+                fake = FakeFirestore()
+                clock = MutableClock(FROZEN_NOW)
+                uuids = SequentialUUIDs()
+                coordinator = self.module.SourceCoordinator(
+                    fake,
+                    uuid_factory=uuids,
+                    now_factory=clock,
+                )
+                source = coordinator.admit_or_repair_source_identity(
+                    user_id="user-1",
+                    hydrated_message={"id": "graph-A"},
+                    evidence_kind="graph_hydration",
+                    thread_id="thread-1",
+                )
+                snapshot = coordinator.classify_source_once(
+                    user_id="user-1",
+                    canonical_source_id=source.canonical_source_id,
+                    lease_seconds=60,
+                    classification_input=CLASSIFICATION_INPUT,
+                    classifier=lambda: (
+                        deepcopy(COMPLETE_PROPOSAL),
+                        deepcopy(MODEL_PROPOSAL_EVIDENCE),
+                    ),
+                )
+                classification_path = (
+                    "users/user-1/sourceClassifications/"
+                    f"{source.canonical_source_id}"
+                )
+                fake.data[classification_path][field_name] = True
+                before_data = deepcopy(fake.data)
+                before_writes = [
+                    event
+                    for event in fake.events
+                    if event[0] in {"create", "set", "update", "delete"}
+                ]
+                callback_calls = 0
+
+                def classifier():
+                    nonlocal callback_calls
+                    callback_calls += 1
+                    raise AssertionError("malformed snapshot called classifier")
+
+                self.assertIsInstance(snapshot, self.module.ClassificationSnapshot)
+                self.assertErrorCode(
+                    "source_coordinator_ambiguous",
+                    lambda: coordinator.require_authoritative_classification_snapshot(
+                        user_id="user-1",
+                        canonical_source_id=source.canonical_source_id,
+                    ),
+                )
+                self.assertErrorCode(
+                    "source_coordinator_ambiguous",
+                    lambda: coordinator.classify_source_once(
+                        user_id="user-1",
+                        canonical_source_id=source.canonical_source_id,
+                        lease_seconds=60,
+                        classification_input=CLASSIFICATION_INPUT,
+                        classifier=classifier,
+                    ),
+                )
+
+                self.assertEqual(0, callback_calls)
+                self.assertEqual(before_data, fake.data)
+                self.assertEqual(
+                    before_writes,
+                    [
+                        event
+                        for event in fake.events
+                        if event[0] in {"create", "set", "update", "delete"}
+                    ],
+                )
 
     def test_expired_claim_before_request_start_gets_higher_epoch(self):
         first = self.claim()
@@ -1739,13 +1909,7 @@ class ClassificationTests(unittest.TestCase):
             nonlocal verifier_calls
             verifier_calls += 1
             self.assertEqual(CLASSIFICATION_INPUT, classification_input)
-            return self.module._mint_verified_hard_optout_evidence(
-                evidence={
-                    "schemaVersion": 1,
-                    "evidenceKind": "header_list_unsubscribe",
-                    "evidenceHash": "b" * 64,
-                }
-            )
+            return deepcopy(HARD_OPTOUT_EVIDENCE)
 
         self.coordinator = self.module.SourceCoordinator(
             self.fake,
@@ -1760,7 +1924,10 @@ class ClassificationTests(unittest.TestCase):
             classifier_calls += 1
             raise AssertionError("verified hard opt-out called model")
 
-        snapshot = self.classify(classifier)
+        try:
+            snapshot = self.classify(classifier)
+        except self.module.SourceCoordinatorConfigError as exc:
+            self.fail(f"exact hard opt-out evidence dict was rejected: {exc}")
 
         self.assertEqual(1, verifier_calls)
         self.assertEqual(0, classifier_calls)
@@ -1777,22 +1944,121 @@ class ClassificationTests(unittest.TestCase):
             snapshot.complete_proposal["transitionCandidates"][0]["type"],
         )
 
-    def test_verified_evidence_requires_module_private_mint_capability(self):
-        evidence = {
-            "schemaVersion": 1,
-            "evidenceKind": "header_list_unsubscribe",
-            "evidenceHash": "b" * 64,
+    def test_verified_evidence_has_no_external_mint_or_capability(self):
+        self.assertFalse(hasattr(self.module, "_mint_verified_hard_optout_evidence"))
+        self.assertFalse(
+            hasattr(self.module, "_VERIFIED_HARD_OPTOUT_EVIDENCE_CAPABILITY")
+        )
+
+    def test_verifier_rejects_private_objects_and_non_exact_evidence_dicts(self):
+        forged_private = object.__new__(self.module._VerifiedHardOptoutEvidence)
+        object.__setattr__(forged_private, "evidence", HARD_OPTOUT_EVIDENCE)
+
+        class EvidenceDict(dict):
+            pass
+
+        invalid_results = {
+            "private object": forged_private,
+            "mapping subclass": EvidenceDict(HARD_OPTOUT_EVIDENCE),
+            "key subclass": {
+                HostileString(key): value
+                for key, value in HARD_OPTOUT_EVIDENCE.items()
+            },
+            "extra field": {**HARD_OPTOUT_EVIDENCE, "verified": True},
+            "bool schema": {**HARD_OPTOUT_EVIDENCE, "schemaVersion": True},
+            "wrong schema": {**HARD_OPTOUT_EVIDENCE, "schemaVersion": 2},
+            "empty evidence kind": {**HARD_OPTOUT_EVIDENCE, "evidenceKind": ""},
+            "kind subclass": {
+                **HARD_OPTOUT_EVIDENCE,
+                "evidenceKind": HostileString("header_list_unsubscribe"),
+            },
+            "short hash": {**HARD_OPTOUT_EVIDENCE, "evidenceHash": "b" * 63},
+            "uppercase hash": {**HARD_OPTOUT_EVIDENCE, "evidenceHash": "B" * 64},
         }
-        with self.assertRaises(self.module.SourceCoordinatorConfigError):
-            self.module._VerifiedHardOptoutEvidence(evidence=evidence)
-        self.assertTrue(
-            hasattr(self.module, "_mint_verified_hard_optout_evidence"),
-            "reviewed verified-evidence mint is absent",
-        )
-        verified = self.module._mint_verified_hard_optout_evidence(
-            evidence=evidence
-        )
-        self.assertIs(type(verified), self.module._VerifiedHardOptoutEvidence)
+        for case, verifier_result in invalid_results.items():
+            with self.subTest(case=case):
+                fake = FakeFirestore()
+                clock = MutableClock(FROZEN_NOW)
+                coordinator = self.module.SourceCoordinator(
+                    fake,
+                    uuid_factory=SequentialUUIDs(),
+                    now_factory=clock,
+                    hard_optout_verifier=lambda _: verifier_result,
+                )
+                source = coordinator.admit_or_repair_source_identity(
+                    user_id="user-1",
+                    hydrated_message={"id": "graph-A"},
+                    evidence_kind="graph_hydration",
+                    thread_id="thread-1",
+                )
+                claim = coordinator.claim_source_classification(
+                    user_id="user-1",
+                    canonical_source_id=source.canonical_source_id,
+                    lease_seconds=60,
+                )
+                before_data = deepcopy(fake.data)
+                before_writes = [
+                    event
+                    for event in fake.events
+                    if event[0] in {"create", "set", "update", "delete"}
+                ]
+
+                with self.assertRaises(self.module.SourceCoordinatorConfigError):
+                    coordinator.persist_deterministic_classification_snapshot(
+                        user_id="user-1",
+                        canonical_source_id=source.canonical_source_id,
+                        classification_epoch=claim.classification_epoch,
+                        classification_claim_id=claim.classification_claim_id,
+                        classification_input=CLASSIFICATION_INPUT,
+                    )
+
+                self.assertEqual(before_data, fake.data)
+                self.assertEqual(
+                    before_writes,
+                    [
+                        event
+                        for event in fake.events
+                        if event[0] in {"create", "set", "update", "delete"}
+                    ],
+                )
+
+    def test_verifier_validates_key_types_before_private_construction(self):
+        hostile_keys = {
+            HostileString(key): value
+            for key, value in HARD_OPTOUT_EVIDENCE.items()
+        }
+        construction_calls = 0
+        original_private_type = self.module._VerifiedHardOptoutEvidence
+
+        class ConstructionProbe:
+            def __init__(probe_self, *, evidence):
+                nonlocal construction_calls
+                construction_calls += 1
+                probe_self.evidence = evidence
+
+        self.module._VerifiedHardOptoutEvidence = ConstructionProbe
+        try:
+            self.coordinator = self.module.SourceCoordinator(
+                self.fake,
+                uuid_factory=self.uuids,
+                now_factory=self.clock,
+                hard_optout_verifier=lambda _: hostile_keys,
+            )
+            claim = self.claim()
+            self.assertErrorCode(
+                "source_coordinator_config",
+                lambda: self.coordinator.persist_deterministic_classification_snapshot(
+                    user_id="user-1",
+                    canonical_source_id=self.source_id,
+                    classification_epoch=claim.classification_epoch,
+                    classification_claim_id=claim.classification_claim_id,
+                    classification_input=CLASSIFICATION_INPUT,
+                ),
+            )
+        finally:
+            self.module._VerifiedHardOptoutEvidence = original_private_type
+
+        self.assertEqual(0, construction_calls)
 
     def test_deterministic_no_match_validates_authority_inside_one_transaction(self):
         observations = []
@@ -1838,13 +2104,7 @@ class ClassificationTests(unittest.TestCase):
         def verifier(classification_input):
             nonlocal verifier_calls
             verifier_calls += 1
-            return self.module._mint_verified_hard_optout_evidence(
-                evidence={
-                    "schemaVersion": 1,
-                    "evidenceKind": "header_list_unsubscribe",
-                    "evidenceHash": "b" * 64,
-                }
-            )
+            return deepcopy(HARD_OPTOUT_EVIDENCE)
 
         self.coordinator = self.module.SourceCoordinator(
             self.fake,
@@ -1905,13 +2165,7 @@ class ClassificationTests(unittest.TestCase):
         def verifier(classification_input):
             nonlocal verifier_calls
             verifier_calls += 1
-            return self.module._mint_verified_hard_optout_evidence(
-                evidence={
-                    "schemaVersion": 1,
-                    "evidenceKind": "header_list_unsubscribe",
-                    "evidenceHash": "b" * 64,
-                }
-            )
+            return deepcopy(HARD_OPTOUT_EVIDENCE)
 
         self.coordinator = self.module.SourceCoordinator(
             self.fake,
@@ -1961,13 +2215,10 @@ class ClassificationTests(unittest.TestCase):
         def verifier(classification_input):
             nonlocal verifier_calls
             verifier_calls += 1
-            return self.module._mint_verified_hard_optout_evidence(
-                evidence={
-                    "schemaVersion": 1,
-                    "evidenceKind": "header_list_unsubscribe",
-                    "evidenceHash": evidence_hash,
-                }
-            )
+            return {
+                **HARD_OPTOUT_EVIDENCE,
+                "evidenceHash": evidence_hash,
+            }
 
         self.coordinator = self.module.SourceCoordinator(
             self.fake,

@@ -117,7 +117,11 @@ _ORDINARY_CANDIDATE_TYPES = {
     "informational",
 }
 _MODEL_REQUEST_KEY_MAX_BYTES = 1024
-_VERIFIED_HARD_OPTOUT_EVIDENCE_CAPABILITY = object()
+_HARD_OPTOUT_EVIDENCE_FIELDS = {
+    "schemaVersion",
+    "evidenceKind",
+    "evidenceHash",
+}
 
 
 class CoordinatorMode(str, Enum):
@@ -346,27 +350,8 @@ def _thaw_json(value: Any) -> Any:
 class _VerifiedHardOptoutEvidence:
     evidence: Mapping[str, Any]
 
-    def __init__(self, *, evidence: Mapping[str, Any], capability=None):
-        if capability is not _VERIFIED_HARD_OPTOUT_EVIDENCE_CAPABILITY:
-            raise SourceCoordinatorConfigError(
-                "verified hard opt-out evidence requires coordinator capability"
-            )
-        if type(evidence) is not dict:
-            raise SourceCoordinatorConfigError(
-                "verified hard opt-out evidence must be an exact mapping"
-            )
-        _validate_exact_json(evidence, active_containers=set())
+    def __init__(self, *, evidence: dict[str, Any]):
         object.__setattr__(self, "evidence", _freeze_json(deepcopy(evidence)))
-
-
-def _mint_verified_hard_optout_evidence(
-    *,
-    evidence: Mapping[str, Any],
-) -> _VerifiedHardOptoutEvidence:
-    return _VerifiedHardOptoutEvidence(
-        evidence=evidence,
-        capability=_VERIFIED_HARD_OPTOUT_EVIDENCE_CAPABILITY,
-    )
 
 
 @dataclass(frozen=True)
@@ -486,6 +471,10 @@ def _is_sha256(value: Any) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _is_exact_schema_version(value: Any, expected: int) -> bool:
+    return type(value) is int and value == expected
 
 
 def _is_aware_datetime(value: Any) -> bool:
@@ -671,8 +660,10 @@ def _normalize_complete_proposal(
     )
     if (
         set(normalized) != _COMPLETE_PROPOSAL_FIELDS
-        or type(normalized.get("schemaVersion")) is not int
-        or normalized.get("schemaVersion") != _CLASSIFICATION_SNAPSHOT_SCHEMA_VERSION
+        or not _is_exact_schema_version(
+            normalized.get("schemaVersion"),
+            _CLASSIFICATION_SNAPSHOT_SCHEMA_VERSION,
+        )
         or type(normalized.get("transitionCandidates")) is not list
         or type(normalized.get("ordinaryObligations")) is not list
     ):
@@ -968,12 +959,17 @@ def _validate_classification_document(
     if (
         type(data) is not dict
         or set(data) != _CLASSIFICATION_FIELDS
-        or data.get("schemaVersion") != _CLASSIFICATION_SCHEMA_VERSION
+        or not _is_exact_schema_version(
+            data.get("schemaVersion"),
+            _CLASSIFICATION_SCHEMA_VERSION,
+        )
         or data.get("canonicalSourceId") != canonical_source_id
         or type(data.get("classificationEpoch")) is not int
         or data.get("classificationEpoch", 0) <= 0
-        or data.get("classificationInputSchemaVersion")
-        != _CLASSIFICATION_INPUT_SCHEMA_VERSION
+        or not _is_exact_schema_version(
+            data.get("classificationInputSchemaVersion"),
+            _CLASSIFICATION_INPUT_SCHEMA_VERSION,
+        )
         or not _is_aware_datetime(data.get("leaseExpiresAt"))
         or not _is_aware_datetime(data.get("createdAt"))
         or not _is_aware_datetime(data.get("updatedAt"))
@@ -1160,6 +1156,13 @@ def _validate_alias_projection(
         raise SourceCoordinatorAmbiguous(
             "source alias projection schema is malformed"
         )
+    if not _is_exact_schema_version(
+        data.get("schemaVersion"),
+        _SOURCE_IDENTITY_SCHEMA_VERSION,
+    ):
+        raise SourceAliasConflict(
+            "source alias projection conflicts with authority"
+        )
     expected = {
         "schemaVersion": _SOURCE_IDENTITY_SCHEMA_VERSION,
         **descriptor,
@@ -1178,7 +1181,10 @@ def _validated_identity_descriptors(
 ) -> list[dict[str, str]]:
     if (
         set(data) != _SOURCE_IDENTITY_FIELDS
-        or data.get("schemaVersion") != _SOURCE_IDENTITY_SCHEMA_VERSION
+        or not _is_exact_schema_version(
+            data.get("schemaVersion"),
+            _SOURCE_IDENTITY_SCHEMA_VERSION,
+        )
         or data.get("canonicalSourceId") != canonical_source_id
         or not _is_sha256(data.get("creationHash"))
         or data.get("lifecycleState") != "pending"
@@ -1836,14 +1842,24 @@ class SourceCoordinator:
                 raise SourceCoordinatorAmbiguous(
                     "hard opt-out verifier failed"
                 ) from verifier_error
+            if verified_result is None:
+                return None
             if (
-                verified_result is not None
-                and type(verified_result) is not _VerifiedHardOptoutEvidence
+                type(verified_result) is not dict
+                or any(type(field) is not str for field in verified_result)
+                or set(verified_result) != _HARD_OPTOUT_EVIDENCE_FIELDS
+                or not _is_exact_schema_version(
+                    verified_result.get("schemaVersion"),
+                    _CLASSIFICATION_SNAPSHOT_SCHEMA_VERSION,
+                )
+                or type(verified_result.get("evidenceKind")) is not str
+                or not verified_result.get("evidenceKind")
+                or not _is_sha256(verified_result.get("evidenceHash"))
             ):
                 raise SourceCoordinatorConfigError(
                     "hard opt-out verifier returned an untrusted result"
                 )
-            return verified_result
+            return _VerifiedHardOptoutEvidence(evidence=verified_result)
 
         def material_from_verified(verified_result):
             deterministic_evidence = _thaw_json(verified_result.evidence)
