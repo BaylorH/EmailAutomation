@@ -7,6 +7,7 @@ import unittest
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
+from unittest import mock
 
 from tests.source_coordinator_fakes import (
     FakeDocumentSnapshot,
@@ -2406,6 +2407,463 @@ class ClassificationTests(unittest.TestCase):
                 canonical_source_id=self.source_id,
             ),
         )
+
+
+class SelectionAndLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self.module = _load_source_coordinator(self)
+        self.assertTrue(
+            hasattr(self.module, "build_selection_snapshot"),
+            "build_selection_snapshot is absent",
+        )
+        for name in (
+            "elect_transition_owner_from_snapshot",
+            "create_or_verify_source_work_ledger",
+        ):
+            self.assertTrue(
+                hasattr(self.module.SourceCoordinator, name),
+                f"SourceCoordinator.{name} is absent",
+            )
+
+        self.fake = FakeFirestore()
+        self.clock = MutableClock(FROZEN_NOW)
+        self.uuids = SequentialUUIDs()
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+        )
+        identity = self.coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={"id": "graph-A"},
+            evidence_kind="graph_hydration",
+            thread_id="thread-1",
+        )
+        self.source_id = identity.canonical_source_id
+        self.fake.events.clear()
+
+    @property
+    def classification_path(self):
+        return f"users/user-1/sourceClassifications/{self.source_id}"
+
+    @property
+    def owner_path(self):
+        return f"users/user-1/sourceTransitionOwners/{self.source_id}"
+
+    @property
+    def ledger_path(self):
+        return f"users/user-1/sourceWorkLedgers/{self.source_id}"
+
+    def write_events(self):
+        return [
+            event
+            for event in self.fake.events
+            if event[0] in {"create", "set", "update", "delete"}
+        ]
+
+    def freeze(self, proposal):
+        return self.coordinator.classify_source_once(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            lease_seconds=60,
+            classification_input=CLASSIFICATION_INPUT,
+            classifier=lambda: (
+                deepcopy(proposal),
+                deepcopy(MODEL_PROPOSAL_EVIDENCE),
+            ),
+        )
+
+    def elect(self, **kwargs):
+        return self.coordinator.elect_transition_owner_from_snapshot(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            **kwargs,
+        )
+
+    def ledger(self):
+        return self.coordinator.create_or_verify_source_work_ledger(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+        )
+
+    def test_preview_normalizes_unverified_optout_without_owner_key(self):
+        proposal = {
+            "schemaVersion": 1,
+            "transitionCandidates": [
+                {"type": "contact_optout", "claimed": True}
+            ],
+            "ordinaryObligations": [
+                {"type": "field_update", "field": "stage", "value": "cold"},
+                {"type": "informational", "message": "retained"},
+            ],
+        }
+        preview = self.module.build_selection_snapshot(proposal)
+
+        self.assertEqual("source-candidate-taxonomy-v1", preview["candidateTaxonomyVersion"])
+        self.assertEqual("human_decision", preview["ownerKind"])
+        self.assertNotIn("ownerKey", preview)
+        self.assertEqual(
+            "needs_user_input",
+            preview["selectedCandidates"][0]["type"],
+        )
+        self.assertEqual(
+            "unverified_optout_review",
+            preview["selectedCandidates"][0]["reason"],
+        )
+
+        permuted = deepcopy(proposal)
+        permuted["ordinaryObligations"].reverse()
+        self.assertEqual(preview, self.module.build_selection_snapshot(permuted))
+
+        unknown = {
+            "schemaVersion": 1,
+            "transitionCandidates": [{"type": "invented_transition"}],
+            "ordinaryObligations": [],
+        }
+        with self.assertRaises(self.module.SourceCoordinatorConfigError):
+            self.module.build_selection_snapshot(unknown)
+
+    def test_terminal_owner_is_stored_and_expected_kind_is_assertion_only(self):
+        proposal = {
+            "schemaVersion": 1,
+            "transitionCandidates": [
+                {"type": "call_requested", "phone": "555-0100"},
+                {"type": "property_unavailable", "property": "A"},
+            ],
+            "ordinaryObligations": [],
+        }
+        snapshot = self.freeze(proposal)
+        self.fake.events.clear()
+
+        with self.assertRaises(self.module.SourceCoordinatorConflict):
+            self.elect(expected_owner_kind="human_decision")
+        self.assertNotIn(self.owner_path, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+        owner = self.elect(expected_owner_kind="terminal")
+        self.assertEqual("terminal", owner["ownerKind"])
+        self.assertIsNotNone(owner["ownerKey"])
+        self.assertEqual(snapshot.selection_hash, owner["selectionHash"])
+        self.assertEqual(1, owner["revision"])
+        self.assertEqual(owner, self.fake.data[self.owner_path])
+        self.assertEqual(["create"], [event[0] for event in self.write_events()])
+
+        writes = list(self.write_events())
+        retry = self.elect(expected_owner_kind="terminal")
+        self.assertEqual(owner, retry)
+        self.assertEqual(writes, self.write_events())
+
+    def test_ordinary_only_source_persists_explicit_none_owner(self):
+        self.freeze(
+            {
+                "schemaVersion": 1,
+                "transitionCandidates": [],
+                "ordinaryObligations": [
+                    {"type": "field_update", "field": "stage", "value": "warm"}
+                ],
+            }
+        )
+
+        with self.assertRaises(self.module.TransitionOwnerConflict):
+            self.ledger()
+        self.assertNotIn(self.ledger_path, self.fake.data)
+
+        owner = self.elect()
+
+        self.assertEqual("none", owner["ownerKind"])
+        self.assertIsNone(owner["ownerKey"])
+        self.assertIn(self.owner_path, self.fake.data)
+
+    def test_human_candidates_aggregate_and_model_optout_never_elects_hard(self):
+        proposal = {
+            "schemaVersion": 1,
+            "transitionCandidates": [
+                {"type": "call_requested", "phone": "555-0100"},
+                {"type": "needs_user_input", "reason": "missing_property"},
+                {"type": "contact_optout", "verified": True},
+            ],
+            "ordinaryObligations": [],
+        }
+        snapshot = self.freeze(proposal)
+        owner = self.elect()
+
+        self.assertEqual("human_decision", owner["ownerKind"])
+        self.assertNotEqual("contact_optout", owner["ownerKind"])
+        selected_types = {
+            item["type"] for item in snapshot.selection_snapshot["selectedCandidates"]
+        }
+        self.assertEqual(
+            {"call_requested", "needs_user_input"},
+            selected_types,
+        )
+        self.assertNotIn(
+            "contact_optout",
+            json.dumps(self.module._thaw_json(snapshot.selection_snapshot)),
+        )
+
+    def test_ledger_applies_dominance_and_preserves_ordinary_work(self):
+        proposal = {
+            "schemaVersion": 1,
+            "transitionCandidates": [
+                {"type": "property_unavailable", "property": "A"},
+                {"type": "call_requested", "phone": "555-0100"},
+            ],
+            "ordinaryObligations": [
+                {"type": "generic_reply", "template": "terminal"},
+                {"type": "field_update", "field": "stage", "value": "closed"},
+                {"type": "new_property", "property": "B"},
+                {"type": "informational", "message": "retained"},
+            ],
+        }
+        self.freeze(proposal)
+        owner = self.elect()
+        self.fake.events.clear()
+
+        ledger = self.ledger()
+        by_type = {entry["kind"]: entry for entry in ledger["entries"]}
+
+        self.assertEqual("terminal", owner["ownerKind"])
+        self.assertEqual("delegate_owner", by_type["property_unavailable"]["dominanceOutcome"])
+        self.assertEqual("dominated_by_owner", by_type["call_requested"]["dominanceOutcome"])
+        self.assertEqual("delegate_terminal_policy", by_type["generic_reply"]["dominanceOutcome"])
+        for kind in ("field_update", "new_property", "informational"):
+            self.assertEqual("preserve", by_type[kind]["dominanceOutcome"])
+        self.assertTrue(all(entry["state"] == "pending" for entry in ledger["entries"]))
+        self.assertEqual(6, ledger["entryCount"])
+        self.assertEqual(ledger, self.fake.data[self.ledger_path])
+        self.assertEqual(1, len(self.write_events()))
+        self.assertEqual("create", self.write_events()[0][0])
+        self.assertEqual(self.ledger_path, self.write_events()[0][1])
+        self.assertEqual(400, self.module.MAX_SOURCE_WORK_TRANSACTION_WRITES)
+
+    def test_verified_hard_optout_dominates_other_transition_work(self):
+        self.coordinator = self.module.SourceCoordinator(
+            self.fake,
+            uuid_factory=self.uuids,
+            now_factory=self.clock,
+            hard_optout_verifier=lambda _: deepcopy(HARD_OPTOUT_EVIDENCE),
+        )
+        self.coordinator.classify_source_once(
+            user_id="user-1",
+            canonical_source_id=self.source_id,
+            lease_seconds=60,
+            classification_input=CLASSIFICATION_INPUT,
+            classifier=lambda: self.fail("hard opt-out invoked classifier"),
+        )
+        classification = self.fake.data[self.classification_path]
+        proposal = {
+            "schemaVersion": 1,
+            "transitionCandidates": [
+                {"type": "contact_optout", "evidenceHash": "c" * 64},
+                {"type": "close_conversation", "reason": "complete"},
+                {"type": "call_requested", "phone": "555-0100"},
+            ],
+            "ordinaryObligations": [
+                {"type": "generic_reply", "template": "ordinary"},
+                {"type": "field_update", "field": "stage", "value": "closed"},
+            ],
+        }
+        classification.update(
+            self.module._build_classification_snapshot_material(
+                canonical_source_id=self.source_id,
+                classification_input_hash=classification["classificationInputHash"],
+                model_request_key=None,
+                complete_proposal=proposal,
+                proposal_evidence=None,
+                deterministic_evidence=deepcopy(HARD_OPTOUT_EVIDENCE),
+            )
+        )
+
+        owner = self.elect()
+        ledger = self.ledger()
+        by_type = {entry["kind"]: entry for entry in ledger["entries"]}
+
+        self.assertEqual("contact_optout", owner["ownerKind"])
+        self.assertEqual("delegate_owner", by_type["contact_optout"]["dominanceOutcome"])
+        self.assertEqual("dominated_by_owner", by_type["close_conversation"]["dominanceOutcome"])
+        self.assertEqual("dominated_by_owner", by_type["call_requested"]["dominanceOutcome"])
+        self.assertEqual("dominated_no_send", by_type["generic_reply"]["dominanceOutcome"])
+        self.assertEqual("preserve", by_type["field_update"]["dominanceOutcome"])
+
+    def test_duplicate_work_gets_stable_ordinals_and_full_hash_keys(self):
+        proposal = {
+            "schemaVersion": 1,
+            "transitionCandidates": [],
+            "ordinaryObligations": [
+                {"type": "field_update", "field": "stage", "value": "warm"},
+                {"type": "field_update", "field": "stage", "value": "warm"},
+                {"type": "informational", "message": "retained"},
+            ],
+        }
+
+        def materialize(candidate):
+            fake = FakeFirestore()
+            coordinator = self.module.SourceCoordinator(
+                fake,
+                uuid_factory=SequentialUUIDs(),
+                now_factory=MutableClock(FROZEN_NOW),
+            )
+            identity = coordinator.admit_or_repair_source_identity(
+                user_id="user-1",
+                hydrated_message={"id": "graph-A"},
+                evidence_kind="graph_hydration",
+                thread_id="thread-1",
+            )
+            coordinator.classify_source_once(
+                user_id="user-1",
+                canonical_source_id=identity.canonical_source_id,
+                lease_seconds=60,
+                classification_input=CLASSIFICATION_INPUT,
+                classifier=lambda: (
+                    deepcopy(candidate),
+                    deepcopy(MODEL_PROPOSAL_EVIDENCE),
+                ),
+            )
+            coordinator.elect_transition_owner_from_snapshot(
+                user_id="user-1",
+                canonical_source_id=identity.canonical_source_id,
+            )
+            return coordinator.create_or_verify_source_work_ledger(
+                user_id="user-1",
+                canonical_source_id=identity.canonical_source_id,
+            )
+
+        first = materialize(proposal)
+        permuted = deepcopy(proposal)
+        permuted["ordinaryObligations"].reverse()
+        second = materialize(permuted)
+
+        duplicates = [
+            entry for entry in first["entries"] if entry["kind"] == "field_update"
+        ]
+        self.assertEqual([1, 2], [entry["occurrenceOrdinal"] for entry in duplicates])
+        self.assertEqual(2, len({entry["workKey"] for entry in duplicates}))
+        self.assertTrue(all(len(entry["workKey"]) == 64 for entry in duplicates))
+        self.assertEqual(first["ledgerHash"], second["ledgerHash"])
+        self.assertEqual(
+            [entry["workKey"] for entry in first["entries"]],
+            [entry["workKey"] for entry in second["entries"]],
+        )
+
+    def test_entry_byte_and_write_limits_fail_before_ledger_mutation(self):
+        oversized_entries = {
+            "schemaVersion": 1,
+            "transitionCandidates": [],
+            "ordinaryObligations": [
+                {"type": "informational", "index": index}
+                for index in range(129)
+            ],
+        }
+        self.freeze(oversized_entries)
+        self.elect()
+        before_data = deepcopy(self.fake.data)
+        self.fake.events.clear()
+
+        with self.assertRaises(self.module.SourceCoordinatorConfigError):
+            self.ledger()
+        self.assertEqual(before_data, self.fake.data)
+        self.assertNotIn(self.ledger_path, self.fake.data)
+        self.assertEqual([], self.write_events())
+
+        fake = FakeFirestore()
+        coordinator = self.module.SourceCoordinator(
+            fake,
+            uuid_factory=SequentialUUIDs(),
+            now_factory=MutableClock(FROZEN_NOW),
+        )
+        identity = coordinator.admit_or_repair_source_identity(
+            user_id="user-1",
+            hydrated_message={"id": "graph-B"},
+            evidence_kind="graph_hydration",
+            thread_id="thread-2",
+        )
+        coordinator.classify_source_once(
+            user_id="user-1",
+            canonical_source_id=identity.canonical_source_id,
+            lease_seconds=60,
+            classification_input=CLASSIFICATION_INPUT,
+            classifier=lambda: (
+                deepcopy(COMPLETE_PROPOSAL),
+                deepcopy(MODEL_PROPOSAL_EVIDENCE),
+            ),
+        )
+        coordinator.elect_transition_owner_from_snapshot(
+            user_id="user-1",
+            canonical_source_id=identity.canonical_source_id,
+        )
+        before_data = deepcopy(fake.data)
+        before_writes = [event for event in fake.events if event[0] == "create"]
+        with mock.patch.object(self.module, "MAX_SOURCE_WORK_LEDGER_BYTES", 1):
+            with self.assertRaises(self.module.SourceCoordinatorConfigError):
+                coordinator.create_or_verify_source_work_ledger(
+                    user_id="user-1",
+                    canonical_source_id=identity.canonical_source_id,
+                )
+        self.assertEqual(before_data, fake.data)
+        self.assertEqual(
+            before_writes,
+            [event for event in fake.events if event[0] == "create"],
+        )
+        with mock.patch.object(
+            self.module,
+            "MAX_SOURCE_WORK_TRANSACTION_WRITES",
+            0,
+        ):
+            with self.assertRaises(self.module.SourceCoordinatorConfigError):
+                coordinator.create_or_verify_source_work_ledger(
+                    user_id="user-1",
+                    canonical_source_id=identity.canonical_source_id,
+                )
+        self.assertEqual(before_data, fake.data)
+        self.assertEqual(
+            before_writes,
+            [event for event in fake.events if event[0] == "create"],
+        )
+
+    def test_apply_then_raise_is_accepted_only_by_exact_readback(self):
+        self.freeze(deepcopy(COMPLETE_PROPOSAL))
+        self.fake.events.clear()
+        self.fake.apply_then_raise_next_commit = RuntimeError("unknown owner commit")
+
+        owner = self.elect()
+
+        self.assertEqual(owner, self.fake.data[self.owner_path])
+        self.fake.apply_then_raise_next_commit = RuntimeError("unknown ledger commit")
+        ledger = self.ledger()
+        self.assertEqual(ledger, self.fake.data[self.ledger_path])
+        self.assertEqual(
+            2,
+            sum(event[0] == "commit_raised_after_apply" for event in self.fake.events),
+        )
+
+    def test_unauthorized_settlement_or_conflicting_owner_cannot_replace_ledger(self):
+        self.freeze(deepcopy(COMPLETE_PROPOSAL))
+        self.elect()
+        ledger = self.ledger()
+        writes = list(self.write_events())
+
+        self.fake.data[self.ledger_path]["entries"][0]["state"] = "applying"
+        retry = self.ledger()
+        self.assertEqual("applying", retry["entries"][0]["state"])
+        self.assertEqual(ledger["ledgerHash"], retry["ledgerHash"])
+        self.assertEqual(writes, self.write_events())
+
+        for unsupported_state in ("completed", "delegated", "dominated"):
+            self.fake.data[self.ledger_path]["entries"][0]["state"] = (
+                unsupported_state
+            )
+            with self.subTest(state=unsupported_state):
+                with self.assertRaises(self.module.SourceWorkLedgerConflict):
+                    self.ledger()
+                self.assertEqual(writes, self.write_events())
+
+        self.fake.data[self.ledger_path]["entries"][0]["state"] = "applying"
+
+        self.fake.data[self.owner_path]["ownerKind"] = "terminal"
+        with self.assertRaises(self.module.SourceCoordinatorError):
+            self.ledger()
+        self.assertEqual(writes, self.write_events())
+        self.assertEqual(ledger["ledgerHash"], self.fake.data[self.ledger_path]["ledgerHash"])
 
 
 if __name__ == "__main__":

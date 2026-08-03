@@ -22,6 +22,9 @@ SOURCE_COORDINATOR_MODE_ENV = "SITESIFT_SOURCE_COORDINATOR_MODE"
 MAX_SOURCE_ALIAS_BYTES = 1024
 MAX_SOURCE_ALIASES = 8
 MAX_CLASSIFICATION_SNAPSHOT_BYTES = 614400
+MAX_SOURCE_WORK_ENTRIES = 128
+MAX_SOURCE_WORK_LEDGER_BYTES = 600 * 1024
+MAX_SOURCE_WORK_TRANSACTION_WRITES = 400
 _SOURCE_ALIAS_KEY_DOMAIN = "source-alias-v2"
 _SOURCE_ALIAS_TYPES = {"graph", "internet_message_id"}
 _SOURCE_ADMISSION_EVIDENCE_KINDS = {"graph_hydration", "operator_replay"}
@@ -122,6 +125,56 @@ _HARD_OPTOUT_EVIDENCE_FIELDS = {
     "evidenceKind",
     "evidenceHash",
 }
+_TRANSITION_OWNER_SCHEMA_VERSION = 1
+_SOURCE_WORK_LEDGER_SCHEMA_VERSION = 1
+_TRANSITION_OWNER_HASH_KIND = "source-transition-owner-v1"
+_SOURCE_WORK_KEY_HASH_KIND = "source-work-key-v1"
+_SOURCE_WORK_LEDGER_HASH_KIND = "source-work-ledger-v1"
+_TRANSITION_OWNER_KINDS = {
+    "none",
+    "contact_optout",
+    "terminal",
+    "human_decision",
+}
+_TRANSITION_OWNER_FIELDS = {
+    "schemaVersion",
+    "canonicalSourceId",
+    "snapshotImmutableHash",
+    "selectionHash",
+    "ownerKind",
+    "ownerKey",
+    "ownerDecisionHash",
+    "revision",
+    "createdAt",
+    "updatedAt",
+}
+_SOURCE_WORK_LEDGER_FIELDS = {
+    "schemaVersion",
+    "canonicalSourceId",
+    "completeProposalHash",
+    "snapshotImmutableHash",
+    "selectionHash",
+    "ownerDecisionHash",
+    "entries",
+    "entryCount",
+    "ledgerHash",
+    "revision",
+    "createdAt",
+    "updatedAt",
+}
+_SOURCE_WORK_ENTRY_FIELDS = {
+    "workKey",
+    "lane",
+    "kind",
+    "payload",
+    "payloadHash",
+    "occurrenceOrdinal",
+    "selectedOwnerKind",
+    "selectedOwnerKey",
+    "dominanceOutcome",
+    "completionContract",
+    "state",
+}
 
 
 class CoordinatorMode(str, Enum):
@@ -200,6 +253,18 @@ class ClassificationSnapshotConflict(SourceCoordinatorConflict):
 
 class ClassificationSnapshotTooLarge(SourceCoordinatorConfigError):
     code = "classification_snapshot_too_large"
+
+
+class TransitionOwnerConflict(SourceCoordinatorConflict):
+    code = "source_transition_owner_conflict"
+
+
+class SourceWorkLedgerConflict(SourceCoordinatorConflict):
+    code = "source_work_ledger_conflict"
+
+
+class SourceWorkLedgerLimitExceeded(SourceCoordinatorConfigError):
+    code = "source_work_ledger_limit_exceeded"
 
 
 @dataclass(frozen=True)
@@ -362,6 +427,16 @@ class _ClassificationTransactionPlan:
     classification_ref: Any
     before_data: Mapping[str, Any] | None
     expected_data: Mapping[str, Any] | None
+    ambiguous_error_type: type[SourceCoordinatorError] = SourceCoordinatorAmbiguous
+
+
+@dataclass(frozen=True)
+class _AuthorityCreatePlan:
+    result: Any
+    prerequisites: Sequence[tuple[Any, Mapping[str, Any]]]
+    target_ref: Any
+    before_data: Mapping[str, Any] | None
+    expected_data: Mapping[str, Any]
     ambiguous_error_type: type[SourceCoordinatorError] = SourceCoordinatorAmbiguous
 
 
@@ -707,7 +782,7 @@ def _candidate_type(candidate: Mapping[str, Any]) -> str:
 
 def _derive_classification_selection(
     *,
-    canonical_source_id: str,
+    canonical_source_id: str | None,
     complete_proposal: Mapping[str, Any],
     deterministic_hard_optout: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -780,7 +855,7 @@ def _derive_classification_selection(
         selected_candidates = []
 
     owner_key = None
-    if owner_kind != "none":
+    if owner_kind != "none" and canonical_source_id is not None:
         owner_key = canonical_json_hash(
             {
                 "hashKind": _CLASSIFICATION_SELECTION_HASH_KIND,
@@ -813,6 +888,340 @@ def _derive_classification_selection(
         "ordinaryObligationsHash": canonical_json_hash(normalized_obligations),
     }
     return normalized_candidates, normalized_obligations, selection_snapshot
+
+
+def build_selection_snapshot(
+    complete_proposal: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Return a source-independent preview; it never grants owner authority."""
+    normalized = _normalize_complete_proposal(complete_proposal)
+    candidates, obligations, selection = _derive_classification_selection(
+        canonical_source_id=None,
+        complete_proposal=normalized,
+        deterministic_hard_optout=False,
+    )
+    preview = deepcopy(selection)
+    preview.pop("ownerKey", None)
+    preview["transitionCandidates"] = candidates
+    preview["ordinaryObligations"] = obligations
+    return _freeze_json(preview)
+
+
+def _transition_owner_immutable_material(
+    classification_data: Mapping[str, Any],
+) -> dict[str, Any]:
+    selection = classification_data["selectionSnapshot"]
+    owner_kind = selection.get("ownerKind")
+    owner_key = selection.get("ownerKey")
+    if (
+        owner_kind not in _TRANSITION_OWNER_KINDS
+        or (owner_kind == "none") != (owner_key is None)
+        or (owner_key is not None and not _is_sha256(owner_key))
+    ):
+        raise SourceCoordinatorAmbiguous(
+            "classification selection owner is malformed"
+        )
+    immutable = {
+        "schemaVersion": _TRANSITION_OWNER_SCHEMA_VERSION,
+        "canonicalSourceId": classification_data["canonicalSourceId"],
+        "snapshotImmutableHash": classification_data["snapshotImmutableHash"],
+        "selectionHash": classification_data["selectionHash"],
+        "ownerKind": owner_kind,
+        "ownerKey": owner_key,
+    }
+    immutable["ownerDecisionHash"] = canonical_json_hash(
+        {
+            "hashKind": _TRANSITION_OWNER_HASH_KIND,
+            **immutable,
+        }
+    )
+    return immutable
+
+
+def _validate_transition_owner_document(
+    data: Mapping[str, Any],
+    *,
+    canonical_source_id: str,
+    classification_data: Mapping[str, Any] | None = None,
+) -> None:
+    if (
+        type(data) is not dict
+        or set(data) != _TRANSITION_OWNER_FIELDS
+        or not _is_exact_schema_version(
+            data.get("schemaVersion"),
+            _TRANSITION_OWNER_SCHEMA_VERSION,
+        )
+        or data.get("canonicalSourceId") != canonical_source_id
+        or type(data.get("revision")) is not int
+        or data.get("revision") != 1
+        or not _is_aware_datetime(data.get("createdAt"))
+        or not _is_aware_datetime(data.get("updatedAt"))
+    ):
+        raise SourceCoordinatorAmbiguous("transition owner is malformed")
+    expected_hash = canonical_json_hash(
+        {
+            "hashKind": _TRANSITION_OWNER_HASH_KIND,
+            **{
+                field: data[field]
+                for field in (
+                    "schemaVersion",
+                    "canonicalSourceId",
+                    "snapshotImmutableHash",
+                    "selectionHash",
+                    "ownerKind",
+                    "ownerKey",
+                )
+            },
+        }
+    )
+    if (
+        data.get("ownerKind") not in _TRANSITION_OWNER_KINDS
+        or (data.get("ownerKind") == "none")
+        != (data.get("ownerKey") is None)
+        or (
+            data.get("ownerKey") is not None
+            and not _is_sha256(data.get("ownerKey"))
+        )
+        or not _is_sha256(data.get("snapshotImmutableHash"))
+        or not _is_sha256(data.get("selectionHash"))
+        or data.get("ownerDecisionHash") != expected_hash
+    ):
+        raise SourceCoordinatorAmbiguous("transition owner hashes conflict")
+    if classification_data is not None:
+        expected = _transition_owner_immutable_material(classification_data)
+        if any(data.get(field) != value for field, value in expected.items()):
+            raise TransitionOwnerConflict(
+                "transition owner conflicts with classification"
+            )
+
+
+def _work_dominance_outcome(
+    *,
+    lane: str,
+    kind: str,
+    payload_hash: str,
+    owner_kind: str,
+    selected_hashes: set[str],
+) -> str:
+    if lane == "ordinary":
+        if kind == "generic_reply":
+            if owner_kind == "terminal":
+                return "delegate_terminal_policy"
+            if owner_kind in {"contact_optout", "human_decision"}:
+                return "dominated_no_send"
+        return "preserve"
+    if payload_hash in selected_hashes:
+        return "delegate_owner"
+    return "dominated_by_owner"
+
+
+def _completion_contract(*, kind: str, dominance_outcome: str) -> dict[str, Any]:
+    evidence_kind = {
+        "delegate_owner": "owner_delegation",
+        "delegate_terminal_policy": "terminal_policy_delegation",
+        "dominated_by_owner": "selection_dominance",
+        "dominated_no_send": "selection_dominance",
+        "preserve": "work_completion",
+    }[dominance_outcome]
+    return {
+        "schemaVersion": _SOURCE_WORK_LEDGER_SCHEMA_VERSION,
+        "evidenceKind": evidence_kind,
+        "workKind": kind,
+    }
+
+
+def _build_source_work_entries(
+    *,
+    canonical_source_id: str,
+    classification_data: Mapping[str, Any],
+    owner_data: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    selection = classification_data["selectionSnapshot"]
+    selected_hashes = {
+        canonical_json_hash(candidate)
+        for candidate in selection["selectedCandidates"]
+    }
+    raw_items = [
+        ("transition", deepcopy(item))
+        for item in classification_data["transitionCandidates"]
+    ] + [
+        ("ordinary", deepcopy(item))
+        for item in classification_data["ordinaryObligations"]
+    ]
+    raw_items.sort(
+        key=lambda item: _canonical_json_bytes(
+            {"lane": item[0], "payload": item[1]}
+        )
+    )
+    occurrences: dict[str, int] = {}
+    entries = []
+    for lane, payload in raw_items:
+        payload_hash = canonical_json_hash(payload)
+        semantic_hash = canonical_json_hash(
+            {"lane": lane, "payloadHash": payload_hash}
+        )
+        occurrence_ordinal = occurrences.get(semantic_hash, 0) + 1
+        occurrences[semantic_hash] = occurrence_ordinal
+        kind = _candidate_type(payload)
+        dominance_outcome = _work_dominance_outcome(
+            lane=lane,
+            kind=kind,
+            payload_hash=payload_hash,
+            owner_kind=owner_data["ownerKind"],
+            selected_hashes=selected_hashes,
+        )
+        work_key = canonical_json_hash(
+            {
+                "hashKind": _SOURCE_WORK_KEY_HASH_KIND,
+                "canonicalSourceId": canonical_source_id,
+                "snapshotImmutableHash": classification_data[
+                    "snapshotImmutableHash"
+                ],
+                "selectionHash": classification_data["selectionHash"],
+                "lane": lane,
+                "payloadHash": payload_hash,
+                "occurrenceOrdinal": occurrence_ordinal,
+            }
+        )
+        entries.append(
+            {
+                "workKey": work_key,
+                "lane": lane,
+                "kind": kind,
+                "payload": payload,
+                "payloadHash": payload_hash,
+                "occurrenceOrdinal": occurrence_ordinal,
+                "selectedOwnerKind": owner_data["ownerKind"],
+                "selectedOwnerKey": owner_data["ownerKey"],
+                "dominanceOutcome": dominance_outcome,
+                "completionContract": _completion_contract(
+                    kind=kind,
+                    dominance_outcome=dominance_outcome,
+                ),
+                "state": "pending",
+            }
+        )
+    return entries
+
+
+def _source_work_ledger_immutable_material(
+    *,
+    canonical_source_id: str,
+    classification_data: Mapping[str, Any],
+    owner_data: Mapping[str, Any],
+) -> dict[str, Any]:
+    entries = _build_source_work_entries(
+        canonical_source_id=canonical_source_id,
+        classification_data=classification_data,
+        owner_data=owner_data,
+    )
+    if len(entries) > MAX_SOURCE_WORK_ENTRIES:
+        raise SourceWorkLedgerLimitExceeded(
+            "source work entry limit exceeded"
+        )
+    immutable_entries = [
+        {field: value for field, value in entry.items() if field != "state"}
+        for entry in entries
+    ]
+    ledger_hash = canonical_json_hash(
+        {
+            "hashKind": _SOURCE_WORK_LEDGER_HASH_KIND,
+            "canonicalSourceId": canonical_source_id,
+            "completeProposalHash": classification_data["completeProposalHash"],
+            "snapshotImmutableHash": classification_data["snapshotImmutableHash"],
+            "selectionHash": classification_data["selectionHash"],
+            "ownerDecisionHash": owner_data["ownerDecisionHash"],
+            "entries": immutable_entries,
+        }
+    )
+    material = {
+        "schemaVersion": _SOURCE_WORK_LEDGER_SCHEMA_VERSION,
+        "canonicalSourceId": canonical_source_id,
+        "completeProposalHash": classification_data["completeProposalHash"],
+        "snapshotImmutableHash": classification_data["snapshotImmutableHash"],
+        "selectionHash": classification_data["selectionHash"],
+        "ownerDecisionHash": owner_data["ownerDecisionHash"],
+        "entries": entries,
+        "entryCount": len(entries),
+        "ledgerHash": ledger_hash,
+        "revision": 1,
+    }
+    if len(_canonical_json_bytes(material)) > MAX_SOURCE_WORK_LEDGER_BYTES:
+        raise SourceWorkLedgerLimitExceeded(
+            "source work ledger exceeds canonical byte limit"
+        )
+    planned_transaction_writes = 1
+    if planned_transaction_writes > MAX_SOURCE_WORK_TRANSACTION_WRITES:
+        raise SourceWorkLedgerLimitExceeded(
+            "source work ledger transaction write limit exceeded"
+        )
+    return material
+
+
+def _validate_source_work_ledger_document(
+    data: Mapping[str, Any],
+    *,
+    canonical_source_id: str,
+    classification_data: Mapping[str, Any],
+    owner_data: Mapping[str, Any],
+) -> None:
+    if (
+        type(data) is not dict
+        or set(data) != _SOURCE_WORK_LEDGER_FIELDS
+        or not _is_exact_schema_version(
+            data.get("schemaVersion"),
+            _SOURCE_WORK_LEDGER_SCHEMA_VERSION,
+        )
+        or data.get("canonicalSourceId") != canonical_source_id
+        or type(data.get("revision")) is not int
+        or data.get("revision") != 1
+        or not _is_aware_datetime(data.get("createdAt"))
+        or not _is_aware_datetime(data.get("updatedAt"))
+        or type(data.get("entries")) is not list
+        or type(data.get("entryCount")) is not int
+        or data.get("entryCount") != len(data.get("entries", []))
+    ):
+        raise SourceCoordinatorAmbiguous("source work ledger is malformed")
+    expected = _source_work_ledger_immutable_material(
+        canonical_source_id=canonical_source_id,
+        classification_data=classification_data,
+        owner_data=owner_data,
+    )
+    if any(
+        data.get(field) != expected[field]
+        for field in (
+            "schemaVersion",
+            "canonicalSourceId",
+            "completeProposalHash",
+            "snapshotImmutableHash",
+            "selectionHash",
+            "ownerDecisionHash",
+            "entryCount",
+            "ledgerHash",
+            "revision",
+        )
+    ):
+        raise SourceWorkLedgerConflict(
+            "source work ledger conflicts with authority"
+        )
+    expected_entries = expected["entries"]
+    if len(data["entries"]) != len(expected_entries):
+        raise SourceWorkLedgerConflict("source work ledger entries conflict")
+    for stored, initial in zip(data["entries"], expected_entries):
+        if (
+            type(stored) is not dict
+            or set(stored) != _SOURCE_WORK_ENTRY_FIELDS
+            or stored.get("state")
+            not in {"pending", "applying"}
+            or any(
+                stored.get(field) != value
+                for field, value in initial.items()
+                if field != "state"
+            )
+        ):
+            raise SourceWorkLedgerConflict(
+                "source work ledger entry conflicts with authority"
+            )
 
 
 def _build_classification_snapshot_material(
@@ -1356,6 +1765,53 @@ class SourceCoordinator:
         if isinstance(result, _DeferredClassificationError):
             raise result.error
         return result
+
+    def _run_authority_create_transaction(self, prepare, *, authority_name):
+        try:
+            transaction = self._firestore.transaction(max_attempts=1)
+        except SourceCoordinatorError:
+            raise
+        except Exception as transaction_error:
+            raise SourceCoordinatorRetryable(
+                f"{authority_name} transaction is unavailable"
+            ) from transaction_error
+        prepared_plan = None
+
+        @transactional
+        def run_once(active_transaction):
+            nonlocal prepared_plan
+            prepared_plan = prepare(active_transaction)
+            return prepared_plan.result
+
+        try:
+            return run_once(transaction)
+        except Exception as transaction_error:
+            if prepared_plan is None:
+                if isinstance(transaction_error, SourceCoordinatorError):
+                    raise
+                raise SourceCoordinatorAmbiguous(
+                    f"{authority_name} transaction failed before commit"
+                ) from transaction_error
+            try:
+                for reference, expected in prepared_plan.prerequisites:
+                    if _snapshot_data(reference.get()) != expected:
+                        raise SourceCoordinatorAmbiguous(
+                            f"{authority_name} prerequisite changed during commit"
+                        )
+                readback = _snapshot_data(prepared_plan.target_ref.get())
+            except Exception as readback_error:
+                raise prepared_plan.ambiguous_error_type(
+                    f"{authority_name} commit outcome is unreadable"
+                ) from readback_error
+            if readback == prepared_plan.expected_data:
+                return prepared_plan.result
+            if readback == prepared_plan.before_data:
+                raise SourceCoordinatorRetryable(
+                    f"{authority_name} commit was not applied"
+                ) from transaction_error
+            raise prepared_plan.ambiguous_error_type(
+                f"{authority_name} commit outcome is ambiguous"
+            ) from transaction_error
 
     def claim_source_classification(
         self,
@@ -2132,6 +2588,215 @@ class SourceCoordinator:
             user_id=user_id,
             canonical_source_id=canonical_source_id,
             expected_classification_input_hash=None,
+        )
+
+    def elect_transition_owner_from_snapshot(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+        expected_owner_kind: str | None = None,
+    ) -> Mapping[str, Any]:
+        _validate_user_id(user_id)
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        if (
+            expected_owner_kind is not None
+            and (
+                type(expected_owner_kind) is not str
+                or expected_owner_kind not in _TRANSITION_OWNER_KINDS
+            )
+        ):
+            raise SourceCoordinatorConfigError(
+                "expected owner kind is unsupported"
+            )
+        user_ref = self._firestore.collection("users").document(user_id)
+        identity_ref = user_ref.collection("sourceIdentities").document(
+            canonical_source_id
+        )
+        classification_ref = user_ref.collection("sourceClassifications").document(
+            canonical_source_id
+        )
+        owner_ref = user_ref.collection("sourceTransitionOwners").document(
+            canonical_source_id
+        )
+
+        def prepare(transaction):
+            identity_data = self._require_source_identity_snapshot(
+                identity_ref.get(transaction=transaction),
+                canonical_source_id=canonical_source_id,
+            )
+            classification_data = _snapshot_data(
+                classification_ref.get(transaction=transaction)
+            )
+            if classification_data is None:
+                raise ClassificationSnapshotNotReady(
+                    "transition owner requires a classification snapshot"
+                )
+            _validate_classification_document(
+                classification_data,
+                canonical_source_id=canonical_source_id,
+            )
+            if classification_data["classificationState"] != "snapshot_ready":
+                raise ClassificationSnapshotNotReady(
+                    "transition owner requires snapshot_ready authority"
+                )
+            immutable = _transition_owner_immutable_material(classification_data)
+            if (
+                expected_owner_kind is not None
+                and immutable["ownerKind"] != expected_owner_kind
+            ):
+                raise TransitionOwnerConflict(
+                    "expected owner kind does not match stored selection"
+                )
+            before = _snapshot_data(owner_ref.get(transaction=transaction))
+            if before is not None:
+                _validate_transition_owner_document(
+                    before,
+                    canonical_source_id=canonical_source_id,
+                    classification_data=classification_data,
+                )
+                return _AuthorityCreatePlan(
+                    result=_freeze_json(deepcopy(before)),
+                    prerequisites=(
+                        (identity_ref, deepcopy(identity_data)),
+                        (classification_ref, deepcopy(classification_data)),
+                    ),
+                    target_ref=owner_ref,
+                    before_data=before,
+                    expected_data=before,
+                    ambiguous_error_type=TransitionOwnerConflict,
+                )
+            now = self._current_time()
+            expected = {
+                **immutable,
+                "revision": 1,
+                "createdAt": now,
+                "updatedAt": now,
+            }
+            transaction.create(owner_ref, expected)
+            return _AuthorityCreatePlan(
+                result=_freeze_json(deepcopy(expected)),
+                prerequisites=(
+                    (identity_ref, deepcopy(identity_data)),
+                    (classification_ref, deepcopy(classification_data)),
+                ),
+                target_ref=owner_ref,
+                before_data=None,
+                expected_data=expected,
+                ambiguous_error_type=TransitionOwnerConflict,
+            )
+
+        return self._run_authority_create_transaction(
+            prepare,
+            authority_name="transition owner",
+        )
+
+    def create_or_verify_source_work_ledger(
+        self,
+        *,
+        user_id: str,
+        canonical_source_id: str,
+    ) -> Mapping[str, Any]:
+        _validate_user_id(user_id)
+        _validate_document_id(
+            canonical_source_id,
+            field_name="canonical source id",
+        )
+        user_ref = self._firestore.collection("users").document(user_id)
+        identity_ref = user_ref.collection("sourceIdentities").document(
+            canonical_source_id
+        )
+        classification_ref = user_ref.collection("sourceClassifications").document(
+            canonical_source_id
+        )
+        owner_ref = user_ref.collection("sourceTransitionOwners").document(
+            canonical_source_id
+        )
+        ledger_ref = user_ref.collection("sourceWorkLedgers").document(
+            canonical_source_id
+        )
+
+        def prepare(transaction):
+            identity_data = self._require_source_identity_snapshot(
+                identity_ref.get(transaction=transaction),
+                canonical_source_id=canonical_source_id,
+            )
+            classification_data = _snapshot_data(
+                classification_ref.get(transaction=transaction)
+            )
+            if classification_data is None:
+                raise ClassificationSnapshotNotReady(
+                    "source work ledger requires a classification snapshot"
+                )
+            _validate_classification_document(
+                classification_data,
+                canonical_source_id=canonical_source_id,
+            )
+            if classification_data["classificationState"] != "snapshot_ready":
+                raise ClassificationSnapshotNotReady(
+                    "source work ledger requires snapshot_ready authority"
+                )
+            owner_data = _snapshot_data(owner_ref.get(transaction=transaction))
+            if owner_data is None:
+                raise TransitionOwnerConflict(
+                    "source work ledger requires an explicit owner decision"
+                )
+            _validate_transition_owner_document(
+                owner_data,
+                canonical_source_id=canonical_source_id,
+                classification_data=classification_data,
+            )
+            immutable = _source_work_ledger_immutable_material(
+                canonical_source_id=canonical_source_id,
+                classification_data=classification_data,
+                owner_data=owner_data,
+            )
+            before = _snapshot_data(ledger_ref.get(transaction=transaction))
+            if before is not None:
+                _validate_source_work_ledger_document(
+                    before,
+                    canonical_source_id=canonical_source_id,
+                    classification_data=classification_data,
+                    owner_data=owner_data,
+                )
+                return _AuthorityCreatePlan(
+                    result=_freeze_json(deepcopy(before)),
+                    prerequisites=(
+                        (identity_ref, deepcopy(identity_data)),
+                        (classification_ref, deepcopy(classification_data)),
+                        (owner_ref, deepcopy(owner_data)),
+                    ),
+                    target_ref=ledger_ref,
+                    before_data=before,
+                    expected_data=before,
+                    ambiguous_error_type=SourceWorkLedgerConflict,
+                )
+            now = self._current_time()
+            expected = {
+                **immutable,
+                "createdAt": now,
+                "updatedAt": now,
+            }
+            transaction.create(ledger_ref, expected)
+            return _AuthorityCreatePlan(
+                result=_freeze_json(deepcopy(expected)),
+                prerequisites=(
+                    (identity_ref, deepcopy(identity_data)),
+                    (classification_ref, deepcopy(classification_data)),
+                    (owner_ref, deepcopy(owner_data)),
+                ),
+                target_ref=ledger_ref,
+                before_data=None,
+                expected_data=expected,
+                ambiguous_error_type=SourceWorkLedgerConflict,
+            )
+
+        return self._run_authority_create_transaction(
+            prepare,
+            authority_name="source work ledger",
         )
 
     def classify_source_once(
