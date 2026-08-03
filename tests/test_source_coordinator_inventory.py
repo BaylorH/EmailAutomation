@@ -7,6 +7,19 @@ from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_COORDINATOR_PATH = REPO_ROOT / "email_automation/source_coordinator.py"
+FORBIDDEN_SOURCE_COORDINATOR_IMPORT_ROOTS = {
+    "googleapiclient",
+    "openai",
+    "requests",
+}
+FORBIDDEN_SOURCE_COORDINATOR_RELATIVE_IMPORTS = {
+    "ai_processing",
+    "email",
+    "file_handling",
+    "sheet_operations",
+    "sheets",
+}
 DRAFT_DELETE_MANIFEST_PATH = REPO_ROOT / "tests/fixtures/graph_draft_delete_callers.json"
 DRAFT_DELETE_HELPER_NAME = "_delete_graph_reply_draft"
 DRAFT_DELETE_EMAIL_MODULE = "email_automation.email"
@@ -658,6 +671,40 @@ class ProviderDeleteValidatorTests(unittest.TestCase):
 
 
 class InventoryContractTests(unittest.TestCase):
+    def test_source_coordinator_has_no_provider_or_effect_imports(self):
+        self.assertTrue(
+            SOURCE_COORDINATOR_PATH.exists(),
+            "source coordinator module is missing",
+        )
+        if not SOURCE_COORDINATOR_PATH.exists():
+            return
+
+        tree = ast.parse(
+            SOURCE_COORDINATOR_PATH.read_text(encoding="utf-8"),
+            filename=str(SOURCE_COORDINATOR_PATH),
+        )
+        forbidden = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".", 1)[0]
+                    if root in FORBIDDEN_SOURCE_COORDINATOR_IMPORT_ROOTS:
+                        forbidden.append((node.lineno, alias.name))
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                root = module.split(".", 1)[0]
+                if root in FORBIDDEN_SOURCE_COORDINATOR_IMPORT_ROOTS:
+                    forbidden.append((node.lineno, module))
+                if node.level:
+                    relative_roots = {root} if root else {
+                        alias.name.split(".", 1)[0] for alias in node.names
+                    }
+                    for relative_root in sorted(relative_roots):
+                        if relative_root in FORBIDDEN_SOURCE_COORDINATOR_RELATIVE_IMPORTS:
+                            forbidden.append((node.lineno, f"relative:{relative_root}"))
+
+        self.assertEqual([], forbidden)
+
     def test_application_file_exclusions_are_preserved(self):
         self.assertTrue(_is_application_python_file(Path(DRAFT_DELETE_EMAIL_PATH)))
         self.assertFalse(_is_application_python_file(Path("tests/helper.py")))
