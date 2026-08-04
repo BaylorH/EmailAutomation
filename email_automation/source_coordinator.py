@@ -5912,6 +5912,7 @@ class SourceCoordinator:
         user_id: str,
         canonical_source_id: str,
         ledger_hash: str,
+        required_source_alias_key: str | None = None,
     ) -> SourceSettlementResult:
         _validate_user_id(user_id)
         _validate_document_id(
@@ -5920,6 +5921,13 @@ class SourceCoordinator:
         )
         if not _is_sha256(ledger_hash):
             raise SourceCoordinatorConfigError("ledger hash must be a full hash")
+        if (
+            required_source_alias_key is not None
+            and not _is_sha256(required_source_alias_key)
+        ):
+            raise SourceCoordinatorConfigError(
+                "required source alias key must be a full hash"
+            )
         user_ref = self._firestore.collection("users").document(user_id)
         admission_ref = user_ref.collection("inboundPendingAdmissions").document(
             canonical_source_id
@@ -5948,6 +5956,17 @@ class SourceCoordinator:
                 identity_data,
                 canonical_source_id=canonical_source_id,
             )
+            if (
+                required_source_alias_key is not None
+                and required_source_alias_key
+                not in {
+                    descriptor["sourceAliasKey"]
+                    for descriptor in aliases
+                }
+            ):
+                raise SourceSettlementConflict(
+                    "required source alias is not owned by canonical source"
+                )
             alias_owner_prerequisites = []
             source_alias_collection = user_ref.collection("sourceAliases")
             for descriptor in aliases:
@@ -6637,3 +6656,25 @@ class SourceCoordinator:
             raise SourceCoordinatorAmbiguous(
                 "source identity transaction failed before commit"
             ) from transaction_error
+
+
+def settle_source_marker_context_if_ready(
+    *,
+    coordinator: Any,
+    user_id: str,
+    canonical_source_id: str,
+    ledger_hash: str,
+    required_source_alias_key: str,
+) -> SourceSettlementResult:
+    """Type-gate the messaging compatibility adapter onto B1 authority."""
+    if type(coordinator) is not SourceCoordinator:
+        raise SourceCoordinatorConfigError(
+            "settlement context requires canonical coordinator authority"
+        )
+    return SourceCoordinator.settle_source_markers_if_ready(
+        coordinator,
+        user_id=user_id,
+        canonical_source_id=canonical_source_id,
+        ledger_hash=ledger_hash,
+        required_source_alias_key=required_source_alias_key,
+    )

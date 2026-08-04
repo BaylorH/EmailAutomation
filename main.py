@@ -22,12 +22,26 @@ from email_automation.app_config import CLIENT_ID, CLIENT_SECRET, AUTHORITY, SCO
 from email_automation.scheduler_lease import run_with_scheduler_lease
 from email_automation.scheduler_scope import SchedulerScopeError, resolve_scheduler_user_ids
 from email_automation.system_health import record_user_health
+from email_automation.messaging import SourceCompatibilityDisposition
+from email_automation.source_coordinator import (
+    CoordinatorMode,
+    SourceCoordinatorConfigError,
+    resolve_source_coordinator_mode,
+)
 
 # Thresholds for auto-cleanup (to stay within Firebase free tier)
 PROCESSED_MESSAGES_THRESHOLD = 500
 SHEET_CHANGELOG_THRESHOLD = 100
 GRAPH_TOKEN_REFRESH_BUFFER_SECONDS = 15 * 60
 PROCESSING_FAILURE_RETRY_DEFAULT_MAX_AGE_HOURS = 6
+B1_PROCESSED_OWNERSHIP_FIELDS = frozenset(
+    {
+        "canonicalSourceId",
+        "settlementRevision",
+        "settlementHash",
+        "sourceAliasKey",
+    }
+)
 
 
 def _processing_failure_retry_enabled() -> bool:
@@ -81,8 +95,24 @@ def _timestamp_sort_value(doc, fields):
     return 0
 
 
-def _delete_oldest_excess_docs(collection_ref, threshold: int, timestamp_fields) -> int:
+def _is_b1_owned_processed_projection(doc) -> bool:
+    data = doc.to_dict() or {}
+    return (
+        isinstance(data, dict)
+        and any(field in data for field in B1_PROCESSED_OWNERSHIP_FIELDS)
+    )
+
+
+def _delete_oldest_excess_docs(
+    collection_ref,
+    threshold: int,
+    timestamp_fields,
+    *,
+    retain_predicate=None,
+) -> int:
     docs = list(collection_ref.stream())
+    if retain_predicate is not None:
+        docs = [doc for doc in docs if not retain_predicate(doc)]
     excess_count = max(0, len(docs) - threshold)
     if excess_count <= 0:
         return 0
@@ -109,6 +139,7 @@ def auto_cleanup_firestore(user_id: str):
                 pm_ref,
                 PROCESSED_MESSAGES_THRESHOLD,
                 ["processedAt", "timestamp", "createdAt"],
+                retain_predicate=_is_b1_owned_processed_projection,
             )
             print(f"   ✅ Deleted {deleted} oldest processedMessages docs")
 
@@ -221,8 +252,28 @@ def _combine_graph_operation_states(operation_states):
     }
 
 
+def _source_compatibility_entry(operation: str):
+    mode = resolve_source_coordinator_mode(os.environ)
+    if mode is CoordinatorMode.DISABLED:
+        return None
+    if mode is CoordinatorMode.SHADOW:
+        return SourceCompatibilityDisposition(
+            mode=mode,
+            operation=operation,
+            effect="shadow_no_effect",
+            processed=False,
+        )
+    raise SourceCoordinatorConfigError(
+        f"legacy {operation} is unavailable in enforced mode"
+    )
+
+
 def refresh_and_process_user(user_id: str):
     print(f"\n🔄 Processing user: {user_id}")
+
+    compatibility = _source_compatibility_entry("user_automation_run")
+    if compatibility is not None:
+        return compatibility
 
     download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
 
@@ -407,6 +458,10 @@ def refresh_and_process_user(user_id: str):
 
 
 def run_all_users():
+    compatibility = _source_compatibility_entry("all_users_automation_run")
+    if compatibility is not None:
+        return compatibility
+
     all_users = list_user_ids()
     print(f"📦 Found {len(all_users)} token cache users: {all_users}")
 
@@ -488,7 +543,14 @@ def _install_sigterm_atexit_bridge() -> None:
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
 
+def run_scheduled_automation():
+    compatibility = _source_compatibility_entry("scheduled_automation_run")
+    if compatibility is not None:
+        return compatibility
+    return run_with_scheduler_lease(run_all_users)
+
+
 if __name__ == "__main__":
     _validate_startup_env()
     _install_sigterm_atexit_bridge()
-    run_with_scheduler_lease(run_all_users)
+    run_scheduled_automation()

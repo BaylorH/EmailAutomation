@@ -1,8 +1,20 @@
+import os
 import re
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from google.cloud.firestore import SERVER_TIMESTAMP
 from .clients import _fs
+from .source_coordinator import (
+    CoordinatorMode,
+    SourceAlias,
+    SourceCoordinatorConfigError,
+    SourceSettlementResult,
+    normalize_source_alias,
+    resolve_source_coordinator_mode,
+    settle_source_marker_context_if_ready,
+    source_alias_key,
+)
 from .utils import b64url_id, clean_email_content, normalize_message_id, strip_email_quotes
 
 
@@ -18,6 +30,32 @@ THREAD_STATUS = {
 }
 
 SYNTHETIC_OUTBOUND_SOURCES = {"dashboard_outbox_reply", "followup_scheduler"}
+
+
+@dataclass(frozen=True)
+class CanonicalSettlementContext:
+    """Exact coordinator authority required by enforced marker compatibility."""
+
+    coordinator: Any
+    user_id: str
+    canonical_source_id: str
+    ledger_hash: str
+    alias: SourceAlias
+
+
+@dataclass(frozen=True)
+class SourceCompatibilityDisposition:
+    """Structured non-legacy result for shadow and enforced compatibility."""
+
+    mode: CoordinatorMode
+    operation: str
+    effect: str
+    processed: bool
+    alias_key: str | None = None
+    settlement: SourceSettlementResult | None = None
+
+    def __bool__(self):
+        return self.processed
 
 
 def _normalize_history_text(value: Any) -> str:
@@ -589,8 +627,9 @@ def _processed_ref(user_id: str, key: str):
     encoded_key = b64url_id(key)
     return _fs.collection("users").document(user_id).collection("processedMessages").document(encoded_key)
 
-def has_processed(user_id: str, key: str) -> bool:
-    """Check if a message has already been processed."""
+
+def _legacy_has_processed(user_id: str, key: str) -> bool:
+    """Pre-B1 read contract. Call only after resolving disabled mode."""
     try:
         doc = _processed_ref(user_id, key).get()
         return doc.exists
@@ -598,14 +637,172 @@ def has_processed(user_id: str, key: str) -> bool:
         print(f"❌ Failed to check processed status for {key}: {e}")
         return False
 
-def mark_processed(user_id: str, key: str):
-    """Mark a message as processed."""
+
+def _legacy_mark_processed(user_id: str, key: str):
+    """Pre-B1 write contract. Call only after resolving disabled mode."""
     try:
         _processed_ref(user_id, key).set({
             "processedAt": SERVER_TIMESTAMP
         }, merge=True)
     except Exception as e:
         print(f"❌ Failed to mark message as processed {key}: {e}")
+
+
+def _validated_marker_alias(
+    *,
+    user_id: str,
+    key: str,
+    alias: SourceAlias,
+) -> tuple[SourceAlias, str]:
+    if not isinstance(alias, SourceAlias):
+        raise SourceCoordinatorConfigError(
+            "source marker compatibility requires a typed alias"
+        )
+    canonical_alias = normalize_source_alias(alias.alias_type, alias.value)
+    supplied_key_alias = normalize_source_alias(alias.alias_type, key)
+    if supplied_key_alias != canonical_alias:
+        raise SourceCoordinatorConfigError(
+            "source marker key conflicts with canonical alias"
+        )
+    alias_key = source_alias_key(user_id, canonical_alias)
+    if alias.key and alias.key != alias_key:
+        raise SourceCoordinatorConfigError(
+            "source marker alias key conflicts with canonical proposal"
+        )
+    return canonical_alias, alias_key
+
+
+def _shadow_marker_disposition(
+    *,
+    user_id: str,
+    key: str,
+    operation: str,
+    source_alias: SourceAlias | None,
+) -> SourceCompatibilityDisposition:
+    alias_key = None
+    if source_alias is not None:
+        _canonical_alias, alias_key = _validated_marker_alias(
+            user_id=user_id,
+            key=key,
+            alias=source_alias,
+        )
+    return SourceCompatibilityDisposition(
+        mode=CoordinatorMode.SHADOW,
+        operation=operation,
+        effect="shadow_no_effect",
+        processed=False,
+        alias_key=alias_key,
+    )
+
+
+def _settle_canonical_marker(
+    *,
+    user_id: str,
+    key: str,
+    operation: str,
+    settlement_context: CanonicalSettlementContext | None,
+    source_alias: SourceAlias | None,
+) -> SourceCompatibilityDisposition:
+    if not isinstance(settlement_context, CanonicalSettlementContext):
+        raise SourceCoordinatorConfigError(
+            "enforced source marker requires canonical settlement context"
+        )
+    if settlement_context.user_id != user_id:
+        raise SourceCoordinatorConfigError(
+            "source marker user conflicts with settlement context"
+        )
+    canonical_alias, alias_key = _validated_marker_alias(
+        user_id=user_id,
+        key=key,
+        alias=settlement_context.alias,
+    )
+    if source_alias is not None:
+        proposed_alias, proposed_key = _validated_marker_alias(
+            user_id=user_id,
+            key=key,
+            alias=source_alias,
+        )
+        if proposed_alias != canonical_alias or proposed_key != alias_key:
+            raise SourceCoordinatorConfigError(
+                "source alias proposal conflicts with settlement context"
+            )
+    settlement = settle_source_marker_context_if_ready(
+        coordinator=settlement_context.coordinator,
+        user_id=user_id,
+        canonical_source_id=settlement_context.canonical_source_id,
+        ledger_hash=settlement_context.ledger_hash,
+        required_source_alias_key=alias_key,
+    )
+    if (
+        not isinstance(settlement, SourceSettlementResult)
+        or settlement.canonical_source_id
+        != settlement_context.canonical_source_id
+    ):
+        raise SourceCoordinatorConfigError(
+            "coordinator returned an invalid source settlement"
+        )
+    return SourceCompatibilityDisposition(
+        mode=CoordinatorMode.ENFORCED,
+        operation=operation,
+        effect="canonical_settlement",
+        processed=True,
+        alias_key=alias_key,
+        settlement=settlement,
+    )
+
+
+def has_processed(
+    user_id: str,
+    key: str,
+    *,
+    settlement_context: CanonicalSettlementContext | None = None,
+    source_alias: SourceAlias | None = None,
+) -> bool | SourceCompatibilityDisposition:
+    """Read legacy state when disabled; otherwise use contained B1 authority."""
+    mode = resolve_source_coordinator_mode(os.environ)
+    if mode is CoordinatorMode.DISABLED:
+        return _legacy_has_processed(user_id, key)
+    if mode is CoordinatorMode.SHADOW:
+        return _shadow_marker_disposition(
+            user_id=user_id,
+            key=key,
+            operation="has_processed",
+            source_alias=source_alias,
+        )
+    return _settle_canonical_marker(
+        user_id=user_id,
+        key=key,
+        operation="has_processed",
+        settlement_context=settlement_context,
+        source_alias=source_alias,
+    )
+
+
+def mark_processed(
+    user_id: str,
+    key: str,
+    *,
+    settlement_context: CanonicalSettlementContext | None = None,
+    source_alias: SourceAlias | None = None,
+):
+    """Write only legacy-disabled markers or coordinator-owned settlement."""
+    mode = resolve_source_coordinator_mode(os.environ)
+    if mode is CoordinatorMode.DISABLED:
+        return _legacy_mark_processed(user_id, key)
+    if mode is CoordinatorMode.SHADOW:
+        return _shadow_marker_disposition(
+            user_id=user_id,
+            key=key,
+            operation="mark_processed",
+            source_alias=source_alias,
+        )
+    return _settle_canonical_marker(
+        user_id=user_id,
+        key=key,
+        operation="mark_processed",
+        settlement_context=settlement_context,
+        source_alias=source_alias,
+    )
 
 def _sync_ref(user_id: str):
     """Get reference to sync document."""

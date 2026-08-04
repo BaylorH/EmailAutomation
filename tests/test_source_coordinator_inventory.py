@@ -68,8 +68,12 @@ EXPECTED_LEGACY_MARKER_DEFINITIONS = Counter(
     {
         ("email_automation/messaging.py", "has_processed"): 1,
         ("email_automation/messaging.py", "mark_processed"): 1,
+        ("email_automation/messaging.py", "_legacy_has_processed"): 1,
+        ("email_automation/messaging.py", "_legacy_mark_processed"): 1,
         ("scheduler_runner.py", "has_processed"): 1,
         ("scheduler_runner.py", "mark_processed"): 1,
+        ("scheduler_runner.py", "_legacy_has_processed"): 1,
+        ("scheduler_runner.py", "_legacy_mark_processed"): 1,
         ("email_automation/operator_replay.py", "_begin_replay_claim"): 1,
         ("email_automation/operator_replay.py", "_complete_replay_claim"): 1,
     }
@@ -2713,6 +2717,75 @@ class InventoryContractTests(unittest.TestCase):
 
     def test_pre_b1_legacy_authority_symbols_are_inventoried(self):
         self.assertEqual(EXPECTED_LEGACY_MARKER_DEFINITIONS, _discover_legacy_authority_symbols())
+
+    def test_marker_compatibility_wrappers_quarantine_direct_storage(self):
+        def top_level_function(tree, name):
+            definitions = [
+                node
+                for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == name
+            ]
+            self.assertEqual(1, len(definitions), name)
+            return definitions[0]
+
+        def called_names(function):
+            names = set()
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call):
+                    continue
+                if isinstance(node.func, ast.Name):
+                    names.add(node.func.id)
+                elif isinstance(node.func, ast.Attribute):
+                    names.add(node.func.attr)
+            return names
+
+        expectations = {
+            "email_automation/messaging.py": {
+                "has_processed": {
+                    "resolve_source_coordinator_mode",
+                    "_legacy_has_processed",
+                    "_shadow_marker_disposition",
+                    "_settle_canonical_marker",
+                },
+                "mark_processed": {
+                    "resolve_source_coordinator_mode",
+                    "_legacy_mark_processed",
+                    "_shadow_marker_disposition",
+                    "_settle_canonical_marker",
+                },
+            },
+            "scheduler_runner.py": {
+                "has_processed": {
+                    "resolve_source_coordinator_mode",
+                    "_legacy_has_processed",
+                    "_compat_has_processed",
+                },
+                "mark_processed": {
+                    "resolve_source_coordinator_mode",
+                    "_legacy_mark_processed",
+                    "_compat_mark_processed",
+                },
+            },
+        }
+        for relative_path, wrappers in expectations.items():
+            tree = _parse_module(Path(relative_path))
+            for name, required_calls in wrappers.items():
+                with self.subTest(relative_path=relative_path, name=name):
+                    calls = called_names(top_level_function(tree, name))
+                    self.assertTrue(required_calls <= calls)
+                    self.assertNotIn("_processed_ref", calls)
+                    self.assertNotIn("set", calls)
+                    self.assertNotIn("get", calls)
+
+            for name, required_effect in (
+                ("_legacy_has_processed", "get"),
+                ("_legacy_mark_processed", "set"),
+            ):
+                with self.subTest(relative_path=relative_path, name=name):
+                    calls = called_names(top_level_function(tree, name))
+                    self.assertIn("_processed_ref", calls)
+                    self.assertIn(required_effect, calls)
 
     def test_legacy_inventory_only_accepts_top_level_definitions(self):
         sources = {

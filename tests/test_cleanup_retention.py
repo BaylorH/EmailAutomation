@@ -13,19 +13,34 @@ import main
 
 
 class FakeDocRef:
-    def __init__(self, doc_id, deleted_ids):
+    def __init__(self, collection_name, doc_id, deleted_ids, deleted_paths):
+        self.collection_name = collection_name
         self.doc_id = doc_id
         self.deleted_ids = deleted_ids
+        self.deleted_paths = deleted_paths
 
     def delete(self):
         self.deleted_ids.append(self.doc_id)
+        self.deleted_paths.append(f"{self.collection_name}/{self.doc_id}")
 
 
 class FakeDoc:
-    def __init__(self, doc_id, data, deleted_ids):
+    def __init__(
+        self,
+        collection_name,
+        doc_id,
+        data,
+        deleted_ids,
+        deleted_paths,
+    ):
         self.id = doc_id
         self._data = data
-        self.reference = FakeDocRef(doc_id, deleted_ids)
+        self.reference = FakeDocRef(
+            collection_name,
+            doc_id,
+            deleted_ids,
+            deleted_paths,
+        )
 
     def to_dict(self):
         return self._data
@@ -48,30 +63,85 @@ class FakeCollection:
 
 
 class FakeFirestore:
-    def __init__(self):
-        self.deleted_ids = []
-        self.collections = {
-            "processedMessages": FakeCollection([
-                FakeDoc("processed-oldest", {"processedAt": 1}, self.deleted_ids),
-                FakeDoc("processed-old", {"processedAt": 2}, self.deleted_ids),
-                FakeDoc("processed-kept", {"processedAt": 3}, self.deleted_ids),
-                FakeDoc("processed-newest", {"processedAt": 4}, self.deleted_ids),
-            ]),
-            "sheetChangeLog": FakeCollection([
-                FakeDoc("change-oldest", {"timestamp": 1}, self.deleted_ids),
-                FakeDoc("change-kept", {"timestamp": 2}, self.deleted_ids),
-                FakeDoc("change-newest", {"timestamp": 3}, self.deleted_ids),
-            ]),
-        }
+    B1_AUTHORITY_COLLECTIONS = (
+        "sourceIdentities",
+        "sourceAliases",
+        "sourceClassifications",
+        "sourceTransitionOwners",
+        "threadTransitionHeads",
+        "sourceWorkLedgers",
+        "sourceDeferredWork",
+        "inboundPendingAdmissions",
+        "blockedSources",
+        "sourceSettlements",
+    )
 
-    def collection(self, name):
-        return self
+    def __init__(self, *, processed_rows=None, changelog_rows=None):
+        self.deleted_ids = []
+        self.deleted_paths = []
+        self.accessed_collections = []
+        if processed_rows is None:
+            processed_rows = [
+                ("processed-oldest", {"processedAt": 1}),
+                ("processed-old", {"processedAt": 2}),
+                ("processed-kept", {"processedAt": 3}),
+                ("processed-newest", {"processedAt": 4}),
+            ]
+        if changelog_rows is None:
+            changelog_rows = [
+                ("change-oldest", {"timestamp": 1}),
+                ("change-kept", {"timestamp": 2}),
+                ("change-newest", {"timestamp": 3}),
+            ]
+        self.collections = {
+            "processedMessages": FakeCollection(
+                self._docs("processedMessages", processed_rows)
+            ),
+            "sheetChangeLog": FakeCollection(
+                self._docs("sheetChangeLog", changelog_rows)
+            ),
+        }
+        for collection_name in self.B1_AUTHORITY_COLLECTIONS:
+            self.collections[collection_name] = FakeCollection(
+                self._docs(
+                    collection_name,
+                    [(f"{collection_name}-authority", {"createdAt": 0})],
+                )
+            )
+
+    def _docs(self, collection_name, rows):
+        return [
+            FakeDoc(
+                collection_name,
+                doc_id,
+                data,
+                self.deleted_ids,
+                self.deleted_paths,
+            )
+            for doc_id, data in rows
+        ]
 
     def document(self, name):
         return self
 
     def collection(self, name):
-        return self.collections[name] if name in self.collections else self
+        if name in self.collections:
+            self.accessed_collections.append(name)
+            return self.collections[name]
+        return self
+
+
+def _canonical_processed_projection(processed_at):
+    return {
+        "schemaVersion": 1,
+        "sourceAliasKey": "a" * 64,
+        "aliasType": "graph",
+        "normalizedValueHash": "b" * 64,
+        "canonicalSourceId": "source-0001",
+        "settlementRevision": 1,
+        "settlementHash": "c" * 64,
+        "processedAt": processed_at,
+    }
 
 
 class CleanupRetentionTests(unittest.TestCase):
@@ -88,13 +158,145 @@ class CleanupRetentionTests(unittest.TestCase):
             ["processed-oldest", "processed-old", "change-oldest"],
         )
 
+    def test_b1_projection_is_retained_without_consuming_legacy_quota(self):
+        fake_fs = FakeFirestore(
+            processed_rows=[
+                ("b1-oldest", _canonical_processed_projection(0)),
+                ("legacy-oldest", {"processedAt": 1}),
+                ("legacy-kept", {"processedAt": 2}),
+                ("legacy-newest", {"processedAt": 3}),
+            ],
+            changelog_rows=[],
+        )
+
+        with patch.object(main, "_fs", fake_fs), \
+             patch.object(main, "PROCESSED_MESSAGES_THRESHOLD", 2), \
+             patch.object(main, "SHEET_CHANGELOG_THRESHOLD", 2):
+            main.auto_cleanup_firestore("uid-1")
+
+        self.assertEqual(
+            [
+                path
+                for path in fake_fs.deleted_paths
+                if path.startswith("processedMessages/")
+            ],
+            ["processedMessages/legacy-oldest"],
+        )
+        self.assertNotIn("b1-oldest", fake_fs.deleted_ids)
+
+    def test_b1_projections_alone_do_not_trigger_deletion(self):
+        fake_fs = FakeFirestore(
+            processed_rows=[
+                (
+                    f"b1-{index}",
+                    {
+                        **_canonical_processed_projection(index),
+                        "sourceAliasKey": f"{index:064x}",
+                    },
+                )
+                for index in range(3)
+            ],
+            changelog_rows=[],
+        )
+
+        with patch.object(main, "_fs", fake_fs), \
+             patch.object(main, "PROCESSED_MESSAGES_THRESHOLD", 1), \
+             patch.object(main, "SHEET_CHANGELOG_THRESHOLD", 1):
+            main.auto_cleanup_firestore("uid-1")
+
+        self.assertEqual([], fake_fs.deleted_paths)
+
+    def test_partial_b1_ownership_markers_fail_closed(self):
+        fake_fs = FakeFirestore(
+            processed_rows=[
+                (
+                    "partial-canonical",
+                    {"canonicalSourceId": "source-partial", "processedAt": 0},
+                ),
+                (
+                    "partial-revision",
+                    {"settlementRevision": 1, "processedAt": 0},
+                ),
+                (
+                    "partial-settlement-hash",
+                    {"settlementHash": "a" * 64, "processedAt": 0},
+                ),
+                (
+                    "partial-alias-key",
+                    {"sourceAliasKey": "b" * 64, "processedAt": 0},
+                ),
+                ("legacy-oldest", {"processedAt": 1}),
+                ("legacy-kept", {"processedAt": 2}),
+            ],
+            changelog_rows=[],
+        )
+
+        with patch.object(main, "_fs", fake_fs), \
+             patch.object(main, "PROCESSED_MESSAGES_THRESHOLD", 1), \
+             patch.object(main, "SHEET_CHANGELOG_THRESHOLD", 1):
+            main.auto_cleanup_firestore("uid-1")
+
+        self.assertEqual(
+            ["processedMessages/legacy-oldest"],
+            fake_fs.deleted_paths,
+        )
+
+    def test_b1_authority_collections_are_never_accessed_or_deleted(self):
+        fake_fs = FakeFirestore()
+
+        with patch.object(main, "_fs", fake_fs), \
+             patch.object(main, "PROCESSED_MESSAGES_THRESHOLD", 2), \
+             patch.object(main, "SHEET_CHANGELOG_THRESHOLD", 2):
+            main.auto_cleanup_firestore("uid-1")
+
+        self.assertTrue(
+            set(FakeFirestore.B1_AUTHORITY_COLLECTIONS).isdisjoint(
+                fake_fs.accessed_collections
+            )
+        )
+        self.assertFalse(
+            any(
+                path.split("/", 1)[0]
+                in FakeFirestore.B1_AUTHORITY_COLLECTIONS
+                for path in fake_fs.deleted_paths
+            )
+        )
+
     def test_cleanup_timestamp_sort_handles_mixed_legacy_values(self):
         deleted_ids = []
+        deleted_paths = []
         docs = [
-            FakeDoc("missing-time", {}, deleted_ids),
-            FakeDoc("iso-time", {"timestamp": "2026-06-05T08:00:00Z"}, deleted_ids),
-            FakeDoc("datetime-time", {"timestamp": datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)}, deleted_ids),
-            FakeDoc("numeric-time", {"timestamp": 3}, deleted_ids),
+            FakeDoc("test", "missing-time", {}, deleted_ids, deleted_paths),
+            FakeDoc(
+                "test",
+                "iso-time",
+                {"timestamp": "2026-06-05T08:00:00Z"},
+                deleted_ids,
+                deleted_paths,
+            ),
+            FakeDoc(
+                "test",
+                "datetime-time",
+                {
+                    "timestamp": datetime(
+                        2026,
+                        6,
+                        5,
+                        9,
+                        0,
+                        tzinfo=timezone.utc,
+                    )
+                },
+                deleted_ids,
+                deleted_paths,
+            ),
+            FakeDoc(
+                "test",
+                "numeric-time",
+                {"timestamp": 3},
+                deleted_ids,
+                deleted_paths,
+            ),
         ]
 
         deleted = main._delete_oldest_excess_docs(FakeCollection(docs), 2, ["timestamp"])

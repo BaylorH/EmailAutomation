@@ -3,6 +3,7 @@ import json
 import atexit
 import base64
 import requests
+from dataclasses import dataclass
 from urllib.parse import quote
 from openpyxl import Workbook
 from msal import ConfidentialClientApplication, SerializableTokenCache
@@ -20,6 +21,13 @@ from datetime import datetime, timezone
 import openai
 from bs4 import BeautifulSoup
 from google.cloud.firestore_v1 import FieldFilter
+from email_automation.source_coordinator import (
+    CoordinatorMode,
+    SourceCoordinatorConfigError,
+    normalize_source_alias,
+    resolve_source_coordinator_mode,
+    source_alias_key,
+)
 
 # Config
 CLIENT_ID         = os.getenv("AZURE_API_APP_ID")
@@ -33,6 +41,18 @@ TOKEN_CACHE       = "msal_token_cache.bin"
 # OpenAI config
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_ASSISTANT_MODEL = os.getenv("OPENAI_ASSISTANT_MODEL", "gpt-5.2")
+
+
+@dataclass(frozen=True)
+class SchedulerCompatibilityDisposition:
+    mode: CoordinatorMode
+    operation: str
+    effect: str
+    processed: bool
+    alias_key: str | None = None
+
+    def __bool__(self):
+        return self.processed
 
 SUBJECT = "Weekly Questions"
 BODY = (
@@ -2558,8 +2578,8 @@ def _processed_ref(user_id: str, key: str):
     encoded_key = b64url_id(key)
     return _fs.collection("users").document(user_id).collection("processedMessages").document(encoded_key)
 
-def has_processed(user_id: str, key: str) -> bool:
-    """Check if a message has already been processed."""
+def _legacy_has_processed(user_id: str, key: str) -> bool:
+    """Pre-B1 scheduler-local read. Call only in disabled mode."""
     try:
         doc = _processed_ref(user_id, key).get()
         return doc.exists
@@ -2567,14 +2587,117 @@ def has_processed(user_id: str, key: str) -> bool:
         print(f"❌ Failed to check processed status for {key}: {e}")
         return False
 
-def mark_processed(user_id: str, key: str):
-    """Mark a message as processed."""
+
+def _legacy_mark_processed(user_id: str, key: str):
+    """Pre-B1 scheduler-local write. Call only in disabled mode."""
     try:
         _processed_ref(user_id, key).set({
             "processedAt": SERVER_TIMESTAMP
         }, merge=True)
     except Exception as e:
         print(f"❌ Failed to mark message as processed {key}: {e}")
+
+
+def _scheduler_shadow_marker_disposition(
+    *,
+    user_id: str,
+    key: str,
+    operation: str,
+    source_alias,
+):
+    alias_key = None
+    if source_alias is not None:
+        try:
+            canonical_alias = normalize_source_alias(
+                source_alias.alias_type,
+                source_alias.value,
+            )
+            supplied_alias = normalize_source_alias(source_alias.alias_type, key)
+            retained_key = source_alias.key
+        except AttributeError as exc:
+            raise SourceCoordinatorConfigError(
+                "scheduler shadow marker requires a typed source alias"
+            ) from exc
+        if supplied_alias != canonical_alias:
+            raise SourceCoordinatorConfigError(
+                "scheduler shadow marker conflicts with source alias"
+            )
+        alias_key = source_alias_key(user_id, canonical_alias)
+        if retained_key and retained_key != alias_key:
+            raise SourceCoordinatorConfigError(
+                "scheduler shadow alias key conflicts with proposal"
+            )
+    return SchedulerCompatibilityDisposition(
+        mode=CoordinatorMode.SHADOW,
+        operation=operation,
+        effect="shadow_no_effect",
+        processed=False,
+        alias_key=alias_key,
+    )
+
+
+def has_processed(
+    user_id: str,
+    key: str,
+    *,
+    settlement_context=None,
+    source_alias=None,
+):
+    """Keep scheduler legacy-local when disabled; delegate all B1 modes."""
+    mode = resolve_source_coordinator_mode(os.environ)
+    if mode is CoordinatorMode.DISABLED:
+        return _legacy_has_processed(user_id, key)
+    if mode is CoordinatorMode.SHADOW:
+        return _scheduler_shadow_marker_disposition(
+            user_id=user_id,
+            key=key,
+            operation="has_processed",
+            source_alias=source_alias,
+        )
+    if settlement_context is None:
+        raise SourceCoordinatorConfigError(
+            "enforced scheduler marker requires canonical settlement context"
+        )
+    from email_automation.messaging import has_processed as _compat_has_processed
+
+    return _compat_has_processed(
+        user_id,
+        key,
+        settlement_context=settlement_context,
+        source_alias=source_alias,
+    )
+
+
+def mark_processed(
+    user_id: str,
+    key: str,
+    *,
+    settlement_context=None,
+    source_alias=None,
+):
+    """Keep scheduler legacy-local when disabled; delegate all B1 modes."""
+    mode = resolve_source_coordinator_mode(os.environ)
+    if mode is CoordinatorMode.DISABLED:
+        return _legacy_mark_processed(user_id, key)
+    if mode is CoordinatorMode.SHADOW:
+        return _scheduler_shadow_marker_disposition(
+            user_id=user_id,
+            key=key,
+            operation="mark_processed",
+            source_alias=source_alias,
+        )
+    if settlement_context is None:
+        raise SourceCoordinatorConfigError(
+            "enforced scheduler marker requires canonical settlement context"
+        )
+    from email_automation.messaging import mark_processed as _compat_mark_processed
+
+    return _compat_mark_processed(
+        user_id,
+        key,
+        settlement_context=settlement_context,
+        source_alias=source_alias,
+    )
 
 def _sync_ref(user_id: str):
     """Get reference to sync document."""
@@ -2605,6 +2728,18 @@ def set_last_scan_iso(user_id: str, iso_str: str):
 
 def scan_inbox_against_index(user_id: str, headers: Dict[str, str], only_unread: bool = True, top: int = 50):
     """Idempotent scan of inbox for replies with early exit on processed messages."""
+    mode = resolve_source_coordinator_mode(os.environ)
+    if mode is CoordinatorMode.SHADOW:
+        return SchedulerCompatibilityDisposition(
+            mode=mode,
+            operation="scheduler_inbox_scan",
+            effect="shadow_no_effect",
+            processed=False,
+        )
+    if mode is CoordinatorMode.ENFORCED:
+        raise SourceCoordinatorConfigError(
+            "legacy scheduler scan is unavailable in enforced mode"
+        )
     base = "https://graph.microsoft.com/v1.0"
     
     # Calculate 5-hour cutoff
@@ -3440,6 +3575,19 @@ def process_replies(headers, user_id):
 # --- Main Loop ---
 def refresh_and_process_user(user_id: str):
     print(f"\n🔄 Processing user: {user_id}")
+
+    mode = resolve_source_coordinator_mode(os.environ)
+    if mode is CoordinatorMode.SHADOW:
+        return SchedulerCompatibilityDisposition(
+            mode=mode,
+            operation="scheduler_user_run",
+            effect="shadow_no_effect",
+            processed=False,
+        )
+    if mode is CoordinatorMode.ENFORCED:
+        raise SourceCoordinatorConfigError(
+            "legacy scheduler run is unavailable in enforced mode"
+        )
 
     download_token(FIREBASE_API_KEY, output_file=TOKEN_CACHE, user_id=user_id)
 
