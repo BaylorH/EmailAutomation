@@ -267,6 +267,7 @@ def normalize_contact_mailbox(mailbox):
     if type(mailbox) is not str:
         raise RowAuthorityConfigError("mailbox must be a string")
     normalized = unicodedata.normalize("NFC", mailbox).strip().lower()
+    normalized = unicodedata.normalize("NFC", normalized)
     encoded = _utf8_bytes(normalized, field_name="mailbox")
     if (
         not encoded

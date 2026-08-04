@@ -92,6 +92,7 @@ class BoundedRowAuthorityFakeTests(unittest.TestCase):
 import ast
 import hashlib
 import json
+import unicodedata
 from types import MappingProxyType
 from uuid import UUID
 
@@ -595,6 +596,26 @@ class ContactIdentityPrimitiveTests(unittest.TestCase):
         self.assertEqual("first.lást+tour+second@example.com", exact)
         self.assertEqual("first.lást@example.com", canonical)
 
+        exact, canonical = self.module.normalize_contact_mailbox(
+            "J\u030c+Tag@Example.COM"
+        )
+        self.assertEqual("ǰ+tag@example.com", exact)
+        self.assertEqual("ǰ@example.com", canonical)
+        self.assertTrue(unicodedata.is_normalized("NFC", exact))
+        self.assertTrue(unicodedata.is_normalized("NFC", canonical))
+        self.assertEqual(
+            (exact, canonical),
+            self.module.normalize_contact_mailbox(exact),
+        )
+        for normalized in (exact, canonical):
+            self.assertRegex(
+                self.module.contact_identity_hash(
+                    normalized,
+                    user_scope_hash="a" * 64,
+                ),
+                r"^[0-9a-f]{64}$",
+            )
+
     def test_normalization_preserves_dots_and_has_no_domain_specific_rules(self):
         exact, canonical = self.module.normalize_contact_mailbox(
             "First.Last+Tag@Example.com"
@@ -604,6 +625,14 @@ class ContactIdentityPrimitiveTests(unittest.TestCase):
         self.assertNotEqual("firstlast@example.com", canonical)
 
     def test_normalization_rejects_invalid_or_overbound_mailboxes(self):
+        exact_maximum = "a" * 308 + "@example.com"
+        overbound = "a" * 309 + "@example.com"
+        self.assertEqual(320, len(exact_maximum.encode("utf-8")))
+        self.assertEqual(321, len(overbound.encode("utf-8")))
+        self.assertEqual(
+            (exact_maximum, exact_maximum),
+            self.module.normalize_contact_mailbox(exact_maximum),
+        )
         invalid = (
             "",
             "plain-address",
@@ -614,7 +643,7 @@ class ContactIdentityPrimitiveTests(unittest.TestCase):
             "a\n@example.com",
             "a@exam\u0000ple.com",
             chr(0xD800) + "@example.com",
-            "a" * 310 + "@example.com",
+            overbound,
             None,
             1,
             True,
