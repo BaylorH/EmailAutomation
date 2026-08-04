@@ -3564,6 +3564,12 @@ class SourceCoordinatorLateAliasProcessingTests(unittest.TestCase):
                     fake,
                     uuid_factory=SequentialIds(),
                     now_factory=MutableClock(FROZEN_NOW),
+                    retained_terminal_authority_loader=lambda *_args, **_kwargs: {
+                        "kind": "ordinary",
+                        "saga": None,
+                        "settlement": None,
+                        "exactSourceConfirmed": False,
+                    },
                 )
                 first_message = self.message(
                     graph_id=graph_id,
@@ -3734,6 +3740,12 @@ class SourceCoordinatorLateAliasProcessingTests(unittest.TestCase):
             fake,
             uuid_factory=SequentialIds(),
             now_factory=MutableClock(FROZEN_NOW),
+            retained_terminal_authority_loader=lambda *_args, **_kwargs: {
+                "kind": "ordinary",
+                "saga": None,
+                "settlement": None,
+                "exactSourceConfirmed": False,
+            },
         )
         first_message = self.message(
             graph_id=graph_id,
@@ -3891,6 +3903,235 @@ class SourceCoordinatorLateAliasProcessingTests(unittest.TestCase):
         self.assertEqual(first, repaired)
 
 
+class SourceCoordinatorScannerLegacyBridgeTests(unittest.TestCase):
+    def setUp(self):
+        self.mode = mock.patch.dict(
+            os.environ,
+            {MODE_ENV: "enforced"},
+            clear=False,
+        )
+        self.mode.start()
+        self.addCleanup(self.mode.stop)
+
+    def run_bridge_case(self, *, retained_kind="ordinary", marker_payload=None):
+        fake = FakeFirestore()
+        user_id = "user-scanner-legacy-bridge"
+        thread_id = "thread-scanner-legacy-bridge"
+        client_id = "client-scanner-legacy-bridge"
+        graph_id = "graph-scanner-legacy-bridge"
+        internet_id = "<scanner-legacy-bridge@example.test>"
+        fake.data[f"users/{user_id}/threads/{thread_id}"] = {
+            "clientId": client_id,
+            "status": processing.THREAD_STATUS["active"],
+        }
+        if marker_payload is not None:
+            fake.data[
+                "users/"
+                f"{user_id}/processedMessages/{processing.b64url_id(graph_id)}"
+            ] = deepcopy(marker_payload)
+
+        def retained_loader(*_args, **_kwargs):
+            if retained_kind == "ordinary":
+                return {
+                    "kind": "ordinary",
+                    "saga": None,
+                    "settlement": None,
+                    "exactSourceConfirmed": False,
+                }
+            return {
+                "kind": retained_kind,
+                "saga": {
+                    "clientId": client_id,
+                    "sourceMessageKey": internet_id,
+                    "sourceGraphMessageId": graph_id,
+                    "sourceInternetMessageId": internet_id,
+                    "sagaKey": "scanner-legacy-bridge-saga",
+                    "immutableHash": "c" * 64,
+                    "phase": "classified",
+                },
+                "settlement": None,
+                "exactSourceConfirmed": True,
+            }
+
+        coordinator = source_coordinator.SourceCoordinator(
+            fake,
+            uuid_factory=SequentialIds(),
+            now_factory=MutableClock(FROZEN_NOW),
+            retained_terminal_authority_loader=retained_loader,
+        )
+        message = {
+            "id": graph_id,
+            "internetMessageId": internet_id,
+            "conversationId": "conversation-scanner-legacy-bridge",
+            "subject": "Retained source",
+            "from": {
+                "emailAddress": {
+                    "address": "sender@example.test",
+                    "name": "Sender",
+                }
+            },
+            "receivedDateTime": "2026-08-03T12:00:00Z",
+            "sentDateTime": "2026-08-03T12:00:00Z",
+            "bodyPreview": "Retained source body",
+            "hasAttachments": False,
+            "internetMessageHeaders": [
+                {
+                    "name": "In-Reply-To",
+                    "value": "<tracked-root@example.test>",
+                }
+            ],
+        }
+        full_message = mock.Mock()
+        full_message.json.return_value = {
+            "body": {
+                "contentType": "Text",
+                "content": "Retained source body",
+            },
+            "hasAttachments": False,
+        }
+        me_response = mock.Mock(status_code=200)
+        me_response.json.return_value = {"mail": "owner@example.test"}
+
+        with mock.patch.object(
+            processing,
+            "_fs",
+            fake,
+        ), mock.patch.object(
+            processing,
+            "SourceCoordinator",
+            return_value=coordinator,
+        ), mock.patch.object(
+            processing,
+            "exponential_backoff_request",
+            return_value=full_message,
+        ), mock.patch.object(
+            processing.requests,
+            "get",
+            return_value=me_response,
+        ), mock.patch.object(
+            processing.requests,
+            "post",
+        ) as post, mock.patch.object(
+            processing.requests,
+            "patch",
+        ) as patch_request, mock.patch.object(
+            processing.requests,
+            "put",
+        ) as put, mock.patch.object(
+            processing.requests,
+            "delete",
+        ) as delete, mock.patch.object(
+            processing,
+            "lookup_thread_by_message_id",
+            return_value=thread_id,
+        ), mock.patch.object(
+            processing,
+            "lookup_thread_by_conversation_id",
+            return_value=None,
+        ), mock.patch.object(
+            processing,
+            "_classify_source_proposal",
+            return_value=(
+                {
+                    "schemaVersion": 1,
+                    "transitionCandidates": [
+                        {
+                            "type": "needs_user_input",
+                            "reason": "legacy_bridge_test",
+                        }
+                    ],
+                    "ordinaryObligations": [],
+                },
+                {
+                    "schemaVersion": 1,
+                    "evidenceKind": "model_capture",
+                    "responseHash": "e" * 64,
+                },
+            ),
+        ) as classifier, mock.patch.object(
+            processing,
+            "_consume_source_authority",
+        ) as downstream, mock.patch.object(
+            processing,
+            "_source_authority_consumer_available",
+            return_value=False,
+        ):
+            result = processing.process_inbox_message(
+                user_id,
+                {"Authorization": "Bearer local-test"},
+                message,
+            )
+
+        classifier.assert_not_called()
+        downstream.assert_not_called()
+        post.assert_not_called()
+        patch_request.assert_not_called()
+        put.assert_not_called()
+        delete.assert_not_called()
+        self.assertEqual(thread_id, result.thread_id)
+        self.assertEqual(
+            processing._source_alias_keys_for_message(user_id, message),
+            result.source_alias_keys,
+        )
+        self.assertFalse(
+            any(
+                collection in path
+                for path in fake.data
+                for collection in (
+                    "/sourceTransitionOwners/",
+                    "/sourceWorkLedgers/",
+                    "/inboundPendingAdmissions/",
+                    "/sourceSettlements/",
+                )
+            )
+        )
+        return fake, result
+
+    def test_normal_enforced_path_quarantines_retained_terminal_before_classifier(self):
+        fake, result = self.run_bridge_case(retained_kind="active")
+
+        self.assertEqual("legacy_terminal_authority_retained", result.state)
+        classifications = [
+            data
+            for path, data in fake.data.items()
+            if "/sourceClassifications/" in path
+        ]
+        self.assertEqual(1, len(classifications))
+        self.assertEqual(
+            "legacy_terminal_quarantined",
+            classifications[0]["classificationState"],
+        )
+
+    def test_normal_enforced_path_blocks_legacy_markers_before_classifier(self):
+        cases = (
+            (
+                "legacy_marker_only_ambiguous",
+                {"processedAt": FROZEN_NOW},
+            ),
+            (
+                "legacy_replay_claim_quarantined",
+                {
+                    "status": "operator_replay_in_progress",
+                    "replayAttemptId": "scanner-legacy-replay-attempt",
+                    "claimedAt": FROZEN_NOW,
+                },
+            ),
+        )
+        for expected_state, marker_payload in cases:
+            with self.subTest(expected_state=expected_state):
+                fake, result = self.run_bridge_case(
+                    marker_payload=marker_payload,
+                )
+
+                self.assertEqual(expected_state, result.state)
+                self.assertFalse(
+                    any(
+                        "/sourceClassifications/" in path
+                        for path in fake.data
+                    )
+                )
+
+
 class SourceCoordinatorAuthorityOrderTests(unittest.TestCase):
     def setUp(self):
         self.mode = mock.patch.dict(
@@ -4034,6 +4275,12 @@ class SourceCoordinatorAuthorityOrderTests(unittest.TestCase):
             uuid_factory=SequentialIds(),
             now_factory=MutableClock(FROZEN_NOW),
             hard_optout_verifier=verifier,
+            retained_terminal_authority_loader=lambda *_args, **_kwargs: {
+                "kind": "ordinary",
+                "saga": None,
+                "settlement": None,
+                "exactSourceConfirmed": False,
+            },
         )
         complete_proposal = {
             "schemaVersion": 1,

@@ -178,6 +178,28 @@ class SourceCoordinatorContractTests(unittest.TestCase):
         )
         self.assertEqual(0, malformed.equality_calls)
 
+    def test_invalid_mode_emits_safe_config_error_without_rendering_value(self):
+        coordinator = self.coordinator
+        with mock.patch("builtins.print") as emit:
+            self.assertIs(
+                coordinator.CoordinatorMode.DISABLED,
+                coordinator.resolve_source_coordinator_mode(
+                    {
+                        "SITESIFT_SOURCE_COORDINATOR_MODE": (
+                            "private-invalid-mode-value"
+                        )
+                    }
+                ),
+            )
+
+        emit.assert_called_once_with(
+            "⚠️ Invalid SITESIFT_SOURCE_COORDINATOR_MODE; using disabled"
+        )
+        self.assertNotIn(
+            "private-invalid-mode-value",
+            emit.call_args.args[0],
+        )
+
     def test_source_alias_is_frozen_and_limit_is_exact(self):
         coordinator = self.coordinator
         alias = coordinator.SourceAlias("graph", "opaque")
@@ -2795,10 +2817,12 @@ class RetainedTerminalAuthorityTests(unittest.TestCase):
         started = deepcopy(self.fake.data[self.classification_path])
         self.fake.events.clear()
 
-        self.assertErrorCode(
-            "legacy_terminal_authority_conflict",
-            self.quarantine,
-        )
+        disposition = self.quarantine()
+
+        self.assertEqual("migrated_b1", disposition.state)
+        self.assertIsNone(disposition.terminal_kind)
+        self.assertIsNone(disposition.evidence_hash)
+        self.assertFalse(disposition.created)
         self.assertEqual(started, self.fake.data[self.classification_path])
         self.assertEqual([], self.loader_calls)
         self.assertEqual([], self.write_events())
@@ -2859,6 +2883,36 @@ class RetainedTerminalAuthorityTests(unittest.TestCase):
                 if event[0] in {"create", "set", "update", "delete"}
             ],
         )
+
+    def test_ambiguous_b1_request_bypasses_legacy_terminal_loader(self):
+        classifier_calls = 0
+
+        def fail_after_request_start():
+            nonlocal classifier_calls
+            classifier_calls += 1
+            raise RuntimeError("simulated ambiguous model request")
+
+        self.assertErrorCode(
+            "classification_request_ambiguous",
+            lambda: self.coordinator.classify_source_once(
+                user_id="user-1",
+                canonical_source_id=self.source_id,
+                lease_seconds=60,
+                classification_input=CLASSIFICATION_INPUT,
+                classifier=fail_after_request_start,
+            ),
+        )
+        ambiguous = deepcopy(self.fake.data[self.classification_path])
+        self.fake.events.clear()
+
+        disposition = self.quarantine()
+
+        self.assertEqual(1, classifier_calls)
+        self.assertEqual("migrated_b1", disposition.state)
+        self.assertFalse(disposition.created)
+        self.assertEqual(ambiguous, self.fake.data[self.classification_path])
+        self.assertEqual([], self.loader_calls)
+        self.assertEqual([], self.write_events())
 
     def test_ordinary_loader_does_not_block_or_mutate_an_existing_claim(self):
         claim = self.coordinator.claim_source_classification(

@@ -13260,6 +13260,40 @@ def process_inbox_message(
                 merged_msg,
             ),
         }
+        retained = coordinator.quarantine_retained_terminal_authority(
+            user_id=user_id,
+            canonical_source_id=identity.canonical_source_id,
+            thread_id=thread_id,
+            graph_message_id=msg_id,
+            internet_message_id=internet_message_id,
+        )
+        if retained.canonical_source_id != identity.canonical_source_id:
+            raise SourceCoordinatorAmbiguous(
+                "retained terminal authority changed canonical source"
+            )
+        if retained.state == "legacy_terminal_authority_retained":
+            return SourceProcessingDisposition(
+                mode=source_mode,
+                state=retained.state,
+                **disposition_binding,
+            )
+        if retained.state == "no_retained_terminal_authority":
+            marker_disposition = _strict_legacy_source_marker_disposition(
+                user_id,
+                thread_id,
+                graph_message_id=msg_id,
+                internet_message_id=internet_message_id,
+            )
+            if marker_disposition != "none":
+                return SourceProcessingDisposition(
+                    mode=source_mode,
+                    state=marker_disposition,
+                    **disposition_binding,
+                )
+        elif retained.state != "migrated_b1":
+            raise SourceCoordinatorAmbiguous(
+                "retained terminal authority returned an unknown state"
+            )
         if existing_canonical_source_id is None:
             saved_history_binding, index_binding = (
                 _persist_strict_source_history_and_index(

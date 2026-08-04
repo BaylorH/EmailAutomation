@@ -861,13 +861,16 @@ class _DeferredClassificationError:
 
 
 def resolve_source_coordinator_mode(environ: Mapping[str, str]) -> CoordinatorMode:
-    value = environ.get(SOURCE_COORDINATOR_MODE_ENV)
-    if type(value) is not str:
+    if SOURCE_COORDINATOR_MODE_ENV not in environ:
         return CoordinatorMode.DISABLED
-    if value == CoordinatorMode.SHADOW.value:
+    value = environ.get(SOURCE_COORDINATOR_MODE_ENV)
+    if type(value) is str and value == CoordinatorMode.SHADOW.value:
         return CoordinatorMode.SHADOW
-    if value == CoordinatorMode.ENFORCED.value:
+    if type(value) is str and value == CoordinatorMode.ENFORCED.value:
         return CoordinatorMode.ENFORCED
+    if type(value) is str and value == CoordinatorMode.DISABLED.value:
+        return CoordinatorMode.DISABLED
+    print("⚠️ Invalid SITESIFT_SOURCE_COORDINATOR_MODE; using disabled")
     return CoordinatorMode.DISABLED
 
 
@@ -5824,6 +5827,32 @@ class SourceCoordinator:
                 )
                 state = before["classificationState"]
                 if state == "snapshot_ready":
+                    return _AuthorityCreatePlan(
+                        result=disposition(
+                            state="migrated_b1",
+                            terminal_kind=None,
+                            evidence_hash=None,
+                            created=False,
+                        ),
+                        prerequisites=(
+                            (identity_ref, deepcopy(identity_data)),
+                            *(
+                                (reference, deepcopy(data))
+                                for reference, data in (
+                                    alias_prerequisites[key]
+                                    for key in sorted(alias_prerequisites)
+                                )
+                            ),
+                        ),
+                        target_ref=classification_ref,
+                        before_data=before,
+                        expected_data=before,
+                        ambiguous_error_type=RetainedTerminalAuthorityConflict,
+                    )
+                if state in {
+                    "request_started",
+                    "classification_request_ambiguous",
+                }:
                     return _AuthorityCreatePlan(
                         result=disposition(
                             state="migrated_b1",
