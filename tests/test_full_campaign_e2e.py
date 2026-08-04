@@ -163,6 +163,26 @@ def _matches(op, cell, value):
     raise NotImplementedError(f"fake firestore where op {op!r} not supported")
 
 
+_WHERE_MISSING = object()
+
+
+def _where_parts(
+    field=_WHERE_MISSING,
+    op=_WHERE_MISSING,
+    value=_WHERE_MISSING,
+    *,
+    filter=None,
+):
+    """Normalize legacy positional and production FieldFilter query forms."""
+    if filter is not None:
+        if any(part is not _WHERE_MISSING for part in (field, op, value)):
+            raise TypeError("where() cannot combine positional fields with filter=")
+        return filter.field_path, filter.op_string, filter.value
+    if any(part is _WHERE_MISSING for part in (field, op, value)):
+        raise TypeError("where() requires field, op, and value")
+    return field, op, value
+
+
 class _Query:
     def __init__(self, collection_node, filters=None, order=None, limit=None):
         self._node = collection_node
@@ -170,7 +190,15 @@ class _Query:
         self._order = order
         self._limit = limit
 
-    def where(self, field, op, value):
+    def where(
+        self,
+        field=_WHERE_MISSING,
+        op=_WHERE_MISSING,
+        value=_WHERE_MISSING,
+        *,
+        filter=None,
+    ):
+        field, op, value = _where_parts(field, op, value, filter=filter)
         return _Query(self._node, self._filters + [(field, op, value)], self._order, self._limit)
 
     def order_by(self, field, **kwargs):
@@ -212,8 +240,15 @@ class _Collection:
         ref.set(data)
         return (None, ref)
 
-    def where(self, field, op, value):
-        return _Query(self._node).where(field, op, value)
+    def where(
+        self,
+        field=_WHERE_MISSING,
+        op=_WHERE_MISSING,
+        value=_WHERE_MISSING,
+        *,
+        filter=None,
+    ):
+        return _Query(self._node).where(field, op, value, filter=filter)
 
     def order_by(self, field, **kwargs):
         return _Query(self._node).order_by(field)
@@ -535,6 +570,15 @@ def patched(world):
     stack.enter_context(mock.patch.object(followup_mod, "time", _NoSleep()))
     stack.enter_context(mock.patch.object(
         sheet_operations, "_apply_gross_rent_formula_for_row", lambda *a, **k: False))
+    # The host/CI process stays globally paused. Enter live mode only after every
+    # provider boundary is faked so LIFO teardown restores paused mode first.
+    stack.enter_context(
+        mock.patch.dict(
+            os.environ,
+            {"SITESIFT_OUTBOUND_MODE": "live"},
+            clear=False,
+        )
+    )
     try:
         yield
     finally:
@@ -696,8 +740,10 @@ def stage7_sheet(world, proposal):
 
 def stage8_followup(world):
     """FOLLOWUP: the REAL check_and_send_followups gate must NOT send a follow-up
-    on a thread the broker already replied to.  Positive/negative controls on the
-    REAL _followup_terminal_block_reason prove the gate discriminates."""
+    on a thread the broker already replied to. The gate leaves the waiting status
+    unclaimed and preserves hasInboundReply as the authoritative send block.
+    Positive/negative controls on the REAL _followup_terminal_block_reason prove
+    the gate discriminates."""
     thread_ref = world.fs.collection("users").document(USER_ID).collection("threads").document(world.thread_root)
     thread_ref.set({
         "clientId": CLIENT_ID,
@@ -711,12 +757,13 @@ def stage8_followup(world):
         },
     }, merge=True)
     # Neutralize only the business-hours scheduler (a calendar helper, NOT a safety
-    # gate) so the run deterministically reaches the REAL broker-reply pause branch
-    # instead of a weekend deferral. The reply-withhold logic itself stays real.
+    # gate) so the run deterministically reaches the REAL broker-reply withhold
+    # branch instead of a weekend deferral. The reply-withhold logic itself stays
+    # real.
     with mock.patch.object(followup_mod, "_next_business_followup_time", lambda now, cfg: now):
         sent = followup_mod.check_and_send_followups(USER_ID, {"Authorization": "Bearer fake"})
-    paused = thread_ref.get().to_dict().get("followUpStatus")
-    return sent, paused
+    thread_state = thread_ref.get().to_dict()
+    return sent, thread_state.get("followUpStatus"), thread_state.get("hasInboundReply")
 
 
 def stage9_completion(world):
@@ -837,12 +884,14 @@ class FullCampaignE2ETests(unittest.TestCase):
     def test_stage8_followup_withholds_after_broker_reply(self):
         world = World()
         with patched(world):
-            sent, paused = _drive_through(world, 8)["followup"]
+            sent, followup_status, has_inbound_reply = _drive_through(world, 8)["followup"]
         # #20: check_and_send_followups now returns a Graph op-state list; a
         # withheld follow-up sends nothing, so the list is empty (no error state).
         self.assertEqual([], sent)
-        # proves the WITHHOLD happened via the real broker-reply pause branch
-        self.assertEqual("paused", paused)
+        # The inbound-reply safety gate does not claim or rewrite the follow-up;
+        # it preserves both the waiting status and the authoritative reply block.
+        self.assertEqual("waiting", followup_status)
+        self.assertTrue(has_inbound_reply)
         # gate discriminates: terminal blocks, active-due does not
         active_due = {"enabled": True, "currentFollowUpIndex": 0,
                       "followUps": [{"waitTime": 3, "waitUnit": "days"}]}
@@ -899,8 +948,8 @@ class FullCampaignE2ETests(unittest.TestCase):
             self.assertEqual(f"{PROPERTY_ADDRESS}, {CITY}", sheet_result["targetAnchor"])
             self.assertTrue(all(a["range"].endswith("3") for a in sheet_result["applied"]))
             # follow-up gate withheld after reply (#20 op-state list empty -> no
-            # send, thread paused by the real broker-reply gate)
-            self.assertEqual(([], "paused"), out["followup"])
+            # send) without claiming or rewriting the still-reply-blocked thread.
+            self.assertEqual(([], "waiting", True), out["followup"])
             # completion: terminal, no further sends, no stuck/hidden-failed item
             sends_before, sends_after, status, health = out["completion"]
             self.assertEqual(sends_before, sends_after)
