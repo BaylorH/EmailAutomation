@@ -231,6 +231,11 @@ B2_B3_FORBIDDEN_OWNERSHIP_LITERALS = frozenset(
         "providerIntent",
     }
 )
+B2_B3_OWNERSHIP_LITERAL_ALLOWLIST = {
+    "email_automation/row_authority.py": frozenset(
+        {"rowBindings", "stableRowOwner"}
+    ),
+}
 DRAFT_DELETE_MANIFEST_PATH = REPO_ROOT / "tests/fixtures/graph_draft_delete_callers.json"
 DRAFT_DELETE_HELPER_NAME = "_delete_graph_reply_draft"
 DRAFT_DELETE_EMAIL_MODULE = "email_automation.email"
@@ -2690,11 +2695,18 @@ class InventoryContractTests(unittest.TestCase):
             )
         self.assertEqual([], violations)
 
-    def test_b2_b3_ownership_literals_are_absent_from_runtime(self):
-        self.assertEqual(
-            Counter(),
-            self.static_closure_inventory.forbidden_ownership_literals,
+    def test_b2_b3_ownership_literals_are_bounded_to_reviewed_b2_files(self):
+        violations = Counter(
+            {
+                (path, literal): count
+                for (path, literal), count in (
+                    self.static_closure_inventory.forbidden_ownership_literals.items()
+                )
+                if literal
+                not in B2_B3_OWNERSHIP_LITERAL_ALLOWLIST.get(path, frozenset())
+            }
         )
+        self.assertEqual(Counter(), violations)
 
     def test_source_admission_private_type_and_call_sites_are_bounded(self):
         self.assertEqual([], _discover_source_admission_contract_violations())

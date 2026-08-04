@@ -102,7 +102,7 @@ Task 0 starts only after every command above succeeds.
 - Create: `tests/test_row_authority_contracts.py`
 - Modify: `tests/test_source_coordinator_inventory.py`
 
-- [ ] **Step 1: Replace the global literal expectation with the exact allowlist test**
+- [x] **Step 1: Replace the global literal expectation with the exact allowlist test**
 
 Add this constant immediately after
 `B2_B3_FORBIDDEN_OWNERSHIP_LITERALS`:
@@ -138,7 +138,7 @@ This replacement keeps `executionEpoch`, `executionClaimId`, and
 allowlist. It permits only `rowBindings` and `stableRowOwner`, only in the pure
 B2 authority module.
 
-- [ ] **Step 2: Create the complete failing bounded-fake test file**
+- [x] **Step 2: Create the complete failing bounded-fake test file**
 
 Create `tests/test_row_authority_contracts.py` with exactly:
 
@@ -206,7 +206,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 3: Run the exact RED**
+- [x] **Step 3: Run the exact RED**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -218,7 +218,7 @@ Expected: the inventory suite passes and exactly three bounded-fake tests fail
 with `row authority fakes module is missing`. A `ModuleNotFoundError` or B1 test
 failure is an invalid RED.
 
-- [ ] **Step 4: Create the complete B2-only bounded fake**
+- [x] **Step 4: Create the complete B2-only bounded fake**
 
 Create `tests/row_authority_fakes.py` with exactly:
 
@@ -267,7 +267,7 @@ class BoundedFakeFirestore(FakeFirestore):
 
 Do not modify `tests/source_coordinator_fakes.py`.
 
-- [ ] **Step 5: Run GREEN and retained B1 fake regressions**
+- [x] **Step 5: Run GREEN and retained B1 fake regressions**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -280,7 +280,7 @@ git diff --check
 
 Expected: every test passes and `git diff --check` has no output.
 
-- [ ] **Step 6: Commit Task 0**
+- [x] **Step 6: Commit Task 0**
 
 Mark Task 0 checkboxes complete, then run:
 
