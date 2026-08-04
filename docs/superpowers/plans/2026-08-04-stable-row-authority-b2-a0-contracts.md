@@ -1052,7 +1052,7 @@ git commit -m "feat: add canonical row authority primitives"
 - Modify: `tests/test_row_authority_contracts.py`
 - Modify: `.github/workflows/production-clearance-ci.yml`
 
-- [ ] **Step 1: Append the complete failing mailbox test class**
+- [x] **Step 1: Append the complete failing mailbox test class**
 
 Before the test file's final `if __name__ == "__main__":` block, add exactly:
 
@@ -1170,17 +1170,17 @@ class ContactIdentityPrimitiveTests(unittest.TestCase):
 Move the final `if __name__ == "__main__": unittest.main()` block after this
 class.
 
-- [ ] **Step 2: Run the exact RED**
+- [x] **Step 2: Run the exact RED**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
   tests.test_row_authority_contracts.ContactIdentityPrimitiveTests -v
 ```
 
-Expected: seven errors naming missing
+Expected: seven failing methods (22 subtest errors) naming missing
 `normalize_contact_mailbox`/`contact_identity_hash`. No unrelated test may fail.
 
-- [ ] **Step 3: Append the complete mailbox implementation**
+- [x] **Step 3: Append the complete mailbox implementation**
 
 Add these constants after `MAX_OPAQUE_BYTES`:
 
@@ -1236,7 +1236,7 @@ def contact_identity_hash(normalized_mailbox, *, user_scope_hash):
     )
 ```
 
-- [ ] **Step 4: Run mailbox GREEN and complete focused regression**
+- [x] **Step 4: Run mailbox GREEN and complete focused regression**
 
 ```bash
 ../codex-release-a-medium-recovery-20260714/.venv/bin/python -m unittest \
@@ -1253,7 +1253,7 @@ git diff --check
 
 Expected: every test passes, compilation exits 0, and diff check has no output.
 
-- [ ] **Step 5: Add permanent B2 test discovery to GitHub Actions**
+- [x] **Step 5: Add permanent B2 test discovery to GitHub Actions**
 
 Insert this exact step after `Run complete B1 focused suite` in
 `.github/workflows/production-clearance-ci.yml`:
@@ -1277,7 +1277,7 @@ ruby -e 'require "yaml"; YAML.load_file(".github/workflows/production-clearance-
 
 Expected: YAML prints `ok` and every B2 test passes.
 
-- [ ] **Step 6: Commit Task 2**
+- [x] **Step 6: Commit Task 2**
 
 Mark Task 2 checkboxes complete, then run:
 

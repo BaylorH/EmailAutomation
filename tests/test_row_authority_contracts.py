@@ -583,5 +583,115 @@ class CanonicalRowAuthorityPrimitiveTests(unittest.TestCase):
         )
 
 
+class ContactIdentityPrimitiveTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = importlib.import_module("email_automation.row_authority")
+
+    def test_normalization_nfc_trims_lowers_and_strips_only_first_plus_suffix(self):
+        exact, canonical = self.module.normalize_contact_mailbox(
+            "  First.La\u0301st+Tour+Second@Example.COM  "
+        )
+        self.assertEqual("first.lást+tour+second@example.com", exact)
+        self.assertEqual("first.lást@example.com", canonical)
+
+    def test_normalization_preserves_dots_and_has_no_domain_specific_rules(self):
+        exact, canonical = self.module.normalize_contact_mailbox(
+            "First.Last+Tag@Example.com"
+        )
+        self.assertEqual("first.last+tag@example.com", exact)
+        self.assertEqual("first.last@example.com", canonical)
+        self.assertNotEqual("firstlast@example.com", canonical)
+
+    def test_normalization_rejects_invalid_or_overbound_mailboxes(self):
+        invalid = (
+            "",
+            "plain-address",
+            "a@@example.com",
+            "@example.com",
+            "+tag@example.com",
+            "a@",
+            "a\n@example.com",
+            "a@exam\u0000ple.com",
+            chr(0xD800) + "@example.com",
+            "a" * 310 + "@example.com",
+            None,
+            1,
+            True,
+        )
+        for value in invalid:
+            with self.subTest(value=repr(value)), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module.normalize_contact_mailbox(value)
+
+    def test_contact_identity_hash_has_frozen_prefixed_digest(self):
+        actual = self.module.contact_identity_hash(
+            "first.last@example.com",
+            user_scope_hash="a" * 64,
+        )
+        self.assertEqual(
+            "0929de5bfcbb44acae6c72bcafbd62c0587ee42c12aab305883a723b5639515c",
+            actual,
+        )
+
+    def test_plus_variants_have_distinct_exact_hashes_and_one_canonical_hash(self):
+        first_exact, first_canonical = self.module.normalize_contact_mailbox(
+            "first.last+one@example.com"
+        )
+        second_exact, second_canonical = self.module.normalize_contact_mailbox(
+            "first.last+two@example.com"
+        )
+        self.assertEqual(first_canonical, second_canonical)
+        self.assertNotEqual(
+            self.module.contact_identity_hash(
+                first_exact,
+                user_scope_hash="a" * 64,
+            ),
+            self.module.contact_identity_hash(
+                second_exact,
+                user_scope_hash="a" * 64,
+            ),
+        )
+        self.assertEqual(
+            self.module.contact_identity_hash(
+                first_canonical,
+                user_scope_hash="a" * 64,
+            ),
+            self.module.contact_identity_hash(
+                second_canonical,
+                user_scope_hash="a" * 64,
+            ),
+        )
+
+    def test_contact_hash_rejects_untrimmed_mixed_case_and_non_nfc_input(self):
+        invalid = (
+            " first.last@example.com",
+            "First.Last@example.com",
+            "first.la\u0301st@example.com",
+            None,
+        )
+        for value in invalid:
+            with self.subTest(value=repr(value)), self.assertRaises(
+                self.module.RowAuthorityConfigError
+            ):
+                self.module.contact_identity_hash(
+                    value,
+                    user_scope_hash="a" * 64,
+                )
+
+    def test_contact_hash_output_contains_no_mailbox_material(self):
+        value = "private.mailbox+tag@example.com"
+        exact, canonical = self.module.normalize_contact_mailbox(value)
+        for normalized in (exact, canonical):
+            digest = self.module.contact_identity_hash(
+                normalized,
+                user_scope_hash="a" * 64,
+            )
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+            self.assertNotIn("private", digest)
+            self.assertNotIn("example", digest)
+
+
 if __name__ == "__main__":
     unittest.main()

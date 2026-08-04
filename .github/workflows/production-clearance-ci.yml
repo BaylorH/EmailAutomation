@@ -78,6 +78,13 @@ jobs:
           tests.test_system_health
           -v
 
+      - name: Run complete B2 focused suite
+        run: >-
+          python -m unittest discover
+          -s tests
+          -p 'test_row_authority*.py'
+          -v
+
       - name: Run retained M2 changed-surface suite
         # These send expectations require live semantics, but every provider
         # boundary is faked and provider egress remains blackholed.

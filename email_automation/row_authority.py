@@ -13,6 +13,8 @@ SCHEMA_VERSION = 1
 MAX_ROW_BINDINGS = 128
 MAX_ROW_AUTHORITY_PLANNED_WRITES = 400
 MAX_OPAQUE_BYTES = 512
+MAX_MAILBOX_BYTES = 320
+CONTACT_NORMALIZATION_VERSION = "sitesift-mailbox-v1"
 MAX_JSON_SAFE_INTEGER = 9007199254740991
 MAX_CANONICAL_JSON_DEPTH = 64
 MAX_CANONICAL_JSON_NODES = 4096
@@ -259,3 +261,47 @@ def new_row_id(*, uuid_factory=uuid4):
             "row ID factory must return an RFC4122 UUIDv4"
         )
     return validate_row_id(f"sr1_{value.hex}")
+
+
+def normalize_contact_mailbox(mailbox):
+    if type(mailbox) is not str:
+        raise RowAuthorityConfigError("mailbox must be a string")
+    normalized = unicodedata.normalize("NFC", mailbox).strip().lower()
+    encoded = _utf8_bytes(normalized, field_name="mailbox")
+    if (
+        not encoded
+        or len(encoded) > MAX_MAILBOX_BYTES
+        or _contains_control(normalized)
+        or normalized.count("@") != 1
+    ):
+        raise RowAuthorityConfigError(
+            "mailbox must be bounded, control-free, and contain one @"
+        )
+    local_part, domain = normalized.split("@", 1)
+    if not local_part or not domain:
+        raise RowAuthorityConfigError(
+            "mailbox local part and domain must be nonempty"
+        )
+    canonical_local = local_part.split("+", 1)[0]
+    if not canonical_local:
+        raise RowAuthorityConfigError(
+            "mailbox canonical local part must be nonempty"
+        )
+    return normalized, f"{canonical_local}@{domain}"
+
+
+def contact_identity_hash(normalized_mailbox, *, user_scope_hash):
+    exact, _canonical = normalize_contact_mailbox(normalized_mailbox)
+    if exact != normalized_mailbox:
+        raise RowAuthorityConfigError(
+            "contact identity hash requires a normalized mailbox"
+        )
+    payload = {
+        "normalizationVersion": CONTACT_NORMALIZATION_VERSION,
+        "normalizedMailboxIdentity": normalized_mailbox,
+    }
+    return domain_hash(
+        "sitesift.contact.identity.v1",
+        payload,
+        user_scope_hash=user_scope_hash,
+    )
