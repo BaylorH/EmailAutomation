@@ -256,6 +256,11 @@ class CanonicalRowAuthorityPrimitiveTests(unittest.TestCase):
 
     def test_canonical_json_rejects_unsupported_unsafe_and_cyclic_values(self):
         module = self._require_module()
+        shared = [1]
+        self.assertEqual(
+            b'{"left":[1],"right":[1]}',
+            module.canonical_json_bytes({"left": shared, "right": shared}),
+        )
         cyclic = []
         cyclic.append(cyclic)
         invalid_values = (
