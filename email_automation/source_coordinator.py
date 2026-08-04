@@ -303,6 +303,7 @@ _SOURCE_SETTLEMENT_FIELDS = {
     "ownerDecisionHash",
     "ledgerHash",
     "finalLedgerEvidenceHash",
+    "threadHeadBinding",
     "aliases",
     "aliasSetHash",
     "settlementRevision",
@@ -1878,6 +1879,7 @@ def _source_settlement_hash_material(
                 "ownerDecisionHash",
                 "ledgerHash",
                 "finalLedgerEvidenceHash",
+                "threadHeadBinding",
                 "aliases",
                 "aliasSetHash",
                 "settlementRevision",
@@ -1893,6 +1895,7 @@ def _source_settlement_immutable_material(
     classification_data: Mapping[str, Any],
     owner_data: Mapping[str, Any],
     ledger_data: Mapping[str, Any],
+    thread_head_binding: Mapping[str, Any] | None,
     aliases: Sequence[Mapping[str, str]],
 ) -> dict[str, Any]:
     alias_list = [deepcopy(dict(alias)) for alias in aliases]
@@ -1905,6 +1908,11 @@ def _source_settlement_immutable_material(
         "ownerDecisionHash": owner_data["ownerDecisionHash"],
         "ledgerHash": ledger_data["ledgerHash"],
         "finalLedgerEvidenceHash": _final_ledger_evidence_hash(ledger_data),
+        "threadHeadBinding": (
+            None
+            if thread_head_binding is None
+            else deepcopy(dict(thread_head_binding))
+        ),
         "aliases": alias_list,
         "aliasSetHash": canonical_json_hash(
             {
@@ -1974,6 +1982,48 @@ def _validate_source_settlement_document(
         raise SourceSettlementConflict(
             "retained settlement aliases conflict with source identity"
         )
+    thread_head_binding = data.get("threadHeadBinding")
+    if owner_data["ownerKind"] == "none":
+        if thread_head_binding is not None:
+            raise SourceSettlementConflict(
+                "none-owner settlement retains a thread-head binding"
+            )
+    else:
+        try:
+            _validate_blocker(thread_head_binding)
+        except SourceCoordinatorError as error:
+            raise SourceSettlementConflict(
+                "source settlement thread-head binding is malformed"
+            ) from error
+        expected_head_hash = canonical_json_hash(
+            _thread_head_hash_material(
+                {
+                    "schemaVersion": _THREAD_HEAD_SCHEMA_VERSION,
+                    "threadId": identity_data["threadId"],
+                    "threadHeadRevision": thread_head_binding[
+                        "threadHeadRevision"
+                    ],
+                    "activeOwnerKey": thread_head_binding["ownerKey"],
+                    "activeOwnerKind": thread_head_binding["ownerKind"],
+                    "activeCanonicalSourceId": thread_head_binding[
+                        "canonicalSourceId"
+                    ],
+                    "activeGeneration": thread_head_binding["generation"],
+                    "activeState": "active",
+                }
+            )
+        )
+        if (
+            thread_head_binding["canonicalSourceId"] != canonical_source_id
+            or thread_head_binding["ownerKind"] != owner_data["ownerKind"]
+            or thread_head_binding["ownerKey"] != owner_data["ownerKey"]
+            or thread_head_binding["threadHeadRevision"]
+            != (2 * thread_head_binding["generation"]) - 1
+            or thread_head_binding["headHash"] != expected_head_hash
+        ):
+            raise SourceSettlementConflict(
+                "source settlement thread-head binding conflicts with retained authority"
+            )
     expected_bindings = {
         "identityHash": _source_settlement_identity_hash(identity_data),
         "snapshotImmutableHash": classification_data["snapshotImmutableHash"],
@@ -3217,24 +3267,14 @@ def _validate_classification_document(
             _CLASSIFICATION_SCHEMA_VERSION,
         )
         or data.get("canonicalSourceId") != canonical_source_id
-        or type(data.get("classificationEpoch")) is not int
-        or data.get("classificationEpoch", 0) <= 0
         or not _is_exact_schema_version(
             data.get("classificationInputSchemaVersion"),
             _CLASSIFICATION_INPUT_SCHEMA_VERSION,
         )
-        or not _is_aware_datetime(data.get("leaseExpiresAt"))
         or not _is_aware_datetime(data.get("createdAt"))
         or not _is_aware_datetime(data.get("updatedAt"))
     ):
         raise SourceCoordinatorAmbiguous("source classification is malformed")
-    try:
-        _validate_document_id(
-            data.get("classificationClaimId"),
-            field_name="classification claim id",
-        )
-    except SourceCoordinatorConfigError as exc:
-        raise SourceCoordinatorAmbiguous("source classification is malformed") from exc
 
     state = data.get("classificationState")
     model_state = data.get("modelRequestState")
@@ -3245,7 +3285,11 @@ def _validate_classification_document(
     }
     if state == "legacy_terminal_quarantined":
         if (
-            model_state != "not_applicable"
+            data.get("classificationEpoch") != 0
+            or type(data.get("classificationEpoch")) is not int
+            or data.get("classificationClaimId") is not None
+            or data.get("leaseExpiresAt") is not None
+            or model_state != "not_applicable"
             or data.get("classificationInputHash") is not None
             or data.get("modelRequestKey") is not None
             or data.get("requestStartFence") is not None
@@ -3264,6 +3308,15 @@ def _validate_classification_document(
                 "retained terminal classification quarantine is malformed"
             )
         return
+    try:
+        _validate_classification_claim_coordinates(
+            classification_epoch=data.get("classificationEpoch"),
+            classification_claim_id=data.get("classificationClaimId"),
+        )
+    except SourceCoordinatorConfigError as exc:
+        raise SourceCoordinatorAmbiguous("source classification is malformed") from exc
+    if not _is_aware_datetime(data.get("leaseExpiresAt")):
+        raise SourceCoordinatorAmbiguous("source classification is malformed")
     if any(value is not None for value in retained_terminal_values.values()):
         raise SourceCoordinatorAmbiguous(
             "classification retains unsupported terminal authority"
@@ -5926,9 +5979,9 @@ class SourceCoordinator:
                     "schemaVersion": _CLASSIFICATION_SCHEMA_VERSION,
                     "canonicalSourceId": canonical_source_id,
                     "classificationState": "legacy_terminal_quarantined",
-                    "classificationEpoch": 1,
-                    "classificationClaimId": "legacy-terminal-quarantine",
-                    "leaseExpiresAt": now,
+                    "classificationEpoch": 0,
+                    "classificationClaimId": None,
+                    "leaseExpiresAt": None,
                     "classificationInputSchemaVersion": _CLASSIFICATION_INPUT_SCHEMA_VERSION,
                     "classificationInputHash": None,
                     "modelRequestKey": None,
@@ -9348,6 +9401,7 @@ class SourceCoordinator:
                 )
             if owner_data["ownerKind"] == "none":
                 admission_ready = admission_before["admissionState"] == "pending"
+                thread_head_binding = None
             else:
                 admission_ready = admission_before["admissionState"] == "processing"
                 if (
@@ -9361,6 +9415,7 @@ class SourceCoordinator:
                     raise SourceSettlementNotReady(
                         "source settlement requires its active thread-head outcome"
                     )
+                thread_head_binding = _blocker_from_head(head_before)
             if not admission_ready:
                 raise SourceSettlementNotReady(
                     "pending admission is not ready for canonical settlement"
@@ -9371,6 +9426,7 @@ class SourceCoordinator:
                 classification_data=classification_data,
                 owner_data=owner_data,
                 ledger_data=ledger_data,
+                thread_head_binding=thread_head_binding,
                 aliases=aliases,
             )
             settlement_expected = {

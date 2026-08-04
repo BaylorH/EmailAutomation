@@ -382,10 +382,14 @@ The dominance matrix is explicit:
 `sourceSettlements/{canonicalSourceId}` is the one canonical processed
 authority. It is create-only and stores the canonical source ID, identity hash,
 snapshot hash, selection hash, explicit owner-decision hash, ledger hash, final
-ledger-evidence hash, complete typed alias set and hash, settlement revision,
-and server settlement time. The alias set is complete for aliases known at the
-settlement transaction; later verified aliases create projections against the
-retained identity and settlement without mutating the settlement. Exact
+ledger-evidence hash, the exact active thread-head acquisition binding for an
+owned transition (or null for an explicit none owner), complete typed alias set
+and hash, settlement revision, and server settlement time. The thread-head
+binding is frozen from the validated active head in the settlement transaction
+and is covered by the settlement hash; it is never inferred from a later head
+or mutable admission timestamp. The alias set is complete for aliases known at
+the settlement transaction; later verified aliases create projections against
+the retained identity and settlement without mutating the settlement. Exact
 idempotent replays are accepted; different content is
 `source_settlement_conflict`. No projection or legacy marker may be
 used to synthesize this record.

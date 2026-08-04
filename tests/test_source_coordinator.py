@@ -2627,12 +2627,16 @@ class RetainedTerminalAuthorityTests(unittest.TestCase):
         )
         stored = self.fake.data[self.classification_path]
         self.assertEqual("legacy_terminal_quarantined", stored["classificationState"])
+        self.assertEqual(0, stored["classificationEpoch"])
+        self.assertIsNone(stored["classificationClaimId"])
+        self.assertIsNone(stored["leaseExpiresAt"])
         self.assertEqual("not_applicable", stored["modelRequestState"])
         self.assertEqual("active", stored["retainedTerminalKind"])
         self.assertEqual("a" * 64, stored["retainedTerminalImmutableHash"])
         self.assertRegex(stored["retainedTerminalRecordHash"], r"^[0-9a-f]{64}$")
         self.assertEqual(result.evidence_hash, stored["retainedTerminalBindingHash"])
         self.assertIsNone(stored["classificationInputHash"])
+        self.assertIsNone(stored["modelRequestKey"])
         for field in (
             "completeProposalSnapshot",
             "completeProposalHash",
@@ -2659,6 +2663,32 @@ class RetainedTerminalAuthorityTests(unittest.TestCase):
                 )
             )
         )
+
+    def test_quarantine_rejects_fresh_claim_coordinates(self):
+        self.quarantine()
+        valid = deepcopy(self.fake.data[self.classification_path])
+
+        for field, value in (
+            ("classificationEpoch", 1),
+            ("classificationEpoch", False),
+            ("classificationClaimId", "legacy-terminal-quarantine"),
+            ("leaseExpiresAt", FROZEN_NOW),
+        ):
+            with self.subTest(field=field, value=value):
+                self.fake.data[self.classification_path] = deepcopy(valid)
+                self.fake.data[self.classification_path][field] = value
+                before = deepcopy(self.fake.data)
+                before_calls = len(self.loader_calls)
+                self.fake.events.clear()
+
+                self.assertErrorCode(
+                    "source_coordinator_ambiguous",
+                    self.quarantine,
+                )
+
+                self.assertEqual(before, self.fake.data)
+                self.assertEqual(before_calls, len(self.loader_calls))
+                self.assertEqual([], self.write_events())
 
     def test_settled_authority_hashes_aware_datetime_and_exact_retry_is_idempotent(self):
         self.loader_result = self.settled_result()
@@ -4784,6 +4814,11 @@ class LedgerTransitionAndSettlementTests(unittest.TestCase):
 
         self.assertNotIn(head_path, fake.data)
         self.assertEqual(1, settlement.alias_projection_count)
+        self.assertIsNone(
+            fake.data[
+                f"users/user-1/sourceSettlements/{source_id}"
+            ]["threadHeadBinding"]
+        )
         self.assertEqual(
             "settled",
             fake.data[
@@ -4801,6 +4836,14 @@ class LedgerTransitionAndSettlementTests(unittest.TestCase):
         stored = self.fake.data[settlement_path]
         self.assertEqual(settlement.settlement_hash, stored["settlementHash"])
         self.assertEqual(2, len(stored["aliases"]))
+        self.assertEqual(
+            self.module._blocker_from_head(
+                self.fake.data[
+                    "users/user-1/threadTransitionHeads/thread-ledger"
+                ]
+            ),
+            stored["threadHeadBinding"],
+        )
         self.assertEqual("settled", self.fake.data[self.admission_path]["admissionState"])
         for descriptor in stored["aliases"]:
             projection_path = (

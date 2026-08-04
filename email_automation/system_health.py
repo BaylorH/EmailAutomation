@@ -15,6 +15,35 @@ from .send_permits import (
     _unresolved_draft_review_payload,
     validate_pending_completion_obligation_payload,
 )
+from .source_coordinator import (
+    SourceAliasConflict,
+    SourceCoordinatorError,
+    SourceSettlementConflict,
+    SourceSettlementNotReady,
+    _PROCESSED_ALIAS_FIELDS,
+    _SOURCE_ALIAS_PROJECTION_FIELDS,
+    _SOURCE_ALIAS_TYPES,
+    _SOURCE_SETTLEMENT_FIELDS,
+    _blocker_from_head,
+    _source_deferred_work_immutable_material,
+    _thread_head_hash_material,
+    _validate_blocker,
+    _validate_admission_authority_bindings,
+    _validate_alias_projection,
+    _validate_blocked_projection_document,
+    _validate_classification_document,
+    _validate_pending_admission_document,
+    _validate_processed_alias_projection,
+    _validate_source_deferred_work_document,
+    _validate_source_resume_bindings,
+    _validate_source_settlement_document,
+    _validate_source_work_ledger_document,
+    _validate_thread_head_document,
+    _validate_transition_owner_document,
+    _validated_identity_descriptors,
+    _wake_token_for_release,
+    canonical_json_hash,
+)
 
 
 HEALTH_COLLECTION = "systemHealth"
@@ -40,6 +69,93 @@ RESOLVED_DEAD_LETTER_STATUSES = {
 # A queue count of this sentinel means the Firestore read failed — the count is
 # UNKNOWN, not zero. Health must never treat an unknown count as an empty queue.
 COUNT_ERROR = -1
+HEALTH_SCAN_LIMIT = 500
+B1_HEALTH_KEYS = (
+    "b1ActiveClassifications",
+    "b1AmbiguousClassifications",
+    "b1BlockedSources",
+    "b1NonsettledPendingAdmissions",
+    "b1UnsettledWorkLedgers",
+    "b1AliasConflicts",
+    "b1MarkerOrSettlementAmbiguities",
+    "b1LegacyTerminalQuarantined",
+    "b1LegacyMarkerOnlyAmbiguous",
+    "b1LegacyReplayClaimQuarantined",
+)
+B1_COLLECTIONS = (
+    "sourceIdentities",
+    "sourceAliases",
+    "sourceClassifications",
+    "sourceTransitionOwners",
+    "threadTransitionHeads",
+    "sourceWorkLedgers",
+    "sourceDeferredWork",
+    "inboundPendingAdmissions",
+    "blockedSources",
+    "sourceSettlements",
+)
+B1_SCAN_COLLECTIONS = (*B1_COLLECTIONS, "processedMessages")
+_B1_COLLECTION_ERROR_KEYS = {
+    "sourceIdentities": {
+        "b1ActiveClassifications",
+        "b1AmbiguousClassifications",
+        "b1NonsettledPendingAdmissions",
+        "b1UnsettledWorkLedgers",
+        "b1AliasConflicts",
+        "b1MarkerOrSettlementAmbiguities",
+        "b1LegacyTerminalQuarantined",
+    },
+    "sourceAliases": {
+        "b1AliasConflicts",
+        "b1MarkerOrSettlementAmbiguities",
+    },
+    "sourceClassifications": {
+        "b1ActiveClassifications",
+        "b1AmbiguousClassifications",
+        "b1NonsettledPendingAdmissions",
+        "b1UnsettledWorkLedgers",
+        "b1MarkerOrSettlementAmbiguities",
+        "b1LegacyTerminalQuarantined",
+    },
+    "sourceTransitionOwners": {
+        "b1NonsettledPendingAdmissions",
+        "b1UnsettledWorkLedgers",
+        "b1MarkerOrSettlementAmbiguities",
+    },
+    "threadTransitionHeads": {
+        "b1BlockedSources",
+        "b1NonsettledPendingAdmissions",
+    },
+    "sourceWorkLedgers": {
+        "b1NonsettledPendingAdmissions",
+        "b1UnsettledWorkLedgers",
+        "b1MarkerOrSettlementAmbiguities",
+    },
+    "sourceDeferredWork": {"b1UnsettledWorkLedgers"},
+    "inboundPendingAdmissions": {
+        "b1BlockedSources",
+        "b1NonsettledPendingAdmissions",
+        "b1MarkerOrSettlementAmbiguities",
+    },
+    "blockedSources": {"b1BlockedSources"},
+    "sourceSettlements": {"b1MarkerOrSettlementAmbiguities"},
+    "processedMessages": {
+        "b1MarkerOrSettlementAmbiguities",
+        "b1LegacyMarkerOnlyAmbiguous",
+        "b1LegacyReplayClaimQuarantined",
+    },
+}
+_B1_PROCESSED_OWNERSHIP_FIELDS = {
+    "canonicalSourceId",
+    "settlementRevision",
+    "settlementHash",
+    "sourceAliasKey",
+}
+_B1_ADMISSION_ERROR_KEYS = {
+    "b1BlockedSources",
+    "b1NonsettledPendingAdmissions",
+    "b1MarkerOrSettlementAmbiguities",
+}
 
 
 def _utc_now() -> datetime:
@@ -436,6 +552,1112 @@ def _count_active_terminal_protocol_threads(user_ref, limit: int = 500) -> int:
         return COUNT_ERROR
 
 
+def _scan_b1_collection(user_ref, collection_name: str):
+    """Return an exact, bounded read-only snapshot for one B1 collection."""
+    try:
+        snapshots = list(
+            user_ref.collection(collection_name)
+            .limit(HEALTH_SCAN_LIMIT + 1)
+            .stream()
+        )
+        if len(snapshots) > HEALTH_SCAN_LIMIT:
+            raise ValueError("bounded B1 health scan overflow")
+        documents = {}
+        for snapshot in snapshots:
+            document_id = getattr(snapshot, "id", None)
+            data = snapshot.to_dict()
+            if (
+                type(document_id) is not str
+                or not document_id
+                or type(data) is not dict
+                or document_id in documents
+            ):
+                raise ValueError("unreadable B1 health document")
+            documents[document_id] = data
+        return documents, True
+    except Exception:
+        # Collection names are static source literals. Never render exception
+        # text, document identifiers, or stored authority data in health logs.
+        print(f"⚠️ B1 health scan failed closed for {collection_name}")
+        return {}, False
+
+
+def _mark_b1_validation_error(error_keys, affected_keys, validation_log_state):
+    error_keys.update(affected_keys)
+    if not validation_log_state[0]:
+        print("⚠️ B1 health authority validation failed closed")
+        validation_log_state[0] = True
+
+
+def _is_schema_v1(value) -> bool:
+    return type(value) is int and value == 1
+
+
+def _valid_settlement_shape(data: Dict, canonical_source_id: str) -> bool:
+    if (
+        type(data) is not dict
+        or set(data) != _SOURCE_SETTLEMENT_FIELDS
+        or not _is_schema_v1(data.get("schemaVersion"))
+        or data.get("canonicalSourceId") != canonical_source_id
+        or type(data.get("settlementRevision")) is not int
+        or data.get("settlementRevision") != 1
+        or any(
+            not _is_sha256(data.get(field))
+            for field in (
+                "identityHash",
+                "snapshotImmutableHash",
+                "selectionHash",
+                "ownerDecisionHash",
+                "ledgerHash",
+                "finalLedgerEvidenceHash",
+                "aliasSetHash",
+                "settlementHash",
+            )
+        )
+        or not _is_aware_datetime(data.get("settledAt"))
+    ):
+        return False
+    aliases = data.get("aliases")
+    if type(aliases) is not list or not aliases:
+        return False
+    thread_head_binding = data.get("threadHeadBinding")
+    if thread_head_binding is not None:
+        try:
+            _validate_blocker(thread_head_binding)
+        except SourceCoordinatorError:
+            return False
+    seen = set()
+    for descriptor in aliases:
+        if (
+            type(descriptor) is not dict
+            or set(descriptor)
+            != {"sourceAliasKey", "aliasType", "normalizedValueHash"}
+            or not _is_sha256(descriptor.get("sourceAliasKey"))
+            or descriptor.get("aliasType") not in _SOURCE_ALIAS_TYPES
+            or not _is_sha256(descriptor.get("normalizedValueHash"))
+            or descriptor["sourceAliasKey"] in seen
+        ):
+            return False
+        seen.add(descriptor["sourceAliasKey"])
+    return aliases == sorted(aliases, key=lambda item: item["sourceAliasKey"])
+
+
+def _valid_alias_projection_shape(document_id: str, data: Dict) -> bool:
+    return bool(
+        type(data) is dict
+        and set(data) == _SOURCE_ALIAS_PROJECTION_FIELDS
+        and _is_schema_v1(data.get("schemaVersion"))
+        and data.get("sourceAliasKey") == document_id
+        and data.get("aliasType") in _SOURCE_ALIAS_TYPES
+        and _is_sha256(data.get("sourceAliasKey"))
+        and _is_sha256(data.get("normalizedValueHash"))
+        and type(data.get("canonicalSourceId")) is str
+        and bool(data.get("canonicalSourceId"))
+        and _is_aware_datetime(data.get("createdAt"))
+    )
+
+
+def _valid_processed_projection_shape(
+    document_id: str,
+    data: Dict,
+) -> bool:
+    return bool(
+        type(data) is dict
+        and set(data) == _PROCESSED_ALIAS_FIELDS
+        and _is_schema_v1(data.get("schemaVersion"))
+        and data.get("sourceAliasKey") == document_id
+        and data.get("aliasType") in _SOURCE_ALIAS_TYPES
+        and _is_sha256(data.get("sourceAliasKey"))
+        and _is_sha256(data.get("normalizedValueHash"))
+        and type(data.get("canonicalSourceId")) is str
+        and bool(data.get("canonicalSourceId"))
+        and type(data.get("settlementRevision")) is int
+        and data.get("settlementRevision") == 1
+        and _is_sha256(data.get("settlementHash"))
+        and _is_aware_datetime(data.get("processedAt"))
+    )
+
+
+def _prior_active_blocker_for_releasing_head(
+    head_data: Dict,
+    *,
+    thread_id: str,
+) -> Dict:
+    prior_head = {
+        "schemaVersion": head_data["schemaVersion"],
+        "threadId": thread_id,
+        "threadHeadRevision": head_data["threadHeadRevision"] - 1,
+        "activeOwnerKey": head_data["activeOwnerKey"],
+        "activeOwnerKind": head_data["activeOwnerKind"],
+        "activeCanonicalSourceId": head_data["activeCanonicalSourceId"],
+        "activeGeneration": head_data["activeGeneration"],
+        "activeState": "active",
+    }
+    prior_head["headHash"] = canonical_json_hash(
+        _thread_head_hash_material(prior_head)
+    )
+    return _blocker_from_head(prior_head)
+
+
+def _expected_current_blocker(head_data: Dict, *, thread_id: str) -> Dict:
+    if head_data["activeState"] == "active":
+        return _blocker_from_head(head_data)
+    if head_data["activeState"] == "releasing":
+        return _prior_active_blocker_for_releasing_head(
+            head_data,
+            thread_id=thread_id,
+        )
+    raise SourceCoordinatorError("clear thread head cannot retain a blocker")
+
+
+def _thread_head_revision_matches_generation(head_data: Dict) -> bool:
+    expected_revision = 2 * head_data["activeGeneration"]
+    if head_data["activeState"] == "active":
+        expected_revision -= 1
+    return head_data["threadHeadRevision"] == expected_revision
+
+
+def _validate_admission_head_relationship(
+    admission: Dict,
+    *,
+    head_data: Optional[Dict],
+    thread_id: str,
+    user_id: str,
+) -> None:
+    state = admission["admissionState"]
+    lifecycle = admission["blockedLifecycleState"]
+    owner_kind = admission["ownerKind"]
+    current_blocker = admission["currentBlocker"]
+
+    if state == "pending":
+        if owner_kind != "none" and (
+            head_data is not None and head_data["activeState"] != "clear"
+        ):
+            raise SourceCoordinatorError(
+                "pending transition admission conflicts with occupied head"
+            )
+        return
+    if state == "settled":
+        return
+    if owner_kind == "none" or head_data is None:
+        raise SourceCoordinatorError(
+            "transition admission lacks retained thread-head authority"
+        )
+
+    if state == "blocked":
+        if lifecycle not in {"blocked", "eligible"}:
+            raise SourceCoordinatorError(
+                "blocked admission lifecycle has no production writer"
+            )
+        if head_data["activeState"] not in {"active", "releasing"}:
+            raise SourceCoordinatorError(
+                "blocked admission lacks an actionable thread head"
+            )
+        expected_blocker = _expected_current_blocker(
+            head_data,
+            thread_id=thread_id,
+        )
+        if current_blocker != expected_blocker:
+            raise SourceCoordinatorError(
+                "blocked admission conflicts with thread-head blocker"
+            )
+        if lifecycle == "blocked":
+            if admission["wakeState"] != "none":
+                raise SourceCoordinatorError(
+                    "blocked admission retains an unexpected wake"
+                )
+            return
+        if (
+            head_data["activeState"] != "releasing"
+            or admission["wakeState"] != "eligible"
+            or admission["wakeGeneration"]
+            != head_data["activeGeneration"] + 1
+            or admission["wakeToken"]
+            != _wake_token_for_release(
+                user_id=user_id,
+                thread_id=thread_id,
+                admission=admission,
+                released_blocker=current_blocker,
+                wake_generation=admission["wakeGeneration"],
+            )
+        ):
+            raise SourceCoordinatorError(
+                "eligible wake conflicts with releasing thread head"
+            )
+        return
+
+    if state == "processing":
+        if (
+            head_data["activeState"] != "active"
+            or head_data["activeCanonicalSourceId"]
+            != admission["canonicalSourceId"]
+            or head_data["activeOwnerKind"] != owner_kind
+            or head_data["activeOwnerKey"] != admission["ownerKey"]
+        ):
+            raise SourceCoordinatorError(
+                "processing admission conflicts with active thread head"
+            )
+        if lifecycle is None:
+            return
+        if (
+            lifecycle != "settled_as_new_blocker"
+            or admission["wakeState"] != "consumed"
+            or head_data["activeGeneration"] != admission["wakeGeneration"]
+            or current_blocker is None
+            or current_blocker["generation"] + 1
+            != admission["wakeGeneration"]
+            or admission["wakeToken"]
+            != _wake_token_for_release(
+                user_id=user_id,
+                thread_id=thread_id,
+                admission=admission,
+                released_blocker=current_blocker,
+                wake_generation=admission["wakeGeneration"],
+            )
+        ):
+            raise SourceCoordinatorError(
+                "consumed wake conflicts with rebound thread head"
+            )
+        return
+
+    raise SourceCoordinatorError("admission state lacks head semantics")
+
+
+def _settled_owned_head_outcome_is_valid(
+    admission: Dict,
+    *,
+    owner_data: Dict,
+    settlement_data: Dict,
+    head_data: Optional[Dict],
+) -> bool:
+    if head_data is None:
+        return False
+    canonical_source_id = admission["canonicalSourceId"]
+    retained_binding = settlement_data["threadHeadBinding"]
+    if head_data["activeCanonicalSourceId"] == canonical_source_id:
+        if (
+            head_data["activeState"] not in {"active", "releasing"}
+            or head_data["activeOwnerKind"] != owner_data["ownerKind"]
+            or head_data["activeOwnerKey"] != owner_data["ownerKey"]
+        ):
+            return False
+        if head_data["activeState"] == "active":
+            retained_head = _blocker_from_head(head_data)
+        else:
+            retained_head = _prior_active_blocker_for_releasing_head(
+                head_data,
+                thread_id=admission["threadId"],
+            )
+        return retained_head == retained_binding
+    return bool(
+        head_data["activeGeneration"] >= retained_binding["generation"]
+        and head_data["threadHeadRevision"]
+        > retained_binding["threadHeadRevision"]
+        and head_data["updatedAt"] >= settlement_data["settledAt"]
+        and (
+            head_data["activeState"] == "clear"
+            or head_data["activeGeneration"]
+            > retained_binding["generation"]
+        )
+    )
+
+
+def _retained_blocker_lineage_index(admissions: Dict[str, Dict]):
+    blocker_events = {}
+    generation_owners = {}
+    for canonical_source_id, admission in admissions.items():
+        thread_id = admission["threadId"]
+        if admission["wakeState"] == "consumed":
+            generation = admission["wakeGeneration"]
+            generation_key = (thread_id, generation)
+            existing_owner = generation_owners.get(generation_key)
+            if (
+                existing_owner is not None
+                and existing_owner != canonical_source_id
+            ):
+                return None
+            generation_owners[generation_key] = canonical_source_id
+        for field in ("initialBlocker", "currentBlocker"):
+            blocker = admission[field]
+            if blocker is None:
+                continue
+            if (
+                blocker["threadHeadRevision"]
+                != (2 * blocker["generation"]) - 1
+            ):
+                return None
+            predecessor_id = blocker["canonicalSourceId"]
+            predecessor_key = (thread_id, predecessor_id)
+            existing_event = blocker_events.get(predecessor_key)
+            if existing_event is not None and existing_event != blocker:
+                return None
+            blocker_events[predecessor_key] = blocker
+
+    for (thread_id, predecessor_id), blocker in blocker_events.items():
+        predecessor_admission = admissions.get(predecessor_id)
+        if (
+            predecessor_admission is None
+            or predecessor_admission["threadId"] != thread_id
+        ):
+            return None
+        generation = blocker["generation"]
+        generation_key = (thread_id, generation)
+        existing_owner = generation_owners.get(generation_key)
+        if existing_owner is not None and existing_owner != predecessor_id:
+            return None
+        generation_owners[generation_key] = predecessor_id
+        if (
+            predecessor_admission["wakeState"] == "consumed"
+            and predecessor_admission["wakeGeneration"] != generation
+        ):
+            return None
+    return blocker_events, generation_owners
+
+
+def _consumed_wake_lineage_is_valid(
+    admission: Dict,
+    *,
+    admissions: Dict[str, Dict],
+    blocker_events: Dict[tuple[str, str], Dict],
+    generation_owners: Dict[tuple[str, int], str],
+    owners: Dict[str, Dict],
+    settlements: Dict[str, Dict],
+    head_data: Optional[Dict],
+    thread_id: str,
+    user_id: str,
+) -> bool:
+    if admission["wakeState"] != "consumed":
+        return True
+    blocker = admission["currentBlocker"]
+    wake_generation = admission["wakeGeneration"]
+    if (
+        admission["blockedLifecycleState"] != "settled_as_new_blocker"
+        or blocker is None
+        or type(wake_generation) is not int
+        or blocker["generation"] + 1 != wake_generation
+        or head_data is None
+        or head_data["threadHeadRevision"]
+        < blocker["threadHeadRevision"] + 2
+        or head_data["activeGeneration"] < wake_generation
+    ):
+        return False
+
+    predecessor_id = blocker["canonicalSourceId"]
+    predecessor_admission = admissions.get(predecessor_id)
+    predecessor_owner = owners.get(predecessor_id)
+    predecessor_settlement = settlements.get(predecessor_id)
+    predecessor_event = blocker_events.get((thread_id, predecessor_id))
+    generation_owner = generation_owners.get(
+        (thread_id, blocker["generation"])
+    )
+    if (
+        predecessor_id == admission["canonicalSourceId"]
+        or predecessor_admission is None
+        or predecessor_owner is None
+        or predecessor_settlement is None
+        or predecessor_settlement["threadHeadBinding"] != blocker
+        or predecessor_event != blocker
+        or generation_owner != predecessor_id
+        or predecessor_admission["threadId"] != thread_id
+        or predecessor_admission["admissionState"] != "settled"
+        or predecessor_owner["ownerKind"] != blocker["ownerKind"]
+        or predecessor_owner["ownerKey"] != blocker["ownerKey"]
+    ):
+        return False
+
+    prior_active_head = {
+        "schemaVersion": head_data["schemaVersion"],
+        "threadId": thread_id,
+        "threadHeadRevision": blocker["threadHeadRevision"],
+        "activeOwnerKey": blocker["ownerKey"],
+        "activeOwnerKind": blocker["ownerKind"],
+        "activeCanonicalSourceId": predecessor_id,
+        "activeGeneration": blocker["generation"],
+        "activeState": "active",
+    }
+    if blocker["headHash"] != canonical_json_hash(
+        _thread_head_hash_material(prior_active_head)
+    ):
+        return False
+    if admission["wakeToken"] != _wake_token_for_release(
+        user_id=user_id,
+        thread_id=thread_id,
+        admission=admission,
+        released_blocker=blocker,
+        wake_generation=wake_generation,
+    ):
+        return False
+    if (
+        admission["admissionState"] == "settled"
+        and admission["canonicalSourceId"] not in settlements
+    ):
+        return False
+    return True
+
+
+def _collect_b1_health_counts(user_ref, *, user_id: str) -> Dict[str, int]:
+    counts = {key: 0 for key in B1_HEALTH_KEYS}
+    error_keys = set()
+    validation_log_state = [False]
+    scans = {}
+    readable = {}
+    for collection_name in B1_SCAN_COLLECTIONS:
+        scans[collection_name], readable[collection_name] = (
+            _scan_b1_collection(user_ref, collection_name)
+        )
+        if not readable[collection_name]:
+            error_keys.update(_B1_COLLECTION_ERROR_KEYS[collection_name])
+
+    valid_identities = {}
+    descriptors_by_source = {}
+    if readable["sourceIdentities"]:
+        for canonical_source_id, data in scans["sourceIdentities"].items():
+            try:
+                descriptors = _validated_identity_descriptors(
+                    data,
+                    canonical_source_id=canonical_source_id,
+                )
+            except Exception:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceIdentities"],
+                    validation_log_state,
+                )
+                continue
+            valid_identities[canonical_source_id] = data
+            descriptors_by_source[canonical_source_id] = descriptors
+
+    alias_conflicts = set()
+    expected_aliases = {}
+    for canonical_source_id, descriptors in descriptors_by_source.items():
+        for descriptor in descriptors:
+            expected_aliases.setdefault(descriptor["sourceAliasKey"], []).append(
+                (canonical_source_id, descriptor)
+            )
+    if readable["sourceAliases"]:
+        alias_documents = scans["sourceAliases"]
+        for source_alias_key, owners in expected_aliases.items():
+            if len(owners) != 1:
+                alias_conflicts.add(source_alias_key)
+            alias_data = alias_documents.get(source_alias_key)
+            if alias_data is None:
+                _mark_b1_validation_error(
+                    error_keys,
+                    {"b1AliasConflicts", "b1MarkerOrSettlementAmbiguities"},
+                    validation_log_state,
+                )
+                continue
+            if not _valid_alias_projection_shape(
+                source_alias_key,
+                alias_data,
+            ):
+                _mark_b1_validation_error(
+                    error_keys,
+                    {"b1AliasConflicts", "b1MarkerOrSettlementAmbiguities"},
+                    validation_log_state,
+                )
+                continue
+            canonical_source_id, descriptor = owners[0]
+            try:
+                _validate_alias_projection(
+                    alias_data,
+                    descriptor=descriptor,
+                    canonical_source_id=canonical_source_id,
+                )
+            except SourceAliasConflict:
+                alias_conflicts.add(source_alias_key)
+            except Exception:
+                _mark_b1_validation_error(
+                    error_keys,
+                    {"b1AliasConflicts", "b1MarkerOrSettlementAmbiguities"},
+                    validation_log_state,
+                )
+        for source_alias_key in alias_documents:
+            if source_alias_key not in expected_aliases:
+                _mark_b1_validation_error(
+                    error_keys,
+                    {"b1AliasConflicts", "b1MarkerOrSettlementAmbiguities"},
+                    validation_log_state,
+                )
+    counts["b1AliasConflicts"] = len(alias_conflicts)
+
+    valid_classifications = {}
+    if readable["sourceClassifications"]:
+        for canonical_source_id, data in scans["sourceClassifications"].items():
+            if canonical_source_id not in valid_identities:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceClassifications"],
+                    validation_log_state,
+                )
+                continue
+            try:
+                _validate_classification_document(
+                    data,
+                    canonical_source_id=canonical_source_id,
+                )
+            except Exception:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceClassifications"],
+                    validation_log_state,
+                )
+                continue
+            valid_classifications[canonical_source_id] = data
+            state = data["classificationState"]
+            if state in {"claimed", "request_started"}:
+                counts["b1ActiveClassifications"] += 1
+            elif state == "classification_request_ambiguous":
+                counts["b1AmbiguousClassifications"] += 1
+            elif state == "legacy_terminal_quarantined":
+                counts["b1LegacyTerminalQuarantined"] += 1
+        for canonical_source_id in valid_identities:
+            if canonical_source_id not in valid_classifications:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceClassifications"],
+                    validation_log_state,
+                )
+
+    valid_owners = {}
+    if readable["sourceTransitionOwners"]:
+        for canonical_source_id, data in scans["sourceTransitionOwners"].items():
+            classification_data = valid_classifications.get(canonical_source_id)
+            if (
+                canonical_source_id not in valid_identities
+                or classification_data is None
+            ):
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceTransitionOwners"],
+                    validation_log_state,
+                )
+                continue
+            try:
+                _validate_transition_owner_document(
+                    data,
+                    canonical_source_id=canonical_source_id,
+                    classification_data=classification_data,
+                )
+            except Exception:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceTransitionOwners"],
+                    validation_log_state,
+                )
+                continue
+            valid_owners[canonical_source_id] = data
+        for canonical_source_id, classification_data in (
+            valid_classifications.items()
+        ):
+            if (
+                classification_data["classificationState"] == "snapshot_ready"
+                and canonical_source_id not in valid_owners
+            ):
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceTransitionOwners"],
+                    validation_log_state,
+                )
+
+    valid_ledgers = {}
+    work_entries = {}
+    delegated_work_keys = set()
+    if readable["sourceWorkLedgers"]:
+        for canonical_source_id, data in scans["sourceWorkLedgers"].items():
+            classification_data = valid_classifications.get(canonical_source_id)
+            owner_data = valid_owners.get(canonical_source_id)
+            if (
+                canonical_source_id not in valid_identities
+                or classification_data is None
+                or owner_data is None
+            ):
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceWorkLedgers"],
+                    validation_log_state,
+                )
+                continue
+            try:
+                _validate_source_work_ledger_document(
+                    data,
+                    canonical_source_id=canonical_source_id,
+                    classification_data=classification_data,
+                    owner_data=owner_data,
+                )
+            except Exception:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceWorkLedgers"],
+                    validation_log_state,
+                )
+                continue
+            valid_ledgers[canonical_source_id] = data
+            if any(
+                entry["state"] in {"pending", "applying"}
+                for entry in data["entries"]
+            ):
+                counts["b1UnsettledWorkLedgers"] += 1
+            for entry in data["entries"]:
+                work_key = entry["workKey"]
+                if work_key in work_entries:
+                    _mark_b1_validation_error(
+                        error_keys,
+                        {"b1UnsettledWorkLedgers"},
+                        validation_log_state,
+                    )
+                    continue
+                work_entries[work_key] = (
+                    canonical_source_id,
+                    data,
+                    entry,
+                )
+                if entry["state"] == "delegated":
+                    delegated_work_keys.add(work_key)
+        for canonical_source_id in valid_owners:
+            if canonical_source_id not in valid_ledgers:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceWorkLedgers"],
+                    validation_log_state,
+                )
+
+    if readable["sourceDeferredWork"]:
+        deferred_documents = scans["sourceDeferredWork"]
+        for work_key, data in deferred_documents.items():
+            entry_bundle = work_entries.get(work_key)
+            if entry_bundle is None or work_key not in delegated_work_keys:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceDeferredWork"],
+                    validation_log_state,
+                )
+                continue
+            canonical_source_id, ledger_data, entry = entry_bundle
+            try:
+                expected = _source_deferred_work_immutable_material(
+                    canonical_source_id=canonical_source_id,
+                    ledger_hash=ledger_data["ledgerHash"],
+                    entry=entry,
+                )
+                _validate_source_deferred_work_document(
+                    data,
+                    expected_immutable=expected,
+                )
+            except Exception:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceDeferredWork"],
+                    validation_log_state,
+                )
+        if any(
+            work_key not in deferred_documents
+            for work_key in delegated_work_keys
+        ):
+            _mark_b1_validation_error(
+                error_keys,
+                _B1_COLLECTION_ERROR_KEYS["sourceDeferredWork"],
+                validation_log_state,
+            )
+
+    valid_heads = {}
+    if readable["threadTransitionHeads"]:
+        for thread_id, data in scans["threadTransitionHeads"].items():
+            try:
+                _validate_thread_head_document(data, thread_id=thread_id)
+                if not _thread_head_revision_matches_generation(data):
+                    raise SourceCoordinatorError(
+                        "thread head revision conflicts with its generation"
+                    )
+            except Exception:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["threadTransitionHeads"],
+                    validation_log_state,
+                )
+                continue
+            valid_heads[thread_id] = data
+
+    valid_admissions = {}
+    if readable["inboundPendingAdmissions"]:
+        for canonical_source_id, data in scans[
+            "inboundPendingAdmissions"
+        ].items():
+            identity_data = valid_identities.get(canonical_source_id)
+            classification_data = valid_classifications.get(canonical_source_id)
+            owner_data = valid_owners.get(canonical_source_id)
+            ledger_data = valid_ledgers.get(canonical_source_id)
+            thread_id = data.get("threadId")
+            if (
+                identity_data is None
+                or classification_data is None
+                or owner_data is None
+                or ledger_data is None
+                or type(thread_id) is not str
+                or not thread_id
+                or identity_data.get("threadId") != thread_id
+            ):
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_ADMISSION_ERROR_KEYS,
+                    validation_log_state,
+                )
+                continue
+            try:
+                _validate_pending_admission_document(
+                    data,
+                    canonical_source_id=canonical_source_id,
+                    thread_id=thread_id,
+                )
+                _validate_source_resume_bindings(
+                    data,
+                    canonical_source_id=canonical_source_id,
+                    thread_id=thread_id,
+                )
+                _validate_admission_authority_bindings(
+                    data,
+                    identity_data=identity_data,
+                    classification_data=classification_data,
+                    owner_data=owner_data,
+                    ledger_data=ledger_data,
+                )
+                _validate_admission_head_relationship(
+                    data,
+                    head_data=valid_heads.get(thread_id),
+                    thread_id=thread_id,
+                    user_id=user_id,
+                )
+            except Exception:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_ADMISSION_ERROR_KEYS,
+                    validation_log_state,
+                )
+                continue
+            valid_admissions[canonical_source_id] = data
+            if data["admissionState"] in {"pending", "blocked", "processing"}:
+                counts["b1NonsettledPendingAdmissions"] += 1
+        for canonical_source_id in valid_ledgers:
+            if canonical_source_id not in valid_admissions:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["inboundPendingAdmissions"],
+                    validation_log_state,
+                )
+
+    for thread_id, head_data in valid_heads.items():
+        if head_data["activeState"] == "clear":
+            continue
+        active_source_id = head_data["activeCanonicalSourceId"]
+        admission = valid_admissions.get(active_source_id)
+        if (
+            admission is None
+            or admission["threadId"] != thread_id
+            or admission["ownerKind"] != head_data["activeOwnerKind"]
+            or admission["ownerKey"] != head_data["activeOwnerKey"]
+            or admission["admissionState"] not in {"processing", "settled"}
+            or (
+                head_data["activeState"] == "releasing"
+                and admission["admissionState"] != "settled"
+            )
+        ):
+            _mark_b1_validation_error(
+                error_keys,
+                _B1_COLLECTION_ERROR_KEYS["threadTransitionHeads"],
+                validation_log_state,
+            )
+        if head_data["activeState"] == "releasing":
+            eligible = [
+                candidate
+                for candidate in valid_admissions.values()
+                if candidate["threadId"] == thread_id
+                and candidate["admissionState"] == "blocked"
+                and candidate["blockedLifecycleState"] == "eligible"
+                and candidate["wakeState"] == "eligible"
+            ]
+            if len(eligible) != 1:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["threadTransitionHeads"],
+                    validation_log_state,
+                )
+
+    valid_blocked_projection_ids = set()
+    if readable["blockedSources"]:
+        for canonical_source_id, data in scans["blockedSources"].items():
+            admission = valid_admissions.get(canonical_source_id)
+            if admission is None:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["blockedSources"],
+                    validation_log_state,
+                )
+                continue
+            try:
+                _validate_blocked_projection_document(
+                    data,
+                    admission=admission,
+                )
+            except Exception:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["blockedSources"],
+                    validation_log_state,
+                )
+                continue
+            valid_blocked_projection_ids.add(canonical_source_id)
+            if admission["admissionState"] != "settled":
+                counts["b1BlockedSources"] += 1
+        if any(
+            admission["currentBlocker"] is not None
+            and canonical_source_id not in valid_blocked_projection_ids
+            for canonical_source_id, admission in valid_admissions.items()
+        ):
+            _mark_b1_validation_error(
+                error_keys,
+                _B1_COLLECTION_ERROR_KEYS["blockedSources"],
+                validation_log_state,
+            )
+
+    ambiguity_tokens = set()
+    structurally_valid_settlements = {}
+    fully_valid_settlements = {}
+    if readable["sourceSettlements"]:
+        for canonical_source_id, data in scans["sourceSettlements"].items():
+            if not _valid_settlement_shape(data, canonical_source_id):
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceSettlements"],
+                    validation_log_state,
+                )
+                continue
+            structurally_valid_settlements[canonical_source_id] = data
+            identity_data = valid_identities.get(canonical_source_id)
+            classification_data = valid_classifications.get(canonical_source_id)
+            owner_data = valid_owners.get(canonical_source_id)
+            ledger_data = valid_ledgers.get(canonical_source_id)
+            admission_data = valid_admissions.get(canonical_source_id)
+            if any(
+                value is None
+                for value in (
+                    identity_data,
+                    classification_data,
+                    owner_data,
+                    ledger_data,
+                    admission_data,
+                )
+            ):
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceSettlements"],
+                    validation_log_state,
+                )
+                continue
+            try:
+                _validate_source_settlement_document(
+                    data,
+                    canonical_source_id=canonical_source_id,
+                    identity_data=identity_data,
+                    classification_data=classification_data,
+                    owner_data=owner_data,
+                    ledger_data=ledger_data,
+                    current_aliases=descriptors_by_source[canonical_source_id],
+                )
+            except (SourceSettlementConflict, SourceSettlementNotReady):
+                ambiguity_tokens.add(("settlement", canonical_source_id))
+            except Exception:
+                _mark_b1_validation_error(
+                    error_keys,
+                    _B1_COLLECTION_ERROR_KEYS["sourceSettlements"],
+                    validation_log_state,
+                )
+            else:
+                if (
+                    owner_data["ownerKind"] != "none"
+                    and not _settled_owned_head_outcome_is_valid(
+                        admission_data,
+                        owner_data=owner_data,
+                        settlement_data=data,
+                        head_data=valid_heads.get(admission_data["threadId"]),
+                    )
+                ):
+                    _mark_b1_validation_error(
+                        error_keys,
+                        {"b1MarkerOrSettlementAmbiguities"},
+                        validation_log_state,
+                    )
+                else:
+                    fully_valid_settlements[canonical_source_id] = data
+            if admission_data["admissionState"] != "settled":
+                ambiguity_tokens.add(("settlement", canonical_source_id))
+        for canonical_source_id, admission in valid_admissions.items():
+            if (
+                admission["admissionState"] == "settled"
+                and canonical_source_id
+                not in structurally_valid_settlements
+            ):
+                ambiguity_tokens.add(("settlement", canonical_source_id))
+
+    blocker_lineage = _retained_blocker_lineage_index(valid_admissions)
+    if blocker_lineage is None:
+        _mark_b1_validation_error(
+            error_keys,
+            _B1_ADMISSION_ERROR_KEYS,
+            validation_log_state,
+        )
+        blocker_events, generation_owners = {}, {}
+    else:
+        blocker_events, generation_owners = blocker_lineage
+    for admission in valid_admissions.values():
+        if not _consumed_wake_lineage_is_valid(
+            admission,
+            admissions=valid_admissions,
+            blocker_events=blocker_events,
+            generation_owners=generation_owners,
+            owners=valid_owners,
+            settlements=fully_valid_settlements,
+            head_data=valid_heads.get(admission["threadId"]),
+            thread_id=admission["threadId"],
+            user_id=user_id,
+        ):
+            _mark_b1_validation_error(
+                error_keys,
+                _B1_ADMISSION_ERROR_KEYS,
+                validation_log_state,
+            )
+
+    processed_collection_name = B1_SCAN_COLLECTIONS[-1]
+    canonical_marker_ids = set()
+    replay_attempt_states = {}
+    legacy_marker_count = 0
+    if readable[processed_collection_name]:
+        processed_documents = scans[processed_collection_name]
+        for document_id, data in processed_documents.items():
+            if set(data) & _B1_PROCESSED_OWNERSHIP_FIELDS:
+                canonical_marker_ids.add(document_id)
+                if not _valid_processed_projection_shape(document_id, data):
+                    _mark_b1_validation_error(
+                        error_keys,
+                        _B1_COLLECTION_ERROR_KEYS[processed_collection_name],
+                        validation_log_state,
+                    )
+                    continue
+                canonical_source_id = data["canonicalSourceId"]
+                settlement_data = structurally_valid_settlements.get(
+                    canonical_source_id
+                )
+                if settlement_data is None:
+                    _mark_b1_validation_error(
+                        error_keys,
+                        {"b1MarkerOrSettlementAmbiguities"},
+                        validation_log_state,
+                    )
+                    continue
+                descriptor = next(
+                    (
+                        item
+                        for item in descriptors_by_source.get(
+                            canonical_source_id,
+                            (),
+                        )
+                        if item["sourceAliasKey"] == document_id
+                    ),
+                    None,
+                )
+                if descriptor is None:
+                    ambiguity_tokens.add(("processed", document_id))
+                    continue
+                try:
+                    _validate_processed_alias_projection(
+                        data,
+                        descriptor=descriptor,
+                        canonical_source_id=canonical_source_id,
+                        settlement_data=settlement_data,
+                    )
+                except SourceSettlementConflict:
+                    ambiguity_tokens.add(("processed", document_id))
+                except Exception:
+                    _mark_b1_validation_error(
+                        error_keys,
+                        {"b1MarkerOrSettlementAmbiguities"},
+                        validation_log_state,
+                    )
+                continue
+
+            if (
+                set(data) == {"processedAt"}
+                and _is_aware_datetime(data.get("processedAt"))
+            ):
+                legacy_marker_count += 1
+                continue
+            if (
+                set(data) == {"status", "replayAttemptId", "claimedAt"}
+                and data.get("status") == "operator_replay_in_progress"
+                and type(data.get("replayAttemptId")) is str
+                and bool(data.get("replayAttemptId"))
+                and _is_aware_datetime(data.get("claimedAt"))
+            ):
+                replay_attempt_states.setdefault(
+                    data["replayAttemptId"],
+                    set(),
+                ).add("in_progress")
+                continue
+            if (
+                set(data)
+                == {
+                    "status",
+                    "replayAttemptId",
+                    "claimedAt",
+                    "processedAt",
+                }
+                and data.get("status") == "processed"
+                and type(data.get("replayAttemptId")) is str
+                and bool(data.get("replayAttemptId"))
+                and _is_aware_datetime(data.get("claimedAt"))
+                and _is_aware_datetime(data.get("processedAt"))
+            ):
+                replay_attempt_states.setdefault(
+                    data["replayAttemptId"],
+                    set(),
+                ).add("completed")
+                continue
+            _mark_b1_validation_error(
+                error_keys,
+                _B1_COLLECTION_ERROR_KEYS[processed_collection_name],
+                validation_log_state,
+            )
+
+        for canonical_source_id in fully_valid_settlements:
+            for descriptor in descriptors_by_source[canonical_source_id]:
+                if descriptor["sourceAliasKey"] not in canonical_marker_ids:
+                    ambiguity_tokens.add(
+                        (
+                            "processed-missing",
+                            canonical_source_id,
+                            descriptor["sourceAliasKey"],
+                        )
+                    )
+
+    completed_replay_attempt_count = sum(
+        "in_progress" not in states
+        for states in replay_attempt_states.values()
+    )
+    quarantined_replay_attempt_count = sum(
+        "in_progress" in states
+        for states in replay_attempt_states.values()
+    )
+    counts["b1MarkerOrSettlementAmbiguities"] = len(ambiguity_tokens)
+    counts["b1LegacyMarkerOnlyAmbiguous"] = (
+        legacy_marker_count + completed_replay_attempt_count
+    )
+    counts["b1LegacyReplayClaimQuarantined"] = (
+        quarantined_replay_attempt_count
+    )
+    for key in error_keys:
+        counts[key] = COUNT_ERROR
+    return counts
+
+
 def _overall_status(token_state: Dict, graph_state: Dict, queues: Dict[str, int]) -> str:
     if token_state.get("status") == "error" or graph_state.get("status") == "error":
         return "error"
@@ -486,6 +1708,7 @@ def collect_user_health(
     queues[TERMINAL_PROTOCOL_HEALTH_KEY] = (
         _count_active_terminal_protocol_threads(user_ref)
     )
+    queues.update(_collect_b1_health_counts(user_ref, user_id=user_id))
 
     return {
         "status": _overall_status(token_state, graph_state, queues),

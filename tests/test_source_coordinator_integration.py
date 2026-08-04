@@ -1,6 +1,9 @@
 import os
+import io
+import logging
+import sys
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -12,15 +15,41 @@ os.environ.setdefault("E2E_TEST_MODE", "true")
 os.environ.setdefault("AZURE_API_APP_ID", "test-client-id")
 os.environ.setdefault("AZURE_API_CLIENT_SECRET", "test-client-secret")
 os.environ.setdefault("FIREBASE_API_KEY", "test-firebase-api-key")
-os.environ.setdefault("OPENAI_API_KEY", "test-openai-api-key")
-with mock.patch("google.cloud.firestore.Client", return_value=mock.Mock()):
+_IMPORT_OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+_SCOPED_IMPORT_OPENAI_API_KEY = (
+    _IMPORT_OPENAI_API_KEY or "test-openai-api-key"
+)
+with mock.patch.dict(
+    os.environ,
+    {"OPENAI_API_KEY": _SCOPED_IMPORT_OPENAI_API_KEY},
+    clear=False,
+), mock.patch("google.cloud.firestore.Client", return_value=mock.Mock()):
     import main
     import scheduler_runner
-    from email_automation import messaging, processing, source_coordinator
+    from email_automation import (
+        messaging,
+        processing,
+        source_coordinator,
+        system_health,
+    )
 
 
 MODE_ENV = source_coordinator.SOURCE_COORDINATOR_MODE_ENV
 FROZEN_NOW = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
+B1_HEALTH_KEYS = frozenset(
+    {
+        "b1ActiveClassifications",
+        "b1AmbiguousClassifications",
+        "b1BlockedSources",
+        "b1NonsettledPendingAdmissions",
+        "b1UnsettledWorkLedgers",
+        "b1AliasConflicts",
+        "b1MarkerOrSettlementAmbiguities",
+        "b1LegacyTerminalQuarantined",
+        "b1LegacyMarkerOnlyAmbiguous",
+        "b1LegacyReplayClaimQuarantined",
+    }
+)
 
 
 class SequentialIds:
@@ -111,7 +140,252 @@ class FakeSettlementCoordinator:
         return self.result
 
 
-def build_ready_ordinary_source(*, graph_id="graph-enforced", complete_work=True):
+class ReadOnlyCoordinatorHealthSnapshot:
+    def __init__(self, reference, data):
+        self.reference = reference
+        self.id = reference.id
+        self._data = deepcopy(data)
+
+    @property
+    def exists(self):
+        return self._data is not None
+
+    def to_dict(self):
+        return deepcopy(self._data)
+
+
+class ReadOnlyCoordinatorHealthQuery:
+    def __init__(self, view, path, *, filters=(), limit_count=None):
+        self.view = view
+        self.path = path.strip("/")
+        self.filters = tuple(filters)
+        self.limit_count = limit_count
+
+    def where(
+        self,
+        field_path=None,
+        operator=None,
+        value=None,
+        *,
+        filter=None,
+    ):
+        if filter is not None:
+            field_path = filter.field_path
+            operator = getattr(filter, "op_string", None)
+            value = filter.value
+        return ReadOnlyCoordinatorHealthQuery(
+            self.view,
+            self.path,
+            filters=(*self.filters, (field_path, operator, deepcopy(value))),
+            limit_count=self.limit_count,
+        )
+
+    def order_by(self, _field_path):
+        return self
+
+    def limit(self, count):
+        return ReadOnlyCoordinatorHealthQuery(
+            self.view,
+            self.path,
+            filters=self.filters,
+            limit_count=count,
+        )
+
+    @staticmethod
+    def _matches(actual, operator, expected):
+        if operator == "==":
+            return actual == expected
+        if operator == "!=":
+            return actual != expected
+        if operator == "in":
+            return actual in expected
+        if operator == "not-in":
+            return actual not in expected
+        raise AssertionError(
+            f"unsupported read-only health query operator: {operator}"
+        )
+
+    def stream(self):
+        prefix = f"{self.path}/"
+        expected_depth = len(self.path.split("/")) + 1
+        snapshots = []
+        for document_path, data in sorted(self.view.backing.data.items()):
+            if (
+                not document_path.startswith(prefix)
+                or len(document_path.split("/")) != expected_depth
+            ):
+                continue
+            if not all(
+                self._matches(data.get(field), operator, expected)
+                for field, operator, expected in self.filters
+            ):
+                continue
+            reference = ReadOnlyCoordinatorHealthDocument(
+                self.view,
+                document_path,
+            )
+            snapshots.append(
+                ReadOnlyCoordinatorHealthSnapshot(reference, data)
+            )
+        if self.limit_count is not None:
+            snapshots = snapshots[: self.limit_count]
+        self.view.reads.append(
+            (self.path, deepcopy(self.filters), self.limit_count)
+        )
+        return iter(snapshots)
+
+
+class ReadOnlyCoordinatorHealthCollection(ReadOnlyCoordinatorHealthQuery):
+    def document(self, document_id=None):
+        if document_id is None:
+            self.view._reject_write(
+                "collection.document(auto-id)",
+                self.path,
+            )
+        return ReadOnlyCoordinatorHealthDocument(
+            self.view,
+            f"{self.path}/{document_id}",
+        )
+
+    def add(self, _data, document_id=None, **_options):
+        del document_id, _options
+        self.view._reject_write("collection.add", self.path)
+
+
+class ReadOnlyCoordinatorHealthDocument:
+    def __init__(self, view, path):
+        self.view = view
+        self.path = path.strip("/")
+        self.id = self.path.rsplit("/", 1)[-1]
+
+    def collection(self, name):
+        return ReadOnlyCoordinatorHealthCollection(
+            self.view,
+            f"{self.path}/{name}",
+        )
+
+    def get(self):
+        self.view.reads.append((self.path, (), None))
+        return ReadOnlyCoordinatorHealthSnapshot(
+            self,
+            self.view.backing.data.get(self.path),
+        )
+
+    def _reject_write(self, operation):
+        self.view._reject_write(f"document.{operation}", self.path)
+
+    def create(self, _data, **_options):
+        del _options
+        self._reject_write("create")
+
+    def set(self, _data, *, merge=False, **_options):
+        del merge, _options
+        self._reject_write("set")
+
+    def update(self, _data, **_options):
+        del _options
+        self._reject_write("update")
+
+    def delete(self, **_options):
+        del _options
+        self._reject_write("delete")
+
+
+class ReadOnlyCoordinatorHealthWriteProxy:
+    def __init__(self, view, kind):
+        self.view = view
+        self.kind = kind
+
+    @staticmethod
+    def _reference_path(reference):
+        path = getattr(reference, "path", None)
+        return path if isinstance(path, str) and path else "<unknown-reference>"
+
+    def _reject_reference_write(self, operation, reference):
+        self.view._reject_write(
+            f"{self.kind}.{operation}",
+            self._reference_path(reference),
+        )
+
+    def create(self, reference, _data, **_options):
+        del _options
+        self._reject_reference_write("create", reference)
+
+    def set(self, reference, _data, *, merge=False, **_options):
+        del merge, _options
+        self._reject_reference_write("set", reference)
+
+    def update(self, reference, _data, **_options):
+        del _options
+        self._reject_reference_write("update", reference)
+
+    def delete(self, reference, **_options):
+        del _options
+        self._reject_reference_write("delete", reference)
+
+    def commit(self, **_options):
+        del _options
+        self.view._reject_write(f"{self.kind}.commit", "<client>")
+
+    def flush(self, **_options):
+        del _options
+        self.view._reject_write(f"{self.kind}.flush", "<client>")
+
+    def close(self, **_options):
+        del _options
+        self.view._reject_write(f"{self.kind}.close", "<client>")
+
+
+class ReadOnlyCoordinatorHealthView:
+    """Expose real coordinator fake state without granting write methods."""
+
+    def __init__(self, backing):
+        self.backing = backing
+        self.reads = []
+        self.writes = []
+
+    def collection(self, name):
+        return ReadOnlyCoordinatorHealthCollection(self, name)
+
+    def _record_write(self, operation, path):
+        self.writes.append((operation, path))
+
+    def _reject_write(self, operation, path):
+        self._record_write(operation, path)
+        raise AssertionError(
+            "read-only coordinator health view attempted "
+            f"{operation} at {path}"
+        )
+
+    def batch(self, **_options):
+        del _options
+        self._record_write("client.batch", "<client>")
+        return ReadOnlyCoordinatorHealthWriteProxy(self, "batch")
+
+    def transaction(self, **_options):
+        del _options
+        self._record_write("client.transaction", "<client>")
+        return ReadOnlyCoordinatorHealthWriteProxy(self, "transaction")
+
+    def bulk_writer(self, **_options):
+        del _options
+        self._record_write("client.bulk_writer", "<client>")
+        return ReadOnlyCoordinatorHealthWriteProxy(self, "bulk_writer")
+
+    def recursive_delete(self, reference, **_options):
+        del _options
+        path = getattr(reference, "path", "<unknown-reference>")
+        self._reject_write("client.recursive_delete", path)
+
+
+def build_ready_ordinary_source(
+    *,
+    graph_id="graph-enforced",
+    complete_work=True,
+    message_body="Please update the stage.",
+    proposal_value="warm",
+    recipient="recipient@example.test",
+):
     fake = FakeFirestore()
     coordinator = source_coordinator.SourceCoordinator(
         fake,
@@ -133,7 +407,8 @@ def build_ready_ordinary_source(*, graph_id="graph-enforced", complete_work=True
             "message": {
                 "from": "sender@example.test",
                 "subject": "Ready source",
-                "body": "Please update the stage.",
+                "body": message_body,
+                "recipient": recipient,
             },
         },
         classifier=lambda: (
@@ -144,7 +419,7 @@ def build_ready_ordinary_source(*, graph_id="graph-enforced", complete_work=True
                     {
                         "type": "field_update",
                         "field": "stage",
-                        "value": "warm",
+                        "value": proposal_value,
                     }
                 ],
             },
@@ -171,6 +446,11 @@ def build_ready_ordinary_source(*, graph_id="graph-enforced", complete_work=True
                 canonical_source_id=identity.canonical_source_id,
                 message_record={
                     "direction": "inbound",
+                    "body": {
+                        "contentType": "Text",
+                        "content": message_body,
+                    },
+                    "to": [recipient],
                     "headers": {"internetMessageId": None},
                     "sourceMessage": {
                         "graphMessageId": graph_id,
@@ -207,6 +487,549 @@ def build_ready_ordinary_source(*, graph_id="graph-enforced", complete_work=True
             },
         )
     return fake, coordinator, identity, ledger
+
+
+class SourceCoordinatorHealthIntegrationTests(unittest.TestCase):
+    PENDING_ADMISSION_KEY = "b1NonsettledPendingAdmissions"
+    UNSETTLED_LEDGER_KEY = "b1UnsettledWorkLedgers"
+    ACTIVE_CLASSIFICATION_KEY = "b1ActiveClassifications"
+    AMBIGUOUS_CLASSIFICATION_KEY = "b1AmbiguousClassifications"
+    LEGACY_TERMINAL_QUARANTINE_KEY = "b1LegacyTerminalQuarantined"
+
+    @staticmethod
+    def _collect_health(backing):
+        view = ReadOnlyCoordinatorHealthView(backing)
+        stdout_output = io.StringIO()
+        stderr_output = io.StringIO()
+        logging_output = io.StringIO()
+        root_logger = logging.getLogger()
+        previous_level = root_logger.level
+        capture_handler = logging.StreamHandler(logging_output)
+        capture_handler.setLevel(logging.DEBUG)
+        root_logger.addHandler(capture_handler)
+        root_logger.setLevel(logging.DEBUG)
+        try:
+            with redirect_stdout(stdout_output), redirect_stderr(stderr_output):
+                payload = system_health.collect_user_health(
+                    "user-enforced",
+                    fs_client=view,
+                    token_state={"status": "healthy"},
+                    graph_state={"status": "healthy"},
+                    now=FROZEN_NOW,
+                )
+        finally:
+            root_logger.removeHandler(capture_handler)
+            root_logger.setLevel(previous_level)
+            capture_handler.close()
+        rendered_channels = "".join(
+            (
+                stdout_output.getvalue(),
+                stderr_output.getvalue(),
+                logging_output.getvalue(),
+            )
+        )
+        return payload, rendered_channels, view
+
+    def assertAggregateHealthContract(self, payload, rendered_channels, *, raw_values):
+        self.assertEqual(
+            {
+                "status",
+                "token",
+                "graph",
+                "queues",
+                "countErrors",
+                "lastCheckedAt",
+                "updatedAt",
+            },
+            set(payload),
+        )
+        queues = payload["queues"]
+        self.assertEqual(
+            {
+                *system_health.QUEUE_COLLECTIONS,
+                system_health.TERMINAL_PROTOCOL_HEALTH_KEY,
+                *B1_HEALTH_KEYS,
+            },
+            set(queues),
+        )
+        self.assertEqual(
+            B1_HEALTH_KEYS,
+            {key for key in queues if key.startswith("b1")},
+        )
+        for key in B1_HEALTH_KEYS:
+            self.assertIs(type(queues[key]), int, key)
+        rendered = f"{payload!r}\n{rendered_channels}"
+        for raw_value in raw_values:
+            self.assertNotIn(raw_value, rendered)
+
+
+    @staticmethod
+    def _settle_ordinary_source(coordinator, identity, ledger):
+        entry = ledger["entries"][0]
+        work_arguments = {
+            "user_id": "user-enforced",
+            "canonical_source_id": identity.canonical_source_id,
+            "ledger_hash": ledger["ledgerHash"],
+            "work_key": entry["workKey"],
+            "payload_hash": entry["payloadHash"],
+        }
+        coordinator.record_source_work_applying(**work_arguments)
+        coordinator.complete_source_work_entry(
+            **work_arguments,
+            completion_record={
+                "schemaVersion": 1,
+                "evidenceKind": "work_completion",
+                "workKind": "field_update",
+                "resultHash": "b" * 64,
+            },
+        )
+        coordinator.settle_source_markers_if_ready(
+            user_id="user-enforced",
+            canonical_source_id=identity.canonical_source_id,
+            ledger_hash=ledger["ledgerHash"],
+        )
+
+    @staticmethod
+    def _add_legacy_terminal_quarantine(backing):
+        graph_message_id = "raw-legacy-graph-health-canary"
+        internet_message_id = "raw-legacy-address-health@example.test"
+        thread_id = "raw-legacy-thread-health-canary"
+        client_id = "raw-legacy-customer-health-canary"
+        backing.data[
+            f"users/user-enforced/threads/{thread_id}"
+        ] = {"clientId": client_id}
+
+        def retained_terminal_loader(*_args, **_kwargs):
+            return {
+                "kind": "active",
+                "saga": {
+                    "clientId": client_id,
+                    "sourceMessageKey": internet_message_id,
+                    "sourceGraphMessageId": graph_message_id,
+                    "sourceInternetMessageId": internet_message_id,
+                    "sagaKey": "raw-legacy-saga-health-canary",
+                    "immutableHash": "c" * 64,
+                    "phase": "classified",
+                },
+                "settlement": None,
+                "exactSourceConfirmed": True,
+            }
+
+        coordinator = source_coordinator.SourceCoordinator(
+            backing,
+            uuid_factory=lambda: "raw-legacy-canonical-health-canary",
+            now_factory=MutableClock(FROZEN_NOW),
+            retained_terminal_authority_loader=(
+                retained_terminal_loader
+            ),
+        )
+        identity = coordinator.admit_or_repair_source_identity(
+            user_id="user-enforced",
+            hydrated_message={
+                "id": graph_message_id,
+                "internetMessageId": internet_message_id,
+                "body": "raw customer message body health canary",
+                "recipient": "raw-recipient-health@example.test",
+            },
+            evidence_kind="operator_replay",
+            thread_id=thread_id,
+        )
+        coordinator.quarantine_retained_terminal_authority(
+            user_id="user-enforced",
+            canonical_source_id=identity.canonical_source_id,
+            thread_id=thread_id,
+            graph_message_id=graph_message_id,
+            internet_message_id=internet_message_id,
+        )
+        return identity
+
+    def test_empty_openai_key_is_scoped_only_during_offline_imports(self):
+        self.assertTrue(_SCOPED_IMPORT_OPENAI_API_KEY)
+        if _IMPORT_OPENAI_API_KEY == "":
+            self.assertEqual("", os.environ.get("OPENAI_API_KEY"))
+        self.assertIsNotNone(main)
+        self.assertIsNotNone(system_health)
+
+    def test_health_capture_includes_stderr_and_python_logging_channels(self):
+        backing = FakeFirestore()
+        stderr_canary = "raw-health-stderr-leak-canary"
+        logging_canary = "raw-health-python-log-leak-canary"
+        collect = system_health.collect_user_health
+
+        def leaking_collect(*args, **kwargs):
+            print(stderr_canary, file=sys.stderr)
+            logging.getLogger("tests.health-leak-probe").warning(logging_canary)
+            return collect(*args, **kwargs)
+
+        with mock.patch.object(
+            system_health,
+            "collect_user_health",
+            side_effect=leaking_collect,
+        ):
+            _payload, rendered_channels, _view = self._collect_health(backing)
+
+        self.assertIn(stderr_canary, rendered_channels)
+        self.assertIn(logging_canary, rendered_channels)
+
+    def test_aggregate_contract_rejects_debug_topology_and_channel_leaks(self):
+        aggregate_payload, rendered_channels, _view = self._collect_health(
+            FakeFirestore()
+        )
+        debug_payload = deepcopy(aggregate_payload)
+        debug_payload["queues"]["b1DebugDetails"] = 0
+
+        with self.assertRaises(AssertionError):
+            self.assertAggregateHealthContract(
+                debug_payload,
+                rendered_channels,
+                raw_values=(),
+            )
+        with self.assertRaises(AssertionError):
+            self.assertAggregateHealthContract(
+                aggregate_payload,
+                "raw-health-channel-leak-canary",
+                raw_values=("raw-health-channel-leak-canary",),
+            )
+
+        stderr_canary = "raw-health-stderr-contract-canary"
+        logging_canary = "raw-health-logging-contract-canary"
+        collect = system_health.collect_user_health
+
+        def leaking_collect(*args, **kwargs):
+            print(stderr_canary, file=sys.stderr)
+            logging.getLogger("tests.health-contract-probe").error(
+                logging_canary
+            )
+            return collect(*args, **kwargs)
+
+        with mock.patch.object(
+            system_health,
+            "collect_user_health",
+            side_effect=leaking_collect,
+        ):
+            leaked_payload, leaked_channels, _leaked_view = (
+                self._collect_health(FakeFirestore())
+            )
+        with self.assertRaises(AssertionError):
+            self.assertAggregateHealthContract(
+                leaked_payload,
+                leaked_channels,
+                raw_values=(stderr_canary, logging_canary),
+            )
+
+    def test_read_only_health_view_observes_every_supported_write_surface(self):
+        def explicit_document(view):
+            return view.collection("users").document("user-enforced")
+
+        def arbitrary_document(view):
+            return explicit_document(view).collection("healthProbe").document(
+                "probe"
+            )
+
+        cases = {
+            "collection add": (
+                lambda view: explicit_document(view)
+                .collection("healthProbe")
+                .add({"unexpected": True}),
+                "collection.add",
+            ),
+            "collection add options": (
+                lambda view: explicit_document(view)
+                .collection("healthProbe")
+                .add(
+                    {"unexpected": True},
+                    document_id="probe",
+                    retry="retry-policy",
+                    timeout=1,
+                ),
+                "collection.add",
+            ),
+            "collection auto id": (
+                lambda view: explicit_document(view)
+                .collection("healthProbe")
+                .document(),
+                "collection.document(auto-id)",
+            ),
+            "document create": (
+                lambda view: arbitrary_document(view).create(
+                    {"unexpected": True}
+                ),
+                "document.create",
+            ),
+            "document set": (
+                lambda view: arbitrary_document(view).set(
+                    {"unexpected": True}
+                ),
+                "document.set",
+            ),
+            "document set options": (
+                lambda view: arbitrary_document(view).set(
+                    {"unexpected": True},
+                    merge=True,
+                    retry="retry-policy",
+                    timeout=1,
+                ),
+                "document.set",
+            ),
+            "document update": (
+                lambda view: arbitrary_document(view).update(
+                    {"unexpected": True}
+                ),
+                "document.update",
+            ),
+            "document delete": (
+                lambda view: arbitrary_document(view).delete(),
+                "document.delete",
+            ),
+            "batch factory": (lambda view: view.batch(), "client.batch"),
+            "batch create": (
+                lambda view: view.batch().create(
+                    arbitrary_document(view), {"unexpected": True}
+                ),
+                "batch.create",
+            ),
+            "batch set": (
+                lambda view: view.batch().set(
+                    arbitrary_document(view), {"unexpected": True}
+                ),
+                "batch.set",
+            ),
+            "batch update": (
+                lambda view: view.batch().update(
+                    arbitrary_document(view), {"unexpected": True}
+                ),
+                "batch.update",
+            ),
+            "batch update option": (
+                lambda view: view.batch().update(
+                    arbitrary_document(view),
+                    {"unexpected": True},
+                    option="write-option",
+                ),
+                "batch.update",
+            ),
+            "batch delete": (
+                lambda view: view.batch().delete(arbitrary_document(view)),
+                "batch.delete",
+            ),
+            "batch commit": (
+                lambda view: view.batch().commit(
+                    retry="retry-policy",
+                    timeout=1,
+                ),
+                "batch.commit",
+            ),
+            "transaction factory": (
+                lambda view: view.transaction(),
+                "client.transaction",
+            ),
+            "transaction create": (
+                lambda view: view.transaction().create(
+                    arbitrary_document(view), {"unexpected": True}
+                ),
+                "transaction.create",
+            ),
+            "transaction set": (
+                lambda view: view.transaction().set(
+                    arbitrary_document(view), {"unexpected": True}
+                ),
+                "transaction.set",
+            ),
+            "transaction update": (
+                lambda view: view.transaction().update(
+                    arbitrary_document(view), {"unexpected": True}
+                ),
+                "transaction.update",
+            ),
+            "transaction delete": (
+                lambda view: view.transaction().delete(
+                    arbitrary_document(view),
+                    option="write-option",
+                ),
+                "transaction.delete",
+            ),
+            "transaction commit": (
+                lambda view: view.transaction().commit(),
+                "transaction.commit",
+            ),
+            "bulk writer factory": (
+                lambda view: view.bulk_writer(),
+                "client.bulk_writer",
+            ),
+            "bulk writer create": (
+                lambda view: view.bulk_writer().create(
+                    arbitrary_document(view), {"unexpected": True}
+                ),
+                "bulk_writer.create",
+            ),
+            "bulk writer set": (
+                lambda view: view.bulk_writer().set(
+                    arbitrary_document(view), {"unexpected": True}
+                ),
+                "bulk_writer.set",
+            ),
+            "bulk writer update": (
+                lambda view: view.bulk_writer().update(
+                    arbitrary_document(view), {"unexpected": True}
+                ),
+                "bulk_writer.update",
+            ),
+            "bulk writer delete": (
+                lambda view: view.bulk_writer().delete(
+                    arbitrary_document(view)
+                ),
+                "bulk_writer.delete",
+            ),
+            "bulk writer flush": (
+                lambda view: view.bulk_writer().flush(),
+                "bulk_writer.flush",
+            ),
+            "bulk writer close": (
+                lambda view: view.bulk_writer().close(),
+                "bulk_writer.close",
+            ),
+            "recursive delete": (
+                lambda view: view.recursive_delete(arbitrary_document(view)),
+                "client.recursive_delete",
+            ),
+        }
+
+        for case, (attempt, expected_operation) in cases.items():
+            with self.subTest(case=case):
+                view = ReadOnlyCoordinatorHealthView(FakeFirestore())
+                try:
+                    attempt(view)
+                except Exception:
+                    pass
+                self.assertTrue(
+                    any(
+                        operation == expected_operation
+                        for operation, _path in view.writes
+                    ),
+                    view.writes,
+                )
+
+    def test_pending_admission_and_unsettled_ledger_warn_then_settlement_clears(self):
+        backing, coordinator, identity, ledger = (
+            build_ready_ordinary_source(complete_work=False)
+        )
+        pending, pending_logs, pending_view = self._collect_health(backing)
+
+        self._settle_ordinary_source(
+            coordinator,
+            identity,
+            ledger,
+        )
+        settled, settled_logs, settled_view = self._collect_health(backing)
+
+        self.assertEqual("warning", pending["status"])
+        self.assertEqual(
+            1,
+            pending["queues"].get(self.PENDING_ADMISSION_KEY),
+        )
+        self.assertEqual(
+            1,
+            pending["queues"].get(self.UNSETTLED_LEDGER_KEY),
+        )
+        self.assertEqual(
+            0,
+            settled["queues"].get(self.PENDING_ADMISSION_KEY),
+        )
+        self.assertEqual(
+            0,
+            settled["queues"].get(self.UNSETTLED_LEDGER_KEY),
+        )
+        self.assertEqual("healthy", settled["status"])
+        self.assertEqual("", pending_logs)
+        self.assertEqual("", settled_logs)
+        self.assertEqual([], pending_view.writes)
+        self.assertEqual([], settled_view.writes)
+
+    def test_settlement_does_not_hide_legacy_terminal_quarantine(self):
+        backing, coordinator, identity, ledger = (
+            build_ready_ordinary_source(complete_work=False)
+        )
+        self._add_legacy_terminal_quarantine(backing)
+        before, _before_logs, _before_view = self._collect_health(backing)
+
+        self._settle_ordinary_source(
+            coordinator,
+            identity,
+            ledger,
+        )
+        after, _after_logs, _after_view = self._collect_health(backing)
+
+        self.assertEqual(
+            1,
+            before["queues"].get(self.LEGACY_TERMINAL_QUARANTINE_KEY),
+        )
+        self.assertEqual(
+            1,
+            after["queues"].get(self.LEGACY_TERMINAL_QUARANTINE_KEY),
+        )
+        self.assertEqual(
+            0,
+            after["queues"].get(self.PENDING_ADMISSION_KEY),
+        )
+        self.assertEqual(
+            0,
+            after["queues"].get(self.UNSETTLED_LEDGER_KEY),
+        )
+        self.assertEqual(
+            0,
+            after["queues"].get(self.ACTIVE_CLASSIFICATION_KEY),
+        )
+        self.assertEqual(
+            0,
+            after["queues"].get(self.AMBIGUOUS_CLASSIFICATION_KEY),
+        )
+        self.assertEqual("warning", after["status"])
+
+    def test_health_payload_and_logs_are_aggregate_only_and_read_only(self):
+        body_canary = "raw-ordinary-body-health-canary"
+        proposal_canary = "raw-ordinary-proposal-health-canary"
+        recipient_canary = "raw-ordinary-recipient-health@example.test"
+        backing, _coordinator, identity, _ledger = (
+            build_ready_ordinary_source(
+                graph_id="raw-ordinary-graph-health-canary",
+                complete_work=False,
+                message_body=body_canary,
+                proposal_value=proposal_canary,
+                recipient=recipient_canary,
+            )
+        )
+        legacy_identity = self._add_legacy_terminal_quarantine(backing)
+        persisted = repr(backing.data)
+        self.assertIn(body_canary, persisted)
+        self.assertIn(proposal_canary, persisted)
+        self.assertIn(recipient_canary, persisted)
+
+        payload, logs, view = self._collect_health(backing)
+
+        self.assertAggregateHealthContract(
+            payload,
+            logs,
+            raw_values=(
+                identity.canonical_source_id,
+                legacy_identity.canonical_source_id,
+                *(alias.key for alias in identity.aliases),
+                *(alias.key for alias in legacy_identity.aliases),
+                "raw-ordinary-graph-health-canary",
+                "raw-legacy-graph-health-canary",
+                "raw-legacy-address-health@example.test",
+                recipient_canary,
+                "raw-recipient-health@example.test",
+                body_canary,
+                "raw customer message body health canary",
+                proposal_canary,
+                "thread-enforced",
+                "raw-legacy-customer-health-canary",
+                "raw-legacy-thread-health-canary",
+                "raw-legacy-saga-health-canary",
+            ),
+        )
+        self.assertTrue(view.reads)
+        self.assertEqual([], view.writes)
 
 
 class SourceCoordinatorModeContainmentTests(unittest.TestCase):

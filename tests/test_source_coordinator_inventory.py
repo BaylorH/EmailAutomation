@@ -18,9 +18,219 @@ FORBIDDEN_SOURCE_COORDINATOR_APPLICATION_MODULES = {
     "ai_processing",
     "email",
     "file_handling",
+    "followup",
+    "messaging",
+    "notifications",
+    "pending_responses",
+    "processing",
+    "send_permits",
     "sheet_operations",
     "sheets",
 }
+B1_COLLECTION_NAMES = frozenset(
+    {
+        "sourceIdentities",
+        "sourceAliases",
+        "sourceClassifications",
+        "sourceTransitionOwners",
+        "threadTransitionHeads",
+        "sourceWorkLedgers",
+        "sourceDeferredWork",
+        "inboundPendingAdmissions",
+        "blockedSources",
+        "sourceSettlements",
+    }
+)
+B1_RUNTIME_COLLECTION_PATHS = frozenset(
+    {
+        "email_automation/source_coordinator.py",
+        "email_automation/system_health.py",
+        "scripts/production_reset.py",
+    }
+)
+SOURCE_COORDINATOR_FORBIDDEN_EFFECT_CALLS = frozenset(
+    {
+        "_delete_graph_reply_draft",
+        "add_client_notifications",
+        "apply_proposal_to_sheet",
+        "begin_graph_draft_attachment",
+        "begin_graph_draft_creation",
+        "begin_graph_draft_patch",
+        "cas_pending_claim_transition",
+        "cas_terminal_reply_transition",
+        "claim_pending_response_for_send_exact",
+        "clear_pending_response",
+        "clear_pending_response_exact",
+        "clear_row_highlight",
+        "complete_graph_draft_attachment",
+        "complete_graph_draft_creation",
+        "complete_graph_draft_patch",
+        "consume_graph_send_capability",
+        "ensure_nonviable_divider",
+        "finalize_graph_draft_preparation",
+        "highlight_row",
+        "issue_pending_graph_send_permit",
+        "issue_terminal_graph_send_permit",
+        "mark_event_handled",
+        "mark_processed",
+        "move_row_below_divider",
+        "operator_settle_pending_graph_send_review",
+        "queue_pending_response",
+        "reconcile_pending_graph_send_permit",
+        "resolve_graph_send_permit",
+        "send_and_index_email",
+        "send_email",
+        "send_reply_in_thread",
+        "sync_thread_row_numbers_after_move",
+        "write_notification",
+    }
+)
+EXPECTED_PROCESSED_COLLECTION_REFERENCES = Counter(
+    {
+        ("app.py", ("api_firestore_inspect",)): 1,
+        ("app.py", ("api_firestore_cleanup",)): 3,
+        ("email_automation/messaging.py", ("_processed_ref",)): 1,
+        ("email_automation/operator_replay.py", ("_processed_ref",)): 1,
+        (
+            "email_automation/processing.py",
+            ("_strict_legacy_source_marker_disposition",),
+        ): 1,
+        (
+            "email_automation/processing.py",
+            ("_validate_operator_replay_claims",),
+        ): 1,
+        (
+            "email_automation/source_coordinator.py",
+            ("_stage_source_authority_mutations", "affects_audit_verdict"),
+        ): 1,
+        (
+            "email_automation/source_coordinator.py",
+            ("_audit_source_identity",),
+        ): 1,
+        (
+            "email_automation/source_coordinator.py",
+            ("verify_settled_source_dispatch_binding",),
+        ): 1,
+        (
+            "email_automation/source_coordinator.py",
+            ("settle_source_markers_if_ready",),
+        ): 1,
+        ("email_automation/system_health.py", ()): 2,
+        ("main.py", ("auto_cleanup_firestore",)): 1,
+        ("scheduler_runner.py", ("_processed_ref",)): 1,
+        ("scripts/analyze_production.py", ("analyze_user",)): 1,
+        ("scripts/e2e_tools.py", ("check_firestore_all",)): 1,
+        ("scripts/production_reset.py", ()): 1,
+    }
+)
+EXPECTED_DIRECT_PROCESSED_WRITERS = Counter(
+    {
+        (
+            "email_automation/messaging.py",
+            ("_legacy_mark_processed",),
+            "set",
+        ): 1,
+        (
+            "email_automation/operator_replay.py",
+            ("_begin_replay_claim",),
+            "create",
+        ): 1,
+        (
+            "email_automation/operator_replay.py",
+            ("_complete_replay_claim",),
+            "set",
+        ): 1,
+        (
+            "scheduler_runner.py",
+            ("_legacy_mark_processed",),
+            "set",
+        ): 1,
+    }
+)
+EXPECTED_MARK_PROCESSED_CALLS = Counter(
+    {
+        ("email_automation/processing.py", ("retry_processing_failures",)): 2,
+        (
+            "email_automation/processing.py",
+            ("_skip_inbox_retry_after_manual_continuation",),
+        ): 1,
+        ("email_automation/processing.py", ("scan_inbox_against_index",)): 5,
+        ("scheduler_runner.py", ("scan_inbox_against_index",)): 1,
+        ("scheduler_runner.py", ("process_inbox_message",)): 1,
+    }
+)
+EXPECTED_HANDLED_CALLS = Counter(
+    {
+        (
+            "email_automation/messaging.py",
+            ("is_event_handled",),
+            "get_handled_events",
+        ): 1,
+        (
+            "email_automation/processing.py",
+            ("process_inbox_message",),
+            "is_event_handled",
+        ): 1,
+        (
+            "email_automation/processing.py",
+            ("process_inbox_message",),
+            "mark_event_handled",
+        ): 12,
+    }
+)
+EXPECTED_HANDLED_LITERALS = Counter(
+    {
+        (
+            "email_automation/messaging.py",
+            ("get_handled_events",),
+            "handledEvents",
+        ): 1,
+        (
+            "email_automation/messaging.py",
+            ("mark_event_handled",),
+            "handledEvents.",
+        ): 1,
+        (
+            "email_automation/processing.py",
+            ("_find_handled_event_for_message",),
+            "handledEvents",
+        ): 1,
+        (
+            "email_automation/processing.py",
+            ("_find_handled_event_for_message",),
+            "/handledEvents",
+        ): 1,
+        (
+            "email_automation/processing.py",
+            ("_strict_legacy_source_marker_disposition",),
+            "handledEvents",
+        ): 1,
+        (
+            "email_automation/processing.py",
+            ("_thread_handled_event_record",),
+            "handledEvents",
+        ): 1,
+        (
+            "email_automation/processing.py",
+            ("_thread_handled_event_record",),
+            "handledEvents.",
+        ): 1,
+        (
+            "email_automation/processing.py",
+            ("_settle_terminal_notification_obligation",),
+            "handledEvents.",
+        ): 2,
+    }
+)
+B2_B3_FORBIDDEN_OWNERSHIP_LITERALS = frozenset(
+    {
+        "rowBindings",
+        "stableRowOwner",
+        "executionEpoch",
+        "executionClaimId",
+        "providerIntent",
+    }
+)
 DRAFT_DELETE_MANIFEST_PATH = REPO_ROOT / "tests/fixtures/graph_draft_delete_callers.json"
 DRAFT_DELETE_HELPER_NAME = "_delete_graph_reply_draft"
 DRAFT_DELETE_EMAIL_MODULE = "email_automation.email"
@@ -1440,6 +1650,434 @@ def _discover_legacy_authority_symbols():
     )
 
 
+def _call_name(node):
+    if not isinstance(node, ast.Call):
+        return None
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return None
+
+
+class _StaticClosureVisitor(ast.NodeVisitor):
+    def __init__(self, relative_path):
+        self.relative_path = Path(relative_path).as_posix()
+        self.function_scopes = []
+        self.b1_collection_literals = Counter()
+        self.processed_collection_references = Counter()
+        self.direct_processed_writers = Counter()
+        self.mark_processed_calls = Counter()
+        self.handled_calls = Counter()
+        self.handled_literals = Counter()
+        self.forbidden_ownership_literals = Counter()
+        self.processed_reference_names = [set()]
+
+    def _scope(self):
+        return tuple(self.function_scopes)
+
+    def visit_FunctionDef(self, node):
+        self.function_scopes.append(node.name)
+        self.processed_reference_names.append(set())
+        self.generic_visit(node)
+        self.processed_reference_names.pop()
+        self.function_scopes.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    @staticmethod
+    def _assignment_target_names(target):
+        if isinstance(target, ast.Name):
+            return (target.id,)
+        if isinstance(target, (ast.List, ast.Tuple)):
+            return tuple(
+                name
+                for element in target.elts
+                for name in _StaticClosureVisitor._assignment_target_names(element)
+            )
+        return ()
+
+    def _is_processed_reference(self, expression):
+        tainted_names = self.processed_reference_names[-1]
+        if isinstance(expression, ast.Name):
+            return expression.id in tainted_names
+        if not isinstance(expression, ast.Call):
+            return False
+        name = _call_name(expression)
+        if name == "_processed_ref":
+            return True
+        if (
+            name == "collection"
+            and expression.args
+            and isinstance(expression.args[0], ast.Constant)
+            and expression.args[0].value == "processedMessages"
+        ):
+            return True
+        return bool(
+            isinstance(expression.func, ast.Attribute)
+            and expression.func.attr
+            in {"collection", "document", "limit", "order_by", "start_after", "where"}
+            and self._is_processed_reference(expression.func.value)
+        )
+
+    def visit_Assign(self, node):
+        if self._is_processed_reference(node.value):
+            for target in node.targets:
+                self.processed_reference_names[-1].update(
+                    self._assignment_target_names(target)
+                )
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node):
+        if node.value is not None and self._is_processed_reference(node.value):
+            self.processed_reference_names[-1].update(
+                self._assignment_target_names(node.target)
+            )
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        name = _call_name(node)
+        if name in {"mark_event_handled", "is_event_handled", "get_handled_events"}:
+            self.handled_calls[(self.relative_path, self._scope(), name)] += 1
+        if name == "mark_processed":
+            self.mark_processed_calls[(self.relative_path, self._scope())] += 1
+        if (
+            name in {"set", "create", "update", "delete", "add"}
+            and isinstance(node.func, ast.Attribute)
+            and any(
+                self._is_processed_reference(expression)
+                for expression in (node.func.value, *node.args)
+            )
+        ):
+            self.direct_processed_writers[
+                (self.relative_path, self._scope(), name)
+            ] += 1
+        self.generic_visit(node)
+
+    def visit_Constant(self, node):
+        if type(node.value) is not str:
+            return
+        key = (self.relative_path, self._scope())
+        if node.value in B1_COLLECTION_NAMES:
+            self.b1_collection_literals[(self.relative_path, node.value)] += 1
+        if node.value == "processedMessages":
+            self.processed_collection_references[key] += 1
+        if "handledEvents" in node.value:
+            self.handled_literals[(self.relative_path, self._scope(), node.value)] += 1
+        if node.value in B2_B3_FORBIDDEN_OWNERSHIP_LITERALS:
+            self.forbidden_ownership_literals[(self.relative_path, node.value)] += 1
+
+
+def _discover_static_closure_inventory():
+    counter_names = (
+        "b1_collection_literals",
+        "processed_collection_references",
+        "direct_processed_writers",
+        "mark_processed_calls",
+        "handled_calls",
+        "handled_literals",
+        "forbidden_ownership_literals",
+    )
+    inventory = _StaticClosureVisitor(".")
+    for relative_path in _application_python_files():
+        visitor = _StaticClosureVisitor(relative_path)
+        visitor.visit(_parse_module(relative_path))
+        for attribute in counter_names:
+            getattr(inventory, attribute).update(getattr(visitor, attribute))
+    return inventory
+
+
+def _source_coordinator_forbidden_effect_calls(tree):
+    violations = []
+    classifier_calls = []
+    scopes = []
+
+    class Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node):
+            scopes.append(node.name)
+            self.generic_visit(node)
+            scopes.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node):
+            name = _call_name(node)
+            if name in SOURCE_COORDINATOR_FORBIDDEN_EFFECT_CALLS:
+                violations.append((node.lineno, tuple(scopes), name))
+            if name == "classifier":
+                classifier_calls.append((node.lineno, tuple(scopes)))
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    if Counter(scope for _line, scope in classifier_calls) != Counter(
+        {("classify_source_once",): 1}
+    ):
+        violations.extend(
+            (line, scope, "classifier") for line, scope in classifier_calls
+        )
+        if not classifier_calls:
+            violations.append((0, (), "missing exact classifier invocation"))
+    return violations
+
+
+def _system_health_write_calls(tree):
+    reference_chain_methods = {
+        "collection",
+        "document",
+        "limit",
+        "order_by",
+        "start_after",
+        "where",
+    }
+
+    def scoped_nodes(function):
+        nodes = []
+
+        class Visitor(ast.NodeVisitor):
+            def visit_FunctionDef(self, node):
+                if node is function:
+                    self.generic_visit(node)
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_ClassDef(self, _node):
+                return
+
+            def visit_Lambda(self, _node):
+                return
+
+            def generic_visit(self, node):
+                if node is not function:
+                    nodes.append(node)
+                super().generic_visit(node)
+
+        Visitor().visit(function)
+        return nodes
+
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    function_nodes = {function: scoped_nodes(function) for function in functions}
+
+    def target_names(target):
+        if isinstance(target, ast.Name):
+            return (target.id,)
+        if isinstance(target, (ast.List, ast.Tuple)):
+            return tuple(
+                name
+                for element in target.elts
+                for name in target_names(element)
+            )
+        return ()
+
+    def is_reference(expression, tainted_names, returning_helpers):
+        if isinstance(expression, ast.Name):
+            return expression.id in tainted_names
+        if not isinstance(expression, ast.Call):
+            return False
+        name = _call_name(expression)
+        if name in returning_helpers:
+            return True
+        if (
+            name == "collection"
+            and expression.args
+            and isinstance(expression.args[0], ast.Constant)
+            and expression.args[0].value in B1_COLLECTION_NAMES
+        ):
+            return True
+        return bool(
+            isinstance(expression.func, ast.Attribute)
+            and expression.func.attr in reference_chain_methods
+            and is_reference(
+                expression.func.value,
+                tainted_names,
+                returning_helpers,
+            )
+        )
+
+    def reference_names(function, returning_helpers):
+        tainted_names = set()
+        assignments = [
+            node
+            for node in function_nodes[function]
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and node.value is not None
+        ]
+        changed = True
+        while changed:
+            changed = False
+            for assignment in assignments:
+                if not is_reference(
+                    assignment.value,
+                    tainted_names,
+                    returning_helpers,
+                ):
+                    continue
+                targets = (
+                    assignment.targets
+                    if isinstance(assignment, ast.Assign)
+                    else (assignment.target,)
+                )
+                for target in targets:
+                    for name in target_names(target):
+                        if name not in tainted_names:
+                            tainted_names.add(name)
+                            changed = True
+        return tainted_names
+
+    returning_helpers = set()
+    changed = True
+    while changed:
+        changed = False
+        for function in functions:
+            tainted_names = reference_names(function, returning_helpers)
+            if function.name in returning_helpers:
+                continue
+            if any(
+                isinstance(node, ast.Return)
+                and node.value is not None
+                and is_reference(node.value, tainted_names, returning_helpers)
+                for node in function_nodes[function]
+            ):
+                returning_helpers.add(function.name)
+                changed = True
+
+    violations = []
+    for function in functions:
+        tainted_names = reference_names(function, returning_helpers)
+        for node in function_nodes[function]:
+            if (
+                not isinstance(node, ast.Call)
+                or not isinstance(node.func, ast.Attribute)
+                or node.func.attr not in {"set", "create", "update", "delete", "add"}
+            ):
+                continue
+            effect_expressions = (node.func.value, *node.args)
+            if any(
+                is_reference(expression, tainted_names, returning_helpers)
+                for expression in effect_expressions
+            ):
+                violations.append((node.lineno, node.func.attr))
+    return violations
+
+
+def _runtime_enforced_default_violations(tree):
+    violations = []
+
+    def is_mode_key(expression):
+        return (
+            isinstance(expression, ast.Constant)
+            and expression.value == "SITESIFT_SOURCE_COORDINATOR_MODE"
+        ) or (
+            isinstance(expression, ast.Name)
+            and expression.id == "SOURCE_COORDINATOR_MODE_ENV"
+        )
+
+    def is_enforced_value(expression):
+        if isinstance(expression, ast.Constant):
+            return expression.value == "enforced"
+        if not isinstance(expression, ast.Attribute):
+            return False
+        if (
+            expression.attr == "ENFORCED"
+            and isinstance(expression.value, ast.Name)
+            and expression.value.id == "CoordinatorMode"
+        ):
+            return True
+        return bool(
+            expression.attr == "value"
+            and isinstance(expression.value, ast.Attribute)
+            and expression.value.attr == "ENFORCED"
+            and isinstance(expression.value.value, ast.Name)
+            and expression.value.value.id == "CoordinatorMode"
+        )
+
+    def is_environment_mapping(expression):
+        return (
+            isinstance(expression, ast.Name)
+            and expression.id == "environ"
+        ) or (
+            isinstance(expression, ast.Attribute)
+            and expression.attr == "environ"
+            and isinstance(expression.value, ast.Name)
+            and expression.value.id == "os"
+        )
+
+    def assigned_values(node):
+        if isinstance(node, ast.Assign):
+            return node.targets, node.value
+        if isinstance(node, ast.AnnAssign) and node.value is not None:
+            return (node.target,), node.value
+        return (), None
+
+    for node in ast.walk(tree):
+        targets, value = assigned_values(node)
+        if value is not None and is_enforced_value(value):
+            for target in targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and is_environment_mapping(target.value)
+                    and is_mode_key(target.slice)
+                ):
+                    violations.append((node.lineno, "environment assignment"))
+
+        if not isinstance(node, ast.Call) or not isinstance(
+            node.func, ast.Attribute
+        ):
+            continue
+        method = node.func.attr
+        receiver = node.func.value
+        if method in {"get", "setdefault"} and is_environment_mapping(receiver):
+            if len(node.args) >= 2 and is_mode_key(node.args[0]) and is_enforced_value(
+                node.args[1]
+            ):
+                violations.append((node.lineno, f"environment {method} default"))
+            for keyword in node.keywords:
+                if (
+                    keyword.arg == "default"
+                    and node.args
+                    and is_mode_key(node.args[0])
+                    and is_enforced_value(keyword.value)
+                ):
+                    violations.append((node.lineno, f"environment {method} default"))
+        if (
+            method in {"getenv", "putenv"}
+            and isinstance(receiver, ast.Name)
+            and receiver.id == "os"
+            and len(node.args) >= 2
+            and is_mode_key(node.args[0])
+            and is_enforced_value(node.args[1])
+        ):
+            violations.append((node.lineno, f"os.{method} enforced value"))
+    return violations
+
+
+def _module_assignment_string_values(tree, assignment_name):
+    definitions = []
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+        if any(
+            isinstance(target, ast.Name) and target.id == assignment_name
+            for target in targets
+        ):
+            definitions.append(node.value)
+    if len(definitions) != 1 or not isinstance(
+        definitions[0], (ast.List, ast.Tuple, ast.Set)
+    ):
+        raise AssertionError(f"expected one literal {assignment_name} assignment")
+    values = definitions[0].elts
+    if any(
+        not isinstance(value, ast.Constant) or type(value.value) is not str
+        for value in values
+    ):
+        raise AssertionError(f"{assignment_name} must contain only string literals")
+    return [value.value for value in values]
+
+
 def _in_memory_draft_delete_callers(source, relative_path):
     visitor = _DraftDeleteCallVisitor(relative_path)
     visitor.visit(ast.parse(source, filename=relative_path))
@@ -1634,6 +2272,10 @@ class ProviderDeleteValidatorTests(unittest.TestCase):
 
 
 class InventoryContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.static_closure_inventory = _discover_static_closure_inventory()
+
     def assertSourceCoordinatorImportsRejected(self, source):
         in_memory_module = mock.Mock()
         in_memory_module.exists.return_value = True
@@ -1708,6 +2350,351 @@ class InventoryContractTests(unittest.TestCase):
             filename=str(SOURCE_COORDINATOR_PATH),
         )
         self.assertEqual([], _source_coordinator_forbidden_imports(tree))
+
+    def test_source_coordinator_has_no_forbidden_effect_calls(self):
+        tree = _parse_module(SOURCE_COORDINATOR_RELATIVE_PATH)
+        self.assertEqual([], _source_coordinator_forbidden_effect_calls(tree))
+
+        mutations = {
+            "Graph send": "def classify_source_once(): send_and_index_email()",
+            "Sheet mutation": "def helper(): apply_proposal_to_sheet()",
+            "notification": "def helper(): write_notification()",
+            "handled write": "def helper(): mark_event_handled()",
+            "pending mutation": "def helper(): queue_pending_response()",
+            "permit mutation": "def helper(): issue_terminal_graph_send_permit()",
+            "extra classifier": (
+                "def classify_source_once(): classifier()\n"
+                "def alternate(): classifier()"
+            ),
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _source_coordinator_forbidden_effect_calls(ast.parse(source))
+                )
+
+    def test_exact_ten_b1_collections_have_only_reviewed_runtime_owners(self):
+        occurrences = self.static_closure_inventory.b1_collection_literals
+        self.assertEqual(
+            B1_COLLECTION_NAMES,
+            {collection_name for _path, collection_name in occurrences},
+        )
+        self.assertEqual(
+            set(),
+            {
+                path
+                for path, _collection_name in occurrences
+                if path not in B1_RUNTIME_COLLECTION_PATHS
+            },
+        )
+        for collection_name in B1_COLLECTION_NAMES:
+            with self.subTest(collection_name=collection_name):
+                owners = {
+                    path
+                    for path, found_name in occurrences
+                    if found_name == collection_name
+                }
+                self.assertIn(
+                    SOURCE_COORDINATOR_RELATIVE_PATH.as_posix(),
+                    owners,
+                )
+                self.assertIn("scripts/production_reset.py", owners)
+
+        reset_values = _module_assignment_string_values(
+            _parse_module(Path("scripts/production_reset.py")),
+            "COLLECTIONS_TO_WIPE",
+        )
+        self.assertEqual(
+            Counter({name: 1 for name in B1_COLLECTION_NAMES}),
+            Counter(value for value in reset_values if value in B1_COLLECTION_NAMES),
+        )
+        self.assertEqual(
+            [],
+            _system_health_write_calls(
+                _parse_module(Path("email_automation/system_health.py"))
+            ),
+        )
+
+    def test_processed_authority_references_and_writers_match_exact_manifest(self):
+        inventory = self.static_closure_inventory
+        self.assertEqual(
+            EXPECTED_PROCESSED_COLLECTION_REFERENCES,
+            inventory.processed_collection_references,
+        )
+        self.assertEqual(
+            EXPECTED_DIRECT_PROCESSED_WRITERS,
+            inventory.direct_processed_writers,
+        )
+        self.assertEqual(
+            EXPECTED_MARK_PROCESSED_CALLS,
+            inventory.mark_processed_calls,
+        )
+
+        mutation = ast.parse(
+            "def scanner():\n"
+            "    _processed_ref(user_id, key).set({'processedAt': now})\n"
+        )
+        visitor = _StaticClosureVisitor("email_automation/new_scanner.py")
+        visitor.visit(mutation)
+        self.assertEqual(
+            Counter(
+                {
+                    (
+                        "email_automation/new_scanner.py",
+                        ("scanner",),
+                        "set",
+                    ): 1
+                }
+            ),
+            visitor.direct_processed_writers,
+        )
+
+    def test_processed_writer_inventory_follows_local_reference_assignments(self):
+        cases = {
+            "processed helper": (
+                "def scanner(user_id, key):\n"
+                "    marker_ref = _processed_ref(user_id, key)\n"
+                "    marker_ref.set({'processedAt': now})\n",
+                "set",
+            ),
+            "processed collection": (
+                "def replay(user_ref, key):\n"
+                "    marker_ref = user_ref.collection('processedMessages')\n"
+                "    document_ref = marker_ref.document(key)\n"
+                "    document_ref.create({'status': 'claimed'})\n",
+                "create",
+            ),
+        }
+        for case, (source, effect) in cases.items():
+            with self.subTest(case=case):
+                visitor = _StaticClosureVisitor("email_automation/new_lane.py")
+                visitor.visit(ast.parse(source))
+                self.assertEqual(
+                    Counter(
+                        {
+                            (
+                                "email_automation/new_lane.py",
+                                ("scanner",) if case == "processed helper" else ("replay",),
+                                effect,
+                            ): 1,
+                        }
+                    ),
+                    visitor.direct_processed_writers,
+                )
+
+    def test_system_health_write_gate_follows_helper_returned_b1_references(self):
+        b1_mutation = ast.parse(
+            "def _identity_collection(user_ref):\n"
+            "    return user_ref.collection('sourceIdentities')\n"
+            "def mutate_health(user_ref):\n"
+            "    identity_collection = _identity_collection(user_ref)\n"
+            "    identity_ref = identity_collection.document('source-1')\n"
+            "    identity_ref.set({'unexpected': True})\n"
+        )
+        ordinary_health_write = ast.parse(
+            "def _health_collection(user_ref):\n"
+            "    return user_ref.collection('systemHealth')\n"
+            "def write_health(user_ref):\n"
+            "    health_ref = _health_collection(user_ref).document('emailAutomation')\n"
+            "    health_ref.set({'status': 'healthy'})\n"
+        )
+
+        self.assertEqual([(6, "set")], _system_health_write_calls(b1_mutation))
+        self.assertEqual([], _system_health_write_calls(ordinary_health_write))
+
+    def test_default_mode_gate_rejects_runtime_enforced_defaults(self):
+        mutations = {
+            "environment assignment": (
+                "os.environ['SITESIFT_SOURCE_COORDINATOR_MODE'] = 'enforced'"
+            ),
+            "setdefault": (
+                "os.environ.setdefault("
+                "'SITESIFT_SOURCE_COORDINATOR_MODE', 'enforced')"
+            ),
+            "resolver default": (
+                "def resolve_source_coordinator_mode(environ):\n"
+                "    value = environ.get("
+                "'SITESIFT_SOURCE_COORDINATOR_MODE', 'enforced')\n"
+                "    return value\n"
+            ),
+        }
+        for case, source in mutations.items():
+            with self.subTest(case=case):
+                self.assertTrue(
+                    _runtime_enforced_default_violations(ast.parse(source))
+                )
+
+    def test_handled_reads_and_writes_match_exact_compatibility_manifest(self):
+        inventory = self.static_closure_inventory
+        self.assertEqual(EXPECTED_HANDLED_CALLS, inventory.handled_calls)
+        self.assertEqual(EXPECTED_HANDLED_LITERALS, inventory.handled_literals)
+
+        processing_tree = _parse_module(Path("email_automation/processing.py"))
+        process_definitions = [
+            node
+            for node in processing_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "process_inbox_message"
+        ]
+        self.assertEqual(1, len(process_definitions))
+        process_function = process_definitions[0]
+        enforced_barriers = [
+            statement
+            for statement in process_function.body
+            if isinstance(statement, ast.If)
+            and any(isinstance(node, ast.Return) for node in ast.walk(statement))
+            and any(
+                isinstance(node, ast.Attribute)
+                and node.attr == "ENFORCED"
+                for node in ast.walk(statement.test)
+            )
+        ]
+        self.assertEqual(1, len(enforced_barriers))
+        handled_calls = [
+            node
+            for node in ast.walk(process_function)
+            if isinstance(node, ast.Call)
+            and _call_name(node) in {"is_event_handled", "mark_event_handled"}
+        ]
+        self.assertEqual(13, len(handled_calls))
+        self.assertTrue(
+            all(
+                node.lineno > enforced_barriers[0].end_lineno
+                for node in handled_calls
+            )
+        )
+
+    def test_private_evidence_and_retained_loader_wiring_are_exact(self):
+        coordinator_tree = _parse_module(SOURCE_COORDINATOR_RELATIVE_PATH)
+        private_definitions = Counter(
+            node.name
+            for node in coordinator_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name
+            in {
+                SOURCE_ADMISSION_PRIVATE_ENVELOPE,
+                SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE,
+                SOURCE_RETAINED_TERMINAL_PRIVATE_EVIDENCE,
+            }
+        )
+        self.assertEqual(
+            Counter(
+                {
+                    SOURCE_ADMISSION_PRIVATE_ENVELOPE: 1,
+                    SOURCE_CLASSIFICATION_PRIVATE_EVIDENCE: 1,
+                    SOURCE_RETAINED_TERMINAL_PRIVATE_EVIDENCE: 1,
+                }
+            ),
+            private_definitions,
+        )
+
+        processing_tree = _parse_module(Path("email_automation/processing.py"))
+        factory_definitions = [
+            node
+            for node in processing_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "build_source_coordinator"
+        ]
+        self.assertEqual(1, len(factory_definitions))
+        factory = factory_definitions[0]
+        constructor_calls = [
+            node
+            for node in ast.walk(factory)
+            if isinstance(node, ast.Call)
+            and _call_name(node) == "SourceCoordinator"
+        ]
+        self.assertEqual(1, len(constructor_calls))
+        self.assertEqual(
+            {
+                "uuid_factory",
+                "now_factory",
+                "local_source_policy_verifier",
+                "retained_terminal_authority_loader",
+            },
+            {keyword.arg for keyword in constructor_calls[0].keywords},
+        )
+        self.assertNotIn(
+            "hard_optout_verifier",
+            {keyword.arg for keyword in constructor_calls[0].keywords},
+        )
+        loader_definitions = [
+            node
+            for node in factory.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "retained_terminal_authority_loader"
+        ]
+        self.assertEqual(1, len(loader_definitions))
+        self.assertEqual(
+            Counter({"_load_retained_terminal_authority": 1}),
+            Counter(
+                _call_name(node)
+                for node in ast.walk(loader_definitions[0])
+                if isinstance(node, ast.Call)
+                and _call_name(node) == "_load_retained_terminal_authority"
+            ),
+        )
+        bridges = [
+            node
+            for node in processing_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_load_retained_terminal_authority"
+        ]
+        self.assertEqual(1, len(bridges))
+        self.assertEqual(
+            1,
+            sum(
+                isinstance(node, ast.Call)
+                and _call_name(node) == "_terminal_retry_disposition"
+                for node in ast.walk(bridges[0])
+            ),
+        )
+
+    def test_source_coordinator_mode_has_no_runtime_enforced_default(self):
+        from email_automation import source_coordinator
+
+        mode_key = source_coordinator.SOURCE_COORDINATOR_MODE_ENV
+        disabled_cases = (
+            {},
+            {mode_key: None},
+            {mode_key: ""},
+            {mode_key: "invalid"},
+            {mode_key: "ENFORCED"},
+            {mode_key: " enforced "},
+        )
+        for environ in disabled_cases:
+            with self.subTest(environ=environ):
+                self.assertIs(
+                    source_coordinator.CoordinatorMode.DISABLED,
+                    source_coordinator.resolve_source_coordinator_mode(environ),
+                )
+        self.assertIs(
+            source_coordinator.CoordinatorMode.SHADOW,
+            source_coordinator.resolve_source_coordinator_mode(
+                {mode_key: "shadow"}
+            ),
+        )
+        self.assertIs(
+            source_coordinator.CoordinatorMode.ENFORCED,
+            source_coordinator.resolve_source_coordinator_mode(
+                {mode_key: "enforced"}
+            ),
+        )
+
+        violations = []
+        for relative_path in _application_python_files():
+            violations.extend(
+                (Path(relative_path).as_posix(), *violation)
+                for violation in _runtime_enforced_default_violations(
+                    _parse_module(relative_path)
+                )
+            )
+        self.assertEqual([], violations)
+
+    def test_b2_b3_ownership_literals_are_absent_from_runtime(self):
+        self.assertEqual(
+            Counter(),
+            self.static_closure_inventory.forbidden_ownership_literals,
+        )
 
     def test_source_admission_private_type_and_call_sites_are_bounded(self):
         self.assertEqual([], _discover_source_admission_contract_violations())
